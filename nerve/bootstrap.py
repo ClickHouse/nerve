@@ -146,6 +146,7 @@ PRODUCTIVITY_CRONS = [
 class SetupChoices:
     """Collected user choices — nothing is written until apply()."""
 
+    deployment: str = "server"  # "server" or "docker"
     mode: str = "personal"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
@@ -161,13 +162,27 @@ class SetupChoices:
 class SetupWizard:
     """Interactive first-run setup wizard."""
 
-    def __init__(self, config_dir: Path):
+    def __init__(self, config_dir: Path, inside_docker: bool = False):
         self.config_dir = config_dir
         self.choices = SetupChoices()
+        self._inside_docker = inside_docker
+        self._step_counter = 0
+        if inside_docker:
+            self.choices.deployment = "docker"
+
+    def _next_step(self, label: str) -> str:
+        """Return a formatted step header with auto-incrementing number."""
+        self._step_counter += 1
+        return f"Step {self._step_counter}: {label}"
 
     def run(self) -> SetupChoices:
         """Run the full interactive wizard. Returns choices (nothing written yet)."""
         self._welcome()
+        if not self._inside_docker:
+            self._step_deployment()
+            if self.choices.deployment == "docker":
+                self._launch_docker()
+                return self.choices  # Never reached — execvp replaces process
         self._step_mode()
         self._step_api_keys()
         self._step_workspace()
@@ -210,11 +225,129 @@ class SetupWizard:
         click.echo()
         click.pause("Press Enter to begin...")
 
+    # --- Step: Deployment ---
+
+    def _step_deployment(self) -> None:
+        click.clear()
+        click.secho(self._next_step("Deployment"), fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "How do you want to run Nerve?\n",
+            dim=True,
+        )
+        click.secho("  server", fg="green", bold=True, nl=False)
+        click.secho(
+            " — Run directly on this machine. You manage\n"
+            "            Python, dependencies, and process lifecycle.",
+            dim=True,
+        )
+        click.echo()
+        click.secho("  docker", fg="green", bold=True, nl=False)
+        click.secho(
+            " — Run in a Docker container. Isolated environment,\n"
+            "            easy cleanup, recommended for local use.",
+            dim=True,
+        )
+        click.echo()
+        self.choices.deployment = click.prompt(
+            "Choose deployment",
+            type=click.Choice(["server", "docker"], case_sensitive=False),
+            default="server",
+        )
+        click.echo()
+        click.secho(f"  → {self.choices.deployment} deployment selected.", fg="green")
+        click.echo()
+
+    # --- Docker orchestration ---
+
+    def _launch_docker(self) -> None:
+        """Build Docker image, start container, continue wizard inside it."""
+        import subprocess
+
+        # Check Docker is available
+        if not shutil.which("docker"):
+            click.secho(
+                "\n  Docker not found. Install Docker first:\n"
+                "  https://docs.docker.com/get-docker/",
+                fg="red",
+            )
+            raise SystemExit(1)
+
+        click.echo()
+        click.echo("  Checking Docker...", nl=False)
+        # Verify Docker daemon is running
+        result = subprocess.run(["docker", "info"], capture_output=True)
+        if result.returncode != 0:
+            click.secho(" ✗", fg="red")
+            click.secho("  Docker daemon is not running. Start Docker and try again.", fg="red")
+            raise SystemExit(1)
+        click.secho(" ✓", fg="green")
+
+        # Check Docker Compose V2
+        result = subprocess.run(["docker", "compose", "version"], capture_output=True)
+        if result.returncode != 0:
+            click.secho("  Docker Compose V2 not found.", fg="red")
+            click.secho(
+                "  Nerve requires 'docker compose' (V2, built into Docker Desktop).\n"
+                "  Update Docker or install the compose plugin.",
+                fg="red",
+            )
+            raise SystemExit(1)
+
+        # Generate Docker files if they don't exist
+        self._ensure_docker_files()
+
+        # Build image
+        click.echo("  Building image — this may take a few minutes on first run...", nl=False)
+        result = subprocess.run(
+            ["docker", "compose", "build"],
+            capture_output=True,
+            cwd=str(self.config_dir),
+        )
+        if result.returncode != 0:
+            click.secho(" ✗", fg="red")
+            click.echo(result.stderr.decode())
+            raise SystemExit(1)
+        click.secho(" ✓", fg="green")
+
+        # Run the wizard inside the container (interactive)
+        click.echo("  Starting container...\n")
+        os.execvp("docker", [
+            "docker", "compose",
+            "-f", str(self.config_dir / "docker-compose.yml"),
+            "run", "--rm",
+            "--service-ports",
+            "nerve",
+            "nerve", "init", "--inside-docker",
+        ])
+        # execvp replaces this process — we never return here
+
+    def _ensure_docker_files(self) -> None:
+        """Generate Dockerfile, docker-compose.yml, entrypoint, and .dockerignore."""
+        files = {
+            "Dockerfile": _DOCKERFILE_TEMPLATE,
+            "docker-compose.yml": _DOCKER_COMPOSE_TEMPLATE,
+            "docker-entrypoint.sh": _DOCKER_ENTRYPOINT_TEMPLATE,
+            ".dockerignore": _DOCKERIGNORE_TEMPLATE,
+        }
+        for filename, content in files.items():
+            filepath = self.config_dir / filename
+            if filepath.exists():
+                click.echo(f"  {filename} already exists — skipping")
+                continue
+            filepath.write_text(content.lstrip("\n"))
+            if filename == "docker-entrypoint.sh":
+                try:
+                    os.chmod(filepath, 0o755)
+                except OSError:
+                    pass
+            click.echo(f"  Created {filename}")
+
     # --- Step: Mode ---
 
     def _step_mode(self) -> None:
         click.clear()
-        click.secho("Step 1: Mode", fg="cyan", bold=True)
+        click.secho(self._next_step("Mode"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "Nerve has two modes:\n",
@@ -249,7 +382,7 @@ class SetupWizard:
 
     def _step_api_keys(self) -> None:
         click.clear()
-        click.secho("Step 2: API Keys", fg="cyan", bold=True)
+        click.secho(self._next_step("API Keys"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "Nerve uses Claude as its AI engine. You need an Anthropic API key.\n"
@@ -285,7 +418,7 @@ class SetupWizard:
 
     def _step_workspace(self) -> None:
         click.clear()
-        click.secho("Step 3: Workspace", fg="cyan", bold=True)
+        click.secho(self._next_step("Workspace"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "Your workspace is where Nerve keeps its identity files, tasks,\n"
@@ -311,7 +444,8 @@ class SetupWizard:
             click.secho("    TOOLS.md      — Environment-specific notes", dim=True)
 
         click.echo()
-        ws = click.prompt("Workspace path", default="~/nerve-workspace")
+        default_ws = "/root/nerve-workspace" if self._inside_docker else "~/nerve-workspace"
+        ws = click.prompt("Workspace path", default=default_ws)
         self.choices.workspace_path = Path(ws)
         click.echo()
         click.secho(
@@ -325,7 +459,7 @@ class SetupWizard:
 
     def _step_identity(self) -> None:
         click.clear()
-        click.secho("Step 4: About You", fg="cyan", bold=True)
+        click.secho(self._next_step("About You"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "In personal mode, Nerve develops a relationship with you\n"
@@ -348,8 +482,7 @@ class SetupWizard:
 
     def _step_channels(self) -> None:
         click.clear()
-        step_num = "5" if self.choices.mode == "personal" else "4"
-        click.secho(f"Step {step_num}: Channels", fg="cyan", bold=True)
+        click.secho(self._next_step("Channels"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "Nerve communicates through channels. The web UI is always\n"
@@ -372,8 +505,7 @@ class SetupWizard:
 
     def _step_crons(self) -> None:
         click.clear()
-        step_num = "6" if self.choices.mode == "personal" else "5"
-        click.secho(f"Step {step_num}: Background Jobs", fg="cyan", bold=True)
+        click.secho(self._next_step("Background Jobs"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "Nerve runs background jobs on a schedule — like a personal\n"
@@ -422,7 +554,7 @@ class SetupWizard:
 
     def _step_task_spec(self) -> None:
         click.clear()
-        click.secho("Step 4: Task Description", fg="cyan", bold=True)
+        click.secho(self._next_step("Task Description"), fg="cyan", bold=True)
         click.echo()
         click.secho(
             "In worker mode, Nerve needs to know what to do. Describe\n"
@@ -464,6 +596,7 @@ class SetupWizard:
         click.secho("  ┌──────────────────────────────────────────────┐", dim=True)
         click.secho("  │            Setup Summary                     │", bold=True)
         click.secho("  ├──────────────────────────────────────────────┤", dim=True)
+        click.secho(f"  │  Deploy:     {self.choices.deployment:<33}│")
         click.secho(f"  │  Mode:       {self.choices.mode:<33}│")
         click.secho(f"  │  Workspace:  {ws:<33}│")
         click.secho(f"  │  API keys:   {api_status:<33}│")
@@ -696,23 +829,47 @@ class SetupWizard:
         click.echo()
         click.secho("  ✅ Nerve is configured!", fg="green", bold=True)
         click.echo()
-        click.secho("  Next steps:", bold=True)
-        click.echo("    nerve start              Start the server")
-        click.echo("    nerve start -f           Start in foreground (see logs)")
-        click.echo("    nerve doctor             Verify everything is set up")
-        click.echo("    http://localhost:8900     Open the web UI")
-        click.echo()
-        ws = os.path.expanduser(str(self.choices.workspace_path))
-        click.secho(f"  Your workspace: {ws}", bold=True)
-        click.echo("    Edit SOUL.md to customize Nerve's personality")
-        click.echo("    Edit USER.md to tell Nerve about yourself")
-        click.echo()
-        click.secho(
-            "  Tip: Nerve learns from every conversation. The more\n"
-            "  you interact, the more useful it becomes.",
-            dim=True,
-        )
-        click.echo()
+
+        if self._inside_docker:
+            click.secho("  Starting Nerve inside Docker...", bold=True)
+            click.echo("  Open http://localhost:8900 in your browser.")
+            click.echo()
+            click.secho("  Management:", bold=True)
+            click.echo("    docker compose down       Stop the container")
+            click.echo("    docker compose up         Start again")
+            click.echo("    docker compose logs -f    Follow logs")
+            click.echo()
+            ws = os.path.expanduser(str(self.choices.workspace_path))
+            click.secho(f"  Your workspace: {ws}", bold=True)
+            click.echo("    Edit SOUL.md to customize Nerve's personality")
+            click.echo("    Edit USER.md to tell Nerve about yourself")
+            click.echo()
+            click.secho(
+                "  Tip: Nerve learns from every conversation. The more\n"
+                "  you interact, the more useful it becomes.",
+                dim=True,
+            )
+            click.echo()
+            # Auto-start Nerve inside the container
+            os.execvp("nerve", ["nerve", "start", "-f"])
+        else:
+            click.secho("  Next steps:", bold=True)
+            click.echo("    nerve start              Start the server")
+            click.echo("    nerve start -f           Start in foreground (see logs)")
+            click.echo("    nerve doctor             Verify everything is set up")
+            click.echo("    http://localhost:8900     Open the web UI")
+            click.echo()
+            ws = os.path.expanduser(str(self.choices.workspace_path))
+            click.secho(f"  Your workspace: {ws}", bold=True)
+            click.echo("    Edit SOUL.md to customize Nerve's personality")
+            click.echo("    Edit USER.md to tell Nerve about yourself")
+            click.echo()
+            click.secho(
+                "  Tip: Nerve learns from every conversation. The more\n"
+                "  you interact, the more useful it becomes.",
+                dim=True,
+            )
+            click.echo()
 
 
 # --- Non-interactive mode ---
@@ -728,10 +885,15 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
         raise click.ClickException("ANTHROPIC_API_KEY environment variable is required for non-interactive setup")
     choices.anthropic_api_key = api_key
 
+    # Auto-detect Docker via env var
+    is_docker = os.environ.get("NERVE_DOCKER", "") == "1"
+    choices.deployment = "docker" if is_docker else "server"
+
     # Optional
     choices.mode = os.environ.get("NERVE_MODE", "personal")
     choices.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-    choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", "~/nerve-workspace"))
+    default_ws = "/root/nerve-workspace" if is_docker else "~/nerve-workspace"
+    choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", default_ws))
     choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")
     choices.telegram_bot_token = os.environ.get("NERVE_TELEGRAM_BOT_TOKEN", "")
 
@@ -744,7 +906,7 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     if choices.mode == "worker":
         choices.task_description = os.environ.get("NERVE_TASK", "")
 
-    wizard = SetupWizard(config_dir)
+    wizard = SetupWizard(config_dir, inside_docker=is_docker)
     wizard.choices = choices
 
     click.echo("Running non-interactive setup...")
@@ -781,3 +943,128 @@ def _wrap_text(text: str, width: int = 51) -> list[str]:
     if current:
         lines.append(current)
     return lines or [""]
+
+
+# --- Docker file templates ---
+
+_DOCKERFILE_TEMPLATE = """
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    curl git && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 for web UI build
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \\
+    && apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /root/.nerve /root/nerve-workspace
+
+ENV NERVE_DOCKER=1
+
+WORKDIR /nerve
+
+# Pre-install Python dependencies for caching
+COPY pyproject.toml /tmp/pyproject.toml
+RUN pip install --no-cache-dir $(python3 -c "
+import tomllib
+with open('/tmp/pyproject.toml', 'rb') as f:
+    deps = tomllib.load(f)['project']['dependencies']
+print(' '.join(repr(d) for d in deps))
+") && rm /tmp/pyproject.toml
+
+EXPOSE 8900
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \\
+    CMD curl -f http://localhost:8900/health || exit 1
+
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+"""
+
+_DOCKER_COMPOSE_TEMPLATE = """
+services:
+  nerve:
+    build: .
+    ports:
+      - "8900:8900"
+    volumes:
+      - .:/nerve
+      - nerve-data:/root/.nerve
+      - nerve-workspace:/root/nerve-workspace
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    env_file:
+      - path: .env
+        required: false
+
+volumes:
+  nerve-data:
+  nerve-workspace:
+"""
+
+_DOCKER_ENTRYPOINT_TEMPLATE = """#!/bin/bash
+set -e
+
+cd /nerve
+
+# Install the package in editable mode (fast if already installed)
+pip install -e . --quiet 2>/dev/null
+
+# Build web UI if not already built
+if [ ! -d "web/dist" ]; then
+    echo "Building web UI..."
+    cd web && npm ci --quiet && npm run build && cd ..
+fi
+
+# If no arguments, default to init + start
+if [ $# -eq 0 ]; then
+    nerve init --if-needed --non-interactive
+    exec nerve start -f
+else
+    exec "$@"
+fi
+"""
+
+_DOCKERIGNORE_TEMPLATE = """
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# Node
+web/node_modules/
+web/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime data
+*.db
+*.db-journal
+*.log
+*.pid
+
+# Config (secrets)
+config.local.yaml
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+"""

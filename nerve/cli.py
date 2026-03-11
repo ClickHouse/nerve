@@ -106,8 +106,9 @@ def main(ctx: click.Context, config_dir: str, verbose: bool) -> None:
 @main.command()
 @click.option("--if-needed", is_flag=True, help="Only run if fresh install detected")
 @click.option("--non-interactive", is_flag=True, help="Use env vars, no prompts (for Docker)")
+@click.option("--inside-docker", is_flag=True, hidden=True, help="Skip deployment step (running inside Docker)")
 @click.pass_context
-def init(ctx: click.Context, if_needed: bool, non_interactive: bool) -> None:
+def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool) -> None:
     """First-run setup wizard — configure Nerve interactively."""
     from nerve.bootstrap import SetupWizard, is_fresh_install, run_non_interactive
 
@@ -126,7 +127,7 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool) -> None:
     if non_interactive:
         run_non_interactive(config_dir)
     else:
-        wizard = SetupWizard(config_dir)
+        wizard = SetupWizard(config_dir, inside_docker=inside_docker)
         wizard.run()
 
     # Reload config after wizard writes files

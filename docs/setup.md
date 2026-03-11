@@ -1,16 +1,36 @@
 # Setup Guide
 
+## Quick Start
+
+The fastest way to get Nerve running:
+
+```bash
+git clone <repo-url> nerve
+cd nerve
+pip install -e .       # or: uv pip install -e .
+cd web && npm install && npm run build && cd ..
+nerve init             # Interactive wizard — handles everything
+nerve start
+```
+
+The `nerve init` wizard walks you through deployment, mode selection, API keys, workspace setup, and cron configuration. Nothing is written until you confirm.
+
 ## Prerequisites
 
+### Server deployment
 - Python 3.12+
-- Node.js 18+ (for web UI)
+- Node.js 18+ (for web UI build)
 - Anthropic API key
-- Telegram bot token (optional, from @BotFather)
+
+### Docker deployment
+- Docker with Compose V2 (`docker compose`)
+- Anthropic API key
 
 ## Installation
 
+### Option A: Server (bare metal)
+
 ```bash
-# Clone the repo
 git clone <repo-url> nerve
 cd nerve
 
@@ -21,19 +41,61 @@ source .venv/bin/activate
 # Install Nerve
 uv pip install -e .
 
-# Install web UI dependencies and build
-cd web
-npm install
-npx vite build
-cd ..
+# Build web UI
+cd web && npm install && npm run build && cd ..
+
+# Run the setup wizard
+nerve init
 ```
 
-## Configuration
+### Option B: Docker
 
 ```bash
-# Create config files
-cp config.example.yaml config.yaml
+git clone <repo-url> nerve
+cd nerve
+pip install -e .   # Needed to run the wizard on the host
+nerve init         # Choose "docker" at the deployment step
+```
 
+The wizard handles everything: generates Dockerfile + docker-compose.yml, builds the image, starts the container, and continues setup inside it. You never write Docker files manually.
+
+**What happens under the hood:**
+1. `nerve init` asks "How do you want to run Nerve?" → choose `docker`
+2. Generates `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore`
+3. Runs `docker compose build`
+4. Runs `docker compose run nerve nerve init --inside-docker` (seamless transition)
+5. The rest of the wizard (mode, API keys, workspace, crons) continues inside the container
+6. After setup, Nerve starts automatically inside the container
+
+**Subsequent starts:**
+```bash
+docker compose up        # Start
+docker compose up -d     # Start in background
+docker compose down      # Stop
+docker compose logs -f   # Follow logs
+```
+
+**Non-interactive Docker setup** (CI / automation):
+```bash
+cp .env.example .env
+# Edit .env with your ANTHROPIC_API_KEY
+docker compose up
+```
+
+The entrypoint runs `nerve init --if-needed --non-interactive` before starting, using environment variables from `.env`.
+
+**Volumes:**
+| Mount | Purpose |
+|-------|---------|
+| `.:/nerve` | Application code (bind mount) |
+| `nerve-data:/root/.nerve` | Databases, logs, PID, sessions |
+| `nerve-workspace:/root/nerve-workspace` | Workspace files (SOUL.md, tasks, skills) |
+
+## Manual Configuration
+
+The wizard handles all of this automatically, but you can also configure manually:
+
+```bash
 # Create secrets file (gitignored)
 cat > config.local.yaml << 'EOF'
 anthropic_api_key: sk-ant-...
@@ -58,28 +120,12 @@ python -c "import bcrypt; print(bcrypt.hashpw(b'yourpassword', bcrypt.gensalt())
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-### Set workspace path
-
-Edit `config.yaml`:
-```yaml
-workspace: ~/nerve-workspace
-```
-
-Then create the workspace:
-```bash
-mkdir -p ~/nerve-workspace/memory/tasks/{active,done}
-```
-
-Copy your identity files (SOUL.md, IDENTITY.md, USER.md, MEMORY.md, etc.) to the workspace.
-
 ## First Run
 
 ```bash
-# Check everything is configured
-nerve doctor
-
-# Start the server
-nerve start
+nerve doctor             # Verify everything is set up
+nerve start              # Start the server
+# Open http://localhost:8900
 ```
 
 ## HTTPS Setup (Raspberry Pi)
