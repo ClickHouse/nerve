@@ -387,6 +387,11 @@ class AgentEngine:
                     total_messages += count
                     sessions_indexed += 1
 
+            # Release memory after the sweep — prevents RSS ratcheting
+            # from intermediate list[float]→numpy conversions and JSON parsing.
+            if self._memory_bridge:
+                self._memory_bridge._release_memory()
+
             stats = {
                 "sessions_scanned": len(sessions),
                 "sessions_indexed": sessions_indexed,

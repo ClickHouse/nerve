@@ -7,6 +7,8 @@ The .md files remain the source of truth; memU makes them semantically searchabl
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import json
 import logging
 import time
@@ -16,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import numpy as np
 
 from nerve.config import NerveConfig
 
@@ -365,7 +369,7 @@ class MemUBridge:
                 embed_client=None, categories=None,
             ):
                 cat_pool = categories if categories is not None else store.memory_category_repo.categories
-                corpus = [(cid, cat.embedding) for cid, cat in cat_pool.items() if cat.embedding]
+                corpus = [(cid, cat.embedding) for cid, cat in cat_pool.items() if cat.embedding is not None]
                 hits = cosine_topk(query_vec, corpus, k=top_k)
                 summary_lookup = {cid: cat.summary for cid, cat in cat_pool.items() if cat.summary}
                 return hits, summary_lookup
@@ -392,6 +396,69 @@ class MemUBridge:
                 return _original_list_cats(self, where)
 
             SQLiteMemoryCategoryRepo.list_categories = _cached_list_cats
+
+            # Fix 6: Store embeddings as numpy float32 arrays instead of
+            # Python list[float].  Each 1536-dim embedding drops from ~48 KB
+            # (list overhead + 1536 Python float objects) to ~6 KB (contiguous
+            # float32 buffer).  For 4K+ items this saves ~170 MB of RSS on the
+            # Pi.  cosine_topk already converts to numpy internally, so having
+            # numpy input is a no-op (faster, not slower).
+            from memu.database.sqlite.repositories.base import SQLiteRepoBase
+
+            _original_normalize = SQLiteRepoBase._normalize_embedding
+
+            def _numpy_normalize_embedding(self, embedding):
+                if embedding is None:
+                    return None
+                if isinstance(embedding, np.ndarray):
+                    return embedding.astype(np.float32, copy=False)
+                if isinstance(embedding, str):
+                    try:
+                        return np.array(json.loads(embedding), dtype=np.float32)
+                    except (json.JSONDecodeError, TypeError):
+                        return None
+                try:
+                    return np.array(list(embedding), dtype=np.float32)
+                except (ValueError, TypeError, OverflowError):
+                    return None
+
+            SQLiteRepoBase._normalize_embedding = _numpy_normalize_embedding
+
+            # Patch _prepare_embedding to serialize numpy arrays to JSON.
+            def _numpy_prepare_embedding(self, embedding):
+                if embedding is None:
+                    return None
+                if isinstance(embedding, np.ndarray):
+                    return json.dumps(embedding.tolist())
+                return json.dumps(embedding)
+
+            SQLiteRepoBase._prepare_embedding = _numpy_prepare_embedding
+
+            # Patch SQLite model embedding property getters/setters to handle
+            # numpy.  The getters return numpy directly; the setters accept both
+            # numpy and list[float] for serialization to JSON.
+            for _model_cls in (SQLiteResourceModel, SQLiteMemoryItemModel, SQLiteMemoryCategoryModel):
+                def _make_embedding_property(cls):
+                    def _get_embedding(self):
+                        if self.embedding_json is None:
+                            return None
+                        try:
+                            return np.array(json.loads(self.embedding_json), dtype=np.float32)
+                        except (json.JSONDecodeError, TypeError):
+                            return None
+
+                    def _set_embedding(self, value):
+                        if value is None:
+                            self.embedding_json = None
+                        elif isinstance(value, np.ndarray):
+                            self.embedding_json = json.dumps(value.tolist())
+                        else:
+                            self.embedding_json = json.dumps(value)
+
+                    cls.embedding = property(_get_embedding, _set_embedding)
+                _make_embedding_property(_model_cls)
+
+            logger.info("Patched embeddings to use numpy float32 (saves ~170 MB on 4K items)")
 
         except Exception as e:
             logger.error(
@@ -580,11 +647,48 @@ class MemUBridge:
             try:
                 self._service.database.memory_item_repo.list_items()
                 self._service.database.memory_category_repo.list_categories()
-                logger.info("Preloaded %d items and %d categories into vector cache",
-                            len(self._service.database.memory_item_repo.items),
-                            len(self._service.database.memory_category_repo.categories))
+
+                # Convert cached embeddings from list[float] to numpy float32.
+                # Pydantic coerces numpy → list during model construction, so we
+                # bypass it with __dict__ assignment after the models are built.
+                # This drops ~170 MB of RSS (48 KB → 6 KB per 1536-dim embedding).
+                converted = 0
+                for item in self._service.database.memory_item_repo.items.values():
+                    if item.embedding is not None and not isinstance(item.embedding, np.ndarray):
+                        item.__dict__["embedding"] = np.array(item.embedding, dtype=np.float32)
+                        converted += 1
+                for cat in self._service.database.memory_category_repo.categories.values():
+                    if cat.embedding is not None and not isinstance(cat.embedding, np.ndarray):
+                        cat.__dict__["embedding"] = np.array(cat.embedding, dtype=np.float32)
+                        converted += 1
+
+                # Release the list[float] objects immediately
+                self._release_memory()
+
+                logger.info(
+                    "Preloaded %d items and %d categories into vector cache "
+                    "(%d embeddings converted to numpy float32)",
+                    len(self._service.database.memory_item_repo.items),
+                    len(self._service.database.memory_category_repo.categories),
+                    converted,
+                )
             except Exception as e:
                 logger.warning("Failed to preload vector cache: %s", e)
+
+            # Monkey-patch create_item to keep new embeddings as numpy too.
+            from memu.database.sqlite.repositories.memory_item_repo import SQLiteMemoryItemRepo
+            _original_create_item = SQLiteMemoryItemRepo.create_item
+
+            def _numpy_create_item(self, *args, **kwargs):
+                result = _original_create_item(self, *args, **kwargs)
+                # Convert the newly cached item's embedding to numpy
+                if result and hasattr(result, "id"):
+                    cached = self.items.get(result.id)
+                    if cached and cached.embedding is not None and not isinstance(cached.embedding, np.ndarray):
+                        cached.__dict__["embedding"] = np.array(cached.embedding, dtype=np.float32)
+                return result
+
+            SQLiteMemoryItemRepo.create_item = _numpy_create_item
 
             return True
 
@@ -617,6 +721,25 @@ class MemUBridge:
                 logger.warning("Failed to seed category %s: %s", cat_cfg.name, e)
 
     # Maximum time (seconds) for a single memorize operation before cancellation.
+    # Try to load malloc_trim for returning freed arenas to the OS.
+    # On glibc (Linux), Python's arena allocator holds freed pages;
+    # malloc_trim(0) forces them back, preventing RSS ratcheting.
+    _libc = None
+    try:
+        _libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        pass
+
+    @staticmethod
+    def _release_memory() -> None:
+        """Force Python GC and return freed pages to the OS."""
+        gc.collect()
+        if MemUBridge._libc is not None:
+            try:
+                MemUBridge._libc.malloc_trim(0)
+            except Exception:
+                pass
+
     _MEMORIZE_TIMEOUT = 300
     # Number of retry attempts after a timeout.
     _MEMORIZE_MAX_RETRIES = 2
@@ -814,6 +937,7 @@ class MemUBridge:
                 logger.info("Indexed file: %s (%.1fs)", file_path, elapsed)
                 self._metrics.end_op(op_id, success=True)
                 await self._audit("file_indexed", "resource", file_path, source)
+                self._release_memory()
                 return True
 
             except asyncio.TimeoutError:
@@ -885,6 +1009,7 @@ class MemUBridge:
             attempt += 1
 
         logger.error("memU memorize_file gave up after %d attempts for %s", attempt, file_path)
+        self._release_memory()
         return False
 
     async def memorize_conversation(self, session_id: str, messages: list[dict]) -> bool:
