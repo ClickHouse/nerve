@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -88,6 +89,66 @@ def _get_daemon_status() -> tuple[bool, int | None]:
     return False, None
 
 
+# --- Docker Compose helpers ---
+
+def _is_docker_mode(config) -> bool:
+    """Check if CLI should proxy commands to Docker Compose.
+
+    True when config.deployment == "docker" AND we are NOT inside
+    the container (NERVE_DOCKER env var is not set).
+    """
+    deployment = getattr(config, "deployment", "server")
+    if deployment != "docker":
+        return False
+    # Inside the container, NERVE_DOCKER=1 — don't proxy to self
+    if os.environ.get("NERVE_DOCKER") == "1":
+        return False
+    return True
+
+
+def _find_compose_file(config_dir: str | Path) -> Path:
+    """Locate docker-compose.yml or raise."""
+    compose_file = Path(config_dir) / "docker-compose.yml"
+    if not compose_file.exists():
+        raise click.ClickException(
+            f"docker-compose.yml not found in {config_dir}\n"
+            "Run 'nerve init' to generate Docker files."
+        )
+    return compose_file
+
+
+def _docker_compose(
+    config_dir: str | Path,
+    args: list[str],
+    replace_process: bool = False,
+) -> int:
+    """Run a docker compose command.
+
+    Args:
+        config_dir: Directory containing docker-compose.yml.
+        args: Arguments after 'docker compose' (e.g. ["up", "-d"]).
+        replace_process: Use os.execvp (for streaming commands like logs).
+
+    Returns:
+        Exit code (0 if replace_process since execvp never returns).
+    """
+    compose_file = _find_compose_file(config_dir)
+
+    if not shutil.which("docker"):
+        raise click.ClickException(
+            "Docker not found. Install Docker: https://docs.docker.com/get-docker/"
+        )
+
+    cmd = ["docker", "compose", "-f", str(compose_file)] + args
+
+    if replace_process:
+        os.execvp("docker", cmd)
+        return 0  # unreachable
+
+    result = subprocess.run(cmd, cwd=str(Path(config_dir)))
+    return result.returncode
+
+
 @click.group()
 @click.option("--config-dir", "-c", type=click.Path(), default=".", help="Config directory")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
@@ -157,6 +218,19 @@ def start(ctx: click.Context, foreground: bool) -> None:
             ctx.exit(1)
             return
 
+    # Docker mode: proxy to docker compose
+    if _is_docker_mode(config):
+        if foreground:
+            _docker_compose(config_dir, ["up"], replace_process=True)
+        else:
+            rc = _docker_compose(config_dir, ["up", "-d"])
+            if rc == 0:
+                click.echo("Nerve started (Docker)")
+                click.echo(f"  Listening on http://localhost:{config.gateway.port}")
+                click.echo("  Use 'nerve logs' to follow logs")
+            ctx.exit(rc)
+        return
+
     # Check if already running
     running, pid = _get_daemon_status()
     if running:
@@ -215,6 +289,17 @@ def start(ctx: click.Context, foreground: bool) -> None:
 @click.pass_context
 def stop(ctx: click.Context) -> None:
     """Stop the running Nerve daemon."""
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+
+    # Docker mode: proxy to docker compose
+    if _is_docker_mode(config):
+        rc = _docker_compose(config_dir, ["down"])
+        if rc == 0:
+            click.echo("Nerve stopped (Docker)")
+        ctx.exit(rc)
+        return
+
     running, pid = _get_daemon_status()
     if not running:
         click.echo("Nerve is not running")
@@ -246,6 +331,17 @@ def stop(ctx: click.Context) -> None:
 @click.pass_context
 def restart(ctx: click.Context) -> None:
     """Restart the Nerve daemon."""
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+
+    # Docker mode: proxy to docker compose
+    if _is_docker_mode(config):
+        rc = _docker_compose(config_dir, ["restart"])
+        if rc == 0:
+            click.echo("Nerve restarted (Docker)")
+        ctx.exit(rc)
+        return
+
     running, pid = _get_daemon_status()
     if running:
         click.echo(f"Stopping Nerve (PID {pid})...")
@@ -279,6 +375,17 @@ def restart(ctx: click.Context) -> None:
 @click.pass_context
 def status(ctx: click.Context, follow: bool) -> None:
     """Show Nerve daemon status."""
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+
+    # Docker mode: proxy to docker compose ps
+    if _is_docker_mode(config):
+        rc = _docker_compose(config_dir, ["ps"])
+        if follow:
+            _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
+        ctx.exit(rc)
+        return
+
     running, pid = _get_daemon_status()
 
     if running:
@@ -332,6 +439,14 @@ def status(ctx: click.Context, follow: bool) -> None:
 @click.pass_context
 def logs(ctx: click.Context) -> None:
     """Tail the Nerve daemon log."""
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+
+    # Docker mode: proxy to docker compose logs
+    if _is_docker_mode(config):
+        _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
+        return  # unreachable
+
     if not LOG_FILE.exists():
         click.echo(f"No log file at {LOG_FILE}")
         return

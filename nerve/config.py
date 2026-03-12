@@ -340,6 +340,7 @@ class ChannelsConfig:
 class NerveConfig:
     workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
     timezone: str = "America/New_York"
+    deployment: str = "server"            # "server" or "docker"
     quiet_start: str = "02:00"            # HH:MM — start of quiet period (local timezone)
     quiet_end: str = "08:00"              # HH:MM — end of quiet period (local timezone)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
@@ -363,6 +364,7 @@ class NerveConfig:
         return cls(
             workspace=_expand_path(d.get("workspace", "~/nerve-workspace")) or Path("~/nerve-workspace"),
             timezone=d.get("timezone", "America/New_York"),
+            deployment=d.get("deployment", "server"),
             quiet_start=d.get("quiet_start", "02:00"),
             quiet_end=d.get("quiet_end", "08:00"),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),

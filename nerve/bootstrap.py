@@ -699,6 +699,7 @@ class SetupWizard:
         config: dict[str, Any] = {
             "workspace": ws,
             "timezone": tz,
+            "deployment": self.choices.deployment,
             "agent": {
                 "model": "claude-opus-4-6",
                 "cron_model": "claude-sonnet-4-6",
@@ -847,9 +848,10 @@ class SetupWizard:
             click.echo("  Open http://localhost:8900 in your browser.")
             click.echo()
             click.secho("  Management:", bold=True)
-            click.echo("    docker compose down       Stop the container")
-            click.echo("    docker compose up         Start again")
-            click.echo("    docker compose logs -f    Follow logs")
+            click.echo("    nerve stop                Stop the container")
+            click.echo("    nerve start               Start again")
+            click.echo("    nerve logs                Follow logs")
+            click.echo("    nerve status              Container status")
             click.echo()
             ws = os.path.expanduser(str(self.choices.workspace_path))
             click.secho(f"  Your workspace: {ws}", bold=True)
