@@ -1136,45 +1136,8 @@ class SetupWizard:
                 if cron.get("reminder_mode"):
                     job["reminder_mode"] = cron["reminder_mode"]
                 jobs.append(job)
-        elif self.choices.mode == "worker":
-            # Worker setup cron — runs on first boot with full agent tools
-            jobs.append({
-                "id": "worker-setup",
-                "schedule": "*/5 * * * *",
-                "description": "First-boot setup — researches the task, generates skills and monitoring crons",
-                "model": "",
-                "session_mode": "isolated",
-                "enabled": True,
-                "prompt": (
-                    "You are a setup agent for a Nerve worker instance. Your job is to configure this worker "
-                    "based on the task description in TASK.md.\n\n"
-                    "## Check if setup is needed\n\n"
-                    "1. Read TASK.md from the workspace\n"
-                    "2. If it already has a `## Mission` section, setup is done — reply 'Setup already complete.' and stop\n"
-                    "3. If it's just a raw description (starts with `# Task`), proceed with setup\n\n"
-                    "## Research the task\n\n"
-                    "Use your tools to understand the task:\n"
-                    "- Use `web_fetch` to read any URLs mentioned in the task description\n"
-                    "- Use `bash` to clone repos, explore APIs, read documentation\n"
-                    "- Use `web_search` to find relevant documentation\n"
-                    "- Understand the domain, tools, APIs, and workflows involved\n\n"
-                    "## Generate configuration\n\n"
-                    "Based on your research:\n\n"
-                    "1. **Rewrite TASK.md** with structured sections:\n"
-                    "   - Mission: what the worker does (1-2 sentences)\n"
-                    "   - Scope: repos, services, or systems to monitor\n"
-                    "   - Triggers: what events to watch for\n"
-                    "   - Actions: what to do when triggered\n"
-                    "   - Approval: what needs human approval vs autonomous action\n"
-                    "   - References: links to docs, APIs, tools discovered during research\n\n"
-                    "2. **Create skills** using `skill_create` for domain-specific procedures\n"
-                    "   (e.g., how to query a CI database, how to reproduce a test failure)\n\n"
-                    "3. **Create tasks** using `task_create` for any initial setup work\n"
-                    "   (e.g., 'Set up monitoring cron for CI failures')\n\n"
-                    "4. **Notify** the user when setup is complete using `notify`\n\n"
-                    "Be thorough in your research. You have full tool access — use it.\n"
-                ),
-            })
+        # Worker mode: no productivity crons — the worker-setup onboarding
+        # session runs from AgentEngine.initialize() on first boot instead.
 
         # Write system crons (managed by nerve init, safe to regenerate)
         system_file = Path("~/.nerve/cron/system.yaml").expanduser()

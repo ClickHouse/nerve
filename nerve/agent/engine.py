@@ -125,7 +125,76 @@ class AgentEngine:
         except Exception as e:
             logger.error("Orphaned session recovery failed: %s", e)
 
+        # Worker mode: check if first-boot onboarding is needed
+        if self._needs_worker_onboarding():
+            asyncio.get_event_loop().call_soon(
+                lambda: asyncio.ensure_future(self._run_worker_onboarding())
+            )
+
         logger.info("Agent engine initialized")
+
+    def _needs_worker_onboarding(self) -> bool:
+        """Check if this is a worker instance that needs first-boot onboarding."""
+        task_md = self.config.workspace / "TASK.md"
+        if not task_md.exists():
+            return False
+        content = task_md.read_text(encoding="utf-8").strip()
+        # Raw task description from init starts with "# Task\n\n"
+        # Structured TASK.md (post-onboarding) has "## Mission"
+        return content.startswith("# Task\n") and "## Mission" not in content
+
+    async def _run_worker_onboarding(self) -> None:
+        """Run the worker onboarding agent session on first boot."""
+        logger.info("Worker onboarding: starting first-boot setup session")
+
+        task_md = self.config.workspace / "TASK.md"
+        task_description = task_md.read_text(encoding="utf-8").strip()
+        # Strip the "# Task\n\n" prefix
+        if task_description.startswith("# Task\n\n"):
+            task_description = task_description[len("# Task\n\n"):]
+
+        prompt = (
+            "You are running the **first-boot onboarding** for this Nerve worker instance.\n\n"
+            f"The user described the task as:\n\n> {task_description}\n\n"
+            "Your job is to research this task thoroughly and configure the worker.\n\n"
+            "## Step 1: Research\n\n"
+            "Use your tools to understand the task deeply:\n"
+            "- **Fetch URLs** mentioned in the description (repos, docs, APIs)\n"
+            "- **Search the web** for relevant documentation and tools\n"
+            "- **Clone repos** if needed to understand their structure\n"
+            "- **Explore CI systems**, databases, APIs referenced in the task\n"
+            "- Take notes on what you discover — you'll need them for configuration\n\n"
+            "## Step 2: Rewrite TASK.md\n\n"
+            "Replace the raw description in TASK.md with a structured version:\n"
+            "- **## Mission**: What this worker does (1-2 sentences)\n"
+            "- **## Scope**: Repos, services, or systems to monitor\n"
+            "- **## Triggers**: What events to watch for\n"
+            "- **## Actions**: What to do when triggered (step by step)\n"
+            "- **## Approval**: What needs human approval vs autonomous action\n"
+            "- **## References**: Links to docs, APIs, tools discovered during research\n\n"
+            "## Step 3: Create Skills\n\n"
+            "Use `skill_create` to create domain-specific skills the worker will need.\n"
+            "Each skill should have clear step-by-step instructions for a procedure\n"
+            "(e.g., 'how to query the CI database', 'how to reproduce a test failure').\n\n"
+            "## Step 4: Create Initial Tasks\n\n"
+            "Use `task_create` to create tasks for any remaining setup work\n"
+            "(e.g., 'Configure monitoring cron for CI failures', 'Set up alert thresholds').\n\n"
+            "## Step 5: Notify\n\n"
+            "When done, use `notify` to tell the user that onboarding is complete.\n"
+            "Include a summary of what was configured.\n\n"
+            "---\n\n"
+            "Be thorough. You have full tool access — bash, web fetch, file read/write,\n"
+            "skill_create, task_create, notify. This is a one-time setup — do it right.\n"
+        )
+
+        try:
+            await self.run_cron(
+                job_id="worker-onboarding",
+                prompt=prompt,
+            )
+            logger.info("Worker onboarding: setup session completed")
+        except Exception as e:
+            logger.error("Worker onboarding failed: %s", e)
 
     @staticmethod
     async def _safe_disconnect(client: Any, timeout: float = 5.0) -> None:
