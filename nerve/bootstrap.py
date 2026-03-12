@@ -1251,7 +1251,15 @@ class SetupWizard:
                 content = content.replace("{{TIMEZONE}}", self.choices.timezone)
                 user_md.write_text(content, encoding="utf-8")
 
-        # 3. Write TASK.md for worker mode
+        # 3. Patch TOOLS.md with Docker environment layout
+        if self._inside_docker:
+            tools_md = ws_path / "TOOLS.md"
+            if tools_md.exists():
+                content = tools_md.read_text(encoding="utf-8")
+                content += _DOCKER_TOOLS_SECTION
+                tools_md.write_text(content, encoding="utf-8")
+
+        # 4. Write TASK.md for worker mode
         if self.choices.mode == "worker" and self.choices.task_description:
             task_md = ws_path / "TASK.md"
             task_md.write_text(
@@ -1259,29 +1267,29 @@ class SetupWizard:
                 encoding="utf-8",
             )
 
-        # 4. Write config.yaml
+        # 5. Write config.yaml
         click.echo("  Writing config.yaml...", nl=False)
         self._write_config_yaml()
         click.secho(" ✓", fg="green")
 
-        # 5. Write config.local.yaml
+        # 6. Write config.local.yaml
         click.echo("  Writing config.local.yaml...", nl=False)
         self._write_config_local_yaml()
         click.secho(" ✓", fg="green")
 
-        # 6. Create ~/.nerve directory structure
+        # 7. Create ~/.nerve directory structure
         click.echo("  Setting up ~/.nerve/...", nl=False)
         nerve_dir = Path("~/.nerve").expanduser()
         nerve_dir.mkdir(parents=True, exist_ok=True)
         (nerve_dir / "cron").mkdir(parents=True, exist_ok=True)
         click.secho(" ✓", fg="green")
 
-        # 7. Write cron jobs
+        # 8. Write cron jobs
         click.echo("  Configuring cron jobs...", nl=False)
         self._write_cron_jobs()
         click.secho(" ✓", fg="green")
 
-        # 8. Build web UI (server mode only — Docker handles this in entrypoint)
+        # 9. Build web UI (server mode only — Docker handles this in entrypoint)
         if not self._inside_docker:
             self._build_web_ui()
 
@@ -1837,6 +1845,31 @@ if [ $# -eq 0 ]; then
 else
     exec "$@"
 fi
+"""
+
+_DOCKER_TOOLS_SECTION = """
+## Docker Environment
+
+You are running inside a Docker container. Key paths:
+
+| Path | Contents | Writable | Notes |
+|------|----------|----------|-------|
+| `/nerve` | Nerve source code | ✓ (bind mount) | `pyproject.toml`, `nerve/` package, `web/` — the full repo. Changes persist to host. |
+| `/root/.nerve` | Config directory | ✓ (bind mount) | `config.yaml`, `config.local.yaml`, `cron/` jobs. |
+| `/root/nerve-workspace` | Your workspace | ✓ (bind mount) | AGENTS.md, SOUL.md, MEMORY.md, etc. — where you live. |
+
+### Working with Nerve source
+
+- The Nerve package is installed in editable mode (`pip install -e /nerve`).
+- After modifying Nerve source code, changes take effect immediately for Python.
+- If you modify the web UI (`/nerve/web/`), rebuild with: `cd /nerve/web && npm run build`
+- Config files live in `/root/.nerve/`, NOT in `/nerve/`.
+
+### Credentials
+
+Docker can't access the host's macOS Keychain. Credentials are extracted during
+`nerve init` and stored in `/root/.nerve/config.local.yaml`. The entrypoint exports
+them as environment variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `GH_TOKEN`).
 """
 
 _DOCKERIGNORE_TEMPLATE = """
