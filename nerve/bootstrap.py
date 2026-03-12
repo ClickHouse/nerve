@@ -143,7 +143,7 @@ PRODUCTIVITY_CRONS = [
 
 # Default memory categories for a fresh install.
 # Generic enough for any user — they can customize in config.yaml later.
-_DEFAULT_MEMORY_CATEGORIES = [
+_PERSONAL_MEMORY_CATEGORIES = [
     {"name": "personal_info", "description": "Identity, contact details, timezone, background"},
     {"name": "preferences", "description": "Communication style, tool preferences, how things should be done"},
     {"name": "relationships", "description": "People, dynamics, contact context"},
@@ -154,6 +154,17 @@ _DEFAULT_MEMORY_CATEGORIES = [
     {"name": "conversations", "description": "Key things said, promises, follow-ups"},
     {"name": "agent_ops", "description": "Operational lessons, memory design, prompt tuning"},
     {"name": "people", "description": "Information and facts about people"},
+]
+
+_WORKER_MEMORY_CATEGORIES = [
+    {"name": "task_domain", "description": "Domain-specific knowledge: CI systems, APIs, database schemas, repo structure"},
+    {"name": "patterns", "description": "Recurring patterns: common failure modes, root causes, known flaky tests, seasonal issues"},
+    {"name": "procedures", "description": "How to do things: reproduction steps, debug workflows, fix templates that worked"},
+    {"name": "decisions", "description": "Past decisions and outcomes: what was tried, what worked, why approach X over Y"},
+    {"name": "approvals", "description": "What got approved/rejected, approval preferences, risk thresholds"},
+    {"name": "contacts", "description": "People involved: who owns what, who to notify, escalation paths"},
+    {"name": "infrastructure", "description": "Systems, endpoints, service dependencies, deployment details"},
+    {"name": "agent_ops", "description": "Operational lessons about the worker itself: tool gotchas, performance observations"},
 ]
 
 
@@ -1080,7 +1091,10 @@ class SetupWizard:
                 "memorize_model": "claude-sonnet-4-6",
                 "fast_model": "claude-haiku-4-5-20251001",
                 "embed_model": "text-embedding-3-small",
-                "categories": _DEFAULT_MEMORY_CATEGORIES,
+                "categories": (
+                    _PERSONAL_MEMORY_CATEGORIES if self.choices.mode == "personal"
+                    else _WORKER_MEMORY_CATEGORIES
+                ),
             },
             "cron": {
                 "system_file": "~/.nerve/cron/system.yaml",
