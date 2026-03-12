@@ -338,6 +338,18 @@ class TestConfigMemoryModels:
         config = MemoryConfig.from_dict({"semantic_dedup_threshold": 0.9})
         assert config.semantic_dedup_threshold == 0.9
 
+    def test_knowledge_filter_default_false(self):
+        config = MemoryConfig()
+        assert config.knowledge_filter is False
+
+    def test_knowledge_filter_from_dict(self):
+        config = MemoryConfig.from_dict({"knowledge_filter": True})
+        assert config.knowledge_filter is True
+
+    def test_knowledge_filter_from_dict_default(self):
+        config = MemoryConfig.from_dict({})
+        assert config.knowledge_filter is False
+
     def test_semantic_dedup_threshold_from_dict_default(self):
         config = MemoryConfig.from_dict({})
         assert config.semantic_dedup_threshold == 0.85

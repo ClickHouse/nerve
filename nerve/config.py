@@ -248,6 +248,7 @@ class MemoryConfig:
     embed_model: str = "text-embedding-3-small"
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
+    knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
     categories: list[MemoryCategoryConfig] = field(default_factory=list)
 
     @classmethod
@@ -262,6 +263,7 @@ class MemoryConfig:
             embed_model=d.get("embed_model", "text-embedding-3-small"),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=float(d.get("semantic_dedup_threshold", 0.85)),
+            knowledge_filter=bool(d.get("knowledge_filter", False)),
             categories=categories,
         )
 

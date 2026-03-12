@@ -1266,8 +1266,8 @@ class MemUBridge:
                 self._metrics.end_op(op_id, success=True)
                 await self._audit("file_indexed", "resource", file_path, source)
 
-                # Fire-and-forget: filter out generic knowledge items
-                if response:
+                # Fire-and-forget: filter out generic knowledge items (opt-in)
+                if self.config.memory.knowledge_filter and response:
                     knowledge_items = [
                         item for item in response.get("items", [])
                         if item.get("memory_type") == "knowledge"

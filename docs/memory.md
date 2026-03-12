@@ -62,7 +62,7 @@ Knowledge extraction is filtered at three levels to prevent generic programming/
 
 1. **Custom extraction prompt** — The knowledge memory type uses custom rules (same mechanism as event date resolution) that instruct the LLM to only extract project-specific, environment-specific, or non-obvious knowledge. General CS/DevOps facts that any experienced engineer would know are explicitly forbidden.
 
-2. **Post-extraction relevance filter** — After memorize completes, newly created knowledge items are batch-evaluated by a fast model (Haiku). Items identified as generic knowledge are auto-deleted. Runs as fire-and-forget — doesn't block the memorize path.
+2. **Post-extraction relevance filter** (opt-in, `memory.knowledge_filter: true`) — After memorize completes, newly created knowledge items are batch-evaluated by a fast model (Haiku). Items identified as generic knowledge are auto-deleted. Disabled by default because it adds an extra API call per memorize and can be overly aggressive.
 
 3. **Semantic deduplication** — See below.
 

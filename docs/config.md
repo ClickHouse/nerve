@@ -98,6 +98,7 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 | `memory.fast_model` | string | `claude-haiku-4-5-20251001` | Model for categorization, date resolution, knowledge filtering |
 | `memory.embed_model` | string | `text-embedding-3-small` | Embedding model |
 | `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
+| `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
 | `memory.categories` | list | `[]` | Seed categories (name + description) |
 
 ## Auth
