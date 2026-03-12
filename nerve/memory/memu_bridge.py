@@ -416,6 +416,19 @@ class MemUBridge:
 
             sqlite_models._merge_models = patched_merge
 
+            # Fix 6: SQLiteStore._create_tables() calls SQLModel.metadata.create_all()
+            # on the GLOBAL metadata, which can include stale or conflicting table
+            # registrations (e.g. tables named "sqlite_*" that SQLite reserves).
+            # The memu tables use a scoped MetaData object, so the global call is
+            # unnecessary and can fail on fresh databases.  Patch it out.
+            from memu.database.sqlite.sqlite import SQLiteStore
+
+            def _safe_create_tables(self):
+                self._sqla_models.Base.metadata.create_all(self._sessions.engine)
+                logger.debug("SQLite tables created/verified (scoped metadata only)")
+
+            SQLiteStore._create_tables = _safe_create_tables
+
             # Fix 3: vector_search_items calls list_items() on every query,
             # re-reading and JSON-parsing all embeddings from SQLite (~2s for 3K items).
             # The items cache (self.items) is already kept in sync by create/update/delete,
