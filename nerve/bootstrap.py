@@ -156,6 +156,13 @@ class SetupChoices:
     telegram_bot_token: str = ""
     password: str = ""  # plaintext during wizard, hashed at write time
     enabled_crons: list[str] = field(default_factory=list)
+    # sync sources
+    github_sync: bool = False
+    gmail_sync: bool = False
+    gmail_accounts: list[str] = field(default_factory=list)
+    telegram_sync: bool = False
+    telegram_api_id: int = 0
+    telegram_api_hash: str = ""
     # worker-specific
     task_description: str = ""
 
@@ -191,6 +198,7 @@ class SetupWizard:
         if self.choices.mode == "personal":
             self._step_identity()
             self._step_channels()
+            self._step_sources()
             self._step_crons()
         else:
             self._step_task_spec()
@@ -538,6 +546,141 @@ class SetupWizard:
             click.secho("  → Skipping Telegram. You can set it up later in config.local.yaml.", dim=True)
         click.echo()
 
+    # --- Step: Sync Sources (personal only) ---
+
+    def _step_sources(self) -> None:
+        click.clear()
+        click.secho(self._next_step("Sync Sources"), fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Nerve can poll external services for new messages and act\n"
+            "on them — creating tasks, memorizing facts, sending you\n"
+            "notifications. Each source needs its own CLI tool.",
+            dim=True,
+        )
+        click.echo()
+
+        # --- GitHub ---
+        gh_available = bool(shutil.which("gh"))
+        click.secho("  ┌─" + "─" * 52 + "┐", dim=True)
+        click.secho(f"  │  {'GitHub Notifications':<52}│", bold=True)
+        click.secho("  │" + " " * 53 + "│", dim=True)
+        click.secho("  │  Syncs your GitHub notifications — PR reviews,   │", dim=True)
+        click.secho("  │  issue mentions, CI failures. Creates tasks for  │", dim=True)
+        click.secho("  │  things that need your attention.                │", dim=True)
+        click.secho("  │" + " " * 53 + "│", dim=True)
+        if gh_available:
+            click.secho("  │  Requires: gh CLI  ✓ found                      │", fg="green")
+        else:
+            click.secho("  │  Requires: gh CLI  ✗ not found                  │", fg="yellow")
+            click.secho("  │  Install: https://cli.github.com                │", fg="yellow")
+        click.secho("  └─" + "─" * 52 + "┘", dim=True)
+
+        if gh_available:
+            if click.confirm("  Enable GitHub sync?", default=True):
+                # Check if authenticated
+                import subprocess
+                result = subprocess.run(
+                    ["gh", "auth", "status"], capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    self.choices.github_sync = True
+                    click.secho("  ✓ GitHub sync enabled", fg="green")
+                else:
+                    click.secho("  gh is not authenticated. Run 'gh auth login' after setup.", fg="yellow")
+                    if click.confirm("  Enable anyway (configure auth later)?", default=True):
+                        self.choices.github_sync = True
+        else:
+            click.secho("  → Skipping — install gh CLI first.", dim=True)
+        click.echo()
+
+        # --- Gmail ---
+        gog_available = bool(shutil.which("gog"))
+        click.secho("  ┌─" + "─" * 52 + "┐", dim=True)
+        click.secho(f"  │  {'Gmail':<52}│", bold=True)
+        click.secho("  │" + " " * 53 + "│", dim=True)
+        click.secho("  │  Syncs your email — surfaces actionable messages │", dim=True)
+        click.secho("  │  and creates tasks. Ignores spam and newsletters.│", dim=True)
+        click.secho("  │" + " " * 53 + "│", dim=True)
+        if gog_available:
+            click.secho("  │  Requires: gog CLI  ✓ found                     │", fg="green")
+        else:
+            click.secho("  │  Requires: gog CLI  ✗ not found                 │", fg="yellow")
+            click.secho("  │  Install: https://github.com/steipete/gogcli    │", fg="yellow")
+        click.secho("  └─" + "─" * 52 + "┘", dim=True)
+
+        if gog_available:
+            if click.confirm("  Enable Gmail sync?", default=False):
+                accounts_str = click.prompt(
+                    "  Gmail account(s) (comma-separated)",
+                    default="",
+                )
+                if accounts_str.strip():
+                    self.choices.gmail_sync = True
+                    self.choices.gmail_accounts = [
+                        a.strip() for a in accounts_str.split(",") if a.strip()
+                    ]
+                    click.secho(f"  ✓ Gmail sync enabled ({len(self.choices.gmail_accounts)} account(s))", fg="green")
+                    click.secho(
+                        "  Note: run 'gog gmail setup <account>' for each account\n"
+                        "  after setup to complete OAuth authentication.",
+                        dim=True,
+                    )
+                else:
+                    click.secho("  → No accounts provided, skipping.", dim=True)
+        else:
+            click.secho("  → Skipping — install gog CLI first.", dim=True)
+        click.echo()
+
+        # --- Telegram Messages ---
+        click.secho("  ┌─" + "─" * 52 + "┐", dim=True)
+        click.secho(f"  │  {'Telegram Messages':<52}│", bold=True)
+        click.secho("  │" + " " * 53 + "│", dim=True)
+        click.secho("  │  Syncs messages from your Telegram chats and     │", dim=True)
+        click.secho("  │  groups. Separate from the bot — this reads your │", dim=True)
+        click.secho("  │  personal account via Telethon.                  │", dim=True)
+        click.secho("  │" + " " * 53 + "│", dim=True)
+        click.secho("  │  Requires: Telegram API credentials              │", fg="yellow")
+        click.secho("  │  Get them at: https://my.telegram.org/apps       │", fg="yellow")
+        click.secho("  └─" + "─" * 52 + "┘", dim=True)
+
+        if click.confirm("  Enable Telegram message sync?", default=False):
+            api_id_str = click.prompt("  API ID (from my.telegram.org)", default="")
+            api_hash = click.prompt("  API Hash", default="")
+            if api_id_str and api_hash:
+                try:
+                    self.choices.telegram_api_id = int(api_id_str)
+                    self.choices.telegram_api_hash = api_hash
+                    self.choices.telegram_sync = True
+                    click.secho("  ✓ Telegram sync configured", fg="green")
+                    click.secho(
+                        "  Note: run 'nerve setup-telegram' after setup to\n"
+                        "  complete the interactive authentication.",
+                        dim=True,
+                    )
+                except ValueError:
+                    click.secho("  Invalid API ID — must be a number. Skipping.", fg="yellow")
+            else:
+                click.secho("  → Missing credentials, skipping.", dim=True)
+        else:
+            click.secho("  → Skipping Telegram sync.", dim=True)
+        click.echo()
+
+        # Summary
+        sources_enabled = []
+        if self.choices.github_sync:
+            sources_enabled.append("GitHub")
+        if self.choices.gmail_sync:
+            sources_enabled.append("Gmail")
+        if self.choices.telegram_sync:
+            sources_enabled.append("Telegram")
+
+        if sources_enabled:
+            click.secho(f"  Sources: {', '.join(sources_enabled)}", fg="green")
+        else:
+            click.secho("  No sync sources enabled — you can add them later in config.yaml.", dim=True)
+        click.echo()
+
     # --- Step: System Crons (personal only) ---
 
     def _step_crons(self) -> None:
@@ -641,6 +784,16 @@ class SetupWizard:
 
         if self.choices.mode == "personal":
             click.secho(f"  │  Telegram:   {tg_status:<33}│")
+            # Sources summary
+            src_parts = []
+            if self.choices.github_sync:
+                src_parts.append("GitHub")
+            if self.choices.gmail_sync:
+                src_parts.append("Gmail")
+            if self.choices.telegram_sync:
+                src_parts.append("Telegram")
+            src_str = ", ".join(src_parts) if src_parts else "none"
+            click.secho(f"  │  Sources:    {src_str:<33}│")
             if self.choices.enabled_crons:
                 cron_str = ", ".join(self.choices.enabled_crons)
                 # Wrap if too long
@@ -778,9 +931,13 @@ class SetupWizard:
                 "stream_mode": "partial",
             }
             config["sync"] = {
-                "telegram": {"enabled": False},
-                "gmail": {"enabled": False, "accounts": []},
-                "github": {"enabled": False},
+                "telegram": {"enabled": self.choices.telegram_sync},
+                "gmail": {
+                    "enabled": self.choices.gmail_sync,
+                    "accounts": self.choices.gmail_accounts,
+                },
+                "github": {"enabled": self.choices.github_sync},
+                "github_events": {"enabled": self.choices.github_sync},
             }
 
         if self.choices.deployment == "docker":
@@ -807,6 +964,13 @@ class SetupWizard:
         if self.choices.telegram_bot_token:
             local["telegram"] = {
                 "bot_token": self.choices.telegram_bot_token,
+            }
+
+        # Sync credentials (secrets — go in local config)
+        if self.choices.telegram_sync and self.choices.telegram_api_id:
+            local.setdefault("sync", {})["telegram"] = {
+                "api_id": self.choices.telegram_api_id,
+                "api_hash": self.choices.telegram_api_hash,
             }
 
         # Auth: JWT secret + optional password hash
@@ -962,6 +1126,25 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")
     choices.telegram_bot_token = os.environ.get("NERVE_TELEGRAM_BOT_TOKEN", "")
     choices.password = os.environ.get("NERVE_PASSWORD", "")
+
+    # Sources — auto-detect from available CLIs
+    if choices.mode == "personal":
+        if shutil.which("gh"):
+            choices.github_sync = True
+        if shutil.which("gog"):
+            gmail_accounts = os.environ.get("NERVE_GMAIL_ACCOUNTS", "")
+            if gmail_accounts:
+                choices.gmail_sync = True
+                choices.gmail_accounts = [a.strip() for a in gmail_accounts.split(",") if a.strip()]
+        tg_api_id = os.environ.get("NERVE_TELEGRAM_API_ID", "")
+        tg_api_hash = os.environ.get("NERVE_TELEGRAM_API_HASH", "")
+        if tg_api_id and tg_api_hash:
+            try:
+                choices.telegram_api_id = int(tg_api_id)
+                choices.telegram_api_hash = tg_api_hash
+                choices.telegram_sync = True
+            except ValueError:
+                pass
 
     # In non-interactive personal mode, enable all productivity crons by default
     if choices.mode == "personal":
