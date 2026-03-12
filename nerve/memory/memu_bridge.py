@@ -676,7 +676,7 @@ class MemUBridge:
     async def initialize(self) -> bool:
         """Initialize the memU service with SQLite persistence."""
         try:
-            from memu import MemoryService
+            from memu.app.service import MemoryService
 
             self._check_memu_version()
 
