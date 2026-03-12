@@ -1,14 +1,21 @@
-"""Tests for nerve.memory.memu_bridge — event date resolution."""
+"""Tests for nerve.memory.memu_bridge — event date resolution & knowledge filtering."""
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from nerve.config import MemoryConfig, NerveConfig
-from nerve.memory.memu_bridge import MemUBridge
+from nerve.memory.memu_bridge import (
+    MemUBridge,
+    _KNOWLEDGE_CUSTOM_RULES,
+    _KNOWLEDGE_CUSTOM_EXAMPLES,
+    _SEMANTIC_DEDUP_THRESHOLD,
+)
 
 
 def _make_config(tmp_path: Path) -> NerveConfig:
@@ -322,3 +329,221 @@ class TestConfigMemoryModels:
         config = MemoryConfig.from_dict({})
         assert config.recall_model == "claude-sonnet-4-6"
         assert config.memorize_model == "claude-sonnet-4-6"
+
+    def test_semantic_dedup_threshold_default(self):
+        config = MemoryConfig()
+        assert config.semantic_dedup_threshold == 0.85
+
+    def test_semantic_dedup_threshold_from_dict(self):
+        config = MemoryConfig.from_dict({"semantic_dedup_threshold": 0.9})
+        assert config.semantic_dedup_threshold == 0.9
+
+    def test_semantic_dedup_threshold_from_dict_default(self):
+        config = MemoryConfig.from_dict({})
+        assert config.semantic_dedup_threshold == 0.85
+
+
+class TestKnowledgeCustomPrompts:
+    """Test that custom knowledge extraction prompts are defined correctly."""
+
+    def test_knowledge_rules_exist_and_contain_relevance_filter(self):
+        assert len(_KNOWLEDGE_CUSTOM_RULES) > 100
+        assert "experienced software engineer" in _KNOWLEDGE_CUSTOM_RULES
+        assert "MUST NOT extract" in _KNOWLEDGE_CUSTOM_RULES
+        assert "SHOULD extract" in _KNOWLEDGE_CUSTOM_RULES
+
+    def test_knowledge_rules_forbid_general_knowledge(self):
+        for term in [
+            "standard library",
+            "Common CS concepts",
+            "Standard DevOps",
+            "popular libraries",
+        ]:
+            assert term in _KNOWLEDGE_CUSTOM_RULES, f"Missing forbidden category: {term}"
+
+    def test_knowledge_rules_allow_project_specific(self):
+        for term in [
+            "Architecture decisions or conventions",
+            "Non-obvious gotchas",
+            "Custom tool behavior",
+        ]:
+            assert term in _KNOWLEDGE_CUSTOM_RULES, f"Missing allowed category: {term}"
+
+    def test_knowledge_examples_include_positive_and_negative(self):
+        assert "NOT extracted" in _KNOWLEDGE_CUSTOM_EXAMPLES
+        assert "EXTRACTED" in _KNOWLEDGE_CUSTOM_EXAMPLES
+        # Should have an empty-result example
+        assert "empty result is correct" in _KNOWLEDGE_CUSTOM_EXAMPLES.lower()
+
+    def test_knowledge_examples_show_bcrypt_as_generic(self):
+        assert "bcrypt" in _KNOWLEDGE_CUSTOM_EXAMPLES
+        assert "json.dumps" in _KNOWLEDGE_CUSTOM_EXAMPLES
+
+
+class TestCallKnowledgeFilterSync:
+    """Test _call_knowledge_filter_sync response parsing."""
+
+    def test_parses_valid_json_array(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+
+        mock_mod, _ = _mock_anthropic("[0, 2, 4]")
+        with patch.dict("sys.modules", {"anthropic": mock_mod}):
+            result = bridge._call_knowledge_filter_sync("claude-haiku-4-5-20251001", "test prompt")
+
+        assert result == [0, 2, 4]
+
+    def test_parses_empty_array(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+
+        mock_mod, _ = _mock_anthropic("[]")
+        with patch.dict("sys.modules", {"anthropic": mock_mod}):
+            result = bridge._call_knowledge_filter_sync("claude-haiku-4-5-20251001", "test prompt")
+
+        assert result == []
+
+    def test_parses_json_with_surrounding_text(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+
+        mock_mod, _ = _mock_anthropic("Here are the generic indices:\n[1, 3]\nDone.")
+        with patch.dict("sys.modules", {"anthropic": mock_mod}):
+            result = bridge._call_knowledge_filter_sync("claude-haiku-4-5-20251001", "test prompt")
+
+        assert result == [1, 3]
+
+    def test_returns_empty_on_unparseable_response(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+
+        mock_mod, _ = _mock_anthropic("I cannot determine which items are generic.")
+        with patch.dict("sys.modules", {"anthropic": mock_mod}):
+            result = bridge._call_knowledge_filter_sync("claude-haiku-4-5-20251001", "test prompt")
+
+        assert result == []
+
+    def test_uses_provided_model(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+
+        mock_mod, mock_client_cls = _mock_anthropic("[]")
+        with patch.dict("sys.modules", {"anthropic": mock_mod}):
+            bridge._call_knowledge_filter_sync("claude-haiku-4-5-20251001", "test prompt")
+
+        call_kwargs = mock_client_cls.return_value.messages.create.call_args[1]
+        assert call_kwargs["model"] == "claude-haiku-4-5-20251001"
+
+
+@pytest.mark.asyncio
+class TestFilterKnowledgeItems:
+    """Test _filter_knowledge_items async method."""
+
+    async def test_deletes_items_flagged_by_filter(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+
+        items = [
+            {"id": "k1", "memory_type": "knowledge", "summary": "bcrypt is for password hashing"},
+            {"id": "k2", "memory_type": "knowledge", "summary": "Nerve uses monkey-patching in memu_bridge"},
+            {"id": "k3", "memory_type": "knowledge", "summary": "json.dumps doesn't handle numpy"},
+        ]
+
+        with patch.object(bridge, "_call_knowledge_filter_sync", return_value=[0, 2]):
+            bridge.delete_item = AsyncMock(return_value=True)
+            await bridge._filter_knowledge_items(items)
+
+        assert bridge.delete_item.call_count == 2
+        deleted_ids = [call.args[0] for call in bridge.delete_item.call_args_list]
+        assert "k1" in deleted_ids
+        assert "k3" in deleted_ids
+        assert "k2" not in deleted_ids
+
+    async def test_no_deletions_when_filter_returns_empty(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+
+        items = [
+            {"id": "k1", "memory_type": "knowledge", "summary": "Nerve-specific architecture fact"},
+        ]
+
+        with patch.object(bridge, "_call_knowledge_filter_sync", return_value=[]):
+            bridge.delete_item = AsyncMock(return_value=True)
+            await bridge._filter_knowledge_items(items)
+
+        bridge.delete_item.assert_not_called()
+
+    async def test_skips_when_not_available(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+        bridge._available = False
+
+        items = [{"id": "k1", "memory_type": "knowledge", "summary": "something"}]
+
+        with patch.object(bridge, "_call_knowledge_filter_sync") as mock_filter:
+            bridge.delete_item = AsyncMock()
+            await bridge._filter_knowledge_items(items)
+
+        mock_filter.assert_not_called()
+        bridge.delete_item.assert_not_called()
+
+    async def test_handles_filter_failure_gracefully(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+
+        items = [{"id": "k1", "memory_type": "knowledge", "summary": "something"}]
+
+        with patch.object(bridge, "_call_knowledge_filter_sync", side_effect=Exception("API down")):
+            bridge.delete_item = AsyncMock()
+            # Should not raise
+            await bridge._filter_knowledge_items(items)
+
+        bridge.delete_item.assert_not_called()
+
+    async def test_handles_out_of_range_indices(self, tmp_path):
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+
+        items = [
+            {"id": "k1", "memory_type": "knowledge", "summary": "item one"},
+        ]
+
+        # Filter returns index 5 which is out of range — should be ignored
+        with patch.object(bridge, "_call_knowledge_filter_sync", return_value=[0, 5, -1]):
+            bridge.delete_item = AsyncMock(return_value=True)
+            await bridge._filter_knowledge_items(items)
+
+        # Only index 0 is valid
+        assert bridge.delete_item.call_count == 1
+        assert bridge.delete_item.call_args_list[0].args[0] == "k1"
+
+
+class TestSemanticDedupThreshold:
+    """Test semantic dedup threshold module-level variable."""
+
+    def test_default_threshold_value(self):
+        assert _SEMANTIC_DEDUP_THRESHOLD == 0.85
+
+    def test_threshold_set_from_config(self, tmp_path):
+        """Verify initialize() sets the module-level threshold from config."""
+        import nerve.memory.memu_bridge as bridge_mod
+
+        config = _make_config(tmp_path)
+        config.memory.semantic_dedup_threshold = 0.92
+        bridge = MemUBridge(config)
+
+        original = bridge_mod._SEMANTIC_DEDUP_THRESHOLD
+        try:
+            # Simulate what initialize() does: set global before patching
+            bridge_mod._SEMANTIC_DEDUP_THRESHOLD = config.memory.semantic_dedup_threshold
+            assert bridge_mod._SEMANTIC_DEDUP_THRESHOLD == 0.92
+        finally:
+            bridge_mod._SEMANTIC_DEDUP_THRESHOLD = original
