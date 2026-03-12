@@ -56,9 +56,25 @@ memory:
       description: "Personal tasks, errands, finances"
 ```
 
+### Knowledge Quality Filtering
+
+Knowledge extraction is filtered at three levels to prevent generic programming/CS facts from polluting memory:
+
+1. **Custom extraction prompt** — The knowledge memory type uses custom rules (same mechanism as event date resolution) that instruct the LLM to only extract project-specific, environment-specific, or non-obvious knowledge. General CS/DevOps facts that any experienced engineer would know are explicitly forbidden.
+
+2. **Post-extraction relevance filter** — After memorize completes, newly created knowledge items are batch-evaluated by a fast model (Haiku). Items identified as generic knowledge are auto-deleted. Runs as fire-and-forget — doesn't block the memorize path.
+
+3. **Semantic deduplication** — See below.
+
 ### Deduplication
 
-memU deduplicates via content hashing. When a new memory matches an existing one, instead of creating a duplicate it increments a `reinforcement_count` on the original. Reinforced items rank higher in search results (salience-aware ranking).
+memU deduplicates at two levels:
+
+1. **Content hash** — When a new memory's normalized text matches an existing one exactly, it increments `reinforcement_count` on the original instead of creating a duplicate.
+
+2. **Semantic similarity** — When no exact hash match exists, cosine similarity is checked against all items of the same memory type. If the top match exceeds the configured threshold (default 0.85), the existing item is reinforced instead of creating a near-duplicate. This prevents items saying the same thing with different wording from proliferating.
+
+Reinforced items rank higher in search results via salience-aware ranking: `similarity × log(reinforcement + 1) × recency_decay`.
 
 ### Configuration
 

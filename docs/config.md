@@ -93,8 +93,11 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `memory.chat_model` | string | `claude-sonnet-4-6` | Model for memU reasoning |
+| `memory.recall_model` | string | `claude-sonnet-4-6` | Model for recall routing |
+| `memory.memorize_model` | string | `claude-sonnet-4-6` | Model for extraction & preprocessing |
+| `memory.fast_model` | string | `claude-haiku-4-5-20251001` | Model for categorization, date resolution, knowledge filtering |
 | `memory.embed_model` | string | `text-embedding-3-small` | Embedding model |
+| `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
 | `memory.categories` | list | `[]` | Seed categories (name + description) |
 
 ## Auth

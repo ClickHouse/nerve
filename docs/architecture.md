@@ -90,6 +90,7 @@ Cursor-based data ingestion with agent processing:
 Dual-layer memory:
 - **File-based** — MEMORY.md, identity files (curated source of truth, loaded into system prompt)
 - **memU** — Semantic index over conversations and files (SQLite-persisted at `~/.nerve/memu.sqlite`)
+- **Knowledge quality filtering** — Custom extraction prompt + post-extraction Haiku filter + semantic deduplication prevent generic CS/DevOps facts from polluting memory
 - **Session rotation** — Main session rotates daily; conversations are indexed into memU on close
 - **Session resume** — SDK session IDs stored as dedicated DB columns; sessions resume with full context via `--resume` flag
 - **Session forking** — Fork conversations from any point; new session branches via SDK `fork_session=True`

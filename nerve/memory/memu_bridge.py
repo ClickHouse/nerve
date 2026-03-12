@@ -25,6 +25,9 @@ from nerve.config import NerveConfig
 
 logger = logging.getLogger(__name__)
 
+# Semantic dedup threshold — set from config at init time.
+_SEMANTIC_DEDUP_THRESHOLD = 0.85
+
 # ---------------------------------------------------------------------------
 # Custom event extraction prompt blocks
 # ---------------------------------------------------------------------------
@@ -109,6 +112,104 @@ Example 1: Event Information Extraction
 - "next weekend" and "last Saturday" are resolved to absolute dates using the conversation timestamp.
 - User's job, age, and cooking habits are stable traits, not events — excluded.
 - Only events explicitly stated by the user are extracted.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Custom knowledge extraction prompt blocks
+# ---------------------------------------------------------------------------
+# Override extraction rules to prevent storing generic programming/CS knowledge
+# that any LLM already knows. Only project-specific, environment-specific,
+# or non-obvious gotcha knowledge should be persisted.
+
+_KNOWLEDGE_CUSTOM_RULES = """
+# Rules
+## General requirements (must satisfy all)
+- Each memory item must be complete and self-contained, written as a declarative descriptive sentence.
+- Each memory item must express one single complete piece of information and be understandable without context.
+- Similar/redundant items must be merged into one, and assigned to only one category.
+- Each memory item must be < 50 words worth of length (keep it concise but include relevant details).
+- Focus on factual knowledge, concepts, definitions, and explanations.
+Important: Extract only knowledge directly stated or discussed in the conversation. No guesses or unsupported extensions.
+
+## Special rules for Knowledge Information
+- Personal opinions, subjective preferences, or personal experiences are forbidden in Knowledge Information.
+- User-specific traits, events, or behaviors are not knowledge items.
+
+## CRITICAL: Relevance filter
+Apply this test to EVERY candidate knowledge item:
+"If an experienced software engineer could answer this without access to the user's specific codebase, projects, or environment, it is NOT worth storing."
+
+MUST NOT extract (general knowledge):
+- Programming language features, syntax, or standard library behavior (e.g., how decorators work, json.dumps behavior, async/await)
+- Common CS concepts (hashing, caching, serialization, data structures, algorithms)
+- Well-known framework/library behavior (React hooks, FastAPI routing, SQLAlchemy sessions, Pydantic validation)
+- Standard DevOps/infrastructure facts (Docker networking, Linux permissions, nginx config, OOM killer behavior)
+- Common error patterns and their standard fixes (numpy truthiness checks, GIL limitations)
+- Widely documented API behavior of popular libraries
+
+SHOULD extract (project-specific knowledge):
+- Architecture decisions or conventions specific to the user's projects
+- Non-obvious gotchas discovered in the user's environment or toolchain
+- Custom tool behavior, internal API quirks, or undocumented behavior the user discovered
+- How two systems interact in the user's specific setup
+- Configuration or deployment details unique to the user's infrastructure
+
+## Forbidden content
+- General programming/CS/DevOps knowledge any experienced developer already knows
+- Opinions or subjective statements without factual basis
+- Personal experiences or events (these belong to event type)
+- User preferences or behavioral patterns (these belong to profile/behavior type)
+- Illegal / harmful sensitive topics
+
+## Review & validation rules
+- Merge similar items: keep only one and assign a single category.
+- Resolve conflicts: keep the latest / most certain item.
+- Final check: every item must pass the relevance filter above.
+- If no items pass the filter, return an empty result. An empty result is CORRECT and preferred over storing generic knowledge.
+"""
+
+_KNOWLEDGE_CUSTOM_EXAMPLES = """
+# Examples (Input / Output / Explanation)
+Example 1: Filtering generic vs. project-specific knowledge
+## Input
+[0] 2026-03-01T10:00:00 [user]: I need to hash passwords in my Flask app. Should I use bcrypt?
+[1] 2026-03-01T10:01:00 [assistant]: Yes, bcrypt is the standard choice for password hashing.
+[2] 2026-03-01T10:02:00 [user]: Got it. Also, I found that our Nerve deployment on the Pi has a weird issue where the first API call to Anthropic always hangs for 30+ seconds. Turns out it's an HTTP/2 negotiation problem with Cloudflare.
+[3] 2026-03-01T10:03:00 [assistant]: That's a known issue. You can work around it by sending a throwaway ping request at startup.
+[4] 2026-03-01T10:04:00 [user]: Yeah, we already do that in memu_bridge.py's initialize() method. Also, json.dumps doesn't handle numpy arrays, so we have to call .tolist() first.
+## Output
+<item>
+    <memory>
+        <content>On the Raspberry Pi, the first HTTP/2 request to Anthropic's API hangs for 30+ seconds due to a Cloudflare negotiation issue, requiring a warmup ping at startup</content>
+        <categories>
+            <category>Infrastructure</category>
+        </categories>
+    </memory>
+    <memory>
+        <content>Nerve's memu_bridge.py initialize() method sends a warmup ping to work around the Anthropic HTTP/2 hang on first connection</content>
+        <categories>
+            <category>Infrastructure</category>
+        </categories>
+    </memory>
+</item>
+## Explanation
+- "bcrypt is for password hashing" — general CS knowledge, any developer knows this. NOT extracted.
+- "json.dumps doesn't handle numpy" — standard Python knowledge, well documented. NOT extracted.
+- HTTP/2 hang on Pi — non-obvious, environment-specific gotcha. EXTRACTED.
+- memu_bridge.py warmup workaround — project-specific architecture knowledge. EXTRACTED.
+
+Example 2: Empty result is correct
+## Input
+[0] 2026-03-05T14:00:00 [user]: Can you explain how Python's GIL works?
+[1] 2026-03-05T14:01:00 [assistant]: The GIL is a mutex that allows only one thread to execute Python bytecodes at a time...
+[2] 2026-03-05T14:03:00 [user]: And asyncio vs threading?
+[3] 2026-03-05T14:04:00 [assistant]: asyncio uses cooperative multitasking via coroutines on a single thread...
+## Output
+<item>
+</item>
+## Explanation
+Python GIL and asyncio vs threading are standard CS knowledge. Nothing project-specific was discussed. An empty result is correct.
 """
 
 
@@ -460,6 +561,111 @@ class MemUBridge:
 
             logger.info("Patched embeddings to use numpy float32 (saves ~170 MB on 4K items)")
 
+            # Fix 7: Semantic deduplication in create_item_reinforce.
+            # The default dedup is content-hash only (exact text after normalization).
+            # This adds cosine similarity check against the in-memory item cache so
+            # items saying the same thing differently get reinforced instead of duplicated.
+            from memu.database.inmemory.repositories.memory_item_repo import InMemoryMemoryItemRepository
+
+            _original_sqlite_reinforce = SQLiteMemoryItemRepo.create_item_reinforce
+            _original_inmemory_reinforce = InMemoryMemoryItemRepository.create_item_reinforce
+
+            def _semantic_sqlite_reinforce(
+                self, *, resource_id, memory_type, summary, embedding, user_data,
+            ):
+                threshold = _SEMANTIC_DEDUP_THRESHOLD
+                if threshold > 0 and embedding is not None and self.items:
+                    corpus = [
+                        (iid, item.embedding)
+                        for iid, item in self.items.items()
+                        if item.memory_type == memory_type and item.embedding is not None
+                    ]
+                    if corpus:
+                        hits = cosine_topk(embedding, corpus, k=1)
+                        if hits and hits[0][1] >= threshold:
+                            match_id, score = hits[0]
+                            matched = self.items[match_id]
+                            logger.info(
+                                "Semantic dedup: reinforcing %s item %s (%.3f) instead of creating '%s'",
+                                memory_type, match_id, score, summary[:80],
+                            )
+                            # Update DB row
+                            from sqlmodel import select as _sel
+                            now = self._now()
+                            extra = dict(matched.extra or {})
+                            extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
+                            extra["last_reinforced_at"] = now.isoformat()
+                            with self._sessions.session() as session:
+                                row = session.exec(
+                                    _sel(self._memory_item_model).where(
+                                        self._memory_item_model.id == match_id
+                                    )
+                                ).first()
+                                if row:
+                                    row.extra = extra
+                                    row.updated_at = now
+                                    session.add(row)
+                                    session.commit()
+                            # Update in-memory cache
+                            matched.extra = extra
+                            matched.updated_at = now
+                            return matched
+
+                return _original_sqlite_reinforce(
+                    self,
+                    resource_id=resource_id,
+                    memory_type=memory_type,
+                    summary=summary,
+                    embedding=embedding,
+                    user_data=user_data,
+                )
+
+            SQLiteMemoryItemRepo.create_item_reinforce = _semantic_sqlite_reinforce
+
+            def _semantic_inmemory_reinforce(
+                self, *, resource_id, memory_type, summary, embedding, user_data, reinforce=False,
+            ):
+                threshold = _SEMANTIC_DEDUP_THRESHOLD
+                if threshold > 0 and embedding is not None and self.items:
+                    corpus = [
+                        (iid, item.embedding)
+                        for iid, item in self.items.items()
+                        if item.memory_type == memory_type and item.embedding is not None
+                    ]
+                    if corpus:
+                        hits = cosine_topk(embedding, corpus, k=1)
+                        if hits and hits[0][1] >= threshold:
+                            match_id, score = hits[0]
+                            matched = self.items[match_id]
+                            logger.info(
+                                "Semantic dedup: reinforcing %s item %s (%.3f) instead of creating '%s'",
+                                memory_type, match_id, score, summary[:80],
+                            )
+                            import pendulum as _pend
+                            extra = dict(matched.extra or {})
+                            extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
+                            extra["last_reinforced_at"] = _pend.now("UTC").isoformat()
+                            matched.extra = extra
+                            matched.updated_at = _pend.now("UTC")
+                            return matched
+
+                return _original_inmemory_reinforce(
+                    self,
+                    resource_id=resource_id,
+                    memory_type=memory_type,
+                    summary=summary,
+                    embedding=embedding,
+                    user_data=user_data,
+                    reinforce=reinforce,
+                )
+
+            InMemoryMemoryItemRepository.create_item_reinforce = _semantic_inmemory_reinforce
+
+            logger.info(
+                "Patched create_item_reinforce with semantic dedup (threshold=%.2f)",
+                _SEMANTIC_DEDUP_THRESHOLD,
+            )
+
         except Exception as e:
             logger.error(
                 "memU monkey-patching failed (expected memu-py==%s): %s. "
@@ -473,6 +679,11 @@ class MemUBridge:
             from memu import MemoryService
 
             self._check_memu_version()
+
+            # Set semantic dedup threshold from config before patches run.
+            global _SEMANTIC_DEDUP_THRESHOLD
+            _SEMANTIC_DEDUP_THRESHOLD = self.config.memory.semantic_dedup_threshold
+
             self._patch_sqlite_bugs()
 
             sqlite_dsn = self.config.memory.sqlite_dsn
@@ -540,6 +751,10 @@ class MemUBridge:
                         "event": {
                             "rules": {"ordinal": 30, "prompt": _EVENT_CUSTOM_RULES},
                             "examples": {"ordinal": 60, "prompt": _EVENT_CUSTOM_EXAMPLES},
+                        },
+                        "knowledge": {
+                            "rules": {"ordinal": 30, "prompt": _KNOWLEDGE_CUSTOM_RULES},
+                            "examples": {"ordinal": 60, "prompt": _KNOWLEDGE_CUSTOM_EXAMPLES},
                         },
                     },
                 },
@@ -925,7 +1140,7 @@ class MemUBridge:
                 )
                 t0 = time.monotonic()
 
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     self._service.memorize(
                         resource_url=file_path,
                         modality=modality,
@@ -937,6 +1152,19 @@ class MemUBridge:
                 logger.info("Indexed file: %s (%.1fs)", file_path, elapsed)
                 self._metrics.end_op(op_id, success=True)
                 await self._audit("file_indexed", "resource", file_path, source)
+
+                # Fire-and-forget: filter out generic knowledge items
+                if response:
+                    knowledge_items = [
+                        item for item in response.get("items", [])
+                        if item.get("memory_type") == "knowledge"
+                    ]
+                    if knowledge_items:
+                        asyncio.create_task(
+                            self._filter_knowledge_items(knowledge_items),
+                            name=f"filter-knowledge-{Path(file_path).name}",
+                        )
+
                 self._release_memory()
                 return True
 
@@ -1226,6 +1454,105 @@ class MemUBridge:
             logger.warning("Failed to parse LLM date resolution response: %s", e)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Post-extraction knowledge relevance filter
+    # ------------------------------------------------------------------
+
+    async def _filter_knowledge_items(self, items: list[dict[str, Any]]) -> None:
+        """Post-extraction filter: delete generic knowledge items using Haiku.
+
+        Runs as fire-and-forget after memorize() completes.  Items that any
+        experienced software engineer would know without project context are
+        deleted from the database.
+        """
+        if not items or not self._available or not self._service:
+            return
+
+        try:
+            model = self.config.memory.fast_model or self.config.memory.recall_model
+
+            items_text = "\n".join(
+                f"{i}. {item.get('summary', '')}"
+                for i, item in enumerate(items)
+            )
+
+            prompt = (
+                "You are a memory quality filter. Review these knowledge items extracted "
+                "from a conversation and stored in a personal memory system.\n\n"
+                "Identify items that are GENERIC knowledge — facts any experienced software "
+                "engineer would know without access to this user's specific projects or environment.\n\n"
+                "GENERIC (delete):\n"
+                "- Standard programming language features, syntax, standard library behavior\n"
+                "- Common CS concepts (hashing, caching, data structures, algorithms)\n"
+                "- Well-known framework/library behavior\n"
+                "- Standard DevOps facts (Docker, Linux, nginx basics)\n"
+                "- Widely documented API behavior of popular libraries\n\n"
+                "KEEP:\n"
+                "- Project-specific architecture decisions or conventions\n"
+                "- Non-obvious gotchas specific to this user's environment\n"
+                "- Custom tool behavior, internal API quirks\n"
+                "- Integration-specific knowledge unique to the user's setup\n\n"
+                f"Items:\n{items_text}\n\n"
+                "Return ONLY a JSON array of 0-based indices of GENERIC items to delete.\n"
+                "Example: [0, 2, 5]\n"
+                "If all items are worth keeping, return: []\n"
+                "Return ONLY the JSON array, nothing else."
+            )
+
+            loop = asyncio.get_running_loop()
+            indices = await loop.run_in_executor(
+                self._blocking_pool,
+                self._call_knowledge_filter_sync,
+                model,
+                prompt,
+            )
+
+            deleted = 0
+            for idx in indices:
+                if 0 <= idx < len(items):
+                    item_id = items[idx].get("id", "")
+                    if item_id:
+                        try:
+                            await self.delete_item(item_id, source="knowledge_filter")
+                            deleted += 1
+                            logger.debug(
+                                "Knowledge filter: deleted generic item %s: %s",
+                                item_id, items[idx].get("summary", "")[:80],
+                            )
+                        except Exception as e:
+                            logger.warning("Knowledge filter: failed to delete %s: %s", item_id, e)
+
+            if deleted:
+                logger.info(
+                    "Knowledge filter: deleted %d/%d generic items", deleted, len(items),
+                )
+
+        except Exception as e:
+            logger.warning("Knowledge filter failed (non-fatal): %s", e)
+
+    def _call_knowledge_filter_sync(self, model: str, prompt: str) -> list[int]:
+        """Synchronous Haiku call for knowledge filtering (runs in thread pool)."""
+        import re as _re
+
+        client = self._get_anthropic_client()
+        response = client.messages.create(
+            model=model,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        try:
+            text = response.content[0].text
+            json_match = _re.search(r"\[.*?\]", text, _re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                if isinstance(parsed, list):
+                    return [int(x) for x in parsed if isinstance(x, (int, float))]
+        except Exception as e:
+            logger.warning("Failed to parse knowledge filter response: %s", e)
+
+        return []
 
     async def recall(self, query: str, limit: int = 10) -> list[dict[str, str]]:
         """Recall relevant memories via semantic search.

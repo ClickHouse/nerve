@@ -247,6 +247,7 @@ class MemoryConfig:
     fast_model: str = "claude-haiku-4-5-20251001"  # Category summaries, date resolution
     embed_model: str = "text-embedding-3-small"
     sqlite_dsn: str = ""
+    semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     categories: list[MemoryCategoryConfig] = field(default_factory=list)
 
     @classmethod
@@ -260,6 +261,7 @@ class MemoryConfig:
             fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
             embed_model=d.get("embed_model", "text-embedding-3-small"),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
+            semantic_dedup_threshold=float(d.get("semantic_dedup_threshold", 0.85)),
             categories=categories,
         )
 
