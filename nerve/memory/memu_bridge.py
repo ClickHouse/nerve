@@ -831,10 +831,9 @@ class MemUBridge:
                             "rules": {"ordinal": 30, "prompt": _EVENT_CUSTOM_RULES},
                             "examples": {"ordinal": 60, "prompt": _EVENT_CUSTOM_EXAMPLES},
                         },
-                        "knowledge": {
-                            "rules": {"ordinal": 30, "prompt": _KNOWLEDGE_CUSTOM_RULES},
-                            "examples": {"ordinal": 60, "prompt": _KNOWLEDGE_CUSTOM_EXAMPLES},
-                        },
+                        # Knowledge prompt override disabled — needs tuning to avoid
+                        # rejecting project-specific assistant-reported knowledge.
+                        # See _KNOWLEDGE_CUSTOM_RULES / _KNOWLEDGE_CUSTOM_EXAMPLES.
                     },
                 },
                 retrieve_config={
