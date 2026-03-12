@@ -151,7 +151,7 @@ class TestDeploymentPersistence:
         assert config["deployment"] == "server"
 
     def test_docker_deployment_in_config(self, tmp_path: Path) -> None:
-        """Docker deployment should be written to config.yaml."""
+        """Docker deployment should be written to config.yaml with docker section."""
         import yaml
         from nerve.bootstrap import SetupWizard
 
@@ -164,3 +164,5 @@ class TestDeploymentPersistence:
 
         config = yaml.safe_load((tmp_path / "config.yaml").read_text())
         assert config["deployment"] == "docker"
+        assert "docker" in config
+        assert config["docker"]["extra_mounts"] == []

@@ -326,9 +326,14 @@ class SetupWizard:
 
     def _ensure_docker_files(self) -> None:
         """Generate Dockerfile, docker-compose.yml, entrypoint, and .dockerignore."""
+        # docker-compose.yml is generated dynamically (host paths, extra mounts)
+        compose_content = _build_docker_compose(
+            workspace_path=str(self.choices.workspace_path),
+        )
+
         files = {
             "Dockerfile": _DOCKERFILE_TEMPLATE,
-            "docker-compose.yml": _DOCKER_COMPOSE_TEMPLATE,
+            "docker-compose.yml": compose_content,
             "docker-entrypoint.sh": _DOCKER_ENTRYPOINT_TEMPLATE,
             ".dockerignore": _DOCKERIGNORE_TEMPLATE,
         }
@@ -778,6 +783,11 @@ class SetupWizard:
                 "github": {"enabled": False},
             }
 
+        if self.choices.deployment == "docker":
+            config["docker"] = {
+                "extra_mounts": [],  # e.g. ["~/code:/code", "~/projects:/projects"]
+            }
+
         config_path = self.config_dir / "config.yaml"
         with open(config_path, "w") as f:
             f.write("# Nerve — Configuration\n")
@@ -1036,26 +1046,40 @@ RUN chmod +x /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
 """
 
-_DOCKER_COMPOSE_TEMPLATE = """
-services:
+def _build_docker_compose(
+    workspace_path: str = "~/nerve-workspace",
+    extra_mounts: list[str] | None = None,
+) -> str:
+    """Build docker-compose.yml content with host bind-mounts.
+
+    Args:
+        workspace_path: Host path for the workspace (e.g. ~/nerve-workspace).
+        extra_mounts: Additional host:container mount pairs (e.g. ["~/code:/code"]).
+    """
+    volumes = [
+        ".:/nerve",
+        "~/.nerve:/root/.nerve",
+        f"{workspace_path}:/root/nerve-workspace",
+    ]
+    if extra_mounts:
+        volumes.extend(extra_mounts)
+
+    # Build YAML by hand to keep formatting clean
+    vol_lines = "\n".join(f"      - {v}" for v in volumes)
+
+    return f"""services:
   nerve:
     build: .
     ports:
       - "8900:8900"
     volumes:
-      - .:/nerve
-      - nerve-data:/root/.nerve
-      - nerve-workspace:/root/nerve-workspace
+{vol_lines}
     restart: unless-stopped
     stdin_open: true
     tty: true
     env_file:
       - path: .env
         required: false
-
-volumes:
-  nerve-data:
-  nerve-workspace:
 """
 
 _DOCKER_ENTRYPOINT_TEMPLATE = """#!/bin/bash

@@ -17,7 +17,7 @@ from nerve.bootstrap import (
     is_fresh_install,
     run_non_interactive,
     _DOCKERFILE_TEMPLATE,
-    _DOCKER_COMPOSE_TEMPLATE,
+    _build_docker_compose,
     _DOCKER_ENTRYPOINT_TEMPLATE,
     _DOCKERIGNORE_TEMPLATE,
 )
@@ -326,7 +326,10 @@ class TestEnsureDockerFiles:
         assert "services" in compose
         assert "nerve" in compose["services"]
         assert "8900:8900" in compose["services"]["nerve"]["ports"]
-        assert "volumes" in compose
+        # Verify bind-mounts (not named volumes)
+        volumes = compose["services"]["nerve"]["volumes"]
+        assert ".:/nerve" in volumes
+        assert "~/.nerve:/root/.nerve" in volumes
 
     def test_entrypoint_executable(self, tmp_path: Path) -> None:
         """docker-entrypoint.sh should be executable."""
@@ -454,10 +457,31 @@ class TestDockerTemplateIntegrity:
         assert len(_DOCKERFILE_TEMPLATE.strip()) > 100
 
     def test_compose_valid_yaml(self) -> None:
-        """docker-compose.yml template should be valid YAML."""
-        parsed = yaml.safe_load(_DOCKER_COMPOSE_TEMPLATE)
+        """_build_docker_compose() should produce valid YAML."""
+        parsed = yaml.safe_load(_build_docker_compose())
         assert "services" in parsed
         assert "nerve" in parsed["services"]
+
+    def test_compose_bind_mounts(self) -> None:
+        """Compose should use host bind-mounts, not named volumes."""
+        content = _build_docker_compose(workspace_path="~/my-workspace")
+        parsed = yaml.safe_load(content)
+        volumes = parsed["services"]["nerve"]["volumes"]
+        assert ".:/nerve" in volumes
+        assert "~/.nerve:/root/.nerve" in volumes
+        assert "~/my-workspace:/root/nerve-workspace" in volumes
+        # No named volumes section
+        assert "volumes" not in parsed or parsed.get("volumes") is None
+
+    def test_compose_extra_mounts(self) -> None:
+        """Extra mounts should appear in the volumes list."""
+        content = _build_docker_compose(
+            extra_mounts=["~/code:/code", "~/data:/data"],
+        )
+        parsed = yaml.safe_load(content)
+        volumes = parsed["services"]["nerve"]["volumes"]
+        assert "~/code:/code" in volumes
+        assert "~/data:/data" in volumes
 
     def test_entrypoint_is_bash(self) -> None:
         """Entrypoint should start with bash shebang."""

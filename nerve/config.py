@@ -337,6 +337,19 @@ class ChannelsConfig:
 
 
 @dataclass
+class DockerConfig:
+    """Docker deployment settings."""
+
+    extra_mounts: list[str] = field(default_factory=list)  # e.g. ["~/code:/code"]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> DockerConfig:
+        return cls(
+            extra_mounts=d.get("extra_mounts", []),
+        )
+
+
+@dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
     timezone: str = "America/New_York"
@@ -353,6 +366,7 @@ class NerveConfig:
     auth: AuthConfig = field(default_factory=AuthConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    docker: DockerConfig = field(default_factory=DockerConfig)
 
     # API keys (from config.local.yaml)
     anthropic_api_key: str = ""
@@ -377,6 +391,7 @@ class NerveConfig:
             auth=AuthConfig.from_dict(d.get("auth", {})),
             channels=ChannelsConfig.from_dict(d.get("channels", {})),
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
+            docker=DockerConfig.from_dict(d.get("docker", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
