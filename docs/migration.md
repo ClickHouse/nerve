@@ -1,5 +1,7 @@
 # Migration from OpenClaw
 
+> **Legacy guide.** This is for users migrating from OpenClaw (the predecessor project). New installations should start with `nerve init` — see the [Setup Guide](setup.md).
+
 ## Overview
 
 Nerve replaces OpenClaw. This guide covers migrating workspace files, cron jobs, tasks, and memory from the existing OpenClaw setup.

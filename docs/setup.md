@@ -5,7 +5,7 @@
 The fastest way to get Nerve running:
 
 ```bash
-git clone <repo-url> nerve
+git clone https://github.com/pufitdev/nerve.git nerve
 cd nerve
 pip install -e .       # or: uv pip install -e .
 cd web && npm install && npm run build && cd ..
@@ -31,7 +31,7 @@ The `nerve init` wizard walks you through deployment, mode selection, API keys, 
 ### Option A: Server (bare metal)
 
 ```bash
-git clone <repo-url> nerve
+git clone https://github.com/pufitdev/nerve.git nerve
 cd nerve
 
 # Create virtual environment
@@ -51,7 +51,7 @@ nerve init
 ### Option B: Docker
 
 ```bash
-git clone <repo-url> nerve
+git clone https://github.com/pufitdev/nerve.git nerve
 cd nerve
 pip install -e .   # Needed to run the wizard on the host
 nerve init         # Choose "docker" at the deployment step
@@ -93,6 +93,35 @@ Set `NERVE_USE_PROXY=1` in your environment (no `ANTHROPIC_API_KEY` required). T
 | `.:/nerve` | Application code (bind mount) |
 | `nerve-data:/root/.nerve` | Databases, logs, PID, sessions |
 | `nerve-workspace:/root/nerve-workspace` | Workspace files (SOUL.md, tasks, skills) |
+
+## Re-running `nerve init`
+
+You can re-run `nerve init` at any time — it's safe on existing installations.
+
+**What gets overwritten:**
+- `config.yaml` and `config.local.yaml` — regenerated from your choices
+- `~/.nerve/cron/system.yaml` — regenerated (picks up new built-in cron prompts from Nerve updates)
+
+**What's preserved:**
+- All workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, skills, tasks, etc.)
+- `~/.nerve/cron/jobs.yaml` — your custom crons are never touched
+- `~/.nerve/nerve.db` and `~/.nerve/memu.sqlite` — databases are preserved
+
+When you run `nerve init` on an existing install, it prompts: *"Nerve is already configured. Re-run setup?"* The `--if-needed` flag skips setup entirely if already configured (useful in Docker entrypoints).
+
+## Docker Credential Forwarding
+
+When deploying via Docker, `nerve init` needs to pass authentication credentials from the host into the container. It resolves credentials using a priority waterfall:
+
+1. **macOS Keychain — `Claude Code-credentials`** — extracts OAuth access token from the JSON stored by Claude Code
+2. **macOS Keychain — `Claude Code`** — raw API key
+3. **`CLAUDE_CODE_OAUTH_TOKEN` env var**
+4. **`~/.claude/.credentials.json` file** — where Linux stores Claude credentials
+5. **`ANTHROPIC_API_KEY` env var**
+
+The first match wins. The extracted credential is passed to `docker compose run` as an environment variable, then written into `config.local.yaml` inside the container during setup.
+
+> **Note:** The `~/.claude` directory is NOT mounted into the container. Instead, credentials are resolved on the host and injected via environment variables. This avoids file permission issues and macOS Keychain access from within Docker.
 
 ## Manual Configuration
 

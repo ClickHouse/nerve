@@ -12,6 +12,9 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 |-----|------|---------|-------------|
 | `workspace` | path | `~/nerve-workspace` | Path to workspace directory |
 | `timezone` | string | `America/New_York` | Local timezone for scheduling |
+| `deployment` | string | `server` | `server` (bare metal) or `docker`. Set during `nerve init`; determines whether CLI commands run directly or proxy to `docker compose`. |
+
+> **Note:** The _mode_ (personal vs worker) is not a config field — it's determined at `nerve init` time and expressed through which workspace templates, cron jobs, and memory categories are active. There's no `mode` key in config.
 
 ## Agent
 
@@ -99,7 +102,17 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 | `memory.embed_model` | string | `text-embedding-3-small` | Embedding model |
 | `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
-| `memory.categories` | list | `[]` | Seed categories (name + description) |
+| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). |
+
+## Docker
+
+Configuration for Docker deployment. Only relevant when `deployment: docker`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `docker.extra_mounts` | list[string] | `[]` | Additional host:container mount pairs to add to `docker-compose.yml`. Example: `["~/code:/code", "~/projects:/projects"]` |
+
+The core Docker mounts (source code, `~/.nerve`, workspace) are always included. GitHub CLI (`~/.config/gh`) and Gmail CLI (`~/.config/gog`) auth directories are mounted automatically if they exist on the host.
 
 ## Auth
 

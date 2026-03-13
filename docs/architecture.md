@@ -5,23 +5,43 @@
 Nerve is a single-process Python application that serves as a personal AI assistant. All components run within one process using async Python (asyncio).
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    nerve (Python)                     │
-│                                                       │
-│  ┌─────────┐  ┌──────────┐  ┌────────┐  ┌────────┐  │
-│  │ Gateway  │  │  Agent   │  │Sources │  │  Cron  │  │
-│  │ (FastAPI)│──│  Engine  │  │ Layer  │  │ Service│  │
-│  │ WS + HTTP│  │ (Claude) │  │(cursor)│  │        │  │
-│  └────┬─────┘  └────┬─────┘  └────┬───┘  └───┬────┘  │
-│       │              │             │           │       │
-│  ┌────┴──────────────┴─────────────┴───────────┴──┐   │
-│  │              SQLite + File Store                │   │
-│  │  sessions, tasks, sync state │ markdown memory  │   │
-│  └────────────────────────────────────────────────┘   │
-│                                                       │
-│  Interfaces:  Telegram Bot  │  React Web UI           │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                      nerve (Python)                       │
+│                                                           │
+│  ┌─────────┐  ┌──────────┐  ┌────────┐  ┌────────┐      │
+│  │ Gateway  │  │  Agent   │  │Sources │  │  Cron  │      │
+│  │ (FastAPI)│──│  Engine  │  │ Layer  │  │ Service│      │
+│  │ WS + HTTP│  │ (Claude) │  │(cursor)│  │        │      │
+│  └────┬─────┘  └────┬─────┘  └────┬───┘  └───┬────┘      │
+│       │              │             │           │          │
+│  ┌────┴──────────────┴─────────────┴───────────┴──┐      │
+│  │              SQLite + File Store                │      │
+│  │  sessions, tasks, sync state │ markdown memory  │      │
+│  └────────────────────────────────────────────────┘      │
+│                                                           │
+│  Interfaces:  Telegram Bot  │  React Web UI              │
+│                                                           │
+│  Optional:  CLIProxyAPI (OAuth proxy, no API key needed) │
+└──────────────────────────────────────────────────────────┘
 ```
+
+## Modes
+
+Nerve supports two modes, selected during `nerve init`:
+
+**Personal** — a full-featured assistant for one human. Ships with sync sources (Telegram, Gmail, GitHub), life-oriented memory categories, identity files (`IDENTITY.md`, `USER.md`), and the inbox-processor cron. The agent develops personality over time.
+
+**Worker** — a task-focused autonomous agent. Ships with operational memory categories, a `TASK.md` mission brief, no sync sources, and a self-configuring onboarding flow. Operates in a plan-approve-execute loop.
+
+Mode affects which workspace templates are generated, which cron jobs are enabled, and which memory categories are seeded — but the underlying engine is identical. Both modes run the same agent, tools, and infrastructure.
+
+## Deployment
+
+Two deployment options:
+
+**Server (bare metal)** — Nerve runs directly as a Python process. Uses `nerve start` for daemon management, `nerve stop` / `nerve restart` for lifecycle.
+
+**Docker** — `nerve init` generates `Dockerfile`, `docker-compose.yml`, and `docker-entrypoint.sh`. The code is bind-mounted (editable), while databases and workspace are in named volumes. CLI commands (`nerve start`, `nerve logs`, etc.) automatically proxy to `docker compose` when `deployment: docker` is set in config. Credentials are resolved from the host (macOS Keychain, env vars, credential files) and injected into the container — `~/.claude` is NOT mounted.
 
 ## Components
 
@@ -108,6 +128,13 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
 
+### Proxy (`nerve/proxy/`)
+Optional local HTTP proxy that routes Anthropic API calls through Claude Code's OAuth authentication:
+- Eliminates the need for a direct Anthropic API key
+- Uses [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) binary (auto-downloaded on first start)
+- OAuth tokens refreshed automatically
+- Configured via `proxy.*` settings in config — see [config.md](config.md#proxy-cliproxyapi)
+
 ### Tasks (`nerve/tasks/`)
 Markdown + SQLite task system:
 - Task files in `workspace/memory/tasks/`
@@ -161,6 +188,18 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 - `memu_memory_items` — Extracted facts with embeddings
 - `memu_memory_categories` — Topic categories with rolling summaries
 - `memu_category_items` — Category-item links
+
+## Startup Sequence
+
+1. Load config (`config.yaml` + `config.local.yaml` deep merge)
+2. Run database migrations (auto-migrate SQLite schema)
+3. Initialize memory system (memU SQLite, load categories)
+4. Start CLIProxyAPI proxy if enabled (download binary if missing, authenticate, start subprocess)
+5. Recover orphan sessions (active in DB but no live client → idle or stopped)
+6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs)
+7. Start gateway (FastAPI + uvicorn, WebSocket, static files)
+8. Start Telegram bot if configured
+9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session
 
 ## Security
 

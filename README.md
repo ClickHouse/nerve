@@ -9,6 +9,7 @@
     <a href="docs/setup.md">Setup Guide</a> ·
     <a href="docs/architecture.md">Architecture</a> ·
     <a href="docs/config.md">Configuration</a> ·
+    <a href="docs/worker-guide.md">Worker Guide</a> ·
     <a href="docs/api.md">API Reference</a>
   </p>
 </p>
@@ -264,15 +265,16 @@ See [docs/config.md](docs/config.md) for all options.
 
 | Doc | Description |
 |-----|-------------|
-| [Architecture](docs/architecture.md) | System overview, data flow, module responsibilities |
-| [Setup](docs/setup.md) | Installation, config, HTTPS, systemd, first run |
+| [Architecture](docs/architecture.md) | System overview, modes, deployment, data flow |
+| [Setup](docs/setup.md) | Installation, config, Docker, HTTPS, systemd |
 | [Config](docs/config.md) | All config options with descriptions and defaults |
+| [Worker Guide](docs/worker-guide.md) | Worker mode setup, onboarding, plan-approve loop |
 | [API Reference](docs/api.md) | REST API and WebSocket protocol |
 | [SDK Sessions](docs/sdk-sessions.md) | Session lifecycle, resume, forking |
 | [Sources](docs/sources.md) | Sync engine, cursors, consumer model |
 | [Tasks](docs/tasks.md) | Task file format, escalation rules |
 | [Memory](docs/memory.md) | Memory file conventions, memU integration |
-| [Cron](docs/cron.md) | Job format, session modes, source runners |
+| [Cron](docs/cron.md) | Job format, session modes, built-in crons |
 | [Plans](docs/plans.md) | Plan proposal, approval, and implementation workflow |
 | [Web UI](docs/web-ui.md) | Frontend architecture, building, development |
 
