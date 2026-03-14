@@ -114,6 +114,45 @@ Configuration for Docker deployment. Only relevant when `deployment: docker`.
 
 The core Docker mounts (source code, `~/.nerve`, workspace) are always included. GitHub CLI (`~/.config/gh`) and Gmail CLI (`~/.config/gog`) auth directories are mounted automatically if they exist on the host.
 
+## MCP Servers
+
+External MCP servers can be added via config without code changes or restarts. The agent picks up new servers on the next session creation, or immediately via the "Reload" button in the UI / `mcp_reload` tool.
+
+Config uses a **dict format** so `_deep_merge` correctly overlays secrets from `config.local.yaml`:
+
+```yaml
+# config.yaml — server definitions
+mcp_servers:
+  filesystem:
+    type: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+
+  remote-api:
+    type: http
+    url: https://mcp.example.com/v1
+```
+
+```yaml
+# config.local.yaml — secrets merge on top
+mcp_servers:
+  remote-api:
+    headers:
+      Authorization: "Bearer sk-secret-token"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mcp_servers.<name>.type` | string | `stdio` | Transport: `stdio`, `sse`, or `http` |
+| `mcp_servers.<name>.enabled` | bool | `true` | Enable/disable this server |
+| `mcp_servers.<name>.command` | string | - | Command to run (stdio only) |
+| `mcp_servers.<name>.args` | list | `[]` | Command arguments (stdio only) |
+| `mcp_servers.<name>.env` | dict | `{}` | Environment variables (stdio only) |
+| `mcp_servers.<name>.url` | string | - | Server URL (sse/http only) |
+| `mcp_servers.<name>.headers` | dict | `{}` | HTTP headers (sse/http only) |
+
+The built-in `nerve` server (SDK type, in-process) is always present and cannot be overridden.
+
 ## Auth
 
 | Key | Type | Default | Description |

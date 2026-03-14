@@ -1592,7 +1592,106 @@ async def _ask_user_impl(args: dict, session_id: str) -> dict:
         return {"content": [{"type": "text", "text": f"Failed to ask question: {e}"}]}
 
 
-# Module-level tool definitions — used only for ALL_TOOLS reference (allowed_tools list).
+_nerve_asgi_app = None  # Cached mini FastAPI app for in-process API calls
+
+
+def _get_nerve_asgi_app():
+    """Get (or lazily create) a minimal FastAPI app wired to the real router.
+
+    Reuses the same route handlers and their already-initialized globals
+    (_engine, _db) — no duplication, no manual endpoint mirroring.
+    """
+    global _nerve_asgi_app
+    if _nerve_asgi_app is None:
+        from fastapi import FastAPI
+        from nerve.gateway.routes import router as api_router
+        _nerve_asgi_app = FastAPI()
+        _nerve_asgi_app.include_router(api_router)
+    return _nerve_asgi_app
+
+
+@tool(
+    "nerve_api",
+    "Query the Nerve API directly (in-process, no HTTP). "
+    "Use to inspect server state: sessions, MCP servers, diagnostics, cron jobs, skills, notifications, etc. "
+    "Returns JSON data from internal DB queries.",
+    {
+        "endpoint": {
+            "type": "string",
+            "description": "API endpoint path, e.g. 'sessions', 'mcp-servers/nerve', 'plans?status=pending'",
+        },
+    },
+)
+async def nerve_api(args: dict) -> dict:
+    """Query Nerve API via in-process ASGI transport — no HTTP round-trip."""
+    import httpx
+
+    endpoint = args.get("endpoint", "").strip().strip("/")
+    if not endpoint:
+        return {"content": [{"type": "text", "text": "Missing 'endpoint' parameter."}]}
+
+    try:
+        app = _get_nerve_asgi_app()
+
+        # Generate an internal auth token
+        from nerve.gateway.auth import create_token
+        from nerve.config import get_config
+        config = get_config()
+        headers = {}
+        if config.auth.jwt_secret:
+            token = create_token(config.auth.jwt_secret)
+            headers["Authorization"] = f"Bearer {token}"
+
+        method = (args.get("method") or "GET").upper()
+        body = args.get("body")
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://nerve-internal",
+        ) as client:
+            resp = await client.request(
+                method, f"/api/{endpoint}",
+                headers=headers,
+                content=body,
+            )
+
+        # Format response
+        if resp.status_code >= 400:
+            return {"content": [{"type": "text", "text": f"HTTP {resp.status_code}: {resp.text}"}]}
+
+        try:
+            data = resp.json()
+            return {"content": [{"type": "text", "text": json.dumps(data, indent=2, default=str)}]}
+        except Exception:
+            return {"content": [{"type": "text", "text": resp.text}]}
+    except Exception as e:
+        logger.error("nerve_api tool failed: %s", e)
+        return {"content": [{"type": "text", "text": f"Error: {e}"}]}
+
+
+@tool(
+    "mcp_reload",
+    "Reload MCP server configuration from config files. "
+    "Use after editing config.yaml to pick up new or changed external MCP servers. "
+    "New sessions will use the updated config; existing sessions keep their current connections.",
+    {},
+)
+async def mcp_reload(args: dict) -> dict:
+    """Reload MCP server configs from YAML files."""
+    if not _engine:
+        return {"content": [{"type": "text", "text": "Engine not available."}]}
+    try:
+        servers = await _engine.reload_mcp_config()
+        names = ["nerve (built-in)"] + [s.name for s in servers]
+        return {"content": [{"type": "text", "text": (
+            f"MCP config reloaded. {len(names)} server(s): {', '.join(names)}"
+        )}]}
+    except Exception as e:
+        logger.error("mcp_reload failed: %s", e)
+        return {"content": [{"type": "text", "text": f"Reload failed: {e}"}]}
+
+
+# Module-level tool definitions — used only for ALL_TOOLS reference.
 # Actual session-scoped tools are created by create_session_mcp_server().
 @tool(
     "notify",

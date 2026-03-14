@@ -224,6 +224,15 @@ export const api = {
   getSkillsStats: () => request<any>('/skills/stats'),
   syncSkills: () => request<any>('/skills/sync', { method: 'POST' }),
 
+  // MCP Servers
+  listMcpServers: () => request<{ servers: any[] }>('/mcp-servers'),
+  getMcpServer: (name: string) =>
+    request<any>(`/mcp-servers/${encodeURIComponent(name)}`),
+  getMcpServerUsage: (name: string, limit = 50) =>
+    request<any>(`/mcp-servers/${encodeURIComponent(name)}/usage?limit=${limit}`),
+  reloadMcpServers: () =>
+    request<any>('/mcp-servers/reload', { method: 'POST' }),
+
   // Plans
   listPlans: (status?: string, taskId?: string) => {
     const qs = new URLSearchParams();

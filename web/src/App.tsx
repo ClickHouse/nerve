@@ -17,6 +17,8 @@ import { PlansPage } from './pages/PlansPage';
 import { PlanDetailPage } from './pages/PlanDetailPage';
 import { SkillsPage } from './pages/SkillsPage';
 import { SkillDetailPage } from './pages/SkillDetailPage';
+import { McpServersPage } from './pages/McpServersPage';
+import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 
@@ -49,6 +51,8 @@ function App() {
           <Route path="/plans/:planId" element={<PlanDetailPage />} />
           <Route path="/skills" element={<SkillsPage />} />
           <Route path="/skills/:skillId" element={<SkillDetailPage />} />
+          <Route path="/mcp" element={<McpServersPage />} />
+          <Route path="/mcp/:serverName" element={<McpServerDetailPage />} />
           <Route path="/notifications" element={<NotificationsPage />} />
           <Route path="/sources" element={<SourcesPage />} />
           <Route path="/cron" element={<CronPage />} />

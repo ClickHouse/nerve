@@ -18,7 +18,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA = """
 -- Schema version tracking
@@ -260,6 +260,32 @@ CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status, cre
 
 SCHEMA_V15 = """
 ALTER TABLE plans ADD COLUMN plan_type TEXT DEFAULT 'generic';
+"""
+
+SCHEMA_V16 = """
+-- MCP server registry (config is source of truth, DB tracks metadata + usage)
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    name TEXT PRIMARY KEY,
+    type TEXT NOT NULL DEFAULT 'stdio',
+    enabled BOOLEAN DEFAULT 1,
+    tool_count INTEGER DEFAULT 0,
+    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- MCP tool invocation tracking
+CREATE TABLE IF NOT EXISTS mcp_tool_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_name TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    session_id TEXT,
+    duration_ms INTEGER,
+    success BOOLEAN DEFAULT 1,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_tool_usage_server ON mcp_tool_usage(server_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_tool_usage_session ON mcp_tool_usage(session_id, created_at);
 """
 
 _V3_SESSION_COLUMNS = [
@@ -533,6 +559,14 @@ class Database:
             )
             await self.db.commit()
             logger.info("V15 migration: added plan_type column to plans table")
+
+        if current < 16:
+            await self.db.executescript(SCHEMA_V16)
+            await self.db.execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (16,)
+            )
+            await self.db.commit()
+            logger.info("V16 migration: created mcp_servers and mcp_tool_usage tables")
 
         # --- FTS integrity check (runs every startup) ---
         async with self.db.execute("SELECT COUNT(*) FROM tasks") as cur:
@@ -2033,6 +2067,98 @@ class Database:
                 except (json.JSONDecodeError, TypeError):
                     pass
         return rows
+
+    # --- MCP server operations ---
+
+    async def upsert_mcp_server(
+        self,
+        name: str,
+        server_type: str,
+        enabled: bool = True,
+        tool_count: int = 0,
+    ) -> None:
+        """Register or update an MCP server entry."""
+        now = datetime.now(timezone.utc).isoformat()
+        await self.db.execute(
+            """INSERT INTO mcp_servers (name, type, enabled, tool_count, first_seen_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   type = excluded.type,
+                   enabled = excluded.enabled,
+                   tool_count = CASE WHEN excluded.tool_count > 0
+                                     THEN excluded.tool_count
+                                     ELSE mcp_servers.tool_count END,
+                   last_seen_at = excluded.last_seen_at""",
+            (name, server_type, enabled, tool_count, now, now),
+        )
+        await self.db.commit()
+
+    async def record_mcp_tool_usage(
+        self,
+        server_name: str,
+        tool_name: str,
+        session_id: str | None = None,
+        duration_ms: int | None = None,
+        success: bool = True,
+        error: str | None = None,
+    ) -> None:
+        """Log an MCP tool invocation."""
+        await self.db.execute(
+            """INSERT INTO mcp_tool_usage
+               (server_name, tool_name, session_id, duration_ms, success, error)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (server_name, tool_name, session_id, duration_ms, success, error),
+        )
+        await self.db.commit()
+
+    async def get_mcp_server_stats(self) -> list[dict]:
+        """List all MCP servers with aggregated usage stats."""
+        async with self.db.execute("""
+            SELECT s.*,
+                   COALESCE(u.total_invocations, 0) as total_invocations,
+                   COALESCE(u.success_count, 0) as success_count,
+                   u.avg_duration_ms,
+                   u.last_used
+            FROM mcp_servers s
+            LEFT JOIN (
+                SELECT server_name,
+                       COUNT(*) as total_invocations,
+                       SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count,
+                       ROUND(AVG(duration_ms), 0) as avg_duration_ms,
+                       MAX(created_at) as last_used
+                FROM mcp_tool_usage
+                GROUP BY server_name
+            ) u ON s.name = u.server_name
+            ORDER BY s.name
+        """) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def get_mcp_tool_breakdown(self, server_name: str) -> list[dict]:
+        """Get per-tool usage breakdown for a server."""
+        async with self.db.execute("""
+            SELECT tool_name,
+                   COUNT(*) as invocations,
+                   SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count,
+                   ROUND(AVG(duration_ms), 0) as avg_duration_ms,
+                   MAX(created_at) as last_used
+            FROM mcp_tool_usage
+            WHERE server_name = ?
+            GROUP BY tool_name
+            ORDER BY invocations DESC
+        """, (server_name,)) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def get_mcp_server_usage(
+        self, server_name: str, limit: int = 50,
+    ) -> list[dict]:
+        """Get recent usage history for a specific MCP server."""
+        async with self.db.execute(
+            """SELECT * FROM mcp_tool_usage
+               WHERE server_name = ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (server_name, limit),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
 
 
 # Global database instance

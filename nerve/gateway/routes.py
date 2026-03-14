@@ -787,6 +787,46 @@ async def get_skill_usage(skill_id: str, limit: int = 50, user: dict = Depends(r
     }
 
 
+# --- MCP Servers ---
+
+@router.get("/api/mcp-servers")
+async def list_mcp_servers(user: dict = Depends(require_auth)):
+    """List all MCP servers with aggregated usage stats."""
+    servers = await _db.get_mcp_server_stats()
+    return {"servers": servers}
+
+
+@router.get("/api/mcp-servers/{server_name}")
+async def get_mcp_server_detail(server_name: str, user: dict = Depends(require_auth)):
+    """Get detailed info for a specific MCP server."""
+    stats_list = await _db.get_mcp_server_stats()
+    server = next((s for s in stats_list if s["name"] == server_name), None)
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+
+    tools = await _db.get_mcp_tool_breakdown(server_name)
+    usage = await _db.get_mcp_server_usage(server_name, limit=30)
+
+    return {**server, "tools": tools, "recent_usage": usage}
+
+
+@router.get("/api/mcp-servers/{server_name}/usage")
+async def get_mcp_server_usage(
+    server_name: str, limit: int = 50, user: dict = Depends(require_auth),
+):
+    """Get usage history for an MCP server."""
+    usage = await _db.get_mcp_server_usage(server_name, limit=min(limit, 200))
+    return {"usage": usage}
+
+
+@router.post("/api/mcp-servers/reload")
+async def reload_mcp_servers(user: dict = Depends(require_auth)):
+    """Re-read MCP server config from YAML files and refresh cache."""
+    servers = await _engine.reload_mcp_config()
+    stats = await _db.get_mcp_server_stats()
+    return {"reloaded": len(servers), "servers": stats}
+
+
 # --- Memory files ---
 
 @router.get("/api/memory/files")

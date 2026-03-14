@@ -240,6 +240,42 @@ Aggregate usage stats across all skills.
 #### `POST /api/skills/sync`
 Re-scan the `workspace/skills/` directory and sync to DB. Discovers new skills, removes deleted ones, preserves enabled state.
 
+### MCP Servers
+
+#### `GET /api/mcp-servers`
+List all MCP servers with aggregated usage statistics.
+
+```json
+Response: {
+  "servers": [{
+    "name": "nerve", "type": "sdk", "enabled": true, "tool_count": 34,
+    "total_invocations": 127, "success_count": 125, "avg_duration_ms": null,
+    "last_used": "2026-03-14T19:00:00", "first_seen_at": "...", "last_seen_at": "..."
+  }]
+}
+```
+
+#### `GET /api/mcp-servers/{name}`
+Get server detail including per-tool breakdown and recent usage.
+
+```json
+Response: {
+  "name": "nerve", "type": "sdk", ...,
+  "tools": [{ "tool_name": "task_list", "invocations": 42, "success_count": 42, "avg_duration_ms": null, "last_used": "..." }],
+  "recent_usage": [{ "id": 1, "server_name": "nerve", "tool_name": "task_list", "session_id": "abc", "success": true, "created_at": "..." }]
+}
+```
+
+#### `GET /api/mcp-servers/{name}/usage?limit=50`
+Paginated usage history for a server.
+
+#### `POST /api/mcp-servers/reload`
+Re-read MCP server config from YAML files and refresh the in-memory cache. New sessions will use updated config.
+
+```json
+Response: { "reloaded": 2, "servers": [...] }
+```
+
 ### Memory Files
 
 #### `GET /api/memory/files`

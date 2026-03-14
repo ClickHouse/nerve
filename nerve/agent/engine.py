@@ -38,7 +38,7 @@ from nerve.agent.prompts import build_system_prompt, set_skill_manager
 from nerve.agent.sessions import SessionManager, SessionStatus
 from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import ALL_TOOLS, create_session_mcp_server, init_tools
-from nerve.config import NerveConfig
+from nerve.config import NerveConfig, load_mcp_servers
 from nerve.db import Database
 from nerve.skills.manager import SkillManager
 
@@ -72,6 +72,16 @@ def _normalize_ts(ts: str) -> str:
     return s.strip()
 
 
+def _parse_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
+    """Parse 'mcp__server__tool' into (server_name, tool_name), or None."""
+    if not tool_name or not tool_name.startswith("mcp__"):
+        return None
+    parts = tool_name.split("__", 2)
+    if len(parts) == 3:
+        return parts[1], parts[2]
+    return None
+
+
 class AgentEngine:
     """Core agent engine wrapping claude-agent-sdk.
 
@@ -94,6 +104,7 @@ class AgentEngine:
         self._skill_manager: SkillManager | None = None
         self._memorize_lock = asyncio.Lock()
         self._router = None  # ChannelRouter — lazy-initialized via .router property
+        self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
 
     async def initialize(self) -> None:
         """Initialize the agent engine — set up tools and main session."""
@@ -119,6 +130,9 @@ class AgentEngine:
             engine=self,
         )
 
+        # Sync MCP servers to DB for frontend visibility
+        await self._sync_mcp_servers_to_db()
+
         # Wire up memorize callback so SessionManager can trigger memU indexing
         self.sessions._on_memorize = self._memorize_session
 
@@ -135,6 +149,34 @@ class AgentEngine:
             )
 
         logger.info("Agent engine initialized")
+
+    async def _sync_mcp_servers_to_db(self) -> None:
+        """Register all known MCP servers (built-in + external) in the DB."""
+        # Built-in nerve server
+        await self.db.upsert_mcp_server(
+            name="nerve", server_type="sdk", enabled=True,
+            tool_count=len(ALL_TOOLS),
+        )
+        # External servers from cache
+        for srv in self._mcp_servers_cache:
+            await self.db.upsert_mcp_server(
+                name=srv.name, server_type=srv.type, enabled=srv.enabled,
+            )
+
+    async def reload_mcp_config(self) -> list:
+        """Re-read MCP server config from YAML files and update cache + DB.
+
+        New sessions will automatically use the updated config.
+        Returns the list of McpServerConfig.
+        """
+        from nerve.config import load_mcp_servers
+        self._mcp_servers_cache = load_mcp_servers()
+        await self._sync_mcp_servers_to_db()
+        logger.info(
+            "MCP config reloaded: %d external server(s)",
+            len(self._mcp_servers_cache),
+        )
+        return self._mcp_servers_cache
 
     def _needs_worker_onboarding(self) -> bool:
         """Check if this is a worker instance that needs first-boot onboarding."""
@@ -568,21 +610,33 @@ class AgentEngine:
             resume=resume,
             fork_session=fork_session,
             hooks=hooks,
-            allowed_tools=[
-                # Built-in Claude Code tools
-                "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-                "WebSearch", "WebFetch", "NotebookEdit",
-                "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-                "Task", "TaskOutput", "TaskStop", "TodoWrite",
-                "EnterWorktree", "Skill",
-                # Nerve MCP tools — derived from ALL_TOOLS
-                *(f"mcp__nerve__{t.name}" for t in ALL_TOOLS),
-            ],
+            # No allowed_tools — can_use_tool callback handles permissions.
+            # External MCP server tools are discovered at connection time,
+            # so we can't enumerate them upfront.
             cwd=str(self.config.workspace),
+            mcp_servers=self._build_mcp_servers(session_id),
+        )
+
+    def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
+        """Build the mcp_servers dict: built-in nerve + external servers from config."""
+        servers: dict[str, Any] = {
             # Per-session MCP server with session_id bound in closure —
             # ensures notify/ask_user always reference the correct session.
-            mcp_servers={"nerve": create_session_mcp_server(session_id)},
-        )
+            "nerve": create_session_mcp_server(session_id),
+        }
+        for srv in self._mcp_servers_cache:
+            if srv.enabled and srv.name != "nerve":
+                try:
+                    servers[srv.name] = srv.to_sdk_config()
+                except ValueError as e:
+                    logger.warning("Skipping MCP server %r: %s", srv.name, e)
+        if len(servers) > 1:
+            logger.debug(
+                "Session %s: %d MCP servers (%s)",
+                session_id[:8], len(servers),
+                ", ".join(servers.keys()),
+            )
+        return servers
 
     def _build_snapshot_hooks(self, session_id: str) -> dict:
         """Build PreToolUse hooks for capturing file snapshots before modification."""
@@ -867,6 +921,31 @@ class AgentEngine:
         if not is_error and tool_use_id:
             _maybe_broadcast_plan_update(session_id, tool_use_id, tool_calls_log)
             _maybe_broadcast_file_changed(session_id, tool_use_id, tool_calls_log)
+
+        # Record MCP tool usage for frontend stats
+        if tool_use_id:
+            for tc in reversed(tool_calls_log):
+                if tc.get("tool_use_id") == tool_use_id:
+                    parsed = _parse_mcp_tool_name(tc.get("tool", ""))
+                    if parsed:
+                        srv_name, mcp_tool = parsed
+                        try:
+                            duration = None
+                            if tool_use_id in active_subagents:
+                                # Sub-agent already popped above, but for
+                                # regular MCP tools we don't track start time
+                                pass
+                            await self.db.record_mcp_tool_usage(
+                                server_name=srv_name,
+                                tool_name=mcp_tool,
+                                session_id=session_id,
+                                duration_ms=duration,
+                                success=not is_error,
+                                error=result_content[:500] if is_error else None,
+                            )
+                        except Exception as e:
+                            logger.debug("Failed to record MCP usage: %s", e)
+                    break
 
     @staticmethod
     def _merge_tool_results(

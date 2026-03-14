@@ -379,6 +379,65 @@ class ProxyConfig:
 
 
 @dataclass
+class McpServerConfig:
+    """External MCP server configuration.
+
+    Supports stdio (command + args + env), SSE (url + headers),
+    and HTTP (url + headers) transports.  Dict-based YAML format
+    allows _deep_merge to correctly overlay secrets from config.local.yaml.
+    """
+
+    name: str
+    type: str = "stdio"                                    # stdio | sse | http
+    enabled: bool = True
+    # stdio fields
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    # sse / http fields
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, name: str, d: dict) -> McpServerConfig:
+        return cls(
+            name=name,
+            type=d.get("type", "stdio"),
+            enabled=d.get("enabled", True),
+            command=d.get("command", ""),
+            args=d.get("args", []),
+            env=d.get("env", {}),
+            url=d.get("url", ""),
+            headers=d.get("headers", {}),
+        )
+
+    def to_sdk_config(self) -> dict:
+        """Convert to Claude Agent SDK McpServerConfig dict."""
+        if self.type == "stdio":
+            cfg: dict = {"command": self.command}
+            if self.args:
+                cfg["args"] = self.args
+            if self.env:
+                cfg["env"] = self.env
+            return cfg
+        elif self.type in ("sse", "http"):
+            cfg = {"type": self.type, "url": self.url}
+            if self.headers:
+                cfg["headers"] = self.headers
+            return cfg
+        raise ValueError(f"Unknown MCP server type: {self.type}")
+
+
+def _parse_mcp_servers(d: dict) -> list[McpServerConfig]:
+    """Parse the mcp_servers dict from merged YAML config."""
+    raw = d.get("mcp_servers", {})
+    if not isinstance(raw, dict):
+        return []
+    return [McpServerConfig.from_dict(name, cfg) for name, cfg in raw.items()
+            if isinstance(cfg, dict)]
+
+
+@dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
     timezone: str = "America/New_York"
@@ -397,6 +456,7 @@ class NerveConfig:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
+    mcp_servers: list[McpServerConfig] = field(default_factory=list)
 
     # API keys (from config.local.yaml)
     anthropic_api_key: str = ""
@@ -437,10 +497,37 @@ class NerveConfig:
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
             docker=DockerConfig.from_dict(d.get("docker", {})),
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
+            mcp_servers=_parse_mcp_servers(d),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
         )
+
+
+def load_mcp_servers(config_dir: Path | None = None) -> list[McpServerConfig]:
+    """Re-read MCP server configs from YAML files.
+
+    Called per session creation and on reload to pick up config changes
+    without restarting Nerve.
+    """
+    if config_dir is None:
+        config_dir = Path.cwd()
+
+    base_path = config_dir / "config.yaml"
+    local_path = config_dir / "config.local.yaml"
+
+    base: dict[str, Any] = {}
+    if base_path.exists():
+        with open(base_path) as f:
+            base = yaml.safe_load(f) or {}
+
+    local: dict[str, Any] = {}
+    if local_path.exists():
+        with open(local_path) as f:
+            local = yaml.safe_load(f) or {}
+
+    merged = _deep_merge(base, local)
+    return _parse_mcp_servers(merged)
 
 
 def load_config(config_dir: Path | None = None) -> NerveConfig:
