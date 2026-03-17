@@ -435,17 +435,8 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Update status/note/deadline via agent tool
-    if req.status or req.note or req.deadline:
-        from nerve.agent.tools import task_update
-        await task_update.handler({
-            "task_id": task_id,
-            "status": req.status,
-            "note": req.note,
-            "deadline": req.deadline,
-        })
-
-    # Update full markdown content if provided
+    # Write content FIRST — before status changes that may move/delete the file
+    # (task_done moves the file to done/ and deletes the source)
     if req.content:
         config = get_config()
         file_path = config.workspace / task["file_path"]
@@ -464,6 +455,16 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
                 source_url=task.get("source_url"),
                 deadline=fields.get("deadline") or task.get("deadline"),
             )
+
+    # Update status/note/deadline via agent tool (may move file for "done")
+    if req.status or req.note or req.deadline:
+        from nerve.agent.tools import task_update
+        await task_update.handler({
+            "task_id": task_id,
+            "status": req.status,
+            "note": req.note,
+            "deadline": req.deadline,
+        })
 
     return {"task_id": task_id, "updated": True}
 

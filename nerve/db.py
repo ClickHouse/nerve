@@ -1019,8 +1019,9 @@ class Database:
                 """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
-                       title=excluded.title, status=excluded.status, source=excluded.source,
-                       source_url=excluded.source_url, deadline=excluded.deadline, updated_at=?""",
+                       file_path=excluded.file_path, title=excluded.title, status=excluded.status,
+                       source=excluded.source, source_url=excluded.source_url,
+                       deadline=excluded.deadline, updated_at=?""",
                 (task_id, file_path, title, status, source, source_url, deadline, now, now, now),
             )
             # Sync FTS index
