@@ -644,7 +644,7 @@ def sync(ctx: click.Context, source: str) -> None:
             engine = AgentEngine(config, db)
             await engine.initialize()
 
-            runners = build_source_runners(config, db, engine)
+            runners = build_source_runners(config, db)
             if not runners:
                 click.echo("No sources configured.")
                 return
@@ -665,15 +665,14 @@ def sync(ctx: click.Context, source: str) -> None:
                 status = "OK" if result.error is None else "ERROR"
                 click.echo(
                     f" [{status}] "
-                    f"{result.records_processed} processed, "
-                    f"{result.records_skipped} skipped"
+                    f"{result.records_ingested} ingested"
                     + (f" — {result.error}" if result.error else "")
                 )
                 # Log to source_run_log
                 await db.log_source_run(
                     source=runner.source.source_name,
-                    records_fetched=result.records_processed + result.records_skipped,
-                    records_processed=result.records_processed,
+                    records_fetched=result.records_ingested,
+                    records_processed=result.records_ingested,
                     error=result.error,
                 )
         finally:
