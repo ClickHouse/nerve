@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, TYPE_CHECKING
 
 from telegram import Update
@@ -35,9 +36,12 @@ MAX_MSG_LEN = 4096
 EDIT_INTERVAL = 1.5
 # Polling watchdog settings
 WATCHDOG_INTERVAL = 30  # seconds between health checks
+WATCHDOG_HEARTBEAT_INTERVAL = 10  # log heartbeat every N checks (~5 min)
+STALE_THRESHOLD = 600  # seconds without any update before active probe
 MAX_RESTART_ATTEMPTS = 10  # consecutive failures before entering cooldown
 RESTART_BACKOFF_BASE = 5  # seconds, doubles each attempt, capped at 300s
 COOLDOWN_INTERVAL = 300  # seconds to wait after exhausting restart attempts
+PROBE_TIMEOUT = 10  # seconds for bot.get_me() active health check
 
 
 class TelegramChannel(BaseChannel):
@@ -55,6 +59,7 @@ class TelegramChannel(BaseChannel):
         self._notification_service = None  # Set after service is created
         self._watchdog_task: asyncio.Task | None = None
         self._stopping = False
+        self._last_update_time: float = 0.0  # monotonic, set on any incoming update
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
@@ -113,6 +118,7 @@ class TelegramChannel(BaseChannel):
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
+        self._last_update_time = time.monotonic()
         logger.info("Telegram bot started polling")
 
         # Launch watchdog to auto-restart polling if it silently dies
@@ -140,15 +146,20 @@ class TelegramChannel(BaseChannel):
     async def _run_watchdog(self) -> None:
         """Monitor polling health and auto-restart if it dies.
 
-        python-telegram-bot's polling runs as an internal asyncio task.
-        If that task crashes, the Updater.running flag stays True (it's
-        only cleared by an explicit stop() call), so we inspect the
-        actual task object to detect silent deaths.
+        Three layers of health checking:
+        1. Task alive? — is the internal polling asyncio task still running
+        2. Updater flag — does PTB think it's polling
+        3. Active probe — can we actually reach Telegram's API (bot.get_me)
+
+        The active probe fires when we haven't received any update in
+        STALE_THRESHOLD seconds, catching cases where the task is alive
+        but the connection is silently hung.
 
         Never gives up permanently — after exhausting rapid restart
         attempts, enters a cooldown period and then tries again.
         """
         restart_count = 0
+        check_count = 0
         while not self._stopping:
             try:
                 await asyncio.sleep(WATCHDOG_INTERVAL)
@@ -158,8 +169,23 @@ class TelegramChannel(BaseChannel):
             if self._app is None or self._stopping:
                 break
 
+            check_count += 1
+
+            # Heartbeat log so we know the watchdog itself is alive
+            if check_count % WATCHDOG_HEARTBEAT_INTERVAL == 0:
+                elapsed = (
+                    f"{time.monotonic() - self._last_update_time:.0f}s ago"
+                    if self._last_update_time > 0
+                    else "never"
+                )
+                logger.info(
+                    "Telegram watchdog heartbeat: check #%d, "
+                    "last_update=%s, restarts=%d",
+                    check_count, elapsed, restart_count,
+                )
+
             try:
-                alive = self._is_polling_alive()
+                alive = await self._is_polling_healthy()
             except Exception as e:
                 logger.error(
                     "Watchdog health check failed: %s", e, exc_info=True,
@@ -175,7 +201,7 @@ class TelegramChannel(BaseChannel):
                 restart_count = 0
                 continue
 
-            # Polling is dead
+            # Polling is dead or unresponsive
             restart_count += 1
             if restart_count > MAX_RESTART_ATTEMPTS:
                 logger.warning(
@@ -189,12 +215,12 @@ class TelegramChannel(BaseChannel):
                     break
                 if self._stopping:
                     break
-                restart_count = 1  # reset counter, start a fresh round
+                restart_count = 1
                 logger.info("Telegram polling: cooldown over, resuming restart attempts")
 
             delay = min(RESTART_BACKOFF_BASE * (2 ** (restart_count - 1)), 300)
             logger.warning(
-                "Telegram polling died — restarting in %ds (attempt %d/%d)",
+                "Telegram polling dead — restarting in %ds (attempt %d/%d)",
                 delay, restart_count, MAX_RESTART_ATTEMPTS,
             )
 
@@ -208,6 +234,7 @@ class TelegramChannel(BaseChannel):
 
             try:
                 await self._restart_polling()
+                self._last_update_time = time.monotonic()
                 logger.info(
                     "Telegram polling restarted successfully (attempt %d/%d)",
                     restart_count, MAX_RESTART_ATTEMPTS,
@@ -217,23 +244,23 @@ class TelegramChannel(BaseChannel):
                     "Telegram polling restart failed: %s", e, exc_info=True,
                 )
 
-    def _is_polling_alive(self) -> bool:
-        """Check whether the Telegram polling loop is still running.
+    async def _is_polling_healthy(self) -> bool:
+        """Multi-layer health check for Telegram polling.
 
-        We check two things:
-        1. Updater.running flag (catches explicit stops)
-        2. The internal __polling_task (catches silent crashes where
-           the task died but _running was never cleared)
+        Layer 1: Is the updater flag set?
+        Layer 2: Is the internal polling task still running?
+        Layer 3: If stale (no updates for STALE_THRESHOLD), actively
+                 probe the API with bot.get_me() to detect hung connections.
         """
         if not self._app or not self._app.updater:
             return False
 
-        # Check 1: updater thinks it's not running → definitely dead
+        # Layer 1: updater thinks it's not running → definitely dead
         if not self._app.updater.running:
+            logger.warning("Telegram watchdog: updater.running is False")
             return False
 
-        # Check 2: internal polling task crashed silently
-        # PTB v22 stores it as __polling_task (name-mangled)
+        # Layer 2: internal polling task crashed silently
         polling_task: asyncio.Task | None = getattr(
             self._app.updater, "_Updater__polling_task", None,
         )
@@ -243,9 +270,47 @@ class TelegramChannel(BaseChannel):
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 exc = None
             logger.warning(
-                "Telegram polling task is dead (exception: %s)", exc,
+                "Telegram watchdog: polling task is dead (exception: %s)", exc,
             )
             return False
+
+        # Layer 3: if no updates received recently, probe the API
+        now = time.monotonic()
+        if self._last_update_time > 0:
+            stale_seconds = now - self._last_update_time
+        else:
+            # Never received an update — use time since start
+            stale_seconds = now - self._last_update_time if self._last_update_time else STALE_THRESHOLD + 1
+
+        if stale_seconds > STALE_THRESHOLD:
+            logger.info(
+                "Telegram watchdog: no updates for %.0fs, running active probe",
+                stale_seconds,
+            )
+            try:
+                me = await asyncio.wait_for(
+                    self._app.bot.get_me(), timeout=PROBE_TIMEOUT,
+                )
+                if me:
+                    # API is reachable — polling task might just have no messages
+                    # That's fine, reset the timer to avoid spamming probes
+                    logger.info(
+                        "Telegram watchdog: active probe OK (bot: @%s)",
+                        me.username,
+                    )
+                    self._last_update_time = now
+                    return True
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Telegram watchdog: active probe timed out after %ds",
+                    PROBE_TIMEOUT,
+                )
+                return False
+            except Exception as e:
+                logger.warning(
+                    "Telegram watchdog: active probe failed: %s", e,
+                )
+                return False
 
         return True
 
@@ -338,8 +403,13 @@ class TelegramChannel(BaseChannel):
     #  Command handlers — delegate to router for session management        #
     # ------------------------------------------------------------------ #
 
+    def _touch(self) -> None:
+        """Record that we received an update from Telegram."""
+        self._last_update_time = time.monotonic()
+
     async def _handle_start(self, update: Update, context: Any) -> None:
         """Handle /start command."""
+        self._touch()
         user_id = update.effective_user.id
         if not self._is_authorized(user_id):
             logger.warning("Unauthorized /start from user %d", user_id)
@@ -351,6 +421,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_session(self, update: Update, context: Any) -> None:
         """Handle /session <id> — switch active session."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         chat_id = update.effective_chat.id
@@ -376,6 +447,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
         """Handle /sessions — list sessions."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
 
@@ -391,6 +463,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
         """Handle /new [title] — create and switch to a new session."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         chat_id = update.effective_chat.id
@@ -410,6 +483,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text messages — delegate to router."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         chat_id = update.effective_chat.id
@@ -441,6 +515,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_error(self, update: object, context: Any) -> None:
         """Log errors from the Telegram bot polling/handler pipeline."""
+        self._touch()
         logger.error(
             "Telegram update error: %s (update=%s)",
             context.error, update, exc_info=context.error,
@@ -452,6 +527,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_callback_query(self, update: Update, context: Any) -> None:
         """Handle inline keyboard button presses for notification questions."""
+        self._touch()
         query = update.callback_query
         if not query or not query.data:
             return
@@ -494,6 +570,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_reply(self, update: Update, context: Any) -> None:
         """Handle /reply <text> — answer the most recent pending question."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         if not context.args:
