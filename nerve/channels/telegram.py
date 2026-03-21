@@ -420,6 +420,9 @@ class TelegramChannel(BaseChannel):
                 parse_mode=ParseMode.HTML,
             )
         except Exception as exc:
+            exc_str = str(exc)
+            if "message is not modified" in exc_str.lower():
+                return  # Already up-to-date — don't clobber with plain text
             logger.warning("edit_message HTML failed: %s", exc)
             # Fallback: send without formatting if HTML parsing fails
             try:
