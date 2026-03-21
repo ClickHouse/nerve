@@ -8,7 +8,9 @@ Session management is delegated to ChannelRouter.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import logging
+import re
 import socket
 import time
 from typing import Any, TYPE_CHECKING
@@ -48,6 +50,57 @@ _TCP_KEEPALIVE_OPTS = (
     (socket.SOL_TCP, socket.TCP_KEEPINTVL, 10),
     (socket.SOL_TCP, socket.TCP_KEEPCNT, 3),
 )
+
+
+def _md_to_tg_html(text: str) -> str:
+    """Convert standard Markdown to Telegram-compatible HTML.
+
+    Telegram's legacy ``ParseMode.MARKDOWN`` only supports ``*bold*``,
+    but LLMs emit ``**bold**`` (standard Markdown).  This converts the
+    common constructs to HTML so we can use ``ParseMode.HTML`` instead,
+    which is more predictable and doesn't choke on special characters.
+
+    Handles: ``**bold**``, ``*italic*``, `` `code` ``, code fences,
+    and ``[text](url)``.  Unmatched markers pass through as-is.
+    """
+    protected: list[str] = []
+
+    def _protect(replacement: str) -> str:
+        idx = len(protected)
+        protected.append(replacement)
+        return f"\x00{idx}\x00"
+
+    # -- protect constructs that contain chars we'd otherwise escape --
+
+    # Code fences: ```lang\n...\n```
+    def _fence(m: re.Match) -> str:
+        return _protect(f"<pre>{_html.escape(m.group(2))}</pre>")
+    text = re.sub(r"```(\w*)\n?(.*?)```", _fence, text, flags=re.DOTALL)
+
+    # Inline code: `...`
+    def _code(m: re.Match) -> str:
+        return _protect(f"<code>{_html.escape(m.group(1))}</code>")
+    text = re.sub(r"`([^`]+)`", _code, text)
+
+    # Markdown links: [text](url)
+    def _link(m: re.Match) -> str:
+        label = _html.escape(m.group(1))
+        url = m.group(2)
+        return _protect(f'<a href="{url}">{label}</a>')
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link, text)
+
+    # -- escape remaining HTML entities --
+    text = _html.escape(text, quote=False)
+
+    # -- inline formatting --
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+
+    # -- restore protected spans --
+    for i, repl in enumerate(protected):
+        text = text.replace(f"\x00{i}\x00", repl)
+
+    return text
 
 
 class TelegramChannel(BaseChannel):
@@ -322,11 +375,18 @@ class TelegramChannel(BaseChannel):
         # Split long messages
         for i in range(0, len(text), MAX_MSG_LEN):
             chunk = text[i:i + MAX_MSG_LEN]
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            html_chunk = _md_to_tg_html(chunk)
+            try:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=html_chunk,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                )
 
     def format_response(self, text: str) -> str:
         """Truncate for Telegram if needed."""
@@ -351,20 +411,24 @@ class TelegramChannel(BaseChannel):
         if self._app is None:
             return
         chat_id = int(target)
+        html_text = _md_to_tg_html(text)
         try:
             await self._app.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=int(message_id),
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
+                text=html_text,
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
-            # Fallback: send without markdown if parsing fails
-            await self._app.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=int(message_id),
-                text=text,
-            )
+            # Fallback: send without formatting if HTML parsing fails
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    text=text,
+                )
+            except Exception:
+                pass
 
     async def send_typing(self, target: str) -> None:
         """Show typing indicator."""
