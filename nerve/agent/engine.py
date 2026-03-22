@@ -1246,7 +1246,8 @@ class AgentEngine:
             })
             # Memorize before discarding client
             await self._memorize_session(session_id)
-            # Keep sdk_session_id for resume — stop is user-initiated
+            # mark_stopped only sets status — sdk_session_id (if any)
+            # stays in the DB from when the client was created/resumed.
             await self.sessions.mark_stopped(session_id)
             unregister_handler(session_id)
             client = self.sessions.remove_client(session_id)

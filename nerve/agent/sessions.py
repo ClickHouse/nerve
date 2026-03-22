@@ -341,24 +341,27 @@ class SessionManager:
     async def stop_session(self, session_id: str) -> bool:
         """Stop a running session.
 
-        Uses SDK client.interrupt() first for clean stop, falls back to
-        asyncio task cancellation, then deferred stop flag if the client
-        hasn't been created yet.  Returns True if something was stopped.
+        Sends SDK interrupt first (tells the CLI to stop the current turn),
+        then always cancels the asyncio task so ``_run_inner`` exits via
+        ``CancelledError``.  The interrupt is best-effort — even if it fails,
+        the task cancellation guarantees ``_run_inner`` won't hang.
         """
-        # Try SDK interrupt first (cleanly stops the current turn)
+        # Try SDK interrupt first (tells CLI to stop gracefully)
         client = self._clients.get(session_id)
         if client:
             try:
                 await client.interrupt()
                 logger.info("Interrupted SDK client for session %s", session_id)
-                return True
             except Exception as e:
                 logger.warning(
-                    "SDK interrupt failed for %s: %s, falling back to cancel",
+                    "SDK interrupt failed for %s: %s",
                     session_id, e,
                 )
 
-        # Fallback: cancel the asyncio task
+        # Always cancel the asyncio task so _run_inner exits.
+        # interrupt() only signals the CLI — it doesn't guarantee that
+        # receive_response() will stop (e.g. if the CLI doesn't send a
+        # ResultMessage after interrupt, the loop hangs forever).
         task = self._running_tasks.get(session_id)
         if task and not task.done():
             task.cancel()
@@ -372,7 +375,7 @@ class SessionManager:
             logger.info("Deferred stop requested for session %s", session_id)
             return True
 
-        return False
+        return client is not None  # interrupt was sent even if no task
 
     # ------------------------------------------------------------------ #
     #  Fork & resume                                                       #
