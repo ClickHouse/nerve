@@ -1008,11 +1008,25 @@ class AgentEngine:
             images: Optional list of image dicts with keys ``type``,
                     ``media_type``, and ``data`` (base64-encoded).
         """
+        # If the session is still running (e.g. /stop cleanup in progress),
+        # wait briefly instead of failing immediately.
         if self.sessions.is_running(session_id):
-            raise RuntimeError(f"Session {session_id} is already running")
+            for _ in range(10):
+                await asyncio.sleep(0.3)
+                if not self.sessions.is_running(session_id):
+                    break
+            else:
+                raise RuntimeError(f"Session {session_id} is already running")
 
         broadcaster.start_buffering(session_id)
         async with self._semaphore:
+            # Clear any stale deferred-stop flag left over from a *previous*
+            # turn.  If /stop arrived while the old turn was still cleaning up
+            # (mark_not_running hadn't run yet), the flag lingers and would
+            # immediately kill this brand-new turn.  Flags set *during* this
+            # turn's client init are unaffected — they're created after
+            # mark_running below.
+            self.sessions.pop_stop_request(session_id)
             self.sessions.mark_running(session_id)
             # Notify all connected clients that this session started running
             await broadcaster.broadcast("__global__", {
@@ -1241,20 +1255,8 @@ class AgentEngine:
                 if full_response_text
                 else "[Stopped by user]"
             )
-            # Merge available tool results
-            self._merge_tool_results(tool_calls_log, tool_results_map)
-            await self.sessions.add_message(
-                session_id, "assistant", partial,
-                channel=channel,
-                thinking=thinking_text if thinking_text else None,
-                tool_calls=tool_calls_log if tool_calls_log else None,
-                blocks=ordered_blocks if ordered_blocks else None,
-            )
-            await broadcaster.broadcast(session_id, {
-                "type": "stopped", "session_id": session_id,
-            })
-            # Memorize before discarding client
-            await self._memorize_session(session_id)
+
+            # --- Critical cleanup first (must succeed for resume) ----------
             # Persist sdk_session_id so the session can be resumed later.
             # For new sessions the DB still has NULL because mark_active()
             # was called before the SDK emitted any messages.
@@ -1267,6 +1269,27 @@ class AgentEngine:
             client = self.sessions.remove_client(session_id)
             if client:
                 await self._safe_disconnect(client)
+
+            # --- Non-critical: save message, broadcast, memorize -----------
+            try:
+                self._merge_tool_results(tool_calls_log, tool_results_map)
+                await self.sessions.add_message(
+                    session_id, "assistant", partial,
+                    channel=channel,
+                    thinking=thinking_text if thinking_text else None,
+                    tool_calls=tool_calls_log if tool_calls_log else None,
+                    blocks=ordered_blocks if ordered_blocks else None,
+                )
+                await broadcaster.broadcast(session_id, {
+                    "type": "stopped", "session_id": session_id,
+                })
+            except Exception as cleanup_err:
+                logger.warning(
+                    "Non-critical stop cleanup failed for %s: %s",
+                    session_id, cleanup_err,
+                )
+            # Memorize in background — don't block the stop path
+            asyncio.create_task(self._memorize_session(session_id))
             return partial
 
         except Exception as e:

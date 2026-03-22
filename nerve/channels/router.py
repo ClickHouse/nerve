@@ -117,15 +117,30 @@ class ChannelRouter:
         # Extract images from metadata (e.g. Telegram photos)
         images = msg.metadata.get("images") if msg.metadata else None
 
-        try:
-            response = await self.engine.run(
+        # Wrap in a Task so stop_session() can cancel it (otherwise
+        # channels that ``await engine.run()`` directly — like Telegram —
+        # have no cancellable task and /stop only sends an SDK interrupt
+        # which may hang indefinitely).
+        task = asyncio.create_task(
+            self.engine.run(
                 session_id=session_id,
                 user_message=msg.text,
                 source=msg.channel_name,
                 channel=msg.channel_name,
                 images=images,
             )
+        )
+        self.engine.register_task(session_id, task)
+        try:
+            response = await task
             return response
+        except asyncio.CancelledError:
+            # /stop cancelled the task — _run_inner already handled
+            # cleanup (persisted sdk_session_id, marked stopped, etc.).
+            # Return whatever partial response was captured.
+            if task.done() and not task.cancelled():
+                return task.result()
+            return ""
         finally:
             await self._teardown_streaming(
                 channel.name, msg.sender_id, session_id,
