@@ -27,6 +27,7 @@ class ChannelCapability(Flag):
     MARKDOWN = auto()           # Renders markdown natively
     INTERACTIVE = auto()        # Can route interactive tool responses back (AskUserQuestion, etc.)
     TYPING_INDICATOR = auto()   # Can show "typing…" status
+    REACTIONS = auto()          # Can set emoji reactions on messages
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,17 @@ class BaseChannel(abc.ABC):
         """Show typing indicator.
 
         Only called if channel declares TYPING_INDICATOR capability.
+        """
+
+    # ------------------------------------------------------------------ #
+    #  Optional: reactions support                                          #
+    #  Only called if channel declares ChannelCapability.REACTIONS.         #
+    # ------------------------------------------------------------------ #
+
+    async def set_reaction(self, target: str, message_id: int, emoji: str) -> None:
+        """Set an emoji reaction on a message.
+
+        Only called if channel declares REACTIONS capability.
         """
 
     # ------------------------------------------------------------------ #

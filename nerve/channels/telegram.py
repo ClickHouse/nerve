@@ -186,6 +186,7 @@ class TelegramChannel(BaseChannel):
             ChannelCapability.SEND_TEXT
             | ChannelCapability.MARKDOWN
             | ChannelCapability.TYPING_INDICATOR
+            | ChannelCapability.REACTIONS
         )
         if self.config.telegram.stream_mode == "partial":
             caps |= ChannelCapability.STREAMING
@@ -512,6 +513,20 @@ class TelegramChannel(BaseChannel):
         )
 
     # ------------------------------------------------------------------ #
+    #  Reactions: set emoji on a message                                    #
+    # ------------------------------------------------------------------ #
+
+    async def set_reaction(self, target: str, message_id: int, emoji: str) -> None:
+        """Set an emoji reaction on a Telegram message."""
+        if self._app is None:
+            return
+        await self._app.bot.set_message_reaction(
+            chat_id=int(target),
+            message_id=message_id,
+            reaction=[emoji],
+        )
+
+    # ------------------------------------------------------------------ #
     #  Message cache (for reaction context)                                #
     # ------------------------------------------------------------------ #
 
@@ -705,12 +720,16 @@ class TelegramChannel(BaseChannel):
             f" [{len(images)} image(s)]" if images else "",
         )
 
+        metadata: dict[str, Any] = {"message_id": update.message.message_id}
+        if images:
+            metadata["images"] = images
+
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat_id}",
             sender_id=str(chat_id),
             text=text,
-            metadata={"images": images} if images else {},
+            metadata=metadata,
         )
 
         try:
@@ -740,12 +759,27 @@ class TelegramChannel(BaseChannel):
         chat_id = reaction_update.chat.id
         message_id = reaction_update.message_id
 
-        # Extract new emoji reactions
+        # Extract new emoji reactions (standard + premium custom emoji)
         emojis = []
+        custom_ids = []
         for r in reaction_update.new_reaction:
             emoji = getattr(r, "emoji", None)
             if emoji:
                 emojis.append(emoji)
+            else:
+                custom_id = getattr(r, "custom_emoji_id", None)
+                if custom_id:
+                    custom_ids.append(custom_id)
+
+        # Resolve premium custom emoji IDs to their base emoji
+        if custom_ids:
+            try:
+                stickers = await self._app.bot.get_custom_emoji_stickers(custom_ids)
+                for sticker in stickers:
+                    emojis.append(sticker.emoji or f"[premium:{sticker.custom_emoji_id}]")
+            except Exception as e:
+                logger.warning("Failed to resolve custom emoji: %s", e)
+                emojis.extend(f"[premium:{cid}]" for cid in custom_ids)
 
         if not emojis:
             # Reaction removed — ignore for now
@@ -835,12 +869,16 @@ class TelegramChannel(BaseChannel):
             (text[:80] + "..." if len(text) > 80 else text) if text else "(none)",
         )
 
+        metadata: dict[str, Any] = {"message_id": updates[0].message.message_id}
+        if images:
+            metadata["images"] = images
+
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat_id}",
             sender_id=str(chat_id),
             text=text,
-            metadata={"images": images} if images else {},
+            metadata=metadata,
         )
 
         try:

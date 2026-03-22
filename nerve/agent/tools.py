@@ -1623,6 +1623,24 @@ async def _ask_user_impl(args: dict, session_id: str) -> dict:
         return {"content": [{"type": "text", "text": f"Failed to ask question: {e}"}]}
 
 
+async def _react_impl(args: dict, session_id: str) -> dict:
+    """Core implementation for the react tool."""
+    if not _engine:
+        return {"content": [{"type": "text", "text": "Engine not available."}]}
+
+    emoji = args["emoji"]
+
+    try:
+        success = await _engine.router.set_reaction(session_id, emoji)
+        if success:
+            return {"content": [{"type": "text", "text": f"Reaction set: {emoji}"}]}
+        else:
+            return {"content": [{"type": "text", "text": "Cannot set reaction: no message context or channel does not support reactions."}]}
+    except Exception as e:
+        logger.error("react tool failed: %s", e)
+        return {"content": [{"type": "text", "text": f"Failed to set reaction: {e}"}]}
+
+
 _nerve_asgi_app = None  # Cached mini FastAPI app for in-process API calls
 
 
@@ -1740,6 +1758,20 @@ async def notify(args: dict) -> dict:
 
 
 @tool(
+    "react",
+    "Set an emoji reaction on the user's last message. "
+    "Use to acknowledge messages, express emotions, or respond non-verbally. "
+    "Works on channels that support reactions (e.g., Telegram).",
+    {
+        "emoji": {"type": "string", "description": "Emoji to react with (e.g., '👍', '❤', '🔥', '😂')"},
+    },
+)
+async def react_tool(args: dict) -> dict:
+    """Set a reaction (fallback — uses deprecated global)."""
+    return await _react_impl(args, _current_session_id)
+
+
+@tool(
     "ask_user",
     "Ask the user a question via async notification. "
     "Returns immediately — when the user answers, their reply is "
@@ -1795,11 +1827,15 @@ _ASK_USER_SCHEMA = {
     "priority": {"type": "string", "description": "Priority: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
 }
 
+_REACT_SCHEMA = {
+    "emoji": {"type": "string", "description": "Emoji to react with (e.g., '👍', '❤', '🔥', '😂')"},
+}
+
 
 def create_session_mcp_server(session_id: str):
-    """Create an MCP server with session_id bound for notification tools.
+    """Create an MCP server with session_id bound for session-scoped tools.
 
-    Each session gets its own MCP server instance so notify/ask_user
+    Each session gets its own MCP server instance so notify/ask_user/react
     tools always reference the correct session — no shared global needed.
     """
 
@@ -1825,8 +1861,19 @@ def create_session_mcp_server(session_id: str):
         # session_id captured from enclosing scope — race-free
         return await _ask_user_impl(args, session_id)
 
+    @tool(
+        "react",
+        "Set an emoji reaction on the user's last message. "
+        "Use to acknowledge messages, express emotions, or respond non-verbally. "
+        "Works on channels that support reactions (e.g., Telegram).",
+        _REACT_SCHEMA,
+    )
+    async def session_react(args: dict) -> dict:
+        # session_id captured from enclosing scope — race-free
+        return await _react_impl(args, session_id)
+
     # Shared tools (don't need session context) + session-scoped tools
-    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user")]
-    all_tools = shared_tools + [session_notify, session_ask_user]
+    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react")]
+    all_tools = shared_tools + [session_notify, session_ask_user, session_react]
 
     return create_sdk_mcp_server(name="nerve", version="1.0.0", tools=all_tools)
