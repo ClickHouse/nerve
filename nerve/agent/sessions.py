@@ -339,18 +339,19 @@ class SessionManager:
             return False
 
     async def stop_session(self, session_id: str) -> bool:
-        """Stop a running session.
+        """Stop the current turn of a running session.
 
-        Sends SDK interrupt first (tells the CLI to stop the current turn),
-        then always cancels the asyncio task so ``_run_inner`` exits via
-        ``CancelledError``.  The interrupt is best-effort — even if it fails,
-        the task cancellation guarantees ``_run_inner`` won't hang.
+        Sends SDK interrupt first — this gracefully ends the current turn
+        while keeping the client alive for the next message.  Falls back
+        to asyncio task cancellation (which disconnects the client) only
+        if the interrupt doesn't complete within a timeout.
         """
-        # Try SDK interrupt first (tells CLI to stop gracefully)
         client = self._clients.get(session_id)
+        interrupted = False
         if client:
             try:
                 await client.interrupt()
+                interrupted = True
                 logger.info("Interrupted SDK client for session %s", session_id)
             except Exception as e:
                 logger.warning(
@@ -358,14 +359,26 @@ class SessionManager:
                     session_id, e,
                 )
 
-        # Always cancel the asyncio task so _run_inner exits.
-        # interrupt() only signals the CLI — it doesn't guarantee that
-        # receive_response() will stop (e.g. if the CLI doesn't send a
-        # ResultMessage after interrupt, the loop hangs forever).
         task = self._running_tasks.get(session_id)
         if task and not task.done():
+            if interrupted:
+                # Give interrupt time to complete the turn gracefully.
+                # When it works, receive_response() yields a ResultMessage,
+                # _run_inner exits via the normal path, and the client
+                # stays alive for the next message.
+                done, _ = await asyncio.wait({task}, timeout=5.0)
+                if done:
+                    logger.info(
+                        "Session %s stopped gracefully via interrupt",
+                        session_id,
+                    )
+                    return True
+
+            # Interrupt failed or timed out — force cancel.
+            # The CancelledError handler in _run_inner disconnects the
+            # client since its state is inconsistent.
             task.cancel()
-            logger.info("Cancelled task for session %s", session_id)
+            logger.info("Cancelled task for session %s (interrupt timed out)", session_id)
             return True
 
         # Session is running but client/task not registered yet — set a
