@@ -552,14 +552,7 @@ main() {
 
     setup_repo
     setup_python_env
-
-    # On upgrade, rebuild web UI since nerve init is skipped.
-    # On fresh install, nerve init handles the build (server mode)
-    # or Docker handles it (docker mode).
-    if [ "$IS_UPGRADE" = "1" ]; then
-        build_web_ui
-    fi
-
+    build_web_ui
     setup_path
     run_init
     print_summary
