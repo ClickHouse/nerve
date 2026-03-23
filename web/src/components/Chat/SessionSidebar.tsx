@@ -1,5 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer } from 'lucide-react';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2 } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
@@ -45,7 +45,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar } = useChatStore();
 
   const isSearching = localQuery.trim().length > 0;
 
@@ -90,16 +90,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
 
   const activeIsRunning = agentStatus.state !== 'idle';
 
-  // Split running conversations to pin them at the top
-  const { pinnedRunning, restConversations } = useMemo(() => {
-    const pinned: Session[] = [];
+  // Split running and starred conversations to pin them at the top
+  const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+    const running: Session[] = [];
+    const starred: Session[] = [];
     const rest: Session[] = [];
     for (const s of conversations) {
-      const running = s.id === activeSession ? activeIsRunning : !!s.is_running;
-      if (running) pinned.push(s);
+      const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
+      if (isRunning) running.push(s);
+      else if (s.starred) starred.push(s);
       else rest.push(s);
     }
-    return { pinnedRunning: pinned, restConversations: rest };
+    return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
   }, [conversations, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
@@ -181,6 +183,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                       isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
                       onSelect={onSelect}
                       onDelete={onDelete}
+                      onRename={renameSession}
+                      onToggleStar={toggleStar}
                       showDate
                     />
                   ))
@@ -204,13 +208,36 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     isRunning
                     onSelect={onSelect}
                     onDelete={onDelete}
+                    onRename={renameSession}
+                    onToggleStar={toggleStar}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Pinned starred sessions */}
+            {pinnedStarred.length > 0 && (
+              <div>
+                <div className="px-3 pt-2 pb-0.5">
+                  <span className="text-[10px] text-yellow-600/70 font-medium">Starred</span>
+                </div>
+                {pinnedStarred.map((s) => (
+                  <SessionItem
+                    key={s.id}
+                    session={s}
+                    isActive={s.id === activeSession}
+                    isRunning={false}
+                    onSelect={onSelect}
+                    onDelete={onDelete}
+                    onRename={renameSession}
+                    onToggleStar={toggleStar}
                   />
                 ))}
               </div>
             )}
 
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && (
+            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && (
               <div className="px-3 py-2 text-[11px] text-[#444]">No conversations yet</div>
             )}
 
@@ -227,6 +254,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
                     onSelect={onSelect}
                     onDelete={onDelete}
+                    onRename={renameSession}
+                    onToggleStar={toggleStar}
                   />
                 ))}
               </div>
@@ -325,14 +354,66 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onSelect, onDelete, showDate }: {
+function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRename, onToggleStar, showDate }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => Promise<void>;
+  onToggleStar: (id: string) => Promise<void>;
   showDate?: boolean;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+  const menuRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [menuOpen]);
+
+  // Focus input when renaming
+  useEffect(() => {
+    if (renaming) inputRef.current?.focus();
+  }, [renaming]);
+
+  const handleRenameSubmit = () => {
+    const trimmed = renameValue.trim();
+    if (trimmed && trimmed !== cleanTitle(session)) {
+      onRename(session.id, trimmed);
+    }
+    setRenaming(false);
+  };
+
+  if (renaming) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-[#1a1a1a]">
+        <MessageSquare size={13} className="shrink-0 opacity-50" />
+        <input
+          ref={inputRef}
+          value={renameValue}
+          onChange={e => setRenameValue(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') handleRenameSubmit();
+            if (e.key === 'Escape') setRenaming(false);
+          }}
+          onBlur={handleRenameSubmit}
+          className="flex-1 min-w-0 bg-transparent text-[13px] text-[#e0e0e0] outline-none border-b border-[#444]"
+        />
+      </div>
+    );
+  }
+
   return (
     <div
       onClick={() => onSelect(session.id)}
@@ -344,7 +425,9 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, showDat
     >
       {isImplementSession(session)
         ? <Hammer size={13} className="shrink-0 text-violet-400/60" />
-        : <MessageSquare size={13} className="shrink-0 opacity-50" />
+        : session.starred
+          ? <Star size={13} className="shrink-0 text-yellow-500 fill-yellow-500" />
+          : <MessageSquare size={13} className="shrink-0 opacity-50" />
       }
       <div className="flex-1 min-w-0">
         <div className="truncate text-[13px]">{cleanTitle(session)}</div>
@@ -360,15 +443,55 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, showDat
         </span>
       )}
 
-      {/* Delete button on hover (hidden when running) */}
-      {!isRunning && (
+      {/* Context menu trigger */}
+      <div className="relative shrink-0" ref={menuRef}>
         <button
-          onClick={(e) => { e.stopPropagation(); onDelete(session.id); }}
-          className="shrink-0 p-0.5 text-[#333] opacity-0 group-hover:opacity-100 hover:text-red-400 cursor-pointer transition-opacity"
+          onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
+          className="p-0.5 text-[#333] opacity-0 group-hover:opacity-100 hover:text-[#888] cursor-pointer transition-opacity"
         >
-          <X size={12} />
+          <MoreHorizontal size={14} />
         </button>
-      )}
+
+        {menuOpen && (
+          <div className="absolute right-0 top-full mt-1 z-50 bg-[#1a1a1a] border border-[#333] rounded-lg shadow-xl py-1 min-w-[140px]">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleStar(session.id);
+                setMenuOpen(false);
+              }}
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-[#222] cursor-pointer transition-colors"
+            >
+              <Star size={14} className={session.starred ? 'text-yellow-500 fill-yellow-500' : ''} />
+              {session.starred ? 'Unstar' : 'Star'}
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setRenameValue(cleanTitle(session));
+                setRenaming(true);
+                setMenuOpen(false);
+              }}
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-[#222] cursor-pointer transition-colors"
+            >
+              <Pencil size={14} />
+              Rename
+            </button>
+            <div className="border-t border-[#2a2a2a] my-1" />
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setMenuOpen(false);
+                onDelete(session.id);
+              }}
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-red-400 hover:bg-[#222] cursor-pointer transition-colors"
+            >
+              <Trash2 size={14} />
+              Delete
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

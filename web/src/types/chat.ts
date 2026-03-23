@@ -42,6 +42,7 @@ export interface Session {
   total_cost_usd?: number;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
+  starred?: boolean;
 }
 
 export type AgentStatus =

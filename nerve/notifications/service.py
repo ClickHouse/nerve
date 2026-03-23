@@ -40,8 +40,15 @@ class NotificationService:
         title: str,
         body: str = "",
         priority: str = "normal",
+        channels: list[str] | None = None,
+        silent: bool = False,
     ) -> str:
-        """Fire-and-forget notification. Returns notification_id."""
+        """Fire-and-forget notification. Returns notification_id.
+
+        Args:
+            channels: Override default notification channels (e.g. ["telegram"]).
+            silent: If True, deliver without sound (Telegram disable_notification).
+        """
         notification_id = f"notif-{uuid.uuid4().hex[:8]}"
 
         await self.db.create_notification(
@@ -55,6 +62,7 @@ class NotificationService:
 
         await self._fanout(
             notification_id, session_id, "notify", title, body, priority,
+            channels=channels, silent=silent,
         )
 
         return notification_id
@@ -208,9 +216,11 @@ class NotificationService:
         body: str,
         priority: str,
         options: list[str] | None = None,
+        channels: list[str] | None = None,
+        silent: bool = False,
     ) -> None:
         """Deliver notification to all configured channels in parallel."""
-        target_channels = self.config.notifications.channels
+        target_channels = channels or self.config.notifications.channels
 
         async def _deliver(channel_name: str) -> str | None:
             """Deliver to a single channel, return name on success."""
@@ -225,6 +235,7 @@ class NotificationService:
                     msg_id = await self._deliver_telegram(
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
+                        silent=silent,
                     )
                     if msg_id:
                         await self.db.update_notification(
@@ -301,6 +312,7 @@ class NotificationService:
         body: str,
         priority: str,
         options: list[str] | None,
+        silent: bool = False,
     ) -> str | None:
         """Send notification to Telegram, with inline keyboard for questions."""
         bot = self._get_telegram_bot()
@@ -321,10 +333,13 @@ class NotificationService:
 
         if notif_type == "question" and options:
             return await self._send_telegram_inline(
-                chat_id, notification_id, text, options,
+                chat_id, notification_id, text, options, silent=silent,
             )
         else:
-            msg = await bot.send_message(chat_id=chat_id, text=text)
+            msg = await bot.send_message(
+                chat_id=chat_id, text=text,
+                disable_notification=silent,
+            )
             return str(msg.message_id)
 
     async def _send_telegram_inline(
@@ -333,6 +348,7 @@ class NotificationService:
         notification_id: str,
         text: str,
         options: list[str],
+        silent: bool = False,
     ) -> str | None:
         """Send Telegram message with inline keyboard buttons."""
         bot = self._get_telegram_bot()
@@ -357,6 +373,7 @@ class NotificationService:
             chat_id=chat_id,
             text=text,
             reply_markup=keyboard,
+            disable_notification=silent,
         )
 
         await self.db.update_notification(

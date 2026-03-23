@@ -110,6 +110,7 @@ class SessionStore:
             "status", "sdk_session_id", "connected_at", "last_activity_at",
             "archived_at", "title", "message_count", "total_cost_usd",
             "parent_session_id", "forked_from_message", "last_memorized_at",
+            "starred",
         }
         set_clauses: list[str] = []
         params: list = []

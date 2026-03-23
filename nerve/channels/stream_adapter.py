@@ -20,6 +20,8 @@ from nerve.channels.base import (
 
 logger = logging.getLogger(__name__)
 
+STREAMING_INDICATOR = "\n\n⏳"
+
 
 class StreamAdapter:
     """Translates StreamBroadcaster events into channel-specific output.
@@ -129,9 +131,10 @@ class StreamAdapter:
 
         async with self._edit_lock:
             try:
-                display = self._truncate(self._buffer)
+                indicator = STREAMING_INDICATOR
+                display = self._truncate(self._buffer, reserve=len(indicator))
                 await self.channel.edit_message(
-                    self.target, self._placeholder_id, display,
+                    self.target, self._placeholder_id, display + indicator,
                 )
                 self._last_edit = now
             except Exception:
@@ -139,15 +142,32 @@ class StreamAdapter:
 
     async def _handle_done(self) -> None:
         if self._supports_streaming and self._supports_edit and self._placeholder_id:
-            # Final edit with complete text
+            # Send final text as a new message (triggers notification),
+            # then delete the streaming placeholder.
             async with self._edit_lock:
+                text = self._buffer.strip() or "(no response)"
+                formatted = self.channel.format_response(text)
+                placeholder_id = self._placeholder_id
                 try:
-                    text = self._truncate(self._buffer).strip() or "(no response)"
-                    await self.channel.edit_message(
-                        self.target, self._placeholder_id, text,
-                    )
+                    await self.channel.send(OutboundMessage(
+                        target=self.target,
+                        text=formatted,
+                        session_id=self.session_id,
+                    ))
                 except Exception:
-                    pass
+                    # Send failed → fallback to final edit (keep placeholder)
+                    try:
+                        await self.channel.edit_message(
+                            self.target, placeholder_id, self._truncate(text),
+                        )
+                    except Exception:
+                        pass
+                    return
+                # Sent OK → delete placeholder
+                try:
+                    await self.channel.delete_message(self.target, placeholder_id)
+                except Exception:
+                    pass  # Duplicate is better than lost response
         elif not self._supports_streaming:
             # Non-streaming channel: send the accumulated response as one message
             if self._buffer.strip():
@@ -162,10 +182,23 @@ class StreamAdapter:
         error_text = f"Error: {error}"
         if self._supports_streaming and self._supports_edit and self._placeholder_id:
             async with self._edit_lock:
+                placeholder_id = self._placeholder_id
                 try:
-                    await self.channel.edit_message(
-                        self.target, self._placeholder_id, error_text,
-                    )
+                    await self.channel.send(OutboundMessage(
+                        target=self.target,
+                        text=error_text,
+                        session_id=self.session_id,
+                    ))
+                except Exception:
+                    try:
+                        await self.channel.edit_message(
+                            self.target, placeholder_id, error_text,
+                        )
+                    except Exception:
+                        pass
+                    return
+                try:
+                    await self.channel.delete_message(self.target, placeholder_id)
                 except Exception:
                     pass
         else:
@@ -190,8 +223,16 @@ class StreamAdapter:
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
 
-    def _truncate(self, text: str) -> str:
-        """Truncate text to max message length if constrained."""
-        if self._max_len and len(text) > self._max_len:
-            return text[:self._max_len]
+    def _truncate(self, text: str, reserve: int = 0) -> str:
+        """Truncate text to max message length if constrained.
+
+        Args:
+            reserve: Characters to reserve at the end (e.g. for streaming indicator).
+        """
+        limit = self._max_len
+        if not limit:
+            return text
+        effective = limit - reserve
+        if len(text) > effective:
+            return text[:effective]
         return text

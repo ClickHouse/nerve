@@ -163,6 +163,8 @@ interface ChatState {
   switchSession: (id: string) => Promise<void>;
   createSession: (title?: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  renameSession: (id: string, title: string) => Promise<void>;
+  toggleStar: (id: string) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
   clearSearch: () => void;
   sendMessage: (content: string) => void;
@@ -440,6 +442,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     } catch (e) {
       console.error('Failed to delete session:', e);
+    }
+  },
+
+  renameSession: async (id: string, title: string) => {
+    try {
+      await api.updateSession(id, { title });
+      set(s => ({
+        sessions: s.sessions.map(sess =>
+          sess.id === id ? { ...sess, title } : sess
+        ),
+      }));
+    } catch (e) {
+      console.error('Failed to rename session:', e);
+    }
+  },
+
+  toggleStar: async (id: string) => {
+    const session = get().sessions.find(s => s.id === id);
+    if (!session) return;
+    const starred = !session.starred;
+    try {
+      await api.updateSession(id, { starred });
+      set(s => ({
+        sessions: s.sessions.map(sess =>
+          sess.id === id ? { ...sess, starred } : sess
+        ),
+      }));
+    } catch (e) {
+      console.error('Failed to toggle star:', e);
     }
   },
 

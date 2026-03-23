@@ -14,6 +14,8 @@ import html as _html
 import logging
 import re
 import socket
+import subprocess
+import sys
 import time
 from typing import Any, TYPE_CHECKING
 
@@ -230,10 +232,12 @@ class TelegramChannel(BaseChannel):
         app.add_handler(CommandHandler("sessions", self._handle_sessions))
         app.add_handler(CommandHandler("new", self._handle_new_session))
         app.add_handler(CommandHandler("stop", self._handle_stop))
+        app.add_handler(CommandHandler("restart", self._handle_restart))
+        app.add_handler(CommandHandler("doctor", self._handle_doctor))
         app.add_handler(CommandHandler("reply", self._handle_reply))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         app.add_handler(MessageHandler(
-            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
+            filters.TEXT | filters.PHOTO | filters.COMMAND,
             self._handle_message,
         ))
         app.add_handler(MessageReactionHandler(self._handle_reaction))
@@ -470,7 +474,7 @@ class TelegramChannel(BaseChannel):
         if self._app is None:
             return None
         chat_id = int(target)
-        msg = await self._app.bot.send_message(chat_id=chat_id, text="...")
+        msg = await self._app.bot.send_message(chat_id=chat_id, text="⏳")
         return str(msg.message_id)
 
     async def edit_message(self, target: str, message_id: str, text: str) -> None:
@@ -502,6 +506,17 @@ class TelegramChannel(BaseChannel):
                 pass
         # Update cache with the latest text (streaming overwrites placeholder)
         self._cache_message(int(message_id), int(target), text)
+
+    async def delete_message(self, target: str, message_id: str) -> None:
+        """Delete a previously sent message."""
+        if self._app is None:
+            return
+        try:
+            await self._app.bot.delete_message(
+                chat_id=int(target), message_id=int(message_id),
+            )
+        except Exception as exc:
+            logger.warning("delete_message failed: %s", exc)
 
     async def send_typing(self, target: str) -> None:
         """Show typing indicator."""
@@ -663,6 +678,32 @@ class TelegramChannel(BaseChannel):
             )
         else:
             await update.message.reply_text("Nothing running to stop.")
+
+    async def _handle_restart(self, update: Update, context: Any) -> None:
+        """Handle /restart — run ``nerve restart`` to restart the daemon."""
+        self._touch()
+        if not self._is_authorized(update.effective_user.id):
+            return
+        await update.message.reply_text("Restarting Nerve...")
+        logger.info("Restart requested by Telegram user %d", update.effective_user.id)
+        subprocess.Popen(
+            [sys.executable, "-m", "nerve", "restart"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    async def _handle_doctor(self, update: Update, context: Any) -> None:
+        """Handle /doctor — run health checks and return the report."""
+        self._touch()
+        if not self._is_authorized(update.effective_user.id):
+            return
+        from nerve.cli import doctor_report
+        report = doctor_report(self.config)
+        await update.message.reply_text(
+            f"```\n{report}\n```",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     # ------------------------------------------------------------------ #
     #  Message handler — construct InboundMessage and delegate             #

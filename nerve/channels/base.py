@@ -131,6 +131,15 @@ class BaseChannel(abc.ABC):
         constraints.supports_message_edit is True.
         """
 
+    async def delete_message(self, target: str, message_id: str) -> None:
+        """Delete a previously sent message.
+
+        Used by StreamAdapter to remove the streaming placeholder after
+        sending the final message as a new message (to trigger notifications).
+        Only called if channel declares STREAMING capability and
+        constraints.supports_message_edit is True.
+        """
+
     # ------------------------------------------------------------------ #
     #  Optional: typing indicator                                          #
     #  Only called if channel declares ChannelCapability.TYPING_INDICATOR. #

@@ -51,6 +51,13 @@ class ChannelRouter:
         # Per-session inbound message context (for reaction support)
         # Maps session_id -> {channel_name, target, message_id}
         self._message_context: dict[str, dict[str, Any]] = {}
+        # Per-session locks and pending queues for message batching.
+        # Messages arriving while a session is busy are queued and
+        # processed as a single combined turn once the current run ends.
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._pending_batches: dict[
+            str, list[tuple[InboundMessage, asyncio.Future[str]]]
+        ] = {}
 
     # ------------------------------------------------------------------ #
     #  Channel registry                                                    #
@@ -80,12 +87,11 @@ class ChannelRouter:
     async def handle_message(self, msg: InboundMessage) -> str:
         """Process an inbound user message.
 
-        1. Resolve session (from explicit session_id or channel mapping)
-        2. Show typing indicator if supported
-        3. Set up streaming adapter for the response
-        4. Run the agent
-        5. Tear down streaming adapter
-        6. Return the final response text
+        Messages for the same session are serialized via a per-session lock.
+        If a session is already busy, arriving messages are queued and
+        processed together as a single batched turn once the current run
+        finishes.  This avoids "Session already running" errors and lets
+        rapid-fire or forwarded messages be handled as a group.
 
         Called by channel implementations when they receive a user message.
         """
@@ -96,7 +102,6 @@ class ChannelRouter:
         # Resolve session
         if msg.session_id:
             session_id = msg.session_id
-            # Ensure mapping is persisted
             await self.engine.sessions.set_active_session(
                 msg.channel_key, session_id,
             )
@@ -114,25 +119,71 @@ class ChannelRouter:
                 "message_id": msg_id,
             }
 
-        # Show typing indicator if supported
+        # If the session is busy, queue for batch processing instead of
+        # setting up a streaming adapter that would never be used.
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            self._pending_batches.setdefault(session_id, []).append(
+                (msg, future),
+            )
+            return await future
+
+        async with lock:
+            try:
+                response = await self._run_single(channel, msg, session_id)
+            except (asyncio.CancelledError, Exception):
+                # Current run failed/cancelled — cancel all pending futures
+                self._cancel_pending(session_id)
+                raise
+
+            # Drain messages that arrived while we were busy
+            while pending := self._pending_batches.pop(session_id, None):
+                try:
+                    batch_response = await self._run_batch(
+                        channel, pending, session_id,
+                    )
+                except asyncio.CancelledError:
+                    for _, fut in pending:
+                        if not fut.done():
+                            fut.cancel()
+                    self._cancel_pending(session_id)
+                    raise
+                except Exception as exc:
+                    for _, fut in pending:
+                        if not fut.done():
+                            fut.set_exception(exc)
+                else:
+                    for _, fut in pending:
+                        if not fut.done():
+                            fut.set_result(batch_response)
+
+            return response
+
+    # ------------------------------------------------------------------ #
+    #  Internal run helpers                                                #
+    # ------------------------------------------------------------------ #
+
+    async def _run_single(
+        self,
+        channel: BaseChannel,
+        msg: InboundMessage,
+        session_id: str,
+    ) -> str:
+        """Run the engine for a single message with streaming."""
         if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
             try:
                 await channel.send_typing(msg.sender_id)
             except Exception as e:
-                logger.debug("Typing indicator failed for %s: %s", msg.channel_name, e)
+                logger.debug(
+                    "Typing indicator failed for %s: %s", msg.channel_name, e,
+                )
 
-        # Set up streaming adapter
         adapter = await self._setup_streaming(
             channel, msg.sender_id, session_id,
         )
-
-        # Extract images from metadata (e.g. Telegram photos)
         images = msg.metadata.get("images") if msg.metadata else None
 
-        # Wrap in a Task so stop_session() can cancel it (otherwise
-        # channels that ``await engine.run()`` directly — like Telegram —
-        # have no cancellable task and /stop only sends an SDK interrupt
-        # which may hang indefinitely).
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -144,12 +195,8 @@ class ChannelRouter:
         )
         self.engine.register_task(session_id, task)
         try:
-            response = await task
-            return response
+            return await task
         except asyncio.CancelledError:
-            # /stop cancelled the task — _run_inner already handled
-            # cleanup (persisted sdk_session_id, marked stopped, etc.).
-            # Return whatever partial response was captured.
             if task.done() and not task.cancelled():
                 return task.result()
             return ""
@@ -157,6 +204,73 @@ class ChannelRouter:
             await self._teardown_streaming(
                 channel.name, msg.sender_id, session_id,
             )
+
+    async def _run_batch(
+        self,
+        channel: BaseChannel,
+        pending: list[tuple[InboundMessage, asyncio.Future[str]]],
+        session_id: str,
+    ) -> str:
+        """Combine pending messages into one turn and run."""
+        last_msg = pending[-1][0]
+        sender_id = last_msg.sender_id
+
+        # Combine texts (each message on its own line)
+        combined_text = "\n\n".join(m.text for m, _ in pending)
+
+        # Combine images from all messages
+        all_images: list[dict[str, Any]] = []
+        for m, _ in pending:
+            imgs = m.metadata.get("images") if m.metadata else None
+            if imgs:
+                all_images.extend(imgs)
+
+        # Update reaction context to the last message in the batch
+        msg_id = last_msg.metadata.get("message_id") if last_msg.metadata else None
+        if msg_id is not None:
+            self._message_context[session_id] = {
+                "channel_name": last_msg.channel_name,
+                "target": sender_id,
+                "message_id": msg_id,
+            }
+
+        if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
+            try:
+                await channel.send_typing(sender_id)
+            except Exception as e:
+                logger.debug(
+                    "Typing indicator failed for %s: %s",
+                    last_msg.channel_name, e,
+                )
+
+        adapter = await self._setup_streaming(channel, sender_id, session_id)
+
+        task = asyncio.create_task(
+            self.engine.run(
+                session_id=session_id,
+                user_message=combined_text,
+                source=last_msg.channel_name,
+                channel=last_msg.channel_name,
+                images=all_images or None,
+            )
+        )
+        self.engine.register_task(session_id, task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if task.done() and not task.cancelled():
+                return task.result()
+            return ""
+        finally:
+            await self._teardown_streaming(
+                channel.name, sender_id, session_id,
+            )
+
+    def _cancel_pending(self, session_id: str) -> None:
+        """Cancel all pending futures for a session."""
+        for _, fut in self._pending_batches.pop(session_id, []):
+            if not fut.done():
+                fut.cancel()
 
     # ------------------------------------------------------------------ #
     #  Reactions                                                            #

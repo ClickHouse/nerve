@@ -103,6 +103,7 @@ class AgentEngine:
         self._memory_bridge = None
         self._skill_manager: SkillManager | None = None
         self._memorize_lock = asyncio.Lock()
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
@@ -1008,46 +1009,40 @@ class AgentEngine:
             images: Optional list of image dicts with keys ``type``,
                     ``media_type``, and ``data`` (base64-encoded).
         """
-        # If the session is still running (e.g. /stop cleanup in progress),
-        # wait briefly instead of failing immediately.
-        if self.sessions.is_running(session_id):
-            for _ in range(10):
-                await asyncio.sleep(0.3)
-                if not self.sessions.is_running(session_id):
-                    break
-            else:
-                raise RuntimeError(f"Session {session_id} is already running")
-
-        broadcaster.start_buffering(session_id)
-        async with self._semaphore:
-            # Clear any stale deferred-stop flag left over from a *previous*
-            # turn.  If /stop arrived while the old turn was still cleaning up
-            # (mark_not_running hadn't run yet), the flag lingers and would
-            # immediately kill this brand-new turn.  Flags set *during* this
-            # turn's client init are unaffected — they're created after
-            # mark_running below.
-            self.sessions.pop_stop_request(session_id)
-            self.sessions.mark_running(session_id)
-            # Notify all connected clients that this session started running
-            await broadcaster.broadcast("__global__", {
-                "type": "session_running",
-                "session_id": session_id,
-                "is_running": True,
-            })
-            try:
-                return await self._run_inner(
-                    session_id, user_message, source, channel, model,
-                    internal=internal, images=images,
-                )
-            finally:
-                self.sessions.mark_not_running(session_id)
-                broadcaster.stop_buffering(session_id)
-                # Notify all connected clients that this session stopped
+        # Serialize runs per session — messages for the same session wait
+        # in order instead of failing with "already running".
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            broadcaster.start_buffering(session_id)
+            async with self._semaphore:
+                # Clear any stale deferred-stop flag left over from a *previous*
+                # turn.  If /stop arrived while the old turn was still cleaning up
+                # (mark_not_running hadn't run yet), the flag lingers and would
+                # immediately kill this brand-new turn.  Flags set *during* this
+                # turn's client init are unaffected — they're created after
+                # mark_running below.
+                self.sessions.pop_stop_request(session_id)
+                self.sessions.mark_running(session_id)
+                # Notify all connected clients that this session started running
                 await broadcaster.broadcast("__global__", {
                     "type": "session_running",
                     "session_id": session_id,
-                    "is_running": False,
+                    "is_running": True,
                 })
+                try:
+                    return await self._run_inner(
+                        session_id, user_message, source, channel, model,
+                        internal=internal, images=images,
+                    )
+                finally:
+                    self.sessions.mark_not_running(session_id)
+                    broadcaster.stop_buffering(session_id)
+                    # Notify all connected clients that this session stopped
+                    await broadcaster.broadcast("__global__", {
+                        "type": "session_running",
+                        "session_id": session_id,
+                        "is_running": False,
+                    })
 
     async def _run_inner(
         self,
@@ -1124,11 +1119,19 @@ class AgentEngine:
                 return ""
 
             # Send message — the client preserves conversation history internally
+            # Escape slash-prefixed messages so Claude Code CLI doesn't
+            # intercept them as built-in slash commands.  Registered bot
+            # commands (/stop, /new, etc.) are handled upstream — anything
+            # that reaches here should go straight to the LLM.
+            query_text = user_message
+            if query_text and query_text.startswith("/"):
+                query_text = "\u200b" + query_text
+
             if images:
                 # Build multi-modal content blocks (text + images)
                 content_blocks: list[dict[str, Any]] = []
-                if user_message:
-                    content_blocks.append({"type": "text", "text": user_message})
+                if query_text:
+                    content_blocks.append({"type": "text", "text": query_text})
                 for img in images:
                     content_blocks.append({
                         "type": "image",
@@ -1148,7 +1151,7 @@ class AgentEngine:
 
                 await client.query(_image_prompt())
             else:
-                await client.query(user_message)
+                await client.query(query_text)
 
             async for message in client.receive_response():
                 # Early-capture sdk_session_id from first message that

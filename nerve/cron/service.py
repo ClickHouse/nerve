@@ -210,11 +210,15 @@ class CronService:
 
     async def _maybe_rotate_context(
         self, session_id: str, rotate_hours: int,
+        rotate_at: str = "",
     ) -> bool:
         """Check if a persistent cron session's context should be rotated.
 
         Rotation clears the sdk_session_id so the next run starts a fresh
         SDK client.  Old messages remain in the DB for memU search.
+
+        If rotate_at is set (e.g. "04:00"), rotation happens once per day
+        at that local time instead of using the hours-based approach.
 
         Returns True if rotation was performed.
         """
@@ -236,11 +240,35 @@ class CronService:
             )
             return False
 
-        age_hours = (
-            datetime.now(timezone.utc) - connected_at
-        ).total_seconds() / 3600
+        now = datetime.now(timezone.utc)
+        should_rotate = False
+        reason = ""
 
-        if age_hours < rotate_hours:
+        if rotate_at:
+            # Time-of-day rotation: rotate if session started before today's
+            # rotate_at and current time is past it.
+            try:
+                hour, minute = (int(x) for x in rotate_at.split(":"))
+            except (ValueError, TypeError):
+                logger.warning("Invalid context_rotate_at: %s", rotate_at)
+                return False
+
+            local_tz = datetime.now().astimezone().tzinfo
+            today_rotate = datetime.now(local_tz).replace(
+                hour=hour, minute=minute, second=0, microsecond=0,
+            )
+            today_rotate_utc = today_rotate.astimezone(timezone.utc)
+
+            if now >= today_rotate_utc and connected_at < today_rotate_utc:
+                should_rotate = True
+                reason = f"rotate_at={rotate_at}"
+        elif rotate_hours > 0:
+            age_hours = (now - connected_at).total_seconds() / 3600
+            if age_hours >= rotate_hours:
+                should_rotate = True
+                reason = f"age {age_hours:.1f}h >= {rotate_hours}h"
+
+        if not should_rotate:
             return False
 
         # Memorize current context before rotation (safety net)
@@ -252,8 +280,8 @@ class CronService:
         # Clear sdk_session_id + connected_at → next run starts fresh
         await self.engine.sessions.mark_idle(session_id, preserve_sdk_id=False)
         logger.info(
-            "Rotated context for persistent cron %s (age: %.1fh >= %dh)",
-            session_id, age_hours, rotate_hours,
+            "Rotated context for persistent cron %s (%s)",
+            session_id, reason,
         )
         return True
 
@@ -302,8 +330,35 @@ class CronService:
 
         return list(jobs_by_id.values())
 
+    async def _has_pending_messages(
+        self, consumer: str, sources: list[str],
+    ) -> bool:
+        """Check if any of the listed sources have unread messages.
+
+        Uses existing consumer cursor position vs source max rowid.
+        Does not advance any cursors.
+        """
+        for source in sources:
+            cursor_seq = await self.db.get_consumer_cursor(consumer, source)
+            max_seq = await self.db.get_source_max_rowid(source)
+            if max_seq > cursor_seq:
+                return True
+        return False
+
     async def _run_job_wrapper(self, job: CronJob) -> None:
         """Wrapper to run a cron job with logging."""
+        # Pre-check: skip if no new messages in monitored sources
+        if job.skip_when_idle:
+            has_pending = await self._has_pending_messages(
+                job.idle_consumer, job.skip_when_idle,
+            )
+            if not has_pending:
+                logger.info(
+                    "Skipping cron job %s: no new messages in %s",
+                    job.id, job.skip_when_idle,
+                )
+                return
+
         log_id = await self.db.log_cron_start(job.id)
         logger.info("Running cron job: %s (mode=%s)", job.id, job.session_mode)
 
@@ -313,9 +368,10 @@ class CronService:
 
             if job.session_mode == "persistent":
                 # Persistent mode: reuse SDK context across runs
-                if job.context_rotate_hours > 0:
+                if job.context_rotate_at or job.context_rotate_hours > 0:
                     rotated = await self._maybe_rotate_context(
                         f"cron:{job.id}", job.context_rotate_hours,
+                        rotate_at=job.context_rotate_at,
                     )
 
                 # Determine prompt: full on first run, short reminder on subsequent

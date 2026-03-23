@@ -207,6 +207,24 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
     return {"deleted": True}
 
 
+@router.patch("/api/sessions/{session_id}")
+async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
+    """Update session fields (title, starred)."""
+    session = await _db.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    fields: dict = {}
+    if "title" in req:
+        fields["title"] = req["title"]
+    if "starred" in req:
+        fields["starred"] = 1 if req["starred"] else 0
+    if not fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    await _db.update_session_fields(session_id, fields)
+    updated = await _db.get_session(session_id)
+    return updated
+
+
 @router.get("/api/sessions/{session_id}/status")
 async def session_status(session_id: str, user: dict = Depends(require_auth)):
     """Enhanced session status with lifecycle info."""
@@ -1463,8 +1481,9 @@ async def list_notifications(
         type=type or None,
         session_id=session_id or None,
         limit=min(limit, 200),
+        channel="web",
     )
-    pending_count = await _db.count_pending_notifications()
+    pending_count = await _db.count_pending_notifications(channel="web")
     return {"notifications": notifications, "pending_count": pending_count}
 
 

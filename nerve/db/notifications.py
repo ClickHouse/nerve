@@ -47,6 +47,7 @@ class NotificationStore:
     async def list_notifications(
         self, status: str | None = None, type: str | None = None,
         session_id: str | None = None, limit: int = 50,
+        channel: str | None = None,
     ) -> list[dict]:
         conditions = []
         params: list = []
@@ -59,6 +60,11 @@ class NotificationStore:
         if session_id:
             conditions.append("n.session_id = ?")
             params.append(session_id)
+        if channel:
+            # Filter: only show notifications delivered to this channel
+            # channels_delivered is JSON like '["telegram"]' or '["web","telegram"]'
+            conditions.append("(n.channels_delivered IS NULL OR n.channels_delivered LIKE ?)")
+            params.append(f'%"{channel}"%')
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
         async with self.db.execute(
@@ -122,10 +128,13 @@ class NotificationStore:
         await self.db.commit()
         return cursor.rowcount
 
-    async def count_pending_notifications(self) -> int:
-        async with self.db.execute(
-            "SELECT COUNT(*) FROM notifications WHERE status = 'pending'"
-        ) as cursor:
+    async def count_pending_notifications(self, channel: str | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM notifications WHERE status = 'pending'"
+        params: tuple = ()
+        if channel:
+            sql += ' AND (channels_delivered IS NULL OR channels_delivered LIKE ?)'
+            params = (f'%"{channel}"%',)
+        async with self.db.execute(sql, params) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 

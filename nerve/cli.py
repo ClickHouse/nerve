@@ -30,6 +30,7 @@ from nerve.config import load_config, set_config
 # Default PID file location
 PID_DIR = Path("~/.nerve").expanduser()
 PID_FILE = PID_DIR / "nerve.pid"
+CONFIG_DIR_FILE = PID_DIR / "config_dir"
 LOG_FILE = PID_DIR / "nerve.log"
 
 
@@ -68,9 +69,19 @@ def _is_running(pid: int) -> bool:
         return True  # Process exists but we can't signal it
 
 
-def _write_pid(pid: int) -> None:
+def _write_pid(pid: int, config_dir: Path | None = None) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(pid))
+    if config_dir is not None:
+        CONFIG_DIR_FILE.write_text(str(config_dir.resolve()))
+
+
+def _read_config_dir() -> Path | None:
+    """Read stored config directory. Returns None if not available."""
+    try:
+        return Path(CONFIG_DIR_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def _remove_pid() -> None:
@@ -240,7 +251,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     if foreground:
         # Run directly in this process
-        _write_pid(os.getpid())
+        _write_pid(os.getpid(), config_dir=config_dir)
         try:
             from nerve.gateway.server import run_server
             click.echo(f"Starting Nerve on {config.gateway.host}:{config.gateway.port}")
@@ -339,6 +350,12 @@ def restart(ctx: click.Context) -> None:
     """
     config = ctx.obj["config"]
     config_dir = Path(ctx.obj["config_dir"])
+
+    # Prefer the config dir stored by the running daemon — it's an absolute
+    # path that doesn't depend on the caller's CWD.
+    stored = _read_config_dir()
+    if stored is not None and stored.is_dir():
+        config_dir = stored
 
     # Docker mode: proxy to docker compose
     if _is_docker_mode(config):
@@ -511,42 +528,42 @@ def logs(ctx: click.Context) -> None:
             click.echo(line)
 
 
-@main.command()
-@click.pass_context
-def doctor(ctx: click.Context) -> None:
-    """Check config, DB, API keys, and connectivity."""
-    config = ctx.obj["config"]
-    errors = []
-    warnings = []
+def doctor_report(config) -> str:
+    """Run doctor checks and return the report as a plain-text string.
 
-    click.echo("Nerve Doctor")
-    click.echo("=" * 40)
+    Used by both the CLI ``nerve doctor`` command and the Telegram ``/doctor``
+    command so they share the same diagnostics.
+    """
+    lines: list[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    lines.append("Nerve Doctor")
+    lines.append("=" * 40)
 
     # Daemon status
     running, pid = _get_daemon_status()
     if running:
-        click.echo(f"[OK] Daemon running (PID {pid})")
+        lines.append(f"[OK] Daemon running (PID {pid})")
     else:
-        click.echo("[--] Daemon not running")
+        lines.append("[--] Daemon not running")
 
     # Check workspace
     if config.workspace.exists():
-        click.echo(f"[OK] Workspace: {config.workspace}")
-        # Check workspace files against mode's manifest
+        lines.append(f"[OK] Workspace: {config.workspace}")
         mode = getattr(config, "mode", "personal")
         try:
             from nerve.workspace import get_expected_files
             expected = get_expected_files(mode)
             for f in expected:
                 if (config.workspace / f).exists():
-                    click.echo(f"  [OK] {f}")
+                    lines.append(f"  [OK] {f}")
                 else:
                     warnings.append(f"  [WARN] {f} not found (expected for {mode} mode)")
         except (FileNotFoundError, ValueError):
-            # Fallback if templates aren't available
             for f in ["SOUL.md", "IDENTITY.md", "MEMORY.md"]:
                 if (config.workspace / f).exists():
-                    click.echo(f"  [OK] {f}")
+                    lines.append(f"  [OK] {f}")
                 else:
                     warnings.append(f"  [WARN] {f} not found")
     else:
@@ -556,10 +573,10 @@ def doctor(ctx: click.Context) -> None:
     if config.proxy.enabled:
         binary = config.proxy.binary_path.expanduser()
         if binary.exists():
-            click.echo(f"[OK] CLIProxyAPI binary: {binary}")
+            lines.append(f"[OK] CLIProxyAPI binary: {binary}")
         else:
             warnings.append(f"[WARN] CLIProxyAPI binary not found (will download on start): {binary}")
-        click.echo(f"[OK] Proxy configured: {config.proxy.host}:{config.proxy.port}")
+        lines.append(f"[OK] Proxy configured: {config.proxy.host}:{config.proxy.port}")
         try:
             import httpx
             resp = httpx.get(
@@ -568,7 +585,7 @@ def doctor(ctx: click.Context) -> None:
                 timeout=3,
             )
             if resp.status_code == 200:
-                click.echo("[OK] Proxy is running and healthy")
+                lines.append("[OK] Proxy is running and healthy")
             else:
                 warnings.append(f"[WARN] Proxy returned status {resp.status_code}")
         except Exception:
@@ -577,58 +594,58 @@ def doctor(ctx: click.Context) -> None:
     # Check API keys
     if config.proxy.enabled:
         if config.anthropic_api_key:
-            click.echo(f"[--] Anthropic API key set (proxy takes precedence)")
+            lines.append("[--] Anthropic API key set (proxy takes precedence)")
         else:
-            click.echo("[--] Anthropic API key not set (using proxy)")
+            lines.append("[--] Anthropic API key not set (using proxy)")
     elif config.anthropic_api_key:
-        click.echo(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
+        lines.append(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
     else:
         errors.append("[ERR] Anthropic API key not set and proxy not enabled (config.local.yaml)")
 
     if config.openai_api_key:
-        click.echo(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}")
+        lines.append(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}")
     else:
         warnings.append("[WARN] OpenAI API key not set (needed for memU embeddings)")
 
     # Check Telegram
     if config.telegram.enabled:
         if config.telegram.bot_token:
-            click.echo(f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}")
+            lines.append(f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}")
         else:
             errors.append("[ERR] Telegram enabled but bot_token not set")
     else:
-        click.echo("[--] Telegram disabled")
+        lines.append("[--] Telegram disabled")
 
     # Check SSL
     if config.gateway.ssl.enabled:
         if config.gateway.ssl.cert and config.gateway.ssl.cert.exists():
-            click.echo(f"[OK] SSL cert: {config.gateway.ssl.cert}")
+            lines.append(f"[OK] SSL cert: {config.gateway.ssl.cert}")
         else:
             warnings.append("[WARN] SSL cert not found")
         if config.gateway.ssl.key and config.gateway.ssl.key.exists():
-            click.echo(f"[OK] SSL key: {config.gateway.ssl.key}")
+            lines.append(f"[OK] SSL key: {config.gateway.ssl.key}")
         else:
             warnings.append("[WARN] SSL key not found")
     else:
-        click.echo("[--] SSL not configured")
+        lines.append("[--] SSL not configured")
 
     # Check auth
     if config.auth.password_hash:
-        click.echo("[OK] Auth password hash configured")
+        lines.append("[OK] Auth password hash configured")
     else:
         warnings.append("[WARN] Auth password not set — running in dev mode (no auth)")
 
     if config.auth.jwt_secret:
-        click.echo("[OK] JWT secret configured")
+        lines.append("[OK] JWT secret configured")
     else:
         warnings.append("[WARN] JWT secret not set — running in dev mode")
 
     # Check DB
     db_path = Path("~/.nerve/nerve.db").expanduser()
     if db_path.exists():
-        click.echo(f"[OK] Database: {db_path} ({db_path.stat().st_size / 1024:.1f} KB)")
+        lines.append(f"[OK] Database: {db_path} ({db_path.stat().st_size / 1024:.1f} KB)")
     else:
-        click.echo(f"[--] Database will be created at: {db_path}")
+        lines.append(f"[--] Database will be created at: {db_path}")
 
     # Check cron files
     if config.cron.system_file.exists():
@@ -636,45 +653,55 @@ def doctor(ctx: click.Context) -> None:
             from nerve.cron.jobs import load_jobs
             system_jobs = load_jobs(config.cron.system_file)
             enabled = sum(1 for j in system_jobs if j.enabled)
-            click.echo(f"[OK] System crons: {config.cron.system_file} ({enabled}/{len(system_jobs)} enabled)")
+            lines.append(f"[OK] System crons: {config.cron.system_file} ({enabled}/{len(system_jobs)} enabled)")
         except Exception:
-            click.echo(f"[OK] System crons: {config.cron.system_file}")
+            lines.append(f"[OK] System crons: {config.cron.system_file}")
     else:
-        click.echo(f"[--] No system crons at: {config.cron.system_file}")
+        lines.append(f"[--] No system crons at: {config.cron.system_file}")
 
     if config.cron.jobs_file.exists():
         try:
             from nerve.cron.jobs import load_jobs as _load_jobs
             user_jobs = _load_jobs(config.cron.jobs_file)
             if user_jobs:
-                click.echo(f"[OK] User crons: {config.cron.jobs_file} ({len(user_jobs)} jobs)")
+                lines.append(f"[OK] User crons: {config.cron.jobs_file} ({len(user_jobs)} jobs)")
             else:
-                click.echo(f"[OK] User crons: {config.cron.jobs_file} (empty)")
+                lines.append(f"[OK] User crons: {config.cron.jobs_file} (empty)")
         except Exception:
-            click.echo(f"[OK] User crons: {config.cron.jobs_file}")
+            lines.append(f"[OK] User crons: {config.cron.jobs_file}")
     else:
-        click.echo(f"[--] No user crons at: {config.cron.jobs_file}")
+        lines.append(f"[--] No user crons at: {config.cron.jobs_file}")
 
     # Check external tools
     import shutil
     for tool_name in ["gog", "gh"]:
         if shutil.which(tool_name):
-            click.echo(f"[OK] {tool_name} CLI found")
+            lines.append(f"[OK] {tool_name} CLI found")
         else:
             warnings.append(f"[WARN] {tool_name} CLI not found (needed for sync)")
 
     # Summary
-    click.echo()
-    for w in warnings:
-        click.echo(w)
-    for e in errors:
-        click.echo(e)
+    lines.append("")
+    lines.extend(warnings)
+    lines.extend(errors)
 
     if errors:
-        click.echo(f"\n{len(errors)} error(s), {len(warnings)} warning(s)")
-        ctx.exit(1)
+        lines.append(f"\n{len(errors)} error(s), {len(warnings)} warning(s)")
     else:
-        click.echo(f"\nAll good! {len(warnings)} warning(s)")
+        lines.append(f"\nAll good! {len(warnings)} warning(s)")
+
+    return "\n".join(lines)
+
+
+@main.command()
+@click.pass_context
+def doctor(ctx: click.Context) -> None:
+    """Check config, DB, API keys, and connectivity."""
+    config = ctx.obj["config"]
+    report = doctor_report(config)
+    click.echo(report)
+    if "[ERR]" in report:
+        ctx.exit(1)
 
 
 @main.command()
