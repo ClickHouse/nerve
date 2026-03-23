@@ -49,16 +49,7 @@ nerve start -f
 ```
 </details>
 
-**No API key?** Use your Claude subscription instead:
-```bash
-NERVE_USE_PROXY=1 nerve init --non-interactive
-```
-
-**Docker:**
-```bash
-nerve init           # Generates Dockerfile + docker-compose.yml
-nerve start          # All CLI commands proxy to docker compose
-```
+**No API key?** Use your Claude subscription instead
 
 ## Two Modes
 
