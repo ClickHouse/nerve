@@ -30,6 +30,7 @@ from nerve.config import load_config, set_config
 # Default PID file location
 PID_DIR = Path("~/.nerve").expanduser()
 PID_FILE = PID_DIR / "nerve.pid"
+CONFIG_DIR_FILE = PID_DIR / "config_dir"
 LOG_FILE = PID_DIR / "nerve.log"
 
 
@@ -68,9 +69,19 @@ def _is_running(pid: int) -> bool:
         return True  # Process exists but we can't signal it
 
 
-def _write_pid(pid: int) -> None:
+def _write_pid(pid: int, config_dir: Path | None = None) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(pid))
+    if config_dir is not None:
+        CONFIG_DIR_FILE.write_text(str(config_dir.resolve()))
+
+
+def _read_config_dir() -> Path | None:
+    """Read stored config directory. Returns None if not available."""
+    try:
+        return Path(CONFIG_DIR_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def _remove_pid() -> None:
@@ -240,7 +251,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     if foreground:
         # Run directly in this process
-        _write_pid(os.getpid())
+        _write_pid(os.getpid(), config_dir=config_dir)
         try:
             from nerve.gateway.server import run_server
             click.echo(f"Starting Nerve on {config.gateway.host}:{config.gateway.port}")
@@ -339,6 +350,12 @@ def restart(ctx: click.Context) -> None:
     """
     config = ctx.obj["config"]
     config_dir = Path(ctx.obj["config_dir"])
+
+    # Prefer the config dir stored by the running daemon — it's an absolute
+    # path that doesn't depend on the caller's CWD.
+    stored = _read_config_dir()
+    if stored is not None and stored.is_dir():
+        config_dir = stored
 
     # Docker mode: proxy to docker compose
     if _is_docker_mode(config):

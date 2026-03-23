@@ -90,16 +90,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
 
   const activeIsRunning = agentStatus.state !== 'idle';
 
-  // Split running conversations to pin them at the top
-  const { pinnedRunning, restConversations } = useMemo(() => {
-    const pinned: Session[] = [];
+  // Split running and starred conversations to pin them at the top
+  const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+    const running: Session[] = [];
+    const starred: Session[] = [];
     const rest: Session[] = [];
     for (const s of conversations) {
-      const running = s.id === activeSession ? activeIsRunning : !!s.is_running;
-      if (running) pinned.push(s);
+      const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
+      if (isRunning) running.push(s);
+      else if (s.starred) starred.push(s);
       else rest.push(s);
     }
-    return { pinnedRunning: pinned, restConversations: rest };
+    return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
   }, [conversations, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
@@ -213,8 +215,29 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
               </div>
             )}
 
+            {/* Pinned starred sessions */}
+            {pinnedStarred.length > 0 && (
+              <div>
+                <div className="px-3 pt-2 pb-0.5">
+                  <span className="text-[10px] text-yellow-600/70 font-medium">Starred</span>
+                </div>
+                {pinnedStarred.map((s) => (
+                  <SessionItem
+                    key={s.id}
+                    session={s}
+                    isActive={s.id === activeSession}
+                    isRunning={false}
+                    onSelect={onSelect}
+                    onDelete={onDelete}
+                    onRename={renameSession}
+                    onToggleStar={toggleStar}
+                  />
+                ))}
+              </div>
+            )}
+
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && (
+            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && (
               <div className="px-3 py-2 text-[11px] text-[#444]">No conversations yet</div>
             )}
 
