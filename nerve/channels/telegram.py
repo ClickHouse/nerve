@@ -107,6 +107,52 @@ def _md_to_tg_html(text: str) -> str:
     return text
 
 
+def _format_forward_context(message: Any) -> str:
+    """Extract forward origin info from a Telegram message.
+
+    Returns a prefix string like:
+        [Forwarded from Иван Иванов]
+        [Forwarded from Новости]
+        [Forwarded from hidden user "Аноним"]
+
+    Returns empty string if the message is not forwarded.
+    """
+    origin = getattr(message, "forward_origin", None)
+    if not origin:
+        return ""
+
+    origin_type = getattr(origin, "type", None)
+
+    if origin_type == "user":
+        user = getattr(origin, "sender_user", None)
+        if user:
+            name = getattr(user, "first_name", "") or ""
+            last = getattr(user, "last_name", "") or ""
+            full = f"{name} {last}".strip() or "unknown"
+            username = getattr(user, "username", None)
+            if username:
+                return f'[Forwarded from {full} (@{username})]'
+            return f'[Forwarded from {full}]'
+
+    elif origin_type == "hidden_user":
+        name = getattr(origin, "sender_user_name", None) or "unknown"
+        return f'[Forwarded from hidden user "{name}"]'
+
+    elif origin_type == "chat":
+        chat = getattr(origin, "sender_chat", None)
+        if chat:
+            title = getattr(chat, "title", None) or "unknown chat"
+            return f'[Forwarded from chat "{title}"]'
+
+    elif origin_type == "channel":
+        chat = getattr(origin, "chat", None)
+        if chat:
+            title = getattr(chat, "title", None) or "unknown channel"
+            return f'[Forwarded from channel "{title}"]'
+
+    return "[Forwarded message]"
+
+
 def _format_reply_context(message: Any) -> str:
     """Extract reply-to context and quote from a Telegram message.
 
@@ -740,6 +786,11 @@ class TelegramChannel(BaseChannel):
         # Cache for reaction lookups (raw text, before reply-context prefix)
         self._cache_message(update.message.message_id, chat_id, text)
 
+        # Prepend forward origin (if forwarded message)
+        forward_context = _format_forward_context(update.message)
+        if forward_context:
+            text = f"{forward_context}\n\n{text}" if text else forward_context
+
         # Prepend reply-to context and quote (if replying to a message)
         reply_context = _format_reply_context(update.message)
         if reply_context:
@@ -888,6 +939,11 @@ class TelegramChannel(BaseChannel):
             if caption:
                 text = caption
                 break
+
+        # Prepend forward origin (album forward info is on the first message)
+        forward_context = _format_forward_context(updates[0].message)
+        if forward_context:
+            text = f"{forward_context}\n\n{text}" if text else forward_context
 
         # Prepend reply-to context (album reply info is on the first message)
         reply_context = _format_reply_context(updates[0].message)
