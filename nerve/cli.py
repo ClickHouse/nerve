@@ -647,30 +647,35 @@ def doctor_report(config) -> str:
     else:
         lines.append(f"[--] Database will be created at: {db_path}")
 
-    # Check cron files
-    if config.cron.system_file.exists():
-        try:
-            from nerve.cron.jobs import load_jobs
-            system_jobs = load_jobs(config.cron.system_file)
-            enabled = sum(1 for j in system_jobs if j.enabled)
-            lines.append(f"[OK] System crons: {config.cron.system_file} ({enabled}/{len(system_jobs)} enabled)")
-        except Exception:
-            lines.append(f"[OK] System crons: {config.cron.system_file}")
-    else:
-        lines.append(f"[--] No system crons at: {config.cron.system_file}")
+    # Check cron files (merge like the scheduler does: user jobs override system by ID)
+    try:
+        from nerve.cron.jobs import load_jobs
 
-    if config.cron.jobs_file.exists():
-        try:
-            from nerve.cron.jobs import load_jobs as _load_jobs
-            user_jobs = _load_jobs(config.cron.jobs_file)
-            if user_jobs:
-                lines.append(f"[OK] User crons: {config.cron.jobs_file} ({len(user_jobs)} jobs)")
-            else:
-                lines.append(f"[OK] User crons: {config.cron.jobs_file} (empty)")
-        except Exception:
+        system_jobs = load_jobs(config.cron.system_file) if config.cron.system_file.exists() else []
+        user_jobs = load_jobs(config.cron.jobs_file) if config.cron.jobs_file.exists() else []
+
+        # Merge: user jobs override system jobs with the same ID
+        merged: dict[str, object] = {j.id: j for j in system_jobs}
+        overridden = sum(1 for j in user_jobs if j.id in merged)
+        for j in user_jobs:
+            merged[j.id] = j
+
+        all_jobs = list(merged.values())
+        enabled = sum(1 for j in all_jobs if j.enabled)
+
+        if all_jobs:
+            detail = f"{enabled}/{len(all_jobs)} enabled"
+            if overridden:
+                detail += f", {overridden} overridden in jobs.yaml"
+            lines.append(f"[OK] Cron jobs: {detail}")
+        else:
+            lines.append("[--] No cron jobs configured")
+    except Exception:
+        # Fallback: just report file existence
+        if config.cron.system_file.exists():
+            lines.append(f"[OK] System crons: {config.cron.system_file}")
+        if config.cron.jobs_file.exists():
             lines.append(f"[OK] User crons: {config.cron.jobs_file}")
-    else:
-        lines.append(f"[--] No user crons at: {config.cron.jobs_file}")
 
     # Check external tools
     import shutil
