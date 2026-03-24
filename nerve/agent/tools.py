@@ -1617,7 +1617,7 @@ async def _notify_impl(args: dict, session_id: str) -> dict:
     if not _notification_service:
         return {"content": [{"type": "text", "text": "Notification service not available."}]}
 
-    title = args["title"]
+    title = args.get("title", "")
     body = args.get("body", "")
     priority = args.get("priority", "normal")
 
@@ -1902,7 +1902,7 @@ def create_nerve_mcp_server():
 
 # Notification tool schemas — shared between module-level and session-scoped definitions
 _NOTIFY_SCHEMA = {
-    "title": {"type": "string", "description": "Short notification title (shown as heading)"},
+    "title": {"type": "string", "description": "Short notification title (shown as heading)", "default": ""},
     "body": {"type": "string", "description": "Optional notification body with details (markdown supported)", "default": ""},
     "priority": {"type": "string", "description": "Priority level: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
 }
