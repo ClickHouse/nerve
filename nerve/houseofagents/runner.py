@@ -65,6 +65,9 @@ class HoARunner:
 
         if pipeline_file:
             cmd.extend(["--pipeline", str(pipeline_file)])
+            # Pass prompt alongside pipeline — overrides the TOML's initial_prompt
+            if prompt:
+                cmd.extend(["--prompt", prompt])
         else:
             cmd.extend(["--prompt", prompt])
             cmd.extend(["--mode", mode])

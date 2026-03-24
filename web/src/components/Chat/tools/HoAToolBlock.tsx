@@ -14,10 +14,13 @@ function getProviderStyle(kind?: string) {
 }
 
 interface HoAEvent {
-  event?: string;     // event type: agent_started, agent_log, agent_finished, etc.
+  event?: string;     // event type: block_started, block_log, block_finished, etc.
   agent?: string;
   provider?: string;  // anthropic, openai, gemini
+  label?: string;     // pipeline block name (e.g. "Implement", "Review")
+  block_id?: number;
   iteration?: number;
+  loop_pass?: number;
   message?: string;
   [key: string]: unknown;
 }
@@ -27,10 +30,12 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
   const isRunning = block.status === 'running';
   const events: HoAEvent[] = (block.hoaEvents as HoAEvent[] | undefined) || [];
 
-  // Extract state from events
+  // Extract state from latest events
   const lastEvent = events.length > 0 ? events[events.length - 1] : null;
   const activeAgent = lastEvent?.agent ?? undefined;
   const activeProvider = lastEvent?.provider ?? undefined;
+  // Find the latest block label from block_started events
+  const activeLabel = [...events].reverse().find(e => e.label)?.label;
   const mode = String(block.input?.mode || 'relay');
   const agents = String(block.input?.agents || '');
 
@@ -49,7 +54,8 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
         <Users size={14} className="text-amber-400 shrink-0" />
         <span className="text-[13px] font-mono font-medium text-[#ccc]">hoa_execute</span>
         <span className="text-[12px] text-amber-400/60 font-mono">{mode}</span>
-        {agents && <span className="text-[12px] text-[#555] font-mono truncate">{agents}</span>}
+        {activeLabel && isRunning && <span className="text-[12px] text-[#888]">· {activeLabel}</span>}
+        {agents && !activeLabel && <span className="text-[12px] text-[#555] font-mono truncate">{agents}</span>}
 
         {isRunning && activeAgent ? (
           <span className={`ml-2 px-1.5 py-0.5 text-[10px] rounded border ${getProviderStyle(activeProvider)}`}>
@@ -70,6 +76,11 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
               <div className="space-y-1">
                 {events.slice(-20).map((event, i) => (
                   <div key={i} className="flex items-center gap-2 text-[11px]">
+                    {event.label && (
+                      <span className="px-1.5 py-0.5 rounded bg-[#2a2a2a] text-[#aaa] border border-[#333] text-[10px]">
+                        {event.label}
+                      </span>
+                    )}
                     {event.agent && (
                       <span className={`px-1.5 py-0.5 rounded border text-[10px] ${getProviderStyle(event.provider)}`}>
                         {event.agent}
@@ -81,7 +92,7 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
                     {event.message && (
                       <span className="text-[#777] truncate">{event.message}</span>
                     )}
-                    {!event.message && !event.agent && (
+                    {!event.message && !event.agent && !event.label && (
                       <span className="text-[#555] font-mono truncate">
                         {JSON.stringify(event).slice(0, 80)}
                       </span>
