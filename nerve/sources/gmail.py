@@ -163,12 +163,13 @@ class GmailSource(Source):
 
                 # Keep original HTML for UI rendering.
                 raw_html: str | None = html_body
-                # Prefer gog's plain-text body — it already handles
-                # multipart/alternative and produces clean text.  Only
-                # fall back to html2text when the plain text is missing
-                # or is itself HTML (single-part HTML emails).
-                if html_body and (not body or _looks_like_html(body)):
-                    body = _html_to_text(html_body)
+                # Use HTML-to-text when it's more complete than plain text
+                # (e.g. Amazon pickup emails include DHL tracking only in
+                # HTML).  Fall back to gog's plain-text body otherwise.
+                if html_body:
+                    html_text = _html_to_text(html_body)
+                    if not body or _looks_like_html(body) or len(html_text) > len(body):
+                        body = html_text
 
                 records.append(SourceRecord(
                     id=msg.get("id", ""),
