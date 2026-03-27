@@ -348,3 +348,96 @@ class TestCronJobCatchup:
             "id": "x", "schedule": "1h", "prompt": "p", "catchup": False,
         })
         assert job.catchup is False
+
+
+# ---------------------------------------------------------------------------
+# CronJob.lock field
+# ---------------------------------------------------------------------------
+
+class TestCronJobLock:
+    def test_default_false(self):
+        job = _make_job()
+        assert job.lock is False
+
+    def test_from_dict_default(self):
+        job = CronJob.from_dict({"id": "x", "schedule": "1h", "prompt": "p"})
+        assert job.lock is False
+
+    def test_from_dict_explicit_true(self):
+        job = CronJob.from_dict({
+            "id": "x", "schedule": "1h", "prompt": "p", "lock": True,
+        })
+        assert job.lock is True
+
+
+# ---------------------------------------------------------------------------
+# Job lock (concurrent run serialization)
+# ---------------------------------------------------------------------------
+
+class TestJobLock:
+    @pytest.mark.asyncio
+    async def test_lock_serializes_concurrent_runs(self, cron_service):
+        """When lock=True, overlapping runs execute sequentially."""
+        call_order = []
+
+        async def slow_cron(*args, **kwargs):
+            call_order.append("start")
+            await asyncio.sleep(0.1)
+            call_order.append("end")
+            return "ok"
+
+        cron_service.engine.run_cron = slow_cron
+        job = _make_job(id="locked-job", lock=True)
+
+        await asyncio.gather(
+            cron_service._run_job_wrapper(job),
+            cron_service._run_job_wrapper(job),
+        )
+
+        # With lock: runs are sequential — start/end/start/end
+        assert call_order == ["start", "end", "start", "end"]
+
+    @pytest.mark.asyncio
+    async def test_no_lock_allows_concurrent_runs(self, cron_service):
+        """When lock=False (default), runs can overlap."""
+        call_order = []
+
+        async def slow_cron(*args, **kwargs):
+            call_order.append("start")
+            await asyncio.sleep(0.1)
+            call_order.append("end")
+            return "ok"
+
+        cron_service.engine.run_cron = slow_cron
+        job = _make_job(id="unlocked-job", lock=False)
+
+        await asyncio.gather(
+            cron_service._run_job_wrapper(job),
+            cron_service._run_job_wrapper(job),
+        )
+
+        # Without lock: runs overlap — start/start/end/end
+        assert call_order == ["start", "start", "end", "end"]
+
+    @pytest.mark.asyncio
+    async def test_lock_uses_per_job_locks(self, cron_service):
+        """Different locked jobs get independent locks (don't block each other)."""
+        call_order = []
+
+        async def slow_cron(*args, **kwargs):
+            call_order.append(f"start")
+            await asyncio.sleep(0.1)
+            call_order.append(f"end")
+            return "ok"
+
+        cron_service.engine.run_cron = slow_cron
+        job_a = _make_job(id="job-a", lock=True)
+        job_b = _make_job(id="job-b", lock=True)
+
+        await asyncio.gather(
+            cron_service._run_job_wrapper(job_a),
+            cron_service._run_job_wrapper(job_b),
+        )
+
+        # Different jobs run concurrently even with lock=True
+        assert call_order == ["start", "start", "end", "end"]

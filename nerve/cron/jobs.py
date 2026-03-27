@@ -29,6 +29,7 @@ class CronJob:
     reminder_mode: bool = False  # Persistent only: send short reminder instead of full prompt on subsequent runs
     catchup: bool = True  # Fire once on startup if missed while server was down
     enabled: bool = True
+    lock: bool = False  # When True, prevent concurrent runs of this job (next run waits for previous)
     skip_when_idle: list[str] = field(default_factory=list)  # Source names to check; skip run if no new messages
     idle_consumer: str = "inbox"  # Consumer cursor name for the idle check
     show_session_label: bool = True  # Show "Session: ..." in notification messages
@@ -48,6 +49,7 @@ class CronJob:
             reminder_mode=bool(d.get("reminder_mode", False)),
             catchup=d.get("catchup", True),
             enabled=d.get("enabled", True),
+            lock=bool(d.get("lock", False)),
             skip_when_idle=d.get("skip_when_idle", []),
             idle_consumer=d.get("idle_consumer", "inbox"),
             show_session_label=d.get("show_session_label", True),
@@ -100,6 +102,7 @@ def save_jobs(jobs: list[CronJob], jobs_file: Path) -> None:
             "reminder_mode": job.reminder_mode,
             "catchup": job.catchup,
             "enabled": job.enabled,
+            "lock": job.lock,
             "skip_when_idle": job.skip_when_idle,
             "idle_consumer": job.idle_consumer,
             "show_session_label": job.show_session_label,

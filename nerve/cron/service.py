@@ -60,6 +60,7 @@ class CronService:
         self.scheduler = AsyncIOScheduler()
         self._jobs: list[CronJob] = []
         self._source_runners: list[SourceRunner] = []
+        self._job_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
@@ -346,7 +347,16 @@ class CronService:
         return False
 
     async def _run_job_wrapper(self, job: CronJob) -> None:
-        """Wrapper to run a cron job with logging."""
+        """Wrapper to run a cron job with logging and optional lock."""
+        if job.lock:
+            lock = self._job_locks.setdefault(job.id, asyncio.Lock())
+            async with lock:
+                await self._run_job_inner(job)
+        else:
+            await self._run_job_inner(job)
+
+    async def _run_job_inner(self, job: CronJob) -> None:
+        """Inner implementation of job execution."""
         # Pre-check: skip if no new messages in monitored sources
         if job.skip_when_idle:
             has_pending = await self._has_pending_messages(
@@ -548,6 +558,7 @@ class CronService:
                 "description": job.description,
                 "enabled": job.enabled,
                 "session_mode": job.session_mode,
+                "lock": job.lock,
                 "next_run": next_run.isoformat() if next_run else None,
             })
 
