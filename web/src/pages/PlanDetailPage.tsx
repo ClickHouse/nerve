@@ -4,20 +4,7 @@ import { ArrowLeft, Check, X, MessageSquare, ExternalLink, Users, ChevronDown } 
 import { usePlanStore } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 import { api } from '../api/client';
-
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
-  approved: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
-  implementing: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
-  declined: 'bg-red-400/10 text-red-400 border-red-400/20',
-  superseded: 'bg-[#333]/50 text-[#888] border-[#333]',
-  failed: 'bg-red-400/10 text-red-400 border-red-400/20',
-};
-
-const TYPE_STYLES: Record<string, { label: string; className: string }> = {
-  'skill-create': { label: 'Skill', className: 'bg-purple-400/10 text-purple-400 border-purple-400/20' },
-  'skill-update': { label: 'Skill Update', className: 'bg-purple-400/10 text-purple-300 border-purple-400/20' },
-};
+import { PLAN_STATUS_STYLES as STATUS_STYLES, PLAN_TYPE_STYLES as TYPE_STYLES } from '../constants/statusStyles';
 
 interface HoaStatus {
   enabled: boolean;
