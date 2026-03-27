@@ -94,6 +94,8 @@ detect_os() {
                         DISTRO="arch"; PKG_MGR="pacman" ;;
                     opensuse*)
                         DISTRO="suse"; PKG_MGR="zypper" ;;
+                    nixos)
+                        DISTRO="nixos"; PKG_MGR="nix" ;;
                     *)
                         DISTRO="${ID:-unknown}" ;;
                 esac
@@ -115,6 +117,17 @@ detect_os() {
     esac
 }
 
+# --- NixOS helper ---
+
+nixos_require() {
+    local tool="$1"
+    if command_exists "$tool"; then return 0; fi
+    error "$tool is required but not found."
+    error "On NixOS, enter the dev shell first:  nix develop"
+    error "Or install $tool in your system/user profile."
+    exit 1
+}
+
 # --- Dependency: git ---
 
 ensure_git() {
@@ -122,6 +135,8 @@ ensure_git() {
         success "git $(git --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
         return
     fi
+
+    if [ "$DISTRO" = "nixos" ]; then nixos_require git; return; fi
 
     info "git is not installed"
     if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
@@ -161,6 +176,8 @@ ensure_uv() {
         success "uv $(uv --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
         return
     fi
+
+    if [ "$DISTRO" = "nixos" ]; then nixos_require uv; return; fi
 
     info "Installing uv (Python package manager)..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -213,6 +230,11 @@ ensure_python() {
 
     # Last resort: system packages
     warn "uv python install failed. Trying system packages..."
+
+    if [ "$DISTRO" = "nixos" ]; then
+        error "uv python install failed. On NixOS, ensure you're in the dev shell: nix develop"
+        exit 1
+    fi
 
     if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
         error "Cannot install Python: no sudo and uv python install failed."
@@ -275,6 +297,8 @@ ensure_node() {
         fi
         warn "Node.js $(node --version) is too old (need v${MIN_NODE_MAJOR}+)"
     fi
+
+    if [ "$DISTRO" = "nixos" ]; then nixos_require node; return; fi
 
     info "Node.js ${MIN_NODE_MAJOR}+ is not installed"
 
