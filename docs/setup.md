@@ -5,7 +5,7 @@
 The fastest way to get Nerve running:
 
 ```bash
-git clone https://github.com/pufit/nerve.git nerve
+git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
 pip install -e .       # or: uv pip install -e .
 cd web && npm install && npm run build && cd ..
@@ -31,7 +31,7 @@ The `nerve init` wizard walks you through deployment, mode selection, API keys, 
 ### Option A: Server (bare metal)
 
 ```bash
-git clone https://github.com/pufit/nerve.git nerve
+git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
 
 # Create virtual environment
@@ -51,7 +51,7 @@ nerve init
 ### Option B: Docker
 
 ```bash
-git clone https://github.com/pufit/nerve.git nerve
+git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
 pip install -e .   # Needed to run the wizard on the host
 nerve init         # Choose "docker" at the deployment step
