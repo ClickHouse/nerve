@@ -10,12 +10,7 @@ interface Task {
   created_at: string;
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  pending: 'text-yellow-400',
-  in_progress: 'text-blue-400',
-  done: 'text-green-400',
-  deferred: 'text-[#888]',
-};
+import { TASK_STATUS_TEXT_COLORS as STATUS_COLORS } from '../../constants/statusStyles';
 
 export function TaskList() {
   const [tasks, setTasks] = useState<Task[]>([]);

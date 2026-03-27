@@ -2,13 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bell, X, CheckCheck, EyeOff } from 'lucide-react';
 import { useNotificationStore, type Notification } from '../stores/notificationStore';
-
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
-  answered: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
-  expired: 'bg-[#333]/50 text-[#888] border-[#333]',
-  dismissed: 'bg-[#333]/50 text-[#666] border-[#333]',
-};
+import { NOTIFICATION_STATUS_STYLES as STATUS_STYLES } from '../constants/statusStyles';
 
 const PRIORITY_DOTS: Record<string, string> = {
   urgent: 'bg-red-500',

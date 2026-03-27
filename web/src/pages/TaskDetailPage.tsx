@@ -3,13 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Edit3, Eye, Save, Calendar, ExternalLink } from 'lucide-react';
 import { useTaskStore } from '../stores/taskStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
-
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
-  in_progress: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
-  done: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
-  deferred: 'bg-[#333]/50 text-[#888] border-[#333]',
-};
+import { TASK_STATUS_STYLES as STATUS_STYLES } from '../constants/statusStyles';
 
 export function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
