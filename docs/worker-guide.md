@@ -6,7 +6,7 @@ Worker mode deploys Nerve as a task-focused autonomous agent. Give it a job desc
 
 ```bash
 # Clone and install
-git clone https://github.com/pufit/nerve.git nerve
+git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
 uv venv && source .venv/bin/activate
 uv pip install -e .
