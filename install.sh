@@ -343,6 +343,11 @@ setup_repo() {
         info "Existing installation found at $INSTALL_DIR"
         info "Pulling latest changes..."
         git -C "$INSTALL_DIR" fetch origin "$NERVE_BRANCH" --depth 1
+        if ! git -C "$INSTALL_DIR" diff --quiet 2>/dev/null; then
+            warn "Local changes detected — stashing before update"
+            git -C "$INSTALL_DIR" stash push -m "nerve-installer-$(date +%Y%m%d-%H%M%S)"
+            info "Recover with: git -C $INSTALL_DIR stash pop"
+        fi
         git -C "$INSTALL_DIR" checkout "$NERVE_BRANCH" 2>/dev/null || git -C "$INSTALL_DIR" checkout -b "$NERVE_BRANCH" "origin/$NERVE_BRANCH"
         git -C "$INSTALL_DIR" reset --hard "origin/$NERVE_BRANCH"
         IS_UPGRADE=1
@@ -364,7 +369,7 @@ setup_repo() {
 setup_python_env() {
     step "Setting up Python environment"
 
-    cd "$INSTALL_DIR"
+    cd "$INSTALL_DIR" || exit 1
 
     if [ ! -d ".venv" ]; then
         info "Creating virtualenv..."
@@ -385,7 +390,7 @@ setup_python_env() {
 build_web_ui() {
     step "Building web UI"
 
-    cd "$INSTALL_DIR/web"
+    cd "$INSTALL_DIR/web" || exit 1
 
     info "Installing npm dependencies..."
     npm ci --quiet 2>/dev/null || npm install --quiet
@@ -456,7 +461,7 @@ run_init() {
         return
     fi
 
-    cd "$INSTALL_DIR"
+    cd "$INSTALL_DIR" || exit 1
     "$nerve_bin" init
 }
 
