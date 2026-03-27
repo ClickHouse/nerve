@@ -108,6 +108,8 @@ class AgentEngine:
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
+        # Background task watcher tracking — one watcher per session max.
+        self._background_watchers: dict[str, asyncio.Task] = {}
 
     async def initialize(self) -> None:
         """Initialize the agent engine — set up tools and main session."""
@@ -353,6 +355,12 @@ class AgentEngine:
         No memorization here — the periodic sweep handles that.
         Sessions are marked idle so they can be resumed on next startup.
         """
+        # Cancel all background task watchers first
+        for watcher in self._background_watchers.values():
+            if not watcher.done():
+                watcher.cancel()
+        self._background_watchers.clear()
+
         for sid, client in list(self.sessions._clients.items()):
             try:
                 await self._safe_disconnect(client)
@@ -879,6 +887,10 @@ class AgentEngine:
 
     async def stop_session(self, session_id: str) -> bool:
         """Stop a running session."""
+        # Cancel the background task watcher if one is running
+        watcher = self._background_watchers.pop(session_id, None)
+        if watcher and not watcher.done():
+            watcher.cancel()
         # Cancel any pending interactive tool prompts so the handler unblocks
         handler = get_handler(session_id)
         if handler:
@@ -1490,11 +1502,16 @@ class AgentEngine:
                     for t in bg_tasks
                 ],
             })
-            asyncio.create_task(
+            # Cancel any existing watcher for this session before spawning
+            old_watcher = self._background_watchers.pop(session_id, None)
+            if old_watcher and not old_watcher.done():
+                old_watcher.cancel()
+            watcher = asyncio.create_task(
                 self._watch_background_tasks(
                     session_id, bg_tasks, source, channel,
                 )
             )
+            self._background_watchers[session_id] = watcher
 
         return full_response_text
 
@@ -1522,6 +1539,10 @@ class AgentEngine:
             while elapsed < max_wait:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
+
+                # Keep session alive — prevent idle sweep from killing the
+                # client while we wait for background tasks to finish.
+                self.sessions.touch(session_id)
 
                 all_done = True
                 newly_completed = False
@@ -1602,10 +1623,16 @@ class AgentEngine:
                 )
                 return
 
+            # Tell the frontend to enter streaming mode BEFORE the run starts.
+            # This ensures the thinking cursor is visible and input is disabled
+            # so the user can't type during the auto-resume.
+            await broadcaster.broadcast_auto_resume_start(session_id)
+
             # Trigger a new engine.run() so the model picks up the
-            # background task notifications from the SDK
-            task = asyncio.create_task(
-                self.run(
+            # background task results.  We await instead of create_task
+            # so errors propagate and the lifecycle is controlled.
+            try:
+                await self.run(
                     session_id=session_id,
                     user_message=(
                         "[Background tasks completed. "
@@ -1615,14 +1642,25 @@ class AgentEngine:
                     channel=channel,
                     internal=True,
                 )
-            )
-            self.register_task(session_id, task)
+            except Exception as run_err:
+                logger.error(
+                    "Auto-resume failed for session %s: %s",
+                    session_id, run_err,
+                )
 
+        except asyncio.CancelledError:
+            logger.info(
+                "Background task watcher cancelled for session %s",
+                session_id,
+            )
         except Exception as e:
             logger.error(
                 "Background task watcher failed for session %s: %s",
                 session_id, e,
             )
+        finally:
+            # Clean up watcher reference
+            self._background_watchers.pop(session_id, None)
 
     # ------------------------------------------------------------------ #
     #  Cron / Hook runs                                                    #

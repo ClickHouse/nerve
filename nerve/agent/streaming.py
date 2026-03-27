@@ -220,6 +220,18 @@ class StreamBroadcaster:
             "tool_use_id": tool_use_id,
         })
 
+    async def broadcast_auto_resume_start(self, session_id: str) -> None:
+        """Notify the frontend that a background-task auto-resume is starting.
+
+        Broadcast on the *session* channel (not __global__) so it reaches
+        the connected WebSocket listener and is buffered for replay.
+        The frontend uses this to enter streaming mode before tokens arrive.
+        """
+        await self.broadcast(session_id, {
+            "type": "auto_resume_start",
+            "session_id": session_id,
+        })
+
 
 # Global broadcaster instance
 broadcaster = StreamBroadcaster()
