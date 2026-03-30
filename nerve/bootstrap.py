@@ -1885,6 +1885,9 @@ if [ -z "$GH_TOKEN" ] && [ -f config.local.yaml ]; then
     [ -n "$_gh" ] && export GH_TOKEN="$_gh"
 fi
 
+# Clean up stale PID file from previous container runs
+rm -f ~/.nerve/nerve.pid
+
 # If no arguments, default to init + start
 if [ $# -eq 0 ]; then
     nerve init --if-needed --non-interactive
