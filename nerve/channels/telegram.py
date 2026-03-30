@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import io
 import html as _html
 import logging
 import re
@@ -17,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+import zipfile
 from typing import Any, TYPE_CHECKING
 
 from telegram import Update
@@ -75,6 +77,15 @@ def _md_to_tg_html(text: str) -> str:
         return f"\x00{idx}\x00"
 
     # -- protect constructs that contain chars we'd otherwise escape --
+
+    # Expandable blockquotes: <blockquote expandable>...</blockquote>
+    def _expandable_bq(m: re.Match) -> str:
+        inner = _md_to_tg_html(m.group(1))
+        return _protect(f"<blockquote expandable>{inner}</blockquote>")
+    text = re.sub(
+        r"<blockquote\s+expandable>(.*?)</blockquote>",
+        _expandable_bq, text, flags=re.DOTALL,
+    )
 
     # Code fences: ```lang\n...\n```
     def _fence(m: re.Match) -> str:
@@ -861,23 +872,31 @@ class TelegramChannel(BaseChannel):
 
     _IMAGE_MIMES: set[str] = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
+    _ARCHIVE_MIMES: set[str] = {"application/zip", "application/x-zip-compressed"}
+
+    _IMAGE_EXT_TO_MIME: dict[str, str] = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+    }
+
     _MAX_TEXT_SIZE: int = 512 * 1024       # 512 KB — inline text cap
     _MAX_DOWNLOAD_SIZE: int = 20_000_000   # ~20 MB — Telegram Bot API limit
 
     async def _extract_document(
         self, message: Any,
-    ) -> tuple[dict[str, str] | None, str]:
+    ) -> tuple[list[dict[str, str]], str]:
         """Extract document content and context from a Telegram message.
 
-        Returns (content_block_or_None, context_text).
-        - Text files: content is None (text inlined in context), context has file content.
-        - Images sent as documents: content is base64 image dict.
-        - PDFs: content is base64 document dict.
-        - Other: content is None, context has metadata only.
+        Returns (content_blocks, context_text).
+        - Text files: blocks=[], context has file content.
+        - Images sent as documents: blocks=[image_dict], context has metadata.
+        - PDFs: blocks=[pdf_dict], context has metadata.
+        - ZIP archives: blocks=[images/pdfs inside], context has metadata + text.
+        - Other: blocks=[], context has metadata only.
         """
         doc = getattr(message, "document", None)
         if not doc:
-            return None, ""
+            return [], ""
 
         file_name = doc.file_name or "unnamed"
         mime = doc.mime_type or ""
@@ -894,7 +913,7 @@ class TelegramChannel(BaseChannel):
 
         # -- Too large to download via Bot API --
         if size > self._MAX_DOWNLOAD_SIZE:
-            return None, f"{meta_line}\n(File too large to download)"
+            return [], f"{meta_line}\n(File too large to download)"
 
         # -- Text-like files --
         is_text = (
@@ -904,15 +923,15 @@ class TelegramChannel(BaseChannel):
         )
         if is_text:
             if size > self._MAX_TEXT_SIZE:
-                return None, f"{meta_line}\n(Text file too large to display — {size_str})"
+                return [], f"{meta_line}\n(Text file too large to display — {size_str})"
             try:
                 tg_file = await doc.get_file()
                 data = await tg_file.download_as_bytearray()
                 content = bytes(data).decode("utf-8", errors="replace")
-                return None, f"{meta_line}\n```\n{content}\n```"
+                return [], f"{meta_line}\n```\n{content}\n```"
             except Exception as e:
                 logger.warning("Failed to download text document %s: %s", file_name, e)
-                return None, meta_line
+                return [], meta_line
 
         # -- Image files sent as documents --
         if mime in self._IMAGE_MIMES:
@@ -924,10 +943,10 @@ class TelegramChannel(BaseChannel):
                     "media_type": mime,
                     "data": base64.b64encode(bytes(data)).decode("utf-8"),
                 }
-                return image, meta_line
+                return [image], meta_line
             except Exception as e:
                 logger.warning("Failed to download image document %s: %s", file_name, e)
-                return None, meta_line
+                return [], meta_line
 
         # -- PDF --
         if mime == "application/pdf" or ext == ".pdf":
@@ -939,13 +958,102 @@ class TelegramChannel(BaseChannel):
                     "media_type": "application/pdf",
                     "data": base64.b64encode(bytes(data)).decode("utf-8"),
                 }
-                return pdf_block, meta_line
+                return [pdf_block], meta_line
             except Exception as e:
                 logger.warning("Failed to download PDF %s: %s", file_name, e)
-                return None, meta_line
+                return [], meta_line
+
+        # -- ZIP archives --
+        if mime in self._ARCHIVE_MIMES or ext == ".zip":
+            return await self._extract_zip(doc, file_name, meta_line)
 
         # -- Other binary files — metadata only --
-        return None, meta_line
+        return [], meta_line
+
+    async def _extract_zip(
+        self, doc: Any, file_name: str, meta_line: str,
+    ) -> tuple[list[dict[str, str]], str]:
+        """Extract ZIP archive contents — text inline, images/PDFs as blocks."""
+        try:
+            tg_file = await doc.get_file()
+            data = await tg_file.download_as_bytearray()
+        except Exception as e:
+            logger.warning("Failed to download ZIP %s: %s", file_name, e)
+            return [], meta_line
+
+        buf = io.BytesIO(bytes(data))
+        if not zipfile.is_zipfile(buf):
+            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
+        buf.seek(0)
+
+        blocks: list[dict[str, str]] = []
+        parts: list[str] = [meta_line]
+
+        try:
+            with zipfile.ZipFile(buf) as zf:
+                entries = [
+                    i for i in zf.infolist()
+                    if not i.is_dir() and not i.filename.startswith("__MACOSX/")
+                ]
+                parts.append(f"Archive contains {len(entries)} file(s):")
+
+                total_text = 0
+                for info in entries:
+                    ename = info.filename
+                    esize = info.file_size
+                    eext = ""
+                    if "." in ename.rsplit("/", 1)[-1]:
+                        eext = "." + ename.rsplit(".", 1)[-1].lower()
+
+                    is_text = eext in self._TEXT_EXTENSIONS
+                    is_image = eext in self._IMAGE_EXT_TO_MIME
+                    is_pdf = eext == ".pdf"
+
+                    if is_text and total_text + esize <= self._MAX_TEXT_SIZE:
+                        try:
+                            raw = zf.read(info.filename)
+                            total_text += len(raw)
+                            text_content = raw.decode("utf-8", errors="replace")
+                            parts.append(
+                                f"--- {ename} ({esize} bytes) ---\n"
+                                f"```\n{text_content}\n```"
+                            )
+                        except Exception:
+                            parts.append(f"- {ename} ({esize} bytes) [read error]")
+                    elif is_text:
+                        parts.append(f"- {ename} ({esize} bytes) [text, too large to inline]")
+                    elif is_image:
+                        try:
+                            raw = zf.read(info.filename)
+                            img_mime = self._IMAGE_EXT_TO_MIME.get(eext, "image/png")
+                            blocks.append({
+                                "type": "base64",
+                                "media_type": img_mime,
+                                "data": base64.b64encode(raw).decode("utf-8"),
+                            })
+                            parts.append(f"- {ename} ({esize} bytes) [image]")
+                        except Exception:
+                            parts.append(f"- {ename} ({esize} bytes) [read error]")
+                    elif is_pdf:
+                        try:
+                            raw = zf.read(info.filename)
+                            blocks.append({
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": base64.b64encode(raw).decode("utf-8"),
+                            })
+                            parts.append(f"- {ename} ({esize} bytes) [PDF]")
+                        except Exception:
+                            parts.append(f"- {ename} ({esize} bytes) [read error]")
+                    else:
+                        parts.append(f"- {ename} ({esize} bytes)")
+        except zipfile.BadZipFile:
+            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
+        except RuntimeError as e:
+            # Password-protected archives
+            return [], f"{meta_line}\n(Cannot extract: {e})"
+
+        return blocks, "\n".join(parts)
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
@@ -988,11 +1096,11 @@ class TelegramChannel(BaseChannel):
             images.append(sticker_image)
 
         # Extract document/file if present
-        doc_content, doc_context = await self._extract_document(update.message)
+        doc_contents, doc_context = await self._extract_document(update.message)
         if doc_context:
             text = f"{doc_context}\n\n{text}" if text else doc_context
-        if doc_content:
-            images.append(doc_content)
+        if doc_contents:
+            images.extend(doc_contents)
 
         if not text and not images:
             return
