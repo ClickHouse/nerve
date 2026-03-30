@@ -148,6 +148,7 @@ class GmailSyncConfig:
     prompt_hint: str = ""
     model: str = ""
     condense: bool = False
+    condense_prompt: str = ""  # Custom prompt for LLM condensation (overrides default)
 
     @classmethod
     def from_dict(cls, d: dict) -> GmailSyncConfig:
@@ -161,6 +162,7 @@ class GmailSyncConfig:
             prompt_hint=d.get("prompt_hint", ""),
             model=d.get("model", ""),
             condense=d.get("condense", False),
+            condense_prompt=d.get("condense_prompt", ""),
         )
 
 

@@ -389,8 +389,9 @@ class SourceRunner:
             async with sem:
                 original_len = len(record.content)
                 try:
+                    condense_prompt = self.condense_config.get("prompt") or _CONDENSE_PROMPT
                     prompt_content = (
-                        f"{_CONDENSE_PROMPT}\n\n"
+                        f"{condense_prompt}\n\n"
                         f"---\n\n"
                         f"{record.content}"
                     )

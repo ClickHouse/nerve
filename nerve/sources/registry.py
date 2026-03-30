@@ -73,12 +73,15 @@ def build_source_runners(
             source = GmailSource(account=account, config={
                 "keyring_password": gmail.keyring_password,
             })
+            gmail_condense_cfg = condense_cfg
+            if condense_cfg and gmail.condense_prompt:
+                gmail_condense_cfg = {**condense_cfg, "prompt": gmail.condense_prompt}
             runners.append(SourceRunner(
                 source=source,
                 db=db,
                 batch_size=gmail.batch_size,
                 condense=gmail.condense,
-                condense_config=condense_cfg,
+                condense_config=gmail_condense_cfg,
                 ttl_days=ttl_days,
             ))
             logger.info("Registered source: %s (batch=%d)", source.source_name, gmail.batch_size)
