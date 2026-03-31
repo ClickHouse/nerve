@@ -911,12 +911,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 : sess,
             ) ?? null,
           };
-          // Active session started running from a background trigger (e.g.,
-          // background task completion, answer injection) — enter streaming mode
-          // so the response is visible and input is disabled.
-          // Guard: sendMessage() already sets isStreaming before the WS message,
-          // so this only fires for server-initiated runs.
-          if (runMsg.session_id === s.activeSession && runMsg.is_running && !s.isStreaming) {
+          // Active session started running — enter streaming mode so the
+          // response is visible and input is disabled.  No isStreaming guard:
+          // sendMessage() sets identical values (idempotent) and removing the
+          // guard ensures server-initiated runs (auto-resume, answer injection)
+          // always transition the UI into streaming mode reliably.
+          if (runMsg.session_id === s.activeSession && runMsg.is_running) {
             updates.isStreaming = true;
             updates.streamingBlocks = [];
             updates.agentStatus = { state: 'thinking' };
@@ -1099,6 +1099,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
               blocks: [{ type: 'text' as const, content: ai.content }],
             }],
           }));
+        }
+        break;
+      }
+
+      case 'auto_resume_start': {
+        // Background tasks completed — the backend is about to auto-resume.
+        // Enter streaming mode immediately so the thinking cursor is visible
+        // and chat input is disabled (prevents user from typing mid-resume).
+        const arMsg = msg as Extract<WSMessage, { type: 'auto_resume_start' }>;
+        if (arMsg.session_id === state.activeSession) {
+          set({
+            isStreaming: true,
+            streamingBlocks: [],
+            agentStatus: { state: 'thinking' },
+          });
         }
         break;
       }
