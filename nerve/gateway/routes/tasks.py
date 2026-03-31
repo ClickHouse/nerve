@@ -25,6 +25,7 @@ class TaskUpdateRequest(BaseModel):
     note: str = ""
     deadline: str = ""
     content: str = ""
+    title: str = ""
 
 
 @router.get("/api/tasks")
@@ -97,14 +98,15 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
                 deadline=fields.get("deadline") or task.get("deadline"),
             )
 
-    # Update status/note/deadline via agent tool (may move file for "done")
-    if req.status or req.note or req.deadline:
+    # Update status/note/deadline/title via agent tool (may move file for "done")
+    if req.status or req.note or req.deadline or req.title:
         from nerve.agent.tools import task_update
         await task_update.handler({
             "task_id": task_id,
             "status": req.status,
             "note": req.note,
             "deadline": req.deadline,
+            "title": req.title,
         })
 
     return {"task_id": task_id, "updated": True}

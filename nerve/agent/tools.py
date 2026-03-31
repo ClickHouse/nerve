@@ -248,13 +248,14 @@ async def task_list(args: dict) -> dict:
 
 @tool(
     "task_update",
-    "Update a task's status, deadline, tags, or add an update note.",
+    "Update a task's status, deadline, tags, title, or add an update note.",
     {
         "task_id": {"type": "string", "description": "Task ID"},
         "status": {"type": "string", "description": "New status: pending, in_progress, done, deferred", "default": ""},
         "note": {"type": "string", "description": "Update note to append to the task file", "default": ""},
         "deadline": {"type": "string", "description": "New deadline in YYYY-MM-DD format", "default": ""},
         "tags": {"type": "string", "description": "Replace tags (comma-separated). Use '+tag' to add, '-tag' to remove, or 'tag1,tag2' to set.", "default": ""},
+        "title": {"type": "string", "description": "New task title. Updates the H1 heading in the markdown file and the SQLite index.", "default": ""},
     },
 )
 async def task_update(args: dict) -> dict:
@@ -266,6 +267,7 @@ async def task_update(args: dict) -> dict:
     note = args.get("note", "")
     deadline = args.get("deadline", "")
     raw_tags = (args.get("tags", "") or "").strip()
+    new_title = (args.get("title", "") or "").strip()
 
     # Route done transitions through task_done to ensure file move + FTS sync
     if status == "done":
@@ -299,10 +301,24 @@ async def task_update(args: dict) -> dict:
             await _db.update_task_tags(task_id, new_tags_str)
 
         # Update the markdown file
-        if _workspace and (note or deadline or raw_tags):
+        if _workspace and (note or deadline or raw_tags or new_title):
             file_path = _workspace / task["file_path"]
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
+                if new_title:
+                    # Replace the H1 heading (first line starting with #)
+                    content = _re.sub(r"^# .+", f"# {new_title}", content, count=1)
+                    # Sync title to SQLite
+                    await _db.upsert_task(
+                        task_id=task_id,
+                        file_path=task["file_path"],
+                        title=new_title,
+                        status=status or task["status"],
+                        source=task.get("source"),
+                        source_url=task.get("source_url"),
+                        deadline=deadline or task.get("deadline"),
+                        tags=new_tags_str if raw_tags else (task.get("tags") or ""),
+                    )
                 if note:
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     content += f"\n- {today}: {note}"
