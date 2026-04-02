@@ -5,6 +5,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
+import { ThemeToggle } from './ThemeToggle';
 
 const NAV_ITEMS = [
   { path: '/chat', icon: MessageSquare, label: 'Chat' },
@@ -41,7 +42,7 @@ export function NavRail() {
   });
 
   return (
-    <div className="w-14 bg-[#141414] border-r border-[#2a2a2a] flex flex-col items-center py-3 shrink-0">
+    <div className="w-14 bg-surface border-r border-border flex flex-col items-center py-3 shrink-0">
       <div className="text-[#6366f1] font-bold text-xs mb-4 tracking-wider">N</div>
 
       <div className="flex-1 flex flex-col gap-1">
@@ -55,7 +56,7 @@ export function NavRail() {
               className={`relative w-10 h-10 rounded-lg flex flex-col items-center justify-center gap-0.5 cursor-pointer transition-colors
                 ${active
                   ? 'bg-[#6366f1]/15 text-[#6366f1]'
-                  : 'text-[#666] hover:text-[#999] hover:bg-[#1f1f1f]'
+                  : 'text-text-dim hover:text-text-muted hover:bg-surface-hover'
                 }`}
               title={label}
             >
@@ -74,9 +75,10 @@ export function NavRail() {
       <div className="flex flex-col items-center gap-2">
         <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-emerald-400' : 'bg-red-400'}`}
              title={ws.connected ? 'Connected' : 'Disconnected'} />
+        <ThemeToggle />
         <button
           onClick={logout}
-          className="w-10 h-10 rounded-lg flex items-center justify-center text-[#555] hover:text-[#888] hover:bg-[#1f1f1f] cursor-pointer"
+          className="w-10 h-10 rounded-lg flex items-center justify-center text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
           title="Logout"
         >
           <LogOut size={16} />
