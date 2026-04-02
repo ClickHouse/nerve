@@ -18,10 +18,10 @@ export function FilesPage() {
   return (
     <div className="h-full flex">
       {/* File tree sidebar */}
-      <div className="w-64 bg-[#141414] border-r border-[#222] flex flex-col shrink-0">
-        <div className="flex items-center gap-2 p-3 border-b border-[#222]">
+      <div className="w-64 bg-surface border-r border-border-subtle flex flex-col shrink-0">
+        <div className="flex items-center gap-2 p-3 border-b border-border-subtle">
           <FolderOpen size={16} className="text-[#6366f1]" />
-          <span className="text-sm font-medium text-[#888]">Workspace</span>
+          <span className="text-sm font-medium text-text-muted">Workspace</span>
         </div>
         <div className="flex-1 overflow-y-auto">
           <FileTree tree={tree} selectedPath={activeFile} onSelect={openFile} />
@@ -47,7 +47,7 @@ export function FilesPage() {
             onSave={() => saveFile(currentFile.path)}
           />
         ) : (
-          <div className="flex-1 flex items-center justify-center text-[#444]">
+          <div className="flex-1 flex items-center justify-center text-text-faint">
             {loading ? 'Loading...' : 'Select a file to edit'}
           </div>
         )}

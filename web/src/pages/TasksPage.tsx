@@ -33,26 +33,26 @@ export function TasksPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="border-b border-[#222] px-6 py-3 flex items-center justify-between bg-[#0f0f0f] shrink-0">
+      <div className="border-b border-border-subtle px-6 py-3 flex items-center justify-between bg-bg shrink-0">
         <div className="flex items-center gap-4">
           <h1 className="text-lg font-semibold">Tasks</h1>
           <TaskFilters active={filter} onChange={setFilter} />
 
           <div className="relative ml-2">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#555]" />
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
             <input
               type="text"
               value={localQuery}
               onChange={e => handleSearchChange(e.target.value)}
               placeholder="Search..."
-              className="pl-8 pr-7 py-1.5 w-48 text-[13px] bg-[#1a1a1a] border border-[#333] rounded-lg
-                text-[#ccc] placeholder-[#555] focus:outline-none focus:border-[#6366f1]/50
+              className="pl-8 pr-7 py-1.5 w-48 text-[13px] bg-surface-raised border border-border-subtle rounded-lg
+                text-text-secondary placeholder-[#555] focus:outline-none focus:border-[#6366f1]/50
                 transition-colors"
             />
             {localQuery && (
               <button
                 onClick={clearSearch}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-[#555] hover:text-[#aaa] cursor-pointer"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-text-faint hover:text-[#aaa] cursor-pointer"
               >
                 <X size={13} />
               </button>
@@ -69,9 +69,9 @@ export function TasksPage() {
 
       <div className="flex-1 overflow-y-auto p-6">
         {loading ? (
-          <div className="text-[#444] text-center py-10">Loading...</div>
+          <div className="text-text-faint text-center py-10">Loading...</div>
         ) : tasks.length === 0 ? (
-          <div className="text-[#444] text-center py-10">
+          <div className="text-text-faint text-center py-10">
             {searchQuery ? `No tasks matching "${searchQuery}"` : 'No tasks'}
           </div>
         ) : (
