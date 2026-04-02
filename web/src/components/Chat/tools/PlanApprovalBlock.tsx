@@ -21,13 +21,13 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
   if (responded || block.status === 'complete') {
     const wasApproved = approved || (block.result && !block.isError);
     return (
-      <div className="my-1.5 border border-[#2a2a2a] rounded-lg bg-[#141414] overflow-hidden">
+      <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
         <div className="px-3 py-2.5 flex items-center gap-2">
           {wasApproved
             ? <Check size={14} className="text-green-400" />
             : <Ban size={14} className="text-red-400" />
           }
-          <span className="text-[13px] font-medium text-[#ccc]">
+          <span className="text-[13px] font-medium text-text-secondary">
             {isExitPlan ? 'Plan' : 'Plan mode'} {wasApproved ? 'approved' : 'declined'}
           </span>
         </div>
@@ -38,10 +38,10 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
   // Waiting for user input
   if (!isInteractive) {
     return (
-      <div className="my-1.5 border border-[#2a2a2a] rounded-lg bg-[#141414] overflow-hidden">
+      <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
         <div className="px-3 py-2.5 flex items-center gap-2">
-          <FileCheck size={14} className="text-[#888] animate-pulse" />
-          <span className="text-[13px] text-[#888]">
+          <FileCheck size={14} className="text-text-muted animate-pulse" />
+          <span className="text-[13px] text-text-muted">
             {isExitPlan ? 'Waiting to approve plan...' : 'Waiting to enter plan mode...'}
           </span>
         </div>
@@ -58,7 +58,7 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
               ? <FileCheck size={15} className="text-indigo-400" />
               : <Play size={15} className="text-indigo-400" />
             }
-            <span className="text-[13px] font-medium text-[#ddd]">
+            <span className="text-[13px] font-medium text-text">
               {isExitPlan
                 ? 'Plan ready for approval'
                 : 'Claude wants to enter plan mode'

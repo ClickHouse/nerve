@@ -37,22 +37,22 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
   const isSent = resultText.includes('sent') || resultText.includes('Sent');
 
   return (
-    <div className="my-1.5 border border-[#2a2a2a] rounded-lg bg-[#141414] overflow-hidden">
+    <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#1a1a1a] transition-colors"
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-[#6366f1] animate-spin shrink-0" />
           : <Icon size={14} className={`shrink-0 ${iconColor}`} />
         }
-        <span className="text-[13px] font-medium text-[#ccc]">{label}</span>
+        <span className="text-[13px] font-medium text-text-secondary">{label}</span>
         {title && <span className="text-[12px] text-[#777] truncate">{title}</span>}
         {priority !== 'normal' && (
           <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
             priority === 'urgent' ? 'bg-red-500/15 text-red-400' :
             priority === 'high' ? 'bg-orange-400/15 text-orange-400' :
-            'bg-[#333] text-[#888]'
+            'bg-border-subtle text-text-muted'
           }`}>
             {priority}
           </span>
@@ -64,15 +64,15 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           <span className="text-[10px] text-emerald-400/70 shrink-0">sent</span>
         )}
         <div className="ml-auto shrink-0">
-          {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
 
       {expanded && (
-        <div className="border-t border-[#2a2a2a]">
+        <div className="border-t border-border">
           <div className="px-3 py-2">
-            {title && <p className="text-[13px] text-[#e0e0e0] font-medium">{title}</p>}
-            {body && <p className="text-[12px] text-[#888] mt-0.5">{body}</p>}
+            {title && <p className="text-[13px] text-text font-medium">{title}</p>}
+            {body && <p className="text-[12px] text-text-muted mt-0.5">{body}</p>}
 
             {/* Options for questions */}
             {isAsk && options.length > 0 && (
@@ -88,7 +88,7 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* Result */}
           {resultText && (
-            <div className="px-3 py-2 border-t border-[#222]">
+            <div className="px-3 py-2 border-t border-border-subtle">
               <pre className={`text-[12px] font-mono whitespace-pre-wrap ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
                 {resultText}
               </pre>
@@ -96,7 +96,7 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-[#666] flex items-center gap-2 border-t border-[#222]">
+            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2 border-t border-border-subtle">
               <Loader2 size={12} className="animate-spin" /> Sending...
             </div>
           )}

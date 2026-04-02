@@ -75,22 +75,22 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
   const count = countMatch ? countMatch[1] : memoryItems.length > 0 ? String(memoryItems.length) : null;
 
   return (
-    <div className="my-1.5 border border-purple-500/20 rounded-lg bg-[#141418] overflow-hidden">
+    <div className="my-1.5 border border-purple-500/20 rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#1a1a20] transition-colors"
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-purple-400 animate-spin shrink-0" />
           : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : 'text-purple-400'}`} />
         }
         <span className="text-[13px] font-medium text-purple-300">{label}</span>
-        {truncatedQuery && <span className="text-[12px] text-[#666] truncate">{truncatedQuery}</span>}
+        {truncatedQuery && <span className="text-[12px] text-text-dim truncate">{truncatedQuery}</span>}
         {count && !isRunning && (
           <span className="text-[10px] text-purple-400/60 shrink-0">{count} items</span>
         )}
         <div className="ml-auto shrink-0">
-          {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
 
@@ -105,7 +105,7 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
               </div>
               <p className="leading-relaxed">{String(query)}</p>
               {block.input.memory_type ? (
-                <span className={`inline-block mt-1.5 text-[10px] px-1.5 py-0.5 rounded ${TYPE_COLORS[String(block.input.memory_type)] || 'text-[#888] bg-[#222]'}`}>
+                <span className={`inline-block mt-1.5 text-[10px] px-1.5 py-0.5 rounded ${TYPE_COLORS[String(block.input.memory_type)] || 'text-text-muted bg-border-subtle'}`}>
                   {String(block.input.memory_type)}
                 </span>
               ) : null}
@@ -117,7 +117,7 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="px-3 py-2 space-y-1.5 max-h-80 overflow-y-auto">
               {memoryItems.map((item, i) => (
                 <div key={i} className="flex gap-2 text-[12px] leading-relaxed">
-                  <span className={`shrink-0 text-[10px] px-1 py-0.5 rounded mt-0.5 ${TYPE_COLORS[item.type] || 'text-[#888] bg-[#222]'}`}>
+                  <span className={`shrink-0 text-[10px] px-1 py-0.5 rounded mt-0.5 ${TYPE_COLORS[item.type] || 'text-text-muted bg-border-subtle'}`}>
                     {item.type}
                   </span>
                   <span className="text-[#bbb]">{item.text}</span>
@@ -143,7 +143,7 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-[#666] flex items-center gap-2">
+            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> {isRecall || isHistory ? 'Searching...' : 'Saving...'}
             </div>
           )}

@@ -8,7 +8,7 @@ const STATUS_COLORS: Record<string, string> = {
   'in_progress': 'bg-blue-500/15 text-blue-400',
   done: 'bg-green-500/15 text-green-400',
   completed: 'bg-green-500/15 text-green-400',
-  deferred: 'bg-[#333] text-[#888]',
+  deferred: 'bg-border-subtle text-text-muted',
 };
 
 /** Extract readable text from MCP content blocks. */
@@ -86,32 +86,32 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
   const taskList = isList ? parseTaskList(resultText) : [];
 
   return (
-    <div className="my-1.5 border border-[#2a2a2a] rounded-lg bg-[#141414] overflow-hidden">
+    <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#1a1a1a] transition-colors"
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-[#6366f1] animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : isDone ? 'text-green-400' : isCreate ? 'text-blue-400' : 'text-[#888]'}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : isDone ? 'text-green-400' : isCreate ? 'text-blue-400' : 'text-text-muted'}`} />
         }
-        <span className="text-[13px] font-medium text-[#ccc] shrink-0 whitespace-nowrap">{label}</span>
+        <span className="text-[13px] font-medium text-text-secondary shrink-0 whitespace-nowrap">{label}</span>
         {title && <span className="text-[12px] text-[#777] truncate">{title}</span>}
         {status && (
-          <span className={`text-[10px] px-1.5 py-0.5 rounded ${STATUS_COLORS[status] || 'bg-[#333] text-[#888]'}`}>
+          <span className={`text-[10px] px-1.5 py-0.5 rounded ${STATUS_COLORS[status] || 'bg-border-subtle text-text-muted'}`}>
             {status}
           </span>
         )}
         {isList && taskList.length > 0 && (
-          <span className="text-[10px] text-[#555] shrink-0">{taskList.length} tasks</span>
+          <span className="text-[10px] text-text-faint shrink-0">{taskList.length} tasks</span>
         )}
         <div className="ml-auto shrink-0">
-          {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
 
       {expanded && (
-        <div className="border-t border-[#2a2a2a]">
+        <div className="border-t border-border">
           {/* Create: show what was created */}
           {isCreate && title && (
             <div className="px-3 py-2">
@@ -120,10 +120,10 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
                 <span className="font-medium">{title}</span>
               </div>
               {block.input.content ? (
-                <p className="text-[12px] text-[#888] mt-1 pl-5">{String(block.input.content).slice(0, 200)}</p>
+                <p className="text-[12px] text-text-muted mt-1 pl-5">{String(block.input.content).slice(0, 200)}</p>
               ) : null}
               {block.input.deadline ? (
-                <p className="text-[10px] text-[#666] mt-1 pl-5">Deadline: {String(block.input.deadline)}</p>
+                <p className="text-[10px] text-text-dim mt-1 pl-5">Deadline: {String(block.input.deadline)}</p>
               ) : null}
             </div>
           )}
@@ -131,7 +131,7 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Done/Update: show status change */}
           {(isDone || isUpdate) && (
             <div className="px-3 py-2 text-[12px]">
-              <span className="text-[#888]">{block.input.task_id ? String(block.input.task_id) : title}</span>
+              <span className="text-text-muted">{block.input.task_id ? String(block.input.task_id) : title}</span>
               {block.input.note ? <p className="text-[#777] mt-1">{String(block.input.note)}</p> : null}
             </div>
           )}
@@ -141,11 +141,11 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="px-3 py-2 space-y-1 max-h-60 overflow-y-auto">
               {taskList.map((t, i) => (
                 <div key={i} className="flex items-center gap-2 text-[12px]">
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[t.status] || 'bg-[#333] text-[#888]'}`}>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[t.status] || 'bg-border-subtle text-text-muted'}`}>
                     {t.status}
                   </span>
                   <span className="text-[#bbb] truncate">{t.title}</span>
-                  {t.deadline && <span className="text-[10px] text-[#555] shrink-0">{t.deadline}</span>}
+                  {t.deadline && <span className="text-[10px] text-text-faint shrink-0">{t.deadline}</span>}
                 </div>
               ))}
             </div>
@@ -157,19 +157,19 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* Success message */}
           {(isCreate || isDone) && resultText && !block.isError && !taskList.length && (
-            <div className="px-3 py-1.5 text-[11px] text-green-400/70 border-t border-[#222]">
+            <div className="px-3 py-1.5 text-[11px] text-green-400/70 border-t border-border-subtle">
               {isDone ? 'Task completed' : 'Task created'}
             </div>
           )}
 
           {block.isError && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-red-400 whitespace-pre-wrap border-t border-[#222]">
+            <pre className="px-3 py-2 text-[12px] text-red-400 whitespace-pre-wrap border-t border-border-subtle">
               {resultText}
             </pre>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-[#666] flex items-center gap-2">
+            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> Working...
             </div>
           )}

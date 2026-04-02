@@ -105,7 +105,7 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                   {q.header}
                 </span>
                 {q.multiSelect && (
-                  <span className="text-[10px] text-[#555] ml-auto">Select multiple</span>
+                  <span className="text-[10px] text-text-faint ml-auto">Select multiple</span>
                 )}
               </div>
               <p className="text-[14px] text-[#ddd] leading-relaxed">{q.question}</p>
@@ -128,20 +128,20 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                         submitted
                           ? isSelected
                             ? 'border-indigo-500/40 bg-indigo-500/10 cursor-default'
-                            : 'border-[#1a1a1a] bg-[#0e0e12] opacity-40 cursor-default'
+                            : 'border-surface-raised bg-[#0e0e12] opacity-40 cursor-default'
                           : isSelected
                             ? 'border-indigo-500/50 bg-indigo-500/10 cursor-pointer'
-                            : 'border-[#222] bg-[#0c0c10] hover:border-[#3a3a4a] hover:bg-[#141420] cursor-pointer'
+                            : 'border-border-subtle bg-[#0c0c10] hover:border-[#3a3a4a] hover:bg-[#141420] cursor-pointer'
                       }`}
                     >
                       <div className="flex items-start gap-3">
                         <div className={`mt-0.5 shrink-0 w-4 h-4 ${q.multiSelect ? 'rounded-sm' : 'rounded-full'} border flex items-center justify-center transition-colors duration-150 ${
-                          isSelected ? 'border-indigo-500 bg-indigo-500' : 'border-[#444] bg-transparent'
+                          isSelected ? 'border-indigo-500 bg-indigo-500' : 'border-text-faint bg-transparent'
                         }`}>
                           {isSelected && <Check size={10} className="text-white" strokeWidth={3} />}
                         </div>
                         <div className="flex-1 min-w-0">
-                          <div className={`text-[13px] font-medium ${isSelected ? 'text-indigo-300' : 'text-[#ccc]'}`}>
+                          <div className={`text-[13px] font-medium ${isSelected ? 'text-indigo-300' : 'text-text-secondary'}`}>
                             {opt.label}
                           </div>
                           {opt.description && (
@@ -172,7 +172,7 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
               className={`w-full py-2 rounded-md text-[13px] font-medium transition-all duration-150 flex items-center justify-center gap-2 ${
                 allAnswered
                   ? 'bg-indigo-600 hover:bg-indigo-500 text-white cursor-pointer'
-                  : 'bg-[#1a1a22] text-[#444] cursor-not-allowed'
+                  : 'bg-[#1a1a22] text-text-faint cursor-not-allowed'
               }`}
             >
               <Send size={13} />

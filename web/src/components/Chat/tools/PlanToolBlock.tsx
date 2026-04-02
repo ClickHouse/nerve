@@ -49,7 +49,7 @@ const STATUS_COLORS: Record<string, string> = {
   approved: 'bg-green-500/15 text-green-400',
   implementing: 'bg-blue-500/15 text-blue-400',
   declined: 'bg-red-500/15 text-red-400',
-  superseded: 'bg-[#333] text-[#888]',
+  superseded: 'bg-border-subtle text-text-muted',
 };
 
 type PlanTool = 'plan_propose' | 'plan_list' | 'plan_read' | 'plan_approve' | 'plan_decline' | 'plan_revise';
@@ -109,19 +109,19 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
     : 'text-amber-400';
 
   return (
-    <div className="my-1.5 border border-amber-500/20 rounded-lg bg-[#141411] overflow-hidden">
+    <div className="my-1.5 border border-amber-500/20 rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#1a1a18] transition-colors"
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-amber-400 animate-spin shrink-0" />
           : <Icon size={14} className={`shrink-0 ${iconColor}`} />
         }
         <span className="text-[13px] font-medium text-amber-300">{config.label}</span>
-        {summary && <span className="text-[12px] text-[#666] truncate">{summary}</span>}
+        {summary && <span className="text-[12px] text-text-dim truncate">{summary}</span>}
         <div className="ml-auto shrink-0">
-          {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
 
@@ -159,14 +159,14 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
               {planList.map((p, i) => (
                 <div
                   key={i}
-                  className="flex items-center gap-2 text-[12px] cursor-pointer hover:bg-[#1f1f1c] rounded px-1 py-0.5"
+                  className="flex items-center gap-2 text-[12px] cursor-pointer hover:bg-surface-hover rounded px-1 py-0.5"
                   onClick={() => navigate(`/plans/${p.planId}`)}
                 >
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[p.status] || 'bg-[#333] text-[#888]'}`}>
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[p.status] || 'bg-border-subtle text-text-muted'}`}>
                     {p.status}
                   </span>
                   <span className="text-[#bbb] truncate">{p.taskTitle}</span>
-                  <span className="text-[10px] text-[#555] shrink-0">v{p.version}</span>
+                  <span className="text-[10px] text-text-faint shrink-0">v{p.version}</span>
                 </div>
               ))}
             </div>
@@ -181,11 +181,11 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="px-3 py-2">
               {/* Header metadata */}
               {readHeader && (
-                <pre className="text-[12px] text-[#888] whitespace-pre-wrap mb-2">{readHeader}</pre>
+                <pre className="text-[12px] text-text-muted whitespace-pre-wrap mb-2">{readHeader}</pre>
               )}
               {/* Plan content */}
               {readContent && (
-                <div className="max-h-96 overflow-y-auto bg-[#0f0f0d] rounded-lg p-4 border border-amber-500/10">
+                <div className="max-h-96 overflow-y-auto bg-bg rounded-lg p-4 border border-amber-500/10">
                   <MarkdownContent content={readContent} />
                 </div>
               )}
@@ -236,7 +236,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
               {feedback && (
                 <div className="mt-2 flex gap-0">
                   <div className="w-0.5 bg-red-400/30 rounded-full shrink-0" />
-                  <p className="pl-2 text-[12px] text-[#888] whitespace-pre-wrap">{feedback}</p>
+                  <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
                 </div>
               )}
             </div>
@@ -267,7 +267,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* ── Running spinner ── */}
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-[#666] flex items-center gap-2">
+            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> {config.runningLabel}
             </div>
           )}
