@@ -7,7 +7,7 @@ import type { FileDiff, DiffHunk, DiffLine as DiffLineType } from '../../types/c
 
 function HunkHeader({ hunk }: { hunk: DiffHunk }) {
   return (
-    <div className="bg-[#161625] text-[11px] px-3 py-1 border-y border-[#222240] select-none flex items-center gap-2 sticky top-0 z-[1]">
+    <div className="bg-[#6366f1]/10 text-[11px] px-3 py-1 border-y border-[#6366f1]/20 select-none flex items-center gap-2 sticky top-0 z-[1]">
       <span className="text-indigo-400 font-mono">
         @@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@
       </span>
@@ -23,15 +23,15 @@ function HunkHeader({ hunk }: { hunk: DiffHunk }) {
 // ------------------------------------------------------------------ //
 
 const LINE_STYLES: Record<string, string> = {
-  addition: 'bg-green-950/25',
-  deletion: 'bg-red-950/25',
+  addition: 'bg-green-500/15',
+  deletion: 'bg-red-500/15',
   context: '',
   info: '',
 };
 
 const TEXT_STYLES: Record<string, string> = {
-  addition: 'text-green-300/90',
-  deletion: 'text-red-300/90',
+  addition: 'text-green-600',
+  deletion: 'text-red-600',
   context: 'text-text-muted',
   info: 'text-text-faint italic',
 };
@@ -44,8 +44,8 @@ const PREFIX: Record<string, string> = {
 };
 
 const GUTTER_STYLES: Record<string, string> = {
-  addition: 'bg-green-950/15 border-green-900/30',
-  deletion: 'bg-red-950/15 border-red-900/30',
+  addition: 'bg-green-500/10 border-green-500/20',
+  deletion: 'bg-red-500/10 border-red-500/20',
   context: 'border-surface-raised',
   info: 'border-surface-raised',
 };

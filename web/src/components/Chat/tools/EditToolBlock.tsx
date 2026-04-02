@@ -34,12 +34,12 @@ export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Diff view */}
           <div className="font-mono text-[12px] overflow-x-auto max-h-80 overflow-y-auto">
             {oldLines.map((line, i) => (
-              <div key={`old-${i}`} className="px-3 py-0.5 bg-red-900/15 text-red-300/80">
+              <div key={`old-${i}`} className="px-3 py-0.5 bg-red-500/15 text-red-600">
                 <span className="select-none text-red-500/50 mr-2">-</span>{line}
               </div>
             ))}
             {newLines.map((line, i) => (
-              <div key={`new-${i}`} className="px-3 py-0.5 bg-green-900/15 text-green-300/80">
+              <div key={`new-${i}`} className="px-3 py-0.5 bg-green-500/15 text-green-600">
                 <span className="select-none text-green-500/50 mr-2">+</span>{line}
               </div>
             ))}
