@@ -126,7 +126,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
         <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">Conversations</span>
         <button
           onClick={onCreate}
-          className="w-5 h-5 rounded flex items-center justify-center text-text-faint hover:text-[#aaa] hover:bg-surface-hover cursor-pointer"
+          className="w-5 h-5 rounded flex items-center justify-center text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
           title="New session"
         >
           <Plus size={12} />
@@ -420,7 +420,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
       className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors
         ${isActive
           ? 'bg-[#1f1f2f] text-text'
-          : 'text-text-muted hover:bg-surface-raised hover:text-[#bbb]'
+          : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
         }`}
     >
       {isImplementSession(session)

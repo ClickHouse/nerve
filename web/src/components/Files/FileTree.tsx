@@ -15,7 +15,7 @@ function FileTreeNode({ node, depth, selectedPath, onSelect }: {
       <div>
         <button
           onClick={() => setExpanded(!expanded)}
-          className="flex items-center gap-1.5 w-full text-left px-2 py-1 text-[13px] text-[#999] hover:bg-surface-raised cursor-pointer rounded"
+          className="flex items-center gap-1.5 w-full text-left px-2 py-1 text-[13px] text-text-muted hover:bg-surface-raised cursor-pointer rounded"
           style={{ paddingLeft: depth * 16 + 8 }}
         >
           {expanded
@@ -46,7 +46,7 @@ function FileTreeNode({ node, depth, selectedPath, onSelect }: {
     <button
       onClick={() => onSelect(node.path)}
       className={`flex items-center gap-1.5 w-full text-left px-2 py-1 text-[13px] cursor-pointer rounded
-        ${isSelected ? 'bg-[#1f1f2f] text-text' : 'text-text-muted hover:bg-surface-raised hover:text-[#bbb]'}`}
+        ${isSelected ? 'bg-[#1f1f2f] text-text' : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'}`}
       style={{ paddingLeft: depth * 16 + 20 }}
     >
       <File size={13} className="shrink-0 text-text-dim" />

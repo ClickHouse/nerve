@@ -31,14 +31,14 @@ export function FileEditor({ path, content, modified, saving, onContentChange, o
             <button
               onClick={() => setMode('edit')}
               className={`px-2.5 py-1 text-[12px] rounded-l-md cursor-pointer
-                ${mode === 'edit' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-[#aaa]'}`}
+                ${mode === 'edit' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-text-muted'}`}
             >
               <Edit3 size={13} />
             </button>
             <button
               onClick={() => setMode('preview')}
               className={`px-2.5 py-1 text-[12px] rounded-r-md cursor-pointer
-                ${mode === 'preview' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-[#aaa]'}`}
+                ${mode === 'preview' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-text-muted'}`}
             >
               <Eye size={13} />
             </button>

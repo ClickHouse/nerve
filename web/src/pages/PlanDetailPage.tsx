@@ -10,7 +10,7 @@ const STATUS_STYLES: Record<string, string> = {
   approved: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
   implementing: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
   declined: 'bg-red-400/10 text-red-400 border-red-400/20',
-  superseded: 'bg-[#333]/50 text-text-muted border-border-subtle',
+  superseded: 'bg-border-subtle/50 text-text-muted border-border-subtle',
   failed: 'bg-red-400/10 text-red-400 border-red-400/20',
 };
 
@@ -99,7 +99,7 @@ export function PlanDetailPage() {
         <div className="flex items-center gap-3 mb-2">
           <button
             onClick={() => navigate('/plans')}
-            className="p-1 text-text-faint hover:text-[#aaa] hover:bg-surface-hover rounded cursor-pointer"
+            className="p-1 text-text-faint hover:text-text-muted hover:bg-surface-hover rounded cursor-pointer"
           >
             <ArrowLeft size={16} />
           </button>
@@ -149,7 +149,7 @@ export function PlanDetailPage() {
               <div className="w-1 bg-[#6366f1]/40 rounded-full shrink-0" />
               <div className="pl-3 py-2">
                 <div className="text-[11px] text-[#6366f1]/60 font-medium mb-1">Revision feedback</div>
-                <div className="text-[13px] text-[#aaa] leading-relaxed whitespace-pre-wrap">{plan.feedback}</div>
+                <div className="text-[13px] text-text-muted leading-relaxed whitespace-pre-wrap">{plan.feedback}</div>
               </div>
             </div>
           )}
@@ -165,7 +165,7 @@ export function PlanDetailPage() {
                     className={`flex items-center gap-2 px-3 py-1.5 text-[12px] rounded-lg border cursor-pointer transition-colors ${
                       useMultiAgent
                         ? 'bg-amber-400/10 text-amber-400 border-amber-400/30'
-                        : 'bg-surface-raised text-text-dim border-border-subtle hover:border-[#444]'
+                        : 'bg-surface-raised text-text-dim border-border-subtle hover:border-border'
                     }`}
                   >
                     <Users size={13} />
@@ -223,7 +223,7 @@ export function PlanDetailPage() {
                 </button>
                 <button
                   onClick={() => setShowFeedback(!showFeedback)}
-                  className="flex items-center gap-1.5 px-4 py-2 text-[13px] bg-surface-raised hover:bg-[#333] text-text-secondary rounded-lg cursor-pointer"
+                  className="flex items-center gap-1.5 px-4 py-2 text-[13px] bg-surface-raised hover:bg-surface-hover text-text-secondary rounded-lg cursor-pointer"
                 >
                   <MessageSquare size={14} /> Request Revision
                 </button>

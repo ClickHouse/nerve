@@ -8,7 +8,7 @@ const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
   in_progress: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
   done: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
-  deferred: 'bg-[#333]/50 text-text-muted border-border-subtle',
+  deferred: 'bg-border-subtle/50 text-text-muted border-border-subtle',
 };
 
 export function TaskDetailPage() {
@@ -86,7 +86,7 @@ export function TaskDetailPage() {
           <div className="flex items-center gap-3 min-w-0">
             <button
               onClick={() => navigate('/tasks')}
-              className="p-1.5 text-text-dim hover:text-[#aaa] hover:bg-surface-raised rounded cursor-pointer shrink-0"
+              className="p-1.5 text-text-dim hover:text-text-muted hover:bg-surface-raised rounded cursor-pointer shrink-0"
             >
               <ArrowLeft size={18} />
             </button>
@@ -99,14 +99,14 @@ export function TaskDetailPage() {
               <button
                 onClick={() => setMode('edit')}
                 className={`px-2.5 py-1.5 text-[12px] rounded-l-md cursor-pointer transition-colors
-                  ${mode === 'edit' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-[#aaa]'}`}
+                  ${mode === 'edit' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-text-muted'}`}
               >
                 <Edit3 size={14} />
               </button>
               <button
                 onClick={() => setMode('preview')}
                 className={`px-2.5 py-1.5 text-[12px] rounded-r-md cursor-pointer transition-colors
-                  ${mode === 'preview' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-[#aaa]'}`}
+                  ${mode === 'preview' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-text-muted'}`}
               >
                 <Eye size={14} />
               </button>
@@ -134,7 +134,7 @@ export function TaskDetailPage() {
           <select
             value={selectedTask.status}
             onChange={(e) => updateStatus(selectedTask.id, e.target.value)}
-            className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-[#aaa] outline-none cursor-pointer"
+            className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-text-muted outline-none cursor-pointer"
           >
             <option value="pending">Pending</option>
             <option value="in_progress">In Progress</option>

@@ -22,7 +22,7 @@ export function EditorTabBar({ files, activePath, onSelect, onClose }: {
           className={`flex items-center gap-1.5 px-3 py-2 text-[13px] cursor-pointer border-r border-border-subtle shrink-0
             ${f.path === activePath
               ? 'bg-bg text-text border-b-2 border-b-[#6366f1]'
-              : 'text-[#777] hover:text-[#aaa] hover:bg-surface-raised'
+              : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
             }`}
           onClick={() => onSelect(f.path)}
         >

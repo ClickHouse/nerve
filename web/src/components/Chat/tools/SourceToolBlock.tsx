@@ -204,7 +204,7 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
                     {msg.time && <span>{msg.time}</span>}
                   </div>
                   {msg.content && (
-                    <pre className="text-[11px] text-[#999] whitespace-pre-wrap leading-relaxed max-h-32 overflow-y-auto">
+                    <pre className="text-[11px] text-text-muted whitespace-pre-wrap leading-relaxed max-h-32 overflow-y-auto">
                       {msg.content.length > 500 ? msg.content.slice(0, 500) + '...' : msg.content}
                     </pre>
                   )}
@@ -222,14 +222,14 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* Fallback: raw text for unparsed results */}
           {!isList && parsedMessages.length === 0 && !isNoMessages && resultText && (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           )}
 
           {/* list_sources fallback */}
           {isList && sourceEntries.length === 0 && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-[#999] whitespace-pre-wrap max-h-60 overflow-y-auto">
+            <pre className="px-3 py-2 text-[12px] text-text-muted whitespace-pre-wrap max-h-60 overflow-y-auto">
               {resultText}
             </pre>
           )}

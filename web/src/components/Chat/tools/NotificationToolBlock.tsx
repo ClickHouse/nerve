@@ -47,7 +47,7 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           : <Icon size={14} className={`shrink-0 ${iconColor}`} />
         }
         <span className="text-[13px] font-medium text-text-secondary">{label}</span>
-        {title && <span className="text-[12px] text-[#777] truncate">{title}</span>}
+        {title && <span className="text-[12px] text-text-muted truncate">{title}</span>}
         {priority !== 'normal' && (
           <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
             priority === 'urgent' ? 'bg-red-500/15 text-red-400' :
@@ -89,7 +89,7 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Result */}
           {resultText && (
             <div className="px-3 py-2 border-t border-border-subtle">
-              <pre className={`text-[12px] font-mono whitespace-pre-wrap ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+              <pre className={`text-[12px] font-mono whitespace-pre-wrap ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
                 {resultText}
               </pre>
             </div>

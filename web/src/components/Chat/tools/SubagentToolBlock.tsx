@@ -77,7 +77,7 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
           : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : color}`} />
         }
         <span className={`text-[13px] font-medium ${color}`}>{subagentType}</span>
-        {description && <span className="text-[12px] text-[#777] truncate flex-1">{description}</span>}
+        {description && <span className="text-[12px] text-text-muted truncate flex-1">{description}</span>}
         {model && <span className="text-[10px] text-text-faint shrink-0">{model}</span>}
 
         <div className="ml-auto shrink-0 flex items-center gap-1.5">
@@ -85,7 +85,7 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
           {(isRunning || resultText) && (
             <button
               onClick={handleViewInPanel}
-              className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-text-dim hover:text-[#bbb] cursor-pointer transition-colors rounded hover:bg-surface-raised"
+              className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-text-dim hover:text-text-secondary cursor-pointer transition-colors rounded hover:bg-surface-raised"
               title="View in side panel"
             >
               View <ArrowRight size={10} />
@@ -116,7 +116,7 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="border-b border-border-subtle">
               <button
                 onClick={() => setShowPrompt(!showPrompt)}
-                className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left text-[10px] uppercase tracking-wider text-text-faint hover:text-[#777] cursor-pointer"
+                className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left text-[10px] uppercase tracking-wider text-text-faint hover:text-text-muted cursor-pointer"
               >
                 {showPrompt ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
                 Prompt

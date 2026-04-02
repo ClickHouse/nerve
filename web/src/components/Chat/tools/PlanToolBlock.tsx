@@ -132,7 +132,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
           {toolName === 'plan_propose' && (
             <div className="px-3 py-2">
               {block.input.content ? (
-                <div className="text-[12px] text-[#999] max-h-40 overflow-y-auto whitespace-pre-wrap">
+                <div className="text-[12px] text-text-muted max-h-40 overflow-y-auto whitespace-pre-wrap">
                   {String(block.input.content).slice(0, 500)}
                   {String(block.input.content).length > 500 ? '...' : null}
                 </div>
@@ -165,13 +165,13 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
                   <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[p.status] || 'bg-border-subtle text-text-muted'}`}>
                     {p.status}
                   </span>
-                  <span className="text-[#bbb] truncate">{p.taskTitle}</span>
+                  <span className="text-text-secondary truncate">{p.taskTitle}</span>
                   <span className="text-[10px] text-text-faint shrink-0">v{p.version}</span>
                 </div>
               ))}
             </div>
           ) : resultText ? (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           ) : null)}
@@ -252,7 +252,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
               {feedback && (
                 <div className="mt-2 flex gap-0">
                   <div className="w-0.5 bg-amber-400/30 rounded-full shrink-0" />
-                  <p className="pl-2 text-[12px] text-[#999] whitespace-pre-wrap">{feedback}</p>
+                  <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
                 </div>
               )}
             </div>

@@ -69,7 +69,7 @@ function Row({ label, value, color, bold }: { label: string; value: number; colo
   return (
     <div className="flex justify-between items-center">
       <span className="text-text-muted">{label}</span>
-      <span className={bold ? 'text-[#ddd] font-medium' : 'text-[#aaa]'} style={color ? { color } : undefined}>
+      <span className={bold ? 'text-text font-medium' : 'text-text-muted'} style={color ? { color } : undefined}>
         {formatTokens(value)}
       </span>
     </div>

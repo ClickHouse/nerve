@@ -52,7 +52,7 @@ export function TasksPage() {
             {localQuery && (
               <button
                 onClick={clearSearch}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-text-faint hover:text-[#aaa] cursor-pointer"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-text-faint hover:text-text-muted cursor-pointer"
               >
                 <X size={13} />
               </button>

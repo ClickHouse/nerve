@@ -79,7 +79,7 @@ export function DiagnosticsPage() {
     <div className="h-full overflow-y-auto">
       <div className="border-b border-border-subtle px-6 py-3 flex items-center justify-between bg-bg shrink-0">
         <h1 className="text-lg font-semibold">Diagnostics</h1>
-        <button onClick={load} className="text-text-dim hover:text-[#aaa] cursor-pointer p-1.5 hover:bg-surface-raised rounded">
+        <button onClick={load} className="text-text-dim hover:text-text-muted cursor-pointer p-1.5 hover:bg-surface-raised rounded">
           <RefreshCw size={16} />
         </button>
       </div>

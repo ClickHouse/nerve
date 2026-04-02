@@ -103,7 +103,7 @@ function EditForm({ item, onSave, onCancel }: {
           {categories.map(cat => {
             const selected = selectedCatIds.has(cat.id);
             return (
-              <button key={cat.id} onClick={() => toggleCat(cat.id)} className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer transition-colors ${selected ? 'bg-[#6366f1]/25 text-[#6366f1] border border-[#6366f1]/40' : 'bg-surface-raised text-text-dim border border-border-subtle hover:text-text-muted hover:border-[#555]'}`}>
+              <button key={cat.id} onClick={() => toggleCat(cat.id)} className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer transition-colors ${selected ? 'bg-[#6366f1]/25 text-[#6366f1] border border-[#6366f1]/40' : 'bg-surface-raised text-text-dim border border-border-subtle hover:text-text-muted hover:border-border'}`}>
                 {cat.name.replace(/_/g, ' ')}
               </button>
             );
@@ -150,7 +150,7 @@ function ItemRow({ item, isEditing, isDeleting, onEdit, onDelete, onSave, onCanc
       </span>
       <span className="text-[12px] text-text-secondary flex-1">{item.summary}</span>
       <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button onClick={onEdit} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-[#aaa] cursor-pointer transition-colors" title="Edit"><Pencil size={12} /></button>
+        <button onClick={onEdit} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-text-muted cursor-pointer transition-colors" title="Edit"><Pencil size={12} /></button>
         <button onClick={onDelete} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-red-400 cursor-pointer transition-colors" title="Delete"><Trash2 size={12} /></button>
       </div>
     </div>
@@ -488,7 +488,7 @@ function TimelineView() {
                       )}
                     </div>
                     <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button onClick={() => setEditingItemId(item.id)} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-[#aaa] cursor-pointer transition-colors" title="Edit"><Pencil size={12} /></button>
+                      <button onClick={() => setEditingItemId(item.id)} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-text-muted cursor-pointer transition-colors" title="Edit"><Pencil size={12} /></button>
                       <button onClick={() => setDeletingItemId(item.id)} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-red-400 cursor-pointer transition-colors" title="Delete"><Trash2 size={12} /></button>
                     </div>
                   </div>
@@ -555,7 +555,7 @@ function SourcesView() {
                       {resItems.map(item => (
                         <div key={item.id} className="flex items-start gap-2 px-3 py-2">
                           <span className="text-[10px] px-1.5 py-0.5 rounded mt-0.5 shrink-0" style={{ backgroundColor: (TYPE_COLORS[item.memory_type] || '#666') + '20', color: TYPE_COLORS[item.memory_type] || '#666' }}>{item.memory_type}</span>
-                          <span className="text-[11px] text-[#aaa]">{item.summary}</span>
+                          <span className="text-[11px] text-text-muted">{item.summary}</span>
                         </div>
                       ))}
                     </div>
@@ -653,7 +653,7 @@ function Sidebar() {
           {Object.entries(TYPE_COLORS).map(([type, color]) => (
             <div key={type} className="flex items-center gap-2">
               <Circle size={8} fill={color} color={color} />
-              <span className="text-[12px] text-[#aaa] flex-1">{type}</span>
+              <span className="text-[12px] text-text-muted flex-1">{type}</span>
               <span className="text-[11px] text-text-dim">{stats[type] || 0}</span>
             </div>
           ))}
@@ -670,7 +670,7 @@ function Sidebar() {
           {categories.map(cat => {
             const isActive = selectedCategory === cat.id;
             return (
-              <button key={cat.id} onClick={() => setSelectedCategory(isActive ? null : cat.id)} className={`w-full text-left px-2 py-1.5 rounded text-[12px] cursor-pointer transition-colors flex items-center gap-2 ${isActive ? 'bg-[#6366f1]/15 text-[#6366f1]' : 'text-[#aaa] hover:bg-surface-raised hover:text-text-secondary'}`}>
+              <button key={cat.id} onClick={() => setSelectedCategory(isActive ? null : cat.id)} className={`w-full text-left px-2 py-1.5 rounded text-[12px] cursor-pointer transition-colors flex items-center gap-2 ${isActive ? 'bg-[#6366f1]/15 text-[#6366f1]' : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'}`}>
                 <span className="flex-1 truncate">{cat.name.replace(/_/g, ' ')}</span>
                 <span className="text-[10px] text-text-dim">{catCounts[cat.id] || 0}</span>
               </button>
@@ -682,7 +682,7 @@ function Sidebar() {
         <CreateCategoryForm onClose={() => setShowCreateCat(false)} />
       ) : (
         <div className="p-3 border-t border-border-subtle">
-          <button onClick={() => setShowCreateCat(true)} className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded border border-dashed border-border-subtle text-[12px] text-text-dim hover:text-text-muted hover:border-[#555] cursor-pointer transition-colors">
+          <button onClick={() => setShowCreateCat(true)} className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded border border-dashed border-border-subtle text-[12px] text-text-dim hover:text-text-muted hover:border-border cursor-pointer transition-colors">
             <Plus size={12} /> Category
           </button>
         </div>

@@ -88,7 +88,7 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
                     ) : (
                       <>
                         {event.label && event.event !== 'block_log' && (
-                          <span className="px-1.5 py-0.5 rounded bg-surface-raised text-[#aaa] border border-border-subtle text-[10px]">
+                          <span className="px-1.5 py-0.5 rounded bg-surface-raised text-text-muted border border-border-subtle text-[10px]">
                             {event.label}
                           </span>
                         )}
@@ -101,7 +101,7 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
                           <span className="text-text-faint">iter {event.iteration}</span>
                         )}
                         {event.message && (
-                          <span className="text-[#777] truncate">{event.message}</span>
+                          <span className="text-text-muted truncate">{event.message}</span>
                         )}
                         {!event.message && !event.agent && !event.label && (
                           <span className="text-text-faint font-mono truncate">
@@ -134,7 +134,7 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
                   {block.result}
                 </pre>
               ) : (
-                <div className="text-[12px] text-[#999] max-h-96 overflow-y-auto bg-bg rounded p-3 border border-border-subtle">
+                <div className="text-[12px] text-text-muted max-h-96 overflow-y-auto bg-bg rounded p-3 border border-border-subtle">
                   <MarkdownContent content={block.result} />
                 </div>
               )}

@@ -66,12 +66,12 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
             </span>
           </div>
           {isExitPlan && (
-            <p className="text-[12px] text-[#777] mb-3">
+            <p className="text-[12px] text-text-muted mb-3">
               Review the plan in the side panel, then approve or decline.
             </p>
           )}
           {isEnterPlan && (
-            <p className="text-[12px] text-[#777] mb-3">
+            <p className="text-[12px] text-text-muted mb-3">
               The agent will explore the codebase and design an implementation approach for your approval.
             </p>
           )}
@@ -85,7 +85,7 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
             </button>
             <button
               onClick={() => { setResponded(true); setApproved(false); denyInteraction('User declined.'); }}
-              className="flex-1 py-2 rounded-md text-[13px] font-medium bg-[#1a1a22] hover:bg-[#252530] text-[#999] cursor-pointer transition-colors flex items-center justify-center gap-2"
+              className="flex-1 py-2 rounded-md text-[13px] font-medium bg-surface-raised hover:bg-surface-hover text-text-muted cursor-pointer transition-colors flex items-center justify-center gap-2"
             >
               <Ban size={13} />
               Decline

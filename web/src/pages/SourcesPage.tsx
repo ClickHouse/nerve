@@ -757,7 +757,7 @@ export function SourcesPage() {
             {syncing ? 'Syncing...' : 'Sync All'}
           </button>
           <button onClick={() => { loadOverview(); if (activeTab === 'inbox') loadMessages(); }}
-            className="text-text-dim hover:text-[#aaa] cursor-pointer p-1.5 hover:bg-surface-raised rounded"
+            className="text-text-dim hover:text-text-muted cursor-pointer p-1.5 hover:bg-surface-raised rounded"
             title="Refresh">
             <RefreshCw size={16} />
           </button>

@@ -209,7 +209,7 @@ function JobInfoCard({ job }: { job: CronJob }) {
             {jobTypeBadge(job.type)}
             <span className="text-[14px] text-[#eee] font-medium">{job.id}</span>
             {!job.enabled && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#333]/50 text-text-muted border border-border-subtle">disabled</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-border-subtle/50 text-text-muted border border-border-subtle">disabled</span>
             )}
           </div>
           {job.description && (
@@ -372,7 +372,7 @@ export function CronPage() {
       <div className="border-b border-border-subtle px-4 py-2.5 flex items-center justify-between bg-bg shrink-0">
         <h1 className="text-lg font-semibold">Cron Jobs</h1>
         <button onClick={handleRefresh} disabled={refreshing}
-          className="text-text-dim hover:text-[#aaa] cursor-pointer p-1.5 hover:bg-surface-raised rounded"
+          className="text-text-dim hover:text-text-muted cursor-pointer p-1.5 hover:bg-surface-raised rounded"
           title="Refresh">
           {refreshing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
         </button>

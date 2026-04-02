@@ -88,7 +88,7 @@ export function McpServersPage() {
         <button
           onClick={reloadServers}
           disabled={reloading}
-          className="flex items-center gap-1 px-2 py-1 text-xs text-text-muted hover:text-[#ccc] hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
+          className="flex items-center gap-1 px-2 py-1 text-xs text-text-muted hover:text-text-secondary hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
           title="Reload MCP config from YAML files"
         >
           <RefreshCw size={12} className={reloading ? 'animate-spin' : ''} />

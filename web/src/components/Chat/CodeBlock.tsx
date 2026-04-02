@@ -19,7 +19,7 @@ export function CodeBlock({ className, children }: { className?: string; childre
         <span className="text-[11px] text-text-dim font-mono">{language}</span>
         <button
           onClick={handleCopy}
-          className="text-text-dim hover:text-[#aaa] cursor-pointer p-1"
+          className="text-text-dim hover:text-text-muted cursor-pointer p-1"
           title="Copy"
         >
           {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}

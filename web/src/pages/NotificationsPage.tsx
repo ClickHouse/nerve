@@ -6,8 +6,8 @@ import { useNotificationStore, type Notification } from '../stores/notificationS
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
   answered: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
-  expired: 'bg-[#333]/50 text-text-muted border-border-subtle',
-  dismissed: 'bg-[#333]/50 text-text-dim border-border-subtle',
+  expired: 'bg-border-subtle/50 text-text-muted border-border-subtle',
+  dismissed: 'bg-border-subtle/50 text-text-dim border-border-subtle',
 };
 
 const PRIORITY_DOTS: Record<string, string> = {
@@ -38,7 +38,7 @@ function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
     return (
       <button
         onClick={() => setOpen(true)}
-        className="px-3 py-1 text-sm text-text-dim border border-dashed border-[#444] rounded-lg hover:border-[#666] hover:text-text-muted cursor-pointer"
+        className="px-3 py-1 text-sm text-text-dim border border-dashed border-border rounded-lg hover:border-border-subtle hover:text-text-muted cursor-pointer"
       >
         Custom answer...
       </button>
@@ -109,7 +109,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
           <span className={`px-2 py-0.5 rounded-full border ${STATUS_STYLES[notif.status] || STATUS_STYLES.dismissed}`}>
             {notif.status}
           </span>
-          <span className={`px-2 py-0.5 rounded-full border ${notif.type === 'question' ? 'bg-blue-400/10 text-blue-400 border-blue-400/20' : 'bg-[#333]/50 text-text-muted border-border-subtle'}`}>
+          <span className={`px-2 py-0.5 rounded-full border ${notif.type === 'question' ? 'bg-blue-400/10 text-blue-400 border-blue-400/20' : 'bg-border-subtle/50 text-text-muted border-border-subtle'}`}>
             {notif.type}
           </span>
         </div>
@@ -127,7 +127,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
         {notif.status === 'pending' && notif.type === 'notify' && (
           <button
             onClick={() => dismissNotification(notif.id)}
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-[#777] hover:text-[#bbb] hover:bg-surface-hover cursor-pointer transition-colors"
+            className="flex items-center gap-1 px-2 py-0.5 rounded text-text-muted hover:text-text-secondary hover:bg-surface-hover cursor-pointer transition-colors"
           >
             <EyeOff size={11} />
             <span>Dismiss</span>
@@ -184,7 +184,7 @@ export function NotificationsPage() {
               className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
                 ${filter === f.value
                   ? 'bg-[#6366f1]/15 text-[#6366f1] border-[#6366f1]/30'
-                  : 'text-text-dim border-border hover:border-[#444] hover:text-text-muted'
+                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
                 }`}
             >
               {f.label}
@@ -201,7 +201,7 @@ export function NotificationsPage() {
               className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
                 ${typeFilter === f.value
                   ? 'bg-[#6366f1]/15 text-[#6366f1] border-[#6366f1]/30'
-                  : 'text-text-dim border-border hover:border-[#444] hover:text-text-muted'
+                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
                 }`}
             >
               {f.label}
@@ -213,7 +213,7 @@ export function NotificationsPage() {
         {pendingCount > 0 && (
           <button
             onClick={dismissAll}
-            className="ml-auto flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-[#ccc] hover:border-[#444] hover:bg-surface-raised cursor-pointer transition-colors"
+            className="ml-auto flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors"
           >
             <CheckCheck size={13} />
             Dismiss All

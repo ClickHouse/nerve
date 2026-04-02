@@ -6,7 +6,7 @@ const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
   in_progress: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
   done: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
-  deferred: 'bg-[#333]/50 text-[#888] border-[#333]',
+  deferred: 'bg-border-subtle/50 text-text-muted border-border-subtle',
 };
 
 export function TaskCard({ task, onStatusChange }: {
@@ -18,7 +18,7 @@ export function TaskCard({ task, onStatusChange }: {
   return (
     <div
       onClick={() => navigate(`/tasks/${task.id}`)}
-      className="p-4 bg-surface border border-border-subtle rounded-lg hover:border-[#444] transition-colors cursor-pointer"
+      className="p-4 bg-surface border border-border-subtle rounded-lg hover:border-border transition-colors cursor-pointer"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
@@ -43,7 +43,7 @@ export function TaskCard({ task, onStatusChange }: {
               href={task.source_url}
               target="_blank"
               rel="noopener noreferrer"
-              className="p-1.5 text-text-faint hover:text-[#aaa] hover:bg-surface-hover rounded cursor-pointer"
+              className="p-1.5 text-text-faint hover:text-text-muted hover:bg-surface-hover rounded cursor-pointer"
             >
               <ExternalLink size={14} />
             </a>
@@ -51,7 +51,7 @@ export function TaskCard({ task, onStatusChange }: {
           <select
             value={task.status}
             onChange={(e) => onStatusChange(task.id, e.target.value)}
-            className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-[#aaa] outline-none cursor-pointer"
+            className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-text-muted outline-none cursor-pointer"
           >
             <option value="pending">Pending</option>
             <option value="in_progress">In Progress</option>

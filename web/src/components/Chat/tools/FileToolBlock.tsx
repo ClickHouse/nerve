@@ -35,7 +35,7 @@ export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
       {expanded && (
         <div className="border-t border-border">
           {block.result !== undefined && (
-            <pre className={`px-3 py-2 text-[12px] font-mono whitespace-pre-wrap max-h-80 overflow-y-auto bg-bg ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+            <pre className={`px-3 py-2 text-[12px] font-mono whitespace-pre-wrap max-h-80 overflow-y-auto bg-bg ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
               {block.result}
             </pre>
           )}

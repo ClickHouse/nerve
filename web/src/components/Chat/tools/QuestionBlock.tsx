@@ -145,7 +145,7 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                             {opt.label}
                           </div>
                           {opt.description && (
-                            <div className="text-[12px] text-[#777] mt-0.5 leading-relaxed">{opt.description}</div>
+                            <div className="text-[12px] text-text-muted mt-0.5 leading-relaxed">{opt.description}</div>
                           )}
                         </div>
                       </div>

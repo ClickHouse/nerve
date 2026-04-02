@@ -119,7 +119,7 @@ export function SkillToolBlock({ block }: { block: ToolCallBlockData }) {
                       <span className="text-text-secondary font-medium">{s.name}</span>
                       <span className="text-[10px] text-text-faint font-mono">{s.id}</span>
                     </div>
-                    <p className="text-[11px] text-[#777] truncate">{s.description}</p>
+                    <p className="text-[11px] text-text-muted truncate">{s.description}</p>
                   </div>
                 </div>
               ))}
@@ -145,7 +145,7 @@ export function SkillToolBlock({ block }: { block: ToolCallBlockData }) {
           {isRun && resultText && !block.isError && (
             <div className="px-3 py-2">
               <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">Output</div>
-              <pre className="text-[12px] font-mono whitespace-pre-wrap max-h-60 overflow-y-auto bg-bg-sunken rounded p-2 border border-border-subtle text-[#999]">
+              <pre className="text-[12px] font-mono whitespace-pre-wrap max-h-60 overflow-y-auto bg-bg-sunken rounded p-2 border border-border-subtle text-text-muted">
                 {resultText}
               </pre>
             </div>
@@ -194,7 +194,7 @@ export function SkillToolBlock({ block }: { block: ToolCallBlockData }) {
           {isUpdate && (
             <div className="px-3 py-2">
               {String(block.input.content || '') && (
-                <pre className="text-[11px] font-mono text-[#777] whitespace-pre-wrap max-h-60 overflow-y-auto bg-bg-sunken rounded p-2 border border-border-subtle">
+                <pre className="text-[11px] font-mono text-text-muted whitespace-pre-wrap max-h-60 overflow-y-auto bg-bg-sunken rounded p-2 border border-border-subtle">
                   {String(block.input.content).slice(0, 800)}{String(block.input.content).length > 800 ? '\n...' : ''}
                 </pre>
               )}
@@ -208,7 +208,7 @@ export function SkillToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* Fallback for unknown skill tools */}
           {!isList && !isGet && !isRun && !isRef && !isCreate && !isUpdate && resultText && !block.isError && (
-            <pre className="px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto text-[#999]">
+            <pre className="px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto text-text-muted">
               {resultText}
             </pre>
           )}

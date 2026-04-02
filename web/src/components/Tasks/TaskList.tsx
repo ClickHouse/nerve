@@ -14,7 +14,7 @@ const STATUS_COLORS: Record<string, string> = {
   pending: 'text-yellow-400',
   in_progress: 'text-blue-400',
   done: 'text-green-400',
-  deferred: 'text-[#888]',
+  deferred: 'text-text-muted',
 };
 
 export function TaskList() {

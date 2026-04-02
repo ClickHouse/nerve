@@ -8,7 +8,7 @@ const STATUS_STYLES: Record<string, string> = {
   approved: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
   implementing: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
   declined: 'bg-red-400/10 text-red-400 border-red-400/20',
-  superseded: 'bg-[#333]/50 text-text-muted border-[#333]',
+  superseded: 'bg-border-subtle/50 text-text-muted border-border-subtle',
   failed: 'bg-red-400/10 text-red-400 border-red-400/20',
 };
 
@@ -31,7 +31,7 @@ function PlanCard({ plan }: { plan: Plan }) {
   return (
     <div
       onClick={() => navigate(`/plans/${plan.id}`)}
-      className="p-4 bg-surface border border-border-subtle rounded-lg hover:border-[#444] transition-colors cursor-pointer"
+      className="p-4 bg-surface border border-border-subtle rounded-lg hover:border-border transition-colors cursor-pointer"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
@@ -75,7 +75,7 @@ export function PlansPage() {
               className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
                 ${filter === f.value
                   ? 'bg-[#6366f1]/15 text-[#6366f1] border-[#6366f1]/30'
-                  : 'text-text-dim border-border hover:border-[#444] hover:text-text-muted'
+                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
                 }`}
             >
               {f.label}

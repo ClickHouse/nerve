@@ -128,7 +128,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
                 <button
                   key={s.id}
                   onClick={() => { setHovering(false); onSelect(s.id); }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-[#aaa] hover:bg-border-subtle hover:text-[#ddd] transition-colors cursor-pointer"
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-text-muted hover:bg-border-subtle hover:text-text transition-colors cursor-pointer"
                 >
                   <Loader2 size={12} className="shrink-0 text-emerald-400 animate-spin" />
                   <span className="flex-1 min-w-0 truncate">{s.title || s.id}</span>

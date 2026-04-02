@@ -110,7 +110,7 @@ function CreateSkillDialog() {
           </div>
         </div>
         <div className="p-4 border-t border-border flex justify-end gap-2">
-          <button onClick={() => setShowCreateDialog(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-[#ccc] cursor-pointer">
+          <button onClick={() => setShowCreateDialog(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
             Cancel
           </button>
           <button
@@ -145,7 +145,7 @@ export function SkillsPage() {
           <button
             onClick={syncSkills}
             disabled={actionLoading}
-            className="flex items-center gap-1 px-2 py-1 text-xs text-text-muted hover:text-[#ccc] hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
+            className="flex items-center gap-1 px-2 py-1 text-xs text-text-muted hover:text-text-secondary hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
             title="Re-scan filesystem for new skills"
           >
             <RefreshCw size={12} className={actionLoading ? 'animate-spin' : ''} />

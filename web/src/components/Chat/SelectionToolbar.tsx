@@ -109,7 +109,7 @@ export function SelectionToolbar({ containerRef }: { containerRef: React.RefObje
             key={action}
             onClick={() => handleAction(action)}
             title={label}
-            className="flex items-center gap-1.5 px-3 py-2 text-[12px] text-[#aaa] hover:text-white hover:bg-[#2a2a2a] transition-colors cursor-pointer border-r border-border last:border-r-0"
+            className="flex items-center gap-1.5 px-3 py-2 text-[12px] text-text-muted hover:text-white hover:bg-surface-hover transition-colors cursor-pointer border-r border-border last:border-r-0"
           >
             <Icon size={13} />
             <span>{label}</span>

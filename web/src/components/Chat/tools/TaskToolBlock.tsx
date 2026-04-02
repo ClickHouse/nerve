@@ -96,7 +96,7 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
           : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : isDone ? 'text-green-400' : isCreate ? 'text-blue-400' : 'text-text-muted'}`} />
         }
         <span className="text-[13px] font-medium text-text-secondary shrink-0 whitespace-nowrap">{label}</span>
-        {title && <span className="text-[12px] text-[#777] truncate">{title}</span>}
+        {title && <span className="text-[12px] text-text-muted truncate">{title}</span>}
         {status && (
           <span className={`text-[10px] px-1.5 py-0.5 rounded ${STATUS_COLORS[status] || 'bg-border-subtle text-text-muted'}`}>
             {status}
@@ -115,7 +115,7 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Create: show what was created */}
           {isCreate && title && (
             <div className="px-3 py-2">
-              <div className="text-[12px] text-[#bbb] flex items-center gap-2">
+              <div className="text-[12px] text-text-secondary flex items-center gap-2">
                 <Plus size={11} className="text-blue-400" />
                 <span className="font-medium">{title}</span>
               </div>
@@ -132,7 +132,7 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
           {(isDone || isUpdate) && (
             <div className="px-3 py-2 text-[12px]">
               <span className="text-text-muted">{block.input.task_id ? String(block.input.task_id) : title}</span>
-              {block.input.note ? <p className="text-[#777] mt-1">{String(block.input.note)}</p> : null}
+              {block.input.note ? <p className="text-text-muted mt-1">{String(block.input.note)}</p> : null}
             </div>
           )}
 
@@ -144,13 +144,13 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
                   <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[t.status] || 'bg-border-subtle text-text-muted'}`}>
                     {t.status}
                   </span>
-                  <span className="text-[#bbb] truncate">{t.title}</span>
+                  <span className="text-text-secondary truncate">{t.title}</span>
                   {t.deadline && <span className="text-[10px] text-text-faint shrink-0">{t.deadline}</span>}
                 </div>
               ))}
             </div>
           ) : resultText && !isCreate && !isDone && !isUpdate ? (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           ) : null}

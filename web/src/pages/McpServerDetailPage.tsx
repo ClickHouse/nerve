@@ -57,7 +57,7 @@ export function McpServerDetailPage() {
       <div className="flex items-center gap-3 px-4 py-3 border-b border-border shrink-0">
         <button
           onClick={() => navigate('/mcp')}
-          className="text-text-dim hover:text-[#ccc] cursor-pointer"
+          className="text-text-dim hover:text-text-secondary cursor-pointer"
         >
           <ArrowLeft size={16} />
         </button>

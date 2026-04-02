@@ -98,7 +98,7 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
         <div className="border-t border-purple-500/10">
           {/* Memorize: show what was memorized */}
           {isMemorize && query && (
-            <div className="px-3 py-2 text-[12px] text-[#bbb]">
+            <div className="px-3 py-2 text-[12px] text-text-secondary">
               <div className="flex items-center gap-1.5 mb-1">
                 <Brain size={11} className="text-purple-400" />
                 <span className="text-[10px] uppercase tracking-wider text-purple-400/60">Memorized</span>
@@ -120,12 +120,12 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
                   <span className={`shrink-0 text-[10px] px-1 py-0.5 rounded mt-0.5 ${TYPE_COLORS[item.type] || 'text-text-muted bg-border-subtle'}`}>
                     {item.type}
                   </span>
-                  <span className="text-[#bbb]">{item.text}</span>
+                  <span className="text-text-secondary">{item.text}</span>
                 </div>
               ))}
             </div>
           ) : resultText && !isMemorize ? (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           ) : null}

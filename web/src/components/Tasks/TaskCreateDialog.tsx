@@ -20,7 +20,7 @@ export function TaskCreateDialog({ onClose, onCreate }: {
       <div className="bg-surface-raised border border-border-subtle rounded-xl w-[480px] max-w-[90vw]" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-3 border-b border-border">
           <h2 className="text-[15px] font-semibold">New Task</h2>
-          <button onClick={onClose} className="text-text-faint hover:text-[#aaa] cursor-pointer p-1">
+          <button onClick={onClose} className="text-text-faint hover:text-text-muted cursor-pointer p-1">
             <X size={18} />
           </button>
         </div>
@@ -54,7 +54,7 @@ export function TaskCreateDialog({ onClose, onCreate }: {
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <button type="button" onClick={onClose}
-              className="px-4 py-2 text-[13px] text-text-muted hover:text-[#aaa] cursor-pointer">
+              className="px-4 py-2 text-[13px] text-text-muted hover:text-text-muted cursor-pointer">
               Cancel
             </button>
             <button type="submit"

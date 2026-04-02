@@ -89,7 +89,7 @@ export function HouseOfAgentsPage() {
             <span className="text-[12px] text-text-faint font-medium uppercase tracking-wider">Pipelines</span>
             <button
               onClick={() => setShowNewForm(!showNewForm)}
-              className="p-1 text-text-faint hover:text-[#aaa] hover:bg-surface-hover rounded cursor-pointer"
+              className="p-1 text-text-faint hover:text-text-muted hover:bg-surface-hover rounded cursor-pointer"
             >
               <Plus size={14} />
             </button>

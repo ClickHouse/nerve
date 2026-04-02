@@ -74,7 +74,7 @@ export function SkillDetailPage() {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
         <div className="flex items-center gap-3">
-          <button onClick={() => navigate('/skills')} className="text-text-dim hover:text-[#ccc] cursor-pointer">
+          <button onClick={() => navigate('/skills')} className="text-text-dim hover:text-text-secondary cursor-pointer">
             <ArrowLeft size={16} />
           </button>
           <div>
@@ -260,7 +260,7 @@ export function SkillDetailPage() {
               This will permanently delete <strong>{selectedSkill.name}</strong> and all its files. This cannot be undone.
             </p>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowDeleteConfirm(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-[#ccc] cursor-pointer">
+              <button onClick={() => setShowDeleteConfirm(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
                 Cancel
               </button>
               <button
