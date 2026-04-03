@@ -386,8 +386,25 @@ def _strip_boilerplate(body: str) -> str:
         # table-based layouts into a single block.
         if _BOILERPLATE_RE.search(para) and len(para) < 300:
             continue
-        # Strip standalone URL lines within the paragraph
-        para = _STANDALONE_URL_RE.sub('', para).strip()
+        # Strip standalone URL lines that are clearly boilerplate
+        # (tracking pixels, unsubscribe, social media, etc.)
+        # but keep actionable URLs (booking, messaging, payment, etc.)
+        def _is_boilerplate_url(m: re.Match) -> str:
+            url = m.group(0).strip().strip('<>')
+            _boilerplate_url_patterns = (
+                'unsubscribe', 'optout', 'opt-out', 'manage-preferences',
+                'email-preferences', 'notification-settings',
+                'tracking', 'click.', 'trk.', 'sng.link',
+                'tiktok.com', 'instagram.com', 'twitter.com', 'facebook.com',
+                'youtube.com', 'linkedin.com',
+                'account-settings/notification', 'email-unsubscribe',
+                '%opentrack%',
+            )
+            url_lower = url.lower()
+            if any(p in url_lower for p in _boilerplate_url_patterns):
+                return ''
+            return m.group(0)
+        para = _STANDALONE_URL_RE.sub(_is_boilerplate_url, para).strip()
         if para:
             cleaned.append(para)
 
