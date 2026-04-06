@@ -317,7 +317,8 @@ if ms.enabled:
         source=source, db=db,
         batch_size=ms.batch_size,
         condense=ms.condense,
-        condense_config=condense_cfg,
+        condense_model=condense_model,
+        condense_client_factory=condense_factory,
         ttl_days=ttl_days,
     ))
 ```

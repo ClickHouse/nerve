@@ -7,7 +7,7 @@ as APScheduler jobs. Centralizes all source construction and config extraction.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.sources.runner import SourceRunner
 
@@ -33,24 +33,12 @@ def build_source_runners(
     runners: list[SourceRunner] = []
     ttl_days = config.sync.message_ttl_days
 
-    # Build condense config from API credentials / provider
-    condense_cfg: dict[str, Any] | None = None
-    if config.memory.fast_model:
-        if config.provider.is_bedrock:
-            condense_cfg = {
-                "provider": "bedrock",
-                "aws_region": config.provider.aws_region,
-                "aws_profile": config.provider.aws_profile,
-                "model": config.memory.fast_model,
-            }
-        elif config.effective_api_key:
-            condense_cfg = {
-                "provider": "anthropic",
-                "api_key": config.effective_api_key,
-                "model": config.memory.fast_model,
-                "base_url": config.anthropic_api_base_url,
-                "use_proxy": config.proxy.enabled,
-            }
+    # Build condense factory from config — delegates all provider/credential
+    # logic to NerveConfig.create_async_anthropic_client()
+    condense_model = config.memory.fast_model or ""
+    condense_factory: Callable[[], Any] | None = None
+    if condense_model and (config.provider.is_bedrock or config.effective_api_key):
+        condense_factory = lambda: config.create_async_anthropic_client(timeout=60.0)
 
     # Telegram
     tg = config.sync.telegram
@@ -68,7 +56,8 @@ def build_source_runners(
             db=db,
             batch_size=tg.batch_size,
             condense=tg.condense,
-            condense_config=condense_cfg,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
             ttl_days=ttl_days,
         ))
         logger.info("Registered source: telegram (batch=%d)", tg.batch_size)
@@ -82,15 +71,14 @@ def build_source_runners(
             source = GmailSource(account=account, config={
                 "keyring_password": gmail.keyring_password,
             })
-            gmail_condense_cfg = condense_cfg
-            if condense_cfg and gmail.condense_prompt:
-                gmail_condense_cfg = {**condense_cfg, "prompt": gmail.condense_prompt}
             runners.append(SourceRunner(
                 source=source,
                 db=db,
                 batch_size=gmail.batch_size,
                 condense=gmail.condense,
-                condense_config=gmail_condense_cfg,
+                condense_model=condense_model,
+                condense_prompt=gmail.condense_prompt or "",
+                condense_client_factory=condense_factory,
                 ttl_days=ttl_days,
             ))
             logger.info("Registered source: %s (batch=%d)", source.source_name, gmail.batch_size)
@@ -106,7 +94,8 @@ def build_source_runners(
             db=db,
             batch_size=gh.batch_size,
             condense=gh.condense,
-            condense_config=condense_cfg,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
             ttl_days=ttl_days,
         ))
         logger.info("Registered source: github (batch=%d)", gh.batch_size)
@@ -125,7 +114,8 @@ def build_source_runners(
             db=db,
             batch_size=gh_events.batch_size,
             condense=gh_events.condense,
-            condense_config=condense_cfg,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
             ttl_days=ttl_days,
         ))
         logger.info("Registered source: github_events (batch=%d, repos=%s)", gh_events.batch_size, gh_events.repos or "all")

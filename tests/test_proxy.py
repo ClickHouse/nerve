@@ -497,15 +497,14 @@ class TestSubsystemConfigWiring:
     """Verify subsystems use the config helper properties."""
 
     def test_registry_uses_effective_key(self) -> None:
-        """build_source_runners should use effective_api_key, not raw anthropic_api_key."""
+        """build_source_runners should use config factory with effective_api_key."""
         from nerve.sources.registry import build_source_runners
 
         cfg = NerveConfig.from_dict({
             "proxy": {"enabled": True, "api_key": "sk-proxy-key"},
             "anthropic_api_key": "sk-ant-should-be-ignored",
         })
-        # Build runners with no sources enabled — we just verify condense config.
-        # Enable a source so condense_cfg gets used.
+        # Enable a source so condense factory gets used.
         cfg.sync.github.enabled = True
 
         mock_db = MagicMock()
@@ -516,12 +515,16 @@ class TestSubsystemConfigWiring:
         # At least one runner should exist (GitHub).
         assert len(runners) >= 1
         runner = runners[0]
-        # Condense config should use the proxy key, not the raw key.
-        assert runner.condense_config["api_key"] == "sk-proxy-key"
-        assert "127.0.0.1" in runner.condense_config["base_url"]
+        # Model should be set from config.memory.fast_model
+        assert runner.condense_model == "claude-haiku-4-5-20251001"
+        # Factory should be set — delegates to config.create_async_anthropic_client
+        assert runner._client_factory is not None
+        # Calling the factory should produce a client with the proxy base URL
+        client = runner._client_factory()
+        assert "127.0.0.1" in str(client.base_url)
 
     def test_registry_no_proxy_uses_raw_key(self) -> None:
-        """Without proxy, condense config should use the raw API key."""
+        """Without proxy, condense factory should create client with raw API key."""
         from nerve.sources.registry import build_source_runners
 
         cfg = NerveConfig.from_dict({
@@ -532,27 +535,32 @@ class TestSubsystemConfigWiring:
         mock_db = MagicMock()
         runners = build_source_runners(cfg, mock_db)
         assert len(runners) >= 1
-        assert runners[0].condense_config["api_key"] == "sk-ant-real-key"
-        assert "api.anthropic.com" in runners[0].condense_config["base_url"]
+        runner = runners[0]
+        assert runner.condense_model == "claude-haiku-4-5-20251001"
+        assert runner._client_factory is not None
+        client = runner._client_factory()
+        assert "api.anthropic.com" in str(client.base_url)
 
 
 class TestCondenseClientBaseUrl:
-    """Verify condense client strips /v1 suffix to avoid /v1/v1/messages."""
+    """Verify condense client (via factory) strips /v1 suffix to avoid /v1/v1/messages."""
 
     @pytest.mark.asyncio
     async def test_condense_client_strips_v1_from_proxy_url(self) -> None:
-        """Proxy base_url includes /v1/ — SDK must not double it."""
+        """Proxy base_url includes /v1/ — factory must not double it."""
         from nerve.sources.runner import SourceRunner
+
+        cfg = NerveConfig.from_dict({
+            "proxy": {"enabled": True, "port": 8317},
+        })
+        factory = lambda: cfg.create_async_anthropic_client(timeout=60.0)
 
         runner = SourceRunner(
             source=MagicMock(),
             db=MagicMock(),
             condense=True,
-            condense_config={
-                "api_key": "sk-test",
-                "model": "claude-haiku-4-5-20251001",
-                "base_url": "http://127.0.0.1:8317/v1/",
-            },
+            condense_model="claude-haiku-4-5-20251001",
+            condense_client_factory=factory,
         )
         client = await runner._get_condense_client()
         assert client is not None
@@ -567,15 +575,17 @@ class TestCondenseClientBaseUrl:
         """Direct API base_url also includes /v1/ — same fix applies."""
         from nerve.sources.runner import SourceRunner
 
+        cfg = NerveConfig.from_dict({
+            "anthropic_api_key": "sk-test",
+        })
+        factory = lambda: cfg.create_async_anthropic_client(timeout=60.0)
+
         runner = SourceRunner(
             source=MagicMock(),
             db=MagicMock(),
             condense=True,
-            condense_config={
-                "api_key": "sk-test",
-                "model": "claude-haiku-4-5-20251001",
-                "base_url": "https://api.anthropic.com/v1/",
-            },
+            condense_model="claude-haiku-4-5-20251001",
+            condense_client_factory=factory,
         )
         client = await runner._get_condense_client()
         assert client is not None
@@ -584,18 +594,15 @@ class TestCondenseClientBaseUrl:
         assert base.rstrip("/") == "https://api.anthropic.com"
 
     @pytest.mark.asyncio
-    async def test_condense_client_no_base_url(self) -> None:
-        """Without base_url, SDK uses its default — no crash."""
+    async def test_condense_client_no_factory(self) -> None:
+        """Without a client factory, _get_condense_client returns None."""
         from nerve.sources.runner import SourceRunner
 
         runner = SourceRunner(
             source=MagicMock(),
             db=MagicMock(),
             condense=True,
-            condense_config={
-                "api_key": "sk-test",
-                "model": "claude-haiku-4-5-20251001",
-            },
+            condense_model="claude-haiku-4-5-20251001",
         )
         client = await runner._get_condense_client()
-        assert client is not None
+        assert client is None

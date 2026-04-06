@@ -14,7 +14,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.sources.models import IngestResult, SourceRecord
 
@@ -109,7 +109,11 @@ class SourceRunner:
         batch_size: Max records per fetch.
         job_id: Cron job ID for logging (default: "source:<name>").
         condense: Enable LLM condensation for long records.
-        condense_config: Dict with 'api_key' and 'model' for Haiku condensation.
+        condense_model: Model name for condensation (e.g. "claude-haiku-4-5-20251001").
+        condense_prompt: Custom system prompt for condensation (uses default if empty).
+        condense_client_factory: Callable that creates an async Anthropic client.
+            Provided by NerveConfig.create_async_anthropic_client — handles provider
+            detection, credentials, timeout, and proxy routing automatically.
         ttl_days: TTL for persisted source messages.
     """
 
@@ -120,7 +124,9 @@ class SourceRunner:
         batch_size: int = 50,
         job_id: str = "",
         condense: bool = False,
-        condense_config: dict[str, str] | None = None,
+        condense_model: str = "",
+        condense_prompt: str = "",
+        condense_client_factory: Callable[[], Any] | None = None,
         ttl_days: int = 7,
     ):
         self.source = source
@@ -128,10 +134,12 @@ class SourceRunner:
         self.batch_size = batch_size
         self.job_id = job_id or f"source:{source.source_name}"
         self.condense = condense
-        self.condense_config = condense_config or {}
+        self.condense_model = condense_model
+        self.condense_prompt = condense_prompt
+        self._client_factory = condense_client_factory
         self.ttl_days = ttl_days
         self._lock = asyncio.Lock()
-        self._condense_client: Any | None = None  # Lazy AsyncAnthropic
+        self._condense_client: Any | None = None
         self.health = SourceHealth()
         self._notification_service: Any | None = None
 
@@ -290,77 +298,17 @@ class SourceRunner:
     # ------------------------------------------------------------------
 
     async def _get_condense_client(self) -> Any | None:
-        """Get or create the shared async Anthropic client for condensation.
+        """Get or create the async Anthropic client for condensation.
 
-        Returns None when proxy mode is active (uses httpx directly).
-        Supports both direct Anthropic API and AWS Bedrock providers.
+        Uses the config-provided factory which handles provider detection,
+        credentials, timeout, and Bedrock/Anthropic switching automatically.
         """
-        if self.condense_config.get("use_proxy"):
-            return None  # Proxy uses OpenAI-compatible httpx calls
         if self._condense_client is not None:
             return self._condense_client
-
-        provider = self.condense_config.get("provider", "anthropic")
-
-        try:
-            import anthropic
-        except ImportError:
-            logger.warning("anthropic package not available for content condensation")
+        if self._client_factory is None:
             return None
-
-        if provider == "bedrock":
-            from anthropic import AsyncAnthropicBedrock
-            kwargs: dict[str, Any] = {}
-            if self.condense_config.get("aws_region"):
-                kwargs["aws_region"] = self.condense_config["aws_region"]
-            if self.condense_config.get("aws_profile"):
-                kwargs["aws_profile"] = self.condense_config["aws_profile"]
-            self._condense_client = AsyncAnthropicBedrock(**kwargs)
-        else:
-            api_key = self.condense_config.get("api_key")
-            if not api_key:
-                return None
-            kwargs = {"api_key": api_key}
-            base_url = self.condense_config.get("base_url")
-            if base_url:
-                # Strip /v1/ suffix — Anthropic SDK prepends it internally,
-                # so including it here causes /v1/v1/messages (404).
-                url = base_url.rstrip("/")
-                if url.endswith("/v1"):
-                    url = url[:-3]
-                kwargs["base_url"] = url
-            self._condense_client = anthropic.AsyncAnthropic(**kwargs)
-
+        self._condense_client = self._client_factory()
         return self._condense_client
-
-    async def _condense_via_proxy(
-        self, content: str, model: str,
-    ) -> str:
-        """Condense content via the OpenAI-compatible proxy endpoint."""
-        import httpx
-
-        base_url = self.condense_config.get("base_url", "")
-        if not base_url.endswith("/"):
-            base_url += "/"
-        api_key = self.condense_config.get("api_key", "")
-
-        async with httpx.AsyncClient() as http_client:
-            resp = await http_client.post(
-                f"{base_url}chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "max_tokens": 1024,
-                    "messages": [{"role": "user", "content": content}],
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
 
     async def _condense_long_content(
         self, records: list[SourceRecord],
@@ -374,7 +322,7 @@ class SourceRunner:
         On failure (import error, API error, timeout), the original content
         is preserved — this step never blocks the pipeline.
         """
-        model = self.condense_config.get("model")
+        model = self.condense_model
         if not model:
             return records
 
@@ -382,21 +330,13 @@ class SourceRunner:
         if not long_records:
             return records
 
-        use_proxy = self.condense_config.get("use_proxy", False)
-
-        if not use_proxy:
-            client = await self._get_condense_client()
-            if not client:
-                return records
-        else:
-            client = None
-            if not self.condense_config.get("api_key"):
-                return records
+        client = await self._get_condense_client()
+        if not client:
+            return records
 
         logger.info(
-            "Source %s: condensing %d/%d records with %s%s",
+            "Source %s: condensing %d/%d records with %s",
             self.source.source_name, len(long_records), len(records), model,
-            " (via proxy)" if use_proxy else "",
         )
         sem = asyncio.Semaphore(5)
 
@@ -404,33 +344,27 @@ class SourceRunner:
             async with sem:
                 original_len = len(record.content)
                 try:
-                    condense_prompt = self.condense_config.get("prompt") or _CONDENSE_PROMPT
+                    prompt = self.condense_prompt or _CONDENSE_PROMPT
                     prompt_content = (
-                        f"{condense_prompt}\n\n"
+                        f"{prompt}\n\n"
                         f"---\n\n"
                         f"{record.content}"
                     )
-                    if use_proxy:
-                        condensed = await self._condense_via_proxy(
-                            prompt_content, model,
-                        )
-                    else:
-                        response = await asyncio.wait_for(
-                            client.messages.create(
-                                model=model,
-                                max_tokens=1024,
-                                messages=[{
-                                    "role": "user",
-                                    "content": prompt_content,
-                                }],
-                            ),
-                            timeout=30,
-                        )
-                        condensed = response.content[0].text
-                    record.content = condensed
+                    response = await asyncio.wait_for(
+                        client.messages.create(
+                            model=model,
+                            max_tokens=1024,
+                            messages=[{
+                                "role": "user",
+                                "content": prompt_content,
+                            }],
+                        ),
+                        timeout=30,
+                    )
+                    record.content = response.content[0].text
                     logger.debug(
                         "Condensed %s: %d → %d chars",
-                        record.id, original_len, len(condensed),
+                        record.id, original_len, len(record.content),
                     )
                 except Exception as e:
                     logger.warning(
