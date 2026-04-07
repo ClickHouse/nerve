@@ -27,15 +27,24 @@ function estimateCost(u: ContextUsage): number {
 export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; sessionCostUsd?: number }) {
   const [hovering, setHovering] = useState(false);
 
-  // SDK's input_tokens is only non-cached input; total context = all input + output
-  const totalInput = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-  const used = totalInput + usage.output_tokens;
+  // The SDK reports cumulative token counts across all API sub-calls in a turn
+  // (each tool use triggers a new API call). So cache_read can exceed the context
+  // window — it's a billing metric, not context occupancy.
+  // For the progress bar, use total billed tokens as a rough activity indicator
+  // rather than a precise context window gauge.
+  const totalBilled = usage.input_tokens + usage.cache_read_input_tokens
+    + usage.cache_creation_input_tokens + usage.output_tokens;
   const max = usage.max_context_tokens;
-  const pct = Math.min((used / max) * 100, 100);
+
+  // Estimate single-call context: if there were N sub-calls, each saw roughly
+  // the same prompt. Approximate N from how much total exceeds max.
+  const estimatedCalls = Math.max(1, Math.ceil(totalBilled / max));
+  const estimatedContext = Math.round(totalBilled / estimatedCalls);
+  const pct = Math.min((estimatedContext / max) * 100, 100);
 
   const turnCost = estimateCost(usage);
-  const cacheRate = totalInput > 0
-    ? (usage.cache_read_input_tokens / totalInput * 100)
+  const cacheRate = totalBilled > 0
+    ? (usage.cache_read_input_tokens / (usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens) * 100)
     : 0;
 
   // Color based on usage level
@@ -50,7 +59,7 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
       onMouseLeave={() => setHovering(false)}
     >
       <span className="text-[11px] text-text-dim whitespace-nowrap">
-        {formatTokens(used)} / {formatTokens(max)}
+        ~{formatTokens(estimatedContext)} / {formatTokens(max)}
       </span>
       <div className="w-20 h-1.5 bg-border-subtle rounded-full overflow-hidden">
         <div
@@ -61,7 +70,7 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
 
       {hovering && (
         <div className="absolute right-0 top-full mt-2 z-50 bg-surface-raised border border-border-subtle rounded-lg p-3 shadow-xl min-w-[220px]">
-          <div className="text-[11px] text-text-muted uppercase tracking-wider mb-2">Context Usage</div>
+          <div className="text-[11px] text-text-muted uppercase tracking-wider mb-2">Token Usage (this turn)</div>
           <div className="space-y-1.5 text-[12px]">
             <Row label="Fresh input" value={usage.input_tokens} />
             <Row label="Output tokens" value={usage.output_tokens} />
@@ -72,9 +81,16 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
               <Row label="Cache created" value={usage.cache_creation_input_tokens} color="#a855f7" />
             )}
             <div className="border-t border-border-subtle my-1.5" />
-            <Row label="Total used" value={used} bold />
+            <Row label="Total billed" value={totalBilled} bold />
+            {estimatedCalls > 1 && (
+              <div className="flex justify-between items-center">
+                <span className="text-text-muted">API sub-calls</span>
+                <span className="text-text-muted">~{estimatedCalls}</span>
+              </div>
+            )}
+            <Row label="Est. context" value={estimatedContext} />
             <Row label="Max context" value={max} />
-            <Row label="Remaining" value={max - used} color={pct > 80 ? '#ef4444' : '#22c55e'} />
+            <Row label="Remaining" value={Math.max(0, max - estimatedContext)} color={pct > 80 ? '#ef4444' : '#22c55e'} />
 
             {/* Cost section */}
             <div className="border-t border-border-subtle my-1.5" />
