@@ -295,6 +295,7 @@ def create_app() -> FastAPI:
                     # User sent a chat message
                     user_text = data.get("content", "")
                     session_id = data.get("session_id", active_session)
+                    file_ids = data.get("file_ids", [])
 
                     if session_id != active_session:
                         # Switch sessions
@@ -303,6 +304,14 @@ def create_app() -> FastAPI:
                         await broadcaster.register(active_session, client_id, ws_broadcast)
                         await router.switch_session("web:default", session_id)
 
+                    # Load uploaded files if any
+                    images = None
+                    image_refs = None
+                    if file_ids:
+                        images, image_refs = await _load_uploaded_files(
+                            _engine.db, file_ids,
+                        )
+
                     # Run agent in background, store task for stop support
                     task = asyncio.create_task(
                         _engine.run(
@@ -310,6 +319,8 @@ def create_app() -> FastAPI:
                             user_message=user_text,
                             source="web",
                             channel="web",
+                            images=images or None,
+                            image_refs=image_refs or None,
                         )
                     )
                     _engine.register_task(session_id, task)
@@ -433,6 +444,67 @@ def create_app() -> FastAPI:
             return FileResponse(str(web_dist / "index.html"))
 
     return app
+
+
+async def _load_uploaded_files(
+    db: Database, file_ids: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Load uploaded files from DB/disk into the engine image format.
+
+    Returns:
+        (images, image_refs) where images is the list for engine.run(images=...)
+        and image_refs is metadata for storing in the user message blocks column.
+    """
+    import base64
+
+    records = await db.get_uploaded_files_by_ids(file_ids)
+    images: list[dict] = []
+    image_refs: list[dict] = []
+
+    for rec in records:
+        disk_path = Path(rec["disk_path"])
+        if not disk_path.exists():
+            logger.warning("Uploaded file not found on disk: %s", disk_path)
+            continue
+
+        data = disk_path.read_bytes()
+        file_type = rec["file_type"]
+        media_type = rec["media_type"]
+        file_id = rec["id"]
+        filename = rec["filename"]
+
+        if file_type in ("image", "pdf"):
+            b64 = base64.b64encode(data).decode("utf-8")
+            images.append({
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64,
+            })
+            image_refs.append({
+                "type": "image" if file_type == "image" else "file",
+                "url": f"/api/files/uploads/{file_id}",
+                "filename": filename,
+                "media_type": media_type,
+            })
+        else:
+            # Text file — will be appended to user message by the engine
+            try:
+                text_content = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text_content = f"[Binary file: {filename}, {len(data)} bytes]"
+            images.append({
+                "type": "text_file",
+                "filename": filename,
+                "content": text_content,
+            })
+            image_refs.append({
+                "type": "file",
+                "url": f"/api/files/uploads/{file_id}",
+                "filename": filename,
+                "media_type": media_type,
+            })
+
+    return images, image_refs
 
 
 def run_server(config: NerveConfig | None = None) -> None:

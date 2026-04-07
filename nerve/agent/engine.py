@@ -1247,6 +1247,7 @@ class AgentEngine:
         model: str | None = None,
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
+        image_refs: list[dict[str, Any]] | None = None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -1256,6 +1257,8 @@ class AgentEngine:
                       DB or shown in the UI.
             images: Optional list of image dicts with keys ``type``,
                     ``media_type``, and ``data`` (base64-encoded).
+            image_refs: Optional metadata about uploaded files for persisting
+                        in the user message blocks column (web uploads only).
         """
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
@@ -1281,6 +1284,7 @@ class AgentEngine:
                     return await self._run_inner(
                         session_id, user_message, source, channel, model,
                         internal=internal, images=images,
+                        image_refs=image_refs,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -1301,6 +1305,7 @@ class AgentEngine:
         model: str | None,
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
+        image_refs: list[dict[str, Any]] | None = None,
     ) -> str:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source)
@@ -1330,10 +1335,14 @@ class AgentEngine:
             # Store user message in DB (note attached images for display)
             db_text = user_message
             if images:
-                suffix = f"\n[{len(images)} image(s) attached]"
-                db_text = (user_message + suffix) if user_message else suffix.strip()
+                # Count only image/pdf entries, not text_file entries
+                img_count = sum(1 for img in images if img.get("type") != "text_file")
+                if img_count:
+                    suffix = f"\n[{img_count} image(s) attached]"
+                    db_text = (user_message + suffix) if user_message else suffix.strip()
             await self.sessions.add_message(
                 session_id, "user", db_text, channel=channel,
+                blocks=image_refs,
             )
 
         full_response_text = ""
@@ -1383,6 +1392,16 @@ class AgentEngine:
                 if query_text:
                     content_blocks.append({"type": "text", "text": query_text})
                 for img in images:
+                    # Text files are inlined as text context blocks
+                    if img.get("type") == "text_file":
+                        fname = img.get("filename", "file")
+                        content = img.get("content", "")
+                        content_blocks.append({
+                            "type": "text",
+                            "text": f"--- Attached: {fname} ---\n{content}",
+                        })
+                        continue
+
                     # PDFs use "document" content block; images use "image"
                     block_type = "document" if img["media_type"] == "application/pdf" else "image"
 

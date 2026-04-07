@@ -1,10 +1,12 @@
 import { useMemo } from 'react';
+import { Download, FileText } from 'lucide-react';
 import type { MessageBlock } from '../../types/chat';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
+import { getToken } from '../../api/client';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -53,6 +55,29 @@ export function BlockRenderer({
               <div key={i}>{inner}</div>
             );
           }
+          case 'image':
+            return (
+              <div key={i} className="my-2">
+                <a href={item.url} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
+                  <img src={item.url} alt={item.filename} className="max-w-[300px] max-h-[300px] object-contain" />
+                </a>
+              </div>
+            );
+          case 'file':
+            return (
+              <div key={i} className="my-2">
+                <a
+                  href={`${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`}
+                  download={item.filename}
+                  className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
+                >
+                  <FileText size={14} />
+                  <span className="truncate max-w-[200px]">{item.filename}</span>
+                  {item.size != null && <span className="text-text-muted text-xs">({(item.size / 1024).toFixed(1)}KB)</span>}
+                  <Download size={12} className="text-text-muted" />
+                </a>
+              </div>
+            );
           default:
             return null;
         }

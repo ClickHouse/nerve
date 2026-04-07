@@ -2,10 +2,21 @@ import type { ChatMessage, MessageBlock } from '../types/chat';
 
 export function hydrateMessage(raw: any): ChatMessage {
   if (raw.role === 'user') {
+    const userBlocks: MessageBlock[] = [{ type: 'text', content: raw.content || '' }];
+    // Restore image/file blocks from DB (uploaded files)
+    if (raw.blocks && Array.isArray(raw.blocks)) {
+      for (const b of raw.blocks) {
+        if (b.type === 'image') {
+          userBlocks.push({ type: 'image', url: b.url || '', filename: b.filename || '', media_type: b.media_type || '' });
+        } else if (b.type === 'file') {
+          userBlocks.push({ type: 'file', url: b.url || '', filename: b.filename || '', size: b.size });
+        }
+      }
+    }
     return {
       id: raw.id,
       role: 'user',
-      blocks: [{ type: 'text', content: raw.content || '' }],
+      blocks: userBlocks,
       channel: raw.channel,
       created_at: raw.created_at,
     };
@@ -27,6 +38,12 @@ export function hydrateMessage(raw: any): ChatMessage {
           isError: b.is_error,
           status: 'complete' as const,
         };
+      }
+      if (b.type === 'image') {
+        return { type: 'image' as const, url: b.url || '', filename: b.filename || '', media_type: b.media_type || '' };
+      }
+      if (b.type === 'file') {
+        return { type: 'file' as const, url: b.url || '', filename: b.filename || '', size: b.size };
       }
       // Default: text
       return { type: 'text' as const, content: b.content || '' };
