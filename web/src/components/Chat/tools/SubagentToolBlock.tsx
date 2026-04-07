@@ -14,7 +14,7 @@ const AGENT_ICONS: Record<string, typeof Bot> = {
 const AGENT_COLORS: Record<string, string> = {
   Explore: 'text-cyan-400',
   Plan: 'text-amber-400',
-  'general-purpose': 'text-accent',
+  'general-purpose': 'text-link',
 };
 
 export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {

@@ -8,7 +8,7 @@ import type { FileDiff, DiffHunk, DiffLine as DiffLineType } from '../../types/c
 function HunkHeader({ hunk }: { hunk: DiffHunk }) {
   return (
     <div className="bg-accent/10 text-[11px] px-3 py-1 border-y border-accent/20 select-none flex items-center gap-2 sticky top-0 z-[1]">
-      <span className="text-accent font-mono">
+      <span className="text-link font-mono">
         @@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@
       </span>
       {hunk.header && (

@@ -17,7 +17,7 @@ const TAB_ICONS: Record<string, typeof Bot> = {
 const TAB_COLORS: Record<string, string> = {
   Plan: 'text-amber-400',
   Explore: 'text-cyan-400',
-  'general-purpose': 'text-accent',
+  'general-purpose': 'text-link',
   files: 'text-teal-400',
 };
 
@@ -130,7 +130,7 @@ function TabHeader({ tab, onClose }: { tab: PanelTab; onClose: () => void }) {
 // ------------------------------------------------------------------ //
 
 function TabContent({ tab, containerRef }: { tab: PanelTab; containerRef: React.RefObject<HTMLDivElement | null> }) {
-  const cursorColor = tab.type === 'plan' ? 'bg-amber-400' : 'bg-accent';
+  const cursorColor = tab.type === 'plan' ? 'bg-amber-400' : 'bg-link';
   const hasBlocks = tab.blocks.length > 0;
   const endRef = useRef<HTMLDivElement>(null);
   const isNearBottom = useRef(true);
