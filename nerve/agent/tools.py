@@ -2169,8 +2169,6 @@ def create_session_mcp_server(session_id: str):
         _SEND_FILE_SCHEMA,
     )
     async def session_send_file(args: dict) -> dict:
-        from nerve.agent.streaming import broadcaster
-
         file_path = args.get("file_path", "")
         if not file_path:
             return {"content": [{"type": "text", "text": "Error: file_path is required."}]}
@@ -2186,15 +2184,8 @@ def create_session_mcp_server(session_id: str):
         filename = resolved.name
         file_size = resolved.stat().st_size
 
-        # Broadcast a file_attachment event so the frontend renders a download card
-        await broadcaster.broadcast(session_id, {
-            "type": "file_attachment",
-            "session_id": session_id,
-            "path": str(resolved),
-            "filename": filename,
-            "size": file_size,
-        })
-
+        # The tool_call block persists in DB — frontend renders it
+        # as an inline download card via SendFileBlock.
         return {"content": [{"type": "text", "text": f"Sent file: {filename} ({file_size:,} bytes)"}]}
 
     # Shared tools (don't need session context) + session-scoped tools

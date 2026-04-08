@@ -25,7 +25,6 @@ export type WSMessage =
   | { type: 'session_running'; session_id: string; is_running: boolean }
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'timeout' }[] }
   | { type: 'hoa_progress'; session_id: string; event: Record<string, unknown> }
-  | { type: 'file_attachment'; session_id: string; path: string; filename: string; size: number }
   | { type: 'pong' };
 
 type MessageHandler = (msg: WSMessage) => void;
