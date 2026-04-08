@@ -2157,9 +2157,49 @@ def create_session_mcp_server(session_id: str):
             parts.append(f"stderr:\n{result.stderr_log[:2000]}")
             return _hoa_text("\n\n".join(parts))
 
+    _SEND_FILE_SCHEMA = {
+        "file_path": {"type": "string", "description": "Absolute path to the file to send to the user"},
+    }
+
+    @tool(
+        "send_file",
+        "Send a file to the user as a downloadable attachment in the chat. "
+        "The file will appear inline as a download card. Use this when the user asks "
+        "you to share, export, or send them a file.",
+        _SEND_FILE_SCHEMA,
+    )
+    async def session_send_file(args: dict) -> dict:
+        from nerve.agent.streaming import broadcaster
+
+        file_path = args.get("file_path", "")
+        if not file_path:
+            return {"content": [{"type": "text", "text": "Error: file_path is required."}]}
+
+        resolved = Path(file_path).resolve()
+        if not resolved.exists() or not resolved.is_file():
+            return {"content": [{"type": "text", "text": f"Error: file not found: {file_path}"}]}
+
+        # Security: must be within workspace
+        if _workspace and not str(resolved).startswith(str(_workspace.resolve())):
+            return {"content": [{"type": "text", "text": "Error: file must be within the workspace."}]}
+
+        filename = resolved.name
+        file_size = resolved.stat().st_size
+
+        # Broadcast a file_attachment event so the frontend renders a download card
+        await broadcaster.broadcast(session_id, {
+            "type": "file_attachment",
+            "session_id": session_id,
+            "path": str(resolved),
+            "filename": filename,
+            "size": file_size,
+        })
+
+        return {"content": [{"type": "text", "text": f"Sent file: {filename} ({file_size:,} bytes)"}]}
+
     # Shared tools (don't need session context) + session-scoped tools
     shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker")]
-    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker]
+    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_send_file]
 
     # Only include houseofagents tools when enabled — saves context tokens otherwise
     hoa_enabled = _config and _config.houseofagents.enabled

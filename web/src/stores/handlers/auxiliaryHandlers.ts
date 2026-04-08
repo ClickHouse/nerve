@@ -54,6 +54,25 @@ export function handleFileChanged(
   });
 }
 
+export function handleFileAttachment(
+  msg: Extract<WSMessage, { type: 'file_attachment' }>,
+  _get: Get,
+  set: Set,
+): void {
+  // Inject a downloadable file block into the streaming assistant message
+  set(s => {
+    if (!s.isStreaming) return {};
+    const downloadUrl = `/api/files/download?path=${encodeURIComponent(msg.path)}`;
+    return {
+      streamingBlocks: [...s.streamingBlocks, {
+        type: 'file' as const,
+        url: downloadUrl,
+        filename: msg.filename,
+      }],
+    };
+  });
+}
+
 export function handleNotification(
   msg: Extract<WSMessage, { type: 'notification' }>,
   _get: Get,

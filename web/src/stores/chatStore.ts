@@ -11,7 +11,7 @@ import { extractTodosFromMessages } from './helpers/bufferReplay';
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleAnswerInjected } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
+import { handleInteraction, handleFileChanged, handleFileAttachment, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -482,6 +482,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'file_changed':             return handleFileChanged(msg, get, set);
+      case 'file_attachment':          return handleFileAttachment(msg, get, set);
       case 'notification':             return handleNotification(msg, get, set);
       case 'notification_answered':    return handleNotificationAnswered(msg, get, set);
       case 'background_tasks_update':  return handleBackgroundTasksUpdate(msg, get, set);
