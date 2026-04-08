@@ -46,7 +46,7 @@ def decode_token(token: str, jwt_secret: str) -> dict:
 
 
 def get_token_from_request(request: Request) -> str:
-    """Extract JWT token from cookie or Authorization header."""
+    """Extract JWT token from cookie, Authorization header, or query param."""
     # Try cookie first
     token = request.cookies.get("nerve_token")
     if token:
@@ -56,6 +56,11 @@ def get_token_from_request(request: Request) -> str:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:]
+
+    # Try query parameter (for <img src> and <a download> that can't set headers)
+    token = request.query_params.get("token")
+    if token:
+        return token
 
     raise HTTPException(status_code=401, detail="Not authenticated")
 

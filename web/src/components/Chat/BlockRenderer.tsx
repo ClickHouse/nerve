@@ -55,14 +55,16 @@ export function BlockRenderer({
               <div key={i}>{inner}</div>
             );
           }
-          case 'image':
+          case 'image': {
+            const imgUrl = `${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`;
             return (
               <div key={i} className="my-2">
-                <a href={item.url} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
-                  <img src={item.url} alt={item.filename} className="max-w-[300px] max-h-[300px] object-contain" />
+                <a href={imgUrl} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
+                  <img src={imgUrl} alt={item.filename} className="max-w-[300px] max-h-[300px] object-contain" />
                 </a>
               </div>
             );
+          }
           case 'file':
             return (
               <div key={i} className="my-2">

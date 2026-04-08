@@ -2,6 +2,12 @@ import type { ChatMessage, ImageBlockData, FileBlockData } from '../../types/cha
 import { Download, FileText } from 'lucide-react';
 import { getToken } from '../../api/client';
 
+function authUrl(url: string): string {
+  const token = getToken();
+  if (!token) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
+}
+
 export function UserMessage({ message }: { message: ChatMessage }) {
   const text = message.blocks.find(b => b.type === 'text')?.content || '';
   const images = message.blocks.filter(b => b.type === 'image') as ImageBlockData[];
@@ -23,13 +29,13 @@ export function UserMessage({ message }: { message: ChatMessage }) {
                 {images.map((img, idx) => (
                   <a
                     key={idx}
-                    href={img.url}
+                    href={authUrl(img.url)}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors"
                   >
                     <img
-                      src={img.url}
+                      src={authUrl(img.url)}
                       alt={img.filename}
                       className="max-w-[200px] max-h-[200px] object-cover"
                     />
