@@ -649,3 +649,37 @@ class TestSanitizeMemuDatetimes:
         """Should handle missing DB gracefully."""
         MemUBridge._sanitize_memu_datetimes(f"sqlite:///{tmp_path / 'nonexistent.sqlite'}")
         # No exception raised
+
+
+class TestValidateDateValue:
+    """Test _validate_date_value rejects bad LLM date outputs."""
+
+    def test_valid_date_string(self):
+        assert MemUBridge._validate_date_value("2025-03-15") == "2025-03-15"
+
+    def test_valid_datetime_string(self):
+        assert MemUBridge._validate_date_value("2025-03-15 10:30:00") == "2025-03-15 10:30:00"
+
+    def test_none_passthrough(self):
+        assert MemUBridge._validate_date_value(None) is None
+
+    def test_bare_integer_year(self):
+        assert MemUBridge._validate_date_value(2025) == "2025-01-01"
+
+    def test_bare_float_year(self):
+        assert MemUBridge._validate_date_value(2025.0) == "2025-01-01"
+
+    def test_out_of_range_integer(self):
+        assert MemUBridge._validate_date_value(99) is None
+        assert MemUBridge._validate_date_value(3000) is None
+
+    def test_empty_string(self):
+        assert MemUBridge._validate_date_value("") is None
+        assert MemUBridge._validate_date_value("  ") is None
+
+    def test_garbage_string(self):
+        assert MemUBridge._validate_date_value("not a date") is None
+
+    def test_non_string_non_number(self):
+        assert MemUBridge._validate_date_value([2025]) is None
+        assert MemUBridge._validate_date_value({"year": 2025}) is None

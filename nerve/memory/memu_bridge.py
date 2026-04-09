@@ -1907,11 +1907,40 @@ class MemUBridge:
                 for idx, entry in enumerate(parsed):
                     if 0 <= idx < len(items):
                         item_id = items[idx][0]
-                        result[item_id] = entry.get("happened_at")
+                        raw = entry.get("happened_at")
+                        result[item_id] = self._validate_date_value(raw)
         except Exception as e:
             logger.warning("Failed to parse LLM date resolution response: %s", e)
 
         return result
+
+    @staticmethod
+    def _validate_date_value(raw: Any) -> str | None:
+        """Validate and normalize a date value from LLM output.
+
+        The LLM may return bare integers (e.g. 2025), partial dates, or
+        other non-standard values.  Only well-formed ISO date strings are
+        accepted; everything else is coerced or rejected.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            # Bare year like 2025 → "2025-01-01"
+            year = int(raw)
+            if 1900 <= year <= 2100:
+                return f"{year}-01-01"
+            return None
+        if not isinstance(raw, str):
+            return None
+        raw = raw.strip()
+        if not raw:
+            return None
+        # Validate it's a parseable date
+        try:
+            datetime.fromisoformat(raw)
+            return raw
+        except (ValueError, TypeError):
+            return None
 
     # ------------------------------------------------------------------
     # Post-extraction knowledge relevance filter
