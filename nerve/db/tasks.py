@@ -263,24 +263,38 @@ class TaskStore:
 
     async def search_tasks_similar(
         self, query: str, limit: int = 10,
+        rank_threshold: float | None = None,
     ) -> list[dict]:
         """Find tasks similar to query using OR semantics + FTS5 ranking.
 
         Unlike search_tasks (AND, strict), this uses OR (any word matches)
         and orders by BM25 relevance.  Designed for duplicate detection —
         searches all statuses including done.
+
+        Args:
+            rank_threshold: If set, only return matches with BM25 rank
+                below this value (more negative = better match).  Filters
+                out weak false-positives that share only generic words.
         """
         fts_query = self._build_fts_query(query, mode="or")
         if not fts_query:
             return []
 
-        async with self.db.execute(
+        sql = (
             "SELECT t.* FROM tasks t "
             "JOIN tasks_fts f ON f.task_id = REPLACE(t.id, '-', ' ') "
             "WHERE tasks_fts MATCH ? "
-            "ORDER BY f.rank LIMIT ?",
-            (fts_query, limit),
-        ) as cursor:
+        )
+        params: list = [fts_query]
+
+        if rank_threshold is not None:
+            sql += "AND f.rank < ? "
+            params.append(rank_threshold)
+
+        sql += "ORDER BY f.rank LIMIT ?"
+        params.append(limit)
+
+        async with self.db.execute(sql, tuple(params)) as cursor:
             return [dict(row) async for row in cursor]
 
     async def find_tasks_by_source_url(

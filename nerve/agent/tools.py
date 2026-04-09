@@ -128,10 +128,13 @@ async def _find_duplicate_tasks(title: str, source_url: str = "") -> list[dict]:
         if url_matches:
             return url_matches
     # Fallback: fuzzy OR-based FTS search ranked by relevance.
-    # Uses OR semantics so "backend escalation #7104" matches
-    # "backend support escalation #7104 TTLDelete" even without
-    # every word being present.
-    return await _db.search_tasks_similar(query=title, limit=10)
+    # Uses OR semantics so partial word overlap still matches.
+    # rank_threshold filters out weak false-positives that share
+    # only common words, which would otherwise cause the model to
+    # see "duplicates" on every call and never use confirm_duplicate.
+    return await _db.search_tasks_similar(
+        query=title, limit=10, rank_threshold=-5.0,
+    )
 
 
 @tool(
