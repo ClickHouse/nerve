@@ -249,14 +249,14 @@ npm install
 
 **Never use real-world information in code comments, docstrings, test fixtures, or LLM prompt examples.** This includes:
 
-- **Real project/company names** — don't write `"deploy Vox"` or `"ClickHouse PR #98795"`; use `"deploy the app"`, `"fix issue #101"`
-- **Real incidents or tasks** — don't copy from your task list into test data (e.g. `"Azure eastus to centralus"`, `"Google Workspace billing failure"`); invent generic scenarios like `"Redis cache TTL expiry"`, `"Fix database connection timeout"`
-- **Real bot/service names** — don't write `clickhouse-gh[bot]`; use `some-ci[bot]`
-- **Real credit card numbers, even partial** — use obviously fake ones like `4111111111111111`
-- **Realistic-looking issue numbers** from real trackers — use low, obviously synthetic numbers (`#101`, `#102`)
+- **Real project/company names** — use generic placeholders like `"deploy the app"`, `"fix issue #101"`
+- **Real incidents or tasks** — don't copy from your task list into test data; invent obviously synthetic scenarios
+- **Real bot/service names** — use generic names like `some-ci[bot]`
+- **Real credit card numbers, even partial** — use standard test numbers like `4111111111111111`
+- **Realistic-looking issue numbers** from real trackers — use low, obviously synthetic numbers
 - **Real usernames** in examples — use `<your-username>` or `alice`/`bob`
 
-**Why:** Even "innocent" examples build an identity fingerprint. A comment referencing a specific migration, a test fixture matching a real billing failure, and a tool description naming a real product — together they deanonymize the developer. Outsiders can cross-reference these with public records.
+**Why:** Even "innocent" examples build an identity fingerprint when cross-referenced. Multiple small leaks across comments, tests, and docs compound into a deanonymization risk.
 
 **Rule of thumb:** If an example could be traced back to a specific person, company, or incident — replace it with something generic.
 
