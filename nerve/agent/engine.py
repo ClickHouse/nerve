@@ -1752,19 +1752,32 @@ class AgentEngine:
             session_record = await self.db.get_session(session_id)
             meta = json.loads(session_record.get("metadata") or "{}") if session_record else {}
             meta["last_usage"] = usage_data
-            await self.db.update_session_metadata(session_id, meta)
 
             # Extract server_tool_use counts
             server_tool = last_usage.get("server_tool_use") or {}
             web_search = server_tool.get("web_search_requests", 0)
             web_fetch = server_tool.get("web_fetch_requests", 0)
 
-            # Use SDK-provided cost when available, otherwise estimate
+            # Calculate per-turn cost.
+            # NOTE: The SDK's total_cost_usd is *cumulative* across the
+            # entire SDK session, NOT per-invocation.  We track the last
+            # known cumulative value in session metadata so we can compute
+            # the delta for this turn.
             from nerve.db.usage import estimate_turn_cost
             sdk_cost = (result_meta or {}).get("total_cost_usd")
-            cost = sdk_cost if sdk_cost is not None else estimate_turn_cost(
-                last_usage, model=last_model,
-            )
+            current_session_cost = (
+                session_record.get("total_cost_usd", 0) if session_record else 0
+            ) or 0
+
+            if sdk_cost is not None:
+                prev_cumulative = meta.get("_sdk_cumulative_cost", 0) or 0
+                turn_cost = max(sdk_cost - prev_cumulative, 0)
+                meta["_sdk_cumulative_cost"] = sdk_cost
+            else:
+                turn_cost = estimate_turn_cost(last_usage, model=last_model)
+
+            # Save metadata (includes _sdk_cumulative_cost update)
+            await self.db.update_session_metadata(session_id, meta)
 
             # Persist per-turn usage to session_usage table
             await self.db.record_turn_usage(
@@ -1775,7 +1788,7 @@ class AgentEngine:
                 cache_read=last_usage.get("cache_read_input_tokens", 0),
                 max_context=max_context,
                 model=last_model,
-                cost_usd=cost,
+                cost_usd=turn_cost,
                 duration_ms=(result_meta or {}).get("duration_ms"),
                 duration_api_ms=(result_meta or {}).get("duration_api_ms"),
                 num_turns=num_turns,
@@ -1784,11 +1797,8 @@ class AgentEngine:
             )
 
             # Update total_cost_usd on the session
-            current_cost = (
-                session_record.get("total_cost_usd", 0) if session_record else 0
-            )
             await self.db.update_session_fields(session_id, {
-                "total_cost_usd": (current_cost or 0) + cost,
+                "total_cost_usd": current_session_cost + turn_cost,
             })
 
         await broadcaster.broadcast_done(
