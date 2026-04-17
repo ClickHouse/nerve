@@ -771,7 +771,13 @@ class AgentEngine:
         # thinking blocks with only a signature (for multi-turn continuity).
         # Force "summarized" so the UI actually has thinking text to render.
         # The CLI ignores this flag when thinking is disabled.
-        if thinking_config and thinking_config.get("type") != "disabled":
+        # NOTE: --thinking-display hangs on Bedrock (multi-turn after ToolSearch
+        # never returns). Disabled for Bedrock until the provider bug is fixed.
+        if (
+            thinking_config
+            and thinking_config.get("type") != "disabled"
+            and not self.config.provider.is_bedrock
+        ):
             extra_args["thinking-display"] = "summarized"
 
         return ClaudeAgentOptions(
