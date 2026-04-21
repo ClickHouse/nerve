@@ -806,6 +806,10 @@ class AgentEngine:
             api_key = self.config.effective_api_key
             if api_key:
                 env["ANTHROPIC_API_KEY"] = api_key
+            if self.config.proxy.enabled:
+                env["ANTHROPIC_BASE_URL"] = (
+                    f"http://{self.config.proxy.host}:{self.config.proxy.port}"
+                )
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
