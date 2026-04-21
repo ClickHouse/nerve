@@ -809,10 +809,17 @@ class NotificationService:
         logger.warning("No telegram_chat_id configured for notifications")
         return None
 
-    def _get_telegram_bot(self):
-        """Get the Telegram bot instance, or None if unavailable."""
+    def _get_telegram_channel(self):
+        """Get the TelegramChannel instance, or None if unavailable."""
         channel = self.engine.router.get_channel("telegram")
         if not channel or not hasattr(channel, '_app') or channel._app is None:
+            return None
+        return channel
+
+    def _get_telegram_bot(self):
+        """Get the Telegram bot instance, or None if unavailable."""
+        channel = self._get_telegram_channel()
+        if not channel:
             return None
         return channel._app.bot
 
@@ -862,12 +869,20 @@ class NotificationService:
                 else:
                     rendered = value
                 button_labels.append((rendered, value))
-            return await self._send_telegram_inline(
+            msg_id = await self._send_telegram_inline(
                 chat_id, notification_id, text, button_labels, silent=silent,
             )
         else:
             msg = await self._send_telegram_html(bot, chat_id, text, silent=silent)
-            return str(msg.message_id)
+            msg_id = str(msg.message_id)
+
+        # Cache for reaction context lookups
+        if msg_id:
+            channel = self._get_telegram_channel()
+            if channel:
+                channel._cache_message(int(msg_id), chat_id, text)
+
+        return msg_id
 
     @staticmethod
     async def _send_telegram_html(
