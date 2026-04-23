@@ -114,3 +114,65 @@ async def test_no_hot_loop_when_only_task_is_current():
     # callback parked in it. We can't easily introspect the ready queue, but
     # we *can* confirm we didn't stash a handle on the scope ourselves.
     assert not loop.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_no_hot_loop_when_current_task_has_must_cancel():
+    """Regression (April 23, 2026 evening): the first version of the patch
+    still spun when the *current task* already had ``_must_cancel=True``.
+
+    In production this happens when a task that's about to be cancelled is
+    itself running the cancel callback (via a CancelScope it owns). The
+    previous patch unconditionally set ``should_retry = True`` whenever it
+    saw ``_must_cancel``, re-queuing ``_deliver_cancellation`` on every
+    event-loop tick. Result: ~20% CPU / ~61k epoll_pwait/sec, nerve kept
+    crowning the fan.
+
+    The fix: skip the current task entirely, and only retry when we
+    actually called ``task.cancel()``.
+    """
+    from anyio._backends._asyncio import CancelScope
+
+    scope = CancelScope()
+    current = asyncio.current_task()
+    scope._host_task = current
+    scope._cancel_called = True
+    scope._cancel_reason = "regression test (must_cancel)"
+    scope._tasks = {current}
+    scope._cancel_handle = None
+
+    # Simulate the production state: a task already flagged as
+    # "must cancel" is sitting in the scope. asyncio will deliver the
+    # CancelledError when the task next resumes — we must NOT re-queue
+    # ourselves in the meantime.
+    #
+    # The real ``_asyncio.Task._must_cancel`` attribute is read-only from
+    # Python, so we use a stub that mimics the shape the patch reads.
+    class _FakeTask:
+        def __init__(self):
+            self._must_cancel = True
+            self._fut_waiter = None
+            self._cancel_calls = 0
+
+        def cancel(self, *_args, **_kwargs):
+            self._cancel_calls += 1
+            return True
+
+    fake = _FakeTask()
+    scope._tasks = {fake}
+
+    should_retry = scope._deliver_cancellation(scope)
+
+    assert fake._cancel_calls == 0, (
+        "Must not re-cancel a task already flagged with _must_cancel — "
+        "asyncio will deliver on resume."
+    )
+    assert should_retry is False, (
+        "Patched _deliver_cancellation must not retry on _must_cancel "
+        "alone. That was the April 23 regression: the callback re-queued "
+        "itself every tick while the task sat with _must_cancel=True, "
+        "burning ~20% CPU on 61k epoll_pwait/sec."
+    )
+    assert scope._cancel_handle is None, (
+        "No retry → no pending handle."
+    )

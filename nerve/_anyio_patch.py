@@ -31,10 +31,17 @@ SDK-side mitigation in ``nerve.agent.engine._safe_disconnect`` only runs
 during ``client.disconnect()``, so spins originating elsewhere (telegram
 polling, cron, an active SDK request hitting a broken pipe) are not covered.
 
-The fix below sets ``should_retry = True`` only when we *actually* did
-something — marked a task for cancellation, or found one already in
-``_must_cancel`` state waiting to be processed. The rest of the semantics
-match upstream byte-for-byte.
+The fix below sets ``should_retry = True`` only when we *actually* called
+``task.cancel()`` in this pass. Tasks already flagged with ``_must_cancel``
+do **not** justify a retry — asyncio's ``Task.__step`` raises
+``CancelledError`` when such a task next resumes, without help from us.
+Retrying on ``_must_cancel`` was the second iteration of this bug
+(April 23, 2026 evening): ~20% CPU / 61k epoll_pwait/sec because the
+current task itself was sitting with ``_must_cancel=True`` while running
+the cancel callback, causing the callback to re-queue forever.
+
+We also skip the *current task* explicitly — it is running this very
+callback and cannot be cancelled from inside it.
 
 Import this module once, before anyio is used (i.e. very early in the
 process entry point — see ``nerve/__main__.py``).
@@ -57,22 +64,35 @@ _APPLIED = False
 def _patched_deliver_cancellation(self, origin):  # type: ignore[no-untyped-def]
     """Drop-in replacement for ``CancelScope._deliver_cancellation``.
 
-    Behaves identically to upstream *except* that ``should_retry`` is only
-    set when the pass actually produced work (a ``task.cancel()`` call or a
-    task still in ``_must_cancel`` awaiting pickup).
+    Semantics: ``should_retry`` is True **only when we actually called
+    ``task.cancel()`` on some task in this pass**. A task already flagged
+    with ``_must_cancel`` does not justify a retry — asyncio's
+    ``Task.__step`` checks the flag when the task next resumes and will
+    raise ``CancelledError`` without our help. Retrying in that case means
+    we re-queue ourselves on every event-loop tick while the task is
+    blocked (shielded, awaiting I/O, or — critically — is the *current
+    task* running this very callback), which is the hot loop we're trying
+    to kill.
     """
     should_retry = False
     current = current_task()
     for task in self._tasks:
+        # The current task is running this callback; it can't cancel
+        # itself from inside it. Whatever state it's in (including
+        # ``_must_cancel``) will be handled once we return and control
+        # flows back to ``Task.__step``.
+        if task is current:
+            continue
+
+        # Already flagged for cancellation. asyncio will deliver the
+        # exception when the task resumes; no retry needed from us.
+        # (Upstream anyio 4.13.0 set should_retry=True here — that's the
+        # root-cause bug.)
         if task._must_cancel:  # type: ignore[attr-defined]
-            # Already flagged; re-check next tick to see if it cleared.
-            should_retry = True
             continue
 
         # The task is eligible for cancellation if it has started.
-        if task is not current and (
-            task is self._host_task or _anyio_asyncio._task_started(task)
-        ):
+        if task is self._host_task or _anyio_asyncio._task_started(task):
             waiter = task._fut_waiter  # type: ignore[attr-defined]
             if not isinstance(waiter, asyncio.Future) or not waiter.done():
                 task.cancel(origin._cancel_reason)
@@ -90,7 +110,7 @@ def _patched_deliver_cancellation(self, origin):  # type: ignore[no-untyped-def]
         if not scope._shield and not scope.cancel_called:
             should_retry = scope._deliver_cancellation(origin) or should_retry
 
-    # Schedule another callback if there are still tasks left.
+    # Schedule another callback only if we actually did work this pass.
     if origin is self:
         if should_retry:
             self._cancel_handle = get_running_loop().call_soon(
