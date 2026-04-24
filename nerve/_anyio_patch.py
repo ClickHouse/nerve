@@ -26,22 +26,37 @@ cancel) nothing gets ``task.cancel()``-ed, but the scheduler reschedules
 one CPU core pinned at 100%, tens of thousands of ``epoll_pwait`` syscalls per
 second, and no forward progress.
 
-We have seen this trigger at least twice (April 22 and April 23, 2026). The
-SDK-side mitigation in ``nerve.agent.engine._safe_disconnect`` only runs
+We have seen this trigger at least three times (April 22, 23, and 24, 2026).
+The SDK-side mitigation in ``nerve.agent.engine._safe_disconnect`` only runs
 during ``client.disconnect()``, so spins originating elsewhere (telegram
 polling, cron, an active SDK request hitting a broken pipe) are not covered.
 
 The fix below sets ``should_retry = True`` only when we *actually* called
-``task.cancel()`` in this pass. Tasks already flagged with ``_must_cancel``
-do **not** justify a retry — asyncio's ``Task.__step`` raises
-``CancelledError`` when such a task next resumes, without help from us.
-Retrying on ``_must_cancel`` was the second iteration of this bug
-(April 23, 2026 evening): ~20% CPU / 61k epoll_pwait/sec because the
-current task itself was sitting with ``_must_cancel=True`` while running
-the cancel callback, causing the callback to re-queue forever.
+``task.cancel()`` on a task that could still receive a cancellation. We
+skip three categories of tasks that upstream blindly retries on:
 
-We also skip the *current task* explicitly — it is running this very
-callback and cannot be cancelled from inside it.
+1. **Done tasks** (``task.done() is True``). Root cause of the April 24
+   regression: if a task completes while the scope has ``cancel_called``
+   and the scope never pops it out of ``_tasks``, every subsequent pass
+   sees ``_must_cancel=False`` (cleared when the task finished),
+   ``_task_started()=True``, ``_fut_waiter=None``. Our "waiter not done"
+   branch fires, ``task.cancel()`` is a no-op on a done task, and yet we
+   flagged ``should_retry=True`` anyway. Result: infinite ``call_soon``
+   on a scope whose only inhabitant is already a corpse. We observed
+   three such zombie-scopes running simultaneously, all spinning at
+   ~55k epoll_pwait/sec combined (100% CPU, load 1.6, 60°C).
+
+2. **Tasks already flagged with ``_must_cancel``**. asyncio's
+   ``Task.__step`` checks the flag when the task next resumes and will
+   raise ``CancelledError`` without our help. Retrying in that case means
+   we re-queue ourselves on every event-loop tick while the task is
+   blocked (shielded, awaiting I/O). This was the second iteration of
+   the bug (April 23 evening).
+
+3. **The current task**, because a task cannot cancel itself from inside
+   a callback. (``current_task()`` is often ``None`` here because the
+   callback runs from ``call_soon`` outside any task context — the check
+   is a belt-and-suspenders guard for the other case.)
 
 Import this module once, before anyio is used (i.e. very early in the
 process entry point — see ``nerve/__main__.py``).
@@ -77,6 +92,14 @@ def _patched_deliver_cancellation(self, origin):  # type: ignore[no-untyped-def]
     should_retry = False
     current = current_task()
     for task in self._tasks:
+        # Already finished. anyio doesn't always remove tasks from
+        # ``_tasks`` before the scope's cancel callback fires (done
+        # tasks can linger until the task group unwinds). ``task.cancel()``
+        # is a no-op on a done task, so retrying is pure busy-loop.
+        # This is the root cause of the April 24, 2026 spin.
+        if task.done():
+            continue
+
         # The current task is running this callback; it can't cancel
         # itself from inside it. Whatever state it's in (including
         # ``_must_cancel``) will be handled once we return and control

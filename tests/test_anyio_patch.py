@@ -154,6 +154,9 @@ async def test_no_hot_loop_when_current_task_has_must_cancel():
             self._fut_waiter = None
             self._cancel_calls = 0
 
+        def done(self):
+            return False
+
         def cancel(self, *_args, **_kwargs):
             self._cancel_calls += 1
             return True
@@ -175,4 +178,68 @@ async def test_no_hot_loop_when_current_task_has_must_cancel():
     )
     assert scope._cancel_handle is None, (
         "No retry → no pending handle."
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_hot_loop_when_only_task_is_done():
+    """Regression (April 24, 2026): a scope whose only task has already
+    ``done()==True`` must not re-queue ``_deliver_cancellation`` forever.
+
+    Observed in production: anyio 4.13.0 does not always remove tasks from
+    ``CancelScope._tasks`` the instant they finish — a done task can linger
+    until the task group unwinds. For a done task ``_must_cancel`` is False
+    (cleared during final step), ``_task_started()`` is True, and
+    ``_fut_waiter`` is None. The previous patch therefore fell into the
+    "waiter not done → cancel()" branch, called ``task.cancel()`` (which is
+    a no-op on a done task), and still set ``should_retry=True``. Result:
+    a zombie-scope spinning ~55k epoll_pwait/sec per scope, pinning one
+    CPU core until the process was restarted.
+
+    Three such zombies were found in a live process dump (scope IDs
+    0x7ffec1774f50, 0x7ffec17ae090, 0x7ffec17ad6d0) — the live fix was to
+    ``discard()`` the done task and ``handle.cancel()`` the pending
+    ``call_soon``. This test guarantees the code-level fix holds.
+    """
+    from anyio._backends._asyncio import CancelScope
+
+    scope = CancelScope()
+    current = asyncio.current_task()
+    scope._host_task = current
+    scope._cancel_called = True
+    scope._cancel_reason = "regression test (done)"
+    scope._cancel_handle = None
+
+    class _DoneTask:
+        """Mimics an asyncio.Task that has already completed."""
+
+        def __init__(self):
+            self._must_cancel = False  # cleared when task finished
+            self._fut_waiter = None  # done tasks have no waiter
+            self._cancel_calls = 0
+
+        def done(self):
+            return True
+
+        def cancel(self, *_args, **_kwargs):
+            self._cancel_calls += 1
+            return False  # cancel() returns False on done tasks
+
+    done_task = _DoneTask()
+    scope._tasks = {done_task}
+
+    should_retry = scope._deliver_cancellation(scope)
+
+    assert should_retry is False, (
+        "Patched _deliver_cancellation must not retry on done tasks. "
+        "Retrying on a done task is the April 24 hot-loop: cancel() is a "
+        "no-op, but the callback keeps re-queuing itself every tick."
+    )
+    assert done_task._cancel_calls == 0, (
+        "Must not call task.cancel() on a done task — it's a no-op that "
+        "only exists to flag should_retry=True."
+    )
+    assert scope._cancel_handle is None, (
+        "No retry → no pending handle. Otherwise the zombie-scope spin "
+        "returns on the next rebuild."
     )
