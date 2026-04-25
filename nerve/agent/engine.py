@@ -53,6 +53,29 @@ except ImportError:
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
+def _select_thinking_effort(agent_config: Any, source: str) -> tuple[str, str]:
+    """Pick (thinking, effort) settings for a session based on its source.
+
+    Cron and hook sessions run on `cron_model` (typically Sonnet), which
+    under Claude OAuth (subscription) does not accept `level=max` for
+    thinking/effort and rejects requests with
+    `level "max" not supported, valid levels: low, medium, high`. Use
+    the dedicated `cron_*` overrides for those sources so cron jobs
+    don't get blocked while interactive sessions keep their full
+    thinking budget.
+    """
+    is_cron_like = source in ("cron", "hook")
+    thinking_value = (
+        agent_config.cron_thinking if is_cron_like
+        else agent_config.thinking
+    )
+    effort_value = (
+        agent_config.cron_effort if is_cron_like
+        else agent_config.effort
+    )
+    return thinking_value, effort_value
+
+
 # Anthropic API image limits
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -735,10 +758,13 @@ class AgentEngine:
             skill_summaries=skill_summaries,
         )
 
-        thinking_config = self._parse_thinking_config(self.config.agent.thinking)
+        thinking_value, effort_value = _select_thinking_effort(
+            self.config.agent, source,
+        )
+        thinking_config = self._parse_thinking_config(thinking_value)
         effort = (
-            self.config.agent.effort
-            if self.config.agent.effort in ("low", "medium", "high", "max")
+            effort_value
+            if effort_value in ("low", "medium", "high", "max")
             else None
         )
         betas = (

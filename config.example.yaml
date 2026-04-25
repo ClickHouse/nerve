@@ -18,6 +18,15 @@ agent:
   title_model: claude-haiku-4-5-20251001  # Session title generation
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 4              # Max concurrent agent sessions
+  thinking: max                  # Thinking budget for the main model
+  effort: max                    # Reasoning effort for the main model
+  # Cron / hook sessions use the cron_model (Sonnet). Under Claude OAuth
+  # (subscription) Sonnet caps thinking budget and rejects "max" with
+  #   level "max" not supported, valid levels: low, medium, high
+  # Keep these at "high" unless your provider accepts "max" for the
+  # cron model.
+  cron_thinking: high
+  cron_effort: high
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-4-6-v1
   #   cron_model: us.anthropic.claude-sonnet-4-6

@@ -24,6 +24,10 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 | `agent.cron_model` | string | `claude-sonnet-4-6` | Model for cron jobs (cheaper) |
 | `agent.max_turns` | int | `50` | Max agentic turns per request |
 | `agent.max_concurrent` | int | `4` | Max concurrent agent sessions |
+| `agent.thinking` | string | `max` | Thinking budget for the main model: `max` / `high` / `medium` / `low` / `disabled` / `adaptive` / explicit token count |
+| `agent.effort` | string | `max` | Reasoning effort for the main model: `max` / `high` / `medium` / `low` |
+| `agent.cron_thinking` | string | `high` | Thinking budget for cron and hook sessions (which run on `cron_model`). Claude OAuth caps non-flagship models at `high` and rejects `max` with `level "max" not supported` — keep this at `high` unless you're using a provider that accepts `max` for the cron model. |
+| `agent.cron_effort` | string | `high` | Reasoning effort for cron and hook sessions. Same caveat as `cron_thinking`. |
 
 **Note:** The engine uses a `can_use_tool` callback (not `bypassPermissions`) so that interactive tools (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`) can pause mid-turn for user input. All other tools are auto-approved. See [sdk-sessions.md](sdk-sessions.md#permissions--interactive-tools) for details.
 
