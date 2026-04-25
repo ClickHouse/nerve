@@ -138,6 +138,14 @@ class AgentConfig:
     max_concurrent: int = 4
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
+    # Cron / hook overrides — Claude OAuth (subscription) caps thinking budget
+    # for non-flagship models like Sonnet, rejecting effort/thinking="max" with
+    # `level "max" not supported, valid levels: low, medium, high`. Use a
+    # separate, lower setting for cron sessions (which run on `cron_model`)
+    # so cron jobs don't get blocked while keeping `effort=max` for the main
+    # interactive model.
+    cron_thinking: str = "high"
+    cron_effort: str = "high"
     context_1m: bool = True     # Enable 1M context window beta
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
@@ -157,6 +165,8 @@ class AgentConfig:
             max_concurrent=d.get("max_concurrent", 4),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
+            cron_thinking=str(d.get("cron_thinking", "high")),
+            cron_effort=str(d.get("cron_effort", "high")),
             context_1m=d.get("context_1m", True),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
