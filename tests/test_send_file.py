@@ -302,26 +302,6 @@ class TestTelegramSendFile:
         assert await ch.send_file("12345", str(tmp_path)) is False
         ch._app.bot.send_document.assert_not_awaited()
 
-    async def test_oversized_file_returns_false(self, tmp_path, monkeypatch):
-        ch = _make_telegram_channel()
-        f = tmp_path / "big.bin"
-        f.write_bytes(b"x")
-        # Pretend the file is >50 MiB without actually writing 50 MiB.
-        original_stat = Path.stat
-
-        def fake_stat(self, *args, **kwargs):
-            real = original_stat(self, *args, **kwargs)
-            if str(self) == str(f.resolve()):
-                class _S:
-                    st_size = 60 * 1024 * 1024
-                    st_mode = real.st_mode
-                return _S()
-            return real
-
-        monkeypatch.setattr(Path, "stat", fake_stat)
-        assert await ch.send_file("12345", str(f)) is False
-        ch._app.bot.send_document.assert_not_awaited()
-
     async def test_success_path_calls_send_document(self, tmp_path):
         ch = _make_telegram_channel()
         f = tmp_path / "note.md"

@@ -616,11 +616,15 @@ class TelegramChannel(BaseChannel):
     #  Files: deliver a workspace file as a Telegram document             #
     # ------------------------------------------------------------------ #
 
-    # Telegram bot API limit for documents uploaded by bots: 50 MiB.
-    _DOCUMENT_SIZE_LIMIT = 50 * 1024 * 1024
-
     async def send_file(self, target: str, file_path: str) -> bool:
-        """Deliver a file to a Telegram chat as a document attachment."""
+        """Deliver a file to a Telegram chat as a document attachment.
+
+        Size limits are enforced by the Telegram API itself (50 MiB on
+        api.telegram.org, up to 2 GiB on a self-hosted Bot API server).
+        We surface the API's verdict via the ``send_document`` exception
+        path rather than hard-coding the cap client-side, so this code
+        stays correct if the user runs against a local Bot API server.
+        """
         if self._app is None:
             return False
         from pathlib import Path
@@ -630,17 +634,6 @@ class TelegramChannel(BaseChannel):
             logger.warning("send_file: failed to resolve %s: %s", file_path, e)
             return False
         if not resolved.exists() or not resolved.is_file():
-            return False
-        try:
-            size = resolved.stat().st_size
-        except OSError as e:
-            logger.warning("send_file: stat failed for %s: %s", resolved, e)
-            return False
-        if size > self._DOCUMENT_SIZE_LIMIT:
-            logger.warning(
-                "send_file: %s exceeds Telegram %d-byte document limit (%d bytes)",
-                resolved, self._DOCUMENT_SIZE_LIMIT, size,
-            )
             return False
         try:
             with open(resolved, "rb") as f:
