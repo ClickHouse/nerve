@@ -57,6 +57,22 @@ _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
+# Linux execve() limits a single argv element to MAX_ARG_STRLEN = PAGE_SIZE * 32
+# = 131,072 bytes on common configurations. The Claude Agent SDK passes the
+# system prompt inline as `--system-prompt <STRING>`, which makes the string a
+# single argv element. When SOUL.md + TASK.md + AGENTS.md + TOOLS.md +
+# MEMORY.md + recalled memU summaries cross that boundary, execve() returns
+# E2BIG ("Argument list too long") and Claude Code fails to start.
+#
+# We sidestep the limit by writing the prompt to a file and passing
+# `SystemPromptFile = {"type": "file", "path": ...}` (which the SDK converts
+# to `--system-prompt-file <PATH>` — the path string is short).
+#
+# Threshold below which we keep passing inline (preserves prompt-cache hit
+# behavior for small, stable prompts). Set conservatively well under the
+# kernel limit to leave room for env/argv overhead.
+_SYSTEM_PROMPT_INLINE_MAX = 100_000  # bytes
+
 # Magic byte signatures for supported image formats.
 # Each format maps to a list of valid signatures.  A signature is a list
 # of (magic_bytes, offset) pairs that must ALL match (AND logic).
@@ -726,7 +742,7 @@ class AgentEngine:
             except Exception as e:
                 logger.warning("Failed to get skill summaries: %s", e)
 
-        system_prompt = build_system_prompt(
+        system_prompt_str = build_system_prompt(
             workspace=self.config.workspace,
             session_id=session_id,
             source=source,
@@ -734,6 +750,25 @@ class AgentEngine:
             recalled_memories=recalled_memories,
             skill_summaries=skill_summaries,
         )
+
+        # Pass the system prompt as a file when it's large enough to risk
+        # hitting Linux's MAX_ARG_STRLEN argv-element limit. See the comment
+        # near _SYSTEM_PROMPT_INLINE_MAX at module scope. The SDK accepts
+        # `SystemPromptFile` ({"type": "file", "path": ...}) and converts it
+        # to `--system-prompt-file <PATH>` on the CLI.
+        system_prompt: str | dict[str, Any]
+        if len(system_prompt_str) > _SYSTEM_PROMPT_INLINE_MAX:
+            sp_path = self._write_system_prompt_file(session_id, system_prompt_str)
+            system_prompt = {"type": "file", "path": sp_path}
+            logger.info(
+                "Session %s: system prompt %d bytes (> %d), passing via file %s",
+                session_id[:8],
+                len(system_prompt_str),
+                _SYSTEM_PROMPT_INLINE_MAX,
+                sp_path,
+            )
+        else:
+            system_prompt = system_prompt_str
 
         thinking_config = self._parse_thinking_config(
             self.config.agent.thinking,
@@ -806,6 +841,47 @@ class AgentEngine:
             plugins=self._claude_code_plugins,
         )
 
+
+    def _system_prompt_dir(self) -> "os.PathLike[str]":
+        """Directory where oversized system prompts are spilled to disk.
+
+        Lives under the workspace's `.nerve/cache/system_prompts/` so it's
+        per-workspace and easy to inspect / clean.
+        """
+        from pathlib import Path
+        d = Path(self.config.workspace) / ".nerve" / "cache" / "system_prompts"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _write_system_prompt_file(self, session_id: str, content: str) -> str:
+        """Write the system prompt to disk and return its absolute path.
+
+        Uses a deterministic filename so a session that reconnects (resume)
+        gets the same prompt without re-writing. Best-effort cleanup of stale
+        files happens lazily on each write — anything older than 7 days is
+        removed.
+        """
+        import time
+        from pathlib import Path
+
+        dir_path = Path(self._system_prompt_dir())
+
+        # Lazy GC: drop files older than 7 days
+        cutoff = time.time() - 7 * 24 * 3600
+        try:
+            for old in dir_path.iterdir():
+                try:
+                    if old.is_file() and old.stat().st_mtime < cutoff:
+                        old.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120]
+        path = dir_path / f"{safe_id}.md"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
 
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the SDK subprocess."""
