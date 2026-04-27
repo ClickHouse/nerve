@@ -16,15 +16,13 @@ class MessageStore:
         content: str,
         channel: str | None = None,
         thinking: str | None = None,
-        tool_calls: list | None = None,
         blocks: list | None = None,
     ) -> int:
         async with self._atomic():
             async with self.db.execute(
-                """INSERT INTO messages (session_id, role, content, thinking, tool_calls, blocks, channel)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO messages (session_id, role, content, thinking, blocks, channel)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (session_id, role, content, thinking,
-                 json.dumps(tool_calls) if tool_calls else None,
                  json.dumps(blocks) if blocks else None,
                  channel),
             ) as cursor:
@@ -46,8 +44,6 @@ class MessageStore:
         ) as cursor:
             rows = [dict(row) async for row in cursor]
         for row in rows:
-            if row.get("tool_calls"):
-                row["tool_calls"] = json.loads(row["tool_calls"])
             if row.get("blocks"):
                 row["blocks"] = json.loads(row["blocks"])
         return rows

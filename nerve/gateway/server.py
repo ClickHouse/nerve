@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -244,6 +245,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Compress JSON responses. Sessions with heavy tool-call blobs can
+    # easily emit 1+ MB payloads on /api/sessions/{id}/messages, and most
+    # of that compresses ~3-4x. minimum_size=1024 skips tiny responses
+    # where the framing overhead would dominate.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     # REST routes
     app.include_router(register_all_routes())

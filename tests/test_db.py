@@ -658,6 +658,152 @@ class TestDiagnosticsHelpers:
         assert deleted == 0
 
 
+# --- Schema state after V26 ---
+
+@pytest.mark.asyncio
+class TestToolCallsColumnDropped:
+    """V26 dropped the redundant ``messages.tool_calls`` column. After the
+    fixture (which runs all migrations) the column should be gone and
+    ``add_message`` must work without it."""
+
+    async def test_tool_calls_column_is_gone(self, db: Database):
+        async with db.db.execute("PRAGMA table_info(messages)") as cur:
+            cols = {row[1] async for row in cur}
+        assert "tool_calls" not in cols
+        assert "blocks" in cols  # ensure we didn't accidentally drop the wrong one
+
+    async def test_add_message_no_longer_accepts_tool_calls_kwarg(self, db: Database):
+        await db.create_session("s-1", title="T", source="web")
+        # Should succeed without tool_calls.
+        msg_id = await db.add_message(
+            "s-1", "assistant", "ok",
+            blocks=[{"type": "text", "content": "ok"}],
+        )
+        assert msg_id is not None
+        # Tool_calls is no longer a valid parameter.
+        import inspect
+        sig = inspect.signature(db.add_message)
+        assert "tool_calls" not in sig.parameters
+
+    async def test_get_messages_returns_blocks_not_tool_calls(self, db: Database):
+        await db.create_session("s-2", title="T", source="web")
+        await db.add_message(
+            "s-2", "assistant", "hi",
+            blocks=[
+                {"type": "thinking", "content": "thinking..."},
+                {"type": "tool_call", "tool": "Bash", "input": {}, "tool_use_id": "x"},
+                {"type": "text", "content": "done"},
+            ],
+        )
+        msgs = await db.get_messages("s-2")
+        assert len(msgs) == 1
+        assert "tool_calls" not in msgs[0]
+        assert isinstance(msgs[0]["blocks"], list)
+        assert len(msgs[0]["blocks"]) == 3
+
+
+# --- V26 migration backfill ---
+
+@pytest.mark.asyncio
+async def test_v26_backfills_blocks_from_legacy_tool_calls(tmp_path):
+    """Reconstruct a pre-V26 schema (with tool_calls, no blocks) and
+    verify the migration both populates blocks and drops the column."""
+    import json
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.db"
+    async with aiosqlite.connect(db_path) as db:
+        # Minimal schema mirroring v001 + the relevant subset of v003+
+        await db.executescript("""
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                thinking TEXT,
+                tool_calls JSON,
+                blocks JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                channel TEXT
+            );
+        """)
+
+        # Legacy row: only tool_calls populated.
+        legacy_tc = [
+            {"tool": "Read", "input": {"file_path": "/foo"},
+             "tool_use_id": "tu_1", "result": "contents", "is_error": False}
+        ]
+        await db.execute(
+            "INSERT INTO messages (session_id, role, content, thinking, tool_calls) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("s-legacy", "assistant", "final text", "thinking text",
+             json.dumps(legacy_tc)),
+        )
+
+        # Already-blocked row that we must not touch.
+        already = [{"type": "text", "content": "already migrated"}]
+        await db.execute(
+            "INSERT INTO messages (session_id, role, content, blocks) VALUES (?, ?, ?, ?)",
+            ("s-keep", "assistant", "x", json.dumps(already)),
+        )
+        await db.commit()
+
+        # Run the migration directly.
+        from nerve.db.migrations.v026_drop_legacy_tool_calls import up
+        await up(db)
+
+        # tool_calls column should be gone now.
+        async with db.execute("PRAGMA table_info(messages)") as cur:
+            cols = {row[1] async for row in cur}
+        assert "tool_calls" not in cols
+        assert "blocks" in cols
+
+        # Legacy row's blocks were reconstructed in the documented order.
+        async with db.execute(
+            "SELECT blocks FROM messages WHERE session_id = 's-legacy'"
+        ) as cur:
+            (raw,) = await cur.fetchone()
+        blocks = json.loads(raw)
+        assert [b["type"] for b in blocks] == ["thinking", "tool_call", "text"]
+        assert blocks[0]["content"] == "thinking text"
+        assert blocks[1]["tool"] == "Read"
+        assert blocks[1]["tool_use_id"] == "tu_1"
+        assert blocks[2]["content"] == "final text"
+
+        # Already-migrated row preserved.
+        async with db.execute(
+            "SELECT blocks FROM messages WHERE session_id = 's-keep'"
+        ) as cur:
+            (raw,) = await cur.fetchone()
+        assert json.loads(raw) == already
+
+
+@pytest.mark.asyncio
+async def test_v26_is_idempotent_when_column_already_dropped(tmp_path):
+    """Running V26 twice (or on a fresh DB built by later schemas) must
+    not fail."""
+    import aiosqlite
+
+    db_path = tmp_path / "post.db"
+    async with aiosqlite.connect(db_path) as db:
+        await db.executescript("""
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                thinking TEXT,
+                blocks JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                channel TEXT
+            );
+        """)
+        await db.commit()
+
+        from nerve.db.migrations.v026_drop_legacy_tool_calls import up
+        await up(db)  # must not raise
+
+
 # --- Consumer Cursors ---
 
 @pytest.mark.asyncio

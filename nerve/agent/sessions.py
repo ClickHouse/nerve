@@ -477,14 +477,12 @@ class SessionManager:
         content: str,
         channel: str | None = None,
         thinking: str | None = None,
-        tool_calls: list | None = None,
         blocks: list | None = None,
     ) -> int:
         """Add a message to a session's history."""
         return await self.db.add_message(
             session_id, role, content, channel=channel,
-            thinking=thinking, tool_calls=tool_calls,
-            blocks=blocks,
+            thinking=thinking, blocks=blocks,
         )
 
     async def get_conversation_history(

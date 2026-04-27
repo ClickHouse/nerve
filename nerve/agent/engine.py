@@ -1663,7 +1663,6 @@ class AgentEngine:
                     session_id, "assistant", partial,
                     channel=channel,
                     thinking=thinking_text if thinking_text else None,
-                    tool_calls=tool_calls_log if tool_calls_log else None,
                     blocks=ordered_blocks if ordered_blocks else None,
                 )
                 await broadcaster.broadcast(session_id, {
@@ -1764,7 +1763,6 @@ class AgentEngine:
             session_id, "assistant", full_response_text,
             channel=channel,
             thinking=thinking_text if thinking_text else None,
-            tool_calls=tool_calls_log if tool_calls_log else None,
             blocks=ordered_blocks if ordered_blocks else None,
         )
 
