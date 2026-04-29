@@ -584,6 +584,42 @@ def _find_plugin_dir(
     return None
 
 
+_DEFAULT_LANGFUSE_REDACT_PATTERNS: tuple[str, ...] = (
+    r"sk-ant-[A-Za-z0-9_\-]{20,}",
+    r"pk-lf-[A-Za-z0-9_\-]{20,}",
+    r"sk-lf-[A-Za-z0-9_\-]{20,}",
+    r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}",
+)
+
+
+@dataclass
+class LangfuseConfig:
+    """Langfuse observability — optional. Activated by setting both keys.
+
+    With ``public_key`` and ``secret_key`` configured Nerve traces the agent
+    loop and memU LLM calls into the Langfuse project pointed at by ``host``.
+    Empty keys = no-op, zero overhead, no SDK calls.
+    """
+
+    public_key: str = ""
+    secret_key: str = ""
+    host: str = "https://cloud.langfuse.com"
+    redact_patterns: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_LANGFUSE_REDACT_PATTERNS),
+    )
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LangfuseConfig":
+        return cls(
+            public_key=d.get("public_key", ""),
+            secret_key=d.get("secret_key", ""),
+            host=d.get("host", "https://cloud.langfuse.com"),
+            redact_patterns=list(
+                d.get("redact_patterns", _DEFAULT_LANGFUSE_REDACT_PATTERNS),
+            ),
+        )
+
+
 @dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
@@ -605,6 +641,7 @@ class NerveConfig:
     docker: DockerConfig = field(default_factory=DockerConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
+    langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
 
     # API keys (from config.local.yaml)
@@ -711,6 +748,7 @@ class NerveConfig:
             docker=DockerConfig.from_dict(d.get("docker", {})),
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
+            langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             mcp_servers=_parse_mcp_servers(d),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),

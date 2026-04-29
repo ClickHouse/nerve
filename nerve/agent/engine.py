@@ -41,6 +41,7 @@ from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import ALL_TOOLS, create_session_mcp_server, init_tools
 from nerve.config import NerveConfig, load_mcp_servers
 from nerve.db import Database
+from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
 logger = logging.getLogger(__name__)
@@ -1544,175 +1545,193 @@ class AgentEngine:
             # The CLI may crash during query (CLIConnectionError) or during
             # response reading (generic Exception from the SDK reader task).
             # Retry once with a fresh client if no content was received yet.
+            #
+            # The whole turn (query + every streamed message including tool
+            # calls) is wrapped in ``lf_attrs`` so all OTEL spans emitted by
+            # the SDK carry our session_id / tags. The wrap is a no-op when
+            # Langfuse is disabled.
+            _effective_model = model or self.config.agent.model
+            _lf_tags = [f"source:{source}", f"model:{_effective_model}"]
+            if channel:
+                _lf_tags.append(f"channel:{channel}")
+            _lf_metadata = {
+                "parent_session_id": session.get("parent_session_id") if session else None,
+                "fork_from": fork_from,
+            }
             _got_response_content = False
-            for _attempt in range(2):
-                try:
-                    if images:
-                        async def _image_prompt():
-                            yield {
-                                "type": "user",
-                                "message": {"role": "user", "content": content_blocks},
-                                "parent_tool_use_id": None,
-                            }
+            with lf_attrs(
+                session_id=session_id,
+                tags=_lf_tags,
+                metadata=_lf_metadata,
+            ):
+                for _attempt in range(2):
+                    try:
+                        if images:
+                            async def _image_prompt():
+                                yield {
+                                    "type": "user",
+                                    "message": {"role": "user", "content": content_blocks},
+                                    "parent_tool_use_id": None,
+                                }
 
-                        await client.query(_image_prompt())
-                    else:
-                        await client.query(query_text)
-                except CLIConnectionError as _qerr:
-                    if _attempt > 0:
-                        raise
-                    logger.warning(
-                        "CLI dead for session %s (query phase): %s — retrying",
-                        session_id, _qerr,
-                    )
-                    self.sessions.remove_client(session_id)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = await self._get_or_create_client(
-                        session_id, source, model,
-                    )
-                    continue  # retry the query
+                            await client.query(_image_prompt())
+                        else:
+                            await client.query(query_text)
+                    except CLIConnectionError as _qerr:
+                        if _attempt > 0:
+                            raise
+                        logger.warning(
+                            "CLI dead for session %s (query phase): %s — retrying",
+                            session_id, _qerr,
+                        )
+                        self.sessions.remove_client(session_id)
+                        unregister_handler(session_id)
+                        await self._safe_disconnect(client)
+                        client = await self._get_or_create_client(
+                            session_id, source, model,
+                        )
+                        continue  # retry the query
 
-                # Read response — may raise if CLI crashes mid-stream
-                try:
-                    async for message in client.receive_response():
-                        # Early-capture sdk_session_id from first message that
-                        # carries it so it survives /stop cancellation (ResultMessage
-                        # — the normal source — never arrives when the turn is
-                        # interrupted).
-                        if not sdk_session_id:
-                            msg_sid = getattr(message, "session_id", None)
-                            if msg_sid:
-                                sdk_session_id = msg_sid
+                    # Read response — may raise if CLI crashes mid-stream
+                    try:
+                        async for message in client.receive_response():
+                            # Early-capture sdk_session_id from first message that
+                            # carries it so it survives /stop cancellation (ResultMessage
+                            # — the normal source — never arrives when the turn is
+                            # interrupted).
+                            if not sdk_session_id:
+                                msg_sid = getattr(message, "session_id", None)
+                                if msg_sid:
+                                    sdk_session_id = msg_sid
 
-                        if isinstance(message, AssistantMessage):
-                            _got_response_content = True
-                            # Capture model from assistant message (more reliable than config)
-                            msg_model = getattr(message, 'model', None)
-                            if msg_model:
-                                last_model = msg_model
-                            # Extract parent_tool_use_id — set when this message
-                            # comes from a sub-agent (Task) rather than the main agent
-                            parent_id = getattr(message, 'parent_tool_use_id', None)
+                            if isinstance(message, AssistantMessage):
+                                _got_response_content = True
+                                # Capture model from assistant message (more reliable than config)
+                                msg_model = getattr(message, 'model', None)
+                                if msg_model:
+                                    last_model = msg_model
+                                # Extract parent_tool_use_id — set when this message
+                                # comes from a sub-agent (Task) rather than the main agent
+                                parent_id = getattr(message, 'parent_tool_use_id', None)
 
-                            for block in message.content:
-                                if isinstance(block, TextBlock):
-                                    full_response_text += block.text
-                                    # Track ordered blocks for DB persistence
-                                    if ordered_blocks and ordered_blocks[-1].get("type") == "text":
-                                        ordered_blocks[-1]["content"] += block.text
-                                    else:
-                                        ordered_blocks.append({"type": "text", "content": block.text})
-                                    await broadcaster.broadcast_token(
-                                        session_id, block.text,
-                                        parent_tool_use_id=parent_id,
-                                    )
-
-                                elif ThinkingBlock is not None and isinstance(
-                                    block, ThinkingBlock,
-                                ):
-                                    thinking = getattr(block, "thinking", "") or ""
-                                    if not thinking:
-                                        # Empty thinking block (e.g. Opus 4.7 with
-                                        # display="omitted", or simple queries on
-                                        # low effort). Nothing visible to render —
-                                        # never fall back to str(block) as that
-                                        # leaks the ThinkingBlock(...) repr into
-                                        # the UI.
-                                        continue
-                                    thinking_text += thinking
-                                    # Track ordered blocks for DB persistence
-                                    if ordered_blocks and ordered_blocks[-1].get("type") == "thinking":
-                                        ordered_blocks[-1]["content"] += thinking
-                                    else:
-                                        ordered_blocks.append({"type": "thinking", "content": thinking})
-                                    await broadcaster.broadcast_thinking(
-                                        session_id, thinking,
-                                        parent_tool_use_id=parent_id,
-                                    )
-
-                                elif isinstance(block, ToolUseBlock):
-                                    tool_input = getattr(block, "input", {})
-                                    tool_name = getattr(block, "name", None) or str(block)
-                                    tool_use_id = getattr(block, "id", None)
-                                    await broadcaster.broadcast_tool_use(
-                                        session_id, tool_name, tool_input,
-                                        tool_use_id=tool_use_id,
-                                        parent_tool_use_id=parent_id,
-                                    )
-                                    # Track sub-agent lifecycle
-                                    if tool_name == "Task" and tool_use_id:
-                                        active_subagents[tool_use_id] = asyncio.get_event_loop().time()
-                                        await broadcaster.broadcast_subagent_start(
-                                            session_id,
-                                            tool_use_id=tool_use_id,
-                                            subagent_type=str(tool_input.get("subagent_type", tool_input.get("model", "agent"))),
-                                            description=str(tool_input.get("description", "")),
-                                            model=str(tool_input.get("model", "")) or None,
+                                for block in message.content:
+                                    if isinstance(block, TextBlock):
+                                        full_response_text += block.text
+                                        # Track ordered blocks for DB persistence
+                                        if ordered_blocks and ordered_blocks[-1].get("type") == "text":
+                                            ordered_blocks[-1]["content"] += block.text
+                                        else:
+                                            ordered_blocks.append({"type": "text", "content": block.text})
+                                        await broadcaster.broadcast_token(
+                                            session_id, block.text,
+                                            parent_tool_use_id=parent_id,
                                         )
-                                    tool_calls_log.append({
-                                        "tool": tool_name,
-                                        "input": tool_input,
-                                        "tool_use_id": tool_use_id,
-                                    })
-                                    ordered_blocks.append({
-                                        "type": "tool_call",
-                                        "tool": tool_name,
-                                        "input": tool_input,
-                                        "tool_use_id": tool_use_id,
-                                    })
 
-                                elif isinstance(block, ToolResultBlock):
-                                    await self._process_tool_result(
-                                        block, session_id, parent_id,
-                                        tool_results_map, ordered_blocks,
-                                        tool_calls_log, active_subagents,
-                                    )
+                                    elif ThinkingBlock is not None and isinstance(
+                                        block, ThinkingBlock,
+                                    ):
+                                        thinking = getattr(block, "thinking", "") or ""
+                                        if not thinking:
+                                            # Empty thinking block (e.g. Opus 4.7 with
+                                            # display="omitted", or simple queries on
+                                            # low effort). Nothing visible to render —
+                                            # never fall back to str(block) as that
+                                            # leaks the ThinkingBlock(...) repr into
+                                            # the UI.
+                                            continue
+                                        thinking_text += thinking
+                                        # Track ordered blocks for DB persistence
+                                        if ordered_blocks and ordered_blocks[-1].get("type") == "thinking":
+                                            ordered_blocks[-1]["content"] += thinking
+                                        else:
+                                            ordered_blocks.append({"type": "thinking", "content": thinking})
+                                        await broadcaster.broadcast_thinking(
+                                            session_id, thinking,
+                                            parent_tool_use_id=parent_id,
+                                        )
 
-                        elif isinstance(message, UserMessage):
-                            parent_id = getattr(message, 'parent_tool_use_id', None)
-                            content = getattr(message, "content", [])
-                            if isinstance(content, list):
-                                for block in content:
-                                    if isinstance(block, ToolResultBlock):
+                                    elif isinstance(block, ToolUseBlock):
+                                        tool_input = getattr(block, "input", {})
+                                        tool_name = getattr(block, "name", None) or str(block)
+                                        tool_use_id = getattr(block, "id", None)
+                                        await broadcaster.broadcast_tool_use(
+                                            session_id, tool_name, tool_input,
+                                            tool_use_id=tool_use_id,
+                                            parent_tool_use_id=parent_id,
+                                        )
+                                        # Track sub-agent lifecycle
+                                        if tool_name == "Task" and tool_use_id:
+                                            active_subagents[tool_use_id] = asyncio.get_event_loop().time()
+                                            await broadcaster.broadcast_subagent_start(
+                                                session_id,
+                                                tool_use_id=tool_use_id,
+                                                subagent_type=str(tool_input.get("subagent_type", tool_input.get("model", "agent"))),
+                                                description=str(tool_input.get("description", "")),
+                                                model=str(tool_input.get("model", "")) or None,
+                                            )
+                                        tool_calls_log.append({
+                                            "tool": tool_name,
+                                            "input": tool_input,
+                                            "tool_use_id": tool_use_id,
+                                        })
+                                        ordered_blocks.append({
+                                            "type": "tool_call",
+                                            "tool": tool_name,
+                                            "input": tool_input,
+                                            "tool_use_id": tool_use_id,
+                                        })
+
+                                    elif isinstance(block, ToolResultBlock):
                                         await self._process_tool_result(
                                             block, session_id, parent_id,
                                             tool_results_map, ordered_blocks,
                                             tool_calls_log, active_subagents,
                                         )
 
-                        elif isinstance(message, ResultMessage):
-                            if message.usage:
-                                last_usage = message.usage
-                            sdk_session_id = message.session_id
-                            result_meta = {
-                                "total_cost_usd": getattr(message, "total_cost_usd", None),
-                                "duration_ms": getattr(message, "duration_ms", None),
-                                "duration_api_ms": getattr(message, "duration_api_ms", None),
-                                "num_turns": getattr(message, "num_turns", None),
-                            }
+                            elif isinstance(message, UserMessage):
+                                parent_id = getattr(message, 'parent_tool_use_id', None)
+                                content = getattr(message, "content", [])
+                                if isinstance(content, list):
+                                    for block in content:
+                                        if isinstance(block, ToolResultBlock):
+                                            await self._process_tool_result(
+                                                block, session_id, parent_id,
+                                                tool_results_map, ordered_blocks,
+                                                tool_calls_log, active_subagents,
+                                            )
 
-                except asyncio.CancelledError:
-                    raise  # propagate to outer handler
-                except Exception as _recv_err:
-                    # CLI crashed during response reading.
-                    # Retry only if we haven't received any content yet
-                    # (otherwise we'd produce duplicate/garbled output).
-                    if _got_response_content or _attempt > 0:
-                        raise
-                    logger.warning(
-                        "CLI crashed for session %s during response "
-                        "(no content yet): %s — retrying with fresh client",
-                        session_id, _recv_err,
-                    )
-                    self.sessions.remove_client(session_id)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = await self._get_or_create_client(
-                        session_id, source, model,
-                    )
-                    continue  # retry query + response
-                break  # success — exit retry loop
+                            elif isinstance(message, ResultMessage):
+                                if message.usage:
+                                    last_usage = message.usage
+                                sdk_session_id = message.session_id
+                                result_meta = {
+                                    "total_cost_usd": getattr(message, "total_cost_usd", None),
+                                    "duration_ms": getattr(message, "duration_ms", None),
+                                    "duration_api_ms": getattr(message, "duration_api_ms", None),
+                                    "num_turns": getattr(message, "num_turns", None),
+                                }
+
+                    except asyncio.CancelledError:
+                        raise  # propagate to outer handler
+                    except Exception as _recv_err:
+                        # CLI crashed during response reading.
+                        # Retry only if we haven't received any content yet
+                        # (otherwise we'd produce duplicate/garbled output).
+                        if _got_response_content or _attempt > 0:
+                            raise
+                        logger.warning(
+                            "CLI crashed for session %s during response "
+                            "(no content yet): %s — retrying with fresh client",
+                            session_id, _recv_err,
+                        )
+                        self.sessions.remove_client(session_id)
+                        unregister_handler(session_id)
+                        await self._safe_disconnect(client)
+                        client = await self._get_or_create_client(
+                            session_id, source, model,
+                        )
+                        continue  # retry query + response
+                    break  # success — exit retry loop
 
         except asyncio.CancelledError:
             logger.info("Session %s cancelled by user", session_id)

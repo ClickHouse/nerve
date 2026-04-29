@@ -24,6 +24,11 @@ dependencies = [
     "memu-py==1.4.0",  # pinned — nerve monkey-patches memU internals (see memu_bridge._patch_sqlite_bugs)
     "watchfiles>=1.0.0",
     "html2text>=2024.2.26",
+    # Optional observability stack — only active when langfuse keys are
+    # configured. All three are pure-Python wheels.
+    "langfuse>=3.0.0",
+    "langsmith[claude-agent-sdk]>=0.4.0",
+    "opentelemetry-instrumentation-anthropic>=0.40.0",
 ]
 
 [project.scripts]

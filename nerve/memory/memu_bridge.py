@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from nerve.config import NerveConfig
+from nerve.observability.langfuse import attributes as lf_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,11 @@ class _BedrockLLMClient:
         }
         if system_prompt:
             kwargs["system"] = system_prompt
-        response = await self._bedrock.messages.create(**kwargs)
+        # Tag the OTEL spans emitted by AnthropicInstrumentor so memU calls
+        # are filterable in Langfuse separately from the agent loop. No-op
+        # when Langfuse is disabled.
+        with lf_attrs(tags=["component:memu", f"model:{self.chat_model}"]):
+            response = await self._bedrock.messages.create(**kwargs)
         text = response.content[0].text if response.content else ""
         return text, response
 
@@ -87,7 +92,8 @@ class _BedrockLLMClient:
         system_prompt: str | None = None,
     ) -> tuple[str, Any]:
         prompt = system_prompt or "Summarize the text in one short paragraph."
-        return await self.chat(text, max_tokens=max_tokens, system_prompt=prompt)
+        with lf_attrs(tags=["component:memu", "purpose:summarize"]):
+            return await self.chat(text, max_tokens=max_tokens, system_prompt=prompt)
 
     async def embed(self, inputs: list[str]) -> tuple[list[list[float]], None]:
         raise NotImplementedError("Bedrock LLM client does not support embeddings — use the OpenAI embedding profile")

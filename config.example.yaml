@@ -63,3 +63,13 @@ memory:
 cron:
   system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
   jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
+
+# Observability (optional) — Langfuse tracing for the agent loop and memU.
+# Set keys in config.local.yaml. Without keys, the integration is a no-op.
+# See docs/observability.md for setup details.
+# langfuse:
+#   public_key: pk-lf-...        # from your Langfuse project (set in config.local.yaml)
+#   secret_key: sk-lf-...        # from your Langfuse project (set in config.local.yaml)
+#   host: https://cloud.langfuse.com
+#   # redact_patterns:           # optional — strip these regexes from spans
+#   #   - "sk-ant-[A-Za-z0-9_\\-]{20,}"

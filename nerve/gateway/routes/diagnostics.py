@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.observability.langfuse import get_status as langfuse_status
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,19 @@ async def diagnostics(user: dict = Depends(require_auth)):
             "sessions_pending": len(pending_sessions),
         },
         "usage": usage_data,
+        "langfuse": langfuse_status(),
     }
+
+
+@router.get("/api/observability/status")
+async def observability_status(user: dict = Depends(require_auth)):
+    """Lightweight status endpoint — used by the chat UI to render a
+    "View in Langfuse" deep-link when observability is configured.
+
+    Kept separate from /api/diagnostics so the chat page can poll it
+    without paying for the full diagnostics fan-out.
+    """
+    return {"langfuse": langfuse_status()}
 
 
 @router.post("/api/memorization/sweep")

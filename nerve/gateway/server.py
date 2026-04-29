@@ -26,6 +26,10 @@ from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.gateway.auth import authenticate_websocket
 from nerve.gateway.routes import init_deps, register_all_routes, set_notification_service
+from nerve.observability.langfuse import (
+    flush as langfuse_flush,
+    init_langfuse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,12 @@ async def lifespan(app: FastAPI):
     db_path = Path("~/.nerve/nerve.db").expanduser()
     db = await init_db(db_path)
     logger.info("Database initialized at %s", db_path)
+
+    # Optional Langfuse observability — must be set up BEFORE the engine
+    # creates SDK clients so the configure_claude_agent_sdk() patches are
+    # in place when the SDK initializes its OTEL tracer provider. Failures
+    # are logged inside init_langfuse() and never propagate.
+    init_langfuse(config)
 
     # Initialize agent engine
     _engine = AgentEngine(config, db)
@@ -222,6 +232,13 @@ async def lifespan(app: FastAPI):
     memorize_task.cancel()
     cleanup_task.cancel()
     await _engine.shutdown()
+    # Flush Langfuse spans last — after the engine has reported its final
+    # ResultMessage and any in-flight memU spans have completed. ``flush``
+    # is sync and may block on the network, so push it to a thread.
+    try:
+        await asyncio.to_thread(langfuse_flush)
+    except Exception as e:
+        logger.debug("Langfuse flush during shutdown failed: %s", e)
     await close_db()
     if proxy_service:
         await proxy_service.stop()
