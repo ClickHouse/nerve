@@ -256,9 +256,17 @@ class AgentEngine:
         self._skill_manager: SkillManager | None = None
         self._memorize_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Per-session active channel — set on run() entry, cleared on exit.
+        # Read by session-scoped tools (send_file) to avoid dispatching via
+        # stale router context from a prior inbound channel.
+        self._active_channel: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
+
+    def get_active_channel(self, session_id: str) -> str | None:
+        """Return the channel name currently driving ``session_id`` (or None)."""
+        return self._active_channel.get(session_id)
 
     async def initialize(self) -> None:
         """Initialize the agent engine — set up tools and main session."""
@@ -1416,6 +1424,8 @@ class AgentEngine:
                 # mark_running below.
                 self.sessions.pop_stop_request(session_id)
                 self.sessions.mark_running(session_id)
+                if channel is not None:
+                    self._active_channel[session_id] = channel
                 # Notify all connected clients that this session started running
                 await broadcaster.broadcast("__global__", {
                     "type": "session_running",
@@ -1430,6 +1440,7 @@ class AgentEngine:
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
+                    self._active_channel.pop(session_id, None)
                     broadcaster.stop_buffering(session_id)
                     # Notify all connected clients that this session stopped
                     await broadcaster.broadcast("__global__", {
