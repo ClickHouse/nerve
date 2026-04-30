@@ -774,10 +774,9 @@ class AgentEngine:
             self.config.agent.thinking,
             model or self.config.agent.model,
         )
-        effort = (
-            self.config.agent.effort
-            if self.config.agent.effort in ("low", "medium", "high", "xhigh", "max")
-            else None
+        effort = self._effective_effort(
+            self.config.agent.effort,
+            model or self.config.agent.model,
         )
         betas = (
             ["context-1m-2025-08-07"] if self.config.agent.context_1m else []
@@ -1033,6 +1032,41 @@ class AgentEngine:
         except ValueError:
             logger.warning("Unknown thinking config '%s', using adaptive", value)
             return {"type": "adaptive"}
+
+    # Effort levels accepted per Claude model — substring-matched against the
+    # full model name so dated aliases (e.g. "claude-opus-4-7-20260416") resolve.
+    # Ordered most-specific to least-specific; first match wins. Mirrors the
+    # pattern used by MODEL_PRICING in nerve/db/usage.py.
+    _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+        "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
+        "opus-4-6":   ("low", "medium", "high", "max"),
+        "sonnet-4-6": ("low", "medium", "high"),
+    }
+    _EFFORT_RANK: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+    @staticmethod
+    def _effective_effort(value: str, model: str | None = None) -> str | None:
+        """Return ``value`` capped to the highest effort level ``model`` supports."""
+        if value not in AgentEngine._EFFORT_RANK:
+            return None
+        allowed: tuple[str, ...] | None = None
+        if model:
+            m = model.lower()
+            for key, levels in AgentEngine._MODEL_EFFORT_LEVELS.items():
+                if key in m:
+                    allowed = levels
+                    break
+        if not allowed or value in allowed:
+            return value
+        requested_rank = AgentEngine._EFFORT_RANK.index(value)
+        for level in reversed(AgentEngine._EFFORT_RANK[: requested_rank + 1]):
+            if level in allowed:
+                logger.debug(
+                    "Capped effort %r to %r for model %r (model caps at %r)",
+                    value, level, model, allowed[-1],
+                )
+                return level
+        return None
 
     # ------------------------------------------------------------------ #
     #  SDK client lifecycle                                                #
