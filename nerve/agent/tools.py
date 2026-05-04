@@ -13,9 +13,44 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server, tool
+from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
+from claude_agent_sdk import tool as _sdk_tool
 
 logger = logging.getLogger(__name__)
+
+
+def tool(name: str, description: str, input_schema, *args, **kwargs):
+    """Wrapper around ``claude_agent_sdk.tool`` that fixes shorthand-schema handling.
+
+    The SDK's ``_build_schema`` (claude_agent_sdk/__init__.py) converts shorthand
+    dicts (those without a top-level ``"type"`` key) by forcing every property into
+    ``required: list(properties.keys())`` and silently discarding descriptions and
+    defaults via ``_python_type_to_json_schema``. The result is that fields with a
+    ``"default"`` annotation are still advertised as required to the model, and the
+    model never sees the parameter descriptions at all.
+
+    Combined with the Claude Code CLI's behaviour of throwing ``McpToolCallError``
+    on validation failures (which propagates up the streaming connection and ends
+    the agent's turn early), this caused agents to abort mid-task whenever the
+    model trusted a documented default and omitted the field.
+
+    The wrapper pre-promotes shorthand dicts to the explicit JSON Schema form the
+    SDK passes through unchanged: properties are kept intact (so descriptions and
+    defaults survive) and ``required`` only lists fields that have no ``default``.
+    Tools that already supply an explicit ``{"type": "object", ...}`` schema are
+    untouched.
+    """
+    if isinstance(input_schema, dict) and "type" not in input_schema:
+        input_schema = {
+            "type": "object",
+            "properties": dict(input_schema),
+            "required": [
+                field
+                for field, spec in input_schema.items()
+                if not isinstance(spec, dict) or "default" not in spec
+            ],
+        }
+    return _sdk_tool(name, description, input_schema, *args, **kwargs)
 
 # These will be set during initialization
 _workspace: Path | None = None
