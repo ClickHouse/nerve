@@ -205,9 +205,9 @@ class SessionManager:
     ) -> str:
         """Get or create the active session for a channel.
 
-        If the channel has a mapped session with activity within the sticky
-        period, reuse it. Otherwise, create a fresh session and map the
-        channel to it.
+        Reuses the channel's mapped session when it is currently active
+        (a turn is in flight) or when its last activity falls within the
+        sticky period. Otherwise creates a fresh session and remaps.
         """
         row = await self.db.get_channel_session(channel_key)
         if row:
@@ -222,7 +222,25 @@ class SessionManager:
         return session_id
 
     def _is_within_sticky_period(self, session: dict) -> bool:
-        """Check if a session had activity within the sticky period."""
+        """Check whether a session is still the channel's owner.
+
+        Active sessions are always sticky regardless of the timestamp.
+        A turn that hangs never reaches mark_active() at engine.run's
+        end, so last_activity_at freezes at turn-start; without this
+        carve-out, a hang lasting longer than sticky_period_minutes
+        would orphan the session and route the user's follow-up
+        message into a fresh, empty one. The engine's idle-message
+        timeout in receive_response (cli_idle_timeout_seconds) bounds
+        how long a truly hung session can hold the channel before it
+        flips to idle/error and the next message can mint a fresh
+        session.
+
+        Idle sessions fall back to the time-based check so channels
+        that have been quiet for longer than sticky_period_minutes
+        roll over to a new session as before.
+        """
+        if session.get("status") == SessionStatus.ACTIVE.value:
+            return True
         ts = session.get("last_activity_at") or session.get("updated_at")
         if not ts:
             return False
