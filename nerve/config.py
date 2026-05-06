@@ -107,6 +107,12 @@ class AgentConfig:
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
+    # Hung-CLI detection: max idle time between SDK messages on a single
+    # turn before the engine treats the subprocess as dead and falls into
+    # the existing CLI-crash retry path.  Set to 0 to disable (legacy
+    # behaviour: turns can hang forever).  900s comfortably covers a 10-min
+    # Bash tool call plus SDK round-trips while still catching real hangs.
+    cli_idle_timeout_seconds: int = 900
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
@@ -119,6 +125,7 @@ class AgentConfig:
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
             context_1m=d.get("context_1m", True),
+            cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
         )
 
 

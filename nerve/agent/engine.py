@@ -8,6 +8,7 @@ Sessions are resumable across server restarts via SDK's --resume flag.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1450,6 +1451,60 @@ class AgentEngine:
                         "is_running": False,
                     })
 
+    @staticmethod
+    async def _iter_response_with_timeout(
+        client: Any,
+        session_id: str,
+        idle_timeout: float,
+    ):
+        """Iterate ``client.receive_response()`` with a per-message idle timeout.
+
+        The Claude Agent SDK's ``receive_response()`` async generator can
+        block indefinitely if the underlying CLI subprocess hangs (stuck
+        Anthropic API request, broken stdio pipe, etc.).  Without a timeout
+        the engine has no way to notice — ``is_running`` stays True, the
+        per-session lock stays held, queued user messages back up forever.
+
+        Wrapping each ``__anext__()`` await in ``asyncio.wait_for`` detects
+        a hung CLI when no SDK message of any kind (assistant chunk, tool
+        call, tool result, ResultMessage) arrives within ``idle_timeout``
+        seconds.  The iterator is closed and ``asyncio.TimeoutError`` is
+        raised so the existing CLI-crash retry path in ``_run_inner`` can
+        take over.
+
+        The timeout is per-message, not per-turn, so legitimate long tool
+        calls (e.g. a Bash command with ``timeout=600000`` ms) don't trip
+        it as long as they emit ``tool_use``/``tool_result`` chunks
+        between waits.
+
+        ``idle_timeout <= 0`` disables the timeout entirely (kept for
+        belt-and-suspenders ops who want the old behaviour back).
+        """
+        response_iter = client.receive_response()
+        try:
+            while True:
+                try:
+                    if idle_timeout and idle_timeout > 0:
+                        message = await asyncio.wait_for(
+                            response_iter.__anext__(),
+                            timeout=idle_timeout,
+                        )
+                    else:
+                        message = await response_iter.__anext__()
+                except StopAsyncIteration:
+                    return
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "CLI idle timeout (%ds) for session %s — no SDK "
+                        "message received; treating CLI as hung",
+                        idle_timeout, session_id,
+                    )
+                    raise
+                yield message
+        finally:
+            with contextlib.suppress(Exception):
+                await response_iter.aclose()
+
     async def _run_inner(
         self,
         session_id: str,
@@ -1638,8 +1693,13 @@ class AgentEngine:
                         continue  # retry the query
 
                     # Read response — may raise if CLI crashes mid-stream
+                    # or hangs idle for longer than cli_idle_timeout_seconds
+                    # (see _iter_response_with_timeout).
                     try:
-                        async for message in client.receive_response():
+                        async for message in AgentEngine._iter_response_with_timeout(
+                            client, session_id,
+                            self.config.agent.cli_idle_timeout_seconds,
+                        ):
                             # Early-capture sdk_session_id from first message that
                             # carries it so it survives /stop cancellation (ResultMessage
                             # — the normal source — never arrives when the turn is

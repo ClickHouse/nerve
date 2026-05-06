@@ -238,7 +238,11 @@ async def approve_plan(
         )
         prompt += hoa_instructions
 
-    # Spawn implementation in background with error handling
+    # Spawn implementation in background with error handling.  Register
+    # the task with the engine so a manual /stop can cancel a stuck impl
+    # session (without registration, the asyncio.Task is invisible to
+    # `engine.stop_session` and the only way to recover is a daemon
+    # restart).
     async def _run_impl():
         try:
             await deps.engine.run(
@@ -251,7 +255,8 @@ async def approve_plan(
             except Exception:
                 logger.exception("Failed to mark plan %s as failed", plan_id)
 
-    asyncio.create_task(_run_impl())
+    impl_task = asyncio.create_task(_run_impl())
+    deps.engine.register_task(impl_session_id, impl_task)
 
     return {"plan_id": plan_id, "impl_session_id": impl_session_id}
 
