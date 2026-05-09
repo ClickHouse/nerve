@@ -385,6 +385,25 @@ class MemoryConfig:
     memorize_model: str = "claude-sonnet-4-6"  # Extraction & preprocessing
     fast_model: str = "claude-haiku-4-5-20251001"  # Category summaries, date resolution
     embed_model: str = ""
+    # Optional override for the OpenAI-compatible /embeddings endpoint
+    # memU calls. When set, takes precedence over the default
+    # https://api.openai.com/v1. Point it at a self-hosted sidecar
+    # (Ollama, TEI, LocalAI, etc.) to avoid the OpenAI quota / 401
+    # single point of failure. The env vars MEMU_EMBEDDING_BASE_URL,
+    # MEMU_EMBEDDING_API_KEY, and MEMU_EMBED_MODEL override these
+    # config values at runtime, which is convenient for the docker
+    # compose path where the sidecar URL is known to the entrypoint,
+    # not the YAML config.
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
+    # Cap on concurrent LLM chat calls during memorize / recall. memU
+    # fans out per memory_type (profile, event, knowledge, behavior)
+    # and asyncio.gathers the results, which on lower Anthropic API
+    # tiers reliably blows the per-minute rate limit. Bounding
+    # concurrency at 1 serializes the bursts; the SDK's exponential
+    # backoff handles the rest. Bump to 2-4 if your API tier can
+    # absorb the parallel load.
+    llm_concurrency: int = 1
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
@@ -400,6 +419,9 @@ class MemoryConfig:
             memorize_model=d.get("memorize_model", "claude-sonnet-4-6"),
             fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
             embed_model=d.get("embed_model", ""),
+            embedding_base_url=d.get("embedding_base_url", ""),
+            embedding_api_key=d.get("embedding_api_key", ""),
+            llm_concurrency=max(1, int(d.get("llm_concurrency", 1))),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=float(d.get("semantic_dedup_threshold", 0.85)),
             knowledge_filter=bool(d.get("knowledge_filter", False)),

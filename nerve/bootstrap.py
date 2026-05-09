@@ -2116,6 +2116,19 @@ RUN GOG_VERSION=0.11.0 \\
     && curl -fsSL "https://github.com/steipete/gogcli/releases/download/v${GOG_VERSION}/gogcli_${GOG_VERSION}_linux_${ARCH}.tar.gz" \\
     | tar xz -C /usr/local/bin gog
 
+# Install Docker CLI (client only) so the agent can talk to the host
+# docker daemon through the bind-mounted /var/run/docker.sock. Lets
+# Bash run "docker compose up" / "docker run" against the host from
+# inside the agent without needing a separate MCP sidecar.
+RUN install -m 0755 -d /etc/apt/keyrings \\
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \\
+       | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \\
+    && chmod a+r /etc/apt/keyrings/docker.gpg \\
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CODENAME) stable" \\
+       > /etc/apt/sources.list.d/docker.list \\
+    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \\
+    && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /root/.nerve /root/nerve-workspace
 
 ENV NERVE_DOCKER=1
@@ -2139,28 +2152,89 @@ RUN chmod +x /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
 """
 
+def _host_aligned_path(path: str) -> str:
+    """Return a YAML-safe representation of ``path`` that resolves to
+    the same absolute path on the host and inside the container.
+
+    Compose substitutes ``${HOME}`` from the user's shell env at
+    runtime, so a ``~/foo`` workspace becomes ``${HOME}/foo`` and
+    expands to the host's ``$HOME``. Absolute paths are returned
+    untouched. Path alignment is what lets the agent pass paths to
+    the bind-mounted host docker daemon when launching siblings: the
+    same string resolves to the same files inside and out, so
+    ``docker run -v $PWD:$PWD ...`` from inside the agent gives the
+    sibling container the right host directory.
+    """
+    if not path:
+        return path
+    if path.startswith("~/"):
+        return "${HOME}/" + path[2:]
+    if path == "~":
+        return "${HOME}"
+    return path
+
+
 def _build_docker_compose(
     workspace_path: str = "~/nerve-workspace",
+    projects_path: str = "~/projects",
     extra_mounts: list[str] | None = None,
+    docker_socket: bool = True,
 ) -> str:
     """Build docker-compose.yml content with host bind-mounts.
 
     Args:
-        workspace_path: Host path for the workspace (e.g. ~/nerve-workspace).
-        extra_mounts: Additional host:container mount pairs (e.g. ["~/code:/code"]).
+        workspace_path: Host path for the workspace (default ~/nerve-workspace).
+        projects_path: Host path for the projects directory containing
+            git checkouts and worktrees (default ~/projects). Mounted
+            with path alignment so the agent can pass the same paths to
+            the host daemon when starting sibling containers.
+        extra_mounts: Additional host:container mount pairs.
+        docker_socket: When True, mount the host docker socket
+            (``/var/run/docker.sock``) into the agent container so the
+            agent can run ``docker`` and ``docker compose`` directly via
+            Bash. Required for Grafana per-PR runs and HyperDX
+            ``make dev`` orchestration. Works with OrbStack and Docker
+            Desktop on macOS (both expose a compatibility symlink at
+            this path) and with stock dockerd on Linux. Disable only if
+            you have a reason to keep the agent isolated from the host
+            daemon.
+
+    Note on the previous sidecar pattern:
+        Earlier revisions of this file shipped a ``docker-mcp`` service
+        that ran ``supercorp/supergateway`` wrapping ``ckreiling/mcp-
+        server-docker`` to expose Docker daemon verbs as MCP tools. That
+        approach (a) couldn't orchestrate ``docker compose`` (no compose
+        verbs in the underlying server) and (b) suffered a chronic
+        protocol-version drift between supergateway's hardcoded
+        ``MCP-Protocol-Version`` allowlist and the version Claude Code
+        sends in headers. Mounting the socket directly solves both
+        problems in five lines. The agent already had unfettered daemon
+        access through the sidecar's MCP tools, so the blast radius is
+        unchanged.
     """
-    # Required mounts (always present)
-    # ~/.nerve/claude:/root/.claude persists Claude Code's conversation
-    # .jsonl files across container restarts. Without this mount the files
-    # are wiped on every `docker compose down/up` and the Nerve DB's stale
-    # sdk_session_id rows fail every --resume with "No conversation found"
-    # exit 1. Siloed under ~/.nerve so the agent's CLI is isolated from
-    # the host user's personal ~/.claude (where macOS stores OAuth tokens).
+    # Host-aligned paths: same absolute string inside and outside the
+    # container, so the agent can pass them to the bind-mounted host
+    # docker daemon when mounting them into siblings.
+    workspace_aligned = _host_aligned_path(workspace_path)
+    projects_aligned = _host_aligned_path(projects_path)
+
+    # Required mounts. ~/.nerve stays at /root/.nerve because it is
+    # agent-only state and never passed through to siblings.
+    # ~/.nerve/claude:/root/.claude persists Claude Code's in-container
+    # state (config + per-conversation .jsonl files under projects/)
+    # across container restarts. Without this mount the .jsonl files
+    # are wiped on every recreate and the Nerve DB's stale
+    # sdk_session_id rows fail every --resume with "No conversation
+    # found" exit 1. The path is siloed under ~/.nerve so the agent's
+    # CLI is isolated from the host user's personal ~/.claude (where
+    # macOS stores OAuth tokens via the system Keychain; auth still
+    # comes from config.local.yaml, not from this directory).
     volumes = [
         ".:/nerve",
         "~/.nerve:/root/.nerve",
         "~/.nerve/claude:/root/.claude",
-        f"{workspace_path}:/root/nerve-workspace",
+        f"{workspace_aligned}:{workspace_aligned}",
+        f"{projects_aligned}:{projects_aligned}",
     ]
 
     # Optional auth mounts — only include if the host directory exists.
@@ -2175,17 +2249,57 @@ def _build_docker_compose(
         if os.path.isdir(expanded):
             volumes.append(f"{host_path}:{container_path}")
 
+    if docker_socket:
+        # Direct daemon access for the agent. With this in place,
+        # `docker` and `docker compose` work from Bash inside the
+        # agent. The path-aligned ${{HOME}}/projects mount above means
+        # the daemon resolves bind-mount paths identically inside and
+        # out, so `cd ~/projects/worktrees/<repo>/<slug> && make dev`
+        # works from the agent and creates containers visible on the
+        # host. OrbStack and Docker Desktop both expose the daemon at
+        # this exact path on macOS via a compatibility symlink.
+        volumes.append("/var/run/docker.sock:/var/run/docker.sock")
+
     if extra_mounts:
         volumes.extend(extra_mounts)
 
-    # Build YAML by hand to keep formatting clean
     vol_lines = "\n".join(f"      - {v}" for v in volumes)
 
-    return f"""services:
-  nerve:
+    # In-agent service ports. The agent publishes ranges for dev
+    # servers it runs itself (docs preview, vite, storybook). Sibling
+    # containers (grafana, hyperdx-*) get their own host ports
+    # allocated when launched directly by the host daemon, so they are
+    # not listed here.
+    in_agent_port_ranges = [
+        ("docs",      3000, 3019),
+        ("vite",      5173, 5189),
+        ("storybook", 6006, 6019),
+    ]
+    port_lines = ['      - "8900:8900"']
+    for label, lo, hi in in_agent_port_ranges:
+        port_lines.append(f'      - "{lo}-{hi}:{lo}-{hi}"  # {label}')
+
+    nerve_block = f"""  nerve:
     build: .
     ports:
-      - "8900:8900"
+{chr(10).join(port_lines)}
+    environment:
+      # Path alignment: the entrypoint creates /root/* symlinks pointing
+      # at HOST_HOME so legacy paths still resolve, and any path passed
+      # to the host docker daemon resolves identically inside and out.
+      HOST_HOME: ${{HOME}}
+      # Route memU embeddings at the local Ollama sidecar (defined
+      # below). The OpenAI SDK respects this base URL when it talks to
+      # /embeddings, so memU recall + memorize work without OpenAI
+      # auth or network egress. Empty disables the override; memu_bridge
+      # then falls back to api.openai.com if openai_api_key is set,
+      # otherwise embeddings are simply skipped.
+      MEMU_EMBEDDING_BASE_URL: http://embeddings:11434/v1
+      MEMU_EMBEDDING_API_KEY: placeholder
+      MEMU_EMBED_MODEL: nomic-embed-text
+    depends_on:
+      embeddings:
+        condition: service_healthy
     volumes:
 {vol_lines}
     restart: unless-stopped
@@ -2193,7 +2307,56 @@ def _build_docker_compose(
     tty: true
     env_file:
       - path: .env
-        required: false
+        required: false"""
+
+    embeddings_block = """  # Self-hosted OpenAI-compatible embeddings service.
+  # Ollama serves nomic-embed-text (768-dim) at /v1/embeddings, the
+  # same wire format the OpenAI SDK speaks. This replaces the OpenAI
+  # /embeddings calls memU made for routing + recall, removing the
+  # quota / 401 single point of failure. Native ARM64 image; no
+  # emulation overhead on Apple Silicon. The first start of this
+  # service downloads the model (~270 MB) and caches it under
+  # ~/.nerve/ollama; subsequent starts are instant. nomic-embed-text
+  # returns 768-dim vectors (vs OpenAI ada-002's 1536), so any
+  # existing memu.sqlite embeddings get rebuilt on next memorize.
+  embeddings:
+    image: ollama/ollama:latest
+    volumes:
+      - ~/.nerve/ollama:/root/.ollama
+    expose:
+      - "11434"
+    restart: unless-stopped
+    # Pull the embedding model on first start, then run the server.
+    # `ollama serve` blocks; we pull in the background, wait until the
+    # API responds, then `wait` keeps the server in the foreground.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /bin/ollama serve &
+        pid=$$!
+        until /bin/ollama list >/dev/null 2>&1; do sleep 1; done
+        if ! /bin/ollama list | awk '{print $$1}' | grep -q '^nomic-embed-text'; then
+          echo "Pulling nomic-embed-text..."
+          /bin/ollama pull nomic-embed-text
+        fi
+        wait $$pid
+    healthcheck:
+      # Ready means: server up AND embedding model loaded. We grep for
+      # the model name so we don't mark healthy before the first-run
+      # model pull finishes.
+      test:
+        - CMD-SHELL
+        - 'ollama list 2>/dev/null | grep -q "^nomic-embed-text"'
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s"""
+
+    return f"""services:
+{nerve_block}
+
+{embeddings_block}
 """
 
 _DOCKER_ENTRYPOINT_TEMPLATE = """#!/bin/bash
@@ -2208,6 +2371,33 @@ pip install -e . --quiet 2>/dev/null
 if [ ! -d "web/dist" ]; then
     echo "Building web UI..."
     cd web && npm ci --quiet && npm run build && cd ..
+fi
+
+# --- Path alignment ---
+# HOST_HOME comes from compose (set to ${HOME} on the host). For each
+# host-aligned mount point, drop a symlink at the legacy /root/* path
+# so anything that hard-codes /root/nerve-workspace or /root/projects
+# keeps working and resolves to the same files the host docker daemon
+# sees. Idempotent: if the symlink already points where we want, skip.
+if [ -n "${HOST_HOME:-}" ]; then
+    for _name in nerve-workspace projects; do
+        _src="$HOST_HOME/$_name"
+        _dst="/root/$_name"
+        if [ ! -d "$_src" ]; then
+            continue
+        fi
+        if [ -L "$_dst" ]; then
+            # Already a symlink; trust it.
+            continue
+        fi
+        if [ -d "$_dst" ] && [ -z "$(ls -A "$_dst" 2>/dev/null)" ]; then
+            # Empty leftover dir from the Dockerfile mkdir or a prior
+            # bind mount that no longer exists. Replace with the symlink.
+            rmdir "$_dst" && ln -s "$_src" "$_dst"
+        elif [ ! -e "$_dst" ]; then
+            ln -s "$_src" "$_dst"
+        fi
+    done
 fi
 
 # --- Credential resolution (priority waterfall) ---

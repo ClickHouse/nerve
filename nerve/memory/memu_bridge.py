@@ -11,6 +11,7 @@ import ctypes
 import gc
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -417,6 +418,11 @@ class MemUBridge:
         # Debounce tracking for file re-indexing (path -> asyncio.Task)
         self._reindex_tasks: dict[str, asyncio.Task] = {}
         self._anthropic_client: Any | None = None  # Lazy sync Anthropic
+        # Bounded concurrency for memU's LLM chat calls. Created lazily
+        # in _instrument_llm_timeouts() so it binds to the active event
+        # loop, then reused across _reset_llm_clients() so callers
+        # already queued don't double-acquire after a reset.
+        self._llm_semaphore: asyncio.Semaphore | None = None
 
     async def _audit(self, action: str, target_type: str, target_id: str | None = None,
                      source: str = "bridge", details: dict | None = None) -> None:
@@ -914,13 +920,48 @@ class MemUBridge:
                 },
             }
 
-            if self.config.openai_api_key:
+            # Embedding profile resolution: env vars first, then YAML config,
+            # then OpenAI fallback. The env-var path is what docker compose
+            # uses to point memU at the local Ollama / TEI sidecar without
+            # rewriting config.yaml on every container start. Setting an
+            # explicit base URL implies a self-hosted endpoint; api_key is
+            # optional (Ollama / TEI ignore it but the OpenAI SDK requires
+            # a non-empty string).
+            embedding_base_url = (
+                os.environ.get("MEMU_EMBEDDING_BASE_URL")
+                or self.config.memory.embedding_base_url
+            )
+            embedding_api_key = (
+                os.environ.get("MEMU_EMBEDDING_API_KEY")
+                or self.config.memory.embedding_api_key
+            )
+            embed_model = (
+                os.environ.get("MEMU_EMBED_MODEL")
+                or self.config.memory.embed_model
+            )
+
+            if embedding_base_url:
+                llm_profiles["embedding"] = {
+                    "base_url": embedding_base_url,
+                    "api_key": embedding_api_key or "placeholder",
+                    "embed_model": embed_model,
+                    "client_backend": "sdk",
+                }
+                embeddings_configured = True
+                logger.info(
+                    "memU embeddings via self-hosted endpoint %s (model=%s)",
+                    embedding_base_url, embed_model or "<default>",
+                )
+            elif self.config.openai_api_key:
                 llm_profiles["embedding"] = {
                     "base_url": "https://api.openai.com/v1",
                     "api_key": self.config.openai_api_key,
-                    "embed_model": self.config.memory.embed_model,
+                    "embed_model": embed_model,
                     "client_backend": "sdk",
                 }
+                embeddings_configured = True
+            else:
+                embeddings_configured = False
 
             resources_dir = Path("~/.nerve/memu-resources").expanduser()
             resources_dir.mkdir(parents=True, exist_ok=True)
@@ -971,8 +1012,8 @@ class MemUBridge:
                     # work goes through Anthropic — use Haiku for extraction
                     # too to avoid saturating the rate-limit budget.
                     "memory_extract_llm_profile": (
-                        fast_profile if not self.config.openai_api_key
-                        else memorize_profile
+                        memorize_profile if embeddings_configured
+                        else fast_profile
                     ),
                     "category_update_llm_profile": fast_profile,
                     # Pass Nerve's configured categories to memU so the LLM
@@ -999,14 +1040,14 @@ class MemUBridge:
                     },
                 },
                 retrieve_config={
-                    "method": "llm" if not self.config.openai_api_key else "rag",
+                    "method": "rag" if embeddings_configured else "llm",
                     "route_intention": False,
                     "sufficiency_check": False,
                     "resource": {"enabled": False},
                     # Use Haiku for LLM-based ranking — cheaper and avoids
                     # sharing Sonnet's rate-limit budget with the main agent.
                     **({"llm_ranking_llm_profile": fast_profile}
-                       if not self.config.openai_api_key else {}),
+                       if not embeddings_configured else {}),
                 },
             )
             self._available = True
@@ -1048,7 +1089,7 @@ class MemUBridge:
             # memorize pipeline's "categorize_items" step with one that
             # stores items and resources with embedding=None.  This
             # avoids KeyError on the missing "embedding" LLM profile.
-            if not self.config.openai_api_key:
+            if not embeddings_configured:
                 from memu.workflow.step import WorkflowStep as _WfStep
 
                 _svc = self._service
@@ -1365,7 +1406,7 @@ class MemUBridge:
             logger.info("Injected Bedrock LLM client for profile '%s' (model=%s)", name, model)
 
     def _instrument_llm_timeouts(self) -> None:
-        """Configure per-call timeouts on LLM clients (two layers).
+        """Configure per-call timeouts and bounded concurrency on LLM clients.
 
         Layer 1: httpx-level timeout on the AsyncOpenAI transport.  This
         catches unresponsive API calls at the socket level and raises
@@ -1376,14 +1417,33 @@ class MemUBridge:
         (e.g. the coroutine is stuck in Python code, not I/O).
         It works because LLMClientWrapper.chat() delegates to
         self._client.chat() which resolves the instance attribute we set.
+
+        Layer 3: asyncio.Semaphore wrapper for bounded concurrency.
+        memU fans out per-memory-type chat calls via asyncio.gather
+        (memu/app/memorize.py:_generate_entries_from_text and similar).
+        On lower Anthropic API tiers, a 4-way fan-out reliably hits
+        rate_limit_error and the SDK retry/backoff can't catch up
+        before the pipeline gives up.  The semaphore caps simultaneous
+        chat() calls across all profiles at memory.llm_concurrency,
+        which serializes the bursts.  The slot is held only while the
+        actual chat is running (queueing time is unbounded), so the
+        timeout in Layer 2 measures real call duration, not queue wait.
         """
         import httpx as _httpx
+
+        # Lazily create the semaphore. Reused across _reset_llm_clients()
+        # so any callers already waiting in the queue don't lose their
+        # spot when clients get re-instrumented.
+        if self._llm_semaphore is None:
+            concurrency = max(1, int(self.config.memory.llm_concurrency))
+            self._llm_semaphore = asyncio.Semaphore(concurrency)
+            logger.info("memU LLM concurrency capped at %d", concurrency)
 
         for profile in ("memorize", "fast", "default"):
             try:
                 client = self._service._get_llm_base_client(profile)
 
-                # --- Layer 1: httpx timeout + disable SDK retries ---
+                # --- Layer 1: httpx timeout + bounded SDK retries ---
                 # (Bedrock clients use their own timeout; skip Layer 1 for them)
                 if not isinstance(client, _BedrockLLMClient):
                     inner = getattr(client, "client", None)  # OpenAISDKClient.client = AsyncOpenAI
@@ -1392,11 +1452,16 @@ class MemUBridge:
                             self._LLM_CALL_TIMEOUT,
                             connect=10.0,
                         )
-                        # The OpenAI SDK defaults to max_retries=2 and 600s timeout.
-                        # With our 120s asyncio.wait_for wrapper, SDK retries just
-                        # waste time inside a doomed coroutine.  Disable them so the
-                        # httpx timeout fires cleanly and propagates immediately.
-                        inner.max_retries = 0
+                        # SDK default max_retries=2, with exponential backoff
+                        # that respects the API's Retry-After header on 429.
+                        # We keep retries enabled so rate-limit responses
+                        # recover automatically. The Layer 3 semaphore caps
+                        # concurrency, so burst pressure stays low and the
+                        # retries actually drain the queue.  Bumped to 4 to
+                        # cover the worst-case Anthropic minute-window roll.
+                        # Total retry budget ~15s in the worst case (1+2+4+8s),
+                        # well inside the Layer 2 wait_for(120s) bound.
+                        inner.max_retries = 4
 
                 # --- Layer 2: asyncio.wait_for wrapper ---
                 if not callable(getattr(client, "chat", None)):
@@ -1408,44 +1473,47 @@ class MemUBridge:
 
                 async def _timeout_chat(
                     prompt, *, max_tokens=None, system_prompt=None, temperature=0.2,
-                    _orig=original_chat, _prof=profile,
+                    _orig=original_chat, _prof=profile, _sem=self._llm_semaphore,
                 ):
                     # Anthropic API requires max_tokens >= 1; memU sometimes
                     # omits it.  Default to 4096 to prevent 400 errors.
                     if max_tokens is None:
                         max_tokens = 4096
-                    t0 = time.monotonic()
-                    try:
-                        return await asyncio.wait_for(
-                            _orig(
-                                prompt,
-                                max_tokens=max_tokens,
-                                system_prompt=system_prompt,
-                                temperature=temperature,
-                            ),
-                            timeout=self._LLM_CALL_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        elapsed = time.monotonic() - t0
-                        in_flight = len(self._metrics.in_flight)
-                        # Dump httpx connection pool state for diagnosis
-                        pool_info = "unknown"
+                    # Acquire the concurrency slot first so the timeout
+                    # only measures actual call duration, not queue wait.
+                    async with _sem:
+                        t0 = time.monotonic()
                         try:
-                            base = self._service._llm_clients.get(_prof)
-                            sdk = getattr(base, "client", None)
-                            transport = getattr(sdk, "_client", None)
-                            pool = getattr(transport, "_pool", None) or getattr(transport, "_transport", None)
-                            if pool:
-                                pool_info = repr(pool)
-                        except Exception:
-                            pass
-                        logger.error(
-                            "memU LLM HUNG [%s]: no response after %.0fs "
-                            "(prompt=%d chars, in_flight=%d, pool=%s)",
-                            _prof, elapsed, len(prompt),
-                            in_flight, pool_info,
-                        )
-                        raise
+                            return await asyncio.wait_for(
+                                _orig(
+                                    prompt,
+                                    max_tokens=max_tokens,
+                                    system_prompt=system_prompt,
+                                    temperature=temperature,
+                                ),
+                                timeout=self._LLM_CALL_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            elapsed = time.monotonic() - t0
+                            in_flight = len(self._metrics.in_flight)
+                            # Dump httpx connection pool state for diagnosis
+                            pool_info = "unknown"
+                            try:
+                                base = self._service._llm_clients.get(_prof)
+                                sdk = getattr(base, "client", None)
+                                transport = getattr(sdk, "_client", None)
+                                pool = getattr(transport, "_pool", None) or getattr(transport, "_transport", None)
+                                if pool:
+                                    pool_info = repr(pool)
+                            except Exception:
+                                pass
+                            logger.error(
+                                "memU LLM HUNG [%s]: no response after %.0fs "
+                                "(prompt=%d chars, in_flight=%d, pool=%s)",
+                                _prof, elapsed, len(prompt),
+                                in_flight, pool_info,
+                            )
+                            raise
 
                 _timeout_chat._nerve_timeout_wrapped = True  # type: ignore[attr-defined]
                 client.chat = _timeout_chat  # type: ignore[method-assign]
@@ -2448,5 +2516,9 @@ class MemUBridge:
 
     @property
     def _has_embeddings(self) -> bool:
-        """Whether an embedding provider (e.g. OpenAI) is configured."""
-        return bool(self.config.openai_api_key)
+        """Whether an embedding provider (OpenAI or self-hosted) is configured."""
+        return bool(
+            os.environ.get("MEMU_EMBEDDING_BASE_URL")
+            or self.config.memory.embedding_base_url
+            or self.config.openai_api_key
+        )

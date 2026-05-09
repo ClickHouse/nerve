@@ -354,6 +354,170 @@ class TestConfigMemoryModels:
         config = MemoryConfig.from_dict({})
         assert config.semantic_dedup_threshold == 0.85
 
+    # --- Self-hosted embedding endpoint ---
+
+    def test_embedding_base_url_default_empty(self):
+        config = MemoryConfig()
+        assert config.embedding_base_url == ""
+        assert config.embedding_api_key == ""
+
+    def test_embedding_base_url_from_dict(self):
+        config = MemoryConfig.from_dict({
+            "embedding_base_url": "http://embeddings:11434/v1",
+            "embedding_api_key": "secret",
+        })
+        assert config.embedding_base_url == "http://embeddings:11434/v1"
+        assert config.embedding_api_key == "secret"
+
+    def test_embedding_base_url_from_dict_default(self):
+        config = MemoryConfig.from_dict({})
+        assert config.embedding_base_url == ""
+        assert config.embedding_api_key == ""
+
+    # --- LLM concurrency cap ---
+
+    def test_llm_concurrency_default_is_one(self):
+        config = MemoryConfig()
+        assert config.llm_concurrency == 1
+
+    def test_llm_concurrency_from_dict(self):
+        config = MemoryConfig.from_dict({"llm_concurrency": 4})
+        assert config.llm_concurrency == 4
+
+    def test_llm_concurrency_from_dict_default_one(self):
+        config = MemoryConfig.from_dict({})
+        assert config.llm_concurrency == 1
+
+    def test_llm_concurrency_zero_clamped_to_one(self):
+        # Zero would deadlock the wrapper. Clamp to 1.
+        config = MemoryConfig.from_dict({"llm_concurrency": 0})
+        assert config.llm_concurrency == 1
+
+    def test_llm_concurrency_negative_clamped_to_one(self):
+        config = MemoryConfig.from_dict({"llm_concurrency": -3})
+        assert config.llm_concurrency == 1
+
+
+class TestLlmConcurrencyWrapper:
+    """Verify _instrument_llm_timeouts wraps chat calls with the configured semaphore."""
+
+    @pytest.mark.asyncio
+    async def test_semaphore_serializes_concurrent_chat_calls(self, tmp_path):
+        """With llm_concurrency=1, four asyncio.gather'd chat calls run sequentially."""
+        config = _make_config(tmp_path)
+        config.memory.llm_concurrency = 1
+        bridge = MemUBridge(config)
+
+        # Simulate memU's LLM clients with a slow-but-trackable chat method
+        in_flight = 0
+        max_in_flight = 0
+        call_order: list[int] = []
+
+        class _FakeBaseClient:
+            async def chat(self, prompt, *, max_tokens=None, system_prompt=None, temperature=0.2):
+                nonlocal in_flight, max_in_flight
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                # Yield control so other gather'd tasks can race here
+                await asyncio.sleep(0.01)
+                call_order.append(int(prompt))
+                in_flight -= 1
+                return "ok"
+
+        fake_inner_clients = {
+            "memorize": _FakeBaseClient(),
+            "fast": _FakeBaseClient(),
+            "default": _FakeBaseClient(),
+        }
+        # _instrument_llm_timeouts iterates ("memorize","fast","default") and
+        # calls _service._get_llm_base_client(profile). Stub the service.
+        bridge._service = MagicMock()
+        bridge._service._get_llm_base_client = lambda p: fake_inner_clients[p]
+        bridge._service._llm_clients = fake_inner_clients
+
+        bridge._instrument_llm_timeouts()
+
+        # Fan out 4 simultaneous calls on the memorize profile (matches the
+        # memU/extract_items pattern: one gather per memory_type).
+        wrapped = fake_inner_clients["memorize"].chat
+        await asyncio.gather(*(wrapped(str(i)) for i in range(4)))
+
+        assert max_in_flight == 1, f"semaphore should serialize, got max_in_flight={max_in_flight}"
+        assert sorted(call_order) == [0, 1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_semaphore_respects_higher_concurrency(self, tmp_path):
+        """With llm_concurrency=3, four gather'd calls peak at 3 in-flight, not 4."""
+        config = _make_config(tmp_path)
+        config.memory.llm_concurrency = 3
+        bridge = MemUBridge(config)
+
+        in_flight = 0
+        max_in_flight = 0
+
+        class _FakeBaseClient:
+            async def chat(self, prompt, *, max_tokens=None, system_prompt=None, temperature=0.2):
+                nonlocal in_flight, max_in_flight
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                await asyncio.sleep(0.02)
+                in_flight -= 1
+                return "ok"
+
+        fake_inner_clients = {
+            "memorize": _FakeBaseClient(),
+            "fast": _FakeBaseClient(),
+            "default": _FakeBaseClient(),
+        }
+        bridge._service = MagicMock()
+        bridge._service._get_llm_base_client = lambda p: fake_inner_clients[p]
+        bridge._service._llm_clients = fake_inner_clients
+
+        bridge._instrument_llm_timeouts()
+
+        wrapped = fake_inner_clients["memorize"].chat
+        await asyncio.gather(*(wrapped(str(i)) for i in range(4)))
+
+        assert max_in_flight == 3, f"expected peak 3, got {max_in_flight}"
+
+    @pytest.mark.asyncio
+    async def test_semaphore_survives_reset_and_reuses_same_instance(self, tmp_path):
+        """Re-running _instrument_llm_timeouts must not recreate the semaphore.
+
+        _reset_llm_clients evicts caches and re-instruments. If we created a
+        fresh semaphore each time, callers waiting on the old one would lose
+        their slot and a parallel re-instrumentation could double the
+        effective concurrency.
+        """
+        config = _make_config(tmp_path)
+        config.memory.llm_concurrency = 1
+        bridge = MemUBridge(config)
+
+        class _FakeBaseClient:
+            async def chat(self, *a, **kw):
+                return "ok"
+
+        fake = {p: _FakeBaseClient() for p in ("memorize", "fast", "default")}
+        bridge._service = MagicMock()
+        bridge._service._get_llm_base_client = lambda p: fake[p]
+        bridge._service._llm_clients = fake
+
+        bridge._instrument_llm_timeouts()
+        first_semaphore = bridge._llm_semaphore
+        assert first_semaphore is not None
+
+        # Simulate a reset: drop the timeout-wrapper marker so re-instrumentation
+        # actually rewraps the clients.
+        for p in fake:
+            fake[p] = _FakeBaseClient()
+        bridge._service._get_llm_base_client = lambda p: fake[p]
+        bridge._service._llm_clients = fake
+
+        bridge._instrument_llm_timeouts()
+        assert bridge._llm_semaphore is first_semaphore, (
+            "semaphore must be the same instance across resets"
+        )
+
 
 class TestKnowledgeCustomPrompts:
     """Test that custom knowledge extraction prompts are defined correctly."""
