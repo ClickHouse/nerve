@@ -433,6 +433,10 @@ class TestDockerNonInteractive:
             "ANTHROPIC_API_KEY": "sk-ant-api03-test",
             "NERVE_MODE": "personal",
             "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            # Explicitly clear NERVE_DOCKER so the test runs correctly
+            # when executed inside a Docker container where NERVE_DOCKER=1
+            # is already in the environment.
+            "NERVE_DOCKER": "",
         }
         with patch.dict(os.environ, env, clear=False):
             choices = run_non_interactive(tmp_path)
@@ -478,7 +482,13 @@ class TestDockerTemplateIntegrity:
         assert "~/.nerve:/root/.nerve" in volumes
         assert "~/.config/gh:/root/.config/gh" in volumes
         assert "~/.config/gog:/root/.config/gog" in volumes
-        assert "~/my-workspace:/root/nerve-workspace" in volumes
+        # Workspace and projects are mounted host-aligned: same path
+        # inside and outside the container so the agent can pass paths
+        # through to the host docker daemon (via the mounted socket)
+        # without translation. Legacy /root/* paths are restored via
+        # symlinks in the entrypoint.
+        assert "${HOME}/my-workspace:${HOME}/my-workspace" in volumes
+        assert "${HOME}/projects:${HOME}/projects" in volumes
         # ~/.claude is NOT mounted (macOS Keychain, not filesystem)
         assert "~/.claude:/root/.claude" not in volumes
         # No named volumes section
@@ -494,7 +504,8 @@ class TestDockerTemplateIntegrity:
         # Required mounts still present
         assert ".:/nerve" in volumes
         assert "~/.nerve:/root/.nerve" in volumes
-        assert "~/ws:/root/nerve-workspace" in volumes
+        assert "${HOME}/ws:${HOME}/ws" in volumes
+        assert "${HOME}/projects:${HOME}/projects" in volumes
         # Optional auth mounts absent
         assert "~/.config/gh:/root/.config/gh" not in volumes
         assert "~/.config/gog:/root/.config/gog" not in volumes
