@@ -139,6 +139,12 @@ class AgentConfig:
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
+    # Substrings of model names for which the context-1m beta header must NOT
+    # be sent (some subscriptions reject the beta for specific models — e.g.
+    # claude-sonnet-4-6 returns 400 "long context beta not yet available for
+    # this subscription"). Match is case-insensitive substring on the resolved
+    # model name. Empty list = send beta for all models when context_1m=True.
+    context_1m_excluded_models: list[str] = field(default_factory=list)
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
@@ -158,8 +164,22 @@ class AgentConfig:
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
             context_1m=d.get("context_1m", True),
+            context_1m_excluded_models=list(
+                d.get("context_1m_excluded_models", []) or []
+            ),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
+        )
+
+    def context_1m_enabled_for(self, model: str | None) -> bool:
+        """Whether the context-1m beta applies to *model* (or the default
+        model when None).  False if globally disabled or if the model name
+        matches any entry in ``context_1m_excluded_models``."""
+        if not self.context_1m:
+            return False
+        resolved = (model or self.model).lower()
+        return not any(
+            tok and tok.lower() in resolved for tok in self.context_1m_excluded_models
         )
 
 
