@@ -115,6 +115,12 @@ class AgentConfig:
     cron_thinking: str = "high"
     cron_effort: str = "high"
     context_1m: bool = True     # Enable 1M context window beta
+    # Substrings of model names for which the context-1m beta header must NOT
+    # be sent (some subscriptions reject the beta for specific models — e.g.
+    # claude-sonnet-4-6 returns 400 "long context beta not yet available for
+    # this subscription"). Match is case-insensitive substring on the resolved
+    # model name. Empty list = send beta for all models when context_1m=True.
+    context_1m_excluded_models: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
@@ -129,6 +135,20 @@ class AgentConfig:
             cron_thinking=str(d.get("cron_thinking", "high")),
             cron_effort=str(d.get("cron_effort", "high")),
             context_1m=d.get("context_1m", True),
+            context_1m_excluded_models=list(
+                d.get("context_1m_excluded_models", []) or []
+            ),
+        )
+
+    def context_1m_enabled_for(self, model: str | None) -> bool:
+        """Whether the context-1m beta applies to *model* (or the default
+        model when None).  False if globally disabled or if the model name
+        matches any entry in ``context_1m_excluded_models``."""
+        if not self.context_1m:
+            return False
+        resolved = (model or self.model).lower()
+        return not any(
+            tok and tok.lower() in resolved for tok in self.context_1m_excluded_models
         )
 
 

@@ -767,8 +767,12 @@ class AgentEngine:
             if effort_value in ("low", "medium", "high", "max")
             else None
         )
+        # Some subscriptions reject the context-1m beta for specific models
+        # (e.g. claude-sonnet-4-6) — skip the beta header for those.
         betas = (
-            ["context-1m-2025-08-07"] if self.config.agent.context_1m else []
+            ["context-1m-2025-08-07"]
+            if self.config.agent.context_1m_enabled_for(model)
+            else []
         )
 
         # Build PreToolUse hook for file snapshot capture
@@ -1752,7 +1756,11 @@ class AgentEngine:
             )
 
         # Persist usage for context bar on session switch
-        max_context = 1_048_576 if self.config.agent.context_1m else 200_000
+        max_context = (
+            1_048_576
+            if self.config.agent.context_1m_enabled_for(model)
+            else 200_000
+        )
         num_turns = (result_meta or {}).get("num_turns") or 1
         if last_usage:
             usage_data = {
