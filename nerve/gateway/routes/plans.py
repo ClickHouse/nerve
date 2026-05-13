@@ -71,15 +71,17 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, user: dict = Depends
     if fields:
         await deps.db.update_plan(plan_id, **fields)
 
-    # Write task note on decline
+    # On decline: mark the related task as done with a note explaining the closure.
+    # The user-supplied feedback is optional — if absent, leave a generic comment.
     if req.status == "declined":
-        from nerve.agent.tools import task_update as task_update_tool
-        feedback_suffix = ""
+        from nerve.agent.tools import task_done as task_done_tool
         if req.feedback:
-            feedback_suffix = f" — {req.feedback[:80]}{'...' if len(req.feedback) > 80 else ''}"
-        await task_update_tool.handler({
+            note = f"Plan {plan_id} declined — {req.feedback}"
+        else:
+            note = f"Related plan {plan_id} was closed without a specified reason"
+        await task_done_tool.handler({
             "task_id": plan["task_id"],
-            "note": f"Plan declined: {plan_id}{feedback_suffix}",
+            "note": note,
         })
 
     return {"plan_id": plan_id, "updated": True}
