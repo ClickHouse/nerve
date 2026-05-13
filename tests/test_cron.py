@@ -441,3 +441,259 @@ class TestJobLock:
 
         # Different jobs run concurrently even with lock=True
         assert call_order == ["start", "start", "end", "end"]
+
+
+# ---------------------------------------------------------------------------
+# Context rotation: _maybe_rotate_context + rotate_session (force-rotate)
+# ---------------------------------------------------------------------------
+
+
+def _hours_ahead(h: float) -> datetime:
+    return _utc_now() + timedelta(hours=h)
+
+
+def _today_at_local(hour: int, minute: int = 0) -> datetime:
+    """Today's HH:MM in the local timezone, returned as UTC-aware datetime."""
+    local_tz = datetime.now().astimezone().tzinfo
+    today = datetime.now(local_tz).replace(
+        hour=hour, minute=minute, second=0, microsecond=0,
+    )
+    return today.astimezone(timezone.utc)
+
+
+class TestMaybeRotateContext:
+    """Tests for the rotation predicate.
+
+    Together with TestRotateSession this covers two long-standing bugs:
+      * force-rotate API silently doing nothing
+      * `rotate_at` predicate going dead after any nerve restart past the
+        configured local time, because `connected_at` was getting reset.
+    """
+
+    def _wire(self, cron_service, session: dict | None) -> tuple:
+        cron_service.db.get_session = AsyncMock(return_value=session)
+        cron_service.db.update_session_fields = AsyncMock()
+        cron_service.engine._memorize_session = AsyncMock()
+        cron_service.engine.sessions = MagicMock()
+        cron_service.engine.sessions.mark_idle = AsyncMock()
+        return (
+            cron_service.engine.sessions.mark_idle,
+            cron_service.db.update_session_fields,
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_session_missing(self, cron_service):
+        mark_idle, _ = self._wire(cron_service, None)
+        assert not await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=24,
+        )
+        mark_idle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_force_bypasses_all_predicates(self, cron_service):
+        """force=True must rotate regardless of schedule config."""
+        # Session with no connected_at, no last_rotated_at, rotate_hours=0,
+        # rotate_at unset — every normal predicate would return False.
+        session = {"id": "cron:x", "connected_at": None, "last_rotated_at": None}
+        mark_idle, update_fields = self._wire(cron_service, session)
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=0, force=True,
+        )
+
+        assert rotated is True
+        mark_idle.assert_awaited_once_with("cron:x", preserve_sdk_id=False)
+        # last_rotated_at must be persisted on success.
+        update_fields.assert_awaited_once()
+        args, _ = update_fields.call_args
+        assert args[0] == "cron:x"
+        assert "last_rotated_at" in args[1]
+
+    @pytest.mark.asyncio
+    async def test_rotate_at_first_rotation_with_null_last_rotated(
+        self, cron_service,
+    ):
+        """NULL last_rotated_at should not block first-time daily rotation
+        once today's boundary has passed."""
+        # rotate_at = 1h ago in local time → already past boundary today.
+        boundary_local_hour = (datetime.now().astimezone().hour - 1) % 24
+        session = {
+            "id": "cron:x",
+            "connected_at": _hours_ago(0.1),  # connected just now
+            "last_rotated_at": None,
+        }
+        self._wire(cron_service, session)
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=0,
+            rotate_at=f"{boundary_local_hour:02d}:00",
+        )
+        assert rotated is True
+
+    @pytest.mark.asyncio
+    async def test_rotate_at_skipped_if_already_rotated_today(
+        self, cron_service,
+    ):
+        """Daily rotation must run at most once per day."""
+        boundary_local_hour = (datetime.now().astimezone().hour - 1) % 24
+        boundary_utc = _today_at_local(boundary_local_hour, 0)
+        # Already rotated AFTER today's boundary — should NOT rotate again.
+        session = {
+            "id": "cron:x",
+            "connected_at": _hours_ago(0.1),
+            "last_rotated_at": (boundary_utc + timedelta(minutes=5)).isoformat(),
+        }
+        mark_idle, _ = self._wire(cron_service, session)
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=0,
+            rotate_at=f"{boundary_local_hour:02d}:00",
+        )
+        assert rotated is False
+        mark_idle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rotate_at_survives_restart_past_boundary(
+        self, cron_service,
+    ):
+        """Regression: nerve restart that lands AFTER today's rotate_at must
+        not break daily rotation for the rest of the day.
+
+        Old code compared `connected_at` (which is reset on every reconnect /
+        restart) to today's rotate_at boundary, so once `connected_at` was
+        past the boundary, rotation was dead until the next calendar day.
+
+        With `last_rotated_at`, the connect timestamp is irrelevant: as long
+        as we haven't rotated since today's boundary, rotation must fire.
+        """
+        boundary_local_hour = (datetime.now().astimezone().hour - 1) % 24
+        boundary_utc = _today_at_local(boundary_local_hour, 0)
+        # connected_at reset to a moment AFTER today's boundary — exactly
+        # the post-restart scenario that used to break rotation.
+        session = {
+            "id": "cron:x",
+            "connected_at": (boundary_utc + timedelta(minutes=10)).isoformat(),
+            # Last rotated yesterday → still eligible today.
+            "last_rotated_at": (boundary_utc - timedelta(days=1)).isoformat(),
+        }
+        self._wire(cron_service, session)
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=0,
+            rotate_at=f"{boundary_local_hour:02d}:00",
+        )
+        assert rotated is True
+
+    @pytest.mark.asyncio
+    async def test_rotate_at_before_boundary_does_not_rotate(
+        self, cron_service,
+    ):
+        """Before today's rotate_at boundary, must wait."""
+        boundary_local_hour = (datetime.now().astimezone().hour + 2) % 24
+        session = {
+            "id": "cron:x",
+            "connected_at": _hours_ago(1),
+            "last_rotated_at": None,
+        }
+        mark_idle, _ = self._wire(cron_service, session)
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=0,
+            rotate_at=f"{boundary_local_hour:02d}:00",
+        )
+        assert rotated is False
+        mark_idle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_hours_uses_last_rotated_when_present(self, cron_service):
+        """rotate_hours-based: prefer `last_rotated_at` over `connected_at`
+        for the age baseline (so it survives restarts the same way)."""
+        # connected_at is "fresh" (just reconnected), but last rotation was
+        # 30h ago — must be eligible for 24h rotation.
+        session = {
+            "id": "cron:x",
+            "connected_at": _hours_ago(0.1),
+            "last_rotated_at": _hours_ago(30),
+        }
+        self._wire(cron_service, session)
+
+        assert await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=24,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hours_falls_back_to_connected_at_when_never_rotated(
+        self, cron_service,
+    ):
+        """Pre-v025 sessions without last_rotated_at still rotate using
+        connected_at as the baseline."""
+        session = {
+            "id": "cron:x",
+            "connected_at": _hours_ago(48),
+            "last_rotated_at": None,
+        }
+        self._wire(cron_service, session)
+
+        assert await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=24,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hours_no_baseline_returns_false(self, cron_service):
+        """If both timestamps are NULL, hours-based rotation can't decide
+        — wait for next reconnect to set a baseline."""
+        session = {
+            "id": "cron:x",
+            "connected_at": None,
+            "last_rotated_at": None,
+        }
+        mark_idle, _ = self._wire(cron_service, session)
+
+        assert not await cron_service._maybe_rotate_context(
+            "cron:x", rotate_hours=24,
+        )
+        mark_idle.assert_not_called()
+
+
+class TestRotateSession:
+    """Force-rotate via the admin API endpoint.
+
+    Regression for bug where `rotate_session` always returned `rotated=False`
+    because it called `_maybe_rotate_context(rotate_hours=0)` without
+    `rotate_at`, and the inner `elif rotate_hours > 0` filtered zero out.
+    """
+
+    @pytest.mark.asyncio
+    async def test_force_rotate_actually_rotates(self, cron_service):
+        cron_service._jobs = [_make_job(id="inbox", session_mode="persistent")]
+        cron_service.db.get_session = AsyncMock(return_value={
+            "id": "cron:inbox",
+            "connected_at": _hours_ago(2),
+            "last_rotated_at": None,
+        })
+        cron_service.db.update_session_fields = AsyncMock()
+        cron_service.engine._memorize_session = AsyncMock()
+        cron_service.engine.sessions = MagicMock()
+        cron_service.engine.sessions.mark_idle = AsyncMock()
+
+        result = await cron_service.rotate_session("inbox")
+
+        assert result["rotated"] is True
+        assert result["job_id"] == "inbox"
+        assert result["session_age_hours"] is not None
+        cron_service.engine.sessions.mark_idle.assert_awaited_once_with(
+            "cron:inbox", preserve_sdk_id=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_rotate_session_unknown_job_raises(self, cron_service):
+        cron_service._jobs = []
+        cron_service._load_merged_jobs = MagicMock(return_value=[])
+        with pytest.raises(ValueError, match="Job not found"):
+            await cron_service.rotate_session("nope")
+
+    @pytest.mark.asyncio
+    async def test_rotate_session_non_persistent_raises(self, cron_service):
+        cron_service._jobs = [_make_job(id="oneshot", session_mode="per_run")]
+        with pytest.raises(ValueError, match="not persistent"):
+            await cron_service.rotate_session("oneshot")

@@ -212,6 +212,7 @@ class CronService:
     async def _maybe_rotate_context(
         self, session_id: str, rotate_hours: int,
         rotate_at: str = "",
+        force: bool = False,
     ) -> bool:
         """Check if a persistent cron session's context should be rotated.
 
@@ -220,34 +221,33 @@ class CronService:
 
         If rotate_at is set (e.g. "04:00"), rotation happens once per day
         at that local time instead of using the hours-based approach.
+        Rotation timing is tracked via the dedicated `last_rotated_at`
+        column — NOT `connected_at`, which is reset on every reconnect
+        (and on every nerve restart) and would otherwise break time-of-day
+        rotation for the rest of any day where a restart happened past the
+        rotate-at boundary.
+
+        If `force=True`, all schedule predicates are bypassed and rotation
+        runs immediately as long as the session exists.  Used by the
+        `POST /api/cron/jobs/{job_id}/rotate` admin endpoint.
 
         Returns True if rotation was performed.
         """
         session = await self.db.get_session(session_id)
-        if not session or not session.get("connected_at"):
-            return False
-
-        connected_at_str = session["connected_at"]
-        try:
-            ts = connected_at_str
-            if "T" not in ts:
-                ts = ts.replace(" ", "T")
-            if not ts.endswith(("Z", "+00:00")):
-                ts += "+00:00"
-            connected_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            logger.warning(
-                "Invalid connected_at for %s: %s", session_id, connected_at_str,
-            )
+        if not session:
             return False
 
         now = datetime.now(timezone.utc)
         should_rotate = False
         reason = ""
 
-        if rotate_at:
-            # Time-of-day rotation: rotate if session started before today's
-            # rotate_at and current time is past it.
+        if force:
+            should_rotate = True
+            reason = "force"
+        elif rotate_at:
+            # Time-of-day rotation: rotate at most once per day, after the
+            # configured local time, only if we haven't rotated since today's
+            # rotate-at boundary.
             try:
                 hour, minute = (int(x) for x in rotate_at.split(":"))
             except (ValueError, TypeError):
@@ -260,11 +260,27 @@ class CronService:
             )
             today_rotate_utc = today_rotate.astimezone(timezone.utc)
 
-            if now >= today_rotate_utc and connected_at < today_rotate_utc:
+            last_rotated = self._parse_iso_utc(session.get("last_rotated_at"))
+            # Treat NULL as "never rotated" — eligible as soon as we are past
+            # today's boundary.
+            past_boundary = last_rotated is None or last_rotated < today_rotate_utc
+            if now >= today_rotate_utc and past_boundary:
                 should_rotate = True
                 reason = f"rotate_at={rotate_at}"
         elif rotate_hours > 0:
-            age_hours = (now - connected_at).total_seconds() / 3600
+            # Hours-based rotation: prefer `last_rotated_at` for the age
+            # baseline, fall back to `connected_at` for sessions that were
+            # created before the v025 migration (and thus have no rotation
+            # history yet).
+            baseline = (
+                self._parse_iso_utc(session.get("last_rotated_at"))
+                or self._parse_iso_utc(session.get("connected_at"))
+            )
+            if baseline is None:
+                # Nothing to compare against — let the next reconnect set a
+                # baseline and try again.
+                return False
+            age_hours = (now - baseline).total_seconds() / 3600
             if age_hours >= rotate_hours:
                 should_rotate = True
                 reason = f"age {age_hours:.1f}h >= {rotate_hours}h"
@@ -280,11 +296,31 @@ class CronService:
 
         # Clear sdk_session_id + connected_at → next run starts fresh
         await self.engine.sessions.mark_idle(session_id, preserve_sdk_id=False)
+        # Record the rotation timestamp so the next eligibility check uses
+        # rotation history, not the (just-cleared) connect lifecycle.
+        await self.db.update_session_fields(
+            session_id, {"last_rotated_at": now.isoformat()},
+        )
         logger.info(
             "Rotated context for persistent cron %s (%s)",
             session_id, reason,
         )
         return True
+
+    @staticmethod
+    def _parse_iso_utc(value: str | None) -> datetime | None:
+        """Parse an ISO-8601 timestamp into a UTC-aware datetime, or None."""
+        if not value:
+            return None
+        try:
+            ts = value
+            if "T" not in ts:
+                ts = ts.replace(" ", "T")
+            if not ts.endswith(("Z", "+00:00")):
+                ts += "+00:00"
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
     def _load_merged_jobs(self) -> list[CronJob]:
         """Load and merge jobs from system.yaml and jobs.yaml.
@@ -516,22 +552,20 @@ class CronService:
 
         # Calculate current age for the response
         session_age_hours: float | None = None
-        if session and session.get("connected_at"):
-            try:
-                ts = session["connected_at"]
-                if "T" not in ts:
-                    ts = ts.replace(" ", "T")
-                if not ts.endswith(("Z", "+00:00")):
-                    ts += "+00:00"
-                ca = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if session:
+            ca = self._parse_iso_utc(session.get("connected_at"))
+            if ca is not None:
                 session_age_hours = round(
                     (datetime.now(timezone.utc) - ca).total_seconds() / 3600, 2,
                 )
-            except (ValueError, TypeError):
-                pass
 
-        # Force rotation (rotate_hours=0 ensures any positive age passes)
-        rotated = await self._maybe_rotate_context(session_id, rotate_hours=0)
+        # Force rotation: bypass schedule predicates entirely.  Previously
+        # this called `_maybe_rotate_context(rotate_hours=0)`, which silently
+        # returned False because the inner `elif rotate_hours > 0` check
+        # filtered zero out — so the API endpoint never actually rotated.
+        rotated = await self._maybe_rotate_context(
+            session_id, rotate_hours=0, force=True,
+        )
 
         logger.info(
             "Manual rotation for %s: rotated=%s age=%.1fh",
