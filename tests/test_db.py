@@ -559,6 +559,41 @@ class TestTaskSearch:
         results = await db.list_tasks(tag="ci")
         assert len(results) == 2
 
+    async def test_list_tasks_sort_and_pagination(self, db: Database):
+        """list_tasks should respect sort + limit/offset, and count_tasks
+        should return the total ignoring pagination."""
+        import asyncio
+        # Insert three tasks; sleep briefly between each so updated_at
+        # is monotonically increasing.
+        await db.upsert_task(task_id="t-a", file_path="a.md", title="A", status="pending")
+        await asyncio.sleep(0.01)
+        await db.upsert_task(task_id="t-b", file_path="b.md", title="B", status="pending")
+        await asyncio.sleep(0.01)
+        await db.upsert_task(task_id="t-c", file_path="c.md", title="C", status="pending")
+
+        # Sort by updated_at DESC — newest first
+        results = await db.list_tasks(sort="updated_at")
+        assert [r["id"] for r in results] == ["t-c", "t-b", "t-a"]
+
+        # Sort by created_at DESC — same order in this case
+        results = await db.list_tasks(sort="created_at")
+        assert [r["id"] for r in results] == ["t-c", "t-b", "t-a"]
+
+        # Unknown sort falls back to default (deadline) without raising
+        results = await db.list_tasks(sort="bogus")
+        assert len(results) == 3
+
+        # Pagination: limit=2 returns first 2; offset=2 returns the third
+        page1 = await db.list_tasks(sort="updated_at", limit=2, offset=0)
+        page2 = await db.list_tasks(sort="updated_at", limit=2, offset=2)
+        assert [r["id"] for r in page1] == ["t-c", "t-b"]
+        assert [r["id"] for r in page2] == ["t-a"]
+
+        # count_tasks ignores pagination
+        assert await db.count_tasks() == 3
+        assert await db.count_tasks(status="pending") == 3
+        assert await db.count_tasks(status="done") == 0
+
 
 class TestTagParsing:
     """Test tag string parsing handles various agent input formats."""

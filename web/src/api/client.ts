@@ -91,12 +91,23 @@ export const api = {
     }),
 
   // Tasks
-  listTasks: (status?: string) =>
-    request<{ tasks: any[] }>(`/tasks${status ? `?status=${status}` : ''}`),
+  listTasks: (params?: { status?: string; sort?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set('status', params.status);
+    if (params?.sort) qs.set('sort', params.sort);
+    if (params?.limit !== undefined) qs.set('limit', String(params.limit));
+    if (params?.offset !== undefined) qs.set('offset', String(params.offset));
+    const q = qs.toString();
+    return request<{ tasks: any[]; total: number; limit: number; offset: number }>(
+      `/tasks${q ? '?' + q : ''}`,
+    );
+  },
   searchTasks: (query: string, status?: string) => {
     const qs = new URLSearchParams({ q: query });
     if (status) qs.set('status', status);
-    return request<{ tasks: any[] }>(`/tasks/search?${qs}`);
+    return request<{ tasks: any[]; total: number; limit: number; offset: number }>(
+      `/tasks/search?${qs}`,
+    );
   },
   getTask: (id: string) => request<any>(`/tasks/${id}`),
   createTask: (data: { title: string; content?: string; deadline?: string }) =>

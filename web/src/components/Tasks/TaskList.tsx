@@ -24,7 +24,7 @@ export function TaskList() {
 
   const loadTasks = async () => {
     try {
-      const { tasks } = await api.listTasks(filter || undefined);
+      const { tasks } = await api.listTasks({ status: filter || undefined });
       setTasks(tasks);
     } catch (e) {
       console.error('Failed to load tasks:', e);

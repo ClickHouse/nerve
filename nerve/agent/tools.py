@@ -1379,16 +1379,18 @@ async def plan_decline(args: dict) -> dict:
         fields["feedback"] = feedback
     await _db.update_plan(plan_id, **fields)
 
-    # Write task note
-    feedback_suffix = ""
+    # Mark the related task as done. Feedback is optional — if absent,
+    # leave a generic comment noting that the plan was closed without a reason.
     if feedback:
-        feedback_suffix = f" — {feedback[:80]}{'...' if len(feedback) > 80 else ''}"
-    await task_update.handler({
+        note = f"Plan {plan_id} declined — {feedback}"
+    else:
+        note = f"Related plan {plan_id} was closed without a specified reason"
+    await task_done.handler({
         "task_id": plan["task_id"],
-        "note": f"Plan declined: {plan_id}{feedback_suffix}",
+        "note": note,
     })
 
-    return {"content": [{"type": "text", "text": f"Plan {plan_id} declined.{(' Feedback: ' + feedback) if feedback else ''}"}]}
+    return {"content": [{"type": "text", "text": f"Plan {plan_id} declined and task moved to done.{(' Feedback: ' + feedback) if feedback else ''}"}]}
 
 
 @tool(

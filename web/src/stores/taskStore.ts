@@ -13,10 +13,17 @@ export interface Task {
   content?: string;
 }
 
+export type TaskSort = 'deadline' | 'updated_at' | 'created_at';
+
+export const TASKS_PAGE_SIZE = 50;
+
 interface TaskState {
   tasks: Task[];
   filter: string;
   searchQuery: string;
+  sort: TaskSort;
+  page: number;
+  total: number;
   loading: boolean;
   showCreateDialog: boolean;
 
@@ -28,6 +35,8 @@ interface TaskState {
   loadTasks: () => Promise<void>;
   setFilter: (f: string) => void;
   setSearch: (q: string) => void;
+  setSort: (s: TaskSort) => void;
+  setPage: (p: number) => void;
   updateStatus: (id: string, status: string) => Promise<void>;
   createTask: (title: string, content: string, deadline: string) => Promise<void>;
   setShowCreateDialog: (show: boolean) => void;
@@ -41,6 +50,9 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   tasks: [],
   filter: '',
   searchQuery: '',
+  sort: 'deadline',
+  page: 1,
+  total: 0,
   loading: true,
   showCreateDialog: false,
 
@@ -49,12 +61,18 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   saving: false,
 
   loadTasks: async () => {
+    set({ loading: true });
     try {
-      const { filter, searchQuery } = get();
-      const { tasks } = searchQuery
+      const { filter, searchQuery, sort, page } = get();
+      const result = searchQuery
         ? await api.searchTasks(searchQuery, filter || undefined)
-        : await api.listTasks(filter || undefined);
-      set({ tasks, loading: false });
+        : await api.listTasks({
+            status: filter || undefined,
+            sort,
+            limit: TASKS_PAGE_SIZE,
+            offset: (page - 1) * TASKS_PAGE_SIZE,
+          });
+      set({ tasks: result.tasks, total: result.total ?? result.tasks.length, loading: false });
     } catch (e) {
       console.error('Failed to load tasks:', e);
       set({ loading: false });
@@ -62,12 +80,22 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   },
 
   setFilter: (f: string) => {
-    set({ filter: f });
+    set({ filter: f, page: 1 });
     get().loadTasks();
   },
 
   setSearch: (q: string) => {
-    set({ searchQuery: q });
+    set({ searchQuery: q, page: 1 });
+    get().loadTasks();
+  },
+
+  setSort: (s: TaskSort) => {
+    set({ sort: s, page: 1 });
+    get().loadTasks();
+  },
+
+  setPage: (p: number) => {
+    set({ page: Math.max(1, p) });
     get().loadTasks();
   },
 
@@ -83,7 +111,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
 
   createTask: async (title: string, content: string, deadline: string) => {
     await api.createTask({ title, content, deadline });
-    set({ showCreateDialog: false });
+    set({ showCreateDialog: false, page: 1 });
     get().loadTasks();
   },
 

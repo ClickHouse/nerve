@@ -28,18 +28,39 @@ class TaskUpdateRequest(BaseModel):
     title: str = ""
 
 
+_ALLOWED_SORTS = {"deadline", "updated_at", "created_at"}
+
+
 @router.get("/api/tasks")
-async def list_tasks(status: str = "", user: dict = Depends(require_auth)):
+async def list_tasks(
+    status: str = "",
+    sort: str = "deadline",
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(require_auth),
+):
     deps = get_deps()
-    tasks = await deps.db.list_tasks(status=status or None)
-    return {"tasks": tasks}
+    # Clamp inputs to sensible bounds; silently fall back on unknown sorts.
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    if sort not in _ALLOWED_SORTS:
+        sort = "deadline"
+
+    status_filter = status or None
+    tasks = await deps.db.list_tasks(
+        status=status_filter, sort=sort, limit=limit, offset=offset,
+    )
+    total = await deps.db.count_tasks(status=status_filter)
+    return {"tasks": tasks, "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/api/tasks/search")
 async def search_tasks(q: str, status: str = "", user: dict = Depends(require_auth)):
     deps = get_deps()
-    tasks = await deps.db.search_tasks(query=q, status=status or None)
-    return {"tasks": tasks}
+    # Search is relevance-ranked (BM25); pagination would fight the ranking,
+    # so we return up to 100 hits and let the UI hide pagination when active.
+    tasks = await deps.db.search_tasks(query=q, status=status or None, limit=100)
+    return {"tasks": tasks, "total": len(tasks), "limit": len(tasks), "offset": 0}
 
 
 @router.post("/api/tasks")
