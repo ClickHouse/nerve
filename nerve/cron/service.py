@@ -270,7 +270,7 @@ class CronService:
         elif rotate_hours > 0:
             # Hours-based rotation: prefer `last_rotated_at` for the age
             # baseline, fall back to `connected_at` for sessions that were
-            # created before the v025 migration (and thus have no rotation
+            # created before the v027 migration (and thus have no rotation
             # history yet).
             baseline = (
                 self._parse_iso_utc(session.get("last_rotated_at"))

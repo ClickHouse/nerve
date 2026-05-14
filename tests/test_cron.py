@@ -625,7 +625,7 @@ class TestMaybeRotateContext:
     async def test_hours_falls_back_to_connected_at_when_never_rotated(
         self, cron_service,
     ):
-        """Pre-v025 sessions without last_rotated_at still rotate using
+        """Pre-v027 sessions without last_rotated_at still rotate using
         connected_at as the baseline."""
         session = {
             "id": "cron:x",
