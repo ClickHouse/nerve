@@ -160,7 +160,7 @@ nerve start              # Start the server
 # Open http://localhost:8900
 ```
 
-## HTTPS Setup (Raspberry Pi)
+## HTTPS Setup
 
 ```bash
 # Install mkcert

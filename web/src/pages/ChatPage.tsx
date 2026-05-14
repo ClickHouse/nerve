@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
@@ -8,7 +8,8 @@ import { ContextBar } from '../components/Chat/ContextBar';
 import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
-import { Loader2, PanelLeftOpen, PanelLeftClose, Files } from 'lucide-react';
+import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'lucide-react';
+import { api } from '../api/client';
 
 const STATUS_LABELS: Record<string, string> = {
   thinking: 'Thinking...',
@@ -48,6 +49,16 @@ export function ChatPage() {
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Langfuse deep-link status — fetched once. Shows a small "external link"
+  // icon when observability is enabled so we can jump from a session to
+  // its trace in Langfuse.
+  const [langfuse, setLangfuse] = useState<{ host: string | null; enabled: boolean } | null>(null);
+  useEffect(() => {
+    api.getObservabilityStatus()
+      .then(s => setLangfuse({ host: s.langfuse.host, enabled: s.langfuse.enabled }))
+      .catch(() => setLangfuse({ host: null, enabled: false }));
   }, []);
 
   useEffect(() => {
@@ -140,6 +151,18 @@ export function ChatPage() {
                 </button>
               )}
               {contextUsage && <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />}
+              {langfuse?.enabled && langfuse.host && activeSession && (
+                <a
+                  href={`${langfuse.host}/sessions?sessionId=${encodeURIComponent(activeSession)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1 px-2 py-1 rounded text-[12px] text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
+                  title="View this session's trace in Langfuse"
+                >
+                  <ExternalLink size={12} />
+                  <span>Langfuse</span>
+                </a>
+              )}
             </div>
           </div>
 

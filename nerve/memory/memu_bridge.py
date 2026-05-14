@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from nerve.config import NerveConfig
+from nerve.observability.langfuse import attributes as lf_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,11 @@ class _BedrockLLMClient:
         }
         if system_prompt:
             kwargs["system"] = system_prompt
-        response = await self._bedrock.messages.create(**kwargs)
+        # Tag the OTEL spans emitted by AnthropicInstrumentor so memU calls
+        # are filterable in Langfuse separately from the agent loop. No-op
+        # when Langfuse is disabled.
+        with lf_attrs(tags=["component:memu", f"model:{self.chat_model}"]):
+            response = await self._bedrock.messages.create(**kwargs)
         text = response.content[0].text if response.content else ""
         return text, response
 
@@ -87,7 +92,8 @@ class _BedrockLLMClient:
         system_prompt: str | None = None,
     ) -> tuple[str, Any]:
         prompt = system_prompt or "Summarize the text in one short paragraph."
-        return await self.chat(text, max_tokens=max_tokens, system_prompt=prompt)
+        with lf_attrs(tags=["component:memu", "purpose:summarize"]):
+            return await self.chat(text, max_tokens=max_tokens, system_prompt=prompt)
 
     async def embed(self, inputs: list[str]) -> tuple[list[list[float]], None]:
         raise NotImplementedError("Bedrock LLM client does not support embeddings — use the OpenAI embedding profile")
@@ -276,11 +282,11 @@ Example 1: Filtering generic vs. project-specific knowledge
 
 Example 2: Work-specific data SHOULD be extracted
 ## Input
-[0] 2026-03-12T09:00:00 [assistant]: CI Monitor found 3 new issues: #1058 Connection pool exhaustion (Mar 11), #1057 Flaky pagination test (Mar 11), #1042 Missing index on users table (Mar 10). Also 2 integration tests consistently failing on NightlyBuilds.
+[0] 2026-03-12T09:00:00 [assistant]: CI found 3 new issues: #101 Widget alignment broken on mobile (Mar 11), #102 Timeout in CSV export endpoint (Mar 11), #103 Missing NOT NULL constraint on orders table (Mar 10). Also 2 integration tests consistently failing on the nightly pipeline.
 ## Output
 <item>
     <memory>
-        <content>CI Monitor tracked issues as of March 12, 2026: #1058 Connection pool exhaustion, #1057 Flaky pagination test, #1042 Missing index on users table, plus 2 consistently failing integration tests on NightlyBuilds</content>
+        <content>CI tracked issues as of March 12, 2026: #101 Widget alignment broken on mobile, #102 Timeout in CSV export endpoint, #103 Missing NOT NULL constraint on orders table, plus 2 consistently failing integration tests on nightly pipeline</content>
         <categories>
             <category>Work</category>
         </categories>
@@ -823,6 +829,45 @@ class MemUBridge:
                 MemUBridge._MEMU_PATCHED_VERSION, e,
             )
 
+    @staticmethod
+    def _sanitize_memu_datetimes(sqlite_dsn: str) -> None:
+        """Fix non-string values in datetime columns of the memU database.
+
+        The LLM date resolver can produce bare integers (e.g. ``2025`` for
+        "tax year 2025") or other non-text values for the ``happened_at``
+        column.  ``datetime.fromisoformat()`` requires a string, so any
+        non-text value crashes ``list_items()`` and prevents the item cache
+        from loading — effectively breaking all recall.
+
+        Run this once at startup, before memu-py opens the database.
+        """
+        import sqlite3 as _sqlite3
+
+        db_path = sqlite_dsn.replace("sqlite:///", "")
+        try:
+            conn = _sqlite3.connect(db_path)
+            # Fix integer/real values → 'YYYY-01-01 00:00:00'
+            fixed_int = conn.execute(
+                "UPDATE memu_memory_items "
+                "SET happened_at = CAST(happened_at AS TEXT) || '-01-01 00:00:00' "
+                "WHERE typeof(happened_at) IN ('integer', 'real')"
+            ).rowcount
+            # Null out any remaining non-text values (blobs, etc.)
+            fixed_other = conn.execute(
+                "UPDATE memu_memory_items "
+                "SET happened_at = NULL "
+                "WHERE happened_at IS NOT NULL AND typeof(happened_at) != 'text'"
+            ).rowcount
+            if fixed_int or fixed_other:
+                conn.commit()
+                logger.warning(
+                    "Sanitized %d memU datetime values (%d int→date, %d other→NULL)",
+                    fixed_int + fixed_other, fixed_int, fixed_other,
+                )
+            conn.close()
+        except Exception as exc:
+            logger.warning("memU datetime sanitization skipped: %s", exc)
+
     async def initialize(self) -> bool:
         """Initialize the memU service with SQLite persistence."""
         try:
@@ -837,6 +882,14 @@ class MemUBridge:
             self._patch_sqlite_bugs()
 
             sqlite_dsn = self.config.memory.sqlite_dsn
+
+            # ── Fix non-string datetime values in memU database ──
+            # The LLM date resolver can emit bare integers (e.g. 2025 for
+            # "tax year 2025") into the happened_at column, which is typed
+            # DateTime.  SQLAlchemy's datetime.fromisoformat() crashes on
+            # non-string values, breaking list_items() and the entire item
+            # cache.  Sanitize on startup and add a defensive type adapter.
+            self._sanitize_memu_datetimes(sqlite_dsn)
 
             # ── Bedrock detection ──
             # When provider is Bedrock, anthropic_api_base_url and
@@ -1860,11 +1913,40 @@ class MemUBridge:
                 for idx, entry in enumerate(parsed):
                     if 0 <= idx < len(items):
                         item_id = items[idx][0]
-                        result[item_id] = entry.get("happened_at")
+                        raw = entry.get("happened_at")
+                        result[item_id] = self._validate_date_value(raw)
         except Exception as e:
             logger.warning("Failed to parse LLM date resolution response: %s", e)
 
         return result
+
+    @staticmethod
+    def _validate_date_value(raw: Any) -> str | None:
+        """Validate and normalize a date value from LLM output.
+
+        The LLM may return bare integers (e.g. 2025), partial dates, or
+        other non-standard values.  Only well-formed ISO date strings are
+        accepted; everything else is coerced or rejected.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            # Bare year like 2025 → "2025-01-01"
+            year = int(raw)
+            if 1900 <= year <= 2100:
+                return f"{year}-01-01"
+            return None
+        if not isinstance(raw, str):
+            return None
+        raw = raw.strip()
+        if not raw:
+            return None
+        # Validate it's a parseable date
+        try:
+            datetime.fromisoformat(raw)
+            return raw
+        except (ValueError, TypeError):
+            return None
 
     # ------------------------------------------------------------------
     # Post-extraction knowledge relevance filter

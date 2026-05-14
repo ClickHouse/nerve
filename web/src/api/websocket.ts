@@ -89,8 +89,12 @@ export class NerveWebSocket {
     }
   }
 
-  sendMessage(content: string, sessionId: string) {
-    this.send({ type: 'message', content, session_id: sessionId });
+  sendMessage(content: string, sessionId: string, fileIds?: string[]) {
+    const msg: Record<string, unknown> = { type: 'message', content, session_id: sessionId };
+    if (fileIds && fileIds.length > 0) {
+      msg.file_ids = fileIds;
+    }
+    this.send(msg);
   }
 
   switchSession(sessionId: string) {

@@ -53,6 +53,18 @@ class SessionStore:
         async with self.db.execute(query, params) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def count_sessions(self, include_archived: bool = False) -> int:
+        """Count sessions without loading them. Used by diagnostics."""
+        if include_archived:
+            sql = "SELECT COUNT(*) FROM sessions"
+            params: tuple = ()
+        else:
+            sql = "SELECT COUNT(*) FROM sessions WHERE status != 'archived'"
+            params = ()
+        async with self.db.execute(sql, params) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
     async def search_sessions(self, query: str, limit: int = 100) -> list[dict]:
         """Search sessions by title (LIKE match), across all non-archived sessions."""
         sql = (

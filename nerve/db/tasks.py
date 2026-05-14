@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 
@@ -31,12 +32,15 @@ class TaskStore:
                        deadline=excluded.deadline, tags=excluded.tags, updated_at=?""",
                 (task_id, file_path, title, status, source, source_url, deadline, tags, now, now, now),
             )
-            # Sync FTS index — include tags so tag names are searchable
+            # Sync FTS index — include tags and slug so they're all searchable
             fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
-            await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
+            # Normalize slug: replace hyphens with spaces so "2026-03-10-distribution"
+            # becomes searchable as individual words
+            fts_slug = task_id.replace("-", " ")
+            await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (fts_slug,))
             await self.db.execute(
                 "INSERT INTO tasks_fts (task_id, title, content) VALUES (?, ?, ?)",
-                (task_id, title, fts_content),
+                (fts_slug, title, fts_content),
             )
 
     async def get_task(self, task_id: str) -> dict | None:
@@ -85,7 +89,12 @@ class TaskStore:
         )
         await self.db.commit()
 
-    # Short words and common stop words that add noise to FTS searches.
+    # ── FTS query building ───────────────────────────────────────────────
+
+    # Characters that are FTS5 syntax or punctuation — replaced with spaces.
+    _FTS_CLEAN_RE = re.compile(r'["\*\(\)\-:/\\#\.\,\;\'\[\]\{\}@!?\^~`]')
+
+    # Common stop words filtered from search queries.
     _FTS_STOP_WORDS = frozenset({
         "a", "an", "the", "is", "at", "by", "on", "in", "to", "of", "for",
         "and", "or", "not", "it", "be", "as", "do", "if", "so", "no", "up",
@@ -93,80 +102,199 @@ class TaskStore:
     })
 
     @classmethod
-    def _build_fts_query(cls, query: str, mode: str = "and") -> str:
-        """Build an FTS5 query from a user search string.
-
-        Args:
-            query: Raw search text.
-            mode: 'and' — all terms must match (strict, good for user search).
-                  'or'  — any term can match (permissive, good for dedup).
-        """
-        import re
-        clean = re.sub(r'["\*\(\)\-:/\\#]', " ", query)
-        words = [
+    def _tokenize_query(cls, query: str) -> list[str]:
+        """Clean and tokenize a raw search string into FTS-safe words."""
+        clean = cls._FTS_CLEAN_RE.sub(" ", query)
+        return [
             w for w in clean.split()
             if w.strip() and len(w) > 1 and w.lower() not in cls._FTS_STOP_WORDS
         ]
-        if not words:
-            return ""
-        joiner = " OR " if mode == "or" else " "
-        return joiner.join(f'"{w}"' for w in words)
 
-    async def search_tasks(
-        self, query: str, status: str | None = None, tag: str | None = None, limit: int = 20,
-    ) -> list[dict]:
-        """Search tasks using FTS5 full-text search on title and content.
+    @classmethod
+    def _build_fts_query(cls, query: str, mode: str = "and") -> str:
+        """Build an FTS5 MATCH expression with prefix matching.
+
+        Each word is searched as both exact and prefix: (word OR word*)
+        so "distrib" matches "distribution", "distributed", etc.
 
         Args:
-            query: Search words — tokenized and matched via FTS5.
-            status: Filter by status. None = non-done, 'all' = everything.
-            tag: Filter by exact tag name.
-            limit: Max results.
+            query: Raw search text.
+            mode: 'and' — all terms must match (strict search).
+                  'or'  — any term can match (permissive dedup).
         """
-        fts_query = self._build_fts_query(query)
-        if not fts_query:
-            return []
+        words = cls._tokenize_query(query)
+        if not words:
+            return ""
 
-        conditions = ["t.id IN (SELECT task_id FROM tasks_fts WHERE tasks_fts MATCH ?)"]
-        params: list = [fts_query]
+        # Each term: exact OR prefix match.  FTS5 prefix syntax is word*
+        terms = [f'("{w}" OR {w}*)' for w in words]
+
+        joiner = " OR " if mode == "or" else " AND "
+        return joiner.join(terms)
+
+    # ── Status/tag filter helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _apply_status_filter(
+        conditions: list[str], params: list, status: str | None,
+    ) -> None:
+        """Append status filter clause to conditions/params in place."""
         if status == "all":
-            pass  # no status filter
+            pass
         elif status:
             conditions.append("t.status = ?")
             params.append(status)
         else:
             conditions.append("t.status != 'done'")
+
+    @staticmethod
+    def _apply_tag_filter(
+        conditions: list[str], params: list, tag: str | None,
+    ) -> None:
+        """Append tag filter clause to conditions/params in place."""
         if tag:
             conditions.append("',' || t.tags || ',' LIKE ?")
             params.append(f"%,{tag.strip().lower()},%")
-        where = " AND ".join(conditions)
-        params.append(limit)
-        async with self.db.execute(
-            f"SELECT t.* FROM tasks t WHERE {where} ORDER BY t.updated_at DESC LIMIT ?",
-            tuple(params),
-        ) as cursor:
-            return [dict(row) async for row in cursor]
+
+    # ── Search ───────────────────────────────────────────────────────────
+
+    async def search_tasks(
+        self, query: str, status: str | None = None, tag: str | None = None, limit: int = 20,
+    ) -> list[dict]:
+        """Flexible task search with multiple strategies and relevance ranking.
+
+        Strategies (in priority order):
+          1. Exact task ID match
+          2. FTS5 prefix search ranked by BM25
+          3. Task ID substring match (LIKE)
+          4. Title substring fallback (LIKE)
+
+        Results are merged and deduplicated — earlier strategies rank higher.
+        """
+        query = query.strip()
+        if not query:
+            return []
+
+        seen: set[str] = set()
+        results: list[dict] = []
+
+        def _add(rows: list[dict]) -> None:
+            for row in rows:
+                tid = row["id"]
+                if tid not in seen:
+                    seen.add(tid)
+                    results.append(row)
+
+        # ── Strategy 1: exact task ID ────────────────────────────────────
+        exact = await self.get_task(query)
+        if exact and self._row_matches_filters(exact, status, tag):
+            _add([exact])
+
+        # ── Strategy 2: FTS5 prefix match + BM25 ranking ────────────────
+        fts_query = self._build_fts_query(query)
+        if fts_query:
+            conditions: list[str] = []
+            params: list = []
+            self._apply_status_filter(conditions, params, status)
+            self._apply_tag_filter(conditions, params, tag)
+
+            where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
+            fts_params = [fts_query] + params + [limit]
+
+            async with self.db.execute(
+                f"SELECT t.* FROM tasks t "
+                f"JOIN tasks_fts f ON f.task_id = REPLACE(t.id, '-', ' ') "
+                f"WHERE tasks_fts MATCH ?{where_extra} "
+                f"ORDER BY f.rank LIMIT ?",
+                tuple(fts_params),
+            ) as cursor:
+                _add([dict(row) async for row in cursor])
+
+        # ── Strategy 3: task ID substring (slug search) ──────────────────
+        if len(results) < limit:
+            conditions = ["t.id LIKE ?"]
+            params = [f"%{query.lower()}%"]
+            self._apply_status_filter(conditions, params, status)
+            self._apply_tag_filter(conditions, params, tag)
+            remaining = limit - len(results)
+            params.append(remaining)
+
+            async with self.db.execute(
+                f"SELECT t.* FROM tasks t WHERE {' AND '.join(conditions)} "
+                f"ORDER BY t.updated_at DESC LIMIT ?",
+                tuple(params),
+            ) as cursor:
+                _add([dict(row) async for row in cursor])
+
+        # ── Strategy 4: title LIKE fallback ──────────────────────────────
+        if len(results) < limit:
+            conditions = ["lower(t.title) LIKE ?"]
+            params = [f"%{query.lower()}%"]
+            self._apply_status_filter(conditions, params, status)
+            self._apply_tag_filter(conditions, params, tag)
+            remaining = limit - len(results)
+            params.append(remaining)
+
+            async with self.db.execute(
+                f"SELECT t.* FROM tasks t WHERE {' AND '.join(conditions)} "
+                f"ORDER BY t.updated_at DESC LIMIT ?",
+                tuple(params),
+            ) as cursor:
+                _add([dict(row) async for row in cursor])
+
+        return results[:limit]
+
+    @staticmethod
+    def _row_matches_filters(row: dict, status: str | None, tag: str | None) -> bool:
+        """Check if a single task row passes the status/tag filters."""
+        if status == "all":
+            pass
+        elif status:
+            if row.get("status") != status:
+                return False
+        else:
+            if row.get("status") == "done":
+                return False
+        if tag:
+            tags_csv = row.get("tags", "") or ""
+            if tag.strip().lower() not in [t.strip().lower() for t in tags_csv.split(",")]:
+                return False
+        return True
 
     async def search_tasks_similar(
         self, query: str, limit: int = 10,
+        rank_threshold: float | None = None,
     ) -> list[dict]:
         """Find tasks similar to query using OR semantics + FTS5 ranking.
 
         Unlike search_tasks (AND, strict), this uses OR (any word matches)
         and orders by BM25 relevance.  Designed for duplicate detection —
         searches all statuses including done.
+
+        Args:
+            rank_threshold: If set, only return matches with BM25 rank
+                below this value (more negative = better match).  Filters
+                out weak false-positives that share only generic words.
         """
         fts_query = self._build_fts_query(query, mode="or")
         if not fts_query:
             return []
 
-        async with self.db.execute(
+        sql = (
             "SELECT t.* FROM tasks t "
-            "JOIN tasks_fts f ON f.task_id = t.id "
+            "JOIN tasks_fts f ON f.task_id = REPLACE(t.id, '-', ' ') "
             "WHERE tasks_fts MATCH ? "
-            "ORDER BY f.rank LIMIT ?",
-            (fts_query, limit),
-        ) as cursor:
+        )
+        params: list = [fts_query]
+
+        if rank_threshold is not None:
+            sql += "AND f.rank < ? "
+            params.append(rank_threshold)
+
+        sql += "ORDER BY f.rank LIMIT ?"
+        params.append(limit)
+
+        async with self.db.execute(sql, tuple(params)) as cursor:
             return [dict(row) async for row in cursor]
 
     async def find_tasks_by_source_url(

@@ -20,6 +20,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _cleanup_uploaded_files(db: object, session_id: str) -> None:
+    """Delete uploaded files from DB and disk for a deleted session."""
+    try:
+        disk_paths = await db.delete_uploaded_files(session_id)  # type: ignore[attr-defined]
+        for p in disk_paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        # Try to remove session upload dir if empty
+        config = get_config()
+        session_dir = config.workspace / ".uploads" / session_id
+        if session_dir.exists():
+            try:
+                session_dir.rmdir()
+            except OSError:
+                pass  # Not empty — that's fine
+    except Exception as e:
+        logger.warning("Failed to cleanup uploaded files for session %s: %s", session_id, e)
+
+
 # --- Request/Response models ---
 
 class MessageRequest(BaseModel):
@@ -141,6 +162,8 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
         messages = await db.get_messages(session_id, limit=10000) if connected_at else []
         # Delete from DB immediately (fast)
         await db.delete_session(session_id)
+        # Cleanup uploaded files for this session
+        await _cleanup_uploaded_files(db, session_id)
         # Memorize in background from snapshot
         if messages and connected_at and engine._memory_bridge and engine._memory_bridge.available:
             async def _bg_memorize():
@@ -159,6 +182,7 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
             asyncio.create_task(_bg_memorize())
     else:
         await db.delete_session(session_id)
+        await _cleanup_uploaded_files(db, session_id)
     return {"deleted": True}
 
 

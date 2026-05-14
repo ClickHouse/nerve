@@ -245,6 +245,21 @@ npm install
 
 **If anything leaks:** Do NOT push. Unstage the file, fix it, re-scan. If already pushed, the secret must be rotated immediately.
 
+### No Real-Life Data in Examples
+
+**Never use real-world information in code comments, docstrings, test fixtures, or LLM prompt examples.** This includes:
+
+- **Real project/company names** — use generic placeholders like `"deploy the app"`, `"fix issue #101"`
+- **Real incidents or tasks** — don't copy from your task list into test data; invent obviously synthetic scenarios
+- **Real bot/service names** — use generic names like `some-ci[bot]`
+- **Real credit card numbers, even partial** — use standard test numbers like `4111111111111111`
+- **Realistic-looking issue numbers** from real trackers — use low, obviously synthetic numbers
+- **Real usernames** in examples — use `<your-username>` or `alice`/`bob`
+
+**Why:** Even "innocent" examples build an identity fingerprint when cross-referenced. Multiple small leaks across comments, tests, and docs compound into a deanonymization risk.
+
+**Rule of thumb:** If an example could be traced back to a specific person, company, or incident — replace it with something generic.
+
 ## Restarting Nerve
 
 ```bash

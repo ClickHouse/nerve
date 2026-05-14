@@ -41,6 +41,7 @@ from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import ALL_TOOLS, create_session_mcp_server, init_tools
 from nerve.config import NerveConfig, load_mcp_servers
 from nerve.db import Database
+from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,22 @@ def _select_thinking_effort(agent_config: Any, source: str) -> tuple[str, str]:
 # Anthropic API image limits
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# Linux execve() limits a single argv element to MAX_ARG_STRLEN = PAGE_SIZE * 32
+# = 131,072 bytes on common configurations. The Claude Agent SDK passes the
+# system prompt inline as `--system-prompt <STRING>`, which makes the string a
+# single argv element. When SOUL.md + TASK.md + AGENTS.md + TOOLS.md +
+# MEMORY.md + recalled memU summaries cross that boundary, execve() returns
+# E2BIG ("Argument list too long") and Claude Code fails to start.
+#
+# We sidestep the limit by writing the prompt to a file and passing
+# `SystemPromptFile = {"type": "file", "path": ...}` (which the SDK converts
+# to `--system-prompt-file <PATH>` — the path string is short).
+#
+# Threshold below which we keep passing inline (preserves prompt-cache hit
+# behavior for small, stable prompts). Set conservatively well under the
+# kernel limit to leave room for env/argv overhead.
+_SYSTEM_PROMPT_INLINE_MAX = 100_000  # bytes
 
 # Magic byte signatures for supported image formats.
 # Each format maps to a list of valid signatures.  A signature is a list
@@ -263,9 +280,17 @@ class AgentEngine:
         self._skill_manager: SkillManager | None = None
         self._memorize_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Per-session active channel — set on run() entry, cleared on exit.
+        # Read by session-scoped tools (send_file) to avoid dispatching via
+        # stale router context from a prior inbound channel.
+        self._active_channel: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
+
+    def get_active_channel(self, session_id: str) -> str | None:
+        """Return the channel name currently driving ``session_id`` (or None)."""
+        return self._active_channel.get(session_id)
 
     async def initialize(self) -> None:
         """Initialize the agent engine — set up tools and main session."""
@@ -394,7 +419,7 @@ class AgentEngine:
             "## Step 3: Create Skills\n\n"
             "Use `skill_create` to create domain-specific skills the worker will need.\n"
             "Each skill should have clear step-by-step instructions for a procedure\n"
-            "(e.g., 'how to query the CI database', 'how to reproduce a test failure').\n\n"
+            "(e.g., 'how to query the monitoring API', 'how to debug a deployment failure').\n\n"
             "## Step 4: Configure Cron Jobs\n\n"
             "Set up monitoring cron jobs by editing `~/.nerve/cron/jobs.yaml`.\n"
             "This is the Nerve cron system — NOT the Anthropic SDK or system crontab.\n\n"
@@ -749,7 +774,7 @@ class AgentEngine:
             except Exception as e:
                 logger.warning("Failed to get skill summaries: %s", e)
 
-        system_prompt = build_system_prompt(
+        system_prompt_str = build_system_prompt(
             workspace=self.config.workspace,
             session_id=session_id,
             source=source,
@@ -758,14 +783,38 @@ class AgentEngine:
             skill_summaries=skill_summaries,
         )
 
+        # Pass the system prompt as a file when it's large enough to risk
+        # hitting Linux's MAX_ARG_STRLEN argv-element limit. See the comment
+        # near _SYSTEM_PROMPT_INLINE_MAX at module scope. The SDK accepts
+        # `SystemPromptFile` ({"type": "file", "path": ...}) and converts it
+        # to `--system-prompt-file <PATH>` on the CLI.
+        system_prompt: str | dict[str, Any]
+        if len(system_prompt_str) > _SYSTEM_PROMPT_INLINE_MAX:
+            sp_path = self._write_system_prompt_file(session_id, system_prompt_str)
+            system_prompt = {"type": "file", "path": sp_path}
+            logger.info(
+                "Session %s: system prompt %d bytes (> %d), passing via file %s",
+                session_id[:8],
+                len(system_prompt_str),
+                _SYSTEM_PROMPT_INLINE_MAX,
+                sp_path,
+            )
+        else:
+            system_prompt = system_prompt_str
+
+        # Pick raw thinking/effort by source (cron/hook → cron_* overrides,
+        # interactive → main settings), then cap each to what the resolved
+        # model actually supports.
         thinking_value, effort_value = _select_thinking_effort(
             self.config.agent, source,
         )
-        thinking_config = self._parse_thinking_config(thinking_value)
-        effort = (
-            effort_value
-            if effort_value in ("low", "medium", "high", "max")
-            else None
+        thinking_config = self._parse_thinking_config(
+            thinking_value,
+            model or self.config.agent.model,
+        )
+        effort = self._effective_effort(
+            effort_value,
+            model or self.config.agent.model,
         )
         # Some subscriptions reject the context-1m beta for specific models
         # (e.g. claude-sonnet-4-6) — skip the beta header for those.
@@ -793,6 +842,20 @@ class AgentEngine:
                 # Non-debug lines (e.g. raw warnings from the CLI)
                 logger.warning("CLI stderr [%s]: %s", session_id[:8], stripped)
 
+        extra_args: dict[str, str | None] = {"debug-to-stderr": None}
+        # Opus 4.7 defaults thinking.display to "omitted", returning empty
+        # thinking blocks with only a signature (for multi-turn continuity).
+        # Force "summarized" so the UI actually has thinking text to render.
+        # The CLI ignores this flag when thinking is disabled.
+        # NOTE: --thinking-display hangs on Bedrock (multi-turn after ToolSearch
+        # never returns). Disabled for Bedrock until the provider bug is fixed.
+        if (
+            thinking_config
+            and thinking_config.get("type") != "disabled"
+            and not self.config.provider.is_bedrock
+        ):
+            extra_args["thinking-display"] = "summarized"
+
         return ClaudeAgentOptions(
             model=model or self.config.agent.model,
             system_prompt=system_prompt,
@@ -807,7 +870,7 @@ class AgentEngine:
             fork_session=fork_session,
             hooks=hooks,
             stderr=_cli_stderr,
-            extra_args={"debug-to-stderr": None},
+            extra_args=extra_args,
             # No allowed_tools — can_use_tool callback handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
@@ -819,6 +882,47 @@ class AgentEngine:
             plugins=self._claude_code_plugins,
         )
 
+
+    def _system_prompt_dir(self) -> "os.PathLike[str]":
+        """Directory where oversized system prompts are spilled to disk.
+
+        Lives under the workspace's `.nerve/cache/system_prompts/` so it's
+        per-workspace and easy to inspect / clean.
+        """
+        from pathlib import Path
+        d = Path(self.config.workspace) / ".nerve" / "cache" / "system_prompts"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _write_system_prompt_file(self, session_id: str, content: str) -> str:
+        """Write the system prompt to disk and return its absolute path.
+
+        Uses a deterministic filename so a session that reconnects (resume)
+        gets the same prompt without re-writing. Best-effort cleanup of stale
+        files happens lazily on each write — anything older than 7 days is
+        removed.
+        """
+        import time
+        from pathlib import Path
+
+        dir_path = Path(self._system_prompt_dir())
+
+        # Lazy GC: drop files older than 7 days
+        cutoff = time.time() - 7 * 24 * 3600
+        try:
+            for old in dir_path.iterdir():
+                try:
+                    if old.is_file() and old.stat().st_mtime < cutoff:
+                        old.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120]
+        path = dir_path / f"{safe_id}.md"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
 
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the SDK subprocess."""
@@ -938,12 +1042,23 @@ class AgentEngine:
         }
 
     @staticmethod
-    def _parse_thinking_config(value: str) -> dict | None:
+    def _model_supports_legacy_enabled_thinking(model: str | None) -> bool:
+        # Claude 4.5 / 4.6 accept thinking.type="enabled" with budget_tokens.
+        # Newer models (4.7+) require thinking.type="adaptive" with effort.
+        if not model:
+            return False
+        m = model.lower()
+        return "4-5" in m or "4-6" in m
+
+    @staticmethod
+    def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
             return {"type": "disabled"}
         if v == "adaptive":
+            return {"type": "adaptive"}
+        if not AgentEngine._model_supports_legacy_enabled_thinking(model):
             return {"type": "adaptive"}
         budget_map = {
             "max": 128_000,
@@ -959,6 +1074,41 @@ class AgentEngine:
         except ValueError:
             logger.warning("Unknown thinking config '%s', using adaptive", value)
             return {"type": "adaptive"}
+
+    # Effort levels accepted per Claude model — substring-matched against the
+    # full model name so dated aliases (e.g. "claude-opus-4-7-20260416") resolve.
+    # Ordered most-specific to least-specific; first match wins. Mirrors the
+    # pattern used by MODEL_PRICING in nerve/db/usage.py.
+    _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+        "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
+        "opus-4-6":   ("low", "medium", "high", "max"),
+        "sonnet-4-6": ("low", "medium", "high"),
+    }
+    _EFFORT_RANK: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+    @staticmethod
+    def _effective_effort(value: str, model: str | None = None) -> str | None:
+        """Return ``value`` capped to the highest effort level ``model`` supports."""
+        if value not in AgentEngine._EFFORT_RANK:
+            return None
+        allowed: tuple[str, ...] | None = None
+        if model:
+            m = model.lower()
+            for key, levels in AgentEngine._MODEL_EFFORT_LEVELS.items():
+                if key in m:
+                    allowed = levels
+                    break
+        if not allowed or value in allowed:
+            return value
+        requested_rank = AgentEngine._EFFORT_RANK.index(value)
+        for level in reversed(AgentEngine._EFFORT_RANK[: requested_rank + 1]):
+            if level in allowed:
+                logger.debug(
+                    "Capped effort %r to %r for model %r (model caps at %r)",
+                    value, level, model, allowed[-1],
+                )
+                return level
+        return None
 
     # ------------------------------------------------------------------ #
     #  SDK client lifecycle                                                #
@@ -1281,6 +1431,7 @@ class AgentEngine:
         model: str | None = None,
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
+        image_refs: list[dict[str, Any]] | None = None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -1290,6 +1441,8 @@ class AgentEngine:
                       DB or shown in the UI.
             images: Optional list of image dicts with keys ``type``,
                     ``media_type``, and ``data`` (base64-encoded).
+            image_refs: Optional metadata about uploaded files for persisting
+                        in the user message blocks column (web uploads only).
         """
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
@@ -1305,6 +1458,8 @@ class AgentEngine:
                 # mark_running below.
                 self.sessions.pop_stop_request(session_id)
                 self.sessions.mark_running(session_id)
+                if channel is not None:
+                    self._active_channel[session_id] = channel
                 # Notify all connected clients that this session started running
                 await broadcaster.broadcast("__global__", {
                     "type": "session_running",
@@ -1315,9 +1470,11 @@ class AgentEngine:
                     return await self._run_inner(
                         session_id, user_message, source, channel, model,
                         internal=internal, images=images,
+                        image_refs=image_refs,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
+                    self._active_channel.pop(session_id, None)
                     broadcaster.stop_buffering(session_id)
                     # Notify all connected clients that this session stopped
                     await broadcaster.broadcast("__global__", {
@@ -1335,6 +1492,7 @@ class AgentEngine:
         model: str | None,
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
+        image_refs: list[dict[str, Any]] | None = None,
     ) -> str:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source)
@@ -1364,10 +1522,14 @@ class AgentEngine:
             # Store user message in DB (note attached images for display)
             db_text = user_message
             if images:
-                suffix = f"\n[{len(images)} image(s) attached]"
-                db_text = (user_message + suffix) if user_message else suffix.strip()
+                # Count only image/pdf entries, not text_file entries
+                img_count = sum(1 for img in images if img.get("type") != "text_file")
+                if img_count:
+                    suffix = f"\n[{img_count} image(s) attached]"
+                    db_text = (user_message + suffix) if user_message else suffix.strip()
             await self.sessions.add_message(
                 session_id, "user", db_text, channel=channel,
+                blocks=image_refs,
             )
 
         full_response_text = ""
@@ -1417,6 +1579,16 @@ class AgentEngine:
                 if query_text:
                     content_blocks.append({"type": "text", "text": query_text})
                 for img in images:
+                    # Text files are inlined as text context blocks
+                    if img.get("type") == "text_file":
+                        fname = img.get("filename", "file")
+                        content = img.get("content", "")
+                        content_blocks.append({
+                            "type": "text",
+                            "text": f"--- Attached: {fname} ---\n{content}",
+                        })
+                        continue
+
                     # PDFs use "document" content block; images use "image"
                     block_type = "document" if img["media_type"] == "application/pdf" else "image"
 
@@ -1451,167 +1623,193 @@ class AgentEngine:
             # The CLI may crash during query (CLIConnectionError) or during
             # response reading (generic Exception from the SDK reader task).
             # Retry once with a fresh client if no content was received yet.
+            #
+            # The whole turn (query + every streamed message including tool
+            # calls) is wrapped in ``lf_attrs`` so all OTEL spans emitted by
+            # the SDK carry our session_id / tags. The wrap is a no-op when
+            # Langfuse is disabled.
+            _effective_model = model or self.config.agent.model
+            _lf_tags = [f"source:{source}", f"model:{_effective_model}"]
+            if channel:
+                _lf_tags.append(f"channel:{channel}")
+            _lf_metadata = {
+                "parent_session_id": session.get("parent_session_id") if session else None,
+                "fork_from": fork_from,
+            }
             _got_response_content = False
-            for _attempt in range(2):
-                try:
-                    if images:
-                        async def _image_prompt():
-                            yield {
-                                "type": "user",
-                                "message": {"role": "user", "content": content_blocks},
-                                "parent_tool_use_id": None,
-                            }
+            with lf_attrs(
+                session_id=session_id,
+                tags=_lf_tags,
+                metadata=_lf_metadata,
+            ):
+                for _attempt in range(2):
+                    try:
+                        if images:
+                            async def _image_prompt():
+                                yield {
+                                    "type": "user",
+                                    "message": {"role": "user", "content": content_blocks},
+                                    "parent_tool_use_id": None,
+                                }
 
-                        await client.query(_image_prompt())
-                    else:
-                        await client.query(query_text)
-                except CLIConnectionError as _qerr:
-                    if _attempt > 0:
-                        raise
-                    logger.warning(
-                        "CLI dead for session %s (query phase): %s — retrying",
-                        session_id, _qerr,
-                    )
-                    self.sessions.remove_client(session_id)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = await self._get_or_create_client(
-                        session_id, source, model,
-                    )
-                    continue  # retry the query
+                            await client.query(_image_prompt())
+                        else:
+                            await client.query(query_text)
+                    except CLIConnectionError as _qerr:
+                        if _attempt > 0:
+                            raise
+                        logger.warning(
+                            "CLI dead for session %s (query phase): %s — retrying",
+                            session_id, _qerr,
+                        )
+                        self.sessions.remove_client(session_id)
+                        unregister_handler(session_id)
+                        await self._safe_disconnect(client)
+                        client = await self._get_or_create_client(
+                            session_id, source, model,
+                        )
+                        continue  # retry the query
 
-                # Read response — may raise if CLI crashes mid-stream
-                try:
-                    async for message in client.receive_response():
-                        # Early-capture sdk_session_id from first message that
-                        # carries it so it survives /stop cancellation (ResultMessage
-                        # — the normal source — never arrives when the turn is
-                        # interrupted).
-                        if not sdk_session_id:
-                            msg_sid = getattr(message, "session_id", None)
-                            if msg_sid:
-                                sdk_session_id = msg_sid
+                    # Read response — may raise if CLI crashes mid-stream
+                    try:
+                        async for message in client.receive_response():
+                            # Early-capture sdk_session_id from first message that
+                            # carries it so it survives /stop cancellation (ResultMessage
+                            # — the normal source — never arrives when the turn is
+                            # interrupted).
+                            if not sdk_session_id:
+                                msg_sid = getattr(message, "session_id", None)
+                                if msg_sid:
+                                    sdk_session_id = msg_sid
 
-                        if isinstance(message, AssistantMessage):
-                            _got_response_content = True
-                            # Capture model from assistant message (more reliable than config)
-                            msg_model = getattr(message, 'model', None)
-                            if msg_model:
-                                last_model = msg_model
-                            # Extract parent_tool_use_id — set when this message
-                            # comes from a sub-agent (Task) rather than the main agent
-                            parent_id = getattr(message, 'parent_tool_use_id', None)
+                            if isinstance(message, AssistantMessage):
+                                _got_response_content = True
+                                # Capture model from assistant message (more reliable than config)
+                                msg_model = getattr(message, 'model', None)
+                                if msg_model:
+                                    last_model = msg_model
+                                # Extract parent_tool_use_id — set when this message
+                                # comes from a sub-agent (Task) rather than the main agent
+                                parent_id = getattr(message, 'parent_tool_use_id', None)
 
-                            for block in message.content:
-                                if isinstance(block, TextBlock):
-                                    full_response_text += block.text
-                                    # Track ordered blocks for DB persistence
-                                    if ordered_blocks and ordered_blocks[-1].get("type") == "text":
-                                        ordered_blocks[-1]["content"] += block.text
-                                    else:
-                                        ordered_blocks.append({"type": "text", "content": block.text})
-                                    await broadcaster.broadcast_token(
-                                        session_id, block.text,
-                                        parent_tool_use_id=parent_id,
-                                    )
-
-                                elif ThinkingBlock is not None and isinstance(
-                                    block, ThinkingBlock,
-                                ):
-                                    thinking = getattr(block, "thinking", None) or str(block)
-                                    thinking_text += thinking
-                                    # Track ordered blocks for DB persistence
-                                    if ordered_blocks and ordered_blocks[-1].get("type") == "thinking":
-                                        ordered_blocks[-1]["content"] += thinking
-                                    else:
-                                        ordered_blocks.append({"type": "thinking", "content": thinking})
-                                    await broadcaster.broadcast_thinking(
-                                        session_id, thinking,
-                                        parent_tool_use_id=parent_id,
-                                    )
-
-                                elif isinstance(block, ToolUseBlock):
-                                    tool_input = getattr(block, "input", {})
-                                    tool_name = getattr(block, "name", None) or str(block)
-                                    tool_use_id = getattr(block, "id", None)
-                                    await broadcaster.broadcast_tool_use(
-                                        session_id, tool_name, tool_input,
-                                        tool_use_id=tool_use_id,
-                                        parent_tool_use_id=parent_id,
-                                    )
-                                    # Track sub-agent lifecycle
-                                    if tool_name == "Task" and tool_use_id:
-                                        active_subagents[tool_use_id] = asyncio.get_event_loop().time()
-                                        await broadcaster.broadcast_subagent_start(
-                                            session_id,
-                                            tool_use_id=tool_use_id,
-                                            subagent_type=str(tool_input.get("subagent_type", tool_input.get("model", "agent"))),
-                                            description=str(tool_input.get("description", "")),
-                                            model=str(tool_input.get("model", "")) or None,
+                                for block in message.content:
+                                    if isinstance(block, TextBlock):
+                                        full_response_text += block.text
+                                        # Track ordered blocks for DB persistence
+                                        if ordered_blocks and ordered_blocks[-1].get("type") == "text":
+                                            ordered_blocks[-1]["content"] += block.text
+                                        else:
+                                            ordered_blocks.append({"type": "text", "content": block.text})
+                                        await broadcaster.broadcast_token(
+                                            session_id, block.text,
+                                            parent_tool_use_id=parent_id,
                                         )
-                                    tool_calls_log.append({
-                                        "tool": tool_name,
-                                        "input": tool_input,
-                                        "tool_use_id": tool_use_id,
-                                    })
-                                    ordered_blocks.append({
-                                        "type": "tool_call",
-                                        "tool": tool_name,
-                                        "input": tool_input,
-                                        "tool_use_id": tool_use_id,
-                                    })
 
-                                elif isinstance(block, ToolResultBlock):
-                                    await self._process_tool_result(
-                                        block, session_id, parent_id,
-                                        tool_results_map, ordered_blocks,
-                                        tool_calls_log, active_subagents,
-                                    )
+                                    elif ThinkingBlock is not None and isinstance(
+                                        block, ThinkingBlock,
+                                    ):
+                                        thinking = getattr(block, "thinking", "") or ""
+                                        if not thinking:
+                                            # Empty thinking block (e.g. Opus 4.7 with
+                                            # display="omitted", or simple queries on
+                                            # low effort). Nothing visible to render —
+                                            # never fall back to str(block) as that
+                                            # leaks the ThinkingBlock(...) repr into
+                                            # the UI.
+                                            continue
+                                        thinking_text += thinking
+                                        # Track ordered blocks for DB persistence
+                                        if ordered_blocks and ordered_blocks[-1].get("type") == "thinking":
+                                            ordered_blocks[-1]["content"] += thinking
+                                        else:
+                                            ordered_blocks.append({"type": "thinking", "content": thinking})
+                                        await broadcaster.broadcast_thinking(
+                                            session_id, thinking,
+                                            parent_tool_use_id=parent_id,
+                                        )
 
-                        elif isinstance(message, UserMessage):
-                            parent_id = getattr(message, 'parent_tool_use_id', None)
-                            content = getattr(message, "content", [])
-                            if isinstance(content, list):
-                                for block in content:
-                                    if isinstance(block, ToolResultBlock):
+                                    elif isinstance(block, ToolUseBlock):
+                                        tool_input = getattr(block, "input", {})
+                                        tool_name = getattr(block, "name", None) or str(block)
+                                        tool_use_id = getattr(block, "id", None)
+                                        await broadcaster.broadcast_tool_use(
+                                            session_id, tool_name, tool_input,
+                                            tool_use_id=tool_use_id,
+                                            parent_tool_use_id=parent_id,
+                                        )
+                                        # Track sub-agent lifecycle
+                                        if tool_name == "Task" and tool_use_id:
+                                            active_subagents[tool_use_id] = asyncio.get_event_loop().time()
+                                            await broadcaster.broadcast_subagent_start(
+                                                session_id,
+                                                tool_use_id=tool_use_id,
+                                                subagent_type=str(tool_input.get("subagent_type", tool_input.get("model", "agent"))),
+                                                description=str(tool_input.get("description", "")),
+                                                model=str(tool_input.get("model", "")) or None,
+                                            )
+                                        tool_calls_log.append({
+                                            "tool": tool_name,
+                                            "input": tool_input,
+                                            "tool_use_id": tool_use_id,
+                                        })
+                                        ordered_blocks.append({
+                                            "type": "tool_call",
+                                            "tool": tool_name,
+                                            "input": tool_input,
+                                            "tool_use_id": tool_use_id,
+                                        })
+
+                                    elif isinstance(block, ToolResultBlock):
                                         await self._process_tool_result(
                                             block, session_id, parent_id,
                                             tool_results_map, ordered_blocks,
                                             tool_calls_log, active_subagents,
                                         )
 
-                        elif isinstance(message, ResultMessage):
-                            if message.usage:
-                                last_usage = message.usage
-                            sdk_session_id = message.session_id
-                            result_meta = {
-                                "total_cost_usd": getattr(message, "total_cost_usd", None),
-                                "duration_ms": getattr(message, "duration_ms", None),
-                                "duration_api_ms": getattr(message, "duration_api_ms", None),
-                                "num_turns": getattr(message, "num_turns", None),
-                            }
+                            elif isinstance(message, UserMessage):
+                                parent_id = getattr(message, 'parent_tool_use_id', None)
+                                content = getattr(message, "content", [])
+                                if isinstance(content, list):
+                                    for block in content:
+                                        if isinstance(block, ToolResultBlock):
+                                            await self._process_tool_result(
+                                                block, session_id, parent_id,
+                                                tool_results_map, ordered_blocks,
+                                                tool_calls_log, active_subagents,
+                                            )
 
-                except asyncio.CancelledError:
-                    raise  # propagate to outer handler
-                except Exception as _recv_err:
-                    # CLI crashed during response reading.
-                    # Retry only if we haven't received any content yet
-                    # (otherwise we'd produce duplicate/garbled output).
-                    if _got_response_content or _attempt > 0:
-                        raise
-                    logger.warning(
-                        "CLI crashed for session %s during response "
-                        "(no content yet): %s — retrying with fresh client",
-                        session_id, _recv_err,
-                    )
-                    self.sessions.remove_client(session_id)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = await self._get_or_create_client(
-                        session_id, source, model,
-                    )
-                    continue  # retry query + response
-                break  # success — exit retry loop
+                            elif isinstance(message, ResultMessage):
+                                if message.usage:
+                                    last_usage = message.usage
+                                sdk_session_id = message.session_id
+                                result_meta = {
+                                    "total_cost_usd": getattr(message, "total_cost_usd", None),
+                                    "duration_ms": getattr(message, "duration_ms", None),
+                                    "duration_api_ms": getattr(message, "duration_api_ms", None),
+                                    "num_turns": getattr(message, "num_turns", None),
+                                }
+
+                    except asyncio.CancelledError:
+                        raise  # propagate to outer handler
+                    except Exception as _recv_err:
+                        # CLI crashed during response reading.
+                        # Retry only if we haven't received any content yet
+                        # (otherwise we'd produce duplicate/garbled output).
+                        if _got_response_content or _attempt > 0:
+                            raise
+                        logger.warning(
+                            "CLI crashed for session %s during response "
+                            "(no content yet): %s — retrying with fresh client",
+                            session_id, _recv_err,
+                        )
+                        self.sessions.remove_client(session_id)
+                        unregister_handler(session_id)
+                        await self._safe_disconnect(client)
+                        client = await self._get_or_create_client(
+                            session_id, source, model,
+                        )
+                        continue  # retry query + response
+                    break  # success — exit retry loop
 
         except asyncio.CancelledError:
             logger.info("Session %s cancelled by user", session_id)
@@ -1642,7 +1840,6 @@ class AgentEngine:
                     session_id, "assistant", partial,
                     channel=channel,
                     thinking=thinking_text if thinking_text else None,
-                    tool_calls=tool_calls_log if tool_calls_log else None,
                     blocks=ordered_blocks if ordered_blocks else None,
                 )
                 await broadcaster.broadcast(session_id, {
@@ -1743,7 +1940,6 @@ class AgentEngine:
             session_id, "assistant", full_response_text,
             channel=channel,
             thinking=thinking_text if thinking_text else None,
-            tool_calls=tool_calls_log if tool_calls_log else None,
             blocks=ordered_blocks if ordered_blocks else None,
         )
 
@@ -1771,19 +1967,32 @@ class AgentEngine:
             session_record = await self.db.get_session(session_id)
             meta = json.loads(session_record.get("metadata") or "{}") if session_record else {}
             meta["last_usage"] = usage_data
-            await self.db.update_session_metadata(session_id, meta)
 
             # Extract server_tool_use counts
             server_tool = last_usage.get("server_tool_use") or {}
             web_search = server_tool.get("web_search_requests", 0)
             web_fetch = server_tool.get("web_fetch_requests", 0)
 
-            # Use SDK-provided cost when available, otherwise estimate
+            # Calculate per-turn cost.
+            # NOTE: The SDK's total_cost_usd is *cumulative* across the
+            # entire SDK session, NOT per-invocation.  We track the last
+            # known cumulative value in session metadata so we can compute
+            # the delta for this turn.
             from nerve.db.usage import estimate_turn_cost
             sdk_cost = (result_meta or {}).get("total_cost_usd")
-            cost = sdk_cost if sdk_cost is not None else estimate_turn_cost(
-                last_usage, model=last_model,
-            )
+            current_session_cost = (
+                session_record.get("total_cost_usd", 0) if session_record else 0
+            ) or 0
+
+            if sdk_cost is not None:
+                prev_cumulative = meta.get("_sdk_cumulative_cost", 0) or 0
+                turn_cost = max(sdk_cost - prev_cumulative, 0)
+                meta["_sdk_cumulative_cost"] = sdk_cost
+            else:
+                turn_cost = estimate_turn_cost(last_usage, model=last_model)
+
+            # Save metadata (includes _sdk_cumulative_cost update)
+            await self.db.update_session_metadata(session_id, meta)
 
             # Persist per-turn usage to session_usage table
             await self.db.record_turn_usage(
@@ -1794,7 +2003,7 @@ class AgentEngine:
                 cache_read=last_usage.get("cache_read_input_tokens", 0),
                 max_context=max_context,
                 model=last_model,
-                cost_usd=cost,
+                cost_usd=turn_cost,
                 duration_ms=(result_meta or {}).get("duration_ms"),
                 duration_api_ms=(result_meta or {}).get("duration_api_ms"),
                 num_turns=num_turns,
@@ -1803,11 +2012,8 @@ class AgentEngine:
             )
 
             # Update total_cost_usd on the session
-            current_cost = (
-                session_record.get("total_cost_usd", 0) if session_record else 0
-            )
             await self.db.update_session_fields(session_id, {
-                "total_cost_usd": (current_cost or 0) + cost,
+                "total_cost_usd": current_session_cost + turn_cost,
             })
 
         await broadcaster.broadcast_done(

@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2, Download } from 'lucide-react';
 import { getToolSummary } from '../../utils/toolSummary';
 import type { ToolCallBlockData } from '../../types/chat';
+import { getToken } from '../../api/client';
 import { EditToolBlock } from './tools/EditToolBlock';
 import { BashToolBlock } from './tools/BashToolBlock';
 import { FileToolBlock } from './tools/FileToolBlock';
@@ -51,6 +52,11 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
     return <HoAToolBlock block={block} />;
   }
 
+  // send_file — render as inline download card, no tool chrome
+  if (block.tool.includes('send_file')) {
+    return <SendFileBlock block={block} />;
+  }
+
   // Notification tools
   if (block.tool.includes('notify') || block.tool.includes('ask_user')) {
     return <NotificationToolBlock block={block} />;
@@ -75,6 +81,43 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
 
   // Generic fallback
   return <GenericToolBlock block={block} />;
+}
+
+function SendFileBlock({ block }: { block: ToolCallBlockData }) {
+  const filePath = block.input?.file_path as string || '';
+  const filename = filePath.split('/').pop() || 'file';
+  const downloadUrl = `/api/files/download?path=${encodeURIComponent(filePath)}`;
+  const isRunning = block.status === 'running';
+
+  if (isRunning) {
+    return (
+      <div className="my-1.5 inline-flex items-center gap-2 px-3 py-2 text-sm text-text-muted">
+        <Loader2 size={14} className="animate-spin" /> Sending file...
+      </div>
+    );
+  }
+
+  if (block.isError) {
+    return (
+      <div className="my-1.5 inline-flex items-center gap-2 px-3 py-2 text-sm text-error">
+        <FileText size={14} /> Failed to send file
+      </div>
+    );
+  }
+
+  return (
+    <div className="my-2">
+      <a
+        href={`${downloadUrl}&token=${getToken()}`}
+        download={filename}
+        className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
+      >
+        <FileText size={14} />
+        <span className="truncate max-w-[200px]">{filename}</span>
+        <Download size={12} className="text-text-muted" />
+      </a>
+    </div>
+  );
 }
 
 function GenericToolBlock({ block }: { block: ToolCallBlockData }) {

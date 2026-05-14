@@ -96,6 +96,8 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
                 source=task.get("source"),
                 source_url=task.get("source_url"),
                 deadline=fields.get("deadline") or task.get("deadline"),
+                tags=fields.get("tags") or task.get("tags", ""),
+                content=req.content,
             )
 
     # Update status/note/deadline/title via agent tool (may move file for "done")

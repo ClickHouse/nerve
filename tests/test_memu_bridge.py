@@ -315,12 +315,12 @@ class TestConfigMemoryModels:
 
     def test_from_dict(self):
         config = MemoryConfig.from_dict({
-            "recall_model": "claude-opus-4-6",
+            "recall_model": "claude-opus-4-7",
             "memorize_model": "claude-sonnet-4-6",
             "fast_model": "claude-haiku-4-5-20251001",
             "embed_model": "text-embedding-3-large",
         })
-        assert config.recall_model == "claude-opus-4-6"
+        assert config.recall_model == "claude-opus-4-7"
         assert config.memorize_model == "claude-sonnet-4-6"
         assert config.fast_model == "claude-haiku-4-5-20251001"
         assert config.embed_model == "text-embedding-3-large"
@@ -561,3 +561,125 @@ class TestSemanticDedupThreshold:
             assert bridge_mod._SEMANTIC_DEDUP_THRESHOLD == 0.92
         finally:
             bridge_mod._SEMANTIC_DEDUP_THRESHOLD = original
+
+
+class TestSanitizeMemuDatetimes:
+    """Test _sanitize_memu_datetimes fixes non-string datetime values."""
+
+    def _create_memu_db(self, db_path: Path) -> None:
+        """Create a minimal memu_memory_items table with test data."""
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE memu_memory_items (
+                id VARCHAR PRIMARY KEY,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL,
+                resource_id VARCHAR,
+                memory_type VARCHAR NOT NULL,
+                summary TEXT NOT NULL,
+                happened_at DATETIME,
+                extra JSON,
+                embedding_json TEXT,
+                user_id VARCHAR
+            )
+        """)
+        # Good row: text datetime
+        conn.execute(
+            "INSERT INTO memu_memory_items (id, updated_at, memory_type, summary, happened_at) "
+            "VALUES ('good-1', '2026-04-09', 'event', 'Normal event', '2026-03-15 10:00:00')"
+        )
+        # Good row: NULL happened_at
+        conn.execute(
+            "INSERT INTO memu_memory_items (id, updated_at, memory_type, summary, happened_at) "
+            "VALUES ('good-2', '2026-04-09', 'knowledge', 'Some fact', NULL)"
+        )
+        # Bad row: integer happened_at
+        conn.execute(
+            "INSERT INTO memu_memory_items (id, updated_at, memory_type, summary, happened_at) "
+            "VALUES ('bad-int', '2026-04-09', 'event', 'Tax year 2025', 2025)"
+        )
+        # Bad row: another integer
+        conn.execute(
+            "INSERT INTO memu_memory_items (id, updated_at, memory_type, summary, happened_at) "
+            "VALUES ('bad-int2', '2026-04-09', 'event', 'Year 2024', 2024)"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_fixes_integer_happened_at(self, tmp_path):
+        db_path = tmp_path / "memu.sqlite"
+        self._create_memu_db(db_path)
+
+        MemUBridge._sanitize_memu_datetimes(f"sqlite:///{db_path}")
+
+        conn = sqlite3.connect(str(db_path))
+        # Integer rows should now be text
+        row = conn.execute(
+            "SELECT happened_at, typeof(happened_at) FROM memu_memory_items WHERE id = 'bad-int'"
+        ).fetchone()
+        assert row[1] == "text"
+        assert row[0] == "2025-01-01 00:00:00"
+
+        row2 = conn.execute(
+            "SELECT happened_at, typeof(happened_at) FROM memu_memory_items WHERE id = 'bad-int2'"
+        ).fetchone()
+        assert row2[1] == "text"
+        assert row2[0] == "2024-01-01 00:00:00"
+        conn.close()
+
+    def test_preserves_valid_datetimes(self, tmp_path):
+        db_path = tmp_path / "memu.sqlite"
+        self._create_memu_db(db_path)
+
+        MemUBridge._sanitize_memu_datetimes(f"sqlite:///{db_path}")
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT happened_at FROM memu_memory_items WHERE id = 'good-1'"
+        ).fetchone()
+        assert row[0] == "2026-03-15 10:00:00"
+
+        row2 = conn.execute(
+            "SELECT happened_at FROM memu_memory_items WHERE id = 'good-2'"
+        ).fetchone()
+        assert row2[0] is None
+        conn.close()
+
+    def test_no_crash_on_missing_db(self, tmp_path):
+        """Should handle missing DB gracefully."""
+        MemUBridge._sanitize_memu_datetimes(f"sqlite:///{tmp_path / 'nonexistent.sqlite'}")
+        # No exception raised
+
+
+class TestValidateDateValue:
+    """Test _validate_date_value rejects bad LLM date outputs."""
+
+    def test_valid_date_string(self):
+        assert MemUBridge._validate_date_value("2025-03-15") == "2025-03-15"
+
+    def test_valid_datetime_string(self):
+        assert MemUBridge._validate_date_value("2025-03-15 10:30:00") == "2025-03-15 10:30:00"
+
+    def test_none_passthrough(self):
+        assert MemUBridge._validate_date_value(None) is None
+
+    def test_bare_integer_year(self):
+        assert MemUBridge._validate_date_value(2025) == "2025-01-01"
+
+    def test_bare_float_year(self):
+        assert MemUBridge._validate_date_value(2025.0) == "2025-01-01"
+
+    def test_out_of_range_integer(self):
+        assert MemUBridge._validate_date_value(99) is None
+        assert MemUBridge._validate_date_value(3000) is None
+
+    def test_empty_string(self):
+        assert MemUBridge._validate_date_value("") is None
+        assert MemUBridge._validate_date_value("  ") is None
+
+    def test_garbage_string(self):
+        assert MemUBridge._validate_date_value("not a date") is None
+
+    def test_non_string_non_number(self):
+        assert MemUBridge._validate_date_value([2025]) is None
+        assert MemUBridge._validate_date_value({"year": 2025}) is None

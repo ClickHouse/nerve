@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from telegram import Update
@@ -50,12 +51,25 @@ WATCHDOG_HEARTBEAT_EVERY = 10
 # TCP keepalive: prevent NAT/firewall from silently dropping the
 # long-poll connection.  These values tell the OS to send a keepalive
 # probe after 60s idle, retry every 10s, give up after 3 failures.
-_TCP_KEEPALIVE_OPTS = (
-    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-    (socket.SOL_TCP, socket.TCP_KEEPIDLE, 60),
-    (socket.SOL_TCP, socket.TCP_KEEPINTVL, 10),
-    (socket.SOL_TCP, socket.TCP_KEEPCNT, 3),
-)
+#
+# The fine-grained tuning constants (TCP_KEEPIDLE/INTVL/CNT) are Linux-only.
+# macOS exposes only TCP_KEEPALIVE (semantically equivalent to TCP_KEEPIDLE).
+# On Windows / unknown platforms we fall back to enabling SO_KEEPALIVE alone
+# and let the OS use its default keepalive timing.
+if sys.platform == "linux":
+    _TCP_KEEPALIVE_OPTS: tuple[tuple[int, int, int], ...] = (
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.SOL_TCP, socket.TCP_KEEPIDLE, 60),
+        (socket.SOL_TCP, socket.TCP_KEEPINTVL, 10),
+        (socket.SOL_TCP, socket.TCP_KEEPCNT, 3),
+    )
+elif sys.platform == "darwin":
+    _TCP_KEEPALIVE_OPTS = (
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60),
+    )
+else:
+    _TCP_KEEPALIVE_OPTS = ((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),)
 
 
 def _md_to_tg_html(text: str) -> str:
@@ -246,6 +260,7 @@ class TelegramChannel(BaseChannel):
             | ChannelCapability.MARKDOWN
             | ChannelCapability.TYPING_INDICATOR
             | ChannelCapability.REACTIONS
+            | ChannelCapability.SEND_FILES
         )
         if self.config.telegram.stream_mode == "partial":
             caps |= ChannelCapability.STREAMING
@@ -610,6 +625,32 @@ class TelegramChannel(BaseChannel):
             chat_id=int(target),
             sticker=sticker,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Files: deliver a workspace file as a Telegram document             #
+    # ------------------------------------------------------------------ #
+
+    async def send_file(self, target: str, file_path: str) -> bool:
+        """Deliver a file to a Telegram chat as a document attachment.
+
+        Size limits are enforced by the Telegram API itself (50 MiB on
+        api.telegram.org, up to 2 GiB on self-hosted Bot API servers).
+        """
+        if self._app is None:
+            return False
+        path = Path(file_path)
+        if not path.is_file():
+            return False
+        try:
+            await self._app.bot.send_document(
+                chat_id=int(target),
+                document=path,
+                filename=path.name,
+            )
+            return True
+        except Exception as e:
+            logger.warning("send_file: send_document failed for %s: %s", target, e)
+            return False
 
     # ------------------------------------------------------------------ #
     #  Message cache (for reaction context)                                #

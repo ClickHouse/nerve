@@ -6,6 +6,7 @@ Usage:
     nerve stop           Stop the running Nerve daemon
     nerve restart        Restart the Nerve daemon
     nerve status         Show daemon status
+    nerve upgrade        Pull latest code, install deps, rebuild frontend
     nerve doctor         Check config, DB, API keys, connectivity
     nerve sync [source]  Run sync manually
     nerve cron [job_id]  Run a cron job manually
@@ -545,6 +546,112 @@ def logs(ctx: click.Context) -> None:
         lines = LOG_FILE.read_text().splitlines()
         for line in lines[-50:]:
             click.echo(line)
+
+
+# --- Upgrade helpers ---
+
+def _find_source_root() -> Path:
+    """Locate the Nerve source checkout (the directory containing pyproject.toml).
+
+    Nerve is installed in editable mode, so ``__file__`` points at the actual
+    source tree.  The repo root is the parent of the ``nerve`` package
+    directory.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def _pip_install_cmd(source_root: Path) -> list[str]:
+    """Return the command to (re)install Nerve from source in the current venv.
+
+    Prefers ``uv pip`` when available (faster), falls back to ``python -m pip``.
+    """
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        # ``uv pip`` targets the active venv via ``VIRTUAL_ENV`` / ``sys.executable``
+        return [uv_bin, "pip", "install", "-e", str(source_root), "--python", sys.executable]
+    return [sys.executable, "-m", "pip", "install", "-e", str(source_root)]
+
+
+@main.command()
+@click.option("--no-frontend", is_flag=True, help="Skip frontend rebuild")
+@click.option("--no-deps", is_flag=True, help="Skip Python dependency install")
+@click.option("--no-pull", is_flag=True, help="Skip git pull (use local changes only)")
+@click.pass_context
+def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool) -> None:
+    """Upgrade Nerve: git pull, install Python deps, rebuild frontend.
+
+    Operates on the source checkout that this ``nerve`` binary was installed
+    from.  Restart Nerve afterwards for the changes to take effect.
+    """
+    config = ctx.obj["config"]
+
+    # Docker mode: the container is immutable — upgrading means rebuilding
+    # the image or pulling a new one.  Bail out with a helpful hint.
+    if _is_docker_mode(config):
+        click.echo(
+            "Docker deployment detected.  Upgrade the image instead:\n"
+            "  docker compose pull && docker compose up -d\n"
+            "  (or rebuild from source: docker compose build && docker compose up -d)"
+        )
+        ctx.exit(1)
+        return
+
+    source_root = _find_source_root()
+
+    if not (source_root / "pyproject.toml").exists():
+        raise click.ClickException(
+            f"pyproject.toml not found in {source_root}. "
+            "Nerve doesn't appear to be installed from a source checkout."
+        )
+
+    click.echo(f"Upgrading Nerve from source at {source_root}")
+
+    # Step 1: git pull
+    if no_pull:
+        click.echo("\n[1/3] Skipping git pull (--no-pull)")
+    elif not (source_root / ".git").exists():
+        click.echo(f"\n[1/3] Not a git repository ({source_root}) — skipping git pull")
+    elif not shutil.which("git"):
+        raise click.ClickException("git not found on PATH — install git or re-run with --no-pull")
+    else:
+        click.echo("\n[1/3] git pull --ff-only")
+        rc = subprocess.run(["git", "pull", "--ff-only"], cwd=source_root).returncode
+        if rc != 0:
+            raise click.ClickException(
+                "git pull failed. Resolve conflicts manually, then re-run 'nerve upgrade --no-pull'."
+            )
+
+    # Step 2: install Python dependencies
+    if no_deps:
+        click.echo("\n[2/3] Skipping Python dependency install (--no-deps)")
+    else:
+        cmd = _pip_install_cmd(source_root)
+        click.echo(f"\n[2/3] Installing Python dependencies: {' '.join(cmd)}")
+        rc = subprocess.run(cmd, cwd=source_root).returncode
+        if rc != 0:
+            raise click.ClickException("Python dependency install failed")
+
+    # Step 3: rebuild frontend
+    web_dir = source_root / "web"
+    if no_frontend:
+        click.echo("\n[3/3] Skipping frontend rebuild (--no-frontend)")
+    elif not web_dir.exists():
+        click.echo(f"\n[3/3] No web/ directory at {web_dir} — skipping frontend rebuild")
+    elif not shutil.which("npm"):
+        raise click.ClickException(
+            "npm not found on PATH. Install Node.js or re-run with --no-frontend."
+        )
+    else:
+        click.echo("\n[3/3] Rebuilding frontend")
+        rc = subprocess.run(["npm", "install"], cwd=web_dir).returncode
+        if rc != 0:
+            raise click.ClickException("npm install failed")
+        rc = subprocess.run(["npm", "run", "build"], cwd=web_dir).returncode
+        if rc != 0:
+            raise click.ClickException("npm run build failed")
+
+    click.echo("\nUpgrade complete. Restart Nerve for changes to take effect:")
+    click.echo("  nerve restart")
 
 
 def doctor_report(config) -> str:

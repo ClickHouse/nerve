@@ -501,14 +501,16 @@ class CronService:
             )
 
     async def _cleanup_expired(self) -> None:
-        """Clean up expired source messages and consumer cursors."""
+        """Clean up expired source messages, consumer cursors, and old cron logs."""
         try:
             msg_count = await self.db.cleanup_expired_messages()
             cursor_count = await self.db.cleanup_expired_consumer_cursors()
-            if msg_count or cursor_count:
+            cron_log_count = await self.db.cleanup_old_cron_logs(days=14)
+            if msg_count or cursor_count or cron_log_count:
                 logger.info(
-                    "Cleanup: %d expired messages, %d expired consumer cursors",
-                    msg_count, cursor_count,
+                    "Cleanup: %d expired messages, %d expired consumer cursors, "
+                    "%d cron logs older than 14 days",
+                    msg_count, cursor_count, cron_log_count,
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)

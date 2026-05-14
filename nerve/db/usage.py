@@ -9,6 +9,7 @@ from __future__ import annotations
 # Mirrors Claude Code's modelCost.ts pricing tiers.
 # Key: canonical model short-name substring → (input, output, cache_read, cache_write, web_search_per_req)
 MODEL_PRICING: dict[str, tuple[float, float, float, float, float]] = {
+    "opus-4-7":   (5, 25, 0.50, 6.25, 0.01),      # Opus 4.7 standard
     "opus-4-6":   (5, 25, 0.50, 6.25, 0.01),      # Opus 4.6 standard
     "opus-4-5":   (5, 25, 0.50, 6.25, 0.01),      # Opus 4.5
     "opus-4-1":   (15, 75, 1.50, 18.75, 0.01),     # Opus 4.1

@@ -115,10 +115,10 @@ async def revise_plan(plan_id: str, req: PlanReviseRequest, user: dict = Depends
         f'plan_propose(task_id="{plan["task_id"]}", content="...") with the revised plan.'
     )
 
-    session_id = "cron:task-planner"
-    # Ensure the session exists
+    session_id = plan.get("session_id") or "cron:task-planner"
+    # Ensure the session exists — route feedback to the original proposer
     await deps.engine.sessions.get_or_create(
-        session_id, title="Cron: task-planner", source="cron",
+        session_id, title=f"Cron: {session_id.split(':')[-1]}" if session_id.startswith("cron:") else session_id, source="cron",
     )
     asyncio.create_task(
         deps.engine.run(session_id=session_id, user_message=feedback_prompt, source="cron")

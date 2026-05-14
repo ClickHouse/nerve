@@ -28,6 +28,7 @@ class ChannelCapability(Flag):
     INTERACTIVE = auto()        # Can route interactive tool responses back (AskUserQuestion, etc.)
     TYPING_INDICATOR = auto()   # Can show "typing…" status
     REACTIONS = auto()          # Can set emoji reactions on messages
+    SEND_FILES = auto()         # Can deliver files / documents as attachments
 
 
 @dataclass(frozen=True)
@@ -182,3 +183,17 @@ class BaseChannel(abc.ABC):
         For Telegram, this could render as inline keyboard buttons.
         For Web, this is a JSON event over WebSocket.
         """
+
+    # ------------------------------------------------------------------ #
+    #  Optional: file delivery                                              #
+    #  Only called if channel declares ChannelCapability.SEND_FILES.        #
+    # ------------------------------------------------------------------ #
+
+    async def send_file(self, target: str, file_path: str) -> bool:
+        """Deliver a file to a target as a downloadable attachment.
+
+        Returns True on successful delivery, False if the channel
+        cannot deliver the file (size limits, missing transport, etc.).
+        Only called if channel declares SEND_FILES capability.
+        """
+        return False

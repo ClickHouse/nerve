@@ -58,7 +58,9 @@ export const useCronStore = create<CronState>((set, get) => ({
     const { selectedJobId } = get();
     set({ loading: true });
     try {
-      const { logs } = await api.getCronLogs(selectedJobId || undefined, 100);
+      // Cap at 30 — the UI only renders a list, and unfiltered queries
+      // sort the entire cron_logs table. Fewer rows = faster page load.
+      const { logs } = await api.getCronLogs(selectedJobId || undefined, 30);
       set({ logs, loading: false });
     } catch (e) {
       console.error('Failed to load cron logs:', e);

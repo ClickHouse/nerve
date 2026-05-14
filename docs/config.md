@@ -20,7 +20,7 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `agent.model` | string | `claude-opus-4-6` | Primary model for conversations |
+| `agent.model` | string | `claude-opus-4-7` | Primary model for conversations |
 | `agent.cron_model` | string | `claude-sonnet-4-6` | Model for cron jobs (cheaper) |
 | `agent.max_turns` | int | `50` | Max agentic turns per request |
 | `agent.max_concurrent` | int | `4` | Max concurrent agent sessions |

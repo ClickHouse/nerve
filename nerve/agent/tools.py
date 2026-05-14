@@ -81,9 +81,9 @@ def _done_dir() -> Path:
 
 @tool(
     "task_search",
-    "Search tasks by keyword in title. Returns matching tasks. Use this before creating tasks to check for duplicates.",
+    "Search tasks by keyword in title, content, tags, or slug. Supports partial words and task ID lookup. Returns matching tasks ranked by relevance. Use this before creating tasks to check for duplicates.",
     {
-        "query": {"type": "string", "description": "Search keyword(s) to match in task titles"},
+        "query": {"type": "string", "description": "Search keyword(s), partial words, or task ID/slug to match against title, content, tags, and task ID"},
         "status": {"type": "string", "description": "Filter: 'all' (include done), specific status, or empty (open tasks only)", "default": ""},
         "tag": {"type": "string", "description": "Filter by tag name (exact match)", "default": ""},
     },
@@ -94,7 +94,7 @@ async def task_search(args: dict) -> dict:
 
     if raw_status in ("", "open", "active"):
         status = None  # all non-done
-    elif raw_status == "all":
+    elif raw_status in ("all", "any"):
         status = "all"
     else:
         status = raw_status  # specific: pending, in_progress, done, deferred
@@ -128,10 +128,13 @@ async def _find_duplicate_tasks(title: str, source_url: str = "") -> list[dict]:
         if url_matches:
             return url_matches
     # Fallback: fuzzy OR-based FTS search ranked by relevance.
-    # Uses OR semantics so "backend escalation #7104" matches
-    # "backend support escalation #7104 TTLDelete" even without
-    # every word being present.
-    return await _db.search_tasks_similar(query=title, limit=10)
+    # Uses OR semantics so partial word overlap still matches.
+    # rank_threshold filters out weak false-positives that share
+    # only common words, which would otherwise cause the model to
+    # see "duplicates" on every call and never use confirm_duplicate.
+    return await _db.search_tasks_similar(
+        query=title, limit=10, rank_threshold=-5.0,
+    )
 
 
 @tool(
@@ -213,7 +216,7 @@ async def task_create(args: dict) -> dict:
     {
         "status": {"type": "string", "description": "Filter: 'pending', 'in_progress', 'done', 'deferred', 'open' (all non-done), or 'all' (everything). Default (empty) = all non-done.", "default": ""},
         "tag": {"type": "string", "description": "Filter by tag name (exact match)", "default": ""},
-        "limit": {"type": "number", "description": "Max results", "default": 20},
+        "limit": {"type": "number", "description": "Max results (default 100)", "default": 100},
     },
 )
 async def task_list(args: dict) -> dict:
@@ -221,13 +224,13 @@ async def task_list(args: dict) -> dict:
 
     if raw_status in ("", "open", "active"):
         status = None  # all non-done
-    elif raw_status == "all":
+    elif raw_status in ("all", "any"):
         status = "all"  # everything including done
     else:
         status = raw_status  # specific: pending, in_progress, done, deferred
 
     tag = (args.get("tag", "") or "").strip().lower()
-    limit = int(args.get("limit", 20))
+    limit = int(args.get("limit", 100))
 
     if _db:
         tasks = await _db.list_tasks(status=status, tag=tag or None, limit=limit)
@@ -308,7 +311,7 @@ async def task_update(args: dict) -> dict:
                 if new_title:
                     # Replace the H1 heading (first line starting with #)
                     content = _re.sub(r"^# .+", f"# {new_title}", content, count=1)
-                    # Sync title to SQLite
+                    # Sync title to SQLite — pass content to preserve FTS index
                     await _db.upsert_task(
                         task_id=task_id,
                         file_path=task["file_path"],
@@ -318,6 +321,7 @@ async def task_update(args: dict) -> dict:
                         source_url=task.get("source_url"),
                         deadline=deadline or task.get("deadline"),
                         tags=new_tags_str if raw_tags else (task.get("tags") or ""),
+                        content=content,
                     )
                 if note:
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1055,16 +1059,8 @@ async def read_source(args: dict) -> dict:
     return {"content": [{"type": "text", "text": output}]}
 
 
-@tool(
-    "plan_propose",
-    "Propose an implementation plan for a task. The plan will be reviewed and approved by the user asynchronously — it is NOT executed immediately. Use this when you have analyzed a task and want to suggest how to implement it.",
-    {
-        "task_id": {"type": "string", "description": "The task ID to propose a plan for"},
-        "content": {"type": "string", "description": "The plan content in markdown format"},
-        "plan_type": {"type": "string", "description": "Plan type: 'generic' (default), 'skill-create', 'skill-update'. Auto-detected from task source if omitted.", "default": ""},
-    },
-)
-async def plan_propose(args: dict) -> dict:
+async def _plan_propose_impl(args: dict, session_id: str | None = None) -> dict:
+    """Core plan_propose logic. session_id tracks which agent proposed the plan."""
     task_id = args["task_id"]
     content = args["content"]
     plan_type = (args.get("plan_type", "") or "").strip()
@@ -1109,6 +1105,7 @@ async def plan_propose(args: dict) -> dict:
         plan_id=plan_id,
         task_id=task_id,
         content=content,
+        session_id=session_id,  # Track which agent proposed this plan
         model="",
         version=version,
         plan_type=plan_type,
@@ -1121,6 +1118,22 @@ async def plan_propose(args: dict) -> dict:
     })
 
     return {"content": [{"type": "text", "text": f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. Awaiting human review."}]}
+
+
+_PLAN_PROPOSE_SCHEMA = {
+    "task_id": {"type": "string", "description": "The task ID to propose a plan for"},
+    "content": {"type": "string", "description": "The plan content in markdown format"},
+    "plan_type": {"type": "string", "description": "Plan type: 'generic' (default), 'skill-create', 'skill-update'. Auto-detected from task source if omitted.", "default": ""},
+}
+
+
+@tool(
+    "plan_propose",
+    "Propose an implementation plan for a task. The plan will be reviewed and approved by the user asynchronously — it is NOT executed immediately. Use this when you have analyzed a task and want to suggest how to implement it.",
+    _PLAN_PROPOSE_SCHEMA,
+)
+async def plan_propose(args: dict) -> dict:
+    return await _plan_propose_impl(args)
 
 
 @tool(
@@ -1393,15 +1406,15 @@ async def plan_revise(args: dict) -> dict:
         f'plan_propose(task_id="{plan["task_id"]}", content="...") with the revised plan.'
     )
 
-    session_id = "cron:task-planner"
+    session_id = plan.get("session_id") or "cron:task-planner"
     await _engine.sessions.get_or_create(
-        session_id, title="Cron: task-planner", source="cron",
+        session_id, title=f"Cron: {session_id.split(':')[-1]}" if session_id.startswith("cron:") else session_id, source="cron",
     )
     asyncio.create_task(
         _engine.run(session_id=session_id, user_message=feedback_prompt, source="cron")
     )
 
-    return {"content": [{"type": "text", "text": f"Revision requested for {plan_id}. Feedback sent to planner session."}]}
+    return {"content": [{"type": "text", "text": f"Revision requested for {plan_id}. Feedback sent to planner session ({session_id})."}]}
 
 
 # --- Skill tools ---
@@ -1549,12 +1562,12 @@ async def skill_run_script(args: dict) -> dict:
         "with specific trigger phrases."
     ),
     {
-        "name": {"type": "string", "description": "Human-readable skill name (e.g. 'code-review', 'deploy-vox')"},
+        "name": {"type": "string", "description": "Human-readable skill name (e.g. 'code-review', 'deploy-app')"},
         "description": {
             "type": "string",
             "description": (
                 "Third-person description with trigger phrases. Example: "
-                "'This skill should be used when the user asks to \"deploy Vox\", "
+                "'This skill should be used when the user asks to \"deploy the app\", "
                 "\"push to staging\", or \"release a new version\".'"
             ),
         },
@@ -1727,6 +1740,55 @@ async def _send_sticker_impl(args: dict, session_id: str) -> dict:
     except Exception as e:
         logger.error("send_sticker tool failed: %s", e)
         return {"content": [{"type": "text", "text": f"Failed to send sticker: {e}"}]}
+
+
+async def _send_file_impl(args: dict, session_id: str) -> dict:
+    """Core implementation for the send_file tool.
+
+    Delivers the file via the channel router (Telegram → send_document, etc.).
+    Falls back to a web-panel message when the bound channel cannot deliver
+    files natively. The web frontend renders the persisted tool_call block
+    as a SendFileBlock card regardless of native delivery.
+    """
+    file_path = args.get("file_path", "")
+    if not file_path:
+        return {"content": [{"type": "text", "text": "Error: file_path is required."}]}
+
+    resolved = Path(file_path).resolve()
+    if not resolved.is_file():
+        return {"content": [{"type": "text", "text": f"Error: file not found: {file_path}"}]}
+
+    # Security: workspace containment via is_relative_to (path-aware) —
+    # a string prefix check would let sibling-prefix paths slip past
+    # (e.g. workspace /srv/ws would accept /srv/ws-evil/secret.txt).
+    if _workspace:
+        try:
+            resolved.relative_to(_workspace.resolve())
+        except ValueError:
+            return {"content": [{"type": "text", "text": "Error: file must be within the workspace."}]}
+
+    filename = resolved.name
+    file_size = resolved.stat().st_size
+
+    delivered = False
+    if _engine is not None:
+        try:
+            # Pass active channel — router uses it to refuse stale-context dispatch.
+            active_channel = _engine.get_active_channel(session_id)
+            delivered = await _engine.router.send_file(
+                session_id, str(resolved), channel=active_channel,
+            )
+        except Exception as e:
+            logger.error("send_file dispatch failed: %s", e)
+            delivered = False
+
+    if delivered:
+        return {"content": [{"type": "text", "text": f"Sent file: {filename} ({file_size:,} bytes)"}]}
+
+    return {"content": [{"type": "text", "text": (
+        f"File ready: {filename} ({file_size:,} bytes). "
+        "Native delivery not available on this channel — open the web panel to download."
+    )}]}
 
 
 _nerve_asgi_app = None  # Cached mini FastAPI app for in-process API calls
@@ -2085,6 +2147,17 @@ def create_session_mcp_server(session_id: str):
         # session_id captured from enclosing scope — race-free
         return await _send_sticker_impl(args, session_id)
 
+    # --- plan_propose session-scoped (needs session_id for proposer attribution) ---
+
+    @tool(
+        "plan_propose",
+        "Propose an implementation plan for a task. The plan will be reviewed and approved by the user asynchronously — it is NOT executed immediately. Use this when you have analyzed a task and want to suggest how to implement it.",
+        _PLAN_PROPOSE_SCHEMA,
+    )
+    async def session_plan_propose(args: dict) -> dict:
+        # session_id captured from enclosing scope — tracks which agent proposed the plan
+        return await _plan_propose_impl(args, session_id=session_id)
+
     # --- houseofagents session-scoped tool (needs session_id for streaming) ---
 
     _HOA_EXECUTE_SCHEMA = {
@@ -2157,9 +2230,23 @@ def create_session_mcp_server(session_id: str):
             parts.append(f"stderr:\n{result.stderr_log[:2000]}")
             return _hoa_text("\n\n".join(parts))
 
+    _SEND_FILE_SCHEMA = {
+        "file_path": {"type": "string", "description": "Absolute path to the file to send to the user"},
+    }
+
+    @tool(
+        "send_file",
+        "Send a file to the user as a downloadable attachment in the chat. "
+        "On Telegram the file is delivered as a document; on the web panel it appears as an inline "
+        "download card. Use this when the user asks you to share, export, or send them a file.",
+        _SEND_FILE_SCHEMA,
+    )
+    async def session_send_file(args: dict) -> dict:
+        return await _send_file_impl(args, session_id)
+
     # Shared tools (don't need session context) + session-scoped tools
-    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker")]
-    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker]
+    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker", "plan_propose")]
+    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_plan_propose, session_send_file]
 
     # Only include houseofagents tools when enabled — saves context tokens otherwise
     hoa_enabled = _config and _config.houseofagents.enabled

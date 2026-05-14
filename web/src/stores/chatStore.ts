@@ -428,15 +428,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ searchQuery: '', searchResults: null, searchLoading: false });
   },
 
-  sendMessage: (content: string) => {
+  sendMessage: (content: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => {
     const session = get().activeSession;
+    const blocks: import('../types/chat').MessageBlock[] = [];
+    if (content) blocks.push({ type: 'text', content });
+    if (imageBlocks) {
+      for (const img of imageBlocks) {
+        blocks.push({ type: 'image', url: img.url, filename: img.filename, media_type: img.media_type });
+      }
+    }
     set((state) => ({
-      messages: [...state.messages, { role: 'user', blocks: [{ type: 'text', content }] }],
+      messages: [...state.messages, { role: 'user', blocks }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' },
     }));
-    ws.sendMessage(content, session);
+    ws.sendMessage(content, session, fileIds);
   },
 
   stopSession: () => {

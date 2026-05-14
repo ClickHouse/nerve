@@ -70,14 +70,44 @@ class Task:
 
 
 def parse_tags_string(raw: str) -> list[str]:
-    """Parse a comma-separated tags string into a sorted, deduplicated list."""
-    if not raw:
+    """Parse a tags string into a sorted, deduplicated list.
+
+    Handles multiple input formats robustly:
+    - Comma-separated: "ci,fuzzer,p0"
+    - JSON array: '["ci","fuzzer","p0"]'
+    - Quoted CSV: '"ci","fuzzer","p0"'
+    - Malformed JSON fragments: '"tag1","tag2"],["tag3"'
+    - Empty JSON array: "[]"
+    """
+    if not raw or raw.strip() == "[]":
         return []
-    return sorted({t.strip().lower() for t in raw.split(",") if t.strip()})
+    # Try JSON array parse first (handles '["ci","p0"]')
+    stripped = raw.strip()
+    if stripped.startswith("["):
+        try:
+            import json
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return sorted({
+                    str(t).strip().lower()
+                    for t in parsed
+                    if str(t).strip()
+                })
+        except (json.JSONDecodeError, ValueError):
+            pass  # Fall through to robust parsing
+    # Strip JSON artifacts (brackets, quotes) then split by comma
+    cleaned = stripped.replace("[", "").replace("]", "").replace('"', "").replace("'", "")
+    return sorted({t.strip().lower() for t in cleaned.split(",") if t.strip()})
 
 
-def tags_to_string(tags: list[str]) -> str:
-    """Convert a list of tags to a comma-separated string for DB storage."""
+def tags_to_string(tags: list[str] | str) -> str:
+    """Convert a list of tags to a comma-separated string for DB storage.
+
+    Also accepts a raw string (e.g., from agent input) and normalizes it
+    through parse_tags_string first to handle JSON arrays and quoted tags.
+    """
+    if isinstance(tags, str):
+        tags = parse_tags_string(tags)
     return ",".join(sorted({t.strip().lower() for t in tags if t.strip()}))
 
 

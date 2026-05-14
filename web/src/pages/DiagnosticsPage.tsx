@@ -111,6 +111,40 @@ export function DiagnosticsPage() {
           <InfoCard icon={HardDrive} label="Disk Free" value={`${data.system?.disk_free_gb} / ${data.system?.disk_total_gb} GB`} />
         </div>
 
+        {/* Observability — Langfuse status */}
+        {data.langfuse && (
+          <div className="text-[12px] text-text-dim flex items-center gap-3 flex-wrap">
+            <span className="flex items-center gap-1.5">
+              {data.langfuse.enabled ? (
+                <CheckCircle2 size={12} className="text-hue-green" />
+              ) : (
+                <XCircle size={12} className="text-text-faint" />
+              )}
+              <span>
+                Langfuse:{' '}
+                <span className={data.langfuse.enabled ? 'text-text-secondary' : 'text-text-faint'}>
+                  {data.langfuse.enabled ? 'enabled' : 'disabled'}
+                </span>
+              </span>
+            </span>
+            {data.langfuse.host && (
+              <a
+                href={data.langfuse.host}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-text-faint hover:text-text-secondary underline-offset-2 hover:underline"
+              >
+                {data.langfuse.host.replace(/^https?:\/\//, '')}
+              </a>
+            )}
+            {data.langfuse.last_flush_at && (
+              <span className="text-text-faint">
+                last flush {new Date(data.langfuse.last_flush_at).toLocaleString()}
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Usage & Cost */}
         {usage?.last_7d && (
           <section>

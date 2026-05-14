@@ -20,7 +20,21 @@ export interface ToolCallBlockData {
   hoaEvents?: Record<string, unknown>[];
 }
 
-export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData;
+export interface ImageBlockData {
+  type: 'image';
+  url: string;
+  filename: string;
+  media_type: string;
+}
+
+export interface FileBlockData {
+  type: 'file';
+  url: string;
+  filename: string;
+  size?: number;
+}
+
+export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData;
 
 export interface ChatMessage {
   id?: number;

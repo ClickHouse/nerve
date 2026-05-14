@@ -322,6 +322,42 @@ class ChannelRouter:
         return True
 
     # ------------------------------------------------------------------ #
+    #  File delivery                                                        #
+    # ------------------------------------------------------------------ #
+
+    async def send_file(
+        self,
+        session_id: str,
+        file_path: str,
+        channel: str | None = None,
+    ) -> bool:
+        """Deliver a file via the channel passed by the caller.
+
+        Refuses delivery if ``channel`` is None — falling back to
+        ``_message_context`` would leak files from cron/planner runs
+        to whatever chat last touched the session (e.g. a stale
+        Telegram inbound from hours earlier).
+
+        ``_message_context`` is consulted only to look up the target
+        identifier when its cached channel matches the requested
+        ``channel``; otherwise the target is empty. Channels needing
+        a real target (Telegram) fail safely inside their own
+        ``send_file``; broadcast channels (web) succeed regardless.
+
+        Returns True on successful delivery, False otherwise.
+        """
+        if channel is None:
+            return False
+
+        chan_obj = self._channels.get(channel)
+        if not chan_obj or ChannelCapability.SEND_FILES not in chan_obj.capabilities:
+            return False
+
+        ctx = self._message_context.get(session_id)
+        target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
+        return await chan_obj.send_file(target, file_path)
+
+    # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
     # ------------------------------------------------------------------ #
 

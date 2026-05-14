@@ -36,6 +36,7 @@ class WebChannel(BaseChannel):
             | ChannelCapability.STREAMING
             | ChannelCapability.MARKDOWN
             | ChannelCapability.INTERACTIVE
+            | ChannelCapability.SEND_FILES
         )
 
     @property
@@ -82,3 +83,13 @@ class WebChannel(BaseChannel):
             session_id, interaction_type, interaction_id,
             tool_name, tool_input,
         )
+
+    async def send_file(self, target: str, file_path: str) -> bool:
+        """Web file delivery is handled by the persisted tool_call block.
+
+        The frontend renders a SendFileBlock card from the stored
+        ``send_file`` tool call (input + result). Returning True signals
+        that no fallback message is needed — the file is reachable via
+        the inline download card in the web UI.
+        """
+        return True

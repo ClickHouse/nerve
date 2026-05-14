@@ -397,9 +397,9 @@ class TestTaskSearch:
 
     async def test_search_multi_word_tokenized(self, db: Database):
         """Multi-word query should match tasks containing all words, not the exact phrase."""
-        await self._create_task(db, "t1", "Fix Google Workspace billing failure for example.com")
-        # "Google" and "Workspace" are both in the title — should match
-        results = await db.search_tasks("Google Workspace")
+        await self._create_task(db, "t1", "Fix database connection timeout on staging server")
+        # "database" and "connection" are both in the title — should match
+        results = await db.search_tasks("database connection")
         assert len(results) == 1
         assert results[0]["id"] == "t1"
 
@@ -407,11 +407,11 @@ class TestTaskSearch:
         """Words in the body content should be searchable, not just the title."""
         await self._create_task(
             db, "t1",
-            title="Fix Google Workspace billing failure",
-            content="Payment method Mastercard 8417 was declined. Update payment info.",
+            title="Fix database connection timeout on staging",
+            content="Connection pool exhausted after 100 concurrent requests. Increase pool size.",
         )
-        # "payment" is NOT in the title, but IS in the content
-        results = await db.search_tasks("payment")
+        # "pool" is NOT in the title, but IS in the content
+        results = await db.search_tasks("pool")
         assert len(results) == 1
         assert results[0]["id"] == "t1"
 
@@ -419,11 +419,11 @@ class TestTaskSearch:
         """Query with words split across title and content should match."""
         await self._create_task(
             db, "t1",
-            title="Fix Google Workspace billing failure",
-            content="Payment is failing on Mastercard.",
+            title="Fix database connection timeout on staging",
+            content="Connection pool is still exhausted intermittently.",
         )
-        # "Google" is in title, "payment" is in content
-        results = await db.search_tasks("Google payment")
+        # "database" is in title, "pool" is in content
+        results = await db.search_tasks("database pool")
         assert len(results) == 1
 
     async def test_search_status_filter(self, db: Database):
@@ -454,13 +454,18 @@ class TestTaskSearch:
         assert len(results) == 1
 
     async def test_rebuild_fts(self, db: Database):
-        await self._create_task(db, "t1", "Some task")
+        await self._create_task(db, "t1", "Some task", content="secret keyword xyzzy")
+        # Content-only word is findable via FTS
+        results = await db.search_tasks("xyzzy")
+        assert len(results) == 1
+        # Rebuild clears the FTS index
+        await db.rebuild_fts()
+        # Content-only word no longer found (not in title or slug)
+        results = await db.search_tasks("xyzzy")
+        assert len(results) == 0
+        # But title LIKE fallback still works
         results = await db.search_tasks("task")
         assert len(results) == 1
-        # Rebuild clears the index
-        await db.rebuild_fts()
-        results = await db.search_tasks("task")
-        assert len(results) == 0
 
     async def test_build_fts_query_sanitizes_special_chars(self, db: Database):
         """FTS5 special characters should be stripped, not cause errors."""
@@ -479,6 +484,324 @@ class TestTaskSearch:
         assert len(results) == 0
         results = await db.search_tasks("   ")
         assert len(results) == 0
+
+    async def test_search_prefix_matching(self, db: Database):
+        """Partial word should match via FTS5 prefix syntax."""
+        await self._create_task(db, "t1", "Distribution documentation update")
+        results = await db.search_tasks("distrib")
+        assert len(results) == 1
+        assert results[0]["id"] == "t1"
+
+    async def test_search_by_exact_task_id(self, db: Database):
+        """Exact task ID should be found."""
+        await self._create_task(db, "2026-03-10-distribution-docs", "Distribution documentation")
+        results = await db.search_tasks("2026-03-10-distribution-docs")
+        assert len(results) == 1
+        assert results[0]["id"] == "2026-03-10-distribution-docs"
+
+    async def test_search_by_slug_substring(self, db: Database):
+        """Partial slug should find the task."""
+        await self._create_task(db, "2026-03-10-cache-invalidation", "Redis cache TTL expiry fix")
+        results = await db.search_tasks("cache-invalidation")
+        assert len(results) == 1
+        assert results[0]["id"] == "2026-03-10-cache-invalidation"
+
+    async def test_search_slug_words_via_fts(self, db: Database):
+        """Words from the slug should be searchable via FTS."""
+        await self._create_task(db, "2026-04-01-flaky-tests", "CI pipeline reliability issue")
+        # "flaky" is only in the slug, not the title
+        results = await db.search_tasks("flaky")
+        assert len(results) == 1
+
+    async def test_search_deduplicates_across_strategies(self, db: Database):
+        """A task matching multiple strategies should appear only once."""
+        await self._create_task(db, "billing-fix", "Fix billing issue", content="billing problem")
+        results = await db.search_tasks("billing")
+        assert len(results) == 1
+
+    async def test_search_relevance_ordering(self, db: Database):
+        """FTS matches should rank higher than LIKE-only matches."""
+        # Task with exact FTS match on title
+        await self._create_task(db, "t1", "Optimize database queries")
+        # Task where "optim" only matches via slug LIKE
+        await self._create_task(db, "2026-01-01-optimize-cache", "Cache layer improvements")
+        results = await db.search_tasks("optimize", status="all")
+        assert len(results) == 2
+        # FTS match (t1 has "Optimize" in title) should come first
+        assert results[0]["id"] == "t1"
+
+    async def test_search_by_tag(self, db: Database):
+        """Tags should be searchable via FTS."""
+        await db.upsert_task(
+            task_id="tagged-task", file_path="memory/tasks/active/tagged-task.md",
+            title="Some CI issue", status="pending", tags="p0,fuzzer,trunk-bug",
+            content="test content",
+        )
+        results = await db.search_tasks("fuzzer")
+        assert len(results) == 1
+        assert results[0]["id"] == "tagged-task"
+
+    async def test_list_tasks_tag_filter(self, db: Database):
+        """Tag filter should match exact tags in comma-separated list."""
+        await db.upsert_task(
+            task_id="t-p0", file_path="f1.md", title="P0 task",
+            status="pending", tags="p0,ci",
+        )
+        await db.upsert_task(
+            task_id="t-p2", file_path="f2.md", title="P2 task",
+            status="pending", tags="p2,ci",
+        )
+        results = await db.list_tasks(tag="p0")
+        assert len(results) == 1
+        assert results[0]["id"] == "t-p0"
+
+        # Both have "ci" tag
+        results = await db.list_tasks(tag="ci")
+        assert len(results) == 2
+
+
+class TestTagParsing:
+    """Test tag string parsing handles various agent input formats."""
+
+    def test_normal_csv(self):
+        from nerve.tasks.models import parse_tags_string
+        assert parse_tags_string("ci,fuzzer,p0") == ["ci", "fuzzer", "p0"]
+
+    def test_json_array(self):
+        from nerve.tasks.models import parse_tags_string
+        assert parse_tags_string('["ci","fuzzer","p0"]') == ["ci", "fuzzer", "p0"]
+
+    def test_empty_json_array(self):
+        from nerve.tasks.models import parse_tags_string
+        assert parse_tags_string("[]") == []
+
+    def test_malformed_json_fragments(self):
+        from nerve.tasks.models import parse_tags_string
+        result = parse_tags_string('"fuzzer","p0","trunk-bug"],["ci"')
+        assert "ci" in result
+        assert "fuzzer" in result
+        assert "p0" in result
+        assert "trunk-bug" in result
+        # No brackets or quotes in any tag
+        for tag in result:
+            assert "[" not in tag and "]" not in tag and '"' not in tag
+
+    def test_quoted_csv(self):
+        from nerve.tasks.models import parse_tags_string
+        assert parse_tags_string('"ci","p0"') == ["ci", "p0"]
+
+    def test_empty_string(self):
+        from nerve.tasks.models import parse_tags_string
+        assert parse_tags_string("") == []
+
+    def test_tags_to_string_accepts_string(self):
+        from nerve.tasks.models import tags_to_string
+        assert tags_to_string('["ci","p0"]') == "ci,p0"
+
+    def test_tags_to_string_accepts_list(self):
+        from nerve.tasks.models import tags_to_string
+        assert tags_to_string(["P0", "ci", "Fuzzer"]) == "ci,fuzzer,p0"
+
+    def test_roundtrip(self):
+        from nerve.tasks.models import parse_tags_string, tags_to_string
+        original = "ci,fuzzer,p0,trunk-bug"
+        assert tags_to_string(parse_tags_string(original)) == original
+
+
+# --- Diagnostics helpers ---
+
+@pytest.mark.asyncio
+class TestDiagnosticsHelpers:
+    """Test the count + retention helpers introduced for the diagnostics
+    endpoint. These exist to keep /api/diagnostics off full-table scans."""
+
+    async def test_count_sessions(self, db: Database):
+        await db.create_session("d-1", title="One", source="web")
+        await db.create_session("d-2", title="Two", source="web")
+        await db.create_session("d-3", title="Three", source="web")
+        # Archive d-3 directly via the status field.
+        await db.update_session_fields("d-3", {"status": "archived"})
+
+        assert await db.count_sessions() == 2
+        assert await db.count_sessions(include_archived=True) == 3
+
+    async def test_cleanup_old_cron_logs(self, db: Database):
+        # Three logs across different ages.
+        log_old = await db.log_cron_start("job-a")
+        log_mid = await db.log_cron_start("job-b")
+        log_new = await db.log_cron_start("job-c")
+
+        # Backdate two of them via direct UPDATE — the helper isn't going
+        # to time-travel for us.
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = datetime('now', '-30 days') WHERE id = ?",
+            (log_old,),
+        )
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = datetime('now', '-10 days') WHERE id = ?",
+            (log_mid,),
+        )
+        await db.db.commit()
+
+        deleted = await db.cleanup_old_cron_logs(days=14)
+        assert deleted == 1  # only the 30-day-old one
+
+        async with db.db.execute(
+            "SELECT id FROM cron_logs ORDER BY id"
+        ) as cur:
+            remaining = {row[0] async for row in cur}
+        assert remaining == {log_mid, log_new}
+
+    async def test_cleanup_old_cron_logs_noop_when_empty(self, db: Database):
+        # Nothing to delete is not an error — must return 0.
+        deleted = await db.cleanup_old_cron_logs(days=14)
+        assert deleted == 0
+
+
+# --- Schema state after V26 ---
+
+@pytest.mark.asyncio
+class TestToolCallsColumnDropped:
+    """V26 dropped the redundant ``messages.tool_calls`` column. After the
+    fixture (which runs all migrations) the column should be gone and
+    ``add_message`` must work without it."""
+
+    async def test_tool_calls_column_is_gone(self, db: Database):
+        async with db.db.execute("PRAGMA table_info(messages)") as cur:
+            cols = {row[1] async for row in cur}
+        assert "tool_calls" not in cols
+        assert "blocks" in cols  # ensure we didn't accidentally drop the wrong one
+
+    async def test_add_message_no_longer_accepts_tool_calls_kwarg(self, db: Database):
+        await db.create_session("s-1", title="T", source="web")
+        # Should succeed without tool_calls.
+        msg_id = await db.add_message(
+            "s-1", "assistant", "ok",
+            blocks=[{"type": "text", "content": "ok"}],
+        )
+        assert msg_id is not None
+        # Tool_calls is no longer a valid parameter.
+        import inspect
+        sig = inspect.signature(db.add_message)
+        assert "tool_calls" not in sig.parameters
+
+    async def test_get_messages_returns_blocks_not_tool_calls(self, db: Database):
+        await db.create_session("s-2", title="T", source="web")
+        await db.add_message(
+            "s-2", "assistant", "hi",
+            blocks=[
+                {"type": "thinking", "content": "thinking..."},
+                {"type": "tool_call", "tool": "Bash", "input": {}, "tool_use_id": "x"},
+                {"type": "text", "content": "done"},
+            ],
+        )
+        msgs = await db.get_messages("s-2")
+        assert len(msgs) == 1
+        assert "tool_calls" not in msgs[0]
+        assert isinstance(msgs[0]["blocks"], list)
+        assert len(msgs[0]["blocks"]) == 3
+
+
+# --- V26 migration backfill ---
+
+@pytest.mark.asyncio
+async def test_v26_backfills_blocks_from_legacy_tool_calls(tmp_path):
+    """Reconstruct a pre-V26 schema (with tool_calls, no blocks) and
+    verify the migration both populates blocks and drops the column."""
+    import json
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.db"
+    async with aiosqlite.connect(db_path) as db:
+        # Minimal schema mirroring v001 + the relevant subset of v003+
+        await db.executescript("""
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                thinking TEXT,
+                tool_calls JSON,
+                blocks JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                channel TEXT
+            );
+        """)
+
+        # Legacy row: only tool_calls populated.
+        legacy_tc = [
+            {"tool": "Read", "input": {"file_path": "/foo"},
+             "tool_use_id": "tu_1", "result": "contents", "is_error": False}
+        ]
+        await db.execute(
+            "INSERT INTO messages (session_id, role, content, thinking, tool_calls) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("s-legacy", "assistant", "final text", "thinking text",
+             json.dumps(legacy_tc)),
+        )
+
+        # Already-blocked row that we must not touch.
+        already = [{"type": "text", "content": "already migrated"}]
+        await db.execute(
+            "INSERT INTO messages (session_id, role, content, blocks) VALUES (?, ?, ?, ?)",
+            ("s-keep", "assistant", "x", json.dumps(already)),
+        )
+        await db.commit()
+
+        # Run the migration directly.
+        from nerve.db.migrations.v026_drop_legacy_tool_calls import up
+        await up(db)
+
+        # tool_calls column should be gone now.
+        async with db.execute("PRAGMA table_info(messages)") as cur:
+            cols = {row[1] async for row in cur}
+        assert "tool_calls" not in cols
+        assert "blocks" in cols
+
+        # Legacy row's blocks were reconstructed in the documented order.
+        async with db.execute(
+            "SELECT blocks FROM messages WHERE session_id = 's-legacy'"
+        ) as cur:
+            (raw,) = await cur.fetchone()
+        blocks = json.loads(raw)
+        assert [b["type"] for b in blocks] == ["thinking", "tool_call", "text"]
+        assert blocks[0]["content"] == "thinking text"
+        assert blocks[1]["tool"] == "Read"
+        assert blocks[1]["tool_use_id"] == "tu_1"
+        assert blocks[2]["content"] == "final text"
+
+        # Already-migrated row preserved.
+        async with db.execute(
+            "SELECT blocks FROM messages WHERE session_id = 's-keep'"
+        ) as cur:
+            (raw,) = await cur.fetchone()
+        assert json.loads(raw) == already
+
+
+@pytest.mark.asyncio
+async def test_v26_is_idempotent_when_column_already_dropped(tmp_path):
+    """Running V26 twice (or on a fresh DB built by later schemas) must
+    not fail."""
+    import aiosqlite
+
+    db_path = tmp_path / "post.db"
+    async with aiosqlite.connect(db_path) as db:
+        await db.executescript("""
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                thinking TEXT,
+                blocks JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                channel TEXT
+            );
+        """)
+        await db.commit()
+
+        from nerve.db.migrations.v026_drop_legacy_tool_calls import up
+        await up(db)  # must not raise
 
 
 # --- Consumer Cursors ---

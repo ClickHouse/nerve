@@ -205,7 +205,7 @@ class HoAService:
             f'name = "Claude"\n'
             f'provider = "anthropic"\n'
             f'api_key = "{anthropic_key}"\n'
-            f'model = "claude-opus-4-6"\n'
+            f'model = "claude-opus-4-7"\n'
             f'thinking_effort = "high"\n'
             f'use_cli = {str(self._hoa.use_cli).lower()}\n'
             f'extra_cli_args = "{extra_args}"\n'

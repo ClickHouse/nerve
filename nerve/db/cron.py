@@ -55,3 +55,20 @@ class CronStore:
             (f"-{hours}",),
         ) as cursor:
             return [dict(row) async for row in cursor]
+
+    async def cleanup_old_cron_logs(self, days: int = 14) -> int:
+        """Delete cron_logs entries older than ``days``. Returns rows deleted.
+
+        Cron logs grow unbounded — a single source running every 5 minutes
+        produces ~100 rows/day. Without retention the table reaches tens of
+        thousands of rows and the unfiltered "latest N" query (used by the
+        diagnostics endpoint) degrades to a full-table scan + memory sort.
+        """
+        cursor = await self.db.execute(
+            "DELETE FROM cron_logs WHERE started_at < datetime('now', ? || ' days')",
+            (f"-{days}",),
+        )
+        deleted = cursor.rowcount or 0
+        await cursor.close()
+        await self.db.commit()
+        return deleted

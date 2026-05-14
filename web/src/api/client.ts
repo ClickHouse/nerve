@@ -214,6 +214,17 @@ export const api = {
   getCronLogs: (jobId?: string, limit = 50) =>
     request<{ logs: any[] }>(`/cron/logs?job_id=${jobId || ''}&limit=${limit}`),
 
+  // Observability — lightweight status for UI deep-links
+  getObservabilityStatus: () =>
+    request<{
+      langfuse: {
+        enabled: boolean;
+        host: string | null;
+        auth_ok: boolean;
+        last_flush_at: string | null;
+      };
+    }>('/observability/status'),
+
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
   triggerCronJob: (jobId: string) =>
@@ -305,5 +316,32 @@ export const api = {
     request<{ deleted: boolean }>(`/houseofagents/pipelines/${id}`, { method: 'DELETE' }),
   installHoaBinary: () =>
     request<{ installed: boolean; path: string; version: string }>('/houseofagents/install', { method: 'POST' }),
+
+  // Files
+  uploadFiles: async (files: File[], sessionId: string): Promise<{ files: Array<{ id: string; filename: string; media_type: string; file_type: string; size: number }> }> => {
+    const formData = new FormData();
+    formData.append('session_id', sessionId);
+    files.forEach(f => formData.append('files', f));
+
+    const headers: Record<string, string> = {};
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+
+    const res = await fetch(`${API_BASE}/files/upload`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+
+    if (res.status === 401) {
+      clearToken();
+      window.location.reload();
+      throw new Error('Unauthorized');
+    }
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status}: ${body}`);
+    }
+    return res.json();
+  },
 
 };

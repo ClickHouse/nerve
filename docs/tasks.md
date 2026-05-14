@@ -58,7 +58,7 @@ Generated from date + slugified title: `2026-02-25-fix-auth-token-expiry`
 `task_create` automatically checks for potential duplicates before creating a task:
 
 1. **Primary: `source_url` exact match** — If the task has a `source_url` (e.g., a GitHub issue URL), checks for any existing task with the same URL. This is the most reliable dedup for source-generated tasks, since the agent may paraphrase titles differently each time.
-2. **Fallback: Fuzzy FTS5 search** — Uses OR semantics (any word can match) ranked by BM25 relevance. This catches similar tasks even with different wording — e.g., "Google Workspace payment failed" matches "Fix Google Workspace billing failure". Stop words and short tokens (≤1 char) are stripped to reduce noise.
+2. **Fallback: Fuzzy FTS5 search** — Uses OR semantics (any word can match) ranked by BM25 relevance. This catches similar tasks even with different wording — e.g., "database backup failed" matches "Fix database backup failure". Stop words and short tokens (≤1 char) are stripped to reduce noise.
 
 If matches are found, the tool returns them and refuses to create — the caller must re-invoke with `confirm_duplicate=true` to override.
 
