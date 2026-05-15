@@ -26,8 +26,9 @@ These tools are always available via MCP:
 
 **Plans** — Async planning for autonomous work (cron jobs, background tasks).
 - `plan_propose` — Submit an implementation plan for async approval
+- `plan_update` — Revise a pending plan in place (creates v+1, supersedes old). Prefer this over decline+propose when refining your own plan.
 - `plan_list` / `plan_read` — Browse and inspect pending plans
-- `plan_approve` / `plan_decline` / `plan_revise` — Manage plan lifecycle
+- `plan_approve` / `plan_decline` / `plan_revise` — Manage plan lifecycle (decline moves the task to done; use `plan_update` for revisions)
 
 **Notifications** — Async communication with your reviewer.
 - `notify` — Fire-and-forget status update

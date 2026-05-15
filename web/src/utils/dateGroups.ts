@@ -40,6 +40,25 @@ export function getDateGroup(updatedAt: string): string {
 }
 
 /**
+ * Compact relative-time formatter for inline labels: "2m ago", "3h ago", "5d ago".
+ * Falls back to a short date for anything older than ~30 days.
+ */
+export function formatTimeAgo(input: string): string {
+  if (!input) return '';
+  const date = new Date(input.includes('T') ? input : input.replace(' ', 'T') + 'Z');
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 0) return 'just now';
+  const minutes = Math.floor(diffMs / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+/**
  * Group items by date label. Preserves the order items arrive in
  * (most-recent-first from the API), so groups appear top-to-bottom
  * from newest to oldest without needing a hardcoded order list.

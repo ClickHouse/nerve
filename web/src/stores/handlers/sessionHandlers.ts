@@ -1,6 +1,6 @@
 import type { WSMessage } from '../../api/websocket';
 import type { PanelTab } from '../../types/chat';
-import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus } from '../helpers/bufferReplay';
+import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer } from '../helpers/bufferReplay';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
@@ -89,7 +89,13 @@ export function handleSessionStatus(
       }
     }
 
-    set({
+    // Restore todos panel from the freshest TodoWrite in the buffer. Without
+    // this, a client that reconnects mid-turn (page refresh, WS drop, tab
+    // backgrounded) sees a stale snapshot from persisted history because the
+    // buffered TodoWrite tool_use events fed only streamingBlocks.
+    const restoredTodos = extractTodosFromBuffer(bufferedEvents);
+
+    const update: Record<string, unknown> = {
       isStreaming: true,
       streamingBlocks: blocks,
       agentStatus: deriveStatus(blocks),
@@ -97,7 +103,11 @@ export function handleSessionStatus(
       activePanelId: restored.activePanelId,
       panelVisible: restored.panels.length > 0,
       pendingInteraction: restoredInteraction,
-    });
+    };
+    if (restoredTodos !== null) {
+      update.currentTodos = restoredTodos;
+    }
+    set(update);
   } else {
     set({ isStreaming: true, streamingBlocks: blocks, agentStatus: deriveStatus(blocks) });
   }
@@ -177,6 +187,32 @@ export function handleSessionRunning(
       updates.isStreaming = true;
       updates.streamingBlocks = [];
       updates.agentStatus = { state: 'thinking' };
+    }
+    // Defensive: server says the run ended but the frontend is still in
+    // streaming mode.  This happens when done/stopped/error never made
+    // it to the client (lost WS message during reconnect, post-stream
+    // exception on the server before broadcast_done fired, etc.).
+    // Without this branch the chat detail stays on "thinking..." while
+    // the sidebar entry has already dropped out of the "Running" group,
+    // which looks like the chat is stuck between steps.  The server's
+    // backstop in engine.run() ships a synthetic done in most of those
+    // cases; this is belt-and-suspenders for when even that signal is
+    // missed.
+    if (msg.session_id === s.activeSession && !msg.is_running && s.isStreaming) {
+      const finalBlocks = s.streamingBlocks.map(b =>
+        b.type === 'tool_call' && b.status === 'running'
+          ? { ...b, status: 'complete' as const }
+          : b,
+      );
+      if (finalBlocks.length > 0) {
+        updates.messages = [
+          ...s.messages,
+          { role: 'assistant' as const, blocks: finalBlocks },
+        ];
+      }
+      updates.streamingBlocks = [];
+      updates.isStreaming = false;
+      updates.agentStatus = { state: 'idle' };
     }
     return updates;
   });

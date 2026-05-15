@@ -109,6 +109,72 @@ class TestBuffering:
 
 
 @pytest.mark.asyncio
+class TestOpenTurnTracking:
+    """The engine's run() finally relies on open-turn tracking to ship a
+    synthetic ``done`` when ``_run_inner`` exits without sending a
+    terminal event.  Without it, the chat detail stays on
+    "thinking..." forever even though the server has cleared
+    is_running and dropped the session out of the sidebar's "Running"
+    group.
+    """
+
+    async def test_mark_open_and_terminal_clears(self):
+        bc = StreamBroadcaster()
+        assert not bc.is_turn_open("s1")
+
+        bc.mark_turn_open("s1")
+        assert bc.is_turn_open("s1")
+
+        # Each terminal type should clear the flag
+        for terminal in ("done", "stopped", "error"):
+            bc.mark_turn_open("s1")
+            await bc.broadcast("s1", {"type": terminal})
+            assert not bc.is_turn_open("s1"), (
+                f"{terminal!r} should clear the open-turn flag"
+            )
+
+    async def test_non_terminal_does_not_clear(self):
+        bc = StreamBroadcaster()
+        bc.mark_turn_open("s1")
+
+        # Streaming events must not close the turn
+        for nonterminal in (
+            {"type": "token", "content": "hi"},
+            {"type": "thinking", "content": "..."},
+            {"type": "tool_use", "tool": "Bash"},
+            {"type": "tool_result", "tool_use_id": "x"},
+        ):
+            await bc.broadcast("s1", nonterminal)
+            assert bc.is_turn_open("s1"), (
+                f"{nonterminal['type']} should not clear the open-turn flag"
+            )
+
+    async def test_clear_turn_open_explicit(self):
+        bc = StreamBroadcaster()
+        bc.mark_turn_open("s1")
+        assert bc.is_turn_open("s1")
+        bc.clear_turn_open("s1")
+        assert not bc.is_turn_open("s1")
+
+    async def test_open_turns_isolated_per_session(self):
+        bc = StreamBroadcaster()
+        bc.mark_turn_open("s1")
+        bc.mark_turn_open("s2")
+        await bc.broadcast("s1", {"type": "done"})
+        assert not bc.is_turn_open("s1")
+        assert bc.is_turn_open("s2")
+
+    async def test_broadcast_done_helper_clears_open_turn(self):
+        # The engine backstop calls broadcaster.broadcast_done() to ship
+        # the synthetic terminal event.  Verify the helper closes the
+        # turn so a second call wouldn't double-broadcast.
+        bc = StreamBroadcaster()
+        bc.mark_turn_open("s1")
+        await bc.broadcast_done("s1", usage={"input_tokens": 1})
+        assert not bc.is_turn_open("s1")
+
+
+@pytest.mark.asyncio
 class TestBoundedBuffers:
     """Test that buffers are bounded to max_buffer_size."""
 

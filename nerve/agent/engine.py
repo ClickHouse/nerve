@@ -8,6 +8,7 @@ Sessions are resumable across server restarts via SDK's --resume flag.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1125,6 +1126,39 @@ class AgentEngine:
             return True
         return process.returncode is not None
 
+    def _sdk_resume_file_exists(self, sdk_session_id: str) -> bool:
+        """Check whether Claude Code still has the conversation .jsonl
+        for the given SDK session ID on this filesystem.
+
+        The CLI stores history at::
+
+            ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
+
+        where <encoded-cwd> is the absolute cwd path with every '/'
+        replaced by '-'.  If the file is gone (typically because the
+        container's /root/.claude was not bind-mounted and got wiped on
+        restart), passing --resume to the CLI fails with exit 1.
+
+        Best-effort check: any unexpected error returns True so we still
+        attempt the resume and let the CLI surface the real error,
+        rather than masking unrelated bugs.
+        """
+        try:
+            cwd = str(self.config.workspace)
+            encoded = cwd.replace("/", "-")
+            jsonl = (
+                os.path.expanduser("~/.claude/projects")
+                + "/" + encoded
+                + "/" + sdk_session_id + ".jsonl"
+            )
+            return os.path.isfile(jsonl)
+        except Exception as e:
+            logger.debug(
+                "Could not stat resume jsonl for %s: %s, assuming present",
+                sdk_session_id[:12], e,
+            )
+            return True
+
     async def _get_or_create_client(
         self, session_id: str, source: str, model: str | None,
         fork_from: str | None = None,
@@ -1162,6 +1196,33 @@ class AgentEngine:
             # For forks, use the source session's SDK ID
             if fork_from and not sdk_resume_id:
                 sdk_resume_id = fork_from
+
+            # Defensive: verify the resume target's conversation .jsonl
+            # actually exists before passing it to the CLI.  Claude Code
+            # stores conversation history in /root/.claude/projects/
+            # <encoded-cwd>/<sdk_session_id>.jsonl.  If that directory is
+            # not bind-mounted from the host, a container restart wipes
+            # the .jsonl files but the Nerve DB still holds the stale
+            # sdk_session_id; the CLI dies with "No conversation
+            # found with session ID" exit 1.
+            #
+            # When the file is missing, clear the stale id and start a
+            # fresh conversation rather than crashing the turn.  Forks
+            # are exempt: the source session's context lives in the
+            # source's row, and a fresh fork has nothing to recover to.
+            if sdk_resume_id and not fork_from:
+                if not self._sdk_resume_file_exists(sdk_resume_id):
+                    logger.warning(
+                        "Session %s resume target %s.jsonl is missing; "
+                        "starting a fresh CLI conversation.  This usually "
+                        "means /root/.claude was not persisted across a "
+                        "container restart.",
+                        session_id, sdk_resume_id[:12],
+                    )
+                    await self.db.update_session_fields(
+                        session_id, {"sdk_session_id": None},
+                    )
+                    sdk_resume_id = None
 
             if sdk_resume_id:
                 logger.info(
@@ -1460,6 +1521,11 @@ class AgentEngine:
                 self.sessions.mark_running(session_id)
                 if channel is not None:
                     self._active_channel[session_id] = channel
+                # Mark the turn as in flight so the finally below can
+                # detect "ended without sending done/stopped/error" and
+                # ship a synthetic done.  Clearing happens automatically
+                # when a terminal event is broadcast.
+                broadcaster.mark_turn_open(session_id)
                 # Notify all connected clients that this session started running
                 await broadcaster.broadcast("__global__", {
                     "type": "session_running",
@@ -1475,6 +1541,28 @@ class AgentEngine:
                 finally:
                     self.sessions.mark_not_running(session_id)
                     self._active_channel.pop(session_id, None)
+                    # Backstop: if _run_inner exited without broadcasting
+                    # done/stopped/error (post-stream DB exception, hung
+                    # CLI cancelled by an outer mechanism, etc.), the
+                    # frontend never learned the turn ended and is still
+                    # showing "thinking..." even though the server has
+                    # cleared is_running.  Ship a synthetic done so the
+                    # streaming UI exits cleanly.
+                    if broadcaster.is_turn_open(session_id):
+                        logger.warning(
+                            "Session %s ended without a terminal event "
+                            "(done/stopped/error); sending synthetic done "
+                            "so the frontend exits streaming state",
+                            session_id,
+                        )
+                        try:
+                            await broadcaster.broadcast_done(session_id)
+                        except Exception as e:
+                            logger.warning(
+                                "Synthetic done broadcast failed for %s: %s",
+                                session_id, e,
+                            )
+                            broadcaster.clear_turn_open(session_id)
                     broadcaster.stop_buffering(session_id)
                     # Notify all connected clients that this session stopped
                     await broadcaster.broadcast("__global__", {
@@ -1482,6 +1570,60 @@ class AgentEngine:
                         "session_id": session_id,
                         "is_running": False,
                     })
+
+    @staticmethod
+    async def _iter_response_with_timeout(
+        client: Any,
+        session_id: str,
+        idle_timeout: float,
+    ):
+        """Iterate ``client.receive_response()`` with a per-message idle timeout.
+
+        The Claude Agent SDK's ``receive_response()`` async generator can
+        block indefinitely if the underlying CLI subprocess hangs (stuck
+        Anthropic API request, broken stdio pipe, etc.).  Without a timeout
+        the engine has no way to notice — ``is_running`` stays True, the
+        per-session lock stays held, queued user messages back up forever.
+
+        Wrapping each ``__anext__()`` await in ``asyncio.wait_for`` detects
+        a hung CLI when no SDK message of any kind (assistant chunk, tool
+        call, tool result, ResultMessage) arrives within ``idle_timeout``
+        seconds.  The iterator is closed and ``asyncio.TimeoutError`` is
+        raised so the existing CLI-crash retry path in ``_run_inner`` can
+        take over.
+
+        The timeout is per-message, not per-turn, so legitimate long tool
+        calls (e.g. a Bash command with ``timeout=600000`` ms) don't trip
+        it as long as they emit ``tool_use``/``tool_result`` chunks
+        between waits.
+
+        ``idle_timeout <= 0`` disables the timeout entirely (kept for
+        belt-and-suspenders ops who want the old behaviour back).
+        """
+        response_iter = client.receive_response()
+        try:
+            while True:
+                try:
+                    if idle_timeout and idle_timeout > 0:
+                        message = await asyncio.wait_for(
+                            response_iter.__anext__(),
+                            timeout=idle_timeout,
+                        )
+                    else:
+                        message = await response_iter.__anext__()
+                except StopAsyncIteration:
+                    return
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "CLI idle timeout (%ds) for session %s — no SDK "
+                        "message received; treating CLI as hung",
+                        idle_timeout, session_id,
+                    )
+                    raise
+                yield message
+        finally:
+            with contextlib.suppress(Exception):
+                await response_iter.aclose()
 
     async def _run_inner(
         self,
@@ -1671,8 +1813,13 @@ class AgentEngine:
                         continue  # retry the query
 
                     # Read response — may raise if CLI crashes mid-stream
+                    # or hangs idle for longer than cli_idle_timeout_seconds
+                    # (see _iter_response_with_timeout).
                     try:
-                        async for message in client.receive_response():
+                        async for message in AgentEngine._iter_response_with_timeout(
+                            client, session_id,
+                            self.config.agent.cli_idle_timeout_seconds,
+                        ):
                             # Early-capture sdk_session_id from first message that
                             # carries it so it survives /stop cancellation (ResultMessage
                             # — the normal source — never arrives when the turn is

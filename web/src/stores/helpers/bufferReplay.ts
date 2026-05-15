@@ -184,3 +184,27 @@ export function extractTodosFromMessages(messages: ChatMessage[]): TodoItem[] {
   }
   return [];
 }
+
+/**
+ * Extract the latest TodoWrite todos from a list of buffered WS events.
+ * Used during live reconnect (session_status with buffered_events): the
+ * persisted message history may not yet include the in-flight turn, so the
+ * todos panel needs to read the freshest state from the buffer.
+ *
+ * Returns null when the buffer contains no top-level TodoWrite, so the caller
+ * can preserve whatever currentTodos was already set from persisted history.
+ * Unlike extractTodosFromMessages, this does NOT skip the all-completed case;
+ * the panel's own auto-hide handles that animation once the user sees it.
+ */
+export function extractTodosFromBuffer(events: WSMessage[]): TodoItem[] | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== 'tool_use') continue;
+    if (event.tool !== 'TodoWrite') continue;
+    // Sub-agent (Task) child TodoWrite calls belong to the panel, not the main todos.
+    if ('parent_tool_use_id' in event && event.parent_tool_use_id) continue;
+    const todos = (event.input as { todos?: TodoItem[] } | undefined)?.todos;
+    if (Array.isArray(todos)) return todos as TodoItem[];
+  }
+  return null;
+}

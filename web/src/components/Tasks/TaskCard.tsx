@@ -1,6 +1,7 @@
 import { useNavigate } from 'react-router-dom';
-import { Calendar, ExternalLink } from 'lucide-react';
+import { Calendar, Clock, ExternalLink } from 'lucide-react';
 import type { Task } from '../../stores/taskStore';
+import { formatTimeAgo } from '../../utils/dateGroups';
 
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
@@ -30,6 +31,14 @@ export function TaskCard({ task, onStatusChange }: {
             {task.deadline && (
               <span className="flex items-center gap-1 text-text-dim">
                 <Calendar size={11} /> {task.deadline}
+              </span>
+            )}
+            {task.updated_at && (
+              <span
+                className="flex items-center gap-1 text-text-faint"
+                title={`Updated ${task.updated_at}`}
+              >
+                <Clock size={11} /> {formatTimeAgo(task.updated_at)}
               </span>
             )}
             {task.source && (

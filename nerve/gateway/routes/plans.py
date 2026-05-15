@@ -71,15 +71,17 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, user: dict = Depends
     if fields:
         await deps.db.update_plan(plan_id, **fields)
 
-    # Write task note on decline
+    # On decline: mark the related task as done with a note explaining the closure.
+    # The user-supplied feedback is optional — if absent, leave a generic comment.
     if req.status == "declined":
-        from nerve.agent.tools import task_update as task_update_tool
-        feedback_suffix = ""
+        from nerve.agent.tools import task_done as task_done_tool
         if req.feedback:
-            feedback_suffix = f" — {req.feedback[:80]}{'...' if len(req.feedback) > 80 else ''}"
-        await task_update_tool.handler({
+            note = f"Plan {plan_id} declined — {req.feedback}"
+        else:
+            note = f"Related plan {plan_id} was closed without a specified reason"
+        await task_done_tool.handler({
             "task_id": plan["task_id"],
-            "note": f"Plan declined: {plan_id}{feedback_suffix}",
+            "note": note,
         })
 
     return {"plan_id": plan_id, "updated": True}
@@ -238,7 +240,11 @@ async def approve_plan(
         )
         prompt += hoa_instructions
 
-    # Spawn implementation in background with error handling
+    # Spawn implementation in background with error handling.  Register
+    # the task with the engine so a manual /stop can cancel a stuck impl
+    # session (without registration, the asyncio.Task is invisible to
+    # `engine.stop_session` and the only way to recover is a daemon
+    # restart).
     async def _run_impl():
         try:
             await deps.engine.run(
@@ -251,7 +257,8 @@ async def approve_plan(
             except Exception:
                 logger.exception("Failed to mark plan %s as failed", plan_id)
 
-    asyncio.create_task(_run_impl())
+    impl_task = asyncio.create_task(_run_impl())
+    deps.engine.register_task(impl_session_id, impl_task)
 
     return {"plan_id": plan_id, "impl_session_id": impl_session_id}
 

@@ -559,6 +559,41 @@ class TestTaskSearch:
         results = await db.list_tasks(tag="ci")
         assert len(results) == 2
 
+    async def test_list_tasks_sort_and_pagination(self, db: Database):
+        """list_tasks should respect sort + limit/offset, and count_tasks
+        should return the total ignoring pagination."""
+        import asyncio
+        # Insert three tasks; sleep briefly between each so updated_at
+        # is monotonically increasing.
+        await db.upsert_task(task_id="t-a", file_path="a.md", title="A", status="pending")
+        await asyncio.sleep(0.01)
+        await db.upsert_task(task_id="t-b", file_path="b.md", title="B", status="pending")
+        await asyncio.sleep(0.01)
+        await db.upsert_task(task_id="t-c", file_path="c.md", title="C", status="pending")
+
+        # Sort by updated_at DESC — newest first
+        results = await db.list_tasks(sort="updated_at")
+        assert [r["id"] for r in results] == ["t-c", "t-b", "t-a"]
+
+        # Sort by created_at DESC — same order in this case
+        results = await db.list_tasks(sort="created_at")
+        assert [r["id"] for r in results] == ["t-c", "t-b", "t-a"]
+
+        # Unknown sort falls back to default (deadline) without raising
+        results = await db.list_tasks(sort="bogus")
+        assert len(results) == 3
+
+        # Pagination: limit=2 returns first 2; offset=2 returns the third
+        page1 = await db.list_tasks(sort="updated_at", limit=2, offset=0)
+        page2 = await db.list_tasks(sort="updated_at", limit=2, offset=2)
+        assert [r["id"] for r in page1] == ["t-c", "t-b"]
+        assert [r["id"] for r in page2] == ["t-a"]
+
+        # count_tasks ignores pagination
+        assert await db.count_tasks() == 3
+        assert await db.count_tasks(status="pending") == 3
+        assert await db.count_tasks(status="done") == 0
+
 
 class TestTagParsing:
     """Test tag string parsing handles various agent input formats."""
@@ -606,6 +641,110 @@ class TestTagParsing:
         from nerve.tasks.models import parse_tags_string, tags_to_string
         original = "ci,fuzzer,p0,trunk-bug"
         assert tags_to_string(parse_tags_string(original)) == original
+
+
+# --- Plan lifecycle ---
+
+@pytest.mark.asyncio
+class TestPlanUpdate:
+    """Verify plan_update supersedes the old plan and creates a linked v+1."""
+
+    async def _setup_pending_plan(self, db: Database, tmp_path):
+        """Create a task on disk + in DB, plus a pending plan, and wire up tools."""
+        from nerve.agent import tools as tools_mod
+
+        task_id = "t-update-flow"
+        file_path = "test-task.md"
+        task_md = tmp_path / file_path
+        task_md.write_text("# Test task\n\nBody.\n", encoding="utf-8")
+
+        await db.upsert_task(
+            task_id=task_id, file_path=file_path, title="Test task",
+            status="pending", content=task_md.read_text(),
+        )
+        await db.create_plan(
+            plan_id="plan-v1", task_id=task_id, content="v1 content",
+            session_id="sess-orig", version=1, plan_type="generic",
+        )
+        # Plans default to status=pending via column DEFAULT — confirm.
+        plan = await db.get_plan("plan-v1")
+        assert plan["status"] == "pending"
+
+        # Wire tools to this DB + workspace
+        tools_mod.init_tools(workspace=tmp_path, db=db)
+        return task_id, task_md
+
+    async def test_update_supersedes_and_bumps_version(self, db: Database, tmp_path):
+        from nerve.agent.tools import plan_update
+
+        task_id, task_md = await self._setup_pending_plan(db, tmp_path)
+
+        result = await plan_update.handler({
+            "plan_id": "plan-v1",
+            "content": "v2 content with refinements",
+            "feedback": "too vague on edge cases",
+        })
+
+        # Tool result mentions the new plan
+        text = result["content"][0]["text"]
+        assert "superseded" in text
+
+        # Old plan: superseded, feedback recorded
+        old = await db.get_plan("plan-v1")
+        assert old["status"] == "superseded"
+        assert old["feedback"] == "too vague on edge cases"
+
+        # New plan: linked, v=2, fresh content, pending
+        new_plans = [p for p in await db.get_plans_for_task(task_id) if p["id"] != "plan-v1"]
+        assert len(new_plans) == 1
+        new = new_plans[0]
+        assert new["version"] == 2
+        assert new["parent_plan_id"] == "plan-v1"
+        assert new["content"] == "v2 content with refinements"
+        assert new["status"] == "pending"
+        assert new["plan_type"] == "generic"
+
+        # Task note was appended to the markdown file
+        body = task_md.read_text(encoding="utf-8")
+        assert "Plan updated: plan-v1" in body
+        assert "v2" in body
+        assert "too vague on edge cases" in body
+
+    async def test_update_refuses_non_pending_plan(self, db: Database, tmp_path):
+        from nerve.agent.tools import plan_update
+
+        _, _ = await self._setup_pending_plan(db, tmp_path)
+        await db.update_plan("plan-v1", status="declined")
+
+        result = await plan_update.handler({
+            "plan_id": "plan-v1",
+            "content": "should not apply",
+        })
+        text = result["content"][0]["text"]
+        assert "declined" in text
+        assert "only pending" in text
+
+        # No new plan was created
+        plans = await db.get_plans_for_task("t-update-flow")
+        assert len(plans) == 1
+
+    async def test_update_without_feedback_leaves_old_feedback_alone(self, db: Database, tmp_path):
+        """If no feedback is supplied, the old plan's feedback field is untouched."""
+        from nerve.agent.tools import plan_update
+
+        await self._setup_pending_plan(db, tmp_path)
+        # Pre-existing feedback on plan-v1
+        await db.update_plan("plan-v1", feedback="prior feedback")
+
+        await plan_update.handler({
+            "plan_id": "plan-v1",
+            "content": "v2 content",
+        })
+
+        old = await db.get_plan("plan-v1")
+        assert old["status"] == "superseded"
+        # The original feedback survives because we only write feedback when supplied
+        assert old["feedback"] == "prior feedback"
 
 
 # --- Diagnostics helpers ---

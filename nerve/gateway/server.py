@@ -53,6 +53,32 @@ def get_engine() -> AgentEngine:
     return _engine
 
 
+async def _send_session_status(
+    websocket: WebSocket,
+    session_id: str,
+    is_running: bool,
+    session_record: dict | None,
+) -> None:
+    """Send a ``session_status`` event to the freshly-bound listener.
+
+    Called from the initial WS handshake (only when a turn is in flight so an
+    idle client doesn't get a no-op message) and from ``switch_session``
+    (always, to refresh client-side ``is_running``/``status``). When the
+    session is running, the accumulated stream buffer is attached so the
+    client can rebuild ``streamingBlocks``, panels, todos, and interaction
+    state without waiting for new events.
+    """
+    status_msg: dict = {
+        "type": "session_status",
+        "session_id": session_id,
+        "is_running": is_running,
+        "status": session_record.get("status") if session_record else "unknown",
+    }
+    if is_running:
+        status_msg["buffered_events"] = broadcaster.get_buffer(session_id)
+    await websocket.send_json(status_msg)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
@@ -310,6 +336,18 @@ def create_app() -> FastAPI:
             "session_id": active_session,
         })
 
+        # If a turn is mid-flight (page reload, transient WS drop, sticky
+        # reconnect after a network blip), replay the broadcaster buffer so
+        # the freshly-bound listener can rebuild the in-flight stream
+        # without waiting for new events. Idle sessions get nothing here;
+        # they hydrate via REST + the existing ``session_switched`` event.
+        if broadcaster.is_buffering(active_session):
+            is_running = _engine.is_session_running(active_session)
+            session_record = await _engine.db.get_session(active_session)
+            await _send_session_status(
+                websocket, active_session, is_running, session_record,
+            )
+
         try:
             while True:
                 data = await websocket.receive_json()
@@ -368,18 +406,16 @@ def create_app() -> FastAPI:
                     # Persist channel mapping so next page load resumes this session
                     await router.switch_session("web:default", new_session)
 
-                    # Send session status (running/idle + buffered events for reconnect)
+                    # Send session status (running/idle + buffered events for
+                    # reconnect). Unlike the initial-bind branch, we always
+                    # ship a status here so the client can flip its
+                    # ``isStreaming`` / ``status`` for the newly-selected
+                    # session even when the session is idle.
                     is_running = _engine.is_session_running(new_session)
                     session_record = await _engine.db.get_session(new_session)
-                    status_msg: dict = {
-                        "type": "session_status",
-                        "session_id": new_session,
-                        "is_running": is_running,
-                        "status": session_record.get("status") if session_record else "unknown",
-                    }
-                    if is_running:
-                        status_msg["buffered_events"] = broadcaster.get_buffer(new_session)
-                    await websocket.send_json(status_msg)
+                    await _send_session_status(
+                        websocket, new_session, is_running, session_record,
+                    )
 
                     await websocket.send_json({
                         "type": "session_switched",

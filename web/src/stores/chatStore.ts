@@ -437,13 +437,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
         blocks.push({ type: 'image', url: img.url, filename: img.filename, media_type: img.media_type });
       }
     }
+    // Optimistic update: append the user message, flip to streaming. If the
+    // socket isn't open, send() returns 'queued' (will flush on reconnect)
+    // or 'dropped' (revert below).
     set((state) => ({
       messages: [...state.messages, { role: 'user', blocks }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' },
     }));
-    ws.sendMessage(content, session, fileIds);
+    const status = ws.sendMessage(content, session, fileIds);
+    if (status === 'dropped') {
+      // The message could not reach the server. Revert the optimistic
+      // state and surface the failure inline so the user knows to retry.
+      set((state) => ({
+        messages: [
+          ...state.messages.slice(0, -1),
+          {
+            role: 'assistant' as const,
+            blocks: [{
+              type: 'text',
+              content: 'Error: Message could not be sent. The connection is closed; please retry.',
+            }],
+          },
+        ],
+        streamingBlocks: [],
+        isStreaming: false,
+        agentStatus: { state: 'idle' },
+      }));
+    }
   },
 
   stopSession: () => {

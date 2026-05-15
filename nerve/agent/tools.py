@@ -13,9 +13,44 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server, tool
+from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
+from claude_agent_sdk import tool as _sdk_tool
 
 logger = logging.getLogger(__name__)
+
+
+def tool(name: str, description: str, input_schema, *args, **kwargs):
+    """Wrapper around ``claude_agent_sdk.tool`` that fixes shorthand-schema handling.
+
+    The SDK's ``_build_schema`` (claude_agent_sdk/__init__.py) converts shorthand
+    dicts (those without a top-level ``"type"`` key) by forcing every property into
+    ``required: list(properties.keys())`` and silently discarding descriptions and
+    defaults via ``_python_type_to_json_schema``. The result is that fields with a
+    ``"default"`` annotation are still advertised as required to the model, and the
+    model never sees the parameter descriptions at all.
+
+    Combined with the Claude Code CLI's behaviour of throwing ``McpToolCallError``
+    on validation failures (which propagates up the streaming connection and ends
+    the agent's turn early), this caused agents to abort mid-task whenever the
+    model trusted a documented default and omitted the field.
+
+    The wrapper pre-promotes shorthand dicts to the explicit JSON Schema form the
+    SDK passes through unchanged: properties are kept intact (so descriptions and
+    defaults survive) and ``required`` only lists fields that have no ``default``.
+    Tools that already supply an explicit ``{"type": "object", ...}`` schema are
+    untouched.
+    """
+    if isinstance(input_schema, dict) and "type" not in input_schema:
+        input_schema = {
+            "type": "object",
+            "properties": dict(input_schema),
+            "required": [
+                field
+                for field, spec in input_schema.items()
+                if not isinstance(spec, dict) or "default" not in spec
+            ],
+        }
+    return _sdk_tool(name, description, input_schema, *args, **kwargs)
 
 # These will be set during initialization
 _workspace: Path | None = None
@@ -1136,6 +1171,83 @@ async def plan_propose(args: dict) -> dict:
     return await _plan_propose_impl(args)
 
 
+async def _plan_update_impl(args: dict, session_id: str | None = None) -> dict:
+    """Update a pending plan by superseding it with a new version.
+
+    Creates a new plan record (v+1) linked to the old one via parent_plan_id,
+    marks the old plan as 'superseded', and optionally stores feedback on the
+    old plan explaining why it was replaced. Use this instead of the
+    decline→propose dance when refining your own plan based on feedback.
+    """
+    import uuid
+
+    plan_id = args["plan_id"]
+    content = args["content"]
+    feedback = (args.get("feedback", "") or "").strip()
+
+    if not _db:
+        return {"content": [{"type": "text", "text": "Database not available."}]}
+
+    old_plan = await _db.get_plan(plan_id)
+    if not old_plan:
+        return {"content": [{"type": "text", "text": f"Plan not found: {plan_id}"}]}
+
+    if old_plan["status"] != "pending":
+        return {"content": [{"type": "text", "text": f"Plan is '{old_plan['status']}' — only pending plans can be updated."}]}
+
+    # Supersede the old plan, optionally recording why it was replaced.
+    update_fields: dict = {"status": "superseded"}
+    if feedback:
+        update_fields["feedback"] = feedback
+    await _db.update_plan(plan_id, **update_fields)
+
+    # Create the new version, linked to the old one.
+    new_plan_id = f"plan-{str(uuid.uuid4())[:8]}"
+    new_version = int(old_plan.get("version", 1)) + 1
+    await _db.create_plan(
+        plan_id=new_plan_id,
+        task_id=old_plan["task_id"],
+        content=content,
+        session_id=session_id,
+        model="",
+        version=new_version,
+        parent_plan_id=plan_id,
+        plan_type=old_plan.get("plan_type", "generic"),
+    )
+
+    # Write a task note documenting the version bump.
+    note = f"Plan updated: {plan_id} → {new_plan_id} (v{new_version})"
+    if feedback:
+        note += f" — {feedback}"
+    await task_update.handler({
+        "task_id": old_plan["task_id"],
+        "note": note,
+    })
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). The new version is pending review.",
+        }]
+    }
+
+
+_PLAN_UPDATE_SCHEMA = {
+    "plan_id": {"type": "string", "description": "The pending plan ID to update"},
+    "content": {"type": "string", "description": "The full revised plan content in markdown"},
+    "feedback": {"type": "string", "description": "Optional reason for the revision — stored on the superseded plan", "default": ""},
+}
+
+
+@tool(
+    "plan_update",
+    "Update a pending plan with revised content. Creates a new version (v+1), marks the old version as superseded, and links them via parent_plan_id. Prefer this over plan_decline + plan_propose when you're refining your own plan based on feedback — the task stays open and the version history is preserved.",
+    _PLAN_UPDATE_SCHEMA,
+)
+async def plan_update(args: dict) -> dict:
+    return await _plan_update_impl(args)
+
+
 @tool(
     "plan_list",
     "List existing plans. Use this to check which tasks already have pending plans before proposing new ones.",
@@ -1344,16 +1456,18 @@ async def plan_decline(args: dict) -> dict:
         fields["feedback"] = feedback
     await _db.update_plan(plan_id, **fields)
 
-    # Write task note
-    feedback_suffix = ""
+    # Mark the related task as done. Feedback is optional — if absent,
+    # leave a generic comment noting that the plan was closed without a reason.
     if feedback:
-        feedback_suffix = f" — {feedback[:80]}{'...' if len(feedback) > 80 else ''}"
-    await task_update.handler({
+        note = f"Plan {plan_id} declined — {feedback}"
+    else:
+        note = f"Related plan {plan_id} was closed without a specified reason"
+    await task_done.handler({
         "task_id": plan["task_id"],
-        "note": f"Plan declined: {plan_id}{feedback_suffix}",
+        "note": note,
     })
 
-    return {"content": [{"type": "text", "text": f"Plan {plan_id} declined.{(' Feedback: ' + feedback) if feedback else ''}"}]}
+    return {"content": [{"type": "text", "text": f"Plan {plan_id} declined and task moved to done.{(' Feedback: ' + feedback) if feedback else ''}"}]}
 
 
 @tool(
@@ -1398,12 +1512,16 @@ async def plan_revise(args: dict) -> dict:
         "note": f"Revision requested for {plan_id}: {feedback_summary}",
     })
 
-    # Send revision request to persistent planner session
+    # Send revision request to persistent planner session.
+    # Tell the planner to update the existing plan in-place via plan_update
+    # so the version history stays linked instead of producing an orphan via
+    # plan_propose.
     feedback_prompt = (
         f'Revise plan {plan_id} for task "{task["title"]}" based on this feedback:\n\n'
         f"{feedback}\n\n"
         f"Explore the codebase again if needed, then call "
-        f'plan_propose(task_id="{plan["task_id"]}", content="...") with the revised plan.'
+        f'plan_update(plan_id="{plan_id}", content="...", feedback="<short summary>") '
+        f"with the revised plan."
     )
 
     session_id = plan.get("session_id") or "cron:task-planner"
@@ -2158,6 +2276,17 @@ def create_session_mcp_server(session_id: str):
         # session_id captured from enclosing scope — tracks which agent proposed the plan
         return await _plan_propose_impl(args, session_id=session_id)
 
+    # --- plan_update session-scoped (session_id attributes the revision) ---
+
+    @tool(
+        "plan_update",
+        "Update a pending plan with revised content. Creates a new version (v+1), marks the old version as superseded, and links them via parent_plan_id. Prefer this over plan_decline + plan_propose when you're refining your own plan based on feedback — the task stays open and the version history is preserved.",
+        _PLAN_UPDATE_SCHEMA,
+    )
+    async def session_plan_update(args: dict) -> dict:
+        # session_id captured from enclosing scope — attributes the revision to the updating agent
+        return await _plan_update_impl(args, session_id=session_id)
+
     # --- houseofagents session-scoped tool (needs session_id for streaming) ---
 
     _HOA_EXECUTE_SCHEMA = {
@@ -2245,8 +2374,8 @@ def create_session_mcp_server(session_id: str):
         return await _send_file_impl(args, session_id)
 
     # Shared tools (don't need session context) + session-scoped tools
-    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker", "plan_propose")]
-    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_plan_propose, session_send_file]
+    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker", "plan_propose", "plan_update")]
+    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_plan_propose, session_plan_update, session_send_file]
 
     # Only include houseofagents tools when enabled — saves context tokens otherwise
     hoa_enabled = _config and _config.houseofagents.enabled

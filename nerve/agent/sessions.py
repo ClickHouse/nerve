@@ -306,9 +306,29 @@ class SessionManager:
         Does NOT mark the session as running — that's done by mark_running()
         inside engine.run() to avoid a race between create_task() scheduling
         and the task's actual execution.
+
+        If a task is already registered for ``session_id`` and is still
+        live, log a warning and replace it.  The replaced task isn't
+        cancelled (callers may rely on it finishing), but it loses the
+        ability to be stopped via ``/stop``.  The done-callback below is
+        identity-checked so the *old* task finishing later doesn't pop the
+        new entry from under us.
         """
+        existing = self._running_tasks.get(session_id)
+        if existing is not None and not existing.done():
+            logger.warning(
+                "register_task: replacing live task for session %s "
+                "(possible concurrent run)", session_id,
+            )
         self._running_tasks[session_id] = task
-        task.add_done_callback(lambda _: self._running_tasks.pop(session_id, None))
+
+        def _on_done(t: asyncio.Task) -> None:
+            # Only pop if *this* task is still the registered one — a later
+            # register_task call may have replaced us, and clobbering its
+            # entry would leak the new task out of the stop registry.
+            if self._running_tasks.get(session_id) is t:
+                self._running_tasks.pop(session_id, None)
+        task.add_done_callback(_on_done)
 
     def mark_running(self, session_id: str) -> None:
         """Mark a session as currently running."""

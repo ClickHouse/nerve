@@ -33,6 +33,8 @@ export function PlanDetailPage() {
   const { selectedPlan: plan, detailLoading, actionLoading, loadPlan, updatePlan, approvePlan, revisePlan, clearSelectedPlan } = usePlanStore();
   const [feedback, setFeedback] = useState('');
   const [showFeedback, setShowFeedback] = useState(false);
+  const [declineFeedback, setDeclineFeedback] = useState('');
+  const [showDeclineFeedback, setShowDeclineFeedback] = useState(false);
 
   // houseofagents runtime selection state
   const [hoaStatus, setHoaStatus] = useState<HoaStatus | null>(null);
@@ -81,7 +83,9 @@ export function PlanDetailPage() {
   };
 
   const handleDecline = () => {
-    updatePlan(plan.id, 'declined');
+    updatePlan(plan.id, 'declined', declineFeedback.trim() || undefined);
+    setDeclineFeedback('');
+    setShowDeclineFeedback(false);
   };
 
   const handleRevise = () => {
@@ -215,7 +219,7 @@ export function PlanDetailPage() {
                   {useMultiAgent ? 'Approve (Multi-Agent)' : 'Approve & Implement'}
                 </button>
                 <button
-                  onClick={handleDecline}
+                  onClick={() => setShowDeclineFeedback(!showDeclineFeedback)}
                   disabled={actionLoading}
                   className="flex items-center gap-1.5 px-4 py-2 text-[13px] bg-red-600/80 hover:bg-red-500/80 disabled:opacity-50 text-white rounded-lg cursor-pointer"
                 >
@@ -228,6 +232,33 @@ export function PlanDetailPage() {
                   <MessageSquare size={14} /> Request Revision
                 </button>
               </div>
+
+              {showDeclineFeedback && (
+                <div className="space-y-2">
+                  <div className="flex gap-0">
+                    <div className="w-1 bg-red-500/40 rounded-full shrink-0" />
+                    <div className="flex-1 pl-3">
+                      <textarea
+                        value={declineFeedback}
+                        onChange={e => setDeclineFeedback(e.target.value)}
+                        placeholder="Optional: why is this plan being declined? (leave empty to close without a reason)"
+                        className="w-full p-3 text-[13px] bg-surface-raised border border-border-subtle rounded-lg text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-red-500/50 resize-none"
+                        rows={3}
+                        autoFocus
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      onClick={handleDecline}
+                      disabled={actionLoading}
+                      className="px-4 py-2 text-[13px] bg-red-600/80 hover:bg-red-500/80 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+                    >
+                      Confirm Decline
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {showFeedback && (
                 <div className="space-y-2">

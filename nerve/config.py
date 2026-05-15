@@ -122,6 +122,12 @@ class AgentConfig:
     # this subscription"). Match is case-insensitive substring on the resolved
     # model name. Empty list = send beta for all models when context_1m=True.
     context_1m_excluded_models: list[str] = field(default_factory=list)
+    # Hung-CLI detection: max idle time between SDK messages on a single
+    # turn before the engine treats the subprocess as dead and falls into
+    # the existing CLI-crash retry path.  Set to 0 to disable (legacy
+    # behaviour: turns can hang forever).  900s comfortably covers a 10-min
+    # Bash tool call plus SDK round-trips while still catching real hangs.
+    cli_idle_timeout_seconds: int = 900
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
@@ -139,6 +145,7 @@ class AgentConfig:
             context_1m_excluded_models=list(
                 d.get("context_1m_excluded_models", []) or []
             ),
+            cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
         )
 
     def context_1m_enabled_for(self, model: str | None) -> bool:

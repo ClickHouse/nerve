@@ -48,7 +48,22 @@ class TaskStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def list_tasks(self, status: str | None = None, tag: str | None = None, limit: int = 100) -> list[dict]:
+    # Supported sort keys → ORDER BY clause. Keep deterministic with a
+    # secondary key so equal timestamps don't flicker between pages.
+    _SORT_CLAUSES = {
+        "deadline": "deadline ASC NULLS LAST, created_at DESC, id DESC",
+        "updated_at": "updated_at DESC, id DESC",
+        "created_at": "created_at DESC, id DESC",
+    }
+
+    async def list_tasks(
+        self,
+        status: str | None = None,
+        tag: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        sort: str = "deadline",
+    ) -> list[dict]:
         conditions: list[str] = []
         params: list = []
 
@@ -66,12 +81,41 @@ class TaskStore:
             params.append(f"%,{tag.strip().lower()},%")
 
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit)
+        order_clause = self._SORT_CLAUSES.get(sort, self._SORT_CLAUSES["deadline"])
+        params.extend([limit, offset])
         async with self.db.execute(
-            f"SELECT * FROM tasks{where} ORDER BY deadline ASC NULLS LAST, created_at DESC LIMIT ?",
+            f"SELECT * FROM tasks{where} ORDER BY {order_clause} LIMIT ? OFFSET ?",
             tuple(params),
         ) as cursor:
             return [dict(row) async for row in cursor]
+
+    async def count_tasks(
+        self,
+        status: str | None = None,
+        tag: str | None = None,
+    ) -> int:
+        """Count tasks matching the given filters (without limit/offset)."""
+        conditions: list[str] = []
+        params: list = []
+
+        if status == "all":
+            pass
+        elif status:
+            conditions.append("status = ?")
+            params.append(status)
+        else:
+            conditions.append("status != 'done'")
+
+        if tag:
+            conditions.append("',' || tags || ',' LIKE ?")
+            params.append(f"%,{tag.strip().lower()},%")
+
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        async with self.db.execute(
+            f"SELECT COUNT(*) FROM tasks{where}", tuple(params),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
     async def update_task_status(self, task_id: str, status: str) -> None:
         now = datetime.now(timezone.utc).isoformat()

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Lightbulb, ListTodo, FileText, Check, X, MessageSquare, Loader2, ExternalLink } from 'lucide-react';
+import { ChevronRight, ChevronDown, Lightbulb, ListTodo, FileText, Check, X, MessageSquare, Loader2, ExternalLink, RefreshCw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { MarkdownContent } from '../MarkdownContent';
 import type { ToolCallBlockData } from '../../../types/chat';
@@ -52,10 +52,11 @@ const STATUS_COLORS: Record<string, string> = {
   superseded: 'bg-border-subtle text-text-muted',
 };
 
-type PlanTool = 'plan_propose' | 'plan_list' | 'plan_read' | 'plan_approve' | 'plan_decline' | 'plan_revise';
+type PlanTool = 'plan_propose' | 'plan_update' | 'plan_list' | 'plan_read' | 'plan_approve' | 'plan_decline' | 'plan_revise';
 
 const TOOL_CONFIG: Record<PlanTool, { label: string; icon: typeof Lightbulb; runningLabel: string }> = {
   plan_propose: { label: 'Propose Plan', icon: Lightbulb, runningLabel: 'Proposing...' },
+  plan_update:  { label: 'Update Plan', icon: RefreshCw, runningLabel: 'Updating...' },
   plan_list:    { label: 'List Plans', icon: ListTodo, runningLabel: 'Loading...' },
   plan_read:    { label: 'Read Plan', icon: FileText, runningLabel: 'Reading...' },
   plan_approve: { label: 'Approve Plan', icon: Check, runningLabel: 'Approving...' },
@@ -84,6 +85,13 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
     ? resultText.match(/Plan proposed:\s*(plan-\S+)/)?.[1]
     : null;
 
+  // plan_update: extract the new (replacement) plan ID and version
+  const updatedPlan = toolName === 'plan_update'
+    ? resultText.match(/superseded by\s+(plan-\S+)\s*\(v(\d+)\)/)
+    : null;
+  const updatedNewPlanId = updatedPlan?.[1];
+  const updatedNewVersion = updatedPlan?.[2];
+
   // plan_approve: extract impl session ID
   const implSessionId = toolName === 'plan_approve'
     ? resultText.match(/impl[_ ]session[_ ](?:id)?:?\s*(\S+)/i)?.[1]
@@ -99,6 +107,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
   // Collapsed summary text
   let summary = '';
   if (toolName === 'plan_propose') summary = String(block.input.task_id || '');
+  else if (toolName === 'plan_update' && updatedNewVersion) summary = `${planId} → v${updatedNewVersion}`;
   else if (toolName === 'plan_list' && planList.length > 0) summary = `${planList.length} plans`;
   else if (planId) summary = planId;
 
@@ -237,6 +246,37 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
                 <div className="mt-2 flex gap-0">
                   <div className="w-0.5 bg-red-400/30 rounded-full shrink-0" />
                   <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── plan_update ── */}
+          {toolName === 'plan_update' && !block.isError && (
+            <div className="px-3 py-2">
+              {block.input.content ? (
+                <div className="text-[12px] text-text-muted max-h-40 overflow-y-auto whitespace-pre-wrap">
+                  {String(block.input.content).slice(0, 500)}
+                  {String(block.input.content).length > 500 ? '...' : null}
+                </div>
+              ) : null}
+              {feedback && (
+                <div className="mt-2 flex gap-0">
+                  <div className="w-0.5 bg-amber-400/30 rounded-full shrink-0" />
+                  <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
+                </div>
+              )}
+              {updatedNewPlanId && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); navigate(`/plans/${updatedNewPlanId}`); }}
+                  className="mt-2 flex items-center gap-1 text-[11px] text-hue-amber hover:text-amber-300 cursor-pointer"
+                >
+                  <ExternalLink size={10} /> Review v{updatedNewVersion}
+                </button>
+              )}
+              {updatedNewPlanId && (
+                <div className="mt-1 text-[11px] text-hue-green/70">
+                  Plan revised — awaiting review
                 </div>
               )}
             </div>

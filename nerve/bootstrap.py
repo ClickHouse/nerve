@@ -1883,18 +1883,22 @@ def _build_docker_compose(
         extra_mounts: Additional host:container mount pairs (e.g. ["~/code:/code"]).
     """
     # Required mounts (always present)
+    # ~/.nerve/claude:/root/.claude persists Claude Code's conversation
+    # .jsonl files across container restarts. Without this mount the files
+    # are wiped on every `docker compose down/up` and the Nerve DB's stale
+    # sdk_session_id rows fail every --resume with "No conversation found"
+    # exit 1. Siloed under ~/.nerve so the agent's CLI is isolated from
+    # the host user's personal ~/.claude (where macOS stores OAuth tokens).
     volumes = [
         ".:/nerve",
         "~/.nerve:/root/.nerve",
+        "~/.nerve/claude:/root/.claude",
         f"{workspace_path}:/root/nerve-workspace",
     ]
 
     # Optional auth mounts — only include if the host directory exists.
     # Docker would create missing dirs as root-owned empties, which
     # confuses the tools and pollutes the host filesystem.
-    # Note: ~/.claude is NOT mounted — macOS stores OAuth tokens in the
-    # system Keychain, not on disk. The entrypoint exports ANTHROPIC_API_KEY
-    # from config.local.yaml instead, which the claude CLI picks up.
     _optional_mounts = [
         ("~/.config/gh", "/root/.config/gh", "gh CLI auth"),
         ("~/.config/gog", "/root/.config/gog", "gog CLI auth"),
@@ -1961,6 +1965,14 @@ if [ -z "$GH_TOKEN" ] && [ -f config.local.yaml ]; then
     _gh=$(python3 -c "import yaml; print(yaml.safe_load(open('config.local.yaml')).get('github_token',''))" 2>/dev/null)
     [ -n "$_gh" ] && export GH_TOKEN="$_gh"
 fi
+
+# Ensure the persisted Claude Code state dir exists and is writable
+# before any tool that touches /root/.claude runs. The bind mount in
+# docker-compose creates it as a host-owned empty dir on first boot;
+# we need it owned by root with 0700 so the CLI can drop its config
+# file and projects/ tree there without ENOENT or EACCES.
+mkdir -p /root/.claude
+chmod 700 /root/.claude
 
 # Clean up stale PID file from previous container runs
 rm -f ~/.nerve/nerve.pid

@@ -29,12 +29,29 @@ export type WSMessage =
 
 type MessageHandler = (msg: WSMessage) => void;
 
+/**
+ * Outcome of a send attempt.
+ *  - 'sent': payload was written to the open socket.
+ *  - 'queued': socket isn't open yet (CONNECTING or reconnect scheduled);
+ *    payload is buffered and will flush on the next `onopen`.
+ *  - 'dropped': socket is closed with no reconnect pending (or in CLOSING);
+ *    the payload was discarded. Caller should surface an error.
+ */
+export type SendStatus = 'sent' | 'queued' | 'dropped';
+
+// Cap the pending queue so a long disconnect with fast typing doesn't grow
+// memory without bound. Five slots is enough to hold a normal user's burst
+// during the 3-second reconnect window; the oldest is dropped and the new
+// payload wins. The caller still gets 'queued' for the surviving payload.
+const MAX_PENDING = 5;
+
 export class NerveWebSocket {
   private ws: WebSocket | null = null;
   private handlers: Set<MessageHandler> = new Set();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private _connected = false;
+  private _pending: Record<string, unknown>[] = [];
 
   get connected() {
     return this._connected;
@@ -53,6 +70,7 @@ export class NerveWebSocket {
     this.ws.onopen = () => {
       this._connected = true;
       this.startPing();
+      this.flushPending();
     };
 
     this.ws.onmessage = (event) => {
@@ -81,20 +99,34 @@ export class NerveWebSocket {
     this.ws?.close();
     this.ws = null;
     this._connected = false;
+    this._pending = [];
   }
 
-  send(data: Record<string, unknown>) {
+  send(data: Record<string, unknown>): SendStatus {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
+      return 'sent';
     }
+    // Queue while the socket is mid-handshake or a reconnect is scheduled.
+    // The drain happens in `onopen` once the new socket is OPEN.
+    const connecting = this.ws?.readyState === WebSocket.CONNECTING;
+    if (connecting || this.reconnectTimer !== null) {
+      if (this._pending.length >= MAX_PENDING) {
+        this._pending.shift();
+      }
+      this._pending.push(data);
+      return 'queued';
+    }
+    // CLOSING, CLOSED without reconnect, or no socket: caller must handle.
+    return 'dropped';
   }
 
-  sendMessage(content: string, sessionId: string, fileIds?: string[]) {
+  sendMessage(content: string, sessionId: string, fileIds?: string[]): SendStatus {
     const msg: Record<string, unknown> = { type: 'message', content, session_id: sessionId };
     if (fileIds && fileIds.length > 0) {
       msg.file_ids = fileIds;
     }
-    this.send(msg);
+    return this.send(msg);
   }
 
   switchSession(sessionId: string) {
@@ -134,6 +166,18 @@ export class NerveWebSocket {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+  }
+
+  private flushPending() {
+    if (this._pending.length === 0) return;
+    // Snapshot then clear so a synchronous error path can't double-send.
+    const pending = this._pending;
+    this._pending = [];
+    for (const data of pending) {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(data));
+      }
     }
   }
 

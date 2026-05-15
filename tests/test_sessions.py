@@ -1,6 +1,7 @@
 """Tests for nerve.agent.sessions — SessionManager lifecycle, forking, cleanup."""
 
 import asyncio
+import contextlib
 
 import pytest
 import pytest_asyncio
@@ -172,6 +173,37 @@ class TestRunningState:
         await task
         await asyncio.sleep(0.01)
         assert "task-cleanup" not in sm._running_tasks
+
+    async def test_register_task_replacement_does_not_clobber_new_entry(
+        self, sm: SessionManager,
+    ):
+        """An old task finishing must not pop the *new* task's registry entry.
+
+        Regression: the old code used a closure-only ``pop(session_id, None)``
+        which would clobber whatever was registered at the time, including a
+        newer task scheduled by a concurrent register_task call.  The fix
+        identity-checks the task in the done-callback.
+        """
+        async def quick():
+            await asyncio.sleep(0.01)
+
+        async def slow():
+            await asyncio.sleep(1.0)
+
+        old = asyncio.create_task(quick())
+        sm.register_task("dup-1", old)
+        # Replace before old finishes.
+        new = asyncio.create_task(slow())
+        sm.register_task("dup-1", new)
+        # Wait for the old task to finish + its done-callback to fire.
+        await old
+        await asyncio.sleep(0.05)
+        # New task must still be registered — its entry survived old's
+        # done-callback.
+        assert sm._running_tasks.get("dup-1") is new
+        new.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await new
 
     async def test_stop_session_no_client(self, sm: SessionManager):
         """Stop when there's no client or task should return False."""

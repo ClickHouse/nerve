@@ -43,6 +43,15 @@ nerve start -f
 ```
 </details>
 
+### Upgrading
+
+```bash
+nerve upgrade
+nerve restart
+```
+
+Runs `git pull`, reinstalls Python deps, and rebuilds the web UI in one shot. Use `--no-pull`, `--no-deps`, or `--no-frontend` to skip steps. For Docker deployments, rebuild the image instead: `git pull && docker compose build && docker compose up -d`.
+
 **No API key?** Use your Claude subscription instead
 
 ## Two Modes

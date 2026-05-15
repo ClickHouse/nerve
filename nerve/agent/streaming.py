@@ -50,6 +50,18 @@ class StreamBroadcaster:
         # Per-session event buffer for reconnect replay
         self._session_buffers: dict[str, list[dict[str, Any]]] = {}
         self._max_buffer_size = max_buffer_size
+        # Per-session "turn is in flight" flag.  Set by mark_turn_open()
+        # at the start of a run, cleared automatically when broadcast()
+        # ships a terminal event ("done", "stopped", "error").  Used by
+        # the engine's run() finally as a backstop: if the flag is still
+        # set after _run_inner exits, no terminal event was sent (post-
+        # stream exception, hung CLI cancelled externally, etc.) and we
+        # need to ship a synthetic "done" so the frontend exits its
+        # streaming UI state.  Without this, the chat detail stays on
+        # "thinking..." forever even though the server has cleared
+        # is_running and the session card has dropped out of the
+        # "Running" sidebar group.
+        self._open_turns: set[str] = set()
 
     async def register(self, session_id: str, callback_id: str, callback: BroadcastCallback) -> None:
         """Register a broadcast listener for a session."""
@@ -72,6 +84,11 @@ class StreamBroadcaster:
 
     async def broadcast(self, session_id: str, message: dict[str, Any]) -> None:
         """Send a message to all listeners of a session. Also buffers if active."""
+        # Terminal events close the open-turn flag so the engine's
+        # backstop in run() knows no synthetic "done" is needed.
+        if message.get("type") in ("done", "stopped", "error"):
+            self._open_turns.discard(session_id)
+
         # Buffer events during active streaming
         if session_id in self._session_buffers:
             buf = self._session_buffers[session_id]
@@ -88,6 +105,21 @@ class StreamBroadcaster:
                 await callback(session_id, message)
             except Exception as e:
                 logger.warning("Broadcast to %s failed: %s", callback_id, e)
+
+    # --- Turn tracking (engine backstop) ---
+
+    def mark_turn_open(self, session_id: str) -> None:
+        """Mark a turn as in flight. Cleared when a terminal event is
+        broadcast (done/stopped/error) or via clear_turn_open()."""
+        self._open_turns.add(session_id)
+
+    def is_turn_open(self, session_id: str) -> bool:
+        """Whether a turn is in flight (no terminal event sent yet)."""
+        return session_id in self._open_turns
+
+    def clear_turn_open(self, session_id: str) -> None:
+        """Force-clear the open-turn flag without broadcasting."""
+        self._open_turns.discard(session_id)
 
     # --- Buffering for reconnect replay ---
 
