@@ -7,24 +7,35 @@ from __future__ import annotations
 # Model pricing (per 1M tokens, USD)
 # ---------------------------------------------------------------------------
 # Mirrors Claude Code's modelCost.ts pricing tiers.
-# Key: canonical model short-name substring → (input, output, cache_read, cache_write, web_search_per_req)
-MODEL_PRICING: dict[str, tuple[float, float, float, float, float]] = {
-    "opus-4-7":   (5, 25, 0.50, 6.25, 0.01),      # Opus 4.7 standard
-    "opus-4-6":   (5, 25, 0.50, 6.25, 0.01),      # Opus 4.6 standard
-    "opus-4-5":   (5, 25, 0.50, 6.25, 0.01),      # Opus 4.5
-    "opus-4-1":   (15, 75, 1.50, 18.75, 0.01),     # Opus 4.1
-    "opus-4":     (15, 75, 1.50, 18.75, 0.01),     # Opus 4
-    "sonnet-4":   (3, 15, 0.30, 3.75, 0.01),       # Sonnet 4.x
-    "haiku-4-5":  (1, 5, 0.10, 1.25, 0.01),        # Haiku 4.5
-    "haiku-3-5":  (0.8, 4, 0.08, 1.0, 0.01),       # Haiku 3.5
+# Cache writes are billed at different rates depending on TTL:
+#   5m TTL = 1.25x base input   (default)
+#   1h TTL = 2.00x base input   (claude.ai subscriber default; opt-in via
+#                                ENABLE_PROMPT_CACHING_1H for API key users)
+# Key: canonical model short-name substring → (input, output, cache_read,
+# cache_write_5m, cache_write_1h, web_search_per_req)
+MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
+    "opus-4-7":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.7 standard
+    "opus-4-6":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.6 standard
+    "opus-4-5":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.5
+    "opus-4-1":   (15,  75, 1.50, 18.75, 30.00, 0.01),  # Opus 4.1
+    "opus-4":     (15,  75, 1.50, 18.75, 30.00, 0.01),  # Opus 4
+    "sonnet-4":   (3,   15, 0.30,  3.75,  6.00, 0.01),  # Sonnet 4.x
+    "haiku-4-5":  (1,    5, 0.10,  1.25,  2.00, 0.01),  # Haiku 4.5
+    "haiku-3-5":  (0.8,  4, 0.08,  1.00,  1.60, 0.01),  # Haiku 3.5
 }
 
 # Default fallback when model is unknown or None
-DEFAULT_PRICING = (5, 25, 0.50, 6.25, 0.01)  # Opus 4.6 standard (most common)
+DEFAULT_PRICING = (5, 25, 0.50, 6.25, 10.00, 0.01)  # Opus 4.6 standard
 
 
-def _get_pricing(model: str | None) -> tuple[float, float, float, float, float]:
-    """Resolve model string to pricing tier."""
+def _get_pricing(
+    model: str | None,
+) -> tuple[float, float, float, float, float, float]:
+    """Resolve model string to pricing tier.
+
+    Returns ``(input, output, cache_read, cache_write_5m, cache_write_1h,
+    web_search_per_req)`` per 1M tokens (web_search per request).
+    """
     if not model:
         return DEFAULT_PRICING
     m = model.lower()
@@ -47,6 +58,8 @@ class UsageStore:
         cache_read: int,
         max_context: int,
         *,
+        cache_creation_5m: int = 0,
+        cache_creation_1h: int = 0,
         model: str | None = None,
         cost_usd: float | None = None,
         duration_ms: int | None = None,
@@ -55,17 +68,27 @@ class UsageStore:
         web_search_requests: int = 0,
         web_fetch_requests: int = 0,
     ) -> None:
-        """Record token usage for a single agent turn."""
+        """Record token usage for a single agent turn.
+
+        ``cache_creation_5m`` and ``cache_creation_1h`` are the ephemeral
+        TTL split reported by the Anthropic API under
+        ``usage.cache_creation``. They sum to ``cache_creation`` when the
+        API returns the split; otherwise both default to 0 and only the
+        aggregate is preserved.
+        """
         await self.db.execute(
             "INSERT INTO session_usage "
             "(session_id, input_tokens, output_tokens, "
             "cache_creation_input_tokens, cache_read_input_tokens, "
+            "cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, "
             "max_context_tokens, model, cost_usd, duration_ms, "
             "duration_api_ms, num_turns, web_search_requests, web_fetch_requests) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id, input_tokens, output_tokens,
-                cache_creation, cache_read, max_context,
+                cache_creation, cache_read,
+                cache_creation_5m, cache_creation_1h,
+                max_context,
                 model, cost_usd, duration_ms,
                 duration_api_ms, num_turns,
                 web_search_requests, web_fetch_requests,
@@ -82,6 +105,8 @@ class UsageStore:
                 COALESCE(SUM(input_tokens), 0) as total_input,
                 COALESCE(SUM(output_tokens), 0) as total_output,
                 COALESCE(SUM(cache_creation_input_tokens), 0) as total_cache_creation,
+                COALESCE(SUM(cache_creation_5m_input_tokens), 0) as total_cache_creation_5m,
+                COALESCE(SUM(cache_creation_1h_input_tokens), 0) as total_cache_creation_1h,
                 COALESCE(SUM(cache_read_input_tokens), 0) as total_cache_read,
                 MAX(max_context_tokens) as max_context,
                 COALESCE(SUM(cost_usd), 0) as total_cost_usd,
@@ -94,7 +119,10 @@ class UsageStore:
             row = await cursor.fetchone()
             if not row or row[0] == 0:
                 return {"turns": 0, "total_input": 0, "total_output": 0,
-                        "total_cache_creation": 0, "total_cache_read": 0,
+                        "total_cache_creation": 0,
+                        "total_cache_creation_5m": 0,
+                        "total_cache_creation_1h": 0,
+                        "total_cache_read": 0,
                         "max_context": 0, "total_cost_usd": 0,
                         "total_web_searches": 0, "total_web_fetches": 0}
             return dict(row)
@@ -109,6 +137,8 @@ class UsageStore:
                 SUM(input_tokens) as input_tokens,
                 SUM(output_tokens) as output_tokens,
                 SUM(cache_creation_input_tokens) as cache_creation,
+                SUM(cache_creation_5m_input_tokens) as cache_creation_5m,
+                SUM(cache_creation_1h_input_tokens) as cache_creation_1h,
                 SUM(cache_read_input_tokens) as cache_read,
                 COALESCE(SUM(cost_usd), 0) as cost_usd,
                 COALESCE(SUM(web_search_requests), 0) as web_searches
@@ -132,6 +162,8 @@ class UsageStore:
                 SUM(u.input_tokens) as input_tokens,
                 SUM(u.output_tokens) as output_tokens,
                 SUM(u.cache_creation_input_tokens) as cache_creation,
+                SUM(u.cache_creation_5m_input_tokens) as cache_creation_5m,
+                SUM(u.cache_creation_1h_input_tokens) as cache_creation_1h,
                 SUM(u.cache_read_input_tokens) as cache_read,
                 COALESCE(SUM(u.cost_usd), 0) as cost_usd,
                 COALESCE(SUM(u.web_search_requests), 0) as web_searches
@@ -155,6 +187,8 @@ class UsageStore:
                 SUM(input_tokens) as input_tokens,
                 SUM(output_tokens) as output_tokens,
                 SUM(cache_creation_input_tokens) as cache_creation,
+                SUM(cache_creation_5m_input_tokens) as cache_creation_5m,
+                SUM(cache_creation_1h_input_tokens) as cache_creation_1h,
                 SUM(cache_read_input_tokens) as cache_read,
                 COALESCE(SUM(cost_usd), 0) as cost_usd,
                 COALESCE(SUM(web_search_requests), 0) as web_searches
@@ -220,6 +254,8 @@ class UsageStore:
                 COALESCE(SUM(output_tokens), 0) as total_output,
                 COALESCE(SUM(cache_read_input_tokens), 0) as total_cache_read,
                 COALESCE(SUM(cache_creation_input_tokens), 0) as total_cache_creation,
+                COALESCE(SUM(cache_creation_5m_input_tokens), 0) as total_cache_creation_5m,
+                COALESCE(SUM(cache_creation_1h_input_tokens), 0) as total_cache_creation_1h,
                 COALESCE(SUM(cost_usd), 0) as total_cost_usd,
                 COALESCE(SUM(web_search_requests), 0) as total_web_searches
             FROM session_usage
@@ -231,7 +267,10 @@ class UsageStore:
             if not row or row[0] == 0:
                 return {"turns": 0, "sessions": 0, "total_input": 0,
                         "total_output": 0, "total_cache_read": 0,
-                        "total_cache_creation": 0, "total_cost_usd": 0,
+                        "total_cache_creation": 0,
+                        "total_cache_creation_5m": 0,
+                        "total_cache_creation_1h": 0,
+                        "total_cost_usd": 0,
                         "total_web_searches": 0}
             d = dict(row)
             # If SDK cost is available, use it; otherwise fall back to estimate
@@ -249,29 +288,60 @@ class UsageStore:
         await self.db.commit()
 
 
+def extract_cache_ttl_split(usage: dict) -> tuple[int, int]:
+    """Pull the 5m/1h ephemeral split from the Anthropic ``usage`` dict.
+
+    The API returns this under ``usage.cache_creation`` since the 1-hour
+    cache TTL was promoted out of beta. Older responses (or when the
+    field is omitted entirely) lack the split; in that case both counts
+    return 0 and the caller should rely on the aggregate
+    ``cache_creation_input_tokens`` alone.
+    """
+    cc = usage.get("cache_creation")
+    if not isinstance(cc, dict):
+        return 0, 0
+    return (
+        int(cc.get("ephemeral_5m_input_tokens", 0) or 0),
+        int(cc.get("ephemeral_1h_input_tokens", 0) or 0),
+    )
+
+
 def estimate_turn_cost(usage: dict, model: str | None = None) -> float:
     """Estimate USD cost from a single turn's token counts.
 
     Uses model-specific pricing when model is provided, otherwise defaults
     to Opus 4.6 standard pricing.
 
+    Cache writes are split by TTL when ``usage.cache_creation`` carries
+    the ephemeral breakdown. When the split is missing (legacy rows /
+    older API responses), the aggregate ``cache_creation_input_tokens``
+    is billed at the 5-minute rate — the conservative default.
+
     NOTE: The SDK's ``input_tokens`` is already the *non-cached* portion.
     Total input = input_tokens + cache_read + cache_creation.
     """
     pricing = _get_pricing(model)
-    p_input, p_output, p_cache_read, p_cache_write, p_web_search = pricing
+    p_input, p_output, p_cache_read, p_cache_5m, p_cache_1h, p_web_search = pricing
 
     fresh_input = usage.get("input_tokens", 0)
     output_t = usage.get("output_tokens", 0)
     cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_create = usage.get("cache_creation_input_tokens", 0)
+    cache_create_total = usage.get("cache_creation_input_tokens", 0)
     server_tool = usage.get("server_tool_use") or {}
     web_searches = server_tool.get("web_search_requests", 0)
+
+    # Prefer the explicit 5m/1h split when present (post-v027 rows or
+    # raw API usage dicts). Otherwise fall back to the aggregate at the
+    # 5-minute rate.
+    write_5m, write_1h = extract_cache_ttl_split(usage)
+    if write_5m == 0 and write_1h == 0:
+        write_5m = cache_create_total
 
     cost = (
         fresh_input * p_input / 1_000_000
         + cache_read * p_cache_read / 1_000_000
-        + cache_create * p_cache_write / 1_000_000
+        + write_5m * p_cache_5m / 1_000_000
+        + write_1h * p_cache_1h / 1_000_000
         + output_t * p_output / 1_000_000
         + web_searches * p_web_search
     )
@@ -279,10 +349,29 @@ def estimate_turn_cost(usage: dict, model: str | None = None) -> float:
 
 
 def estimate_cost_from_totals(totals: dict, model: str | None = None) -> float:
-    """Estimate USD cost from aggregated totals."""
-    return estimate_turn_cost({
+    """Estimate USD cost from aggregated totals.
+
+    Honors the 5m/1h split when the totals dict carries
+    ``total_cache_creation_5m`` / ``total_cache_creation_1h`` (post-v027
+    aggregates). When absent, falls back to the legacy aggregate at the
+    5-minute rate.
+    """
+    split_5m = totals.get("total_cache_creation_5m") or 0
+    split_1h = totals.get("total_cache_creation_1h") or 0
+    # Reconstruct a usage-shaped dict so estimate_turn_cost sees the
+    # ephemeral breakdown.
+    cache_creation_field: dict | None = None
+    if split_5m or split_1h:
+        cache_creation_field = {
+            "ephemeral_5m_input_tokens": split_5m,
+            "ephemeral_1h_input_tokens": split_1h,
+        }
+    usage: dict = {
         "input_tokens": totals.get("total_input", 0),
         "output_tokens": totals.get("total_output", 0),
         "cache_read_input_tokens": totals.get("total_cache_read", 0),
         "cache_creation_input_tokens": totals.get("total_cache_creation", 0),
-    }, model=model)
+    }
+    if cache_creation_field is not None:
+        usage["cache_creation"] = cache_creation_field
+    return estimate_turn_cost(usage, model=model)

@@ -220,11 +220,14 @@ export function handleDone(
     agentStatus: { state: 'idle' },
   };
   if (msg.usage) {
+    const cc = (msg.usage as { cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } }).cache_creation;
     doneUpdate.contextUsage = {
       input_tokens: msg.usage.input_tokens || 0,
       output_tokens: msg.usage.output_tokens || 0,
       cache_creation_input_tokens: msg.usage.cache_creation_input_tokens || 0,
       cache_read_input_tokens: msg.usage.cache_read_input_tokens || 0,
+      cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
+      cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
       max_context_tokens: msg.max_context_tokens || 200_000,
       num_turns: msg.num_turns || 1,
     };

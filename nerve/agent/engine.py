@@ -2088,7 +2088,7 @@ class AgentEngine:
             # entire SDK session, NOT per-invocation.  We track the last
             # known cumulative value in session metadata so we can compute
             # the delta for this turn.
-            from nerve.db.usage import estimate_turn_cost
+            from nerve.db.usage import estimate_turn_cost, extract_cache_ttl_split
             sdk_cost = (result_meta or {}).get("total_cost_usd")
             current_session_cost = (
                 session_record.get("total_cost_usd", 0) if session_record else 0
@@ -2104,6 +2104,13 @@ class AgentEngine:
             # Save metadata (includes _sdk_cumulative_cost update)
             await self.db.update_session_metadata(session_id, meta)
 
+            # The Anthropic API splits cache_creation by TTL:
+            #   usage.cache_creation.ephemeral_5m_input_tokens  (1.25x base)
+            #   usage.cache_creation.ephemeral_1h_input_tokens  (2.00x base)
+            # Older API responses omit the split; the aggregate still
+            # lives in cache_creation_input_tokens.
+            cache_5m, cache_1h = extract_cache_ttl_split(last_usage)
+
             # Persist per-turn usage to session_usage table
             await self.db.record_turn_usage(
                 session_id=session_id,
@@ -2111,6 +2118,8 @@ class AgentEngine:
                 output_tokens=last_usage.get("output_tokens", 0),
                 cache_creation=last_usage.get("cache_creation_input_tokens", 0),
                 cache_read=last_usage.get("cache_read_input_tokens", 0),
+                cache_creation_5m=cache_5m,
+                cache_creation_1h=cache_1h,
                 max_context=max_context,
                 model=last_model,
                 cost_usd=turn_cost,

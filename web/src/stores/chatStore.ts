@@ -54,6 +54,8 @@ interface ChatState {
     output_tokens: number;
     cache_creation_input_tokens: number;
     cache_read_input_tokens: number;
+    cache_creation_5m_input_tokens?: number;
+    cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
   } | null;
@@ -330,11 +332,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
       // Restore context usage from last turn (for context bar)
       if (data.last_usage) {
+        const cc = data.last_usage.cache_creation as
+          | { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
+          | undefined;
         update.contextUsage = {
           input_tokens: data.last_usage.input_tokens || 0,
           output_tokens: data.last_usage.output_tokens || 0,
           cache_creation_input_tokens: data.last_usage.cache_creation_input_tokens || 0,
           cache_read_input_tokens: data.last_usage.cache_read_input_tokens || 0,
+          cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
+          cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
           max_context_tokens: data.last_usage.max_context_tokens || 200_000,
           num_turns: data.last_usage.num_turns || 1,
         };
