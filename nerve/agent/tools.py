@@ -2183,11 +2183,19 @@ def create_nerve_mcp_server():
     This creates a shared server where notify/ask_user use the global
     _current_session_id, which is racy under concurrent sessions.
     """
-    return create_sdk_mcp_server(
+    config = create_sdk_mcp_server(
         name="nerve",
         version="1.0.0",
         tools=ALL_TOOLS,
     )
+    # alwaysLoad: skip tool-search deferral for the in-process nerve
+    # server. Its tools (memory_recall, task_*, plan_*, notify, etc.)
+    # are core to every session and are used immediately on the first
+    # turn — deferring them adds a ToolSearch round-trip on startup
+    # for no benefit. Requires Claude Code CLI >= 2.1.121; silently
+    # ignored on older versions.
+    config["alwaysLoad"] = True  # type: ignore[typeddict-unknown-key]
+    return config
 
 
 def create_session_mcp_server(session_id: str):
@@ -2360,4 +2368,12 @@ def create_session_mcp_server(session_id: str):
 
     all_tools = shared_tools + session_tools
 
-    return create_sdk_mcp_server(name="nerve", version="1.0.0", tools=all_tools)
+    config = create_sdk_mcp_server(name="nerve", version="1.0.0", tools=all_tools)
+    # alwaysLoad: skip tool-search deferral for the in-process nerve
+    # server. Its tools (memory_recall, task_*, plan_*, notify, etc.)
+    # are core to every session and are used immediately on the first
+    # turn — deferring them adds a ToolSearch round-trip on startup
+    # for no benefit. Requires Claude Code CLI >= 2.1.121; silently
+    # ignored on older versions.
+    config["alwaysLoad"] = True  # type: ignore[typeddict-unknown-key]
+    return config

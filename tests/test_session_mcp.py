@@ -32,6 +32,19 @@ class TestSessionMCPIsolation:
         server_b = create_session_mcp_server("session-b")
         assert server_a is not server_b
 
+    async def test_nerve_server_marked_always_load(self):
+        """The nerve MCP must opt into alwaysLoad so its core tools
+        (memory_recall, task_*, plan_*, notify) skip CLI tool-search
+        deferral and are available on the first turn."""
+        from nerve.agent.tools import create_nerve_mcp_server
+        session_server = create_session_mcp_server("session-load-test")
+        legacy_server = create_nerve_mcp_server()
+        assert session_server.get("alwaysLoad") is True
+        assert legacy_server.get("alwaysLoad") is True
+        # Must remain a valid SDK server config — type and name preserved.
+        assert session_server.get("type") == "sdk"
+        assert session_server.get("name") == "nerve"
+
     async def test_notify_impl_passes_correct_session_id(self):
         """_notify_impl forwards the given session_id to the notification service."""
         mock_service = AsyncMock()
