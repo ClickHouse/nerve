@@ -258,11 +258,101 @@ class GitHubEventsSyncConfig:
 
 
 @dataclass
+class CodexOriginConfig:
+    """A single Codex thread sync origin.
+
+    Origins represent the transport over which we receive Codex thread
+    items — a local rollout directory, a remote app-server, or the
+    OpenAI cloud Codex API.
+    """
+
+    id: str = "local"
+    type: str = "local_rollout"           # local_rollout | app_server | cloud
+    enabled: bool = True
+    # local_rollout fields
+    path: str = "~/.codex/sessions"
+    archive_path: str = "~/.codex/archived_sessions"
+    poll_interval_seconds: float = 2.0    # How often to scan for new content
+    # app_server fields
+    transport: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CodexOriginConfig:
+        return cls(
+            id=d.get("id", "local"),
+            type=d.get("type", "local_rollout"),
+            enabled=bool(d.get("enabled", True)),
+            path=d.get("path", "~/.codex/sessions"),
+            archive_path=d.get("archive_path", "~/.codex/archived_sessions"),
+            poll_interval_seconds=float(d.get("poll_interval_seconds", 2.0)),
+            transport=d.get("transport", {}),
+        )
+
+
+@dataclass
+class CodexWorkspaceFilterConfig:
+    """Decides which Codex threads to sync based on ``session_meta.cwd``.
+
+    ``mode``:
+      * ``nerve_workspace`` (default) — only threads whose cwd matches
+        Nerve's configured workspace.
+      * ``explicit`` — only threads whose cwd matches one of
+        ``explicit_paths``.
+      * ``any`` — sync every thread, regardless of cwd. Not recommended
+        unless you really want every Codex session on the box.
+    """
+
+    mode: str = "nerve_workspace"
+    explicit_paths: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CodexWorkspaceFilterConfig:
+        return cls(
+            mode=str(d.get("mode", "nerve_workspace")),
+            explicit_paths=list(d.get("explicit_paths", [])),
+        )
+
+
+@dataclass
+class CodexSyncConfig:
+    """Sync configuration for Codex threads.
+
+    Disabled by default — flip ``enabled=true`` in config.local.yaml once
+    the workspace filter is verified to behave as expected on your box.
+    """
+
+    enabled: bool = False
+    workspace_filter: CodexWorkspaceFilterConfig = field(
+        default_factory=CodexWorkspaceFilterConfig,
+    )
+    origins: list[CodexOriginConfig] = field(default_factory=list)
+    store_encrypted_reasoning: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CodexSyncConfig:
+        raw_origins = d.get("origins", [])
+        origins = [
+            CodexOriginConfig.from_dict(o)
+            for o in raw_origins
+            if isinstance(o, dict)
+        ]
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            workspace_filter=CodexWorkspaceFilterConfig.from_dict(
+                d.get("workspace_filter", {}),
+            ),
+            origins=origins,
+            store_encrypted_reasoning=bool(d.get("store_encrypted_reasoning", True)),
+        )
+
+
+@dataclass
 class SyncConfig:
     telegram: TelegramSyncConfig = field(default_factory=TelegramSyncConfig)
     gmail: GmailSyncConfig = field(default_factory=GmailSyncConfig)
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
+    codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
 
@@ -273,6 +363,7 @@ class SyncConfig:
             gmail=GmailSyncConfig.from_dict(d.get("gmail", {})),
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
+            codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),
         )

@@ -37,6 +37,23 @@ def _sanitize_client_name(name: str | None) -> str:
     return safe or "external"
 
 
+_CODEX_CLIENT_NAMES = {"codex", "codex_exec", "codex_tui"}
+
+
+def _looks_like_codex_thread_id(value: str | None) -> bool:
+    """Heuristic: is this a UUID-like Codex thread id?
+
+    Codex thread ids are UUIDv7-shaped (8-4-4-4-12 hex digits with
+    dashes). We accept anything 36 chars long with four dashes — cheap
+    to evaluate and false positives are harmless (worst case the MCP
+    server creates a ``codex:<X>`` row that just won't match a sync
+    record).
+    """
+    if not value or len(value) != 36:
+        return False
+    return value.count("-") == 4
+
+
 class SatelliteSessionResolver:
     """Resolve an MCP connection to a Nerve satellite session record.
 
@@ -44,6 +61,14 @@ class SatelliteSessionResolver:
     session row exists in the DB and returns its id. Callers should cache
     the result for the lifetime of the underlying MCP connection so we
     don't hit the DB per tool call.
+
+    Codex convergence: when the connecting client identifies as
+    ``codex`` and supplies a thread-shaped ``client_session_id``, the
+    satellite is created under the canonical ``codex:<thread_id>`` id
+    that the rollout sync also uses (see
+    :mod:`nerve.sources.codex_threads.ingester`). That way an MCP tool
+    call and a synced rollout for the same Codex thread land on a
+    single session row instead of two siblings.
     """
 
     def __init__(self, db: "Database") -> None:
@@ -60,6 +85,14 @@ class SatelliteSessionResolver:
         (best-effort fallback).
         """
         return f"external:{_sanitize_client_name(client_name)}:{identifier}"
+
+    @staticmethod
+    def build_codex_session_id(thread_id: str) -> str:
+        """Build the convergent Codex thread satellite id.
+
+        Must match :func:`nerve.sources.codex_threads.ingester.codex_session_id`.
+        """
+        return f"codex:{thread_id}"
 
     async def resolve(
         self,
@@ -81,6 +114,44 @@ class SatelliteSessionResolver:
                 session id is stable across reconnects.
         """
         safe_client = _sanitize_client_name(client_name)
+
+        # Codex convergence: when we recognise the client AND a
+        # thread-shaped id was supplied, use the same session id the
+        # rollout sync will use. The two paths now merge transparently.
+        if (
+            safe_client in _CODEX_CLIENT_NAMES
+            and _looks_like_codex_thread_id(client_session_id)
+        ):
+            assert client_session_id is not None  # type narrowing
+            sid = self.build_codex_session_id(client_session_id)
+            existing = await self.db.get_session(sid)
+            if existing is not None:
+                return sid
+            metadata = {
+                "client_name": safe_client,
+                "mcp_session_id": mcp_session_id,
+                "client_session_id": client_session_id,
+                "codex_thread_id": client_session_id,
+                "runtime": "codex-external",
+                "origin_ids": ["nerve-mcp-detected"],
+            }
+            title = f"Codex/mcp ({client_session_id[:8]})"
+            try:
+                await self.db.create_session(
+                    session_id=sid,
+                    title=title,
+                    source="external",
+                    metadata=metadata,
+                    status="active",
+                )
+                logger.info(
+                    "Created Codex satellite session %s via MCP (mcp=%s)",
+                    sid, mcp_session_id,
+                )
+            except Exception:
+                logger.exception("Failed to create Codex satellite %s", sid)
+            return sid
+
         identifier = client_session_id or mcp_session_id
         sid = self.build_session_id(safe_client, identifier)
 

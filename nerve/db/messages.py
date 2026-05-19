@@ -17,16 +17,37 @@ class MessageStore:
         channel: str | None = None,
         thinking: str | None = None,
         blocks: list | None = None,
+        external_id: str | None = None,
+        created_at: str | None = None,
     ) -> int:
+        """Insert a message row. ``external_id`` enables idempotent ingest
+        from external sources (Codex thread sync, MCP server).
+
+        ``created_at`` lets external ingesters preserve original Codex
+        timestamps. Defaults to ``CURRENT_TIMESTAMP`` for native callers.
+        """
         async with self._atomic():
-            async with self.db.execute(
-                """INSERT INTO messages (session_id, role, content, thinking, blocks, channel)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, role, content, thinking,
-                 json.dumps(blocks) if blocks else None,
-                 channel),
-            ) as cursor:
-                msg_id = cursor.lastrowid
+            if created_at is not None:
+                async with self.db.execute(
+                    """INSERT INTO messages
+                         (session_id, role, content, thinking, blocks, channel,
+                          external_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, role, content, thinking,
+                     json.dumps(blocks) if blocks else None,
+                     channel, external_id, created_at),
+                ) as cursor:
+                    msg_id = cursor.lastrowid
+            else:
+                async with self.db.execute(
+                    """INSERT INTO messages
+                         (session_id, role, content, thinking, blocks, channel, external_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, role, content, thinking,
+                     json.dumps(blocks) if blocks else None,
+                     channel, external_id),
+                ) as cursor:
+                    msg_id = cursor.lastrowid
             # Update session timestamp and message counter
             now = datetime.now(timezone.utc).isoformat()
             await self.db.execute(
@@ -34,6 +55,65 @@ class MessageStore:
                 (now, session_id),
             )
         return msg_id
+
+    async def add_message_idempotent(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        external_id: str,
+        channel: str | None = None,
+        thinking: str | None = None,
+        blocks: list | None = None,
+        created_at: str | None = None,
+    ) -> int | None:
+        """Insert a message keyed on ``(session_id, external_id)``.
+
+        Returns the new message id, or ``None`` if a row with the same
+        ``external_id`` already exists for the session (no-op).
+
+        Relies on the partial unique index added in v028 — callers MUST
+        pass a non-empty ``external_id``. Use :meth:`add_message` for
+        native inserts where idempotency isn't needed.
+        """
+        if not external_id:
+            raise ValueError("add_message_idempotent requires non-empty external_id")
+        async with self._atomic():
+            ts = created_at or datetime.now(timezone.utc).isoformat()
+            async with self.db.execute(
+                """INSERT OR IGNORE INTO messages
+                     (session_id, role, content, thinking, blocks, channel,
+                      external_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, role, content, thinking,
+                 json.dumps(blocks) if blocks else None,
+                 channel, external_id, ts),
+            ) as cursor:
+                msg_id = cursor.lastrowid
+                # rowcount==0 on IGNORE-skipped insert; lastrowid still
+                # holds the previous insert's id, so we can't rely on it.
+                if cursor.rowcount == 0:
+                    return None
+            now = datetime.now(timezone.utc).isoformat()
+            await self.db.execute(
+                "UPDATE sessions SET updated_at = ?, message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
+                (now, session_id),
+            )
+        return msg_id
+
+    async def message_exists_by_external_id(
+        self, session_id: str, external_id: str,
+    ) -> bool:
+        """Check if a message with the given external_id already exists.
+
+        Cheaper than attempting an insert when you only need a yes/no.
+        """
+        async with self.db.execute(
+            "SELECT 1 FROM messages WHERE session_id = ? AND external_id = ? LIMIT 1",
+            (session_id, external_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
 
     async def get_messages(
         self, session_id: str, limit: int = 500, offset: int = 0

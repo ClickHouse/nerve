@@ -41,6 +41,10 @@ _cron_service = None  # CronService
 # config.mcp_endpoint.enabled. The /mcp/v1 mount handler reads it; until
 # lifespan finishes building it, the mount returns 503.
 _mcp_manager = None
+# CodexThreadSyncService assigned during lifespan when sync.codex.enabled.
+# Exposed on the diagnostics endpoint so the UI can render per-origin
+# health without piercing the lifespan closure.
+_codex_thread_sync = None
 
 # Memorization sweep stats (updated by background task, read by diagnostics)
 _memorize_stats: dict = {
@@ -56,6 +60,16 @@ def get_engine() -> AgentEngine:
     if _engine is None:
         raise RuntimeError("Engine not initialized")
     return _engine
+
+
+def get_codex_thread_sync():
+    """Return the running :class:`CodexThreadSyncService`, if any.
+
+    Used by ``/api/diagnostics`` so the UI can render per-origin
+    health for the Codex thread sync. Returns ``None`` when the
+    feature is disabled or hasn't finished starting up.
+    """
+    return _codex_thread_sync
 
 
 async def _send_session_status(
@@ -238,6 +252,20 @@ async def lifespan(app: FastAPI):
 
     notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
 
+    # Start the Codex thread sync service if enabled. Background tasks
+    # are spawned by the service itself — we only need to keep the
+    # handle so shutdown can cancel them cleanly.
+    global _codex_thread_sync
+    try:
+        from nerve.sources.codex_threads import build_service as _build_codex_sync
+        codex_sync = _build_codex_sync(config, db, broadcaster=broadcaster)
+        if codex_sync is not None:
+            await codex_sync.start()
+            _codex_thread_sync = codex_sync
+    except Exception as e:
+        logger.error("Failed to start Codex thread sync: %s", e, exc_info=True)
+        _codex_thread_sync = None
+
     # Start the external MCP manager if enabled — its run() context
     # owns the task group for in-flight connections. The deferred mount
     # added in create_app() reads the manager from _mcp_manager once
@@ -282,6 +310,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("MCP manager shutdown raised: %s", e)
         _mcp_manager = None
+
+    # Stop Codex thread sync. Origins each get a CancelledError; the
+    # service awaits them before returning so cursors are flushed.
+    if _codex_thread_sync is not None:
+        try:
+            await _codex_thread_sync.stop()
+        except Exception as e:
+            logger.warning("Codex thread sync shutdown raised: %s", e)
+        _codex_thread_sync = None
 
     # Shutdown: stop telegram FIRST, before cancelling background tasks.
     # Background task cancellation propagates through anyio cancel scopes
