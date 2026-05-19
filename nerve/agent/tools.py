@@ -1799,6 +1799,80 @@ async def _ask_user_impl(args: dict, session_id: str) -> dict:
         return {"content": [{"type": "text", "text": f"Failed to ask question: {e}"}]}
 
 
+def _parse_action_options(raw) -> list[dict[str, str]] | None:
+    """Parse the ``options`` arg for propose_action.
+
+    Accepts:
+    - a list of ``{"label": ..., "value": ...}`` dicts (passed through)
+    - a list of strings (interpreted as ``label == value``)
+    - a JSON-encoded string of either of the above
+    - falsy / empty -> None (caller falls back to dispatcher defaults)
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            value = str(item.get("value", "")).strip()
+            label = str(item.get("label", value)).strip()
+            if not value:
+                continue
+            out.append({"label": label or value, "value": value})
+        elif isinstance(item, str):
+            v = item.strip()
+            if v:
+                out.append({"label": v, "value": v})
+    return out or None
+
+
+async def _propose_action_impl(args: dict, session_id: str) -> dict:
+    """Core implementation for the propose_action tool."""
+    if not _notification_service:
+        return {"content": [{"type": "text", "text": "Notification service not available."}]}
+
+    target_kind = str(args.get("target_kind", "")).strip()
+    target_id = str(args.get("target_id", "")).strip()
+    title = str(args.get("title", "")).strip()
+    if not target_kind or not target_id or not title:
+        return {"content": [{"type": "text", "text": (
+            "propose_action: target_kind, target_id, and title are required."
+        )}]}
+
+    body = args.get("body", "")
+    options = _parse_action_options(args.get("options"))
+    priority = args.get("priority", "high")
+    expires_at = args.get("expires_at") or None
+
+    try:
+        result = await _notification_service.propose_action(
+            session_id=session_id,
+            target_kind=target_kind,
+            target_id=target_id,
+            title=title,
+            body=body,
+            options=options,
+            priority=priority,
+            expires_at=expires_at,
+        )
+
+        nid = result["notification_id"]
+        return {"content": [{"type": "text", "text": (
+            f"Approval requested ({nid}). When the user picks a button, "
+            f"the {target_kind} dispatcher acts on {target_id}; the answer "
+            f"is NOT injected back into this session."
+        )}]}
+    except Exception as e:
+        logger.error("propose_action tool failed: %s", e)
+        return {"content": [{"type": "text", "text": f"Failed to propose action: {e}"}]}
+
+
 async def _react_impl(args: dict, session_id: str) -> dict:
     """Core implementation for the react tool."""
     if not _engine:
@@ -2008,6 +2082,62 @@ _ASK_USER_SCHEMA = {
     "required": ["title"],
 }
 
+_PROPOSE_ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target_kind": {
+            "type": "string",
+            "description": (
+                "Dispatcher key the user's answer routes through. "
+                "Currently supported: 'mechanical-action'."
+            ),
+        },
+        "target_id": {
+            "type": "string",
+            "description": (
+                "Dispatcher-specific identifier the chosen decision acts "
+                "on (e.g. a queued mechanical-action proposal id like "
+                "'20260519T143906Z-d2e62e')."
+            ),
+        },
+        "title": {
+            "type": "string",
+            "description": "Short headline shown on the notification card.",
+        },
+        "body": {
+            "type": "string",
+            "description": (
+                "Markdown body with the justification and any details "
+                "the user needs to decide."
+            ),
+            "default": "",
+        },
+        "options": {
+            "type": "string",
+            "description": (
+                "JSON array of {label, value} dicts overriding the "
+                "dispatcher's default options. Leave empty for the "
+                "canonical Approve / Decline / Snooze 24h triplet."
+            ),
+            "default": "",
+        },
+        "priority": {
+            "type": "string",
+            "description": "'low', 'normal', 'high', 'urgent'. Default: 'high'.",
+            "default": "high",
+        },
+        "expires_at": {
+            "type": "string",
+            "description": (
+                "ISO-8601 UTC timestamp the row expires at. Omit to use "
+                "the configured default expiry window."
+            ),
+            "default": "",
+        },
+    },
+    "required": ["target_kind", "target_id", "title"],
+}
+
 _REACT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -2075,6 +2205,21 @@ async def send_sticker_tool(args: dict) -> dict:
 async def ask_user_tool(args: dict) -> dict:
     """Ask the user a question asynchronously (fallback — uses deprecated global)."""
     return await _ask_user_impl(args, _current_session_id)
+
+
+@tool(
+    "propose_action",
+    "Ask the user to approve, decline, or snooze a queued action. "
+    "Unlike ask_user, the answer routes through a server-side dispatcher "
+    "keyed by target_kind (e.g. 'mechanical-action') and acts on target_id "
+    "directly. The answer is NOT injected back into this session. "
+    "Use for queued mechanical actions, pending plans, or any binary "
+    "decision the user owns and the agent has already prepared.",
+    _PROPOSE_ACTION_SCHEMA,
+)
+async def propose_action_tool(args: dict) -> dict:
+    """Propose an action (fallback path; uses deprecated global)."""
+    return await _propose_action_impl(args, _current_session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2228,6 +2373,20 @@ def create_session_mcp_server(session_id: str):
         return await _ask_user_impl(args, session_id)
 
     @tool(
+        "propose_action",
+        "Ask the user to approve, decline, or snooze a queued action. "
+        "Unlike ask_user, the answer routes through a server-side dispatcher "
+        "keyed by target_kind (e.g. 'mechanical-action') and acts on target_id "
+        "directly. The answer is NOT injected back into this session. "
+        "Use for queued mechanical actions, pending plans, or any binary "
+        "decision the user owns and the agent has already prepared.",
+        _PROPOSE_ACTION_SCHEMA,
+    )
+    async def session_propose_action(args: dict) -> dict:
+        # session_id captured from enclosing scope; race-free.
+        return await _propose_action_impl(args, session_id)
+
+    @tool(
         "react",
         "Set an emoji reaction on the user's last message. "
         "Use to acknowledge messages, express emotions, or respond non-verbally. "
@@ -2357,8 +2516,8 @@ def create_session_mcp_server(session_id: str):
         return await _send_file_impl(args, session_id)
 
     # Shared tools (don't need session context) + session-scoped tools
-    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker", "plan_propose", "plan_update")]
-    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_plan_propose, session_plan_update, session_send_file]
+    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "propose_action", "react", "send_sticker", "plan_propose", "plan_update")]
+    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_propose_action, session_react, session_send_sticker, session_plan_propose, session_plan_update, session_send_file]
 
     # Only include houseofagents tools when enabled — saves context tokens otherwise
     hoa_enabled = _config and _config.houseofagents.enabled
