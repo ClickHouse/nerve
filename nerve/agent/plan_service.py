@@ -85,9 +85,11 @@ async def request_plan_revision(
           ``plan_update(plan_id=..., content=..., feedback=<summary>)``
           so version history stays linked.
     """
-    # Import here to avoid a circular import: tools.py imports plan_service
-    # indirectly via the engine wiring.
-    from nerve.agent.tools import task_update as task_update_tool
+    # Import here to avoid a circular import: tool handlers import
+    # plan_service indirectly via the engine wiring.
+    from dataclasses import replace
+    from nerve.agent.tools import _legacy_ctx
+    from nerve.agent.tools.handlers.tasks import task_update_handler
 
     feedback = feedback.strip()
     if not feedback:
@@ -113,9 +115,15 @@ async def request_plan_revision(
     await db.update_plan(plan_id, feedback=feedback)
 
     # 2. Write a task note so the revision request is visible in the
-    #    task's history.
+    #    task's history. Build a ``ToolContext`` from the legacy module
+    #    globals (which ``engine.initialize`` / ``init_tools`` set up)
+    #    and override the db + engine fields with the ones explicitly
+    #    handed to this helper — tests pass a FakeEngine that doesn't
+    #    expose ``.config``, so we can't read workspace off ``engine``
+    #    directly.
     feedback_summary = feedback[:80] + "..." if len(feedback) > 80 else feedback
-    await task_update_tool.handler({
+    task_ctx = replace(_legacy_ctx("system"), db=db, engine=engine)
+    await task_update_handler(task_ctx, {
         "task_id": plan["task_id"],
         "note": f"Revision requested for {plan_id}: {feedback_summary}",
     })

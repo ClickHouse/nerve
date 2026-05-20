@@ -598,6 +598,10 @@ class SessionManager:
         Called on startup. Sessions with sdk_session_id are marked idle
         (resumable); sessions without are marked stopped.
 
+        Satellite sessions (``source="external"``) are skipped — they're
+        managed by a different runtime (Codex, Claude Code, ...) and a
+        missing Claude SDK client is the expected state, not an orphan.
+
         Returns count of sessions recovered.
         """
         orphans = await self.db.get_sessions_by_status(
@@ -608,6 +612,12 @@ class SessionManager:
             sid = session["id"]
             if sid in self._clients:
                 continue  # Still has a live client
+
+            if session.get("source") == "external":
+                # External satellites don't have (or want) an SDK client.
+                # Leave them alone — the owning runtime keeps them active
+                # for as long as it has the thread open.
+                continue
 
             if session.get("sdk_session_id"):
                 await self.transition(sid, SessionStatus.IDLE, {

@@ -64,6 +64,16 @@ cron:
   system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
   jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
 
+# External MCP server (optional) — expose Nerve's tool registry to
+# external MCP clients (Codex, Claude Code, Cursor) over Streamable HTTP.
+# Off by default. Authentication reuses the gateway JWT
+# (auth.jwt_secret) — present it as `Authorization: Bearer <jwt>` or
+# `?token=<jwt>`. Connect a client with the URL "https://<host>:8900/mcp/v1/".
+# mcp_endpoint:
+#   enabled: false
+#   path: /mcp/v1
+#   include_hoa: false   # Expose hoa_* tools externally (default off)
+
 # Observability (optional) — Langfuse tracing for the agent loop and memU.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.
 # See docs/observability.md for setup details.

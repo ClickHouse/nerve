@@ -39,7 +39,18 @@ from nerve.agent.interactive import (
 from nerve.agent.prompts import build_system_prompt, set_skill_manager
 from nerve.agent.sessions import SessionManager, SessionStatus
 from nerve.agent.streaming import broadcaster
-from nerve.agent.tools import ALL_TOOLS, create_session_mcp_server, init_tools
+from nerve.agent.tools import (
+    ToolContext,
+    ToolRegistry,
+    build_default_registry,
+    build_session_mcp_server,
+)
+# Legacy back-compat: ``init_tools`` populates ``nerve.agent.tools``'s
+# module globals so test fixtures that patch them and the shared
+# ``plan_service`` helper (which builds its ctx via ``_legacy_ctx``)
+# keep working. The new runtime path uses ``self.registry`` + a
+# per-session ``ToolContext`` and ignores those globals.
+from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, load_mcp_servers
 from nerve.db import Database
 from nerve.observability.langfuse import attributes as lf_attrs
@@ -266,6 +277,26 @@ class AgentEngine:
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
+        # Tool registry — built once at construction. Per-session MCP
+        # servers are built in ``_build_mcp_servers`` by binding a fresh
+        # ``ToolContext`` (with the session_id) into closures.
+        self.registry: ToolRegistry = build_default_registry()
+
+        # NotificationService is wired in by ``gateway/server.py`` after
+        # ``initialize()`` returns (it depends on the engine being live
+        # so the channels are routable). Use ``set_notification_service``
+        # to install it; ``ToolContext`` constructed per session picks
+        # up the reference from here.
+        self.notification_service: Any = None
+
+    def set_notification_service(self, service: Any) -> None:
+        """Install the notification service used by per-session ``ToolContext``.
+
+        Called once during gateway startup. We accept ``Any`` to avoid
+        a circular import with :mod:`nerve.notifications.service`.
+        """
+        self.notification_service = service
+
     def get_active_channel(self, session_id: str) -> str | None:
         """Return the channel name currently driving ``session_id`` (or None)."""
         return self._active_channel.get(session_id)
@@ -286,6 +317,11 @@ class AgentEngine:
 
         # Make skill manager available to prompts and tools
         set_skill_manager(self._skill_manager)
+        # init_tools seeds ``nerve.agent.tools``'s back-compat module
+        # globals so legacy callers (tests that patch ``tools._workspace``,
+        # ``plan_service`` via ``_legacy_ctx``) keep working. The new
+        # runtime path builds a fresh ``ToolContext`` per session inside
+        # ``_build_mcp_servers`` and doesn't read these.
         init_tools(
             self.config.workspace, self.db,
             memory_bridge=self._memory_bridge,
@@ -327,10 +363,15 @@ class AgentEngine:
 
     async def _sync_mcp_servers_to_db(self) -> None:
         """Register all known MCP servers (built-in + external) in the DB."""
-        # Built-in nerve server
+        # Built-in nerve server. HoA tools are only exposed when enabled,
+        # so the count reflects the runtime visible set rather than the
+        # full registry. The frontend uses this number as a hint and is
+        # not load-bearing.
+        include_hoa = bool(self.config.houseofagents.enabled)
+        tool_count = len(self.registry.list(include_hoa=include_hoa))
         await self.db.upsert_mcp_server(
             name="nerve", server_type="sdk", enabled=True,
-            tool_count=len(ALL_TOOLS),
+            tool_count=tool_count,
         )
         # External servers from cache
         for srv in self._mcp_servers_cache:
@@ -920,10 +961,26 @@ class AgentEngine:
         Claude Code plugin MCPs are handled separately via the SDK ``plugins``
         field which lets the CLI manage OAuth and plugin lifecycle natively.
         """
+        # Construct a fresh ``ToolContext`` per session so every tool
+        # handler sees the correct session_id and the live collaborator
+        # references. The notification_service may still be ``None``
+        # here if a session starts before gateway startup wires it; the
+        # tools themselves degrade gracefully in that case.
+        tool_ctx = ToolContext(
+            session_id=session_id,
+            workspace=self.config.workspace,
+            db=self.db,
+            memory_bridge=self._memory_bridge,
+            config=self.config,
+            skill_manager=self._skill_manager,
+            engine=self,
+            notification_service=self.notification_service,
+        )
+        include_hoa = bool(self.config.houseofagents.enabled)
         servers: dict[str, Any] = {
-            # Per-session MCP server with session_id bound in closure —
-            # ensures notify/ask_user always reference the correct session.
-            "nerve": create_session_mcp_server(session_id),
+            "nerve": build_session_mcp_server(
+                self.registry, tool_ctx, include_hoa=include_hoa,
+            ),
         }
         for srv in self._mcp_servers_cache:
             if srv.enabled and srv.name != "nerve":

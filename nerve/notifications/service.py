@@ -147,6 +147,26 @@ class NotificationService:
 
         from nerve.agent.streaming import broadcaster
 
+        # External (satellite) sessions are MCP-driven by an outside agent
+        # (Codex, Claude Code, ...). Nerve doesn't own their conversation
+        # loop, so injecting a user message and calling engine.run() would
+        # spin up a stray native turn that the external agent never sees.
+        # Mark the answer stored, broadcast to the UI, and stop.
+        session_record = await self.db.get_session(session_id)
+        is_external = bool(
+            session_record and session_record.get("source") == "external"
+        )
+
+        if is_external:
+            await broadcaster.broadcast("__global__", {
+                "type": "notification_answered",
+                "notification_id": notification_id,
+                "session_id": session_id,
+                "answer": answer,
+                "answered_by": answered_by,
+            })
+            return True
+
         # Inject answer as user message into the session
         injected_message = f"[Answer to: {notif['title']}]\n\n{answer}"
 
