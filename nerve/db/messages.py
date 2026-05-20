@@ -115,6 +115,58 @@ class MessageStore:
             row = await cursor.fetchone()
             return row is not None
 
+    async def merge_tool_result_into_call(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        result: str | list | dict,
+        is_error: bool,
+    ) -> int | None:
+        """Find the tool_call message for ``tool_use_id`` and attach the
+        result + is_error fields to its block.
+
+        The Nerve UI renders tool calls and results in a single combined
+        ``tool_call`` block — call inputs + result text live side by side.
+        External ingest paths see them as separate Codex events, so the
+        ingester needs to fold the second event into the first message.
+
+        Returns the message ``id`` that was updated, or ``None`` if no
+        matching tool_call message exists (in which case the caller can
+        fall back to inserting a tool-result-only row).
+        """
+        external_id = f"tool_call:{tool_use_id}"
+        async with self.db.execute(
+            "SELECT id, blocks FROM messages WHERE session_id = ? AND external_id = ? LIMIT 1",
+            (session_id, external_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        msg_id, blocks_json = row["id"], row["blocks"]
+        if not blocks_json:
+            return None
+        try:
+            blocks = json.loads(blocks_json)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        updated = False
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_call" and b.get("tool_use_id") == tool_use_id:
+                b["result"] = result
+                b["is_error"] = bool(is_error)
+                updated = True
+                break
+        if not updated:
+            return None
+        await self.db.execute(
+            "UPDATE messages SET blocks = ? WHERE id = ?",
+            (json.dumps(blocks), msg_id),
+        )
+        await self.db.commit()
+        return msg_id
+
     async def get_messages(
         self, session_id: str, limit: int = 500, offset: int = 0
     ) -> list[dict]:

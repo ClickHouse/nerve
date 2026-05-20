@@ -553,6 +553,75 @@ class McpEndpointConfig:
 
 
 @dataclass
+class ExternalAgentTargetConfig:
+    """One configured external agent (Codex, Claude Code, ...).
+
+    Populated by the bootstrap wizard's ``_step_external_agents`` step
+    and read by :class:`nerve.external_agents.sync_service.SyncService`
+    every interval to keep the agent's memory files in sync with the
+    workspace identity files.
+
+    ``token`` is the bearer JWT the agent uses to authenticate against
+    the local MCP endpoint. It's written into the agent's config once
+    at bootstrap (e.g. into ``~/.codex/config.toml``); the sync service
+    does NOT rewrite the config file, only the memory bundle.
+    """
+
+    name: str                                  # registry key: "codex" | "claude-code" | ...
+    enabled: bool = True
+    token: str = ""                            # bearer JWT for MCP auth (informational only)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ExternalAgentTargetConfig:
+        return cls(
+            name=str(d.get("name", "")),
+            enabled=bool(d.get("enabled", True)),
+            token=str(d.get("token", "")),
+        )
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "enabled": self.enabled, "token": self.token}
+
+
+@dataclass
+class ExternalAgentsConfig:
+    """Configuration for the external-agents bootstrap + sync subsystem.
+
+    The bootstrap wizard writes one :class:`ExternalAgentTargetConfig`
+    per agent selected, plus the global conflict policy chosen for
+    pre-existing files. The sync service iterates ``targets`` every
+    ``sync_interval_minutes`` and re-renders that agent's memory
+    bundle when any source file changes.
+
+    ``conflict_policy`` controls how :class:`nerve.external_agents.writer.ConfigWriter`
+    handles paths that already exist when the wizard's apply step runs:
+    ``backup`` (default) saves a ``.nerve-backup-<ts>`` copy then
+    overwrites; ``skip`` leaves the existing file alone; ``merge`` is
+    only meaningful for JSON files (used by Claude Code's settings.json).
+    """
+
+    enabled: bool = True
+    sync_interval_minutes: int = 15
+    conflict_policy: str = "backup"            # "backup" | "skip" | "merge"
+    targets: list[ExternalAgentTargetConfig] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ExternalAgentsConfig:
+        raw_targets = d.get("targets", [])
+        targets: list[ExternalAgentTargetConfig] = []
+        if isinstance(raw_targets, list):
+            for raw in raw_targets:
+                if isinstance(raw, dict) and raw.get("name"):
+                    targets.append(ExternalAgentTargetConfig.from_dict(raw))
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            sync_interval_minutes=int(d.get("sync_interval_minutes", 15)),
+            conflict_policy=str(d.get("conflict_policy", "backup")),
+            targets=targets,
+        )
+
+
+@dataclass
 class McpServerConfig:
     """External MCP server configuration.
 
@@ -769,6 +838,7 @@ class NerveConfig:
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
+    external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
 
     # API keys (from config.local.yaml)
     anthropic_api_key: str = ""
@@ -877,6 +947,7 @@ class NerveConfig:
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
+            external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),

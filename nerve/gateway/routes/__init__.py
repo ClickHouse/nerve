@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from nerve.gateway.routes._deps import get_deps, init_deps, set_notification_service
+from nerve.gateway.routes._deps import (
+    get_deps,
+    init_deps,
+    set_external_agents_sync,
+    set_notification_service,
+)
 from nerve.gateway.routes import (
     auth,
     sessions,
@@ -25,12 +30,14 @@ from nerve.gateway.routes import (
     notifications,
     houseofagents,
     files,
+    external_agents,
 )
 
 __all__ = [
     "register_all_routes",
     "init_deps",
     "set_notification_service",
+    "set_external_agents_sync",
     "get_deps",
 ]
 
@@ -51,4 +58,5 @@ def register_all_routes() -> APIRouter:
     router.include_router(notifications.router)
     router.include_router(houseofagents.router)
     router.include_router(files.router)
+    router.include_router(external_agents.router)
     return router

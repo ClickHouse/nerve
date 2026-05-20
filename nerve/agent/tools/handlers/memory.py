@@ -23,6 +23,7 @@ from nerve.agent.tools.schemas import (
     MEMORY_RECALL_SCHEMA,
     MEMORY_RECORDS_BY_DATE_SCHEMA,
     MEMORY_UPDATE_SCHEMA,
+    SESSION_CONTEXT_SCHEMA,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,106 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
             return ToolResult.text(f"Memory recall error: {e}")
 
     return ToolResult.text("Memory service not configured.")
+
+
+async def session_context_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Return the dynamic startup context as a single combined message.
+
+    Nerve-owned sessions get this context for free — the system prompt
+    builder injects recalled memories, active skills, and session
+    metadata. External MCP clients (Codex, Claude Code) need to fetch
+    it explicitly because they have no system-prompt hook. AGENTS.md
+    instructs them to call this tool as their first action.
+
+    The recall query is biased by ``topic`` so the priors returned are
+    actually relevant to the task the agent is about to attempt.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    topic = (args.get("topic") or "").strip()
+    if not topic:
+        return ToolResult.text(
+            "session_context() requires a non-empty `topic` argument. "
+            "Pass a short description of what you're about to work on.",
+            is_error=True,
+        )
+
+    include_skills = bool(args.get("include_skills", True))
+    memory_limit = int(args.get("memory_limit", 15))
+
+    parts: list[str] = []
+
+    # Session metadata (id, source, current time, workspace)
+    session_record: dict | None = None
+    if ctx.db is not None and ctx.session_id:
+        try:
+            session_record = await ctx.db.get_session(ctx.session_id)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("session_context: get_session failed: %s", e)
+
+    tz_name = "UTC"
+    if ctx.config is not None:
+        tz_name = ctx.config.timezone or "UTC"
+    try:
+        now = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    source = (session_record or {}).get("source", "external") if session_record else "external"
+    workspace = str(ctx.workspace) if ctx.workspace else "(unknown)"
+
+    parts.append(
+        "# Session Context\n\n"
+        f"- **Session ID:** {ctx.session_id or '(none)'}\n"
+        f"- **Source:** {source}\n"
+        f"- **Current time:** {now}\n"
+        f"- **Workspace:** {workspace}\n"
+        f"- **Topic:** {topic}"
+    )
+
+    # Recalled memories (biased by topic)
+    if ctx.memory_bridge and ctx.memory_bridge.available:
+        try:
+            results = await ctx.memory_bridge.recall(
+                f"context for {source} session: {topic}",
+                limit=memory_limit,
+            )
+            if results:
+                lines = [
+                    f"- [{m['type']}] (id:{m['id']}) {m['summary']}"
+                    for m in results
+                ]
+                parts.append(
+                    f"# Recalled Memories ({len(results)} biased by topic)\n\n"
+                    + "\n".join(lines)
+                )
+            else:
+                parts.append("# Recalled Memories\n\n(none — fresh topic or empty memU)")
+        except Exception as e:
+            logger.warning("session_context recall failed: %s", e)
+            parts.append(f"# Recalled Memories\n\n_recall error: {e}_")
+    else:
+        parts.append("# Recalled Memories\n\n_memory bridge not available_")
+
+    # Active skills summary
+    if include_skills and ctx.skill_manager is not None:
+        try:
+            summaries = await ctx.skill_manager.get_enabled_summaries()
+            if summaries:
+                lines = [
+                    f"- **{s['name']}** (`{s['id']}`): {s['description']}"
+                    for s in summaries
+                ]
+                parts.append(
+                    f"# Active Skills ({len(summaries)})\n\n" + "\n".join(lines)
+                )
+            else:
+                parts.append("# Active Skills\n\n(none enabled)")
+        except Exception as e:
+            logger.warning("session_context skill list failed: %s", e)
+
+    return ToolResult.text("\n\n---\n\n".join(parts))
 
 
 async def conversation_history_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -246,6 +347,21 @@ MEMORY_RECALL_SPEC = ToolSpec(
     handler=memory_recall_handler,
 )
 
+SESSION_CONTEXT_SPEC = ToolSpec(
+    name="session_context",
+    description=(
+        "Return the dynamic startup context: recalled memU priors biased "
+        "by the supplied topic, a summary of currently active skills, and "
+        "session metadata (id, source, current time, workspace). External "
+        "MCP clients (Codex, Claude Code) should call this as their first "
+        "action in a fresh thread — it gives them parity with Nerve-owned "
+        "sessions, which receive the same context via system-prompt "
+        "injection."
+    ),
+    input_schema=SESSION_CONTEXT_SCHEMA,
+    handler=session_context_handler,
+)
+
 CONVERSATION_HISTORY_SPEC = ToolSpec(
     name="conversation_history",
     description="Get memory items from a specific date or date range. Use for temporal queries like 'what did I do yesterday'.",
@@ -304,6 +420,7 @@ CATEGORY_UPDATE_SPEC = ToolSpec(
 
 MEMORY_SPECS = [
     MEMORY_RECALL_SPEC,
+    SESSION_CONTEXT_SPEC,
     CONVERSATION_HISTORY_SPEC,
     MEMORY_RECORDS_BY_DATE_SPEC,
     MEMORIZE_SPEC,

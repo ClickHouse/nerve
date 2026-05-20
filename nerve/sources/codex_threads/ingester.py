@@ -216,6 +216,10 @@ class CodexIngester:
         sync source later discovers the rollout file. We add
         ``origin_ids`` (a list) and backfill any codex_* fields the
         MCP server didn't know about.
+
+        Also reactivates ``stopped`` sessions — orphan recovery (or an
+        older Nerve version) may have flipped them off, but if we're
+        seeing rollout events the Codex side is alive again.
         """
         import json as _json
         try:
@@ -240,6 +244,13 @@ class CodexIngester:
         meta.setdefault("client_name", "codex")
         meta.setdefault("runtime", "codex-external")
         await self.db.update_session_metadata(session_id, meta)
+        # Bring stopped sessions back to active when their rollout is
+        # still alive. Archived stays archived.
+        if existing.get("status") == "stopped":
+            try:
+                await self.db.update_session_fields(session_id, {"status": "active"})
+            except Exception:
+                logger.exception("Failed to reactivate session %s", session_id)
 
     async def _archive_session(self, thread_id: str) -> None:
         session_id = codex_session_id(thread_id)
@@ -256,6 +267,46 @@ class CodexIngester:
     async def _insert_message(
         self, session_id: str, msg: StoredMessage,
     ) -> None:
+        # Merge intent — fold this tool_result onto the matching
+        # tool_call message's block instead of creating a new row.
+        if msg.merge_into_tool_use_id is not None:
+            merged_id = await self.db.merge_tool_result_into_call(
+                session_id=session_id,
+                tool_use_id=msg.merge_into_tool_use_id,
+                result=msg.merge_result,
+                is_error=msg.merge_is_error,
+            )
+            if merged_id is not None:
+                self.stats["messages_inserted"] += 0  # merge isn't a new row
+                await self._broadcast(session_id, {
+                    "type": "tool_result",
+                    "session_id": session_id,
+                    "message_id": merged_id,
+                    "tool_use_id": msg.merge_into_tool_use_id,
+                    "result": msg.merge_result,
+                    "is_error": msg.merge_is_error,
+                })
+                return
+            # No matching tool_call yet — happens if Codex flushed the
+            # output line before its function_call (rare, but possible).
+            # Fall through and insert a synthetic tool_call carrying the
+            # result so the UI shows something.
+            msg = StoredMessage(
+                role="assistant",
+                external_id=f"tool_call:{msg.merge_into_tool_use_id}",
+                content=msg.content,
+                blocks=[{
+                    "type": "tool_call",
+                    "tool": "(unknown — result arrived before call)",
+                    "input": {},
+                    "tool_use_id": msg.merge_into_tool_use_id,
+                    "result": msg.merge_result,
+                    "is_error": msg.merge_is_error,
+                }],
+                created_at=msg.created_at,
+                channel=msg.channel,
+            )
+
         created_at = msg.created_at.isoformat() if msg.created_at else None
         try:
             inserted = await self.db.add_message_idempotent(

@@ -42,6 +42,10 @@ class StoredMessage:
 
     Mirrors the columns the ingester writes plus an ``external_id`` for
     idempotency.
+
+    Tool results carry ``merge_into_tool_use_id`` so the ingester can
+    fold them into the matching tool_call message's block rather than
+    creating a phantom assistant message the UI can't render.
     """
 
     role: str                      # "user" | "assistant" | "tool"
@@ -52,6 +56,9 @@ class StoredMessage:
     created_at: datetime | None = None
     channel: str = "codex"
     external_metadata: dict = field(default_factory=dict)
+    merge_into_tool_use_id: str | None = None
+    merge_result: Any = None
+    merge_is_error: bool = False
 
 
 # ----------------------------------------------------------------------
@@ -222,14 +229,18 @@ def _translate_tool_call(
 def _translate_tool_result(
     event: ThreadEvent, *, store_encrypted_reasoning: bool,
 ) -> list[StoredMessage]:
-    """Emit BOTH a tool_call message (if not already covered) and a
-    tool_result message.
+    """Emit a tool_call message (if not yet recorded) plus a merge
+    intent that folds the result into that block.
 
-    ``mcp_tool_call_end`` carries the structured arguments AND the
-    result, so when we see it the matching ``function_call`` row may
-    already exist (from a prior ``response_item``) or may never appear
-    (purely MCP-routed call). Emitting both is safe because the unique
-    index dedupes on ``(session_id, tool_call:<call_id>)``.
+    The Nerve UI renders calls and results in a single combined
+    ``tool_call`` block. We never insert a standalone tool_result row
+    — the ingester sees ``merge_into_tool_use_id`` and updates the
+    existing message's blocks instead.
+
+    ``mcp_tool_call_end`` carries both the structured ``invocation``
+    and a structured ``result: {Ok|Err}``. The plain
+    ``response_item/function_call_output`` only carries the raw output
+    text — we still emit a merge intent for it.
     """
     p = event.payload
     call_id = p.get("call_id") or ""
@@ -279,17 +290,16 @@ def _translate_tool_result(
         content = _strip_exec_header(raw) if isinstance(raw, str) else _stringify_result(raw)
         is_error = bool(p.get("is_error", False))
 
+    # Merge intent — the ingester folds these fields onto the existing
+    # tool_call message's block; nothing new gets inserted.
     messages.append(StoredMessage(
         role="tool",
         external_id=f"tool_result:{call_id}",
         content=content if isinstance(content, str) else json.dumps(content),
-        blocks=[{
-            "type": "tool_result",
-            "tool_use_id": call_id,
-            "result": content,
-            "is_error": is_error,
-        }],
         created_at=event.timestamp,
+        merge_into_tool_use_id=call_id,
+        merge_result=content,
+        merge_is_error=is_error,
     ))
     return messages
 

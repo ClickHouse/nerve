@@ -232,6 +232,72 @@ async def test_existing_satellite_session_is_merged_not_duplicated(
 
 
 @pytest.mark.asyncio
+async def test_tool_result_merges_into_existing_tool_call_block(db, tmp_path):
+    ing = CodexIngester(
+        db, origin_id="o",
+        workspace_filter=_filter(tmp_path),
+        broadcaster=_NullBroadcaster(),
+    )
+    tid = "t1"
+    await ing.ingest(_evt(
+        "thread_in_scope",
+        thread_id=tid,
+        payload=_session_meta_payload(tid, str(tmp_path)),
+    ))
+    # function_call arrives first…
+    await ing.ingest(_evt(
+        "tool_call",
+        thread_id=tid,
+        payload={"name": "ls", "arguments": '{"path":"/tmp"}', "call_id": "c1"},
+        seq=2,
+    ))
+    # …then function_call_output.
+    await ing.ingest(_evt(
+        "tool_result",
+        thread_id=tid,
+        payload={"call_id": "c1", "output": "file_a\nfile_b\n"},
+        seq=3,
+    ))
+    msgs = await db.get_messages(codex_session_id(tid))
+    # ONE message, not two — the result was folded into the tool_call block.
+    assert len(msgs) == 1
+    block = msgs[0]["blocks"][0]
+    assert block["type"] == "tool_call"
+    assert block["tool_use_id"] == "c1"
+    assert block["result"] == "file_a\nfile_b\n"
+    assert block["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_tool_result_without_prior_call_inserts_synthetic_call(db, tmp_path):
+    ing = CodexIngester(
+        db, origin_id="o",
+        workspace_filter=_filter(tmp_path),
+        broadcaster=_NullBroadcaster(),
+    )
+    tid = "t1"
+    await ing.ingest(_evt(
+        "thread_in_scope",
+        thread_id=tid,
+        payload=_session_meta_payload(tid, str(tmp_path)),
+    ))
+    # tool_result with no prior tool_call (edge case — Codex flushed
+    # the output line before the call).
+    await ing.ingest(_evt(
+        "tool_result",
+        thread_id=tid,
+        payload={"call_id": "orphan", "output": "huh"},
+        seq=2,
+    ))
+    msgs = await db.get_messages(codex_session_id(tid))
+    assert len(msgs) == 1
+    block = msgs[0]["blocks"][0]
+    assert block["type"] == "tool_call"
+    assert block["tool_use_id"] == "orphan"
+    assert block["result"] == "huh"
+
+
+@pytest.mark.asyncio
 async def test_turn_events_do_not_create_messages(db, tmp_path):
     ing = CodexIngester(
         db, origin_id="o",

@@ -25,7 +25,12 @@ from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.gateway.auth import authenticate_websocket
-from nerve.gateway.routes import init_deps, register_all_routes, set_notification_service
+from nerve.gateway.routes import (
+    init_deps,
+    register_all_routes,
+    set_external_agents_sync,
+    set_notification_service,
+)
 from nerve.mcp_server import build_manager as _build_mcp_manager, mount_deferred as _mount_mcp_deferred
 from nerve.observability.langfuse import (
     flush as langfuse_flush,
@@ -45,6 +50,11 @@ _mcp_manager = None
 # Exposed on the diagnostics endpoint so the UI can render per-origin
 # health without piercing the lifespan closure.
 _codex_thread_sync = None
+# External-agents SyncService — re-renders ~/.codex/AGENTS.md,
+# ~/.claude/CLAUDE.md, etc. when source files change. Built in the
+# lifespan once the config is loaded so the periodic sweep starts the
+# moment the gateway accepts traffic.
+_external_agents_sync = None
 
 # Memorization sweep stats (updated by background task, read by diagnostics)
 _memorize_stats: dict = {
@@ -252,6 +262,27 @@ async def lifespan(app: FastAPI):
 
     notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
 
+    # Start the external-agents sync service. It re-renders
+    # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace
+    # identity files on a timer (config.external_agents.sync_interval_minutes).
+    # Failure here is non-fatal: external agents just won't receive
+    # automatic updates, but the gateway and MCP endpoint still work.
+    global _external_agents_sync
+    if config.external_agents.enabled and config.external_agents.targets:
+        try:
+            from nerve.external_agents.sync_service import SyncService
+            _external_agents_sync = SyncService(config)
+            await _external_agents_sync.start()
+            set_external_agents_sync(_external_agents_sync)
+            logger.info(
+                "External-agents sync started (%d target(s), interval=%dm)",
+                len(config.external_agents.targets),
+                config.external_agents.sync_interval_minutes,
+            )
+        except Exception as e:
+            logger.error("Failed to start external-agents sync: %s", e, exc_info=True)
+            _external_agents_sync = None
+
     # Start the Codex thread sync service if enabled. Background tasks
     # are spawned by the service itself — we only need to keep the
     # handle so shutdown can cancel them cleanly.
@@ -319,6 +350,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Codex thread sync shutdown raised: %s", e)
         _codex_thread_sync = None
+
+    # Stop the external-agents sync service. Cheap — it just cancels
+    # the periodic loop; no per-file cleanup needed because every write
+    # is already atomic (temp + rename).
+    if _external_agents_sync is not None:
+        try:
+            await _external_agents_sync.stop()
+        except Exception as e:
+            logger.warning("External-agents sync shutdown raised: %s", e)
+        _external_agents_sync = None
 
     # Shutdown: stop telegram FIRST, before cancelling background tasks.
     # Background task cancellation propagates through anyio cancel scopes

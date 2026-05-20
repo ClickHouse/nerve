@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.agent.tools import ToolContext, ToolRegistry
     from nerve.db import Database
+    from nerve.external_agents.sync_service import SyncService
     from nerve.notifications.service import NotificationService
 
 
@@ -21,6 +22,19 @@ class RouteDeps:
     engine: "AgentEngine"
     db: "Database"
     notification_service: "NotificationService | None" = None
+    external_agents_sync: "SyncService | None" = None
+
+
+def set_external_agents_sync(service: "SyncService | None") -> None:
+    """Wire the external-agents sync service after lifespan creates it.
+
+    Symmetric to :func:`set_notification_service`. Routes that expose
+    sync status / manual re-sync read the live service through
+    :func:`get_deps`.
+    """
+    if _deps is None:
+        raise RuntimeError("init_deps() must be called before set_external_agents_sync()")
+    _deps.external_agents_sync = service
 
 
 _deps: RouteDeps | None = None

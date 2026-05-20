@@ -170,6 +170,31 @@ MEMORY_RECALL_SCHEMA = {
     "required": ["query"],
 }
 
+SESSION_CONTEXT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "topic": {
+            "type": "string",
+            "description": (
+                "Short description of what you're about to work on. "
+                "Used to bias the memU recall query so the priors you "
+                "get back are actually relevant to the task."
+            ),
+        },
+        "include_skills": {
+            "type": "boolean",
+            "description": "Include a summary of currently active skills.",
+            "default": True,
+        },
+        "memory_limit": {
+            "type": "number",
+            "description": "Max number of recalled memories to return.",
+            "default": 15,
+        },
+    },
+    "required": ["topic"],
+}
+
 CONVERSATION_HISTORY_SCHEMA = {
     "type": "object",
     "properties": {

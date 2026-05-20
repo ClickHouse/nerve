@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 // import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from 'lucide-react';
+import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 
 function formatUptime(isoDate: string): string {
   const diff = Date.now() - new Date(isoDate).getTime();
@@ -391,6 +392,9 @@ export function DiagnosticsPage() {
             </div>
           </section>
         )}
+
+        {/* External Agents — Codex / Claude Code / ... */}
+        <ExternalAgentsSection />
 
         {/* Cron Logs */}
         <section>

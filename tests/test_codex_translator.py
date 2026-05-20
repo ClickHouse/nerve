@@ -111,7 +111,7 @@ def test_function_call_falls_back_when_arguments_are_not_json():
     assert msg.blocks[0]["input"] == {"raw": "not-json"}
 
 
-def test_mcp_tool_call_end_emits_both_call_and_result():
+def test_mcp_tool_call_end_emits_call_plus_merge_intent():
     e = _evt("tool_result", {
         "call_id": "mcp_1",
         "invocation": {
@@ -132,15 +132,15 @@ def test_mcp_tool_call_end_emits_both_call_and_result():
         "input": {"limit": 3},
         "tool_use_id": "mcp_1",
     }]
+    assert call.merge_into_tool_use_id is None
 
-    result = next(m for m in messages if m.role == "tool")
-    assert result.external_id == "tool_result:mcp_1"
-    assert result.blocks == [{
-        "type": "tool_result",
-        "tool_use_id": "mcp_1",
-        "result": "the result text",
-        "is_error": False,
-    }]
+    merge = next(m for m in messages if m.role == "tool")
+    # Merge intent — no standalone block, the ingester folds these into
+    # the existing tool_call message's block.
+    assert merge.blocks == []
+    assert merge.merge_into_tool_use_id == "mcp_1"
+    assert merge.merge_result == "the result text"
+    assert merge.merge_is_error is False
 
 
 def test_mcp_tool_call_end_with_err_marks_error():
@@ -150,9 +150,10 @@ def test_mcp_tool_call_end_with_err_marks_error():
         "result": {"Err": "boom"},
     })
     messages = translate_event(e)
-    result = next(m for m in messages if m.role == "tool")
-    assert result.blocks[0]["is_error"] is True
-    assert result.blocks[0]["result"] == "boom"
+    merge = next(m for m in messages if m.role == "tool")
+    assert merge.merge_into_tool_use_id == "c"
+    assert merge.merge_result == "boom"
+    assert merge.merge_is_error is True
 
 
 def test_function_call_output_strips_exec_header():
@@ -163,15 +164,17 @@ def test_function_call_output_strips_exec_header():
             "Output:\nthe real content\nline 2\n"
         ),
     })
-    [result] = translate_event(e)
-    assert result.role == "tool"
-    assert result.blocks[0]["result"] == "the real content\nline 2\n"
+    [merge] = translate_event(e)
+    assert merge.role == "tool"
+    assert merge.merge_into_tool_use_id == "x"
+    assert merge.merge_result == "the real content\nline 2\n"
+    assert merge.merge_is_error is False
 
 
 def test_function_call_output_without_header_preserves_content():
     e = _evt("tool_result", {"call_id": "x", "output": "plain output"})
-    [result] = translate_event(e)
-    assert result.blocks[0]["result"] == "plain output"
+    [merge] = translate_event(e)
+    assert merge.merge_result == "plain output"
 
 
 def test_function_call_output_dict_result_serializes():
@@ -181,9 +184,9 @@ def test_function_call_output_dict_result_serializes():
         "invocation": {"server": "s", "tool": "t", "arguments": {}},
     })
     messages = translate_event(e)
-    result = next(m for m in messages if m.role == "tool")
+    merge = next(m for m in messages if m.role == "tool")
     # JSON-serialized for storage
-    assert "a" in result.blocks[0]["result"]
+    assert "a" in merge.merge_result
 
 
 def test_tool_result_without_call_id_is_dropped():

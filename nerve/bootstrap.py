@@ -204,6 +204,11 @@ class SetupChoices:
     houseofagents_enabled: bool = False
     # worker-specific
     task_description: str = ""
+    # external agents (Codex, Claude Code, ...)
+    external_agents: list[str] = field(default_factory=list)
+    external_agents_conflict_policy: str = "backup"   # "backup" | "skip" | "merge"
+    external_agents_mcp_url: str = ""                  # e.g. "https://localhost:8900/mcp/v1/"
+    external_agents_token: str = ""                    # bearer JWT (one-shot at bootstrap)
 
 
 # --- Credential resolution (priority waterfall) ---
@@ -380,6 +385,7 @@ class SetupWizard:
             self._step_sources()
             self._step_crons()
             self._step_houseofagents()
+            self._step_external_agents()
         else:
             self._step_worker_setup()
         self._step_review()
@@ -1222,6 +1228,86 @@ class SetupWizard:
             click.secho("  -> Skipped.", dim=True)
         click.echo()
 
+    # --- Step: External Agents (Codex, Claude Code, ...) ---
+
+    def _step_external_agents(self) -> None:
+        """Pick which external chat agents Nerve should configure end-to-end.
+
+        Writes the agent's config file (TOML/JSON) with the local MCP
+        endpoint URL + bearer JWT, plus an initial memory bundle
+        (~/.codex/AGENTS.md, ~/.claude/CLAUDE.md). The periodic sync
+        service keeps the memory bundle fresh; the config file is
+        one-shot and the user is free to edit it later.
+        """
+        from nerve.external_agents.registry import AGENT_REGISTRY
+
+        click.clear()
+        click.secho(self._next_step("External Agents (Optional)"), fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Nerve can configure external chat agents (Codex, Claude\n"
+            "Code) to use it as their MCP server. This writes the\n"
+            "agent's config file, sets up MCP auth, and renders an\n"
+            "AGENTS.md/CLAUDE.md memory bundle from your workspace\n"
+            "identity files (SOUL, USER, MEMORY, ...).\n\n"
+            "The sync cron then keeps the memory bundle fresh as your\n"
+            "workspace evolves. Config files are written once and\n"
+            "never overwritten — edit them freely.",
+            dim=True,
+        )
+        click.echo()
+
+        available = list(AGENT_REGISTRY.values())
+        if not available:
+            click.secho("  No external agent integrations registered.", dim=True)
+            return
+
+        selected: list[str] = []
+        for agent in available:
+            version = agent.smoke_check()
+            badge = ""
+            if version:
+                badge = click.style(" (installed)", fg="green")
+            elif agent.cli_command:
+                badge = click.style(f" (not on PATH — `{agent.cli_command}`)", dim=True)
+            prompt = f"  Configure {agent.display_name}?{badge}"
+            if click.confirm(prompt, default=bool(version)):
+                selected.append(agent.name)
+
+        self.choices.external_agents = selected
+        if not selected:
+            click.echo()
+            click.secho("  -> No external agents selected.", dim=True)
+            click.echo()
+            return
+
+        # Detect conflicts so the user picks a policy before apply.
+        existing: list[tuple[str, Path]] = []
+        for name in selected:
+            agent = AGENT_REGISTRY[name]
+            for p in agent.default_config_paths():
+                if p.exists():
+                    existing.append((name, p))
+
+        if existing:
+            click.echo()
+            click.secho("  These files already exist and will be touched:", bold=True)
+            for name, p in existing:
+                click.secho(f"    [{name}] {p}", dim=True)
+            click.echo()
+            self.choices.external_agents_conflict_policy = click.prompt(
+                "  Conflict policy",
+                type=click.Choice(["backup", "skip", "merge"]),
+                default="backup",
+            )
+        click.echo()
+        click.secho(
+            f"  -> {len(selected)} agent(s) selected: "
+            f"{', '.join(self.choices.external_agents)}",
+            fg="green",
+        )
+        click.echo()
+
     # --- Step: Review ---
 
     def _step_review(self) -> None:
@@ -1371,9 +1457,174 @@ class SetupWizard:
         self._write_cron_jobs()
         click.secho(" ✓", fg="green")
 
-        # 10. Build web UI (server mode only — Docker handles this in entrypoint)
+        # 10. Configure external agents (Codex, Claude Code, ...) if any
+        if self.choices.external_agents:
+            click.echo("  Configuring external agents...", nl=False)
+            try:
+                self._apply_external_agents(ws_path)
+                click.secho(" ✓", fg="green")
+            except Exception as e:
+                click.secho(f" ✗ {e}", fg="red")
+
+        # 11. Build web UI (server mode only — Docker handles this in entrypoint)
         if not self._inside_docker:
             self._build_web_ui()
+
+    # ---- External agents apply step --------------------------------
+
+    def _apply_external_agents(self, workspace: Path) -> None:
+        """Issue an MCP token, write each selected agent's config, and
+        record them in config.yaml so the sync service can keep their
+        memory bundles fresh.
+
+        Token strategy: per the user's decision in plan-3bc42e5f we
+        reuse the existing single gateway JWT mechanism (no per-agent
+        token table). The wizard issues one long-lived token via
+        :func:`_issue_mcp_token` and embeds it into every selected
+        agent's config. The token's only use is bearer auth against
+        /mcp/v1; revocation = rotating the gateway JWT secret.
+        """
+        import asyncio
+
+        from nerve.external_agents.registry import AGENT_REGISTRY
+        from nerve.external_agents.writer import ConfigWriter
+
+        token = self._issue_mcp_token()
+        nerve_url = self._compute_nerve_mcp_url()
+        self.choices.external_agents_token = token
+        self.choices.external_agents_mcp_url = nerve_url
+
+        writer = ConfigWriter(
+            conflict_policy=self.choices.external_agents_conflict_policy,
+        )
+
+        async def _run_all():
+            results = []
+            for agent_name in self.choices.external_agents:
+                agent = AGENT_REGISTRY.get(agent_name)
+                if agent is None:
+                    continue
+                result = await agent.write_config(
+                    nerve_url=nerve_url,
+                    mcp_token=token,
+                    workspace=workspace,
+                    writer=writer,
+                )
+                results.append(result)
+            return results
+
+        results = asyncio.run(_run_all())
+
+        # Persist the agents to config.yaml so the SyncService picks
+        # them up on next start.
+        self._record_external_agents_in_config_yaml(results)
+
+    def _issue_mcp_token(self) -> str:
+        """Issue a long-lived JWT for external agent MCP auth.
+
+        We reuse :func:`nerve.gateway.auth.create_token`'s payload but
+        with a 10-year expiry so users don't see the token break a
+        month later. The token isn't stored anywhere — once embedded
+        in the agent config file the wizard's job is done.
+
+        If no jwt_secret is configured yet (dev mode), returns a
+        placeholder string that the user can replace later. The MCP
+        endpoint's auth bypass covers dev mode so this still works
+        end-to-end on a fresh install.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from nerve.gateway.auth import JWT_ALGORITHM
+
+        secret = self._resolve_jwt_secret()
+        if not secret:
+            return "dev-mode-no-auth"
+
+        payload = {
+            "sub": "external-agent-mcp",
+            "iat": datetime.now(timezone.utc),
+            "exp": datetime.now(timezone.utc) + timedelta(days=3650),
+            "kind": "mcp",
+        }
+        return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
+
+    def _resolve_jwt_secret(self) -> str:
+        """Return the JWT secret we're about to write to config.local.yaml.
+
+        The wizard generates the secret in ``_write_config_local_yaml``
+        and stores it on ``self.choices``. If apply order changes in
+        the future this method keeps the dependency explicit.
+        """
+        # The wizard generates this in _write_config_local_yaml. If
+        # that hasn't run yet, we generate it now and let the later
+        # config-write reuse it via ``self.choices.password``-style
+        # caching. In practice apply order calls _write_config_local
+        # before this method, so we'll have the secret already.
+        secret = getattr(self.choices, "_jwt_secret_cache", "")
+        if secret:
+            return secret
+        # Read back from the just-written config.local.yaml
+        local = self.config_dir / "config.local.yaml"
+        if local.exists():
+            try:
+                data = yaml.safe_load(local.read_text()) or {}
+                secret = (data.get("auth") or {}).get("jwt_secret", "") or ""
+            except Exception:
+                secret = ""
+        if not secret:
+            # Generate one now and stash so subsequent calls match.
+            secret = secrets.token_urlsafe(48)
+            self.choices._jwt_secret_cache = secret  # type: ignore[attr-defined]
+        return secret
+
+    def _compute_nerve_mcp_url(self) -> str:
+        """Return the MCP endpoint URL external agents should hit.
+
+        Defaults to ``https://localhost:<gateway-port>/mcp/v1/`` for a
+        local install. The trailing slash matters — Codex's MCP client
+        appends paths to it.
+        """
+        # Default port mirrors GatewayConfig.port (8900). The bootstrap
+        # wizard doesn't currently expose a port-override step but
+        # plumbing it here keeps the door open.
+        port = 8900
+        return f"https://localhost:{port}/mcp/v1/"
+
+    def _record_external_agents_in_config_yaml(self, results) -> None:
+        """Append the external_agents block to the freshly-written config.yaml.
+
+        Called after ``_write_config_yaml`` so we don't have to
+        coordinate the yaml dict structure across two methods.
+        """
+        path = self.config_dir / "config.yaml"
+        if not path.exists():
+            return
+        try:
+            data = yaml.safe_load(path.read_text()) or {}
+        except Exception as e:
+            click.secho(
+                f"  Warning: could not parse config.yaml to record external_agents: {e}",
+                fg="yellow",
+            )
+            return
+
+        targets = []
+        for r in results:
+            targets.append({
+                "name": r.agent,
+                "enabled": True,
+                "token": r.token,
+            })
+
+        data["external_agents"] = {
+            "enabled": True,
+            "sync_interval_minutes": 15,
+            "conflict_policy": self.choices.external_agents_conflict_policy,
+            "targets": targets,
+        }
+        path.write_text(yaml.safe_dump(data, sort_keys=False))
 
     def _build_web_ui(self) -> None:
         """Build the web UI if not already built."""
@@ -1778,6 +2029,24 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
 
     # houseofagents
     choices.houseofagents_enabled = os.environ.get("NERVE_HOA_ENABLED", "") == "1"
+
+    # External agents — comma-separated list ("codex,claude-code") and
+    # optional conflict policy. Validated against AGENT_REGISTRY so an
+    # unknown name aborts setup rather than silently dropping the agent.
+    external = (os.environ.get("NERVE_EXTERNAL_AGENTS", "") or "").strip()
+    if external and choices.mode == "personal":
+        from nerve.external_agents.registry import AGENT_REGISTRY
+        names = [n.strip() for n in external.split(",") if n.strip()]
+        for n in names:
+            if n not in AGENT_REGISTRY:
+                raise click.ClickException(
+                    f"Unknown external agent: {n!r}. Known: "
+                    f"{', '.join(AGENT_REGISTRY.keys())}"
+                )
+        choices.external_agents = names
+        choices.external_agents_conflict_policy = os.environ.get(
+            "NERVE_EXTERNAL_AGENTS_CONFLICT", "backup",
+        )
 
     # Worker task description (setup agent runs on first boot, not during init)
     if choices.mode == "worker":
