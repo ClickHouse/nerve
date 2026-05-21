@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Personal AI assistant — lightweight, single-process, purpose-built"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 
 dependencies = [
     "fastapi>=0.115.0",
