@@ -19,7 +19,8 @@ NERVE_BRANCH="${NERVE_BRANCH:-main}"
 INSTALL_DIR="${NERVE_INSTALL_DIR:-$HOME/nerve}"
 MIN_PYTHON_MINOR=12
 PREFERRED_PYTHON_MINOR=13
-MIN_NODE_MAJOR=18
+# Vite 7 (see web/package.json) requires Node 20.19+ or 22.12+.
+MIN_NODE_VERSION="20.19.0"
 AUTO_YES="${NERVE_YES:-0}"
 IS_UPGRADE=0
 
@@ -268,19 +269,19 @@ ensure_python() {
 ensure_node() {
     if command_exists node; then
         local ver
-        ver="$(node --version | tr -d 'v' | cut -d. -f1)"
-        if [ "$ver" -ge "$MIN_NODE_MAJOR" ] 2>/dev/null; then
-            success "Node.js $(node --version)"
+        ver="$(node --version | tr -d 'v')"
+        if version_ge "$ver" "$MIN_NODE_VERSION"; then
+            success "Node.js v$ver"
             return
         fi
-        warn "Node.js $(node --version) is too old (need v${MIN_NODE_MAJOR}+)"
+        warn "Node.js v$ver is too old (need v${MIN_NODE_VERSION}+ or v22.12+)"
     fi
 
-    info "Node.js ${MIN_NODE_MAJOR}+ is not installed"
+    info "Node.js v${MIN_NODE_VERSION}+ is not installed"
 
     if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
         error "Node.js is required but sudo is not available."
-        error "Install Node.js ${MIN_NODE_MAJOR}+ manually and re-run."
+        error "Install Node.js v${MIN_NODE_VERSION}+ manually and re-run."
         exit 1
     fi
 
