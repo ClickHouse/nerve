@@ -1,7 +1,14 @@
 import type { WSMessage } from '../../api/websocket';
 import type { ChatMessage, MessageBlock, PanelTab, AgentStatus } from '../../types/chat';
 import { extractResultText } from '../../utils/extractResultText';
-import type { TodoItem } from '../chatStore';
+import type { TodoItem, CCTask } from '../chatStore';
+import {
+  applyCCTaskCreateInput,
+  applyCCTaskUpdateInput,
+  parseCCTaskListResult,
+  parseCCTaskGetResult,
+  parseCCTaskCreateResult,
+} from './ccTasks';
 
 /**
  * Apply a single stream event to a blocks array (pure function for replay).
@@ -74,9 +81,11 @@ export function rebuildPanelTabsFromBuffer(
   const panels: PanelTab[] = [];
   const panelMap = new Map<string, PanelTab>();
 
-  // First pass: create panel tabs for Task tool_use events
+  // First pass: create panel tabs for subagent-spawning tool_use events.
+  // Claude Code 2.1.x renamed the subagent tool from "Task" → "Agent"; we
+  // match both so old chat history still rebuilds panels correctly.
   for (const event of events) {
-    if (event.type === 'tool_use' && event.tool === 'Task') {
+    if (event.type === 'tool_use' && (event.tool === 'Agent' || event.tool === 'Task')) {
       const subagentType = String(event.input?.subagent_type || event.input?.model || 'agent');
       const toolUseId = event.tool_use_id || '';
       const block = blocks.find(
@@ -201,10 +210,98 @@ export function extractTodosFromBuffer(events: WSMessage[]): TodoItem[] | null {
     const event = events[i];
     if (event.type !== 'tool_use') continue;
     if (event.tool !== 'TodoWrite') continue;
-    // Sub-agent (Task) child TodoWrite calls belong to the panel, not the main todos.
+    // Sub-agent (Agent / Task) child TodoWrite calls belong to the panel, not the main todos.
     if ('parent_tool_use_id' in event && event.parent_tool_use_id) continue;
     const todos = (event.input as { todos?: TodoItem[] } | undefined)?.todos;
     if (Array.isArray(todos)) return todos as TodoItem[];
   }
   return null;
+}
+
+/** True for Claude Code 2.1+ task tools that drive the task panel. */
+function isCCTaskTool(tool: string | undefined): boolean {
+  return tool === 'TaskCreate'
+    || tool === 'TaskUpdate'
+    || tool === 'TaskList'
+    || tool === 'TaskGet';
+}
+
+/**
+ * Replay every TaskCreate / TaskUpdate / TaskList / TaskGet call across the
+ * persisted message history to rebuild the current task panel. Walks
+ * forward so optimistic inputs and authoritative results compose in the
+ * same order they were emitted live.
+ *
+ * Sub-agent child task calls (parent_tool_use_id set) belong to the panel
+ * tab for that sub-agent, not the main chat — same convention as TodoWrite.
+ */
+export function extractCCTasksFromMessages(messages: ChatMessage[]): CCTask[] {
+  let tasks: CCTask[] = [];
+  for (const msg of messages) {
+    if (msg.role !== 'assistant') continue;
+    for (const block of msg.blocks) {
+      if (block.type !== 'tool_call') continue;
+      if (!isCCTaskTool(block.tool)) continue;
+      const input = (block.input ?? {}) as Record<string, unknown>;
+      const toolUseId = block.toolUseId || '';
+      // Apply input optimistically (mirrors live handler).
+      if (block.tool === 'TaskCreate') {
+        tasks = applyCCTaskCreateInput(tasks, input, toolUseId);
+      } else if (block.tool === 'TaskUpdate') {
+        tasks = applyCCTaskUpdateInput(tasks, input);
+      }
+      // Then reconcile with the result, if we have one and it's not an error.
+      if (block.status === 'complete' && !block.isError && block.result !== undefined) {
+        const resultText = extractResultText(block.result);
+        if (block.tool === 'TaskList') {
+          tasks = parseCCTaskListResult(resultText, tasks);
+        } else if (block.tool === 'TaskCreate') {
+          tasks = parseCCTaskCreateResult(resultText, tasks, toolUseId);
+        } else if (block.tool === 'TaskGet') {
+          tasks = parseCCTaskGetResult(resultText, tasks);
+        }
+        // TaskUpdate result is opaque; the input application above is enough.
+      }
+    }
+  }
+  return tasks;
+}
+
+/**
+ * Buffer-side equivalent of extractCCTasksFromMessages — walks live WS
+ * events to rebuild the task panel on reconnect. Returns null when no
+ * relevant events are present so the caller can keep whatever was already
+ * restored from persisted history.
+ */
+export function extractCCTasksFromBuffer(events: WSMessage[]): CCTask[] | null {
+  let saw = false;
+  let tasks: CCTask[] = [];
+  // Track tool_use_id → tool name so we can dispatch on tool_result.
+  const toolByUseId = new Map<string, string>();
+  for (const event of events) {
+    if ('parent_tool_use_id' in event && event.parent_tool_use_id) continue;
+    if (event.type === 'tool_use' && isCCTaskTool(event.tool)) {
+      saw = true;
+      const input = (event.input ?? {}) as Record<string, unknown>;
+      const toolUseId = event.tool_use_id || '';
+      toolByUseId.set(toolUseId, event.tool);
+      if (event.tool === 'TaskCreate') {
+        tasks = applyCCTaskCreateInput(tasks, input, toolUseId);
+      } else if (event.tool === 'TaskUpdate') {
+        tasks = applyCCTaskUpdateInput(tasks, input);
+      }
+    } else if (event.type === 'tool_result' && event.tool_use_id) {
+      const sourceTool = toolByUseId.get(event.tool_use_id);
+      if (!sourceTool || event.is_error) continue;
+      const resultText = extractResultText(event.result);
+      if (sourceTool === 'TaskList') {
+        tasks = parseCCTaskListResult(resultText, tasks);
+      } else if (sourceTool === 'TaskCreate') {
+        tasks = parseCCTaskCreateResult(resultText, tasks, event.tool_use_id);
+      } else if (sourceTool === 'TaskGet') {
+        tasks = parseCCTaskGetResult(resultText, tasks);
+      }
+    }
+  }
+  return saw ? tasks : null;
 }

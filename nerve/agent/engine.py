@@ -883,6 +883,12 @@ class AgentEngine:
             # No allowed_tools — can_use_tool callback handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
+            # ``disallowed_tools`` strips tools from the model's tool list
+            # entirely (cleaner than runtime denial). ``ScheduleWakeup`` is a
+            # Claude Code built-in for ``/loop`` dynamic mode — Nerve has no
+            # ``/loop`` skill, so the tool would be a dead end. Removing it
+            # avoids the model wasting turns calling it.
+            disallowed_tools=["ScheduleWakeup"],
             env=self._build_env(),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),
@@ -1908,8 +1914,15 @@ class AgentEngine:
                                             tool_use_id=tool_use_id,
                                             parent_tool_use_id=parent_id,
                                         )
-                                        # Track sub-agent lifecycle
-                                        if tool_name == "Task" and tool_use_id:
+                                        # Track sub-agent lifecycle.  Claude Code
+                                        # 2.1.x renamed the subagent-spawning
+                                        # tool from ``Task`` → ``Agent`` (and
+                                        # introduced separate ``TaskCreate``/
+                                        # ``TaskUpdate``/etc. tools for in-
+                                        # session todo tracking).  Match both
+                                        # names so old session history still
+                                        # opens panels on replay.
+                                        if tool_name in ("Task", "Agent") and tool_use_id:
                                             active_subagents[tool_use_id] = asyncio.get_event_loop().time()
                                             await broadcaster.broadcast_subagent_start(
                                                 session_id,

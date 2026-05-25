@@ -8,6 +8,7 @@ import { BashToolBlock } from './tools/BashToolBlock';
 import { FileToolBlock } from './tools/FileToolBlock';
 import { MemoryToolBlock } from './tools/MemoryToolBlock';
 import { TaskToolBlock } from './tools/TaskToolBlock';
+import { CCTaskToolBlock } from './tools/CCTaskToolBlock';
 import { SourceToolBlock } from './tools/SourceToolBlock';
 import { SubagentToolBlock } from './tools/SubagentToolBlock';
 import { HoAToolBlock } from './tools/HoAToolBlock';
@@ -38,8 +39,20 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
     case 'Read':
     case 'Write':
       return <FileToolBlock block={block} />;
+    // Sub-agent spawn: Claude Code 2.1.x renamed "Task" → "Agent". Match both
+    // so old chat history keeps rendering with the sub-agent card.
+    case 'Agent':
     case 'Task':
       return <SubagentToolBlock block={block} />;
+    // Claude Code 2.1+ task tools (replacement for TodoWrite). Compact card
+    // in chat; full list shown by the TaskPanel below the message stream.
+    case 'TaskCreate':
+    case 'TaskUpdate':
+    case 'TaskList':
+    case 'TaskGet':
+    case 'TaskStop':
+    case 'TaskOutput':
+      return <CCTaskToolBlock block={block} />;
     case 'AskUserQuestion':
       return <QuestionBlock block={block} />;
     case 'ExitPlanMode':
