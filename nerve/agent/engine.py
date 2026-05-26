@@ -883,12 +883,14 @@ class AgentEngine:
             # No allowed_tools — can_use_tool callback handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
-            # ``disallowed_tools`` strips tools from the model's tool list
-            # entirely (cleaner than runtime denial). ``ScheduleWakeup`` is a
-            # Claude Code built-in for ``/loop`` dynamic mode — Nerve has no
-            # ``/loop`` skill, so the tool would be a dead end. Removing it
-            # avoids the model wasting turns calling it.
-            disallowed_tools=["ScheduleWakeup"],
+            #
+            # ``ScheduleWakeup`` is intentionally left enabled. Claude Code
+            # persists wakeups in ``~/.claude/scheduled_tasks.json``; on the
+            # next CLI resume, any past-due wakeup fires its stored prompt as
+            # an internal turn. Nerve doesn't actively trigger wakeups on a
+            # timer (no ``/loop`` skill), so the tool is largely informational
+            # — but the UI renders the call (see ``ScheduleWakeupBlock``) so
+            # the user can see what the model scheduled.
             env=self._build_env(),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),

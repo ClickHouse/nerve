@@ -9,6 +9,7 @@ import { FileToolBlock } from './tools/FileToolBlock';
 import { MemoryToolBlock } from './tools/MemoryToolBlock';
 import { TaskToolBlock } from './tools/TaskToolBlock';
 import { CCTaskToolBlock } from './tools/CCTaskToolBlock';
+import { ScheduleWakeupBlock } from './tools/ScheduleWakeupBlock';
 import { SourceToolBlock } from './tools/SourceToolBlock';
 import { SubagentToolBlock } from './tools/SubagentToolBlock';
 import { HoAToolBlock } from './tools/HoAToolBlock';
@@ -53,6 +54,10 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
     case 'TaskStop':
     case 'TaskOutput':
       return <CCTaskToolBlock block={block} />;
+    // Claude Code 2.1+ self-paced ``/loop`` wakeup. Nerve has no timer
+    // for it, but we render the call so the user sees what was scheduled.
+    case 'ScheduleWakeup':
+      return <ScheduleWakeupBlock block={block} />;
     case 'AskUserQuestion':
       return <QuestionBlock block={block} />;
     case 'ExitPlanMode':
