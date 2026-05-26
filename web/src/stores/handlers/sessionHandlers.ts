@@ -1,6 +1,6 @@
 import type { WSMessage } from '../../api/websocket';
 import type { PanelTab } from '../../types/chat';
-import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer } from '../helpers/bufferReplay';
+import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
@@ -94,6 +94,8 @@ export function handleSessionStatus(
     // backgrounded) sees a stale snapshot from persisted history because the
     // buffered TodoWrite tool_use events fed only streamingBlocks.
     const restoredTodos = extractTodosFromBuffer(bufferedEvents);
+    // Same for Claude Code 2.1+ Task* tools.
+    const restoredCCTasks = extractCCTasksFromBuffer(bufferedEvents);
 
     const update: Record<string, unknown> = {
       isStreaming: true,
@@ -106,6 +108,9 @@ export function handleSessionStatus(
     };
     if (restoredTodos !== null) {
       update.currentTodos = restoredTodos;
+    }
+    if (restoredCCTasks !== null) {
+      update.currentCCTasks = restoredCCTasks;
     }
     set(update);
   } else {

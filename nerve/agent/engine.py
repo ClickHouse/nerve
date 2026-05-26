@@ -883,6 +883,23 @@ class AgentEngine:
             # No allowed_tools — can_use_tool callback handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
+            #
+            # ``ScheduleWakeup`` is left enabled. Behaviour in Nerve:
+            #   • The CLI's internal scheduler "fires" the wakeup at the
+            #     scheduled time and enqueues the stored prompt as a
+            #     synthetic user message inside the SDK subprocess.
+            #   • Nerve has no background reader between turns — the queued
+            #     wakeup just sits in the SDK buffer.
+            #   • On the next user message, Nerve calls ``client.query()``
+            #     and the buffered wakeup is flushed BEFORE the user's
+            #     input, so the model sees the self-scheduled prompt first.
+            #   • If the user never sends another message before the idle
+            #     timeout reaps the client, the wakeup is lost (durable
+            #     wakeups would survive in ~/.claude/scheduled_tasks.json,
+            #     but the model rarely sets ``durable: true``).
+            # Net: it's a deferred-prompt, not an autonomous timer. The UI
+            # renders the call (see ``ScheduleWakeupBlock``) so the user
+            # knows what the model scheduled.
             env=self._build_env(),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),
@@ -1908,8 +1925,15 @@ class AgentEngine:
                                             tool_use_id=tool_use_id,
                                             parent_tool_use_id=parent_id,
                                         )
-                                        # Track sub-agent lifecycle
-                                        if tool_name == "Task" and tool_use_id:
+                                        # Track sub-agent lifecycle.  Claude Code
+                                        # 2.1.x renamed the subagent-spawning
+                                        # tool from ``Task`` → ``Agent`` (and
+                                        # introduced separate ``TaskCreate``/
+                                        # ``TaskUpdate``/etc. tools for in-
+                                        # session todo tracking).  Match both
+                                        # names so old session history still
+                                        # opens panels on replay.
+                                        if tool_name in ("Task", "Agent") and tool_use_id:
                                             active_subagents[tool_use_id] = asyncio.get_event_loop().time()
                                             await broadcaster.broadcast_subagent_start(
                                                 session_id,
