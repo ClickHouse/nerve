@@ -42,25 +42,41 @@ export function ScheduleWakeupBlock({ block }: { block: ToolCallBlockData }) {
   const prompt = typeof input.prompt === 'string' ? input.prompt : '';
 
   // Parse the result to surface the actual (clamped) delay and the wall-clock
-  // time the CLI scheduled the wakeup for.
-  let scheduledFor = 0;
+  // time the CLI scheduled the wakeup for. The CLI returns plain text of the
+  // form "Next wakeup scheduled for HH:MM:SS (in Ns). ..."; some older /
+  // experimental builds also returned a JSON object with `scheduledFor`,
+  // `clampedDelaySeconds`, `wasClamped` — accept either shape.
+  let scheduledTimeLabel = '';
   let clampedDelaySeconds = 0;
   let wasClamped = false;
   if (block.result !== undefined && !block.isError) {
     const text = extractResultText(block.result);
+    let parsedJson = false;
     try {
       const parsed = JSON.parse(text);
       if (parsed && typeof parsed === 'object') {
-        if (typeof parsed.scheduledFor === 'number') scheduledFor = parsed.scheduledFor;
+        if (typeof parsed.scheduledFor === 'number') {
+          scheduledTimeLabel = formatScheduledFor(parsed.scheduledFor);
+        }
         if (typeof parsed.clampedDelaySeconds === 'number') clampedDelaySeconds = parsed.clampedDelaySeconds;
         if (typeof parsed.wasClamped === 'boolean') wasClamped = parsed.wasClamped;
+        parsedJson = true;
       }
-    } catch { /* result wasn't JSON; fall back to input.delaySeconds */ }
+    } catch { /* fall through to text parser */ }
+    if (!parsedJson) {
+      // "Next wakeup scheduled for HH:MM[:SS] (in Ns)."
+      const m = /Next wakeup scheduled for (\d{1,2}:\d{2}(?::\d{2})?)\b[^(]*\(in\s+(\d+)s\)/i.exec(text);
+      if (m) {
+        scheduledTimeLabel = m[1].split(':').slice(0, 2).join(':');
+        clampedDelaySeconds = parseInt(m[2], 10);
+        wasClamped = clampedDelaySeconds !== delaySeconds && delaySeconds > 0;
+      }
+    }
   }
 
   const effectiveDelay = clampedDelaySeconds || delaySeconds;
   const delayLabel = effectiveDelay ? formatDelay(effectiveDelay) : '';
-  const timeLabel = scheduledFor ? formatScheduledFor(scheduledFor) : '';
+  const timeLabel = scheduledTimeLabel;
 
   return (
     <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
@@ -92,11 +108,19 @@ export function ScheduleWakeupBlock({ block }: { block: ToolCallBlockData }) {
 
       {expanded && (
         <div className="border-t border-border">
-          {/* Note: Nerve doesn't actively trigger wakeups — the CLI persists
-              them and fires when the session next resumes. */}
+          {/* The CLI scheduler "fires" the wakeup on time and queues the
+              prompt inside the SDK subprocess. Nerve has no background
+              reader, so the queued wakeup waits there until the next user
+              message arrives — at which point Nerve flushes it BEFORE the
+              user's input. If no message ever arrives before the idle
+              client is reaped, the wakeup is lost (unless `durable: true`,
+              which the model rarely sets). Net: it's a deferred prompt
+              that piggybacks on the next user turn. */}
           <div className="px-3 py-2 text-[11px] text-text-faint italic">
-            Stored by Claude Code; fires on next session resume if past-due.
-            Nerve has no <code>/loop</code> timer.
+            Queued by the Claude Code CLI. Nerve has no <code>/loop</code>
+            timer, so the wakeup will only surface on the next user
+            message — and will arrive before that message in the
+            conversation.
           </div>
 
           {prompt && (

@@ -884,13 +884,22 @@ class AgentEngine:
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
             #
-            # ``ScheduleWakeup`` is intentionally left enabled. Claude Code
-            # persists wakeups in ``~/.claude/scheduled_tasks.json``; on the
-            # next CLI resume, any past-due wakeup fires its stored prompt as
-            # an internal turn. Nerve doesn't actively trigger wakeups on a
-            # timer (no ``/loop`` skill), so the tool is largely informational
-            # — but the UI renders the call (see ``ScheduleWakeupBlock``) so
-            # the user can see what the model scheduled.
+            # ``ScheduleWakeup`` is left enabled. Behaviour in Nerve:
+            #   • The CLI's internal scheduler "fires" the wakeup at the
+            #     scheduled time and enqueues the stored prompt as a
+            #     synthetic user message inside the SDK subprocess.
+            #   • Nerve has no background reader between turns — the queued
+            #     wakeup just sits in the SDK buffer.
+            #   • On the next user message, Nerve calls ``client.query()``
+            #     and the buffered wakeup is flushed BEFORE the user's
+            #     input, so the model sees the self-scheduled prompt first.
+            #   • If the user never sends another message before the idle
+            #     timeout reaps the client, the wakeup is lost (durable
+            #     wakeups would survive in ~/.claude/scheduled_tasks.json,
+            #     but the model rarely sets ``durable: true``).
+            # Net: it's a deferred-prompt, not an autonomous timer. The UI
+            # renders the call (see ``ScheduleWakeupBlock``) so the user
+            # knows what the model scheduled.
             env=self._build_env(),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),
