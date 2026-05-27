@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, Circle, Loader2 } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, Circle, Loader2 } from 'lucide-react';
 import type { TodoItem, CCTask } from '../../stores/chatStore';
 
 /**
@@ -45,6 +45,7 @@ export function TodoPanel({
   ccTasks?: CCTask[];
 }) {
   const [visible, setVisible] = useState(true);
+  const [expandCompleted, setExpandCompleted] = useState(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Track previous row count so we can re-show the panel when new work appears.
   const prevCountRef = useRef<number>(0);
@@ -86,7 +87,15 @@ export function TodoPanel({
 
   if (rows.length === 0 || !visible) return null;
 
-  const completed = rows.filter(r => r.status === 'completed').length;
+  const completedRows = rows.filter(r => r.status === 'completed');
+  const activeRows = rows.filter(r => r.status !== 'completed');
+  const completedCount = completedRows.length;
+
+  // Collapse the completed history into a single summary row when there's
+  // still active work to show. When everything is done, keep the list
+  // expanded — the panel will auto-hide in 5s anyway, and a lone "N
+  // completed" summary with no detail would be useless.
+  const collapseCompleted = !allDone && completedCount > 0 && !expandCompleted;
 
   return (
     <div className={`border-t border-border-subtle bg-bg-sunken shrink-0 transition-all duration-300 ${allDone ? 'opacity-60' : ''}`}>
@@ -94,16 +103,66 @@ export function TodoPanel({
         <div className="flex items-center gap-2 mb-1.5">
           <span className="text-[11px] font-medium text-text-faint uppercase tracking-wider">Tasks</span>
           <span className="text-[10px] text-text-faint">
-            {completed}/{rows.length}
+            {completedCount}/{rows.length}
           </span>
         </div>
         <div className="space-y-0.5">
-          {rows.map(row => (
-            <TaskRow key={row.key} row={row} />
-          ))}
+          {collapseCompleted ? (
+            <>
+              <CompletedSummaryRow
+                count={completedCount}
+                expanded={false}
+                onClick={() => setExpandCompleted(true)}
+              />
+              {activeRows.map(row => (
+                <TaskRow key={row.key} row={row} />
+              ))}
+            </>
+          ) : (
+            <>
+              {!allDone && completedCount > 0 && (
+                <CompletedSummaryRow
+                  count={completedCount}
+                  expanded={true}
+                  onClick={() => setExpandCompleted(false)}
+                />
+              )}
+              {rows.map(row => (
+                <TaskRow key={row.key} row={row} />
+              ))}
+            </>
+          )}
         </div>
       </div>
     </div>
+  );
+}
+
+function CompletedSummaryRow({
+  count,
+  expanded,
+  onClick,
+}: {
+  count: number;
+  expanded: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-2 py-0.5 text-[13px] w-full text-left rounded text-text-faint hover:text-text-muted transition-colors"
+    >
+      <CheckCircle2 size={14} className="text-hue-green shrink-0 opacity-60" />
+      {expanded ? (
+        <ChevronDown size={12} className="shrink-0" />
+      ) : (
+        <ChevronRight size={12} className="shrink-0" />
+      )}
+      <span>
+        {count} completed {count === 1 ? 'task' : 'tasks'}
+      </span>
+    </button>
   );
 }
 
