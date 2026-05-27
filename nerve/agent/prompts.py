@@ -37,6 +37,11 @@ def set_skill_manager(manager: Any) -> None:
 def _format_tool_list() -> str:
     """Generate tool list for system prompt from the default registry.
 
+    Tool names are prefixed with ``mcp__nerve__`` because that's how the
+    Claude Agent SDK exposes them: the in-process MCP server is named
+    "nerve", and the CLI namespaces every MCP tool as ``mcp__<server>__<name>``.
+    Calling the bare ``spec.name`` fails with "No such tool available".
+
     HoA tools are excluded — they don't usefully appear in the prompt
     when houseofagents is disabled, and including them when enabled
     bloats the prompt with rarely-used surface. The model still
@@ -46,7 +51,7 @@ def _format_tool_list() -> str:
     for spec in _get_prompt_tool_registry().list(include_hoa=False):
         # Take the first sentence of the description as the summary
         desc = spec.description.split("\n")[0].rstrip(".")
-        lines.append(f"- `{spec.name}` — {desc}")
+        lines.append(f"- `mcp__nerve__{spec.name}` — {desc}")
     return "\n".join(lines)
 
 
@@ -72,7 +77,7 @@ def _format_skills_list(skill_summaries: list[dict] | None = None) -> str | None
     lines = [
         "# Available Skills",
         "",
-        "The following skills are available. Use `skill_get(name)` to load a skill's full instructions when relevant.",
+        "The following skills are available. Use `mcp__nerve__skill_get(name)` to load a skill's full instructions when relevant.",
         "",
     ]
     for s in skill_summaries:
