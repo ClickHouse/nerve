@@ -574,3 +574,39 @@ class TestHandlerRegistry:
         )
         assert result.ok is False
         assert "unsupported decision" in result.audit_event.get("error", "")
+
+    def test_dispatcher_accepts_take_over(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # The third button on conflict-resolution TAP cards routes a
+        # ``take_over`` decision into the dispatcher, which must shell
+        # out to ``mechanical-action.sh take-over <id> --note <text>``.
+        # A fake script that asserts on argv and exits 0 verifies the
+        # invocation shape.
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        captured = tmp_path / "argv.txt"
+        # The fake script writes argv to a file; we assert against it.
+        (scripts_dir / "mechanical-action.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$@" > {captured}\n'
+            "exit 0\n"
+        )
+        (scripts_dir / "mechanical-action.sh").chmod(0o755)
+        monkeypatch.setenv("NERVE_WORKSPACE_PATH", str(tmp_path))
+
+        result = _handlers._dispatch_mechanical_action(
+            {"id": "notif-xyz"},
+            "conflict-prop-123",
+            "take_over",
+            None,
+        )
+        assert result.ok is True
+        # Audit event records the take-over decision.
+        assert result.audit_event.get("decision") == "take_over"
+        # Script was invoked with the right argv.
+        args = captured.read_text(encoding="utf-8").splitlines()
+        assert args[0] == "take-over"
+        assert args[1] == "conflict-prop-123"
+        assert args[2] == "--note"
+        assert "notif-xyz" in args[3]

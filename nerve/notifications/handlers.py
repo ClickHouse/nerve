@@ -112,7 +112,15 @@ def known_kinds() -> list[str]:
 # Valid decisions for the mechanical-action dispatcher. Kept here so a
 # typo in the caller surfaces as an explicit failure rather than a
 # silent no-op shell call.
-_MECHANICAL_DECISIONS = frozenset({"approve", "decline", "snooze_24h"})
+#
+# ``take_over``: third button surfaced on conflict-resolution TAP cards.
+# Moves the cron's scratch draft worktree into ~/projects/worktrees/ so
+# the user can finish the resolution by hand. Routes to
+# ``mechanical-action.sh take-over <id>``. See
+# notes/repo-conventions/nerve/cron-conflict-resolution.md.
+_MECHANICAL_DECISIONS = frozenset(
+    {"approve", "decline", "snooze_24h", "take_over"}
+)
 
 
 def _resolve_workspace(
@@ -230,6 +238,16 @@ def _dispatch_mechanical_action(
         cmd = [
             "bash", str(script_path), "decline", target_id,
             "--reason", reason,
+        ]
+        snooze_until = None
+    elif decision == "take_over":
+        note = (
+            f"user took over via notification {notif_id}"
+            if notif_id else "user took over via notification"
+        )
+        cmd = [
+            "bash", str(script_path), "take-over", target_id,
+            "--note", note,
         ]
         snooze_until = None
     else:  # snooze_24h
