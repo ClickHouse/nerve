@@ -1,4 +1,4 @@
-"""V28: Add target_kind / target_id columns to notifications.
+"""V29: Add target_kind / target_id columns to notifications.
 
 Extends the notification table to support the ``approval`` notification
 kind: notifications that route to a server-side dispatcher when the user
@@ -16,7 +16,7 @@ The two new columns:
   mechanical-action proposal id). Read by the handler registry.
 
 Existing rows are left untouched (target_kind = NULL), so the answer
-path stays identical for every notification created before v28.
+path stays identical for every notification created before v29.
 """
 
 from __future__ import annotations
@@ -40,5 +40,5 @@ async def up(db: aiosqlite.Connection) -> None:
         "ON notifications(target_kind, target_id)"
     )
     logger.info(
-        "v028: added target_kind/target_id to notifications + index"
+        "v029: added target_kind/target_id to notifications + index"
     )

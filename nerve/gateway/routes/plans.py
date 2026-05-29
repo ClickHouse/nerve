@@ -18,7 +18,11 @@ from nerve.agent.plan_service import (
 )
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
-from nerve.gateway.routes._deps import get_deps
+from nerve.gateway.routes._deps import (
+    build_route_tool_context,
+    get_deps,
+    get_tool_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +81,19 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, user: dict = Depends
     if fields:
         await deps.db.update_plan(plan_id, **fields)
 
-    # On decline: mark the related task as done with a note explaining the closure.
-    # The user-supplied feedback is optional — if absent, leave a generic comment.
+    # On decline: mark the related task as done with a note explaining
+    # the closure. The user-supplied feedback is optional — if absent,
+    # leave a generic comment.
     if req.status == "declined":
-        from nerve.agent.tools import task_done as task_done_tool
         if req.feedback:
             note = f"Plan {plan_id} declined — {req.feedback}"
         else:
             note = f"Related plan {plan_id} was closed without a specified reason"
-        await task_done_tool.handler({
-            "task_id": plan["task_id"],
-            "note": note,
-        })
+        await get_tool_registry().invoke(
+            "task_done",
+            build_route_tool_context(),
+            {"task_id": plan["task_id"], "note": note},
+        )
 
     return {"plan_id": plan_id, "updated": True}
 
@@ -159,12 +164,15 @@ async def approve_plan(
     await deps.db.update_plan(plan_id, impl_session_id=impl_session_id)
 
     # Update task status + note
-    from nerve.agent.tools import task_update as task_update_tool
-    await task_update_tool.handler({
-        "task_id": plan["task_id"],
-        "status": "in_progress",
-        "note": f"Plan approved — implementation started (session: {impl_session_id})",
-    })
+    await get_tool_registry().invoke(
+        "task_update",
+        build_route_tool_context(),
+        {
+            "task_id": plan["task_id"],
+            "status": "in_progress",
+            "note": f"Plan approved — implementation started (session: {impl_session_id})",
+        },
+    )
 
     # Read task file content for the implementation prompt
     config = get_config()

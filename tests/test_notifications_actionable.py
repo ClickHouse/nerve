@@ -1,7 +1,7 @@
 """Tests for the ``approval`` notification kind.
 
 PR 1 of the actionable-inbox series:
-- v028 migration adds ``target_kind`` and ``target_id`` columns.
+- v029 migration adds ``target_kind`` and ``target_id`` columns.
 - ``NotificationService.propose_action`` files a row of type=approval.
 - ``handle_answer`` dispatches the user's decision through the
   ``nerve.notifications.handlers`` registry.
@@ -204,7 +204,7 @@ def read_audit_jsonl(state_dir: Path) -> list[dict[str, Any]]:
 
 @pytest.mark.asyncio
 class TestSchemaAndStore:
-    async def test_v028_columns_exist(self, db: Database):
+    async def test_v029_columns_exist(self, db: Database):
         async with db.db.execute("PRAGMA table_info(notifications)") as cur:
             cols = {row[1] async for row in cur}
         assert "target_kind" in cols

@@ -7,7 +7,11 @@ from pydantic import BaseModel
 
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
-from nerve.gateway.routes._deps import get_deps
+from nerve.gateway.routes._deps import (
+    build_route_tool_context,
+    get_deps,
+    get_tool_registry,
+)
 
 router = APIRouter()
 
@@ -65,15 +69,20 @@ async def search_tasks(q: str, status: str = "", user: dict = Depends(require_au
 
 @router.post("/api/tasks")
 async def create_task(req: TaskCreateRequest, user: dict = Depends(require_auth)):
-    from nerve.agent.tools import task_create
-    result = await task_create.handler({
-        "title": req.title,
-        "content": req.content,
-        "source": req.source,
-        "source_url": req.source_url,
-        "deadline": req.deadline,
-    })
-    return result
+    # Route into the unified handler surface via the live registry — no
+    # behavior duplication between the REST and MCP paths.
+    result = await get_tool_registry().invoke(
+        "task_create",
+        build_route_tool_context(),
+        {
+            "title": req.title,
+            "content": req.content,
+            "source": req.source,
+            "source_url": req.source_url,
+            "deadline": req.deadline,
+        },
+    )
+    return result.to_dict()
 
 
 @router.get("/api/tasks/{task_id}")
@@ -121,15 +130,20 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
                 content=req.content,
             )
 
-    # Update status/note/deadline/title via agent tool (may move file for "done")
+    # Update status/note/deadline/title via the unified handler (may
+    # move the file for "done" — the handler routes to task_done in that
+    # case so the FTS index stays consistent).
     if req.status or req.note or req.deadline or req.title:
-        from nerve.agent.tools import task_update
-        await task_update.handler({
-            "task_id": task_id,
-            "status": req.status,
-            "note": req.note,
-            "deadline": req.deadline,
-            "title": req.title,
-        })
+        await get_tool_registry().invoke(
+            "task_update",
+            build_route_tool_context(),
+            {
+                "task_id": task_id,
+                "status": req.status,
+                "note": req.note,
+                "deadline": req.deadline,
+                "title": req.title,
+            },
+        )
 
     return {"task_id": task_id, "updated": True}

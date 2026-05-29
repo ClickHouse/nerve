@@ -99,7 +99,7 @@ class ProviderConfig:
 
 @dataclass
 class AgentConfig:
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     cron_model: str = "claude-sonnet-4-6"
     title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
     max_turns: int = 100
@@ -117,7 +117,7 @@ class AgentConfig:
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
         return cls(
-            model=d.get("model", "claude-opus-4-7"),
+            model=d.get("model", "claude-opus-4-8"),
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
             title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
             max_turns=d.get("max_turns", 100),
@@ -258,11 +258,101 @@ class GitHubEventsSyncConfig:
 
 
 @dataclass
+class CodexOriginConfig:
+    """A single Codex thread sync origin.
+
+    Origins represent the transport over which we receive Codex thread
+    items — a local rollout directory, a remote app-server, or the
+    OpenAI cloud Codex API.
+    """
+
+    id: str = "local"
+    type: str = "local_rollout"           # local_rollout | app_server | cloud
+    enabled: bool = True
+    # local_rollout fields
+    path: str = "~/.codex/sessions"
+    archive_path: str = "~/.codex/archived_sessions"
+    poll_interval_seconds: float = 2.0    # How often to scan for new content
+    # app_server fields
+    transport: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CodexOriginConfig:
+        return cls(
+            id=d.get("id", "local"),
+            type=d.get("type", "local_rollout"),
+            enabled=bool(d.get("enabled", True)),
+            path=d.get("path", "~/.codex/sessions"),
+            archive_path=d.get("archive_path", "~/.codex/archived_sessions"),
+            poll_interval_seconds=float(d.get("poll_interval_seconds", 2.0)),
+            transport=d.get("transport", {}),
+        )
+
+
+@dataclass
+class CodexWorkspaceFilterConfig:
+    """Decides which Codex threads to sync based on ``session_meta.cwd``.
+
+    ``mode``:
+      * ``nerve_workspace`` (default) — only threads whose cwd matches
+        Nerve's configured workspace.
+      * ``explicit`` — only threads whose cwd matches one of
+        ``explicit_paths``.
+      * ``any`` — sync every thread, regardless of cwd. Not recommended
+        unless you really want every Codex session on the box.
+    """
+
+    mode: str = "nerve_workspace"
+    explicit_paths: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CodexWorkspaceFilterConfig:
+        return cls(
+            mode=str(d.get("mode", "nerve_workspace")),
+            explicit_paths=list(d.get("explicit_paths", [])),
+        )
+
+
+@dataclass
+class CodexSyncConfig:
+    """Sync configuration for Codex threads.
+
+    Disabled by default — flip ``enabled=true`` in config.local.yaml once
+    the workspace filter is verified to behave as expected on your box.
+    """
+
+    enabled: bool = False
+    workspace_filter: CodexWorkspaceFilterConfig = field(
+        default_factory=CodexWorkspaceFilterConfig,
+    )
+    origins: list[CodexOriginConfig] = field(default_factory=list)
+    store_encrypted_reasoning: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict) -> CodexSyncConfig:
+        raw_origins = d.get("origins", [])
+        origins = [
+            CodexOriginConfig.from_dict(o)
+            for o in raw_origins
+            if isinstance(o, dict)
+        ]
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            workspace_filter=CodexWorkspaceFilterConfig.from_dict(
+                d.get("workspace_filter", {}),
+            ),
+            origins=origins,
+            store_encrypted_reasoning=bool(d.get("store_encrypted_reasoning", True)),
+        )
+
+
+@dataclass
 class SyncConfig:
     telegram: TelegramSyncConfig = field(default_factory=TelegramSyncConfig)
     gmail: GmailSyncConfig = field(default_factory=GmailSyncConfig)
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
+    codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
 
@@ -273,6 +363,7 @@ class SyncConfig:
             gmail=GmailSyncConfig.from_dict(d.get("gmail", {})),
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
+            codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),
         )
@@ -431,6 +522,102 @@ class ProxyConfig:
             auth_dir=_expand_path(d.get("auth_dir", "~/.nerve/cli-proxy-auth")) or Path("~/.nerve/cli-proxy-auth"),
             api_key=d.get("api_key", "sk-nerve-local-proxy"),
             log_file=_expand_path(d.get("log_file", "~/.nerve/proxy.log")) or Path("~/.nerve/proxy.log"),
+        )
+
+
+@dataclass
+class McpEndpointConfig:
+    """Nerve's own MCP server endpoint (Nerve-as-MCP-server).
+
+    Exposes the Nerve tool registry to external MCP clients (Codex,
+    Claude Code, Cursor) over Streamable HTTP, mounted at ``path`` inside
+    the gateway. Off by default; flip ``enabled=true`` in config.local.yaml
+    to advertise the endpoint. Authenticates with the existing JWT
+    (``config.auth.jwt_secret``) — same token mechanism as the web UI.
+
+    Not to be confused with :class:`McpServerConfig`, which configures
+    *external* MCP servers that Nerve connects to as a client.
+    """
+
+    enabled: bool = False
+    path: str = "/mcp/v1"
+    include_hoa: bool = False   # Expose HouseOfAgents tools to external clients
+
+    @classmethod
+    def from_dict(cls, d: dict) -> McpEndpointConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            path=str(d.get("path", "/mcp/v1")),
+            include_hoa=bool(d.get("include_hoa", False)),
+        )
+
+
+@dataclass
+class ExternalAgentTargetConfig:
+    """One configured external agent (Codex, Claude Code, ...).
+
+    Populated by the bootstrap wizard's ``_step_external_agents`` step
+    and read by :class:`nerve.external_agents.sync_service.SyncService`
+    every interval to keep the agent's memory files in sync with the
+    workspace identity files.
+
+    ``token`` is the bearer JWT the agent uses to authenticate against
+    the local MCP endpoint. It's written into the agent's config once
+    at bootstrap (e.g. into ``~/.codex/config.toml``); the sync service
+    does NOT rewrite the config file, only the memory bundle.
+    """
+
+    name: str                                  # registry key: "codex" | "claude-code" | ...
+    enabled: bool = True
+    token: str = ""                            # bearer JWT for MCP auth (informational only)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ExternalAgentTargetConfig:
+        return cls(
+            name=str(d.get("name", "")),
+            enabled=bool(d.get("enabled", True)),
+            token=str(d.get("token", "")),
+        )
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "enabled": self.enabled, "token": self.token}
+
+
+@dataclass
+class ExternalAgentsConfig:
+    """Configuration for the external-agents bootstrap + sync subsystem.
+
+    The bootstrap wizard writes one :class:`ExternalAgentTargetConfig`
+    per agent selected, plus the global conflict policy chosen for
+    pre-existing files. The sync service iterates ``targets`` every
+    ``sync_interval_minutes`` and re-renders that agent's memory
+    bundle when any source file changes.
+
+    ``conflict_policy`` controls how :class:`nerve.external_agents.writer.ConfigWriter`
+    handles paths that already exist when the wizard's apply step runs:
+    ``backup`` (default) saves a ``.nerve-backup-<ts>`` copy then
+    overwrites; ``skip`` leaves the existing file alone; ``merge`` is
+    only meaningful for JSON files (used by Claude Code's settings.json).
+    """
+
+    enabled: bool = True
+    sync_interval_minutes: int = 15
+    conflict_policy: str = "backup"            # "backup" | "skip" | "merge"
+    targets: list[ExternalAgentTargetConfig] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ExternalAgentsConfig:
+        raw_targets = d.get("targets", [])
+        targets: list[ExternalAgentTargetConfig] = []
+        if isinstance(raw_targets, list):
+            for raw in raw_targets:
+                if isinstance(raw, dict) and raw.get("name"):
+                    targets.append(ExternalAgentTargetConfig.from_dict(raw))
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            sync_interval_minutes=int(d.get("sync_interval_minutes", 15)),
+            conflict_policy=str(d.get("conflict_policy", "backup")),
+            targets=targets,
         )
 
 
@@ -649,7 +836,9 @@ class NerveConfig:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+    mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
+    external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
 
     # API keys (from config.local.yaml)
     anthropic_api_key: str = ""
@@ -756,7 +945,9 @@ class NerveConfig:
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
+            mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
+            external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),

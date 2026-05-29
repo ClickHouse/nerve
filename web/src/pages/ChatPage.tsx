@@ -32,7 +32,7 @@ export function ChatPage() {
   const {
     sessions, activeSession, messages,
     streamingBlocks, isStreaming, loading,
-    agentStatus, contextUsage, currentTodos,
+    agentStatus, contextUsage, currentTodos, currentCCTasks,
     sidebarCollapsed, panels,
     modifiedFiles, modifiedFilesCount,
     loadSessions, switchSession, createSession, deleteSession,
@@ -176,7 +176,7 @@ export function ChatPage() {
             />
           )}
 
-          <TodoPanel todos={currentTodos} />
+          <TodoPanel todos={currentTodos} ccTasks={currentCCTasks} />
 
           <ChatInput
             onSend={sendMessage}

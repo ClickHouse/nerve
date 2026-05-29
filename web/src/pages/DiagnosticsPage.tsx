@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 // import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from 'lucide-react';
+import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 
 function formatUptime(isoDate: string): string {
   const diff = Date.now() - new Date(isoDate).getTime();
@@ -20,7 +21,7 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
-/** Shorten model identifiers for display (e.g. "claude-opus-4-6-20250901" → "Opus 4.6") */
+/** Shorten model identifiers for display (e.g. "claude-opus-4-8-20260528" → "Opus 4.8") */
 function formatModelName(model: string): string {
   const m = model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
   const match = m.match(/^(\w+)-(\d+)-(\d+)/);
@@ -391,6 +392,9 @@ export function DiagnosticsPage() {
             </div>
           </section>
         )}
+
+        {/* External Agents — Codex / Claude Code / ... */}
+        <ExternalAgentsSection />
 
         {/* Cron Logs */}
         <section>

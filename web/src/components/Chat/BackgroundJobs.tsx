@@ -11,9 +11,9 @@ function formatElapsed(startedAt: number): string {
   return `${min}m ${sec % 60}s`;
 }
 
-/** Icon for task tool type. */
+/** Icon for task tool type. Claude Code 2.1.x renamed Task → Agent. */
 function toolIcon(tool: string) {
-  if (tool === 'Task') return Bot;
+  if (tool === 'Agent' || tool === 'Task') return Bot;
   return Terminal;
 }
 
