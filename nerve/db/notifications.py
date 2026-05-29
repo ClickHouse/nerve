@@ -17,18 +17,30 @@ class NotificationStore:
         title: str,
         body: str = "",
         priority: str = "normal",
-        options: list[str] | None = None,
+        options: list | None = None,
         expires_at: str | None = None,
         metadata: dict | None = None,
+        target_kind: str | None = None,
+        target_id: str | None = None,
     ) -> dict:
+        """Insert a notification row.
+
+        ``type`` is one of ``notify`` (fire-and-forget), ``question``
+        (ask_user / answer-injection), or ``approval`` (action-dispatch
+        via the handler registry). ``target_kind`` and ``target_id`` are
+        only populated for ``approval`` rows; left NULL otherwise so the
+        legacy answer path stays untouched.
+        """
         now = datetime.now(timezone.utc).isoformat()
         await self.db.execute(
             """INSERT INTO notifications
-               (id, session_id, type, title, body, priority, options, expires_at, metadata, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, session_id, type, title, body, priority, options,
+                expires_at, metadata, created_at, target_kind, target_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (notification_id, session_id, type, title, body, priority,
              json.dumps(options) if options else None,
-             expires_at, json.dumps(metadata or {}), now),
+             expires_at, json.dumps(metadata or {}), now,
+             target_kind, target_id),
         )
         await self.db.commit()
         return {"id": notification_id, "session_id": session_id, "type": type}
@@ -127,6 +139,32 @@ class NotificationStore:
         )
         await self.db.commit()
         return cursor.rowcount
+
+    async def snooze_notification(
+        self, notification_id: str, new_expires_at: str,
+    ) -> bool:
+        """Push a pending notification's expiry forward.
+
+        Used by the ``approval`` dispatcher when the user picks
+        ``snooze_24h``: the row stays at status=pending so a later
+        re-delivery tick (wired in PR 2) can surface it again, but the
+        expiry advances so it does not get caught by ``expire_stale``
+        in the meantime.
+
+        Returns True on success, False if the row is not pending.
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                (notification_id,),
+            ) as cursor:
+                if not await cursor.fetchone():
+                    return False
+            await self.db.execute(
+                "UPDATE notifications SET expires_at = ? WHERE id = ?",
+                (new_expires_at, notification_id),
+            )
+        return True
 
     async def count_pending_notifications(self, channel: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM notifications WHERE status = 'pending'"

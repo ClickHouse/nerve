@@ -1,8 +1,12 @@
-"""Notification tool handlers — notify, ask_user, react, send_sticker, send_file.
+"""Notification tool handlers — notify, ask_user, propose_action, react, send_sticker, send_file.
 
-All five tools need ``ctx.session_id`` so the channel router can deliver
+All six tools need ``ctx.session_id`` so the channel router can deliver
 to the correct chat (web, Telegram). The session_id arrives via
 :class:`ToolContext`; there's no per-tool special-casing left.
+
+``propose_action`` files an ``approval``-kind notification whose answer
+routes through a server-side dispatcher (``ctx.notification_service``)
+instead of being injected back into the originating session.
 
 ``send_file`` enforces workspace containment via :py:meth:`Path.relative_to`
 (path-aware) — a string prefix check would let sibling-prefix paths
@@ -19,6 +23,7 @@ from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     ASK_USER_SCHEMA,
     NOTIFY_SCHEMA,
+    PROPOSE_ACTION_SCHEMA,
     REACT_SCHEMA,
     SEND_FILE_SCHEMA,
     SEND_STICKER_SCHEMA,
@@ -88,6 +93,85 @@ async def ask_user_handler(ctx: ToolContext, args: dict) -> ToolResult:
     except Exception as e:
         logger.error("ask_user tool failed: %s", e)
         return ToolResult.text(f"Failed to ask question: {e}")
+
+
+def _parse_action_options(raw) -> list[dict[str, str]] | None:
+    """Parse the ``options`` arg for propose_action.
+
+    Accepts:
+    - a list of ``{"label": ..., "value": ...}`` dicts (passed through)
+    - a list of strings (interpreted as ``label == value``)
+    - a JSON-encoded string of either of the above
+    - falsy / empty -> None (caller falls back to dispatcher defaults)
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            value = str(item.get("value", "")).strip()
+            label = str(item.get("label", value)).strip()
+            if not value:
+                continue
+            out.append({"label": label or value, "value": value})
+        elif isinstance(item, str):
+            v = item.strip()
+            if v:
+                out.append({"label": v, "value": v})
+    return out or None
+
+
+async def propose_action_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Ask the user to approve/decline/snooze a queued action.
+
+    Unlike ask_user, the answer routes through a server-side dispatcher
+    keyed by ``target_kind`` and acts on ``target_id`` directly — it is
+    NOT injected back into this session.
+    """
+    if not ctx.notification_service:
+        return ToolResult.text("Notification service not available.")
+
+    target_kind = str(args.get("target_kind", "")).strip()
+    target_id = str(args.get("target_id", "")).strip()
+    title = str(args.get("title", "")).strip()
+    if not target_kind or not target_id or not title:
+        return ToolResult.text(
+            "propose_action: target_kind, target_id, and title are required."
+        )
+
+    body = args.get("body", "")
+    options = _parse_action_options(args.get("options"))
+    priority = args.get("priority", "high")
+    expires_at = args.get("expires_at") or None
+
+    try:
+        result = await ctx.notification_service.propose_action(
+            session_id=ctx.session_id,
+            target_kind=target_kind,
+            target_id=target_id,
+            title=title,
+            body=body,
+            options=options,
+            priority=priority,
+            expires_at=expires_at,
+        )
+
+        nid = result["notification_id"]
+        return ToolResult.text(
+            f"Approval requested ({nid}). When the user picks a button, "
+            f"the {target_kind} dispatcher acts on {target_id}; the answer "
+            f"is NOT injected back into this session."
+        )
+    except Exception as e:
+        logger.error("propose_action tool failed: %s", e)
+        return ToolResult.text(f"Failed to propose action: {e}")
 
 
 async def react_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -196,6 +280,20 @@ ASK_USER_SPEC = ToolSpec(
     handler=ask_user_handler,
 )
 
+PROPOSE_ACTION_SPEC = ToolSpec(
+    name="propose_action",
+    description=(
+        "Ask the user to approve, decline, or snooze a queued action. "
+        "Unlike ask_user, the answer routes through a server-side dispatcher "
+        "keyed by target_kind (e.g. 'mechanical-action') and acts on target_id "
+        "directly. The answer is NOT injected back into this session. "
+        "Use for queued mechanical actions, pending plans, or any binary "
+        "decision the user owns and the agent has already prepared."
+    ),
+    input_schema=PROPOSE_ACTION_SCHEMA,
+    handler=propose_action_handler,
+)
+
 REACT_SPEC = ToolSpec(
     name="react",
     description=(
@@ -232,6 +330,7 @@ SEND_FILE_SPEC = ToolSpec(
 NOTIFICATION_SPECS = [
     NOTIFY_SPEC,
     ASK_USER_SPEC,
+    PROPOSE_ACTION_SPEC,
     REACT_SPEC,
     SEND_STICKER_SPEC,
     SEND_FILE_SPEC,

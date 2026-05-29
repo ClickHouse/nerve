@@ -617,6 +617,62 @@ ASK_USER_SCHEMA = {
     "required": ["title"],
 }
 
+PROPOSE_ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target_kind": {
+            "type": "string",
+            "description": (
+                "Dispatcher key the user's answer routes through. "
+                "Currently supported: 'mechanical-action'."
+            ),
+        },
+        "target_id": {
+            "type": "string",
+            "description": (
+                "Dispatcher-specific identifier the chosen decision acts "
+                "on (e.g. a queued mechanical-action proposal id like "
+                "'20260519T143906Z-d2e62e')."
+            ),
+        },
+        "title": {
+            "type": "string",
+            "description": "Short headline shown on the notification card.",
+        },
+        "body": {
+            "type": "string",
+            "description": (
+                "Markdown body with the justification and any details "
+                "the user needs to decide."
+            ),
+            "default": "",
+        },
+        "options": {
+            "type": "string",
+            "description": (
+                "JSON array of {label, value} dicts overriding the "
+                "dispatcher's default options. Leave empty for the "
+                "canonical Approve / Decline / Snooze 24h triplet."
+            ),
+            "default": "",
+        },
+        "priority": {
+            "type": "string",
+            "description": "'low', 'normal', 'high', 'urgent'. Default: 'high'.",
+            "default": "high",
+        },
+        "expires_at": {
+            "type": "string",
+            "description": (
+                "ISO-8601 UTC timestamp the row expires at. Omit to use "
+                "the configured default expiry window."
+            ),
+            "default": "",
+        },
+    },
+    "required": ["target_kind", "target_id", "title"],
+}
+
 REACT_SCHEMA = {
     "type": "object",
     "properties": {
