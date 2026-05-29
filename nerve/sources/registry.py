@@ -86,9 +86,15 @@ def build_source_runners(
     # GitHub (notifications)
     gh = config.sync.github
     if gh.enabled:
+        from nerve.sources.filters import InboxFilter
         from nerve.sources.github import GitHubSource
 
         source = GitHubSource()
+        # Guardrail: restrict which repos reach the inbox (matched on the
+        # "repo_name" metadata key set by GitHubSource).
+        gh_filter = InboxFilter.from_field(
+            "repo_name", allow=gh.allow_repos, deny=gh.deny_repos,
+        )
         runners.append(SourceRunner(
             source=source,
             db=db,
@@ -97,8 +103,15 @@ def build_source_runners(
             condense_model=condense_model,
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
+            inbox_filter=gh_filter,
         ))
-        logger.info("Registered source: github (batch=%d)", gh.batch_size)
+        if gh_filter.active:
+            logger.info(
+                "Registered source: github (batch=%d, guardrail: allow=%s deny=%s)",
+                gh.batch_size, gh.allow_repos or "*", gh.deny_repos or [],
+            )
+        else:
+            logger.info("Registered source: github (batch=%d)", gh.batch_size)
 
     # GitHub Events (user's own activity)
     gh_events = config.sync.github_events
