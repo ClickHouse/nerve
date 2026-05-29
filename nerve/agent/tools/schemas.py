@@ -57,6 +57,11 @@ TASK_CREATE_SCHEMA = {
             "description": "Deadline in YYYY-MM-DD format",
             "default": "",
         },
+        "status": {
+            "type": "string",
+            "description": "Initial status. Must be one of the configured task statuses (see task_status_list). Defaults to 'pending' when omitted.",
+            "default": "",
+        },
         "tags": {
             "type": "string",
             "description": "Comma-separated tags (e.g. 'urgent,backend,bug')",
@@ -76,7 +81,7 @@ TASK_LIST_SCHEMA = {
     "properties": {
         "status": {
             "type": "string",
-            "description": "Filter: 'pending', 'in_progress', 'done', 'deferred', 'open' (all non-done), or 'all' (everything). Default (empty) = all non-done.",
+            "description": "Filter by a configured status name (see task_status_list), 'open'/'' for all non-done, or 'all' for everything. Default (empty) = all non-done.",
             "default": "",
         },
         "tag": {
@@ -99,7 +104,7 @@ TASK_UPDATE_SCHEMA = {
         "task_id": {"type": "string", "description": "Task ID"},
         "status": {
             "type": "string",
-            "description": "New status: pending, in_progress, done, deferred",
+            "description": "New status. Must be one of the configured task statuses (see task_status_list). Invalid values are rejected with the list of valid options.",
             "default": "",
         },
         "note": {
@@ -157,6 +162,38 @@ TASK_DONE_SCHEMA = {
         },
     },
     "required": ["task_id"],
+}
+
+TASK_STATUS_LIST_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+TASK_STATUS_CREATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Status identifier — lowercase letters, digits, and underscores (e.g. 'blocked', 'in_review').",
+        },
+        "label": {
+            "type": "string",
+            "description": "Human-readable label shown in the UI (e.g. 'In Review'). Defaults to a title-cased version of name.",
+            "default": "",
+        },
+        "color": {
+            "type": "string",
+            "description": "Hex color like '#3b82f6'. A random color is chosen if omitted.",
+            "default": "",
+        },
+        "description": {
+            "type": "string",
+            "description": "Optional explanation of what this status means.",
+            "default": "",
+        },
+    },
+    "required": ["name"],
 }
 
 # ----- Memory tools -----

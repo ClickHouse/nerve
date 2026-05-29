@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { ChevronLeft, ChevronRight, Plus, Search, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
 import { useTaskStore, TASKS_PAGE_SIZE, type TaskSort } from '../stores/taskStore';
+import { useTaskStatusStore } from '../stores/taskStatusStore';
 import { TaskFilters } from '../components/Tasks/TaskFilters';
 import { TaskCard } from '../components/Tasks/TaskCard';
 import { TaskCreateDialog } from '../components/Tasks/TaskCreateDialog';
+import { TaskStatusManager } from '../components/Tasks/TaskStatusManager';
 
 const SORT_OPTIONS: { value: TaskSort; label: string }[] = [
   { value: 'deadline', label: 'Deadline' },
@@ -18,10 +20,13 @@ export function TasksPage() {
     updateStatus, createTask, setShowCreateDialog,
   } = useTaskStore();
 
+  const loadStatuses = useTaskStatusStore((s) => s.load);
+
   const [localQuery, setLocalQuery] = useState(searchQuery);
+  const [showStatusManager, setShowStatusManager] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
-  useEffect(() => { loadTasks(); }, []);
+  useEffect(() => { loadTasks(); loadStatuses(); }, []);
 
   const isSearching = searchQuery.trim().length > 0;
   const pageStart = total === 0 ? 0 : (page - 1) * TASKS_PAGE_SIZE + 1;
@@ -89,6 +94,13 @@ export function TasksPage() {
             </label>
           )}
           <button
+            onClick={() => setShowStatusManager(true)}
+            title="Manage statuses"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary bg-surface-raised border border-border-subtle hover:border-border rounded-lg cursor-pointer"
+          >
+            <SlidersHorizontal size={14} /> Statuses
+          </button>
+          <button
             onClick={() => setShowCreateDialog(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer"
           >
@@ -149,6 +161,10 @@ export function TasksPage() {
           onClose={() => setShowCreateDialog(false)}
           onCreate={createTask}
         />
+      )}
+
+      {showStatusManager && (
+        <TaskStatusManager onClose={() => setShowStatusManager(false)} />
       )}
     </div>
   );

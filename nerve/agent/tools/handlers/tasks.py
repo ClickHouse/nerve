@@ -24,11 +24,51 @@ from nerve.agent.tools.schemas import (
     TASK_LIST_SCHEMA,
     TASK_READ_SCHEMA,
     TASK_SEARCH_SCHEMA,
+    TASK_STATUS_CREATE_SCHEMA,
+    TASK_STATUS_LIST_SCHEMA,
     TASK_UPDATE_SCHEMA,
     TASK_WRITE_SCHEMA,
 )
+from nerve.db.task_statuses import (
+    DEFAULT_STATUS,
+    STATUS_NAME_RE,
+    TERMINAL_STATUS,
+    normalize_color,
+    random_status_color,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def _format_status_reminder(ctx: ToolContext, header: str) -> str:
+    """Build a reminder listing every configured status + its description."""
+    statuses = await ctx.db.list_task_statuses() if ctx.db else []
+    lines = [header, "", "Available statuses:"]
+    for s in statuses:
+        desc = (s.get("description") or "").strip() or "(no description)"
+        lines.append(f"  - {s['name']}: {desc}")
+    lines.append("")
+    lines.append(
+        "Pick one of the statuses above. Only create a new status "
+        "(task_status_create) when configuring Nerve or when explicitly "
+        "asked to add one — not for routine task management."
+    )
+    return "\n".join(lines)
+
+
+async def _validate_status(ctx: ToolContext, status: str) -> str | None:
+    """Return a reminder message if ``status`` is not configured, else None.
+
+    With no DB available (tests/ad-hoc) validation is skipped.
+    """
+    if not ctx.db:
+        return None
+    names = await ctx.db.task_status_names()
+    if status in names:
+        return None
+    return await _format_status_reminder(
+        ctx, f"Invalid task status: '{status}'.",
+    )
 
 
 # Process-wide read-before-write guard. Tracks task IDs that have been
@@ -137,6 +177,12 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
     raw_tags = args.get("tags", "")
     tags = parse_tags_string(raw_tags)
     confirm = args.get("confirm_duplicate", False)
+    status = (args.get("status", "") or "").strip().lower() or DEFAULT_STATUS
+
+    # Reject unknown statuses up front with the list of valid options.
+    err = await _validate_status(ctx, status)
+    if err:
+        return ToolResult.text(err)
 
     # Duplicate check (skip if explicitly confirmed)
     if not confirm:
@@ -172,7 +218,7 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             task_id=task_id,
             file_path=rel_path,
             title=title,
-            status="pending",
+            status=status,
             source=source,
             source_url=source_url or None,
             deadline=deadline or None,
@@ -181,7 +227,13 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
         )
 
     _tasks_read.add(task_id)
-    return ToolResult.text(f"Task created: {task_id}\nFile: {file_path}")
+
+    # Creating directly in the terminal status: route through task_done so
+    # the file is moved into done/ and stays consistent with the done-flow.
+    if status == TERMINAL_STATUS and ctx.db:
+        await task_done_handler(ctx, {"task_id": task_id, "note": ""})
+
+    return ToolResult.text(f"Task created: {task_id} (status: {status})\nFile: {file_path}")
 
 
 async def task_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -218,14 +270,20 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     from nerve.tasks.models import parse_tags_string, tags_to_string
 
     task_id = args["task_id"]
-    status = args.get("status", "")
+    status = (args.get("status", "") or "").strip().lower()
     note = args.get("note", "")
     deadline = args.get("deadline", "")
     raw_tags = (args.get("tags", "") or "").strip()
     new_title = (args.get("title", "") or "").strip()
 
+    # Reject unknown statuses with the list of valid options.
+    if status:
+        err = await _validate_status(ctx, status)
+        if err:
+            return ToolResult.text(err)
+
     # Route done transitions through task_done to ensure file move + FTS sync
-    if status == "done":
+    if status == TERMINAL_STATUS:
         return await task_done_handler(ctx, {"task_id": task_id, "note": note})
 
     if ctx.db:
@@ -409,6 +467,50 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task {task_id} marked as done.")
 
 
+async def task_status_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    if not ctx.db:
+        return ToolResult.text("Database not available.")
+    statuses = await ctx.db.list_task_statuses()
+    if not statuses:
+        return ToolResult.text("No task statuses configured.")
+    lines = ["Configured task statuses:"]
+    for s in statuses:
+        desc = (s.get("description") or "").strip() or "(no description)"
+        flag = " [protected]" if s.get("is_system") else ""
+        lines.append(f"  - {s['name']} ({s['color']}){flag}: {desc}")
+    return ToolResult.text("\n".join(lines))
+
+
+async def task_status_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    if not ctx.db:
+        return ToolResult.text("Database not available.")
+
+    name = (args.get("name", "") or "").strip().lower()
+    if not name:
+        return ToolResult.text("A status 'name' is required.")
+    if not STATUS_NAME_RE.match(name):
+        return ToolResult.text(
+            f"Invalid status name '{name}'. Use lowercase letters, digits, "
+            "and underscores, starting with a letter or digit (e.g. 'in_review')."
+        )
+
+    existing = await ctx.db.get_task_status_def(name)
+    if existing:
+        return ToolResult.text(f"Status '{name}' already exists.")
+
+    label = (args.get("label", "") or "").strip() or name.replace("_", " ").title()
+    color = normalize_color((args.get("color", "") or "").strip() or random_status_color())
+    description = (args.get("description", "") or "").strip()
+
+    created = await ctx.db.create_task_status(
+        name=name, label=label, color=color, description=description,
+    )
+    return ToolResult.text(
+        f"Created task status '{created['name']}' "
+        f"(label: {created['label']}, color: {created['color']})."
+    )
+
+
 # Spec exports for registry registration.
 TASK_SEARCH_SPEC = ToolSpec(
     name="task_search",
@@ -462,6 +564,27 @@ TASK_DONE_SPEC = ToolSpec(
     handler=task_done_handler,
 )
 
+TASK_STATUS_LIST_SPEC = ToolSpec(
+    name="task_status_list",
+    description="List the configured task statuses with their colors and descriptions. Use this to discover valid status values for task_create/task_update.",
+    input_schema=TASK_STATUS_LIST_SCHEMA,
+    handler=task_status_list_handler,
+)
+
+TASK_STATUS_CREATE_SPEC = ToolSpec(
+    name="task_status_create",
+    description=(
+        "Create a new configurable task status. "
+        "⚠️ Use this ONLY when configuring Nerve (e.g. initial setup) or when "
+        "the user explicitly asks you to add a status. Do NOT invent new "
+        "statuses during routine task management — use an existing status "
+        "from task_status_list instead. Color defaults to a random color when "
+        "omitted; description is optional."
+    ),
+    input_schema=TASK_STATUS_CREATE_SCHEMA,
+    handler=task_status_create_handler,
+)
+
 
 TASK_SPECS = [
     TASK_SEARCH_SPEC,
@@ -471,4 +594,6 @@ TASK_SPECS = [
     TASK_READ_SPEC,
     TASK_WRITE_SPEC,
     TASK_DONE_SPEC,
+    TASK_STATUS_LIST_SPEC,
+    TASK_STATUS_CREATE_SPEC,
 ]
