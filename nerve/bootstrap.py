@@ -1689,7 +1689,7 @@ class SetupWizard:
             "timezone": tz,
             "deployment": self.choices.deployment,
             "agent": {
-                "model": "claude-opus-4-7",
+                "model": "claude-opus-4-8",
                 "cron_model": "claude-sonnet-4-6",
                 "max_turns": 50,
                 "max_concurrent": 4,
@@ -1750,7 +1750,7 @@ class SetupWizard:
             if self.choices.aws_profile:
                 config["provider"]["aws_profile"] = self.choices.aws_profile
             # Override model names to Bedrock IDs
-            config["agent"]["model"] = "us.anthropic.claude-opus-4-7-v1"
+            config["agent"]["model"] = "us.anthropic.claude-opus-4-8"
             config["agent"]["cron_model"] = "us.anthropic.claude-sonnet-4-6"
             config["agent"]["title_model"] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
             config["memory"]["recall_model"] = "us.anthropic.claude-sonnet-4-6"

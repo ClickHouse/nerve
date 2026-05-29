@@ -172,6 +172,15 @@ class TestPricing:
         assert c5m == 6.25
         assert c1h == 10.00
 
+    def test_opus_48_rates(self):
+        # Anchor: Opus 4.8 — same pricing tier as 4.7. Base $5/MTok input,
+        # 5m write = 1.25x = $6.25/MTok, 1h write = 2.00x = $10.00/MTok.
+        from nerve.db.usage import _get_pricing
+        p_in, _, _, c5m, c1h, _ = _get_pricing("claude-opus-4-8")
+        assert p_in == 5
+        assert c5m == 6.25
+        assert c1h == 10.00
+
 
 class TestEstimateCost:
     def test_falls_back_to_5m_when_split_absent(self):

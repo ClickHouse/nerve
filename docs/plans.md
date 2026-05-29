@@ -110,7 +110,7 @@ Defined in `~/.nerve/cron/jobs.yaml` as `task-planner`:
 - **Schedule:** Every 4 hours (`0 */4 * * *`)
 - **Session mode:** Persistent (keeps context for revisions)
 - **Context rotation:** Weekly (168 hours)
-- **Model:** claude-opus-4-7
+- **Model:** claude-opus-4-8
 
 The planner is a standard persistent cron job — no special service or engine code needed.
 

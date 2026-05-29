@@ -13,13 +13,13 @@ timezone: America/New_York
 
 # Agent
 agent:
-  model: claude-opus-4-7         # Primary model for conversations
+  model: claude-opus-4-8         # Primary model for conversations
   cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
   title_model: claude-haiku-4-5-20251001  # Session title generation
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 4              # Max concurrent agent sessions
   # For Bedrock, use model IDs like:
-  #   model: us.anthropic.claude-opus-4-7-v1
+  #   model: us.anthropic.claude-opus-4-8
   #   cron_model: us.anthropic.claude-sonnet-4-6
   #   title_model: us.anthropic.claude-haiku-4-5-20251001-v1:0
 
