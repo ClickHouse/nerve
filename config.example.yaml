@@ -53,6 +53,10 @@ sync:
   github:
     enabled: true
     schedule: "*/15 * * * *"
+    # Guardrails — limit which repos reach the inbox (case-insensitive globs).
+    # allow_repos = allowlist (empty = all); deny_repos takes precedence.
+    allow_repos: []                # Example: ["ClickHouse/*", "myorg/myrepo"]
+    deny_repos: []
 
 # Memory (memU)
 memory:

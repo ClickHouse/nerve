@@ -21,6 +21,7 @@ from nerve.sources.models import IngestResult, SourceRecord
 if TYPE_CHECKING:
     from nerve.db import Database
     from nerve.sources.base import Source
+    from nerve.sources.filters import InboxFilter
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,10 @@ class SourceRunner:
             Provided by NerveConfig.create_async_anthropic_client — handles provider
             detection, credentials, timeout, and proxy routing automatically.
         ttl_days: TTL for persisted source messages.
+        inbox_filter: Optional guardrail applied after preprocess and before
+            persist. Records that don't pass are dropped — never written to
+            the inbox, never seen by the agent. An inactive/None filter is a
+            no-op. See :mod:`nerve.sources.filters`.
     """
 
     def __init__(
@@ -128,6 +133,7 @@ class SourceRunner:
         condense_prompt: str = "",
         condense_client_factory: Callable[[], Any] | None = None,
         ttl_days: int = 7,
+        inbox_filter: InboxFilter | None = None,
     ):
         self.source = source
         self.db = db
@@ -138,6 +144,7 @@ class SourceRunner:
         self.condense_prompt = condense_prompt
         self._client_factory = condense_client_factory
         self.ttl_days = ttl_days
+        self.inbox_filter = inbox_filter
         self._lock = asyncio.Lock()
         self._condense_client: Any | None = None
         self.health = SourceHealth()
@@ -244,6 +251,22 @@ class SourceRunner:
         # 1. Source-specific cleanup (e.g., Gmail boilerplate stripping)
         records = await self.source.preprocess(result.records)
 
+        # 1b. Guardrail: drop records that don't pass the inbox filter. This is
+        # the choke point — dropped records are never persisted, so the agent
+        # can never see them (worker-mode safety). The cursor still advances
+        # below, so dropped records are not re-fetched.
+        dropped_count = 0
+        if self.inbox_filter is not None and self.inbox_filter.active:
+            kept, dropped = self.inbox_filter.partition(records)
+            dropped_count = len(dropped)
+            if dropped:
+                logger.info(
+                    "Source %s: guardrail dropped %d/%d records (e.g. %r)",
+                    self.source.source_name, dropped_count, len(records),
+                    dropped[0].summary,
+                )
+            records = kept
+
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
         await self._persist_to_inbox(records)
 
@@ -267,7 +290,7 @@ class SourceRunner:
                 self.source.source_name, len(records), result.next_cursor,
             )
 
-        return IngestResult(records_ingested=len(records))
+        return IngestResult(records_ingested=len(records), records_dropped=dropped_count)
 
     # ------------------------------------------------------------------
     # Inbox persistence

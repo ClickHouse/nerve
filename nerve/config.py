@@ -215,6 +215,12 @@ class GitHubSyncConfig:
     prompt_hint: str = ""
     model: str = ""
     condense: bool = False
+    # Inbox guardrails — limit which repos reach the inbox (matched on the
+    # notification's repo full_name, e.g. "ClickHouse/nerve"). Both support
+    # case-insensitive globs. allow_repos is an allowlist (empty = all repos
+    # pass); deny_repos is a denylist and takes precedence over allow_repos.
+    allow_repos: list[str] = field(default_factory=list)
+    deny_repos: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> GitHubSyncConfig:
@@ -226,6 +232,8 @@ class GitHubSyncConfig:
             prompt_hint=d.get("prompt_hint", ""),
             model=d.get("model", ""),
             condense=d.get("condense", False),
+            allow_repos=d.get("allow_repos", []),
+            deny_repos=d.get("deny_repos", []),
         )
 
 

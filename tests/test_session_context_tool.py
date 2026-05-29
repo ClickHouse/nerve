@@ -41,12 +41,12 @@ async def test_bundles_recall_and_skills() -> None:
     bridge.available = True
     bridge.recall = AsyncMock(return_value=[
         {"id": "mem-1", "type": "knowledge", "summary": "Alice is in NYC"},
-        {"id": "mem-2", "type": "profile", "summary": "Prefers Russian-language responses"},
+        {"id": "mem-2", "type": "profile", "summary": "Prefers concise responses"},
     ])
 
     skill_manager = MagicMock()
     skill_manager.get_enabled_summaries = AsyncMock(return_value=[
-        {"id": "vox-clickhouse", "name": "vox-clickhouse", "description": "Query Vox CH"},
+        {"id": "db-query", "name": "db-query", "description": "Query the database"},
     ])
 
     db = MagicMock()
@@ -54,20 +54,20 @@ async def test_bundles_recall_and_skills() -> None:
 
     ctx = _ctx(memory_bridge=bridge, skill_manager=skill_manager, db=db)
     result = await session_context_handler(ctx, {
-        "topic": "fix the wallet endpoint",
+        "topic": "fix the auth endpoint",
         "memory_limit": 5,
     })
 
     text = result.content[0]["text"]
-    assert "fix the wallet endpoint" in text
+    assert "fix the auth endpoint" in text
     assert "Alice is in NYC" in text
-    assert "vox-clickhouse" in text
+    assert "db-query" in text
     assert "test-session-123" in text
     assert "codex" in text  # source from session record
 
     # Recall was biased by topic
     args, kwargs = bridge.recall.call_args
-    assert "fix the wallet endpoint" in args[0]
+    assert "fix the auth endpoint" in args[0]
     assert kwargs["limit"] == 5
 
 
