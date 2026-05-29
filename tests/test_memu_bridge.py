@@ -315,12 +315,12 @@ class TestConfigMemoryModels:
 
     def test_from_dict(self):
         config = MemoryConfig.from_dict({
-            "recall_model": "claude-opus-4-7",
+            "recall_model": "claude-opus-4-8",
             "memorize_model": "claude-sonnet-4-6",
             "fast_model": "claude-haiku-4-5-20251001",
             "embed_model": "text-embedding-3-large",
         })
-        assert config.recall_model == "claude-opus-4-7"
+        assert config.recall_model == "claude-opus-4-8"
         assert config.memorize_model == "claude-sonnet-4-6"
         assert config.fast_model == "claude-haiku-4-5-20251001"
         assert config.embed_model == "text-embedding-3-large"

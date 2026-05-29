@@ -1118,10 +1118,11 @@ class AgentEngine:
             return {"type": "adaptive"}
 
     # Effort levels accepted per Claude model — substring-matched against the
-    # full model name so dated aliases (e.g. "claude-opus-4-7-20260416") resolve.
+    # full model name so dated aliases (e.g. "claude-opus-4-8-20260528") resolve.
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+        "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),
         "sonnet-4-6": ("low", "medium", "high"),

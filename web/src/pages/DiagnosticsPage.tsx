@@ -21,7 +21,7 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
-/** Shorten model identifiers for display (e.g. "claude-opus-4-6-20250901" → "Opus 4.6") */
+/** Shorten model identifiers for display (e.g. "claude-opus-4-8-20260528" → "Opus 4.8") */
 function formatModelName(model: string): string {
   const m = model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
   const match = m.match(/^(\w+)-(\d+)-(\d+)/);

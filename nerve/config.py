@@ -99,7 +99,7 @@ class ProviderConfig:
 
 @dataclass
 class AgentConfig:
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     cron_model: str = "claude-sonnet-4-6"
     title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
     max_turns: int = 100
@@ -117,7 +117,7 @@ class AgentConfig:
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
         return cls(
-            model=d.get("model", "claude-opus-4-7"),
+            model=d.get("model", "claude-opus-4-8"),
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
             title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
             max_turns=d.get("max_turns", 100),
