@@ -25,7 +25,13 @@ from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.gateway.auth import authenticate_websocket
-from nerve.gateway.routes import init_deps, register_all_routes, set_notification_service
+from nerve.gateway.routes import (
+    init_deps,
+    register_all_routes,
+    set_external_agents_sync,
+    set_notification_service,
+)
+from nerve.mcp_server import build_manager as _build_mcp_manager, mount_deferred as _mount_mcp_deferred
 from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
@@ -36,6 +42,19 @@ logger = logging.getLogger(__name__)
 # Global references
 _engine: AgentEngine | None = None
 _cron_service = None  # CronService
+# StreamableHTTPSessionManager assigned during lifespan when
+# config.mcp_endpoint.enabled. The /mcp/v1 mount handler reads it; until
+# lifespan finishes building it, the mount returns 503.
+_mcp_manager = None
+# CodexThreadSyncService assigned during lifespan when sync.codex.enabled.
+# Exposed on the diagnostics endpoint so the UI can render per-origin
+# health without piercing the lifespan closure.
+_codex_thread_sync = None
+# External-agents SyncService — re-renders ~/.codex/AGENTS.md,
+# ~/.claude/CLAUDE.md, etc. when source files change. Built in the
+# lifespan once the config is loaded so the periodic sweep starts the
+# moment the gateway accepts traffic.
+_external_agents_sync = None
 
 # Memorization sweep stats (updated by background task, read by diagnostics)
 _memorize_stats: dict = {
@@ -51,6 +70,16 @@ def get_engine() -> AgentEngine:
     if _engine is None:
         raise RuntimeError("Engine not initialized")
     return _engine
+
+
+def get_codex_thread_sync():
+    """Return the running :class:`CodexThreadSyncService`, if any.
+
+    Used by ``/api/diagnostics`` so the UI can render per-origin
+    health for the Codex thread sync. Returns ``None`` when the
+    feature is disabled or hasn't finished starting up.
+    """
+    return _codex_thread_sync
 
 
 async def _send_session_status(
@@ -82,7 +111,7 @@ async def _send_session_status(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
-    global _engine
+    global _engine, _mcp_manager
     config = get_config()
 
     # Clear CLAUDECODE env var to prevent nested session detection by claude-agent-sdk
@@ -118,11 +147,16 @@ async def lifespan(app: FastAPI):
     # Wire up routes
     init_deps(_engine, db)
 
-    # Initialize notification service
+    # Initialize notification service. The engine has a setter so the
+    # per-session ``ToolContext`` constructed inside ``engine.run()``
+    # picks up the live reference. We also seed the legacy module
+    # global on ``nerve.agent.tools`` so older test fixtures that patch
+    # ``tools._notification_service`` directly continue to work.
     from nerve.notifications.service import NotificationService
     from nerve.agent import tools as agent_tools
 
     notification_service = NotificationService(config, db, _engine)
+    _engine.set_notification_service(notification_service)
     agent_tools._notification_service = notification_service
     set_notification_service(notification_service)
 
@@ -228,6 +262,61 @@ async def lifespan(app: FastAPI):
 
     notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
 
+    # Start the external-agents sync service. It re-renders
+    # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace
+    # identity files on a timer (config.external_agents.sync_interval_minutes).
+    # Failure here is non-fatal: external agents just won't receive
+    # automatic updates, but the gateway and MCP endpoint still work.
+    global _external_agents_sync
+    if config.external_agents.enabled and config.external_agents.targets:
+        try:
+            from nerve.external_agents.sync_service import SyncService
+            _external_agents_sync = SyncService(config)
+            await _external_agents_sync.start()
+            set_external_agents_sync(_external_agents_sync)
+            logger.info(
+                "External-agents sync started (%d target(s), interval=%dm)",
+                len(config.external_agents.targets),
+                config.external_agents.sync_interval_minutes,
+            )
+        except Exception as e:
+            logger.error("Failed to start external-agents sync: %s", e, exc_info=True)
+            _external_agents_sync = None
+
+    # Start the Codex thread sync service if enabled. Background tasks
+    # are spawned by the service itself — we only need to keep the
+    # handle so shutdown can cancel them cleanly.
+    global _codex_thread_sync
+    try:
+        from nerve.sources.codex_threads import build_service as _build_codex_sync
+        codex_sync = _build_codex_sync(config, db, broadcaster=broadcaster)
+        if codex_sync is not None:
+            await codex_sync.start()
+            _codex_thread_sync = codex_sync
+    except Exception as e:
+        logger.error("Failed to start Codex thread sync: %s", e, exc_info=True)
+        _codex_thread_sync = None
+
+    # Start the external MCP manager if enabled — its run() context
+    # owns the task group for in-flight connections. The deferred mount
+    # added in create_app() reads the manager from _mcp_manager once
+    # it's set, so the /mcp/v1 path is wired BEFORE the SPA catch-all
+    # but only becomes reachable after we enter run() below.
+    mcp_run_ctx = None
+    if config.mcp_endpoint.enabled:
+        try:
+            _mcp_manager = _build_mcp_manager(_engine, _engine.registry, config)
+            mcp_run_ctx = _mcp_manager.run()
+            await mcp_run_ctx.__aenter__()
+            logger.info(
+                "MCP endpoint live at %s (include_hoa=%s)",
+                config.mcp_endpoint.path, config.mcp_endpoint.include_hoa,
+            )
+        except Exception as e:
+            logger.error("Failed to start MCP endpoint: %s", e)
+            mcp_run_ctx = None
+            _mcp_manager = None
+
     logger.info("Nerve started on %s:%d", config.gateway.host, config.gateway.port)
 
     # Send startup notification to the user (Telegram only, silent)
@@ -243,6 +332,34 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to send startup notification: %s", e)
 
     yield
+
+    # Shutdown: stop MCP manager first so in-flight requests finish
+    # before we tear down the engine they depend on.
+    if mcp_run_ctx is not None:
+        try:
+            await mcp_run_ctx.__aexit__(None, None, None)
+        except Exception as e:
+            logger.warning("MCP manager shutdown raised: %s", e)
+        _mcp_manager = None
+
+    # Stop Codex thread sync. Origins each get a CancelledError; the
+    # service awaits them before returning so cursors are flushed.
+    if _codex_thread_sync is not None:
+        try:
+            await _codex_thread_sync.stop()
+        except Exception as e:
+            logger.warning("Codex thread sync shutdown raised: %s", e)
+        _codex_thread_sync = None
+
+    # Stop the external-agents sync service. Cheap — it just cancels
+    # the periodic loop; no per-file cleanup needed because every write
+    # is already atomic (temp + rename).
+    if _external_agents_sync is not None:
+        try:
+            await _external_agents_sync.stop()
+        except Exception as e:
+            logger.warning("External-agents sync shutdown raised: %s", e)
+        _external_agents_sync = None
 
     # Shutdown: stop telegram FIRST, before cancelling background tasks.
     # Background task cancellation propagates through anyio cancel scopes
@@ -297,6 +414,12 @@ def create_app() -> FastAPI:
 
     # REST routes
     app.include_router(register_all_routes())
+
+    # External MCP endpoint (deferred mount — registers /mcp/v1 BEFORE the
+    # SPA catch-all so the path isn't shadowed; the manager itself is
+    # built in lifespan once the engine is live).
+    config = get_config()
+    _mount_mcp_deferred(app, config, lambda: _mcp_manager)
 
     # WebSocket endpoint
     @app.websocket("/ws")

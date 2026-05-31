@@ -34,6 +34,7 @@ class IngestResult:
     """Result of source ingestion (fetch + persist, no processing)."""
 
     records_ingested: int
+    records_dropped: int = 0        # Dropped by the inbox guardrail before persist
     error: str | None = None
 
 

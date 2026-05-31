@@ -30,7 +30,18 @@ interface HoaStatus {
 export function PlanDetailPage() {
   const { planId } = useParams<{ planId: string }>();
   const navigate = useNavigate();
-  const { selectedPlan: plan, detailLoading, actionLoading, loadPlan, updatePlan, approvePlan, revisePlan, clearSelectedPlan } = usePlanStore();
+  const {
+    selectedPlan: plan,
+    detailLoading,
+    actionLoading,
+    actionError,
+    loadPlan,
+    updatePlan,
+    approvePlan,
+    revisePlan,
+    clearActionError,
+    clearSelectedPlan,
+  } = usePlanStore();
   const [feedback, setFeedback] = useState('');
   const [showFeedback, setShowFeedback] = useState(false);
   const [declineFeedback, setDeclineFeedback] = useState('');
@@ -88,9 +99,10 @@ export function PlanDetailPage() {
     setShowDeclineFeedback(false);
   };
 
-  const handleRevise = () => {
-    if (feedback.trim()) {
-      revisePlan(plan.id, feedback.trim());
+  const handleRevise = async () => {
+    if (!feedback.trim()) return;
+    const ok = await revisePlan(plan.id, feedback.trim());
+    if (ok) {
       setFeedback('');
       setShowFeedback(false);
     }
@@ -267,7 +279,10 @@ export function PlanDetailPage() {
                     <div className="flex-1 pl-3">
                       <textarea
                         value={feedback}
-                        onChange={e => setFeedback(e.target.value)}
+                        onChange={e => {
+                          setFeedback(e.target.value);
+                          if (actionError) clearActionError();
+                        }}
                         placeholder="Describe what to change..."
                         className="w-full p-3 text-[13px] bg-surface-raised border border-border-subtle rounded-lg text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-accent/50 resize-none"
                         rows={3}
@@ -275,6 +290,12 @@ export function PlanDetailPage() {
                       />
                     </div>
                   </div>
+                  {actionError && (
+                    <div className="flex gap-0">
+                      <div className="w-1 bg-red-500/40 rounded-full shrink-0" />
+                      <div className="pl-3 py-1 text-[12px] text-hue-red">{actionError}</div>
+                    </div>
+                  )}
                   <div className="flex justify-end">
                     <button
                       onClick={handleRevise}

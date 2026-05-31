@@ -198,7 +198,7 @@ def test_attributes_calls_propagate_when_enabled(monkeypatch):
     with lf.attributes(
         session_id="s1",
         user_id="u1",
-        tags=["source:web", "model:opus-4-7"],
+        tags=["source:web", "model:opus-4-8"],
         metadata={"k": "v", "ignored": None},
     ):
         pass
@@ -208,7 +208,7 @@ def test_attributes_calls_propagate_when_enabled(monkeypatch):
     call_kwargs = sys.modules["langfuse"].propagate_attributes.call_args.kwargs
     assert call_kwargs["session_id"] == "s1"
     assert call_kwargs["user_id"] == "u1"
-    assert call_kwargs["tags"] == ["source:web", "model:opus-4-7"]
+    assert call_kwargs["tags"] == ["source:web", "model:opus-4-8"]
     assert call_kwargs["metadata"] == {"k": "v"}
 
 

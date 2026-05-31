@@ -6,7 +6,7 @@ import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, Modifie
 import { hydrateMessage } from '../utils/hydrateMessage';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
-import { extractTodosFromMessages } from './helpers/bufferReplay';
+import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleAnswerInjected } from './handlers/sessionHandlers';
@@ -17,6 +17,21 @@ export interface TodoItem {
   content: string;
   status: 'pending' | 'in_progress' | 'completed';
   activeForm: string;
+}
+
+/**
+ * Claude Code 2.1.x task (from TaskCreate / TaskUpdate / TaskList / TaskGet).
+ * Stored per-session in ~/.claude/tasks/<id>/ on the CLI side; tracked here
+ * so the in-chat "Tasks" panel reflects what the model is planning during the
+ * turn. Replaces the older TodoWrite todo list.
+ */
+export interface CCTask {
+  id: string;             // numeric string assigned by the CLI ("1", "2", ...)
+  subject: string;        // brief title
+  activeForm?: string;    // present continuous, shown while in_progress
+  status: 'pending' | 'in_progress' | 'completed';
+  owner?: string;
+  blockedBy?: string[];
 }
 
 export type QuoteAction = 'add' | 'remove' | 'improve' | 'question' | 'note';
@@ -54,11 +69,15 @@ interface ChatState {
     output_tokens: number;
     cache_creation_input_tokens: number;
     cache_read_input_tokens: number;
+    cache_creation_5m_input_tokens?: number;
+    cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
   } | null;
-  // TodoWrite panel state
+  // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
+  // Claude Code 2.1+ task panel state (TaskCreate / TaskUpdate / TaskList)
+  currentCCTasks: CCTask[];
   // Text selection quotes
   quotes: QuoteEntry[];
 
@@ -133,6 +152,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   agentStatus: { state: 'idle' },
   contextUsage: null,
   currentTodos: [],
+  currentCCTasks: [],
   quotes: [],
   panels: [],
   activePanelId: null,
@@ -316,7 +336,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeSession: id, messages: [], loading: true, streamingBlocks: [],
       isStreaming: false, agentStatus: { state: 'idle' }, contextUsage: null,
-      currentTodos: [], pendingInteraction: null,
+      currentTodos: [], currentCCTasks: [], pendingInteraction: null,
       panels: [], activePanelId: null, panelVisible: false,
       modifiedFiles: [], modifiedFilesCount: 0, backgroundTasks: [],
     });
@@ -330,17 +350,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
       // Restore context usage from last turn (for context bar)
       if (data.last_usage) {
+        const cc = data.last_usage.cache_creation as
+          | { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
+          | undefined;
         update.contextUsage = {
           input_tokens: data.last_usage.input_tokens || 0,
           output_tokens: data.last_usage.output_tokens || 0,
           cache_creation_input_tokens: data.last_usage.cache_creation_input_tokens || 0,
           cache_read_input_tokens: data.last_usage.cache_read_input_tokens || 0,
+          cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
+          cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
           max_context_tokens: data.last_usage.max_context_tokens || 200_000,
           num_turns: data.last_usage.num_turns || 1,
         };
       }
-      // Restore todos from last TodoWrite call in history
+      // Restore todos from last TodoWrite call in history (legacy)
       update.currentTodos = extractTodosFromMessages(hydrated);
+      // Restore Claude Code 2.1+ task panel from history
+      update.currentCCTasks = extractCCTasksFromMessages(hydrated);
       set(update);
       // Fetch modified files for this session (non-blocking)
       get().fetchModifiedFiles(id);

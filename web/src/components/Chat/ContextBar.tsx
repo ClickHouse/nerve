@@ -5,6 +5,11 @@ interface ContextUsage {
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
+  // 5m vs 1h ephemeral cache TTL split — emitted by the Anthropic API
+  // under usage.cache_creation. Both default to 0 when the API omits
+  // the split (older responses) or when no cache was written.
+  cache_creation_5m_input_tokens?: number;
+  cache_creation_1h_input_tokens?: number;
   max_context_tokens: number;
   num_turns: number;
 }
@@ -78,6 +83,12 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
             )}
             {usage.cache_creation_input_tokens > 0 && (
               <Row label="Cache created" value={usage.cache_creation_input_tokens} color="#a855f7" />
+            )}
+            {(usage.cache_creation_5m_input_tokens ?? 0) > 0 && (
+              <Row label="  ↳ 5m TTL" value={usage.cache_creation_5m_input_tokens!} color="#c084fc" />
+            )}
+            {(usage.cache_creation_1h_input_tokens ?? 0) > 0 && (
+              <Row label="  ↳ 1h TTL" value={usage.cache_creation_1h_input_tokens!} color="#e879f9" />
             )}
             {numCalls > 1 && (
               <div className="flex justify-between items-center">

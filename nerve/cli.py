@@ -874,6 +874,7 @@ def sync(ctx: click.Context, source: str) -> None:
                 click.echo(
                     f" [{status}] "
                     f"{result.records_ingested} ingested"
+                    + (f", {result.records_dropped} dropped" if result.records_dropped else "")
                     + (f" — {result.error}" if result.error else "")
                 )
                 # Log to source_run_log

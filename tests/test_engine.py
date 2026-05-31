@@ -13,7 +13,13 @@ from nerve.agent.engine import AgentEngine
 @pytest.mark.parametrize(
     "value, model, expected",
     [
-        # Opus 4.7 supports every level
+        # Opus 4.8 supports every level (same ladder as 4.7)
+        ("max",    "claude-opus-4-8",           "max"),
+        ("xhigh",  "claude-opus-4-8",           "xhigh"),
+        ("high",   "claude-opus-4-8",           "high"),
+        # Bedrock dateless ID resolves via substring match
+        ("max",    "us.anthropic.claude-opus-4-8", "max"),
+        # Opus 4.7 still resolves correctly for legacy configs
         ("max",    "claude-opus-4-7",           "max"),
         ("xhigh",  "claude-opus-4-7",           "xhigh"),
         ("high",   "claude-opus-4-7",           "high"),

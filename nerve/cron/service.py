@@ -480,6 +480,8 @@ class CronService:
         try:
             result = await runner.run()
             summary = f"{result.records_ingested} ingested"
+            if result.records_dropped:
+                summary += f", {result.records_dropped} dropped by guardrail"
             if result.error:
                 summary += f", error: {result.error}"
 

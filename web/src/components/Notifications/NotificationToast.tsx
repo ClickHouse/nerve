@@ -1,9 +1,27 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, HelpCircle, X } from 'lucide-react';
-import { useNotificationStore } from '../../stores/notificationStore';
+import { Bell, HelpCircle, ShieldCheck, X } from 'lucide-react';
+import { useNotificationStore, type Notification } from '../../stores/notificationStore';
 
 const TOAST_DURATION = 5000;
+
+const APPROVAL_QUICK_BUTTON_STYLES: Record<string, string> = {
+  approve: 'bg-emerald-400/15 text-hue-emerald border-emerald-400/30 hover:bg-emerald-400/25',
+  decline: 'bg-red-400/15 text-hue-red border-red-400/30 hover:bg-red-400/25',
+  snooze_24h: 'bg-border-subtle/40 text-text-muted border-border-subtle hover:bg-border-subtle/60',
+};
+
+const APPROVAL_QUICK_LABELS: Record<string, string> = {
+  approve: '✅ Approve',
+  decline: '❌ Decline',
+  snooze_24h: '💤 Snooze',
+};
+
+function quickLabel(value: string, notif: Notification): string {
+  const labels = notif.option_labels;
+  if (labels && labels[value]) return labels[value];
+  return APPROVAL_QUICK_LABELS[value] || value;
+}
 
 export function NotificationToast() {
   const { toastQueue, dismissToast, answerNotification } = useNotificationStore();
@@ -27,6 +45,7 @@ export function NotificationToast() {
     <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm">
       {visible.map((notif) => {
         const isQuestion = notif.type === 'question';
+        const isApproval = notif.type === 'approval';
         const options = notif.options ? (typeof notif.options === 'string' ? JSON.parse(notif.options) : notif.options) : null;
 
         return (
@@ -35,7 +54,9 @@ export function NotificationToast() {
             className="bg-surface-raised border border-border-subtle rounded-lg shadow-xl p-3 animate-slide-in"
           >
             <div className="flex items-start gap-2">
-              {isQuestion ? (
+              {isApproval ? (
+                <ShieldCheck size={16} className="text-hue-violet shrink-0 mt-0.5" />
+              ) : isQuestion ? (
                 <HelpCircle size={16} className="text-hue-blue shrink-0 mt-0.5" />
               ) : (
                 <Bell size={16} className="text-accent shrink-0 mt-0.5" />
@@ -76,6 +97,26 @@ export function NotificationToast() {
                         {opt}
                       </button>
                     ))}
+                  </div>
+                )}
+                {/* Quick action buttons for approvals */}
+                {isApproval && options && notif.status === 'pending' && (
+                  <div className="flex flex-wrap gap-1.5 mt-2">
+                    {options.slice(0, 3).map((value: string) => {
+                      const style = APPROVAL_QUICK_BUTTON_STYLES[value] || 'bg-accent/15 text-accent border-accent/30 hover:bg-accent/25';
+                      return (
+                        <button
+                          key={value}
+                          onClick={() => {
+                            answerNotification(notif.id, value);
+                            dismissToast(notif.id);
+                          }}
+                          className={`px-2 py-0.5 rounded text-xs border cursor-pointer ${style}`}
+                        >
+                          {quickLabel(value, notif)}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>

@@ -39,7 +39,18 @@ from nerve.agent.interactive import (
 from nerve.agent.prompts import build_system_prompt, set_skill_manager
 from nerve.agent.sessions import SessionManager, SessionStatus
 from nerve.agent.streaming import broadcaster
-from nerve.agent.tools import ALL_TOOLS, create_session_mcp_server, init_tools
+from nerve.agent.tools import (
+    ToolContext,
+    ToolRegistry,
+    build_default_registry,
+    build_session_mcp_server,
+)
+# Legacy back-compat: ``init_tools`` populates ``nerve.agent.tools``'s
+# module globals so test fixtures that patch them and the shared
+# ``plan_service`` helper (which builds its ctx via ``_legacy_ctx``)
+# keep working. The new runtime path uses ``self.registry`` + a
+# per-session ``ToolContext`` and ignores those globals.
+from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, load_mcp_servers
 from nerve.db import Database
 from nerve.observability.langfuse import attributes as lf_attrs
@@ -289,6 +300,26 @@ class AgentEngine:
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
+        # Tool registry — built once at construction. Per-session MCP
+        # servers are built in ``_build_mcp_servers`` by binding a fresh
+        # ``ToolContext`` (with the session_id) into closures.
+        self.registry: ToolRegistry = build_default_registry()
+
+        # NotificationService is wired in by ``gateway/server.py`` after
+        # ``initialize()`` returns (it depends on the engine being live
+        # so the channels are routable). Use ``set_notification_service``
+        # to install it; ``ToolContext`` constructed per session picks
+        # up the reference from here.
+        self.notification_service: Any = None
+
+    def set_notification_service(self, service: Any) -> None:
+        """Install the notification service used by per-session ``ToolContext``.
+
+        Called once during gateway startup. We accept ``Any`` to avoid
+        a circular import with :mod:`nerve.notifications.service`.
+        """
+        self.notification_service = service
+
     def get_active_channel(self, session_id: str) -> str | None:
         """Return the channel name currently driving ``session_id`` (or None)."""
         return self._active_channel.get(session_id)
@@ -309,6 +340,11 @@ class AgentEngine:
 
         # Make skill manager available to prompts and tools
         set_skill_manager(self._skill_manager)
+        # init_tools seeds ``nerve.agent.tools``'s back-compat module
+        # globals so legacy callers (tests that patch ``tools._workspace``,
+        # ``plan_service`` via ``_legacy_ctx``) keep working. The new
+        # runtime path builds a fresh ``ToolContext`` per session inside
+        # ``_build_mcp_servers`` and doesn't read these.
         init_tools(
             self.config.workspace, self.db,
             memory_bridge=self._memory_bridge,
@@ -350,10 +386,15 @@ class AgentEngine:
 
     async def _sync_mcp_servers_to_db(self) -> None:
         """Register all known MCP servers (built-in + external) in the DB."""
-        # Built-in nerve server
+        # Built-in nerve server. HoA tools are only exposed when enabled,
+        # so the count reflects the runtime visible set rather than the
+        # full registry. The frontend uses this number as a hint and is
+        # not load-bearing.
+        include_hoa = bool(self.config.houseofagents.enabled)
+        tool_count = len(self.registry.list(include_hoa=include_hoa))
         await self.db.upsert_mcp_server(
             name="nerve", server_type="sdk", enabled=True,
-            tool_count=len(ALL_TOOLS),
+            tool_count=tool_count,
         )
         # External servers from cache
         for srv in self._mcp_servers_cache:
@@ -875,6 +916,23 @@ class AgentEngine:
             # No allowed_tools — can_use_tool callback handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
+            #
+            # ``ScheduleWakeup`` is left enabled. Behaviour in Nerve:
+            #   • The CLI's internal scheduler "fires" the wakeup at the
+            #     scheduled time and enqueues the stored prompt as a
+            #     synthetic user message inside the SDK subprocess.
+            #   • Nerve has no background reader between turns — the queued
+            #     wakeup just sits in the SDK buffer.
+            #   • On the next user message, Nerve calls ``client.query()``
+            #     and the buffered wakeup is flushed BEFORE the user's
+            #     input, so the model sees the self-scheduled prompt first.
+            #   • If the user never sends another message before the idle
+            #     timeout reaps the client, the wakeup is lost (durable
+            #     wakeups would survive in ~/.claude/scheduled_tasks.json,
+            #     but the model rarely sets ``durable: true``).
+            # Net: it's a deferred-prompt, not an autonomous timer. The UI
+            # renders the call (see ``ScheduleWakeupBlock``) so the user
+            # knows what the model scheduled.
             env=self._build_env(),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),
@@ -953,10 +1011,26 @@ class AgentEngine:
         Claude Code plugin MCPs are handled separately via the SDK ``plugins``
         field which lets the CLI manage OAuth and plugin lifecycle natively.
         """
+        # Construct a fresh ``ToolContext`` per session so every tool
+        # handler sees the correct session_id and the live collaborator
+        # references. The notification_service may still be ``None``
+        # here if a session starts before gateway startup wires it; the
+        # tools themselves degrade gracefully in that case.
+        tool_ctx = ToolContext(
+            session_id=session_id,
+            workspace=self.config.workspace,
+            db=self.db,
+            memory_bridge=self._memory_bridge,
+            config=self.config,
+            skill_manager=self._skill_manager,
+            engine=self,
+            notification_service=self.notification_service,
+        )
+        include_hoa = bool(self.config.houseofagents.enabled)
         servers: dict[str, Any] = {
-            # Per-session MCP server with session_id bound in closure —
-            # ensures notify/ask_user always reference the correct session.
-            "nerve": create_session_mcp_server(session_id),
+            "nerve": build_session_mcp_server(
+                self.registry, tool_ctx, include_hoa=include_hoa,
+            ),
         }
         for srv in self._mcp_servers_cache:
             if srv.enabled and srv.name != "nerve":
@@ -1077,10 +1151,11 @@ class AgentEngine:
             return {"type": "adaptive"}
 
     # Effort levels accepted per Claude model — substring-matched against the
-    # full model name so dated aliases (e.g. "claude-opus-4-7-20260416") resolve.
+    # full model name so dated aliases (e.g. "claude-opus-4-8-20260528") resolve.
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+        "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),
         "sonnet-4-6": ("low", "medium", "high"),
@@ -1884,8 +1959,15 @@ class AgentEngine:
                                             tool_use_id=tool_use_id,
                                             parent_tool_use_id=parent_id,
                                         )
-                                        # Track sub-agent lifecycle
-                                        if tool_name == "Task" and tool_use_id:
+                                        # Track sub-agent lifecycle.  Claude Code
+                                        # 2.1.x renamed the subagent-spawning
+                                        # tool from ``Task`` → ``Agent`` (and
+                                        # introduced separate ``TaskCreate``/
+                                        # ``TaskUpdate``/etc. tools for in-
+                                        # session todo tracking).  Match both
+                                        # names so old session history still
+                                        # opens panels on replay.
+                                        if tool_name in ("Task", "Agent") and tool_use_id:
                                             active_subagents[tool_use_id] = asyncio.get_event_loop().time()
                                             await broadcaster.broadcast_subagent_start(
                                                 session_id,
@@ -2125,7 +2207,7 @@ class AgentEngine:
             # entire SDK session, NOT per-invocation.  We track the last
             # known cumulative value in session metadata so we can compute
             # the delta for this turn.
-            from nerve.db.usage import estimate_turn_cost
+            from nerve.db.usage import estimate_turn_cost, extract_cache_ttl_split
             sdk_cost = (result_meta or {}).get("total_cost_usd")
             current_session_cost = (
                 session_record.get("total_cost_usd", 0) if session_record else 0
@@ -2141,6 +2223,13 @@ class AgentEngine:
             # Save metadata (includes _sdk_cumulative_cost update)
             await self.db.update_session_metadata(session_id, meta)
 
+            # The Anthropic API splits cache_creation by TTL:
+            #   usage.cache_creation.ephemeral_5m_input_tokens  (1.25x base)
+            #   usage.cache_creation.ephemeral_1h_input_tokens  (2.00x base)
+            # Older API responses omit the split; the aggregate still
+            # lives in cache_creation_input_tokens.
+            cache_5m, cache_1h = extract_cache_ttl_split(last_usage)
+
             # Persist per-turn usage to session_usage table
             await self.db.record_turn_usage(
                 session_id=session_id,
@@ -2148,6 +2237,8 @@ class AgentEngine:
                 output_tokens=last_usage.get("output_tokens", 0),
                 cache_creation=last_usage.get("cache_creation_input_tokens", 0),
                 cache_read=last_usage.get("cache_read_input_tokens", 0),
+                cache_creation_5m=cache_5m,
+                cache_creation_1h=cache_1h,
                 max_context=max_context,
                 model=last_model,
                 cost_usd=turn_cost,

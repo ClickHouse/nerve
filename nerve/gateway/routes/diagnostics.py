@@ -130,6 +130,16 @@ async def diagnostics(user: dict = Depends(require_auth)):
         except Exception:
             logger.exception("Failed to collect per-source diagnostics")
 
+    # Codex thread sync (optional)
+    codex_sync_status: dict | None = None
+    try:
+        from nerve.gateway.server import get_codex_thread_sync
+        codex_svc = get_codex_thread_sync()
+        if codex_svc is not None:
+            codex_sync_status = codex_svc.status()
+    except Exception:
+        logger.exception("Failed to collect Codex thread sync diagnostics")
+
     return {
         "system": {
             "platform": platform.platform(),
@@ -142,6 +152,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
         "workspace": str(config.workspace),
         "sessions_count": sessions_count,
         "sync": sync_status,
+        "codex_thread_sync": codex_sync_status,
         "recent_cron_logs": cron_logs,
         "tasks": tasks_health,
         "memorization": {

@@ -5,7 +5,7 @@ export interface Notification {
   id: string;
   session_id: string;
   session_title: string | null;
-  type: 'notify' | 'question';
+  type: 'notify' | 'question' | 'approval';
   title: string;
   body: string;
   priority: string;
@@ -16,6 +16,12 @@ export interface Notification {
   answered_at: string | null;
   created_at: string;
   expires_at: string | null;
+  target_kind?: string | null;
+  target_id?: string | null;
+  // Optional label map for approval-kind rows: value -> human label.
+  // Sent on the WS notification payload and stored on the row metadata.
+  option_labels?: Record<string, string> | null;
+  metadata?: string | Record<string, unknown> | null;
 }
 
 interface NotificationState {
@@ -113,6 +119,9 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       answered_at: null,
       created_at: new Date().toISOString(),
       expires_at: null,
+      target_kind: data.target_kind ?? null,
+      target_id: data.target_id ?? null,
+      option_labels: data.option_labels ?? null,
     };
 
     set(s => ({

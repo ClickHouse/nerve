@@ -13,6 +13,8 @@ PRODUCERS (sources):
       ↓
   Source.preprocess(records)          ← source-specific cleanup (e.g., strip email boilerplate)
       ↓
+  InboxFilter.partition(records)      ← guardrail: drop records that fail allow/deny rules
+      ↓
   Persist to source_messages table    ← inbox storage (with TTL)
       ↓
   SourceRunner._condense_long_content ← LLM condensation via Haiku (if condense: true)
@@ -33,8 +35,9 @@ CONSUMERS (agent tools):
 2. **Preprocess** — Two-stage content cleanup:
    - **Source-specific** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
    - **LLM condensation** (`condense: true`) — Records still over 800 chars are sent to a fast model (Haiku) that extracts only essential information. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
-3. **Persist** — Records are saved to the `source_messages` table with a configurable TTL
-4. **Advance** — Source cursor is saved to SQLite after successful persistence
+3. **Guardrail** — An optional `InboxFilter` drops records that fail the source's allow/deny rules (see [Guardrails](#guardrails-inbox-filtering)). Dropped records are never persisted
+4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL
+5. **Advance** — Source cursor is saved to SQLite after successful persistence
 
 ### Consumption (Consumer Side)
 
@@ -133,6 +136,8 @@ sync:
     schedule: "*/15 * * * *"
     batch_size: 30
     condense: true                # Haiku extraction for long notifications
+    allow_repos: []               # Guardrail allowlist — empty = all repos. Example: ["ClickHouse/*"]
+    deny_repos: []                # Guardrail denylist — always dropped (takes precedence)
 
   github_events:
     enabled: true
@@ -153,6 +158,72 @@ sync:
 | `condense` | bool | `false` | LLM-condense long records via `memory.fast_model` before storing |
 | `message_ttl_days` | int | `7` | How long to keep inbox messages |
 | `consumer_cursor_ttl_days` | int | `2` | Consumer cursors expire after N days of inactivity |
+
+## Guardrails (Inbox Filtering)
+
+Guardrails programmatically limit **which records ever reach the inbox**. Non-matching
+records are dropped at ingestion — they are never persisted to `source_messages`, so the
+agent can never see them and they never cost tokens. This shrinks the prompt-injection
+attack surface, which matters most in **worker mode** where the agent acts on inbox
+content without a human in the loop.
+
+Filtering happens at the choke point in `SourceRunner` (after `source.preprocess()`,
+before persist). The source cursor still advances normally, so dropped records are not
+re-fetched on the next run. The number of dropped records is reported in the run summary
+(visible in the **Runs** tab and `nerve sync` output).
+
+### How it works
+
+Guardrails are declarative allow/deny rules evaluated against `SourceRecord` fields — a
+`metadata` key, or the special `source` / `record_type` attributes. The engine lives in
+`nerve/sources/filters.py` (`FieldRule`, `InboxFilter`) and is source-agnostic.
+
+Per-rule semantics:
+- **deny wins** — a value matching any `deny` pattern is always dropped.
+- **allow is a gate** — if `allow` is non-empty, the value must match one of its patterns,
+  otherwise the record is dropped. An absent field fails closed (cannot satisfy `allow`).
+- an empty `allow` list means "allow anything not denied".
+
+A record is kept only if it passes **every** rule. Matching is case-insensitive and
+supports shell-style globs (`ClickHouse/*`). List-valued metadata (e.g. Gmail `labels`)
+matches if any element matches; non-string scalars (e.g. Telegram `chat_id`) are coerced
+to strings.
+
+### GitHub repo guardrail
+
+The GitHub notification source matches on `repo_name` (the repo `full_name`, e.g.
+`ClickHouse/nerve`):
+
+```yaml
+sync:
+  github:
+    allow_repos: ["ClickHouse/*", "myorg/myrepo"]   # Only these repos reach the inbox
+    deny_repos:  ["myorg/noisy-repo"]                # Always dropped, even if allowed above
+```
+
+With `allow_repos` empty (the default), all repos pass — behavior is unchanged.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.allow_repos` | list | `[]` | Allowlist of repo globs. Empty = all repos pass |
+| `github.deny_repos` | list | `[]` | Denylist of repo globs. Takes precedence over `allow_repos` |
+
+### Extending to other sources
+
+Adding a guardrail to another source is a config field plus one registry line. In
+`build_source_runners()`, build an `InboxFilter` from the relevant metadata key and pass
+it to the `SourceRunner`:
+
+```python
+from nerve.sources.filters import InboxFilter
+
+# e.g. filter Gmail by label, or Telegram by chat_id
+flt = InboxFilter.from_field("labels", allow=cfg.allow_labels, deny=cfg.deny_labels)
+runners.append(SourceRunner(..., inbox_filter=flt))
+```
+
+(Telegram already filters by folder/chat inside `fetch()` via `monitored_folders` /
+`exclude_chats`; those remain source-specific.)
 
 ## Agent Tools
 
@@ -384,7 +455,8 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 |------|---------|
 | `nerve/sources/models.py` | `SourceRecord`, `FetchResult`, `IngestResult` dataclasses |
 | `nerve/sources/base.py` | `Source` abstract base class |
-| `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → persist → condense → advance) |
+| `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → advance) |
+| `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` — declarative allow/deny guardrails applied before persist |
 | `nerve/sources/processor.py` | Legacy agent prompt building (unused by runner, may be used by tools) |
 | `nerve/sources/registry.py` | Config → `list[SourceRunner]` factory |
 | `nerve/sources/telegram.py` | Telegram adapter (Telethon) |

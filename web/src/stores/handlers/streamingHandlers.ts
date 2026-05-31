@@ -1,8 +1,31 @@
 import type { WSMessage } from '../../api/websocket';
 import { extractResultText } from '../../utils/extractResultText';
 import { appendBlockToPanel, updateToolResultInPanel, scheduleAutoClose } from '../helpers/blockHelpers';
-import type { TodoItem } from '../chatStore';
+import type { TodoItem, CCTask } from '../chatStore';
+import {
+  applyCCTaskCreateInput,
+  applyCCTaskUpdateInput,
+  parseCCTaskListResult,
+  parseCCTaskGetResult,
+  parseCCTaskCreateResult,
+} from '../helpers/ccTasks';
 import type { Get, Set } from './types';
+
+/** Tool names that drive the Claude Code task panel (TaskCreate / TaskUpdate
+ *  / TaskList / TaskGet). TaskStop / TaskOutput target background subagent
+ *  jobs, not the task list, and are intentionally excluded. */
+const CC_TASK_TOOLS = new Set([
+  'TaskCreate',
+  'TaskUpdate',
+  'TaskList',
+  'TaskGet',
+]);
+
+/** Subagent-spawning tool name. Claude Code 2.1.x renamed this from "Task"
+ *  → "Agent"; we match both so old chat history still opens panels. */
+function isSubagentTool(name: string | undefined): boolean {
+  return name === 'Agent' || name === 'Task';
+}
 
 // ------------------------------------------------------------------ //
 //  Streaming handlers: thinking, token, tool_use, tool_result         //
@@ -61,8 +84,8 @@ export function handleToolUse(
 ): void {
   const state = get();
 
-  // Is this a Task (sub-agent) call?
-  if (msg.tool === 'Task') {
+  // Is this a sub-agent spawn call? (Claude Code 2.1.x renamed Task → Agent)
+  if (isSubagentTool(msg.tool)) {
     const toolUseId = msg.tool_use_id || '';
     // Add compact card to main chat
     const blocks = [...state.streamingBlocks];
@@ -121,6 +144,16 @@ export function handleToolUse(
     if (msg.tool === 'TodoWrite' && Array.isArray(msg.input?.todos)) {
       extraUpdate.currentTodos = msg.input.todos as TodoItem[];
     }
+    // Optimistically reflect Claude Code task tool calls in the panel before
+    // the result arrives. TaskCreate adds a placeholder row (real ID lands on
+    // tool_result); TaskUpdate mutates by taskId so the row reacts instantly.
+    if (msg.tool === 'TaskCreate') {
+      const input = (msg.input ?? {}) as Record<string, unknown>;
+      extraUpdate.currentCCTasks = applyCCTaskCreateInput(state.currentCCTasks, input, msg.tool_use_id || '');
+    } else if (msg.tool === 'TaskUpdate') {
+      const input = (msg.input ?? {}) as Record<string, unknown>;
+      extraUpdate.currentCCTasks = applyCCTaskUpdateInput(state.currentCCTasks, input);
+    }
     set({ streamingBlocks: blocks, agentStatus: { state: 'tool', toolName: msg.tool }, ...extraUpdate });
   }
 }
@@ -174,7 +207,30 @@ export function handleToolResult(
       }
       return b;
     });
-    set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' } });
+    // Find the originating tool_use to know which CC task tool this result
+    // belongs to. The tool name doesn't ride on tool_result, so we have to
+    // look it up in the block we just updated.
+    const ccTaskUpdate: { currentCCTasks?: CCTask[] } = {};
+    if (!msg.is_error && msg.tool_use_id) {
+      const sourceBlock = blocks.find(
+        b => b.type === 'tool_call' && b.toolUseId === msg.tool_use_id,
+      );
+      const sourceTool = sourceBlock?.type === 'tool_call' ? sourceBlock.tool : undefined;
+      if (sourceTool && CC_TASK_TOOLS.has(sourceTool)) {
+        const resultText = extractResultText(msg.result);
+        let next: CCTask[] | null = null;
+        if (sourceTool === 'TaskList') {
+          next = parseCCTaskListResult(resultText, state.currentCCTasks);
+        } else if (sourceTool === 'TaskCreate') {
+          next = parseCCTaskCreateResult(resultText, state.currentCCTasks, msg.tool_use_id);
+        } else if (sourceTool === 'TaskGet') {
+          next = parseCCTaskGetResult(resultText, state.currentCCTasks);
+        }
+        // TaskUpdate result is opaque — we already applied input optimistically.
+        if (next) ccTaskUpdate.currentCCTasks = next;
+      }
+    }
+    set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' }, ...ccTaskUpdate });
 
     // Update matching panel tab (for non-sub-agent panels like plan_update)
     const matchingTab = state.panels.find(p => p.id === msg.tool_use_id);
@@ -220,11 +276,14 @@ export function handleDone(
     agentStatus: { state: 'idle' },
   };
   if (msg.usage) {
+    const cc = (msg.usage as { cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } }).cache_creation;
     doneUpdate.contextUsage = {
       input_tokens: msg.usage.input_tokens || 0,
       output_tokens: msg.usage.output_tokens || 0,
       cache_creation_input_tokens: msg.usage.cache_creation_input_tokens || 0,
       cache_read_input_tokens: msg.usage.cache_read_input_tokens || 0,
+      cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
+      cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
       max_context_tokens: msg.max_context_tokens || 200_000,
       num_turns: msg.num_turns || 1,
     };

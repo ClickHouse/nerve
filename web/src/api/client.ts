@@ -68,7 +68,7 @@ export const api = {
   updateSession: (id: string, data: { title?: string; starred?: boolean }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getMessages: (sessionId: string, limit = 100) =>
-    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
+    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
   forkSession: (sourceSessionId: string, atMessageId?: string, title?: string) =>
     request<any>('/sessions/fork', {
       method: 'POST',
@@ -354,5 +354,54 @@ export const api = {
     }
     return res.json();
   },
+
+  // External agents (Codex, Claude Code) ----------------------------
+  listExternalAgents: () =>
+    request<{
+      enabled: boolean;
+      sync_interval_minutes: number;
+      conflict_policy: string;
+      available: Array<{
+        name: string;
+        display_name: string;
+        cli_command: string | null;
+        cli_installed: boolean;
+        cli_version: string | null;
+        config_paths: string[];
+      }>;
+      configured: Array<{
+        name: string;
+        enabled: boolean;
+        display_name?: string;
+        cli_installed?: boolean;
+        cli_version?: string | null;
+        last_run_at?: string | null;
+        last_error?: string | null;
+        files?: Array<{
+          path: string;
+          hash: string;
+          written_at: string | null;
+          skipped: boolean;
+          error: string | null;
+        }>;
+      }>;
+    }>('/external-agents'),
+
+  triggerExternalAgentsSync: () =>
+    request<{ status: string; agents: Record<string, unknown> }>(
+      '/external-agents/sync', { method: 'POST' }
+    ),
+
+  toggleExternalAgent: (name: string, enabled: boolean) =>
+    request<{ name: string; enabled: boolean }>(
+      `/external-agents/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' }
+    ),
+
+  removeExternalAgent: (name: string) =>
+    request<{ status: string; name: string }>(
+      `/external-agents/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }
+    ),
 
 };
