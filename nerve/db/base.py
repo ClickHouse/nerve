@@ -26,6 +26,7 @@ from nerve.db.plans import PlanStore
 from nerve.db.sessions import SessionStore
 from nerve.db.skills import SkillStore
 from nerve.db.sources import SourceStore
+from nerve.db.task_statuses import TaskStatusStore
 from nerve.db.tasks import TaskStore
 from nerve.db.usage import UsageStore
 
@@ -40,6 +41,7 @@ class Database(
     SessionStore,
     MessageStore,
     TaskStore,
+    TaskStatusStore,
     PlanStore,
     NotificationStore,
     SourceStore,

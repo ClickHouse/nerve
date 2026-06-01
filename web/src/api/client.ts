@@ -1,5 +1,15 @@
 const API_BASE = '/api';
 
+export interface TaskStatusDef {
+  name: string;
+  label: string;
+  color: string;
+  description: string;
+  is_system: number;
+  sort_order: number;
+  created_at?: string;
+}
+
 let authToken: string | null = localStorage.getItem('nerve_token');
 
 export function setToken(token: string) {
@@ -114,6 +124,16 @@ export const api = {
     request<any>('/tasks', { method: 'POST', body: JSON.stringify(data) }),
   updateTask: (id: string, data: { status?: string; note?: string; content?: string }) =>
     request<any>(`/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+
+  // Task statuses (configurable)
+  listTaskStatuses: () =>
+    request<{ statuses: TaskStatusDef[] }>('/task-statuses'),
+  createTaskStatus: (data: { name: string; label?: string; color?: string; description?: string }) =>
+    request<TaskStatusDef>('/task-statuses', { method: 'POST', body: JSON.stringify(data) }),
+  updateTaskStatus: (name: string, data: { label?: string; color?: string; description?: string; sort_order?: number }) =>
+    request<TaskStatusDef>(`/task-statuses/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteTaskStatus: (name: string) =>
+    request<{ name: string; deleted: boolean }>(`/task-statuses/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
   // Memory
   listMemoryFiles: () => request<{ files: any[] }>('/memory/files'),
