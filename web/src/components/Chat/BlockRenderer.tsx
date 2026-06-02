@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Download, FileText } from 'lucide-react';
+import { Download, FileText, Clock } from 'lucide-react';
 import type { MessageBlock } from '../../types/chat';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
@@ -32,6 +32,17 @@ export function BlockRenderer({
         const isLast = streaming && i === renderItems.length - 1;
 
         switch (item.type) {
+          case 'wakeup':
+            return (
+              <div key={i} className="flex items-center gap-1.5 my-1.5 text-xs text-text-muted">
+                <span className="h-px flex-1 bg-border" />
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-surface">
+                  <Clock size={11} />
+                  Scheduled wakeup
+                </span>
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            );
           case 'thinking':
             return <ThinkingBlock key={i} content={item.content} streaming={isLast} />;
           case 'tool_call':

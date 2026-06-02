@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from claude_agent_sdk import (
@@ -833,8 +833,9 @@ class AgentEngine:
             ["context-1m-2025-08-07"] if self.config.agent.context_1m else []
         )
 
-        # Build PreToolUse hook for file snapshot capture
-        hooks = self._build_snapshot_hooks(session_id)
+        # Build PreToolUse (file snapshots, image validation) +
+        # PostToolUse (ScheduleWakeup capture) hooks.
+        hooks = self._build_hooks(session_id)
 
         def _cli_stderr(line: str) -> None:
             stripped = line.rstrip()
@@ -884,22 +885,13 @@ class AgentEngine:
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
             #
-            # ``ScheduleWakeup`` is left enabled. Behaviour in Nerve:
-            #   • The CLI's internal scheduler "fires" the wakeup at the
-            #     scheduled time and enqueues the stored prompt as a
-            #     synthetic user message inside the SDK subprocess.
-            #   • Nerve has no background reader between turns — the queued
-            #     wakeup just sits in the SDK buffer.
-            #   • On the next user message, Nerve calls ``client.query()``
-            #     and the buffered wakeup is flushed BEFORE the user's
-            #     input, so the model sees the self-scheduled prompt first.
-            #   • If the user never sends another message before the idle
-            #     timeout reaps the client, the wakeup is lost (durable
-            #     wakeups would survive in ~/.claude/scheduled_tasks.json,
-            #     but the model rarely sets ``durable: true``).
-            # Net: it's a deferred-prompt, not an autonomous timer. The UI
-            # renders the call (see ``ScheduleWakeupBlock``) so the user
-            # knows what the model scheduled.
+            # Remove the CLI's cron tools — Nerve has its own cron system,
+            # so exposing CronCreate/CronList/CronDelete is redundant and
+            # confusing. ``ScheduleWakeup`` stays available and is handled by
+            # Nerve's wakeup harness (capture hook + cron-service sweep); the
+            # CLI's own autonomous firing is suppressed via the
+            # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
+            disallowed_tools=["CronCreate", "CronList", "CronDelete"],
             env=self._build_env(),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),
@@ -953,6 +945,14 @@ class AgentEngine:
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the SDK subprocess."""
         env: dict[str, str] = {}
+        # Disable the CLI's built-in cron/wakeup scheduler. It fires
+        # autonomously inside the subprocess, but Nerve only reads the SDK
+        # stream during an active run() — so a fired turn lands in an unread
+        # buffer and then desyncs the next real turn. Nerve owns wakeup
+        # timing instead: a PostToolUse hook records each ScheduleWakeup and
+        # the cron service fires it via run(..., source="wakeup"). The tool
+        # itself stays available (this flag only gates the firing hook).
+        env["CLAUDE_CODE_DISABLE_CRON"] = "1"
         if self.config.provider.is_bedrock:
             env["CLAUDE_CODE_USE_BEDROCK"] = "1"
             if self.config.provider.aws_region:
@@ -1013,8 +1013,15 @@ class AgentEngine:
             )
         return servers
 
-    def _build_snapshot_hooks(self, session_id: str) -> dict:
-        """Build PreToolUse hooks for file snapshots and image validation."""
+    def _build_hooks(self, session_id: str) -> dict:
+        """Build SDK hooks for this session.
+
+        PreToolUse: file snapshots (Edit/Write/NotebookEdit) and image
+        validation (Read). PostToolUse: ScheduleWakeup capture, which
+        records the requested wakeup so the cron-service sweep can fire it
+        through ``engine.run(..., source="wakeup")`` (the CLI's own
+        autonomous firing is suppressed — see ``_build_env``).
+        """
         from nerve.agent.interactive import _read_file_safe
 
         captured_files: set[str] = set()
@@ -1070,6 +1077,24 @@ class AgentEngine:
 
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
 
+        async def _capture_wakeup_hook(hook_input, tool_use_id, context):
+            """PostToolUse hook: record a ScheduleWakeup so Nerve can fire it.
+
+            The CLI's own scheduler is disabled (CLAUDE_CODE_DISABLE_CRON),
+            so the tool just records the request and returns. We persist it
+            here and the cron-service sweep re-injects the prompt at the
+            scheduled time via ``engine.run(..., source="wakeup")``.
+            """
+            try:
+                await self._record_wakeup(
+                    self.db, session_id, hook_input.get("tool_input", {}) or {},
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to record wakeup for session %s: %s", session_id, e,
+                )
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
+
         return {
             "PreToolUse": [
                 HookMatcher(
@@ -1081,7 +1106,61 @@ class AgentEngine:
                     hooks=[_validate_image_hook],
                 ),
             ],
+            "PostToolUse": [
+                HookMatcher(
+                    matcher="ScheduleWakeup",
+                    hooks=[_capture_wakeup_hook],
+                ),
+            ],
         }
+
+    # Min/max delay the CLI's ScheduleWakeup enforces (clamped to [60, 3600]).
+    _WAKEUP_MIN_DELAY = 60
+    _WAKEUP_MAX_DELAY = 3600
+
+    @classmethod
+    def _wakeup_fire_at(cls, delay_seconds: Any) -> str:
+        """Compute a UTC ISO fire time from a ScheduleWakeup ``delaySeconds``.
+
+        Mirrors the CLI's clamping: non-finite or out-of-range values are
+        coerced into ``[60, 3600]`` seconds from now.
+        """
+        try:
+            delay = float(delay_seconds)
+        except (TypeError, ValueError):
+            delay = float(cls._WAKEUP_MIN_DELAY)
+        if delay != delay:  # NaN
+            delay = float(cls._WAKEUP_MIN_DELAY)
+        elif delay == float("inf"):
+            delay = float(cls._WAKEUP_MAX_DELAY)
+        elif delay == float("-inf"):
+            delay = float(cls._WAKEUP_MIN_DELAY)
+        delay = max(cls._WAKEUP_MIN_DELAY, min(cls._WAKEUP_MAX_DELAY, round(delay)))
+        fire_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        return fire_at.isoformat()
+
+    @classmethod
+    async def _record_wakeup(
+        cls, db: Any, session_id: str, tool_input: dict,
+    ) -> int | None:
+        """Persist a ScheduleWakeup request from its tool input.
+
+        Returns the new wakeup id, or ``None`` when there's no prompt to
+        re-inject (in which case nothing is scheduled).
+        """
+        prompt = str(tool_input.get("prompt", "")).strip()
+        if not prompt:
+            return None
+        reason = str(tool_input.get("reason", "") or "")
+        fire_at = cls._wakeup_fire_at(tool_input.get("delaySeconds"))
+        wakeup_id = await db.add_wakeup(
+            session_id, prompt=prompt, fire_at=fire_at, reason=reason,
+        )
+        logger.info(
+            "Recorded wakeup %s for session %s at %s",
+            wakeup_id, session_id[:8], fire_at,
+        )
+        return wakeup_id
 
     @staticmethod
     def _model_supports_legacy_enabled_thinking(model: str | None) -> bool:
@@ -1727,6 +1806,12 @@ class AgentEngine:
         result_meta: dict | None = None  # ResultMessage fields beyond usage
         last_model: str | None = None  # model from most recent AssistantMessage
 
+        # Wakeup turns (fired by the cron-service sweep) carry a leading
+        # marker block so the UI shows a "scheduled wakeup" chip. Persisted
+        # in ordered_blocks (survives reload) and broadcast live below.
+        if source == "wakeup":
+            ordered_blocks.append({"type": "wakeup"})
+
         try:
             # Get or create persistent client for this session
             # Check if we need to fork from a parent
@@ -1821,6 +1906,10 @@ class AgentEngine:
                 "fork_from": fork_from,
             }
             _got_response_content = False
+            # Live marker so the UI shows the "scheduled wakeup" chip as the
+            # turn streams (the persisted block above covers reload).
+            if source == "wakeup":
+                await broadcaster.broadcast_wakeup(session_id)
             with lf_attrs(
                 session_id=session_id,
                 tags=_lf_tags,

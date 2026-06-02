@@ -8,7 +8,7 @@ import { hydrateMessage } from '../utils/hydrateMessage';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError } from './handlers/streamingHandlers';
+import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleAnswerInjected } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
@@ -512,6 +512,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'tool_use':     return handleToolUse(msg, get, set);
       case 'tool_result':  return handleToolResult(msg, get, set);
       case 'done':         return handleDone(msg, get, set);
+      case 'wakeup':       return handleWakeup(msg, get, set);
       case 'stopped':      return handleStopped(msg, get, set);
       case 'error':        return handleError(msg, get, set);
       // Sessions

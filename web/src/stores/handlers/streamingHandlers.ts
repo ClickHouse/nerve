@@ -77,6 +77,20 @@ export function handleToken(
   }
 }
 
+export function handleWakeup(
+  _msg: Extract<WSMessage, { type: 'wakeup' }>,
+  get: Get,
+  set: Set,
+): void {
+  // A self-scheduled wakeup just fired — prepend a marker so this turn
+  // renders with a "scheduled wakeup" chip, live and after reload.
+  const blocks = [...get().streamingBlocks];
+  if (!blocks.some((b) => b.type === 'wakeup')) {
+    blocks.unshift({ type: 'wakeup' });
+  }
+  set({ streamingBlocks: blocks, isStreaming: true });
+}
+
 export function handleToolUse(
   msg: Extract<WSMessage, { type: 'tool_use' }>,
   get: Get,
