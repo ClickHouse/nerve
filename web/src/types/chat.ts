@@ -34,7 +34,12 @@ export interface FileBlockData {
   size?: number;
 }
 
-export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData;
+/** Leading marker on a turn that fired from a self-scheduled ScheduleWakeup. */
+export interface WakeupBlockData {
+  type: 'wakeup';
+}
+
+export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData;
 
 export interface ChatMessage {
   id?: number;

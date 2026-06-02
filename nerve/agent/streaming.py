@@ -200,6 +200,10 @@ class StreamBroadcaster:
     async def broadcast_plan_update(self, session_id: str, content: str) -> None:
         await self.broadcast(session_id, {"type": "plan_update", "session_id": session_id, "content": content})
 
+    async def broadcast_wakeup(self, session_id: str) -> None:
+        """Mark the start of a turn fired by a self-scheduled ScheduleWakeup."""
+        await self.broadcast(session_id, {"type": "wakeup", "session_id": session_id})
+
     async def broadcast_interaction(self, session_id: str, interaction_type: str, interaction_id: str, tool_name: str, tool_input: dict) -> None:
         await self.broadcast(session_id, {
             "type": "interaction",

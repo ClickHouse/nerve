@@ -24,6 +24,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How often to scan for due session wakeups (ScheduleWakeup harness). The
+# tool clamps delays to >= 60s, so a 20s sweep keeps fire latency well under
+# the granularity the model can request.
+_WAKEUP_SWEEP_SECONDS = 20
+
+# ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
+# /loop command, so resolve them to a plain continuation instruction.
+_WAKEUP_SENTINELS = {"<<autonomous-loop>>", "<<autonomous-loop-dynamic>>"}
+_WAKEUP_SENTINEL_PROMPT = (
+    "[Scheduled wakeup] Continue the task you were pacing. If there is "
+    "nothing left to do, stop and don't reschedule."
+)
+
+
+def _resolve_wakeup_prompt(prompt: str) -> str:
+    """Map an autonomous-loop sentinel to a usable prompt; pass others through."""
+    return _WAKEUP_SENTINEL_PROMPT if prompt.strip() in _WAKEUP_SENTINELS else prompt
+
 
 def _parse_interval(interval: str) -> int:
     """Parse an interval string like '2h', '30m', '1h30m' into seconds."""
@@ -124,6 +142,16 @@ class CronService:
             CronTrigger(hour=3, minute=0),
             id="cleanup",
             name="Cleanup expired data",
+            replace_existing=True,
+        )
+
+        # Fire due session wakeups (ScheduleWakeup harness). The CLI's own
+        # scheduler is disabled; Nerve owns wakeup timing here.
+        self.scheduler.add_job(
+            self._sweep_wakeups,
+            IntervalTrigger(seconds=_WAKEUP_SWEEP_SECONDS),
+            id="wakeup_sweep",
+            name="Fire due session wakeups",
             replace_existing=True,
         )
 
@@ -480,6 +508,64 @@ class CronService:
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)
+
+    async def _sweep_wakeups(self) -> None:
+        """Fire due session wakeups recorded by the ScheduleWakeup hook.
+
+        Each due wakeup is atomically claimed (pending -> fired) so
+        overlapping sweeps can't double-fire it, then re-injected into its
+        session via ``engine.run(..., source="wakeup")``. The run is
+        dispatched (not awaited) so one long turn can't stall the sweep; the
+        per-session lock inside ``run`` serialises it behind any live turn.
+        """
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            due = await self.db.get_due_wakeups(now_iso)
+        except Exception as e:
+            logger.error("Wakeup sweep query failed: %s", e, exc_info=True)
+            return
+
+        for wakeup in due:
+            session_id = wakeup["session_id"]
+            # Skip sessions mid-turn; a still-running turn may itself be
+            # rescheduling. Leave the wakeup pending and retry next sweep.
+            if self.engine.sessions.is_running(session_id):
+                continue
+            try:
+                claimed = await self.db.claim_wakeup(wakeup["id"])
+            except Exception as e:
+                logger.error(
+                    "Failed to claim wakeup %s: %s", wakeup["id"], e,
+                )
+                continue
+            if not claimed:
+                continue
+            self._dispatch_wakeup(session_id, wakeup)
+
+    def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
+        """Spawn the engine run for a claimed wakeup with error logging."""
+        prompt = _resolve_wakeup_prompt(wakeup["prompt"])
+        logger.info(
+            "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
+        )
+        task = asyncio.create_task(
+            self.engine.run(
+                session_id=session_id,
+                user_message=prompt,
+                source="wakeup",
+                internal=True,
+            )
+        )
+
+        def _done(t: asyncio.Task) -> None:
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                logger.error(
+                    "Wakeup %s run failed for session %s: %s",
+                    wakeup["id"], session_id, exc,
+                )
+
+        task.add_done_callback(_done)
 
     async def run_job(self, job_id: str) -> None:
         """Run a specific job manually (used by CLI)."""
