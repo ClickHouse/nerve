@@ -20,6 +20,7 @@ from nerve.agent.tools.schemas import (
     CONVERSATION_HISTORY_SCHEMA,
     MEMORIZE_SCHEMA,
     MEMORY_DELETE_SCHEMA,
+    MEMORY_EXPAND_CATEGORY_SCHEMA,
     MEMORY_RECALL_SCHEMA,
     MEMORY_RECORDS_BY_DATE_SCHEMA,
     MEMORY_UPDATE_SCHEMA,
@@ -37,23 +38,100 @@ def _resolve_memu_db_path(ctx: ToolContext) -> str:
     return get_config().memory.sqlite_dsn.replace("sqlite:///", "")
 
 
+# Hard backstop on recall tool-output size. The breadcrumb fix keeps recall
+# small, but this guarantees the result can never exceed the harness's
+# inline-output limit (which would silently persist it to a file).
+_MAX_RECALL_BYTES = 10_000
+
+
+def _clip_to_budget(text: str, max_bytes: int = _MAX_RECALL_BYTES) -> str:
+    """Truncate text to a UTF-8 byte budget, appending a notice if clipped."""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    clipped = data[:max_bytes].decode("utf-8", "ignore").rstrip()
+    return f"{clipped}\n… (truncated to fit recall size budget)"
+
+
 async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
     query = args["query"]
     limit = int(args.get("limit", 10))
+    category_limit = int(args.get("category_limit", 5))
 
     if ctx.memory_bridge:
         try:
-            results = await ctx.memory_bridge.recall(query, limit=limit)
-            if results:
-                lines = [f"- [{m['type']}] (id:{m['id']}) {m['summary']}" for m in results]
-                text = "\n".join(lines)
-                return ToolResult.text(f"Recalled {len(results)} memories:\n\n{text}")
-            return ToolResult.text("No relevant memories found.")
+            results = await ctx.memory_bridge.recall(
+                query, limit=limit, category_limit=category_limit,
+            )
+            if not results:
+                return ToolResult.text("No relevant memories found.")
+
+            items = [m for m in results if m.get("type") != "category"]
+            cats = [m for m in results if m.get("type") == "category"]
+
+            sections: list[str] = []
+            if items:
+                item_lines = [
+                    f"- [{m['type']}] (id:{m['id']}) {m['summary']}" for m in items
+                ]
+                sections.append("\n".join(item_lines))
+            if cats:
+                cat_lines = [
+                    f"- [{m.get('name') or 'topic'}] (id:{m['id']}) {m['summary']}"
+                    for m in cats
+                ]
+                sections.append(
+                    "Related topics — drill in with memory_expand_category "
+                    "(pass the cat:<id>):\n" + "\n".join(cat_lines)
+                )
+
+            body = _clip_to_budget("\n\n".join(sections))
+            header = f"Recalled {len(items)} memories"
+            if cats:
+                header += f" + {len(cats)} related topics"
+            return ToolResult.text(f"{header}:\n\n{body}")
         except Exception as e:
             logger.error("Memory recall failed: %s", e)
             return ToolResult.text(f"Memory recall error: {e}")
 
     return ToolResult.text("Memory service not configured.")
+
+
+async def memory_expand_category_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Expand a category breadcrumb (from recall) into its memory items."""
+    category_id = (args.get("category_id") or "").strip()
+    if not category_id:
+        return ToolResult.text("category_id is required.", is_error=True)
+    query = (args.get("query") or "").strip()
+    limit = int(args.get("limit", 20))
+
+    if not ctx.memory_bridge or not ctx.memory_bridge.available:
+        return ToolResult.text("Memory service not available.")
+
+    try:
+        result = await ctx.memory_bridge.expand_category(
+            category_id, query=query, limit=limit,
+        )
+        if result.get("name") is None:
+            return ToolResult.text(
+                f"No category found with id '{category_id}'. "
+                "Use the cat:<id> value from a recall breadcrumb."
+            )
+        name = result["name"]
+        total = result.get("total", 0)
+        rows = result.get("items", [])
+        if not rows:
+            note = f" matching '{query}'" if query else ""
+            return ToolResult.text(f"Category '{name}' has no items{note}.")
+
+        lines = [f"- [{r['type']}] (id:{r['id']}) {r['summary']}" for r in rows]
+        scope = f"matching '{query}'" if query else "most recent"
+        header = f"Category '{name}' — showing {len(rows)} of {total} items ({scope}):"
+        body = _clip_to_budget(header + "\n\n" + "\n".join(lines))
+        return ToolResult.text(body)
+    except Exception as e:
+        logger.error("memory_expand_category failed: %s", e)
+        return ToolResult.text(f"Error: {e}")
 
 
 async def session_context_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -342,9 +420,16 @@ async def category_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
 MEMORY_RECALL_SPEC = ToolSpec(
     name="memory_recall",
-    description="Recall relevant memories via semantic search (memU). Returns memories related to the query.",
+    description="Recall relevant memories via semantic search (memU). Returns matching memory items plus related-topic breadcrumbs (cat:<id>) you can drill into with memory_expand_category.",
     input_schema=MEMORY_RECALL_SCHEMA,
     handler=memory_recall_handler,
+)
+
+MEMORY_EXPAND_CATEGORY_SPEC = ToolSpec(
+    name="memory_expand_category",
+    description="Expand a category breadcrumb from memory_recall into its constituent memory items. Pass the cat:<id> shown in a recall 'related topics' line. Optionally keyword-filter with `query`. Results are most-recent-first and bounded.",
+    input_schema=MEMORY_EXPAND_CATEGORY_SCHEMA,
+    handler=memory_expand_category_handler,
 )
 
 SESSION_CONTEXT_SPEC = ToolSpec(
@@ -420,6 +505,7 @@ CATEGORY_UPDATE_SPEC = ToolSpec(
 
 MEMORY_SPECS = [
     MEMORY_RECALL_SPEC,
+    MEMORY_EXPAND_CATEGORY_SPEC,
     SESSION_CONTEXT_SPEC,
     CONVERSATION_HISTORY_SPEC,
     MEMORY_RECORDS_BY_DATE_SPEC,

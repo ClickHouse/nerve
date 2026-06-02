@@ -202,9 +202,35 @@ MEMORY_RECALL_SCHEMA = {
     "type": "object",
     "properties": {
         "query": {"type": "string", "description": "What to search for in memory"},
-        "limit": {"type": "number", "description": "Max results", "default": 10},
+        "limit": {"type": "number", "description": "Max memory items to return", "default": 10},
+        "category_limit": {
+            "type": "number",
+            "description": "Max related-topic breadcrumbs (categories) to return",
+            "default": 5,
+        },
     },
     "required": ["query"],
+}
+
+MEMORY_EXPAND_CATEGORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category_id": {
+            "type": "string",
+            "description": "Category id from a recall breadcrumb. The 'cat:' prefix is accepted and stripped.",
+        },
+        "query": {
+            "type": "string",
+            "description": "Optional keyword to filter the category's items by their text.",
+            "default": "",
+        },
+        "limit": {
+            "type": "number",
+            "description": "Max items to return (most recent first). Default 20.",
+            "default": 20,
+        },
+    },
+    "required": ["category_id"],
 }
 
 SESSION_CONTEXT_SCHEMA = {
