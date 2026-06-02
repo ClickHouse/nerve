@@ -12,10 +12,31 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 
+def _check_no_duplicate_versions(items: list[tuple[int, str]]) -> None:
+    """Raise ``RuntimeError`` if two entries share the same version.
+
+    The runner tracks ``MAX(version)`` only, so a duplicate would let
+    one file silently win and the other be skipped forever — the kind
+    of bug that costs hours to track down (see v030_cache_ttl_split:
+    it shipped as v027 and collided with v027_session_last_rotated,
+    breaking usage tracking end-to-end on every DB where the other
+    v027 was applied first).
+    """
+    seen: dict[int, str] = {}
+    for version, name in items:
+        if version in seen:
+            raise RuntimeError(
+                f"Duplicate migration version {version}: "
+                f"{seen[version]!r} and {name!r}. Renumber one of them."
+            )
+        seen[version] = name
+
+
 def discover_migrations() -> list[tuple[int, str]]:
     """Scan the migrations package for vNNN_*.py files.
 
-    Returns sorted list of (version, module_name) tuples.
+    Returns sorted list of (version, module_name) tuples. Raises if
+    two files share the same version number.
     """
     migrations_dir = Path(__file__).parent
     results: list[tuple[int, str]] = []
@@ -28,6 +49,7 @@ def discover_migrations() -> list[tuple[int, str]]:
             except ValueError:
                 continue
     results.sort(key=lambda x: x[0])
+    _check_no_duplicate_versions(results)
     return results
 
 
