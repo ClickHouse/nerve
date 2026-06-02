@@ -29,6 +29,41 @@ logger = logging.getLogger(__name__)
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
 
+# Max characters for a category breadcrumb in recall() output. A category
+# summary is a whole rolled-up topic document (often 5–20KB); recall must
+# surface it as a short navigable pointer, not dump the document.
+_CATEGORY_BREADCRUMB_MAXLEN = 200
+
+
+def _category_breadcrumb(name: str, description: str, summary: str) -> str:
+    """Build a short one-line breadcrumb for a category recall hit.
+
+    Prefers the curated ``description`` (a 1-line purpose). Falls back to the
+    first meaningful line of the rolled-up ``summary`` (with any ``[ref:ID]``
+    citation markers stripped). Never returns the full summary — that is what
+    ``memory_expand_category`` is for.
+    """
+    text = (description or "").strip()
+    if not text:
+        try:
+            from memu.utils.references import strip_references
+        except Exception:  # pragma: no cover - defensive
+            def strip_references(t: str | None) -> str | None:
+                return t
+        for raw in (summary or "").splitlines():
+            line = (strip_references(raw) or "").strip()
+            # Skip markdown headers — they just repeat the category name,
+            # which is returned separately. Take the first real content line.
+            if not line or line.startswith("#"):
+                continue
+            line = line.lstrip("-*").strip()
+            if line:
+                text = line
+                break
+    if len(text) > _CATEGORY_BREADCRUMB_MAXLEN:
+        text = text[: _CATEGORY_BREADCRUMB_MAXLEN - 1].rstrip() + "…"
+    return text
+
 
 class _BedrockLLMClient:
     """Drop-in replacement for memU's OpenAISDKClient that uses AsyncAnthropicBedrock.
@@ -2047,11 +2082,25 @@ class MemUBridge:
 
         return []
 
-    async def recall(self, query: str, limit: int = 10) -> list[dict[str, str]]:
+    async def recall(
+        self, query: str, limit: int = 10, category_limit: int = 5,
+    ) -> list[dict[str, str]]:
         """Recall relevant memories via semantic search.
 
-        Returns list of dicts with keys: id, type, summary.
-        Category results use id="cat:<id>".
+        Returns a list of dicts with keys: id, type, summary (plus ``name``
+        for category hits). Items come first (atomic, full content), followed
+        by category hits rendered as short breadcrumbs (``id="cat:<id>"``).
+
+        memU is hierarchical: an item is one atomic fact, a category is a
+        rolled-up topic *document* (often 5–20KB) that indexes many items.
+        Returning category documents verbatim blows past tool-output size
+        limits and duplicates the items, so category hits are reduced to a
+        one-line breadcrumb. Drill into a category's items with
+        ``expand_category`` / the ``memory_expand_category`` tool.
+
+        Args:
+            limit: max item hits to return (full content).
+            category_limit: max category breadcrumbs to return.
         """
         if not self._available or not self._service:
             return []
@@ -2061,9 +2110,10 @@ class MemUBridge:
                 queries=[{"role": "user", "content": query}],
             )
 
-            memories: list[dict[str, str]] = []
+            items_out: list[dict[str, str]] = []
+            cats_out: list[dict[str, str]] = []
 
-            # Extract from items (individual memory entries)
+            # Items — individual memory entries, returned with full content.
             for item in result.get("items", []):
                 if isinstance(item, dict):
                     text = item.get("summary", item.get("content", ""))
@@ -2078,34 +2128,103 @@ class MemUBridge:
                     item_id = ""
                     mtype = ""
                 if text:
-                    memories.append({"id": item_id, "type": mtype, "summary": text})
+                    items_out.append({"id": item_id, "type": mtype, "summary": text})
 
-            # Extract from categories (higher-level summaries)
+            # Categories — reduced to a one-line breadcrumb (never the full doc).
             for cat in result.get("categories", []):
                 if isinstance(cat, dict):
                     summary = cat.get("summary", "")
+                    description = cat.get("description", "")
                     name = cat.get("name", "")
                     cat_id = cat.get("id", "")
                 elif hasattr(cat, "summary"):
                     summary = cat.summary
+                    description = getattr(cat, "description", "")
                     name = getattr(cat, "name", "")
                     cat_id = getattr(cat, "id", "")
                 else:
                     continue
-                if summary:
-                    memories.append({
+                crumb = _category_breadcrumb(name, description, summary)
+                if crumb or name:
+                    cats_out.append({
                         "id": f"cat:{cat_id}",
                         "type": "category",
-                        "summary": f"[{name}] {summary}" if name else summary,
+                        "name": name,
+                        "summary": crumb,
                     })
 
             self._metrics.end_op(op_id, success=True)
-            return memories[:limit]
+            return items_out[:limit] + cats_out[:category_limit]
 
         except Exception as e:
             logger.error("memU recall failed: %s", e)
             self._metrics.end_op(op_id, success=False, error=str(e))
             return []
+
+    async def expand_category(
+        self, category_id: str, query: str = "", limit: int = 20,
+    ) -> dict[str, Any]:
+        """Drill into a category and return its constituent memory items.
+
+        Categories surface in ``recall`` as one-line breadcrumbs; this expands
+        one into its atomic items via the ``memu_category_items`` membership
+        table. Results are ordered most-recent-first and bounded by ``limit``;
+        an optional ``query`` keyword-filters item summaries.
+
+        Returns a dict: ``{name, total, items: [{id, type, summary}]}``.
+        ``name`` is ``None`` when the category id is unknown.
+        """
+        if not self._available or not self._service:
+            return {"name": None, "total": 0, "items": []}
+
+        cat_id = category_id[4:] if category_id.startswith("cat:") else category_id
+        cat_id = cat_id.strip()
+        if not cat_id:
+            return {"name": None, "total": 0, "items": []}
+
+        def _run() -> dict[str, Any]:
+            import sqlite3
+
+            dsn = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+            db = sqlite3.connect(dsn)
+            db.row_factory = sqlite3.Row
+            try:
+                crow = db.execute(
+                    "SELECT name FROM memu_memory_categories WHERE id = ?",
+                    (cat_id,),
+                ).fetchone()
+                if not crow:
+                    return {"name": None, "total": 0, "items": []}
+                total = db.execute(
+                    "SELECT count(*) FROM memu_category_items WHERE category_id = ?",
+                    (cat_id,),
+                ).fetchone()[0]
+                sql = (
+                    "SELECT i.id, i.memory_type, i.summary "
+                    "FROM memu_category_items ci "
+                    "JOIN memu_memory_items i ON i.id = ci.item_id "
+                    "WHERE ci.category_id = ?"
+                )
+                params: list[Any] = [cat_id]
+                if query:
+                    sql += " AND lower(i.summary) LIKE ?"
+                    params.append(f"%{query.lower()}%")
+                sql += " ORDER BY i.updated_at DESC, i.created_at DESC LIMIT ?"
+                params.append(limit)
+                rows = db.execute(sql, params).fetchall()
+                items = [
+                    {"id": r["id"], "type": r["memory_type"], "summary": r["summary"]}
+                    for r in rows
+                ]
+                return {"name": crow["name"], "total": total, "items": items}
+            finally:
+                db.close()
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as e:
+            logger.error("expand_category failed for %s: %s", cat_id, e)
+            return {"name": None, "total": 0, "items": []}
 
     async def list_items(self) -> list[dict[str, Any]]:
         """List all memory items."""
