@@ -64,6 +64,9 @@ export interface Session {
   model?: string;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
+  // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).
+  // Drives the sidebar "waiting" indicator. Set by backend + WS updates.
+  awaiting_input?: boolean;
   starred?: boolean;
 }
 

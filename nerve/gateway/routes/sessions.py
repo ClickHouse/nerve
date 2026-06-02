@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -71,8 +72,10 @@ async def list_sessions(user: dict = Depends(require_auth)):
     deps = get_deps()
     sessions = await deps.engine.sessions.list_sessions()
     running_ids = deps.engine.sessions.get_running_ids()
+    awaiting_ids = get_awaiting_ids()
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
+        s["awaiting_input"] = s["id"] in awaiting_ids
     return {"sessions": sessions}
 
 
@@ -84,8 +87,10 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
     deps = get_deps()
     sessions = await deps.db.search_sessions(q.strip())
     running_ids = deps.engine.sessions.get_running_ids()
+    awaiting_ids = get_awaiting_ids()
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
+        s["awaiting_input"] = s["id"] in awaiting_ids
     return {"sessions": sessions}
 
 
@@ -198,6 +203,7 @@ async def session_status(session_id: str, user: dict = Depends(require_auth)):
         "session_id": session_id,
         "status": session.get("status", "unknown"),
         "is_running": is_running,
+        "awaiting_input": session_id in get_awaiting_ids(),
         "sdk_session_id": session.get("sdk_session_id"),
         "connected_at": session.get("connected_at"),
         "parent_session_id": session.get("parent_session_id"),

@@ -9,7 +9,7 @@ import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup } from './handlers/streamingHandlers';
-import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleAnswerInjected } from './handlers/sessionHandlers';
+import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
@@ -523,6 +523,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'session_resumed':  return handleSessionResumed(msg, get, set);
       case 'session_archived': return handleSessionArchived(msg, get, set);
       case 'session_running':  return handleSessionRunning(msg, get, set);
+      case 'session_awaiting_input': return handleSessionAwaitingInput(msg, get, set);
       case 'answer_injected':  return handleAnswerInjected(msg, get, set);
       // Panels
       case 'plan_update':        return handlePlanUpdate(msg, get, set);
