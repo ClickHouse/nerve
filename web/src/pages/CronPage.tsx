@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   RefreshCw, RotateCw, Play, Loader2, Clock, Inbox,
-  CheckCircle2, XCircle, Timer,
+  CheckCircle2, XCircle, Timer, Filter,
 } from 'lucide-react';
 import { useCronStore, type CronJob, type CronLog } from '../stores/cronStore';
 
@@ -243,6 +243,22 @@ function JobInfoCard({ job }: { job: CronJob }) {
           </div>
         </div>
       </div>
+
+      {job.gates && job.gates.length > 0 && (
+        <div className="mt-3 pt-3 border-t border-border-subtle">
+          <div className="text-[11px] text-text-dim mb-1.5 flex items-center gap-1">
+            <Filter size={11} /> Runs only if{job.gates.length > 1 ? ' (all)' : ''}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {job.gates.map((gate, i) => (
+              <span key={i}
+                className="text-[12px] px-2 py-0.5 rounded bg-surface-raised text-text-secondary border border-border-subtle">
+                {gate}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

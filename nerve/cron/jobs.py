@@ -8,9 +8,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+if TYPE_CHECKING:
+    from nerve.cron.gates import CronGate
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +33,38 @@ class CronJob:
     catchup: bool = True  # Fire once on startup if missed while server was down
     enabled: bool = True
     lock: bool = False  # When True, prevent concurrent runs of this job (next run waits for previous)
+    # Run gates — preconditions evaluated before each fire. Each entry is a
+    # spec dict like {"type": "tasks", "status": "pending"}. All gates must
+    # pass (AND) for the job to run. See nerve/cron/gates.py.
+    run_if: list[dict] = field(default_factory=list)
+    # Legacy shorthand for a "messages" gate, kept for backward compatibility.
     skip_when_idle: list[str] = field(default_factory=list)  # Source names to check; skip run if no new messages
     idle_consumer: str = "inbox"  # Consumer cursor name for the idle check
     show_session_label: bool = True  # Show "Session: ..." in notification messages
     metadata: dict = field(default_factory=dict)
+    # Built run gates (derived from run_if + legacy fields in __post_init__).
+    # Not serialized; excluded from equality/repr.
+    gates: list["CronGate"] = field(
+        default_factory=list, init=False, repr=False, compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        self.gates = self._build_gates()
+
+    def _build_gates(self) -> list["CronGate"]:
+        """Construct gate objects from run_if plus the legacy shorthand."""
+        from nerve.cron.gates import build_gates
+
+        specs: list[dict] = list(self.run_if)
+        # Translate the legacy skip_when_idle shorthand into a messages gate
+        # so old configs keep working without rewrites.
+        if self.skip_when_idle:
+            specs.append({
+                "type": "messages",
+                "sources": list(self.skip_when_idle),
+                "consumer": self.idle_consumer,
+            })
+        return build_gates(specs)
 
     @classmethod
     def from_dict(cls, d: dict) -> CronJob:
@@ -50,6 +81,7 @@ class CronJob:
             catchup=d.get("catchup", True),
             enabled=d.get("enabled", True),
             lock=bool(d.get("lock", False)),
+            run_if=d.get("run_if", []),
             skip_when_idle=d.get("skip_when_idle", []),
             idle_consumer=d.get("idle_consumer", "inbox"),
             show_session_label=d.get("show_session_label", True),
@@ -103,6 +135,7 @@ def save_jobs(jobs: list[CronJob], jobs_file: Path) -> None:
             "catchup": job.catchup,
             "enabled": job.enabled,
             "lock": job.lock,
+            "run_if": job.run_if,
             "skip_when_idle": job.skip_when_idle,
             "idle_consumer": job.idle_consumer,
             "show_session_label": job.show_session_label,
