@@ -359,21 +359,6 @@ class CronService:
 
         return list(jobs_by_id.values())
 
-    async def _has_pending_messages(
-        self, consumer: str, sources: list[str],
-    ) -> bool:
-        """Check if any of the listed sources have unread messages.
-
-        Uses existing consumer cursor position vs source max rowid.
-        Does not advance any cursors.
-        """
-        for source in sources:
-            cursor_seq = await self.db.get_consumer_cursor(consumer, source)
-            max_seq = await self.db.get_source_max_rowid(source)
-            if max_seq > cursor_seq:
-                return True
-        return False
-
     async def _run_job_wrapper(self, job: CronJob) -> None:
         """Wrapper to run a cron job with logging and optional lock."""
         if job.lock:
@@ -385,16 +370,15 @@ class CronService:
 
     async def _run_job_inner(self, job: CronJob) -> None:
         """Inner implementation of job execution."""
-        # Pre-check: skip if no new messages in monitored sources
-        if job.skip_when_idle:
-            has_pending = await self._has_pending_messages(
-                job.idle_consumer, job.skip_when_idle,
+        # Pre-check: skip if any configured run gate is unsatisfied.
+        if job.gates:
+            from nerve.cron.gates import GateContext, evaluate_gates
+
+            decision = await evaluate_gates(
+                job.gates, GateContext(job_id=job.id, db=self.db),
             )
-            if not has_pending:
-                logger.info(
-                    "Skipping cron job %s: no new messages in %s",
-                    job.id, job.skip_when_idle,
-                )
+            if not decision.should_run:
+                logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
 
         log_id = await self.db.log_cron_start(job.id)
@@ -649,6 +633,7 @@ class CronService:
                 "enabled": job.enabled,
                 "session_mode": job.session_mode,
                 "lock": job.lock,
+                "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
             })
 

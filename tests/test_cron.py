@@ -441,3 +441,73 @@ class TestJobLock:
 
         # Different jobs run concurrently even with lock=True
         assert call_order == ["start", "start", "end", "end"]
+
+
+# ---------------------------------------------------------------------------
+# Run gates — service-level skip/run behaviour
+# ---------------------------------------------------------------------------
+
+class TestRunGates:
+    @pytest.mark.asyncio
+    async def test_skips_when_tasks_gate_unsatisfied(self, cron_service):
+        """A tasks gate with no matching tasks skips the run entirely."""
+        cron_service.db.count_tasks = AsyncMock(return_value=0)
+        job = _make_job(
+            id="planner", run_if=[{"type": "tasks", "status": "pending"}],
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.log_cron_start.assert_not_called()
+        cron_service.engine.run_cron.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_when_tasks_gate_satisfied(self, cron_service):
+        """A tasks gate with matching tasks lets the run proceed."""
+        cron_service.db.count_tasks = AsyncMock(return_value=2)
+        job = _make_job(
+            id="planner", run_if=[{"type": "tasks", "status": "pending"}],
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.log_cron_start.assert_called_once_with("planner")
+        cron_service.engine.run_cron.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_gates_always_runs(self, cron_service):
+        """A job with no gates runs unconditionally (no gate queries)."""
+        job = _make_job(id="ungated")
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_skip_when_idle_skips(self, cron_service):
+        """Legacy skip_when_idle still gates via the messages gate path."""
+        cron_service.db.get_consumer_cursor = AsyncMock(return_value=9)
+        cron_service.db.get_source_max_rowid = AsyncMock(return_value=9)
+        job = _make_job(id="inbox", skip_when_idle=["gmail"])
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_and_semantics_one_gate_blocks(self, cron_service):
+        """With two gates, one unsatisfied is enough to skip (AND)."""
+        cron_service.db.count_tasks = AsyncMock(return_value=5)        # tasks: ok
+        cron_service.db.get_consumer_cursor = AsyncMock(return_value=9)
+        cron_service.db.get_source_max_rowid = AsyncMock(return_value=9)  # msgs: not ok
+        job = _make_job(
+            id="both",
+            run_if=[
+                {"type": "tasks", "status": "pending"},
+                {"type": "messages", "sources": ["gmail"]},
+            ],
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_not_called()

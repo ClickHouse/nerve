@@ -8,6 +8,8 @@ export interface CronJob {
   description: string;
   enabled: boolean;
   session_mode?: string;
+  /** Human-readable run-gate conditions; job runs only if all are satisfied. */
+  gates?: string[];
   next_run: string | null;
 }
 

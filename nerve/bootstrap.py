@@ -93,6 +93,8 @@ PRODUCTIVITY_CRONS = [
         "session_mode": "persistent",
         "context_rotate_hours": 168,
         "reminder_mode": False,
+        # Only fire when there is actually something to plan.
+        "run_if": [{"type": "tasks", "status": "pending"}],
         "prompt": (
             "You are a proactive planning agent. Your job is to find a task worth working on and produce an implementation plan.\n\n"
             "1. Use task_list to browse open tasks\n"
@@ -1869,6 +1871,8 @@ class SetupWizard:
                     job["context_rotate_hours"] = cron["context_rotate_hours"]
                 if cron.get("reminder_mode"):
                     job["reminder_mode"] = cron["reminder_mode"]
+                if cron.get("run_if"):
+                    job["run_if"] = cron["run_if"]
                 jobs.append(job)
         elif self.choices.mode == "worker":
             # Workers get skill crons — they create skills during onboarding
@@ -1892,6 +1896,8 @@ class SetupWizard:
                     job["context_rotate_hours"] = cron["context_rotate_hours"]
                 if cron.get("reminder_mode"):
                     job["reminder_mode"] = cron["reminder_mode"]
+                if cron.get("run_if"):
+                    job["run_if"] = cron["run_if"]
                 jobs.append(job)
 
         # Write system crons (managed by nerve init, safe to regenerate)
