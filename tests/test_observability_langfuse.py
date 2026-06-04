@@ -212,6 +212,74 @@ def test_attributes_calls_propagate_when_enabled(monkeypatch):
     assert call_kwargs["metadata"] == {"k": "v"}
 
 
+def test_attributes_propagates_exception_thrown_into_yield(monkeypatch):
+    """Regression: an exception raised inside the with-block must propagate
+    as itself, not get swallowed and rethrown as RuntimeError from a
+    double-yield.
+
+    Pre-fix the ``except Exception`` branch caught the thrown-in exception
+    and ``yield``ed a second time, which violated the
+    @contextmanager generator protocol and produced
+    ``RuntimeError("generator didn't stop after throw()")``. The engine's
+    idle-timeout path throws ``asyncio.TimeoutError`` into this context
+    manager and relies on the same type coming back out so its retry
+    logic catches it.
+    """
+    import asyncio
+
+    _install_fake_langfuse(monkeypatch, auth_ok=True)
+    cfg = _config_with(public_key="pk-lf", secret_key="sk-lf")
+    assert lf.init_langfuse(cfg) is True
+
+    with pytest.raises(asyncio.TimeoutError, match="idle"):
+        with lf.attributes(session_id="s1", tags=["a"]):
+            raise asyncio.TimeoutError("idle")
+
+
+def test_attributes_propagates_exception_when_setup_fails(monkeypatch):
+    """If ``propagate_attributes()`` itself raises during setup,
+    ``attributes()`` falls back to a bare yield AND must still propagate
+    exceptions raised inside the with-block.
+    """
+    import asyncio
+
+    _install_fake_langfuse(monkeypatch, auth_ok=True)
+    cfg = _config_with(public_key="pk-lf", secret_key="sk-lf")
+    assert lf.init_langfuse(cfg) is True
+    sys.modules["langfuse"].propagate_attributes = MagicMock(
+        side_effect=RuntimeError("bad kwargs"),
+    )
+
+    with pytest.raises(asyncio.TimeoutError, match="idle"):
+        with lf.attributes(session_id="s1"):
+            raise asyncio.TimeoutError("idle")
+
+
+def test_attributes_propagates_non_timeout_exceptions(monkeypatch):
+    """Generalize the regression: ANY exception type raised inside the
+    block must propagate unchanged (not just TimeoutError)."""
+    _install_fake_langfuse(monkeypatch, auth_ok=True)
+    cfg = _config_with(public_key="pk-lf", secret_key="sk-lf")
+    assert lf.init_langfuse(cfg) is True
+
+    with pytest.raises(ValueError, match="boom"):
+        with lf.attributes(session_id="s1"):
+            raise ValueError("boom")
+
+
+def test_attributes_normal_exit_when_block_succeeds(monkeypatch):
+    """Sanity: a clean exit through the block still works after the fix
+    (regression coverage doesn't paper over normal use)."""
+    _install_fake_langfuse(monkeypatch, auth_ok=True)
+    cfg = _config_with(public_key="pk-lf", secret_key="sk-lf")
+    assert lf.init_langfuse(cfg) is True
+
+    ran = False
+    with lf.attributes(session_id="s1", tags=["normal"]):
+        ran = True
+    assert ran is True
+
+
 # ---------------------------------------------------------------------------
 # redact()
 # ---------------------------------------------------------------------------

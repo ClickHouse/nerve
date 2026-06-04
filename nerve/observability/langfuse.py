@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
@@ -170,8 +170,12 @@ def attributes(
 ) -> Iterator[None]:
     """Wrap a block so OTEL spans inside it carry these Langfuse attributes.
 
-    No-op when Langfuse is disabled. Never raises — wrap-failure must not
-    take down the caller.
+    No-op when Langfuse is disabled. Setup failures (missing optional
+    package, ``propagate_attributes`` raising on bad kwargs) are logged
+    and the block runs without propagation. Exceptions thrown into the
+    yielded block (e.g. ``asyncio.TimeoutError`` from the engine's idle-
+    timeout path) propagate normally — they are never swallowed and never
+    converted into a spurious ``RuntimeError`` from a double-yield.
     """
     if not _enabled:
         yield
@@ -196,11 +200,20 @@ def attributes(
         if clean_meta:
             kwargs["metadata"] = clean_meta
 
-    try:
-        with propagate_attributes(**kwargs):
-            yield
-    except Exception as e:
-        logger.debug("Langfuse propagate_attributes failed (%s) — continuing", e)
+    # Guard ENTER only — never wrap the yield. ExitStack closes the inner
+    # context on the way out even when the yielded block raises, so spans
+    # are still finalized correctly. A previous version wrapped the yield
+    # in a try/except Exception and yielded a second time on failure,
+    # which produced "RuntimeError: generator didn't stop after throw()"
+    # whenever an exception was thrown into the yield, masking the real
+    # exception (e.g. the engine's asyncio.TimeoutError).
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(propagate_attributes(**kwargs))
+        except Exception as e:
+            logger.debug(
+                "Langfuse propagate_attributes failed (%s) — continuing", e,
+            )
         yield
 
 
