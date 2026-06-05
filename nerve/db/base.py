@@ -60,8 +60,13 @@ class Database(
     and all domain-specific data access methods via mixin inheritance.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, workspace: Path | None = None):
         self.db_path = db_path
+        # Workspace root used to resolve task file_path values during FTS
+        # reseed. Defaults to the DB's parent dir for backward compatibility,
+        # but production passes the configured workspace (task files live in
+        # the workspace, NOT next to the DB in ~/.nerve).
+        self.workspace = workspace
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
 
@@ -113,8 +118,11 @@ class Database(
                 task_count, fts_count,
             )
             await self.db.execute("DELETE FROM tasks_fts")
-            # Read content from disk files (source of truth) instead of seeding empty
-            workspace = self.db_path.parent
+            # Read content from disk files (source of truth) instead of seeding
+            # empty. Task file_path values are relative to the workspace root,
+            # which is NOT the DB directory (~/.nerve) — fall back to it only
+            # when no workspace was provided.
+            workspace = (self.workspace or self.db_path.parent).expanduser()
             async with self.db.execute("SELECT id, title, file_path FROM tasks") as cur:
                 rows = await cur.fetchall()
             for row in rows:
