@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@pierre/diffs": "^1.2.7",
     "highlight.js": "^11.11.1",
     "lucide-react": "^0.575.0",
     "react": "^19.2.0",
