@@ -9,6 +9,51 @@ interface ToolbarPosition {
   text: string;
 }
 
+interface FoundSelection {
+  text: string;
+  rect: DOMRect;
+}
+
+const QUOTE_SCOPE = '[data-role="assistant"], [data-role="plan"]';
+
+function readSelection(sel: Selection | null): { text: string; range: Range } | null {
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const text = sel.toString().trim();
+  if (!text) return null;
+  return { text, range: sel.getRangeAt(0) };
+}
+
+/**
+ * Resolve the active text selection, looking in both the light DOM (chat /
+ * plan text) and inside any `<diffs-container>` shadow roots. @pierre/diffs
+ * renders the diff into a shadow root whose selection is not surfaced through
+ * `window.getSelection()` in Chromium, so we read it via the non-standard
+ * `ShadowRoot.getSelection()` and fall back gracefully where it's absent.
+ */
+function findSelection(container: HTMLElement): FoundSelection | null {
+  // 1) Light DOM selection.
+  const docSel = window.getSelection();
+  const light = readSelection(docSel);
+  if (light) {
+    const anchor = docSel!.anchorNode;
+    const anchorEl = anchor instanceof Element ? anchor : anchor?.parentElement ?? null;
+    if (anchor && container.contains(anchor) && anchorEl?.closest(QUOTE_SCOPE)) {
+      return { text: light.text, rect: light.range.getBoundingClientRect() };
+    }
+  }
+
+  // 2) Shadow DOM selections (syntax-highlighted diffs).
+  const hosts = container.querySelectorAll<HTMLElement>('diffs-container');
+  for (const host of hosts) {
+    if (!host.closest(QUOTE_SCOPE)) continue;
+    const root = host.shadowRoot as (ShadowRoot & { getSelection?: () => Selection | null }) | null;
+    const found = readSelection(root?.getSelection?.() ?? null);
+    if (found) return { text: found.text, rect: found.range.getBoundingClientRect() };
+  }
+
+  return null;
+}
+
 const ACTIONS: { action: QuoteAction; icon: typeof Plus; label: string }[] = [
   { action: 'add', icon: Plus, label: 'Add' },
   { action: 'remove', icon: Trash2, label: 'Remove' },
@@ -22,31 +67,19 @@ export function SelectionToolbar({ containerRef }: { containerRef: React.RefObje
   const toolbarRef = useRef<HTMLDivElement>(null);
 
   const checkSelection = useCallback(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || !sel.toString().trim()) {
-      setPosition(null);
-      return;
-    }
-
-    const text = sel.toString().trim();
     const container = containerRef.current;
-    if (!container || !text) return;
-
-    const anchorNode = sel.anchorNode;
-    if (!anchorNode || !container.contains(anchorNode)) {
+    if (!container) {
       setPosition(null);
       return;
     }
 
-    // Only activate inside assistant messages or plan panel
-    const anchorEl = anchorNode instanceof Element ? anchorNode : anchorNode.parentElement;
-    if (!anchorEl?.closest('[data-role="assistant"], [data-role="plan"]')) {
+    const found = findSelection(container);
+    if (!found) {
       setPosition(null);
       return;
     }
 
-    const range = sel.getRangeAt(0);
-    const rect = range.getBoundingClientRect();
+    const { text, rect } = found;
     const containerRect = container.getBoundingClientRect();
 
     setPosition({

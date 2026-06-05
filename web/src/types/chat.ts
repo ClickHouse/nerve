@@ -95,6 +95,9 @@ export interface PanelTab {
 
 // --- Session modified files & diff types ---
 
+/** Mirrors MAX_DIFF_LINES in nerve/gateway/diff.py — diffs are truncated past this. */
+export const MAX_DIFF_LINES = 2000;
+
 export interface DiffLine {
   type: 'addition' | 'deletion' | 'context' | 'info';
   content: string;
@@ -118,6 +121,8 @@ export interface FileDiff {
   binary: boolean;
   stats: { additions: number; deletions: number };
   hunks: DiffHunk[];
+  /** Raw git-style unified-diff string for the @pierre/diffs renderer. */
+  patch: string;
   truncated: boolean;
 }
 
