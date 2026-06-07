@@ -32,15 +32,16 @@ class TaskStore:
                        deadline=excluded.deadline, tags=excluded.tags, updated_at=?""",
                 (task_id, file_path, title, status, source, source_url, deadline, tags, now, now, now),
             )
-            # Sync FTS index — include tags and slug so they're all searchable
+            # Sync FTS index — include tags and content so they're all searchable.
+            # The join key is the RAW task_id; readers join on `f.task_id = t.id`.
+            # The FTS5 tokenizer already splits the hyphenated slug into words
+            # ("2026-03-10-distribution" → 2026, 03, 10, distribution), so slug
+            # search works without rewriting the key — and the key stays joinable.
             fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
-            # Normalize slug: replace hyphens with spaces so "2026-03-10-distribution"
-            # becomes searchable as individual words
-            fts_slug = task_id.replace("-", " ")
-            await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (fts_slug,))
+            await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
             await self.db.execute(
                 "INSERT INTO tasks_fts (task_id, title, content) VALUES (?, ?, ?)",
-                (fts_slug, title, fts_content),
+                (task_id, title, fts_content),
             )
 
     async def get_task(self, task_id: str) -> dict | None:
@@ -247,7 +248,7 @@ class TaskStore:
 
             async with self.db.execute(
                 f"SELECT t.* FROM tasks t "
-                f"JOIN tasks_fts f ON f.task_id = REPLACE(t.id, '-', ' ') "
+                f"JOIN tasks_fts f ON f.task_id = t.id "
                 f"WHERE tasks_fts MATCH ?{where_extra} "
                 f"ORDER BY f.rank LIMIT ?",
                 tuple(fts_params),
@@ -326,7 +327,7 @@ class TaskStore:
 
         sql = (
             "SELECT t.* FROM tasks t "
-            "JOIN tasks_fts f ON f.task_id = REPLACE(t.id, '-', ' ') "
+            "JOIN tasks_fts f ON f.task_id = t.id "
             "WHERE tasks_fts MATCH ? "
         )
         params: list = [fts_query]

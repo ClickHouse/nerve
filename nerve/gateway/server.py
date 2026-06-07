@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     db_path = Path("~/.nerve/nerve.db").expanduser()
-    db = await init_db(db_path)
+    db = await init_db(db_path, workspace=config.workspace)
     logger.info("Database initialized at %s", db_path)
 
     # Optional Langfuse observability — must be set up BEFORE the engine
