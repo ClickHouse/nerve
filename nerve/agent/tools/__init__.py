@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 _workspace: Path | None = None
 _db: Any = None
 _memory_bridge: Any = None
+_xmemory_bridge: Any = None
 _config: Any = None
 _skill_manager: Any = None
 _engine: Any = None
@@ -72,6 +73,7 @@ def init_tools(
     workspace: Path,
     db: Any,
     memory_bridge: Any = None,
+    xmemory_bridge: Any = None,
     config: Any = None,
     skill_manager: Any = None,
     engine: Any = None,
@@ -83,10 +85,11 @@ def init_tools(
     ``_*_impl`` helpers (used by tests) and the SdkMcpTool re-exports
     (used by HTTP routes pre-migration) working.
     """
-    global _workspace, _db, _memory_bridge, _config, _skill_manager, _engine
+    global _workspace, _db, _memory_bridge, _xmemory_bridge, _config, _skill_manager, _engine
     _workspace = workspace
     _db = db
     _memory_bridge = memory_bridge
+    _xmemory_bridge = xmemory_bridge
     _config = config
     _skill_manager = skill_manager
     _engine = engine
@@ -104,6 +107,7 @@ def _legacy_ctx(session_id: str | None = None) -> ToolContext:
         workspace=_workspace,
         db=_db,
         memory_bridge=_memory_bridge,
+        xmemory_bridge=_xmemory_bridge,
         config=_config,
         skill_manager=_skill_manager,
         engine=_engine,

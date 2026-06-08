@@ -266,6 +266,7 @@ class AgentEngine:
         )
         self._semaphore = asyncio.Semaphore(config.agent.max_concurrent)
         self._memory_bridge = None
+        self._xmemory_bridge = None
         self._skill_manager: SkillManager | None = None
         self._memorize_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -307,6 +308,13 @@ class AgentEngine:
         self._memory_bridge = MemUBridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
 
+        # Optional xmemory.ai structured-memory layer — inert unless both a
+        # token and instance_id are configured. Runs alongside memU; never
+        # replaces it. ``initialize`` never raises.
+        from nerve.memory.xmemory_bridge import XmemoryBridge
+        self._xmemory_bridge = XmemoryBridge(self.config.xmemory)
+        await self._xmemory_bridge.initialize()
+
         # Initialize skill manager and discover skills from filesystem
         self._skill_manager = SkillManager(self.config.workspace, self.db)
         try:
@@ -325,6 +333,7 @@ class AgentEngine:
         init_tools(
             self.config.workspace, self.db,
             memory_bridge=self._memory_bridge,
+            xmemory_bridge=self._xmemory_bridge,
             config=self.config,
             skill_manager=self._skill_manager,
             engine=self,
@@ -569,6 +578,13 @@ class AgentEngine:
 
         self.sessions._clients.clear()
         self.sessions._client_locks.clear()
+
+        # Close the optional xmemory HTTP client (no-op when disabled).
+        if self._xmemory_bridge is not None:
+            try:
+                await self._xmemory_bridge.aclose()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("Error closing xmemory bridge: %s", e)
 
     # ------------------------------------------------------------------ #
     #  Channel router                                                      #
@@ -988,6 +1004,7 @@ class AgentEngine:
             workspace=self.config.workspace,
             db=self.db,
             memory_bridge=self._memory_bridge,
+            xmemory_bridge=self._xmemory_bridge,
             config=self.config,
             skill_manager=self._skill_manager,
             engine=self,

@@ -26,6 +26,9 @@ dependencies = [
     "memu-py==1.4.0",  # pinned — nerve monkey-patches memU internals (see memu_bridge._patch_sqlite_bugs)
     "watchfiles>=1.0.0",
     "html2text>=2024.2.26",
+    # Optional xmemory.ai structured-memory layer — only active when an
+    # xmemory api_key + instance_id are configured (see XmemoryConfig).
+    "xmemory-ai>=0.5.3",
     # Optional observability stack — only active when langfuse keys are
     # configured. All three are pure-Python wheels.
     "langfuse>=3.0.0",

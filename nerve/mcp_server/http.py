@@ -125,6 +125,7 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
             workspace=engine.config.workspace,
             db=engine.db,
             memory_bridge=engine._memory_bridge,
+            xmemory_bridge=engine._xmemory_bridge,
             config=engine.config,
             skill_manager=engine._skill_manager,
             engine=engine,

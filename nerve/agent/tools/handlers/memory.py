@@ -8,6 +8,7 @@ All handlers read collaborators (``memory_bridge``, ``config``) from
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import tempfile
@@ -43,6 +44,10 @@ def _resolve_memu_db_path(ctx: ToolContext) -> str:
 # inline-output limit (which would silently persist it to a file).
 _MAX_RECALL_BYTES = 10_000
 
+# Sub-budget for xmemory's synthesized answer so it can never crowd out the
+# memU items it's shown alongside.
+_MAX_XMEM_ANSWER_BYTES = 4_000
+
 
 def _clip_to_budget(text: str, max_bytes: int = _MAX_RECALL_BYTES) -> str:
     """Truncate text to a UTF-8 byte budget, appending a notice if clipped."""
@@ -58,23 +63,32 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
     limit = int(args.get("limit", 10))
     category_limit = int(args.get("category_limit", 5))
 
-    if ctx.memory_bridge:
-        try:
-            results = await ctx.memory_bridge.recall(
-                query, limit=limit, category_limit=category_limit,
-            )
-            if not results:
-                return ToolResult.text("No relevant memories found.")
+    if not ctx.memory_bridge:
+        return ToolResult.text("Memory service not configured.")
 
-            items = [m for m in results if m.get("type") != "category"]
-            cats = [m for m in results if m.get("type") == "category"]
+    # Fire the optional xmemory read concurrently with the memU recall so the
+    # dual lookup costs one round-trip, not two. Inert (no task) when xmemory
+    # is disabled; ``recall_answer`` swallows its own errors and returns None.
+    xmem_task: asyncio.Task | None = None
+    if ctx.xmemory_bridge is not None and ctx.xmemory_bridge.available:
+        xmem_task = asyncio.ensure_future(ctx.xmemory_bridge.recall_answer(query))
 
+    memu_block: str | None = None  # None => memU returned no hits
+    try:
+        results = await ctx.memory_bridge.recall(
+            query, limit=limit, category_limit=category_limit,
+        )
+        items = [m for m in results if m.get("type") != "category"]
+        cats = [m for m in results if m.get("type") == "category"]
+
+        if items or cats:
             sections: list[str] = []
             if items:
-                item_lines = [
-                    f"- [{m['type']}] (id:{m['id']}) {m['summary']}" for m in items
-                ]
-                sections.append("\n".join(item_lines))
+                sections.append(
+                    "\n".join(
+                        f"- [{m['type']}] (id:{m['id']}) {m['summary']}" for m in items
+                    )
+                )
             if cats:
                 cat_lines = [
                     f"- [{m.get('name') or 'topic'}] (id:{m['id']}) {m['summary']}"
@@ -84,17 +98,35 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     "Related topics — drill in with memory_expand_category "
                     "(pass the cat:<id>):\n" + "\n".join(cat_lines)
                 )
-
             body = _clip_to_budget("\n\n".join(sections))
             header = f"Recalled {len(items)} memories"
             if cats:
                 header += f" + {len(cats)} related topics"
-            return ToolResult.text(f"{header}:\n\n{body}")
-        except Exception as e:
-            logger.error("Memory recall failed: %s", e)
-            return ToolResult.text(f"Memory recall error: {e}")
+            memu_block = f"{header}:\n\n{body}"
+    except Exception as e:
+        logger.error("Memory recall failed: %s", e)
+        memu_block = f"Memory recall error: {e}"
 
-    return ToolResult.text("Memory service not configured.")
+    # Collect xmemory's synthesized answer (None when disabled/empty/error).
+    xmem_answer: str | None = None
+    if xmem_task is not None:
+        try:
+            xmem_answer = await xmem_task
+        except Exception as e:  # pragma: no cover - recall_answer is guarded
+            logger.warning("xmemory recall task failed: %s", e)
+
+    # xmemory contributed nothing → preserve the exact original output shape.
+    if not xmem_answer:
+        if memu_block is None:
+            return ToolResult.text("No relevant memories found.")
+        return ToolResult.text(memu_block)
+
+    # Both stores in play → label each source so the two are distinguishable.
+    memu_part = memu_block if memu_block is not None else "No relevant memories found."
+    xmem_part = _clip_to_budget(xmem_answer, _MAX_XMEM_ANSWER_BYTES)
+    return ToolResult.text(
+        f"[memU] {memu_part}\n\n---\n\n[xmemory] synthesized answer:\n\n{xmem_part}"
+    )
 
 
 async def memory_expand_category_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -330,19 +362,34 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.memory_bridge or not ctx.memory_bridge.available:
         return ToolResult.text("Memory service not available.")
 
+    # Primary write: memU (file + extraction pipeline).
+    memu_ok = False
+    memu_err: str | None = None
     try:
         mem_dir = Path("~/.nerve/memu-manual").expanduser()
         mem_dir.mkdir(parents=True, exist_ok=True)
         mem_path = mem_dir / f"memorize-{int(time.time())}.txt"
         mem_path.write_text(f"{memory_type}: {content}", encoding="utf-8")
 
-        success = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
-        if success:
-            return ToolResult.text(f"Memorized: {content}")
-        return ToolResult.text("Failed to memorize.")
+        memu_ok = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
     except Exception as e:
-        logger.error("Memorize failed: %s", e)
-        return ToolResult.text(f"Error: {e}")
+        logger.error("Memorize (memU) failed: %s", e)
+        memu_err = str(e)
+
+    # Optional dual-write to xmemory (async, fire-and-forget). Independent of
+    # the memU outcome and never fails the tool; inert when xmemory is
+    # disabled. The memorization *sweep* does not go through this handler, so
+    # it stays memU-only as intended.
+    xmem_written = False
+    if ctx.xmemory_bridge is not None and ctx.xmemory_bridge.available:
+        xmem_written = await ctx.xmemory_bridge.memorize(f"{memory_type}: {content}")
+
+    if memu_ok:
+        suffix = " (+ xmemory)" if xmem_written else ""
+        return ToolResult.text(f"Memorized: {content}{suffix}")
+    if memu_err is not None:
+        return ToolResult.text(f"Error: {memu_err}")
+    return ToolResult.text("Failed to memorize.")
 
 
 async def memory_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
