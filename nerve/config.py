@@ -823,6 +823,41 @@ class LangfuseConfig:
 
 
 @dataclass
+class XmemoryConfig:
+    """xmemory.ai structured memory — optional, runs alongside memU.
+
+    Activated only when both ``api_key`` (the bearer token) and
+    ``instance_id`` are set. When active, the ``memorize`` tool dual-writes
+    to xmemory (async) and ``memory_recall`` appends xmemory's synthesized
+    answer to the memU results. The memorization sweep stays memU-only.
+
+    Empty keys = no-op, zero overhead, no SDK calls. The instance and its
+    schema are created out of band (by the operator) on xmemory's side.
+    """
+
+    api_key: str = ""
+    instance_id: str = ""
+    api_url: str = "https://api.xmemory.ai"
+    extraction_logic: str = "deep"  # "deep" (default) or "fast"
+    timeout: float = 60.0
+
+    @property
+    def enabled(self) -> bool:
+        """True only when both the token and an instance are configured."""
+        return bool(self.api_key and self.instance_id)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "XmemoryConfig":
+        return cls(
+            api_key=d.get("api_key", ""),
+            instance_id=d.get("instance_id", ""),
+            api_url=d.get("api_url", "https://api.xmemory.ai"),
+            extraction_logic=d.get("extraction_logic", "deep"),
+            timeout=float(d.get("timeout", 60.0)),
+        )
+
+
+@dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
     timezone: str = "America/New_York"
@@ -844,6 +879,7 @@ class NerveConfig:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+    xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
@@ -953,6 +989,7 @@ class NerveConfig:
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
+            xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),

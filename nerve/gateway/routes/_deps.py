@@ -89,6 +89,7 @@ def build_route_tool_context(session_id: str = "system") -> "ToolContext":
         workspace=engine.config.workspace,
         db=deps.db,
         memory_bridge=engine._memory_bridge,
+        xmemory_bridge=engine._xmemory_bridge,
         config=engine.config,
         skill_manager=engine._skill_manager,
         engine=engine,

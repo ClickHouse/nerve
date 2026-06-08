@@ -104,6 +104,23 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
 | `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). |
 
+## xmemory (optional, alongside memU)
+
+[xmemory.ai](https://xmemory.ai) is an optional schema-backed memory layer that runs **alongside** memU — it never replaces it. Activated only when both `xmemory.api_key` and `xmemory.instance_id` are set (put them in `config.local.yaml`); otherwise it is completely inert (no SDK calls, zero overhead). The instance and its schema are created out of band on xmemory's side.
+
+When active:
+- The `memorize` tool **dual-writes**: memU (as always) plus an async `write_async` to xmemory. Failures on the xmemory side never fail the tool.
+- `memory_recall` appends xmemory's single synthesized answer (its `SINGLE_ANSWER` read mode) to memU's N items, run concurrently so the dual lookup is one round-trip.
+- The memorization **sweep** (session-close / cron) stays memU-only — it does not go through the `memorize` tool handler.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `xmemory.api_key` | string | *(empty)* | xmemory bearer token (invite-only). Secret → `config.local.yaml`. |
+| `xmemory.instance_id` | string | *(empty)* | The xmemory instance to bind. Both this and `api_key` are required to activate. |
+| `xmemory.api_url` | string | `https://api.xmemory.ai` | API base URL. |
+| `xmemory.extraction_logic` | string | `deep` | Write extraction mode: `deep` (accurate) or `fast` (high-volume). |
+| `xmemory.timeout` | float | `60.0` | Per-request timeout in seconds. |
+
 ## Docker
 
 Configuration for Docker deployment. Only relevant when `deployment: docker`.
