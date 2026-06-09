@@ -13,6 +13,10 @@ from nerve.agent.engine import AgentEngine
 @pytest.mark.parametrize(
     "value, model, expected",
     [
+        # Fable 5 (Mythos-class) supports the full effort ladder
+        ("max",    "claude-fable-5",            "max"),
+        ("xhigh",  "claude-fable-5",            "xhigh"),
+        ("low",    "claude-fable-5",            "low"),
         # Opus 4.8 supports every level (same ladder as 4.7)
         ("max",    "claude-opus-4-8",           "max"),
         ("xhigh",  "claude-opus-4-8",           "xhigh"),
