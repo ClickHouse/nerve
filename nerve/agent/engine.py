@@ -1218,6 +1218,7 @@ class AgentEngine:
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+        "fable-5":    ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),
