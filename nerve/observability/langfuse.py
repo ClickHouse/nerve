@@ -47,6 +47,7 @@ _host: str = ""
 _redact_patterns: list[re.Pattern[str]] = []
 _last_flush_at: str | None = None
 _auth_ok: bool = False
+_usage_rewriter: bool = False
 
 
 def is_enabled() -> bool:
@@ -61,6 +62,7 @@ def get_status() -> dict[str, Any]:
         "host": _host or None,
         "auth_ok": _auth_ok,
         "last_flush_at": _last_flush_at,
+        "usage_rewriter": _usage_rewriter,
     }
 
 
@@ -71,7 +73,7 @@ def init_langfuse(config: Any) -> bool:
     packages, or auth failure). Never raises — observability must not be
     able to take down the gateway.
     """
-    global _enabled, _host, _redact_patterns, _auth_ok
+    global _enabled, _host, _redact_patterns, _auth_ok, _usage_rewriter
 
     lf = getattr(config, "langfuse", None)
     if lf is None:
@@ -117,6 +119,29 @@ def init_langfuse(config: Any) -> bool:
             "Langfuse: auth_check raised (%s) — observability disabled", e,
         )
         return False
+
+    # Wrap the Langfuse OTLP exporter so LangSmith agent spans get
+    # cache-aware usage attributes. Without this, Langfuse prices every
+    # cached input token at the full uncached rate (~5-10x overcount on
+    # agent sessions). See nerve/observability/usage_rewrite.py.
+    try:
+        from nerve.observability.usage_rewrite import install_usage_rewriter
+        _usage_rewriter = install_usage_rewriter(client)
+        if _usage_rewriter:
+            logger.info("Langfuse: cache-aware usage rewriter installed")
+        else:
+            logger.warning(
+                "Langfuse: usage rewriter not installed (SDK layout "
+                "mismatch?) — agent-loop costs in Langfuse will overcount "
+                "cached input tokens"
+            )
+    except Exception as e:
+        _usage_rewriter = False
+        logger.warning(
+            "Langfuse: usage rewriter installation failed (%s) — "
+            "agent-loop costs in Langfuse will overcount cached input "
+            "tokens", e,
+        )
 
     # Wrap Claude Agent SDK. Failure here disables agent tracing but doesn't
     # disable the rest — direct Anthropic instrumentation can still cover

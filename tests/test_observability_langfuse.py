@@ -27,6 +27,7 @@ def _reset_lf_state(monkeypatch):
     lf._redact_patterns = []
     lf._last_flush_at = None
     lf._auth_ok = False
+    lf._usage_rewriter = False
     for var in (
         "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST",
         "LANGSMITH_OTEL_ENABLED", "LANGSMITH_OTEL_ONLY", "LANGSMITH_TRACING",
