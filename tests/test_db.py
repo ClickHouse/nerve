@@ -1344,3 +1344,102 @@ class TestCronLogSessions:
             await db.get_latest_cron_session_id("job_a")
             == "cron:job_a:20260102-000000"
         )
+
+
+class TestCronLogPagination:
+    @pytest.mark.asyncio
+    async def test_offset_pagination_and_count(self, db: Database):
+        ids = []
+        for _ in range(7):
+            log_id = await db.log_cron_start("job-p")
+            await db.log_cron_finish(log_id, "success", output="x")
+            ids.append(log_id)
+
+        assert await db.count_cron_logs(job_id="job-p") == 7
+        assert await db.count_cron_logs() == 7
+
+        page1 = await db.get_cron_logs(job_id="job-p", limit=3, offset=0)
+        page2 = await db.get_cron_logs(job_id="job-p", limit=3, offset=3)
+        page3 = await db.get_cron_logs(job_id="job-p", limit=3, offset=6)
+
+        got = [row["id"] for row in page1 + page2 + page3]
+        assert got == sorted(ids, reverse=True)  # newest first, no overlap
+        assert len(page3) == 1
+
+class TestCronLogSessionBackfill:
+    """v34 best-effort backfill of cron_logs.session_id."""
+
+    @pytest.mark.asyncio
+    async def test_backfill_matches_runs_and_persistent(self, db: Database):
+        from nerve.db.migrations import v034_backfill_cron_log_sessions as v034
+
+        # Per-run session + a matching log row one second later.
+        await db.create_session("cron:iso-job:20260110-120000", source="cron")
+        iso_log = await db.log_cron_start("iso-job")
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = '2026-01-10 12:00:01' WHERE id = ?",
+            (iso_log,),
+        )
+
+        # Persistent session + a log row with no per-run candidate.
+        await db.create_session("cron:pers-job", source="cron")
+        pers_log = await db.log_cron_start("pers-job")
+
+        # Log too far from the only run session (outside tolerance).
+        await db.create_session("cron:far-job:20260101-000000", source="cron")
+        far_log = await db.log_cron_start("far-job")
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = '2026-01-05 00:00:00' WHERE id = ?",
+            (far_log,),
+        )
+
+        # Source-runner log — no sessions at all.
+        src_log = await db.log_cron_start("source:gmail")
+        await db.db.commit()
+
+        await v034.up(db.db)
+        await db.db.commit()
+
+        rows = {
+            r["id"]: r
+            for r in await db.get_cron_logs(limit=50)
+        }
+        assert rows[iso_log]["session_id"] == "cron:iso-job:20260110-120000"
+        assert rows[pers_log]["session_id"] == "cron:pers-job"
+        assert rows[far_log]["session_id"] is None
+        assert rows[src_log]["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_backfill_does_not_touch_existing_links(self, db: Database):
+        from nerve.db.migrations import v034_backfill_cron_log_sessions as v034
+
+        await db.create_session("cron:job-x:20260110-120000", source="cron")
+        log_id = await db.log_cron_start("job-x")
+        await db.log_cron_finish(
+            log_id, "success", output="ok", session_id="cron:job-x:custom",
+        )
+
+        await v034.up(db.db)
+        await db.db.commit()
+
+        logs = await db.get_cron_logs(job_id="job-x")
+        assert logs[0]["session_id"] == "cron:job-x:custom"
+
+    @pytest.mark.asyncio
+    async def test_backfill_picks_closest_run(self, db: Database):
+        from nerve.db.migrations import v034_backfill_cron_log_sessions as v034
+
+        await db.create_session("cron:multi:20260110-120000", source="cron")
+        await db.create_session("cron:multi:20260110-120130", source="cron")
+        log_id = await db.log_cron_start("multi")
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = '2026-01-10 12:01:25' WHERE id = ?",
+            (log_id,),
+        )
+        await db.db.commit()
+
+        await v034.up(db.db)
+        await db.db.commit()
+
+        logs = await db.get_cron_logs(job_id="multi")
+        assert logs[0]["session_id"] == "cron:multi:20260110-120130"

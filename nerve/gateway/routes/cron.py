@@ -61,7 +61,17 @@ async def rotate_cron_session(job_id: str, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/cron/logs")
-async def get_cron_logs(job_id: str = "", limit: int = 50, user: dict = Depends(require_auth)):
+async def get_cron_logs(
+    job_id: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(require_auth),
+):
     deps = get_deps()
-    logs = await deps.db.get_cron_logs(job_id=job_id or None, limit=limit)
-    return {"logs": logs}
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    logs = await deps.db.get_cron_logs(
+        job_id=job_id or None, limit=limit, offset=offset,
+    )
+    total = await deps.db.count_cron_logs(job_id=job_id or None)
+    return {"logs": logs, "total": total, "limit": limit, "offset": offset}
