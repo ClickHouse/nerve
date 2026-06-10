@@ -702,3 +702,69 @@ class TestRunLogOutput:
         args, kwargs = cron_service.db.log_cron_finish.call_args
         assert args[1] == "error"
         assert kwargs["session_id"].startswith("cron:err-job:")
+
+
+# ---------------------------------------------------------------------------
+# Live session linking (chat available while a run is in flight)
+# ---------------------------------------------------------------------------
+
+class TestLiveSessionLink:
+    @pytest.mark.asyncio
+    async def test_isolated_links_session_before_run(self, cron_service):
+        order: list[str] = []
+        cron_service.db.set_cron_log_session = AsyncMock(
+            side_effect=lambda *a, **k: order.append("link"),
+        )
+
+        async def _run(**kwargs):
+            order.append("run")
+            return "ok"
+
+        cron_service.engine.run_cron = AsyncMock(side_effect=_run)
+        job = _make_job(id="live-job")
+
+        await cron_service._run_job_inner(job)
+
+        assert order == ["link", "run"]
+        log_id, session_id = cron_service.db.set_cron_log_session.call_args.args
+        assert log_id == 1
+        assert session_id.startswith("cron:live-job:")
+        # Same session id must be used for the engine run
+        assert (
+            f"cron:live-job:{cron_service.engine.run_cron.call_args.kwargs['run_id']}"
+            == session_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_persistent_links_session_before_run(self, cron_service):
+        cron_service.db.get_session = AsyncMock(return_value=None)
+        job = _make_job(
+            id="pers-live", session_mode="persistent", context_rotate_hours=0,
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.set_cron_log_session.assert_awaited_once_with(
+            1, "cron:pers-live",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_link_when_prompt_unresolvable(self, cron_service, tmp_path):
+        job = CronJob(id="bad", schedule="1h", prompt_file=str(tmp_path / "nope.md"))
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.set_cron_log_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_link_failure_does_not_break_run(self, cron_service):
+        cron_service.db.set_cron_log_session = AsyncMock(
+            side_effect=RuntimeError("db locked"),
+        )
+        job = _make_job(id="resilient")
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_called_once()
+        args, kwargs = cron_service.db.log_cron_finish.call_args
+        assert args[1] == "success"

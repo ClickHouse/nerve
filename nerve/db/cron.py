@@ -16,6 +16,18 @@ class CronStore:
         await self.db.commit()
         return log_id
 
+    async def set_cron_log_session(self, log_id: int, session_id: str) -> None:
+        """Link a run log to its session while the run is still in flight.
+
+        Written at run start so the UI can open the chat of a running cron;
+        log_cron_finish keeps it as a fallback for older code paths.
+        """
+        await self.db.execute(
+            "UPDATE cron_logs SET session_id = ? WHERE id = ?",
+            (session_id, log_id),
+        )
+        await self.db.commit()
+
     async def log_cron_finish(
         self,
         log_id: int,

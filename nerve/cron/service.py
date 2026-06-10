@@ -390,8 +390,28 @@ class CronService:
             rotated = False
             base_prompt = job.resolve_prompt()
 
+            # Determine the session id up front and link the run log to it
+            # immediately, so the UI can open the chat of a *running* cron
+            # instead of waiting for the run to finish.
+            run_id: str | None = None
             if job.session_mode == "persistent":
                 session_id = f"cron:{job.id}"
+            else:
+                # Isolated mode: per-run session. The run_id is generated
+                # here (the engine would otherwise generate an identical
+                # timestamp-based one) so the session id is known for the
+                # run log.
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                session_id = f"cron:{job.id}:{run_id}"
+            try:
+                await self.db.set_cron_log_session(log_id, session_id)
+            except Exception as e:
+                logger.warning(
+                    "Failed to link cron log %s to session %s: %s",
+                    log_id, session_id, e,
+                )
+
+            if job.session_mode == "persistent":
                 # Persistent mode: reuse SDK context across runs
                 if job.context_rotate_at or job.context_rotate_hours > 0:
                     rotated = await self._maybe_rotate_context(
@@ -428,12 +448,6 @@ class CronService:
                     model=model,
                 )
             else:
-                # Isolated mode: per-run session. The run_id is generated
-                # here (the engine would otherwise generate an identical
-                # timestamp-based one) so the session id is known for the
-                # run log.
-                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                session_id = f"cron:{job.id}:{run_id}"
                 response = await self.engine.run_cron(
                     job_id=job.id,
                     prompt=base_prompt,
