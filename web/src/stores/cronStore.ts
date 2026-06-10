@@ -6,11 +6,15 @@ export interface CronJob {
   type: 'cron' | 'source';
   schedule: string;
   description: string;
+  /** Prompt file path when the job's prompt is file-based. */
+  prompt_file?: string;
   enabled: boolean;
   session_mode?: string;
   /** Human-readable run-gate conditions; job runs only if all are satisfied. */
   gates?: string[];
   next_run: string | null;
+  /** Most recently active chat session for this job (cron:{id}[:{run}]). */
+  last_session_id?: string | null;
 }
 
 export interface CronLog {
@@ -21,6 +25,8 @@ export interface CronLog {
   status: string | null;
   output: string | null;
   error: string | null;
+  /** Session the run executed in — deep-links to the chat page. */
+  session_id?: string | null;
 }
 
 interface CronState {

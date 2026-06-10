@@ -1,9 +1,15 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   RefreshCw, RotateCw, Play, Loader2, Clock, Inbox,
-  CheckCircle2, XCircle, Timer, Filter,
+  CheckCircle2, XCircle, Timer, Filter, MessageSquare, FileText,
 } from 'lucide-react';
 import { useCronStore, type CronJob, type CronLog } from '../stores/cronStore';
+
+/** Chat-page path for a session id. */
+function chatPath(sessionId: string): string {
+  return `/chat/${encodeURIComponent(sessionId)}`;
+}
 
 // --- Helpers ---
 
@@ -84,13 +90,10 @@ function jobTypeBadge(type: string) {
   );
 }
 
+/** Sidebar label: always the job name (id) — descriptions go in the tooltip. */
 function jobLabel(job: CronJob): string {
-  if (job.description) {
-    // Truncate long descriptions for sidebar
-    const desc = job.description.split('—')[0].split('–')[0].trim();
-    return desc.length > 24 ? desc.slice(0, 22) + '..' : desc;
-  }
-  return job.id;
+  // Source runner ids are prefixed (e.g. "source:gmail:user@x") — strip it.
+  return job.type === 'source' ? job.id.replace(/^source:/, '') : job.id;
 }
 
 // --- Trigger Button ---
@@ -107,6 +110,7 @@ function TriggerButton({ jobId, small = false }: { jobId: string; small?: boolea
 
   return (
     <button onClick={handleClick} disabled={isTriggering}
+      onAuxClick={(e) => e.stopPropagation()}
       className={`flex items-center gap-1 rounded transition-colors cursor-pointer shrink-0
         ${isTriggering ? 'text-text-faint cursor-not-allowed' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}
         ${small ? 'p-1' : 'px-2 py-1.5 text-[12px]'}`}
@@ -114,6 +118,25 @@ function TriggerButton({ jobId, small = false }: { jobId: string; small?: boolea
       {isTriggering ? <Loader2 size={small ? 12 : 14} className="animate-spin" /> : <Play size={small ? 12 : 14} />}
       {!small && !isTriggering && <span>Run</span>}
     </button>
+  );
+}
+
+// --- Chat Link ---
+
+/** Link to a cron's chat session. Renders an anchor so cmd/ctrl+click and
+ *  middle-click open a new tab natively. */
+function ChatLink({ sessionId, small = false, label }: { sessionId: string; small?: boolean; label?: string }) {
+  return (
+    <Link to={chatPath(sessionId)}
+      onClick={(e) => e.stopPropagation()}
+      onAuxClick={(e) => e.stopPropagation()}
+      className={`flex items-center gap-1 rounded transition-colors cursor-pointer shrink-0
+        text-text-muted hover:text-text-secondary hover:bg-surface-raised
+        ${small ? 'p-1' : 'px-2 py-1.5 text-[12px]'}`}
+      title="Open chat">
+      <MessageSquare size={small ? 12 : 14} />
+      {!small && <span>{label || 'Chat'}</span>}
+    </Link>
   );
 }
 
@@ -158,7 +181,22 @@ function CronSidebar() {
 
         {jobs.map(job => (
           <div key={job.id} className={`group ${!job.enabled ? 'opacity-50' : ''}`}>
-            <button onClick={() => selectJob(job.id)}
+            <button title={job.description || job.id}
+              onClick={(e) => {
+                // Cmd/ctrl+click opens the cron's chat in a new tab;
+                // plain click keeps the in-page select behaviour.
+                if ((e.metaKey || e.ctrlKey) && job.last_session_id) {
+                  window.open(chatPath(job.last_session_id), '_blank', 'noopener');
+                  return;
+                }
+                selectJob(job.id);
+              }}
+              onAuxClick={(e) => {
+                // Middle-click → new tab, like a link.
+                if (e.button === 1 && job.last_session_id) {
+                  window.open(chatPath(job.last_session_id), '_blank', 'noopener');
+                }
+              }}
               className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-[13px] transition-colors cursor-pointer
                 ${selectedJobId === job.id ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
               <span className="flex items-center gap-2 min-w-0 truncate">
@@ -166,6 +204,11 @@ function CronSidebar() {
                 <span className="truncate">{jobLabel(job)}</span>
               </span>
               <span className="flex items-center gap-1 shrink-0">
+                {job.last_session_id && (
+                  <span className="opacity-0 group-hover:opacity-100 transition-opacity">
+                    <ChatLink sessionId={job.last_session_id} small />
+                  </span>
+                )}
                 {job.enabled && (
                   <span className="opacity-0 group-hover:opacity-100 transition-opacity">
                     <TriggerButton jobId={job.id} small />
@@ -215,13 +258,17 @@ function JobInfoCard({ job }: { job: CronJob }) {
           {job.description && (
             <div className="text-[13px] text-text-muted mt-1">{job.description}</div>
           )}
+          {job.prompt_file && (
+            <div className="text-[11px] text-text-dim mt-1 flex items-center gap-1 font-mono">
+              <FileText size={11} /> {job.prompt_file}
+            </div>
+          )}
         </div>
-        {job.enabled && (
-          <div className="flex items-center gap-1">
-            {job.session_mode === 'persistent' && <RotateButton jobId={job.id} />}
-            <TriggerButton jobId={job.id} />
-          </div>
-        )}
+        <div className="flex items-center gap-1">
+          {job.last_session_id && <ChatLink sessionId={job.last_session_id} label="Open Chat" />}
+          {job.enabled && job.session_mode === 'persistent' && <RotateButton jobId={job.id} />}
+          {job.enabled && <TriggerButton jobId={job.id} />}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
@@ -294,6 +341,7 @@ function LogsTable({ showJobColumn }: { showJobColumn: boolean }) {
             <th className="text-left px-3 py-2 font-medium">Duration</th>
             <th className="text-left px-3 py-2 font-medium">Status</th>
             <th className="text-left px-3 py-2 font-medium">Output</th>
+            <th className="w-8" aria-label="Chat" />
           </tr>
         </thead>
         <tbody>
@@ -349,10 +397,13 @@ function LogRow({ log, showJobColumn }: { log: CronLog; showJobColumn: boolean }
             {preview}{isLong && !expanded ? '…' : ''}
           </span>
         </td>
+        <td className="px-1 py-2">
+          {log.session_id && <ChatLink sessionId={log.session_id} small />}
+        </td>
       </tr>
       {expanded && hasOutput && (
         <tr className="bg-surface">
-          <td colSpan={showJobColumn ? 5 : 4} className="px-3 py-2">
+          <td colSpan={showJobColumn ? 6 : 5} className="px-3 py-2">
             <pre className="text-[12px] text-text-muted whitespace-pre-wrap break-words max-h-[200px] overflow-y-auto font-mono">
               {log.error ? `Error: ${log.error}` : log.output}
             </pre>

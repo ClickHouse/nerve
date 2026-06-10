@@ -17,12 +17,18 @@ class CronStore:
         return log_id
 
     async def log_cron_finish(
-        self, log_id: int, status: str, output: str | None = None, error: str | None = None
+        self,
+        log_id: int,
+        status: str,
+        output: str | None = None,
+        error: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         now = utc_now_iso()
         await self.db.execute(
-            "UPDATE cron_logs SET finished_at = ?, status = ?, output = ?, error = ? WHERE id = ?",
-            (now, status, output, error, log_id),
+            "UPDATE cron_logs SET finished_at = ?, status = ?, output = ?, error = ?, "
+            "session_id = COALESCE(?, session_id) WHERE id = ?",
+            (now, status, output, error, session_id, log_id),
         )
         await self.db.commit()
 
@@ -44,6 +50,25 @@ class CronStore:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def get_latest_cron_session_id(self, job_id: str) -> str | None:
+        """Return the most recently active session id for a cron job.
+
+        Matches both the persistent form (``cron:<job>``) and per-run
+        isolated sessions (``cron:<job>:<run>``).
+        """
+        escaped = (
+            job_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        async with self.db.execute(
+            """SELECT id FROM sessions
+               WHERE id = ? OR id LIKE ? ESCAPE '\\'
+               ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC
+               LIMIT 1""",
+            (f"cron:{job_id}", f"cron:{escaped}:%"),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["id"] if row else None
 
     async def get_recent_cron_runs(self, hours: int = 6) -> list[dict]:
         """Get all successful cron runs within the last N hours."""

@@ -45,7 +45,32 @@ jobs:
     prompt: "Check for overdue tasks..."
     target: telegram
     enabled: true
+
+  - id: repo-watch-nerve
+    schedule: "1h"
+    prompt_file: prompts/repo-watch.md   # Relative to this YAML's directory
+    enabled: true
+
+  - id: repo-watch-other
+    schedule: "1h"
+    prompt_file: prompts/repo-watch.md   # Same prompt, shared between jobs
+    enabled: true
 ```
+
+### Prompt Files
+
+Instead of an inline `prompt`, a job can point at a file with `prompt_file`.
+This keeps long prompts out of the YAML and lets multiple jobs share one
+prompt definition.
+
+- Relative paths resolve against the directory of the YAML file the job was
+  loaded from (e.g. `prompts/repo-watch.md` next to `jobs.yaml` →
+  `~/.nerve/cron/prompts/repo-watch.md`). Absolute paths and `~` work too.
+- The file is read fresh on **every run** — edits take effect on the next
+  trigger without a restart.
+- If both `prompt` and `prompt_file` are set, the file wins; the inline
+  prompt is used as a fallback when the file can't be read.
+- A job must define at least one of `prompt` / `prompt_file`.
 
 ## Job Fields
 
@@ -53,7 +78,8 @@ jobs:
 |-------|------|----------|-------------|
 | `id` | string | yes | Unique job identifier |
 | `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`) |
-| `prompt` | string | yes | Message sent to the agent |
+| `prompt` | string | yes* | Message sent to the agent |
+| `prompt_file` | string | yes* | Path to a file containing the prompt (relative to the YAML's directory). Read fresh each run; shareable between jobs. *One of `prompt`/`prompt_file` is required |
 | `description` | string | no | Human-readable description |
 | `model` | string | no | Override model (default: `agent.cron_model`) |
 | `target` | string | no | Delivery channel (default: `telegram`) |

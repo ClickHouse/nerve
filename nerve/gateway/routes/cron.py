@@ -18,7 +18,7 @@ async def list_cron_jobs(user: dict = Depends(require_auth)):
     if not _cron_service:
         return {"jobs": []}
 
-    jobs = _cron_service.list_jobs()
+    jobs = await _cron_service.list_jobs()
     return {"jobs": jobs}
 
 

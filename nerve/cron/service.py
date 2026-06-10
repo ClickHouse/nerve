@@ -383,23 +383,26 @@ class CronService:
 
         log_id = await self.db.log_cron_start(job.id)
         logger.info("Running cron job: %s (mode=%s)", job.id, job.session_mode)
+        session_id: str | None = None
 
         try:
             model = job.model or self.config.agent.cron_model
             rotated = False
+            base_prompt = job.resolve_prompt()
 
             if job.session_mode == "persistent":
+                session_id = f"cron:{job.id}"
                 # Persistent mode: reuse SDK context across runs
                 if job.context_rotate_at or job.context_rotate_hours > 0:
                     rotated = await self._maybe_rotate_context(
-                        f"cron:{job.id}", job.context_rotate_hours,
+                        session_id, job.context_rotate_hours,
                         rotate_at=job.context_rotate_at,
                     )
 
                 # Determine prompt: full on first run, short reminder on subsequent
-                prompt = job.prompt
+                prompt = base_prompt
                 if job.reminder_mode:
-                    session = await self.db.get_session(f"cron:{job.id}")
+                    session = await self.db.get_session(session_id)
                     is_resume = (
                         session
                         and session.get("sdk_session_id")
@@ -411,7 +414,7 @@ class CronService:
                             "task as before."
                         )
                     else:
-                        prompt = job.prompt.rstrip() + (
+                        prompt = base_prompt.rstrip() + (
                             "\n\n---\n"
                             "NOTE: This is a persistent cron with reminder "
                             "mode. On subsequent triggers you will receive "
@@ -425,28 +428,34 @@ class CronService:
                     model=model,
                 )
             else:
-                # Isolated mode: per-run session (existing behaviour)
-                run_id = (
-                    datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                    if self.config.sessions.cron_session_mode == "per_run"
-                    else None
-                )
+                # Isolated mode: per-run session. The run_id is generated
+                # here (the engine would otherwise generate an identical
+                # timestamp-based one) so the session id is known for the
+                # run log.
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                session_id = f"cron:{job.id}:{run_id}"
                 response = await self.engine.run_cron(
                     job_id=job.id,
-                    prompt=job.prompt,
+                    prompt=base_prompt,
                     model=model,
                     run_id=run_id,
                 )
 
-            output = response[:2000]
+            # Keep the tail of the response — for multi-message runs the
+            # final summary lives at the end, not the beginning.
+            output = response if len(response) <= 2000 else "…" + response[-2000:]
             if rotated:
                 output = "[context rotated] " + output
-            await self.db.log_cron_finish(log_id, "success", output=output)
+            await self.db.log_cron_finish(
+                log_id, "success", output=output, session_id=session_id,
+            )
             logger.info("Cron job %s completed (%d chars)", job.id, len(response))
 
         except Exception as e:
             logger.error("Cron job %s failed: %s", job.id, e, exc_info=True)
-            await self.db.log_cron_finish(log_id, "error", error=str(e))
+            await self.db.log_cron_finish(
+                log_id, "error", error=str(e), session_id=session_id,
+            )
 
     async def _run_source_wrapper(self, runner: SourceRunner) -> None:
         """Wrapper to run a source ingestion with cron and source logging."""
@@ -618,23 +627,29 @@ class CronService:
             "session_age_hours": session_age_hours,
         }
 
-    def list_jobs(self) -> list[dict]:
+    async def list_jobs(self) -> list[dict]:
         """List all registered jobs (cron + sources) with their next run times."""
         result = []
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
             next_run = sched_job.next_run_time if sched_job else None
+            try:
+                last_session_id = await self.db.get_latest_cron_session_id(job.id)
+            except Exception:
+                last_session_id = None
             result.append({
                 "id": job.id,
                 "type": "cron",
                 "source": job.metadata.get("_source", "unknown"),
                 "schedule": job.schedule,
                 "description": job.description,
+                "prompt_file": job.prompt_file,
                 "enabled": job.enabled,
                 "session_mode": job.session_mode,
                 "lock": job.lock,
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
+                "last_session_id": last_session_id,
             })
 
         # Include source runners
@@ -652,6 +667,7 @@ class CronService:
                 "description": f"Source: {source_name} (ingestor)",
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
+                "last_session_id": None,
             })
 
         return result
