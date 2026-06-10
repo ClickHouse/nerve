@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
 
+export const LOGS_PAGE_SIZE = 50;
+
 export interface CronJob {
   id: string;
   type: 'cron' | 'source';
@@ -15,6 +17,12 @@ export interface CronJob {
   next_run: string | null;
   /** Most recently active chat session for this job (cron:{id}[:{run}]). */
   last_session_id?: string | null;
+  /** Most recent run summary, if the job has ever run. */
+  last_run?: {
+    status: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+  } | null;
 }
 
 export interface CronLog {
@@ -32,13 +40,16 @@ export interface CronLog {
 interface CronState {
   jobs: CronJob[];
   logs: CronLog[];
+  logsTotal: number;
+  logsOffset: number;
   selectedJobId: string | null;
   loading: boolean;
   triggering: string | null;
   rotating: string | null;
 
   loadJobs: () => Promise<void>;
-  loadLogs: () => Promise<void>;
+  loadLogs: (offset?: number) => Promise<void>;
+  setLogsPage: (offset: number) => void;
   selectJob: (jobId: string | null) => void;
   triggerJob: (jobId: string) => Promise<void>;
   rotateSession: (jobId: string) => Promise<void>;
@@ -48,6 +59,8 @@ interface CronState {
 export const useCronStore = create<CronState>((set, get) => ({
   jobs: [],
   logs: [],
+  logsTotal: 0,
+  logsOffset: 0,
   selectedJobId: null,
   loading: false,
   triggering: null,
@@ -62,23 +75,28 @@ export const useCronStore = create<CronState>((set, get) => ({
     }
   },
 
-  loadLogs: async () => {
-    const { selectedJobId } = get();
+  loadLogs: async (offset?: number) => {
+    const { selectedJobId, logsOffset } = get();
+    const effectiveOffset = offset ?? logsOffset;
     set({ loading: true });
     try {
-      // Cap at 30 — the UI only renders a list, and unfiltered queries
-      // sort the entire cron_logs table. Fewer rows = faster page load.
-      const { logs } = await api.getCronLogs(selectedJobId || undefined, 30);
-      set({ logs, loading: false });
+      const { logs, total } = await api.getCronLogs(
+        selectedJobId || undefined, LOGS_PAGE_SIZE, effectiveOffset,
+      );
+      set({ logs, logsTotal: total, logsOffset: effectiveOffset, loading: false });
     } catch (e) {
       console.error('Failed to load cron logs:', e);
       set({ loading: false });
     }
   },
 
+  setLogsPage: (offset: number) => {
+    get().loadLogs(Math.max(0, offset));
+  },
+
   selectJob: (jobId: string | null) => {
-    set({ selectedJobId: jobId });
-    get().loadLogs();
+    set({ selectedJobId: jobId, logsOffset: 0 });
+    get().loadLogs(0);
   },
 
   triggerJob: async (jobId: string) => {
