@@ -1280,3 +1280,67 @@ class TestConsumerCursors:
         cursors = await db.list_consumer_cursors()
         assert len(cursors) == 1
         assert cursors[0]["consumer"] == "active"
+
+
+class TestCronLogSessions:
+    """cron_logs.session_id linking (v33) + latest-session lookup."""
+
+    @pytest.mark.asyncio
+    async def test_log_cron_finish_stores_session_id(self, db: Database):
+        log_id = await db.log_cron_start("job-a")
+        await db.log_cron_finish(
+            log_id, "success", output="ok", session_id="cron:job-a:20260101-000000",
+        )
+        logs = await db.get_cron_logs(job_id="job-a")
+        assert logs[0]["session_id"] == "cron:job-a:20260101-000000"
+
+    @pytest.mark.asyncio
+    async def test_log_cron_finish_without_session_id(self, db: Database):
+        log_id = await db.log_cron_start("source:gmail")
+        await db.log_cron_finish(log_id, "success", output="3 ingested")
+        logs = await db.get_cron_logs(job_id="source:gmail")
+        assert logs[0]["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_per_run(self, db: Database):
+        await db.create_session("cron:job-a:20260101-000000", source="cron")
+        await db.create_session("cron:job-a:20260102-000000", source="cron")
+        await db.db.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:10+00:00", "cron:job-a:20260101-000000"),
+        )
+        await db.db.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE id = ?",
+            ("2026-01-02T00:00:10+00:00", "cron:job-a:20260102-000000"),
+        )
+        await db.db.commit()
+
+        latest = await db.get_latest_cron_session_id("job-a")
+        assert latest == "cron:job-a:20260102-000000"
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_persistent(self, db: Database):
+        await db.create_session("cron:job-b", source="cron")
+        latest = await db.get_latest_cron_session_id("job-b")
+        assert latest == "cron:job-b"
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_no_prefix_bleed(self, db: Database):
+        """job-a must not match job-a-extended's sessions."""
+        await db.create_session("cron:job-a-extended:20260101-000000", source="cron")
+        assert await db.get_latest_cron_session_id("job-a") is None
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_missing(self, db: Database):
+        assert await db.get_latest_cron_session_id("ghost") is None
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_underscore_not_wildcard(self, db: Database):
+        """LIKE special chars in job ids must be escaped."""
+        await db.create_session("cron:jobXa:20260101-000000", source="cron")
+        assert await db.get_latest_cron_session_id("job_a") is None
+        await db.create_session("cron:job_a:20260102-000000", source="cron")
+        assert (
+            await db.get_latest_cron_session_id("job_a")
+            == "cron:job_a:20260102-000000"
+        )
