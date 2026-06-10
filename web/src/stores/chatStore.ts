@@ -8,7 +8,7 @@ import { hydrateMessage } from '../utils/hydrateMessage';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup } from './handlers/streamingHandlers';
+import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
@@ -103,7 +103,7 @@ interface ChatState {
   modifiedFilesCount: number;
 
   // Background tasks (run_in_background)
-  backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'timeout'; startedAt: number }[];
+  backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout'; startedAt: number }[];
 
   // Session search
   searchQuery: string;
@@ -513,6 +513,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'tool_result':  return handleToolResult(msg, get, set);
       case 'done':         return handleDone(msg, get, set);
       case 'wakeup':       return handleWakeup(msg, get, set);
+      case 'auto_turn':    return handleAutoTurn(msg, get, set);
       case 'stopped':      return handleStopped(msg, get, set);
       case 'error':        return handleError(msg, get, set);
       // Sessions
