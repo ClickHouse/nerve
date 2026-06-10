@@ -297,6 +297,10 @@ class AgentEngine:
         self._xmemory_bridge = None
         self._skill_manager: SkillManager | None = None
         self._memorize_lock = asyncio.Lock()
+        # Background memorization tasks (see schedule_memorize) — strong
+        # refs so the tasks aren't GC'd mid-flight; pruned by their
+        # done-callbacks and flushed in shutdown().
+        self._memorize_bg_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Idle stream watchers — one per live SDK client. Between run()
         # calls nothing reads the SDK message stream, but the CLI keeps
@@ -623,6 +627,17 @@ class AgentEngine:
         self.sessions._clients.clear()
         self.sessions._client_locks.clear()
 
+        # Cancel queued background memorizations — the periodic sweep
+        # re-indexes anything they would have covered (the watermark is
+        # only advanced after a successful pass).
+        for task in list(self._memorize_bg_tasks):
+            task.cancel()
+        if self._memorize_bg_tasks:
+            await asyncio.gather(
+                *self._memorize_bg_tasks, return_exceptions=True,
+            )
+        self._memorize_bg_tasks.clear()
+
         # Close the optional xmemory HTTP client (no-op when disabled).
         if self._xmemory_bridge is not None:
             try:
@@ -660,32 +675,50 @@ class AgentEngine:
     #  Memory bridge                                                       #
     # ------------------------------------------------------------------ #
 
-    async def _memorize_session(self, session_id: str) -> None:
+    async def _memorize_session(
+        self, session_id: str, connected_at_override: str | None = None,
+    ) -> None:
         """Index un-memorized messages from a session into memU.
 
         Uses the more recent of ``connected_at`` and ``last_memorized_at`` as
         the lower bound so already-indexed messages are never re-sent to memU.
+
+        ``connected_at_override`` replaces the live ``connected_at`` column as
+        the fallback lower bound.  Background memorizations (scheduled via
+        ``schedule_memorize``) pass the value frozen at scheduling time: by
+        the time the task acquires the global lock, the live column may have
+        been cleared (``mark_error``, context rotation) or reset by a newer
+        client — either of which would silently skip or shrink the window of
+        messages this memorization is meant to cover.
         """
         if not self._memory_bridge or not self._memory_bridge.available:
             return
 
-        session = await self.db.get_session(session_id)
-        connected_at = session.get("connected_at") if session else None
-        if not connected_at:
-            return
-
-        watermark = _normalize_ts(session.get("last_memorized_at") or "")
-        connected = _normalize_ts(connected_at)
-
-        # Pick effective lower bound: watermark wins when it's more recent
-        if watermark and watermark >= connected:
-            lower_bound = watermark
-            inclusive = False  # strict >: watermark message already indexed
-        else:
-            lower_bound = connected
-            inclusive = True   # >=: include messages from connection time
-
         async with self._memorize_lock:
+            # Session state (notably the last_memorized_at watermark) is
+            # read inside the lock: queued memorizations for the same
+            # session must each see the watermark advanced by the previous
+            # one, or they would re-index the same window and regress it.
+            session = await self.db.get_session(session_id)
+            connected_at = connected_at_override or (
+                session.get("connected_at") if session else None
+            )
+            if not connected_at:
+                return
+
+            watermark = _normalize_ts(
+                (session or {}).get("last_memorized_at") or "",
+            )
+            connected = _normalize_ts(connected_at)
+
+            # Pick effective lower bound: watermark wins when more recent
+            if watermark and watermark >= connected:
+                lower_bound = watermark
+                inclusive = False  # strict >: watermark msg already indexed
+            else:
+                lower_bound = connected
+                inclusive = True   # >=: include messages from connect time
+
             try:
                 messages = await self.db.get_messages(session_id, limit=10000)
 
@@ -721,6 +754,48 @@ class AgentEngine:
 
             except Exception as e:
                 logger.error("Failed to memorize session %s: %s", session_id, e)
+
+    async def schedule_memorize(self, session_id: str) -> None:
+        """Schedule memorization of ``session_id`` as a background task.
+
+        Memorization serialises on a single global lock and one pass can
+        take minutes (LLM-based indexing inside memU), so under load the
+        queue wait reaches tens of minutes.  Latency-sensitive callers —
+        cron-run teardown, error recovery, idle sweeps — must not block on
+        it: the messages are already persisted in the DB, so indexing can
+        happen whenever the queue drains.  If the process exits first, the
+        periodic memorization sweep re-indexes anything still uncovered
+        (the watermark is only advanced after a successful pass).
+
+        The session's current ``connected_at`` is frozen here and handed to
+        the task so the covered message window stays stable however the
+        session mutates while the task is queued (see
+        ``_memorize_session``).
+        """
+        if not self._memory_bridge or not self._memory_bridge.available:
+            return
+
+        session = await self.db.get_session(session_id)
+        connected_at = session.get("connected_at") if session else None
+        if not connected_at:
+            return
+
+        task = asyncio.create_task(
+            self._memorize_session(
+                session_id, connected_at_override=connected_at,
+            ),
+        )
+        self._memorize_bg_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._memorize_bg_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.error(
+                    "Background memorization failed for session %s: %s",
+                    session_id, t.exception(),
+                )
+
+        task.add_done_callback(_done)
 
     async def _memorize_incremental(self, session_id: str) -> int:
         """Index only messages newer than last_memorized_at into memU.
@@ -1477,15 +1552,25 @@ class AgentEngine:
 
     async def _discard_client(
         self, session_id: str, clear_resume: bool = False,
+        background_memorize: bool = False,
     ) -> None:
         """Disconnect and remove a client.
 
         Args:
             clear_resume: If True, clear sdk_session_id (e.g., on error).
                          If False, keep it for future resume (e.g., on stop).
+            background_memorize: If True, schedule memorization as a
+                background task instead of awaiting it inline.
+                Memorization queues on a global lock, so awaiting it here
+                blocks the caller for the whole queue wait — for cron runs
+                that kept the run log "running" (and APScheduler skipping
+                subsequent fires) long after the agent turn had finished.
         """
         self._stop_idle_watcher(session_id)
-        await self._memorize_session(session_id)
+        if background_memorize:
+            await self.schedule_memorize(session_id)
+        else:
+            await self._memorize_session(session_id)
         client = self.sessions.remove_client(session_id)
 
         if clear_resume:
@@ -2457,7 +2542,7 @@ class AgentEngine:
                     session_id, cleanup_err,
                 )
             # Memorize in background — don't block the stop path
-            asyncio.create_task(self._memorize_session(session_id))
+            await self.schedule_memorize(session_id)
             return partial
 
         except Exception as e:
@@ -2495,8 +2580,11 @@ class AgentEngine:
                 )
 
             await broadcaster.broadcast_error(session_id, error_msg)
-            # Memorize before discarding client
-            await self._memorize_session(session_id)
+            # Schedule memorization BEFORE mark_error clears connected_at —
+            # the frozen bound keeps coverage intact.  Scheduled, not
+            # awaited: an inline memorize would hold the session lock for
+            # the whole memorize-queue wait, stalling queued user messages.
+            await self.schedule_memorize(session_id)
             # Clear resume — CLI state may be corrupted after error
             self._stop_idle_watcher(session_id)
             unregister_handler(session_id)
@@ -2886,7 +2974,9 @@ class AgentEngine:
                             "Discarding hung client for session %s "
                             "(autonomous turn stalled)", session_id,
                         )
-                        await self._discard_client(session_id)
+                        await self._discard_client(
+                            session_id, background_memorize=True,
+                        )
                         return
                     except asyncio.CancelledError:
                         current = asyncio.current_task()
@@ -2898,7 +2988,9 @@ class AgentEngine:
                             # state is inconsistent — discard, mirroring
                             # run()'s cancel path.
                             await self.sessions.mark_stopped(session_id)
-                            await self._discard_client(session_id)
+                            await self._discard_client(
+                                session_id, background_memorize=True,
+                            )
                             return
                         if not drain.done():
                             drain.cancel()
@@ -2942,7 +3034,10 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            await self._discard_client(session_id)
+            # background_memorize: returning promptly closes the cron run
+            # log and frees APScheduler to fire the next run — memorization
+            # queues on a global lock and must not gate the run lifecycle.
+            await self._discard_client(session_id, background_memorize=True)
 
     async def run_persistent_cron(
         self,
@@ -2969,7 +3064,8 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            await self._discard_client(session_id)
+            # See run_cron: memorization must not gate the run lifecycle.
+            await self._discard_client(session_id, background_memorize=True)
 
     async def run_hook(
         self,
@@ -2992,7 +3088,8 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            await self._discard_client(session_id)
+            # See run_cron: memorization must not gate the run lifecycle.
+            await self._discard_client(session_id, background_memorize=True)
 
     # ------------------------------------------------------------------ #
     #  Idle client sweep                                                   #
@@ -3013,7 +3110,9 @@ class AgentEngine:
         idle_ids = self.sessions.get_idle_client_ids(timeout_minutes * 60)
         for sid in idle_ids:
             logger.info("Auto-closing idle client for session %s", sid)
-            await self._discard_client(sid)
+            # background_memorize: free the claude subprocess now; indexing
+            # follows whenever the memorize queue drains.
+            await self._discard_client(sid, background_memorize=True)
 
         if idle_ids:
             logger.info(

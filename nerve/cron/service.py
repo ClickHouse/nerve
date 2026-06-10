@@ -300,9 +300,13 @@ class CronService:
         if not should_rotate:
             return False
 
-        # Memorize current context before rotation (safety net)
+        # Schedule memorization of the pre-rotation context (safety net).
+        # Scheduled, not awaited: memorization queues on a global lock and
+        # awaiting it would delay the run start by the whole queue wait.
+        # The lower bound is frozen at scheduling time, so clearing
+        # connected_at below cannot shrink the covered window.
         try:
-            await self.engine._memorize_session(session_id)
+            await self.engine.schedule_memorize(session_id)
         except Exception as e:
             logger.warning("Pre-rotation memorize failed for %s: %s", session_id, e)
 

@@ -444,6 +444,43 @@ class TestJobLock:
 
 
 # ---------------------------------------------------------------------------
+# Context rotation — memorization must not block the run lifecycle
+# ---------------------------------------------------------------------------
+
+class TestRotationMemorize:
+    @pytest.mark.asyncio
+    async def test_rotation_schedules_background_memorize(self, cron_service):
+        """Rotation schedules memorization instead of awaiting it inline."""
+        cron_service.db.get_session = AsyncMock(return_value={
+            "connected_at": _hours_ago(30),
+        })
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:pers", rotate_hours=24,
+        )
+
+        assert rotated is True
+        cron_service.engine.schedule_memorize.assert_awaited_once_with(
+            "cron:pers",
+        )
+        cron_service.engine._memorize_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_rotation_no_memorize(self, cron_service):
+        """A session younger than the rotation window is left alone."""
+        cron_service.db.get_session = AsyncMock(return_value={
+            "connected_at": _hours_ago(1),
+        })
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:pers", rotate_hours=24,
+        )
+
+        assert rotated is False
+        cron_service.engine.schedule_memorize.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Run gates — service-level skip/run behaviour
 # ---------------------------------------------------------------------------
 
