@@ -32,15 +32,47 @@ class CronStore:
         )
         await self.db.commit()
 
-    async def get_cron_logs(self, job_id: str | None = None, limit: int = 50) -> list[dict]:
+    async def get_cron_logs(
+        self, job_id: str | None = None, limit: int = 50, offset: int = 0,
+    ) -> list[dict]:
+        # Secondary sort on id keeps pagination stable when several runs
+        # share the same started_at second.
         if job_id:
-            query = "SELECT * FROM cron_logs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?"
-            params = (job_id, limit)
+            query = (
+                "SELECT * FROM cron_logs WHERE job_id = ? "
+                "ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+            )
+            params = (job_id, limit, offset)
         else:
-            query = "SELECT * FROM cron_logs ORDER BY started_at DESC LIMIT ?"
-            params = (limit,)
+            query = (
+                "SELECT * FROM cron_logs "
+                "ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+            )
+            params = (limit, offset)
         async with self.db.execute(query, params) as cursor:
             return [dict(row) async for row in cursor]
+
+    async def count_cron_logs(self, job_id: str | None = None) -> int:
+        if job_id:
+            query = "SELECT COUNT(*) FROM cron_logs WHERE job_id = ?"
+            params: tuple = (job_id,)
+        else:
+            query = "SELECT COUNT(*) FROM cron_logs"
+            params = ()
+        async with self.db.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+    async def get_last_cron_runs_by_job(self) -> dict[str, dict]:
+        """Map job_id -> its most recent cron_logs row (any status)."""
+        async with self.db.execute(
+            """SELECT cl.* FROM cron_logs cl
+               JOIN (
+                   SELECT job_id, MAX(id) AS max_id
+                   FROM cron_logs GROUP BY job_id
+               ) latest ON cl.id = latest.max_id"""
+        ) as cursor:
+            return {row["job_id"]: dict(row) async for row in cursor}
 
     async def get_last_successful_cron_run(self, job_id: str) -> dict | None:
         """Get the most recent successful cron_logs entry for a job."""

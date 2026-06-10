@@ -242,8 +242,9 @@ export const api = {
 
   // Diagnostics
   getDiagnostics: () => request<any>('/diagnostics'),
-  getCronLogs: (jobId?: string, limit = 50) =>
-    request<{ logs: any[] }>(`/cron/logs?job_id=${jobId || ''}&limit=${limit}`),
+  getCronLogs: (jobId?: string, limit = 50, offset = 0) =>
+    request<{ logs: any[]; total: number; limit: number; offset: number }>(
+      `/cron/logs?job_id=${jobId || ''}&limit=${limit}&offset=${offset}`),
 
   // Observability — lightweight status for UI deep-links
   getObservabilityStatus: () =>
