@@ -91,6 +91,21 @@ export function handleWakeup(
   set({ streamingBlocks: blocks, isStreaming: true });
 }
 
+export function handleAutoTurn(
+  _msg: Extract<WSMessage, { type: 'auto_turn' }>,
+  get: Get,
+  set: Set,
+): void {
+  // The CLI started an autonomous turn (e.g. a background task settled
+  // and the agent is reporting the result) — prepend a marker so the
+  // turn renders with a "background continuation" chip.
+  const blocks = [...get().streamingBlocks];
+  if (!blocks.some((b) => b.type === 'auto')) {
+    blocks.unshift({ type: 'auto' });
+  }
+  set({ streamingBlocks: blocks, isStreaming: true, agentStatus: { state: 'thinking' } });
+}
+
 export function handleToolUse(
   msg: Extract<WSMessage, { type: 'tool_use' }>,
   get: Get,

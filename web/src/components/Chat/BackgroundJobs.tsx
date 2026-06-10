@@ -20,6 +20,7 @@ function toolIcon(tool: string) {
 const STATUS_COLORS = {
   running: 'text-hue-emerald',
   done: 'text-text-faint',
+  failed: 'text-hue-red',
   timeout: 'text-hue-amber',
 } as const;
 

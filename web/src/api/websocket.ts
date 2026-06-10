@@ -24,9 +24,10 @@ export type WSMessage =
   | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
   | { type: 'session_running'; session_id: string; is_running: boolean }
   | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
-  | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'timeout' }[] }
+  | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'hoa_progress'; session_id: string; event: Record<string, unknown> }
   | { type: 'wakeup'; session_id: string }
+  | { type: 'auto_turn'; session_id: string }
   | { type: 'pong' };
 
 type MessageHandler = (msg: WSMessage) => void;

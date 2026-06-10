@@ -39,7 +39,13 @@ export interface WakeupBlockData {
   type: 'wakeup';
 }
 
-export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData;
+/** Leading marker on an autonomous turn the CLI ran on its own (e.g. after
+ *  a background task settled) — no user message preceded it. */
+export interface AutoTurnBlockData {
+  type: 'auto';
+}
+
+export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData | AutoTurnBlockData;
 
 export interface ChatMessage {
   id?: number;
