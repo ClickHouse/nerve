@@ -630,21 +630,6 @@ class CronService:
     async def list_jobs(self) -> list[dict]:
         """List all registered jobs (cron + sources) with their next run times."""
         result = []
-        try:
-            last_runs = await self.db.get_last_cron_runs_by_job()
-        except Exception:
-            last_runs = {}
-
-        def _last_run_summary(job_id: str) -> dict | None:
-            run = last_runs.get(job_id)
-            if not run:
-                return None
-            return {
-                "status": run.get("status"),
-                "started_at": run.get("started_at"),
-                "finished_at": run.get("finished_at"),
-            }
-
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
             next_run = sched_job.next_run_time if sched_job else None
@@ -665,7 +650,6 @@ class CronService:
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": last_session_id,
-                "last_run": _last_run_summary(job.id),
             })
 
         # Include source runners
@@ -684,7 +668,6 @@ class CronService:
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": None,
-                "last_run": _last_run_summary(runner.job_id),
             })
 
         return result

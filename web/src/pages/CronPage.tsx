@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { RefreshCw, Loader2 } from 'lucide-react';
 import { useCronStore } from '../stores/cronStore';
 import { CronSidebar } from '../components/Cron/CronSidebar';
-import { JobsOverview } from '../components/Cron/JobsOverview';
 import { JobInfoCard } from '../components/Cron/JobInfoCard';
 import { LogsTable } from '../components/Cron/LogsTable';
 
@@ -41,11 +40,10 @@ export function CronPage() {
         <CronSidebar />
 
         <div className="flex-1 flex flex-col min-w-0">
-          {selectedJob ? <JobInfoCard job={selectedJob} /> : <JobsOverview />}
-          <div className="mt-2 px-4 pt-1 text-[11px] text-text-dim uppercase tracking-wide shrink-0">
-            {selectedJob ? 'Run History' : 'Recent Runs'}
+          {selectedJob && <JobInfoCard job={selectedJob} />}
+          <div className={`flex-1 flex flex-col min-h-0 ${selectedJob ? 'mt-2' : ''}`}>
+            <LogsTable showJobColumn={selectedJobId === null} />
           </div>
-          <LogsTable showJobColumn={selectedJobId === null} />
         </div>
       </div>
     </div>

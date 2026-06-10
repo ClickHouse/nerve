@@ -17,12 +17,6 @@ export interface CronJob {
   next_run: string | null;
   /** Most recently active chat session for this job (cron:{id}[:{run}]). */
   last_session_id?: string | null;
-  /** Most recent run summary, if the job has ever run. */
-  last_run?: {
-    status: string | null;
-    started_at: string | null;
-    finished_at: string | null;
-  } | null;
 }
 
 export interface CronLog {

@@ -63,17 +63,6 @@ class CronStore:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
-    async def get_last_cron_runs_by_job(self) -> dict[str, dict]:
-        """Map job_id -> its most recent cron_logs row (any status)."""
-        async with self.db.execute(
-            """SELECT cl.* FROM cron_logs cl
-               JOIN (
-                   SELECT job_id, MAX(id) AS max_id
-                   FROM cron_logs GROUP BY job_id
-               ) latest ON cl.id = latest.max_id"""
-        ) as cursor:
-            return {row["job_id"]: dict(row) async for row in cursor}
-
     async def get_last_successful_cron_run(self, job_id: str) -> dict | None:
         """Get the most recent successful cron_logs entry for a job."""
         async with self.db.execute(

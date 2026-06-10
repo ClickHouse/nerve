@@ -1366,21 +1366,6 @@ class TestCronLogPagination:
         assert got == sorted(ids, reverse=True)  # newest first, no overlap
         assert len(page3) == 1
 
-    @pytest.mark.asyncio
-    async def test_last_runs_by_job(self, db: Database):
-        a1 = await db.log_cron_start("job-a")
-        await db.log_cron_finish(a1, "error", error="boom")
-        a2 = await db.log_cron_start("job-a")
-        await db.log_cron_finish(a2, "success", output="fine")
-        b1 = await db.log_cron_start("job-b")
-        await db.log_cron_finish(b1, "success", output="ok")
-
-        last = await db.get_last_cron_runs_by_job()
-        assert last["job-a"]["id"] == a2
-        assert last["job-a"]["status"] == "success"
-        assert last["job-b"]["id"] == b1
-
-
 class TestCronLogSessionBackfill:
     """v34 best-effort backfill of cron_logs.session_id."""
 
