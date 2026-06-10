@@ -180,7 +180,9 @@ async def approve_plan(
     if task.get("file_path"):
         task_file = config.workspace / task["file_path"]
         if task_file.exists():
-            task_content = task_file.read_text(encoding="utf-8")
+            task_content = await asyncio.to_thread(
+                task_file.read_text, encoding="utf-8",
+            )
 
     # Build implementation prompt — skill-aware
     if plan_type in ("skill-create", "skill-update"):

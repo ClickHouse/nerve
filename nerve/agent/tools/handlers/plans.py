@@ -246,7 +246,9 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if task.get("file_path") and ctx.config:
         task_file = ctx.config.workspace / task["file_path"]
         if task_file.exists():
-            task_content = task_file.read_text(encoding="utf-8")
+            task_content = await asyncio.to_thread(
+                task_file.read_text, encoding="utf-8",
+            )
 
     if plan_type in ("skill-create", "skill-update"):
         prompt = (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,9 +30,10 @@ class TaskManager:
         count = 0
 
         for directory, status in [(self.active_dir, "pending"), (self.done_dir, "done")]:
-            for md_file in directory.glob("*.md"):
+            md_files = await asyncio.to_thread(lambda d=directory: sorted(d.glob("*.md")))
+            for md_file in md_files:
                 try:
-                    content = md_file.read_text(encoding="utf-8")
+                    content = await asyncio.to_thread(md_file.read_text, encoding="utf-8")
                     title = parse_task_title(content)
                     fields = parse_task_frontmatter(content)
                     task_id = md_file.stem
@@ -68,7 +70,9 @@ class TaskManager:
         task = Task.from_db_row(row)
         file_path = self.workspace / row["file_path"]
         if file_path.exists():
-            task.content = file_path.read_text(encoding="utf-8")
+            task.content = await asyncio.to_thread(
+                file_path.read_text, encoding="utf-8",
+            )
         return task
 
     async def mark_done(self, task_id: str) -> bool:
@@ -80,11 +84,15 @@ class TaskManager:
         src = self.workspace / row["file_path"]
         if src.exists():
             dst = self.done_dir / src.name
-            content = src.read_text(encoding="utf-8")
+            content = await asyncio.to_thread(src.read_text, encoding="utf-8")
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             content += f"\n- {today}: DONE"
-            dst.write_text(content, encoding="utf-8")
-            src.unlink()
+
+            def _move_to_done() -> None:
+                dst.write_text(content, encoding="utf-8")
+                src.unlink()
+
+            await asyncio.to_thread(_move_to_done)
 
             # Update DB
             rel_path = str(dst.relative_to(self.workspace))

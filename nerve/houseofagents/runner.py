@@ -62,57 +62,61 @@ async def _tail_session_jsonl(
 
     logger.info("Tailing inner session %s → %s", inner_session_id, jsonl_path)
 
+    def _read_new(pos: int) -> tuple[str, int]:
+        """Read appended JSONL content from ``pos``.  Sync — runs in a thread."""
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(pos)
+            return f.read(), f.tell()
+
     last_pos = 0
     while True:
         try:
-            stat = jsonl_path.stat()
+            stat = await asyncio.to_thread(jsonl_path.stat)
             if stat.st_size > last_pos:
-                with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(last_pos)
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            msg = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                chunk, last_pos = await asyncio.to_thread(_read_new, last_pos)
+                for line in chunk.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                        # Only forward assistant tool_use entries
-                        if msg.get("type") != "assistant":
+                    # Only forward assistant tool_use entries
+                    if msg.get("type") != "assistant":
+                        continue
+                    content = msg.get("message", {}).get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if block.get("type") != "tool_use":
                             continue
-                        content = msg.get("message", {}).get("content", [])
-                        if not isinstance(content, list):
-                            continue
-                        for block in content:
-                            if block.get("type") != "tool_use":
-                                continue
-                            name = block.get("name", "?")
-                            inp = block.get("input", {})
-                            # Build a concise summary
-                            if name == "Bash":
-                                detail = str(inp.get("command", ""))[:120]
-                            elif name in ("Read", "Write", "Edit"):
-                                detail = str(inp.get("file_path", ""))[:100]
-                            elif name in ("Glob", "Grep"):
-                                detail = str(inp.get("pattern", inp.get("path", "")))[:100]
-                            elif name == "Task":
-                                detail = str(inp.get("description", ""))[:80]
-                            else:
-                                detail = str(inp)[:80]
+                        name = block.get("name", "?")
+                        inp = block.get("input", {})
+                        # Build a concise summary
+                        if name == "Bash":
+                            detail = str(inp.get("command", ""))[:120]
+                        elif name in ("Read", "Write", "Edit"):
+                            detail = str(inp.get("file_path", ""))[:100]
+                        elif name in ("Glob", "Grep"):
+                            detail = str(inp.get("pattern", inp.get("path", "")))[:100]
+                        elif name == "Task":
+                            detail = str(inp.get("description", ""))[:80]
+                        else:
+                            detail = str(inp)[:80]
 
-                            await broadcaster.broadcast(nerve_session_id, {
-                                "type": "hoa_progress",
-                                "session_id": nerve_session_id,
-                                "event": {
-                                    "event": "tool_call",
-                                    "label": block_label,
-                                    "agent": "Claude",
-                                    "tool": name,
-                                    "detail": detail,
-                                },
-                            })
-                    last_pos = f.tell()
+                        await broadcaster.broadcast(nerve_session_id, {
+                            "type": "hoa_progress",
+                            "session_id": nerve_session_id,
+                            "event": {
+                                "event": "tool_call",
+                                "label": block_label,
+                                "agent": "Claude",
+                                "tool": name,
+                                "detail": detail,
+                            },
+                        })
         except FileNotFoundError:
             pass
         except asyncio.CancelledError:

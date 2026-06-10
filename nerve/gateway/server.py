@@ -650,14 +650,17 @@ async def _load_uploaded_files(
             logger.warning("Uploaded file not found on disk: %s", disk_path)
             continue
 
-        data = disk_path.read_bytes()
+        # Multi-MB reads + base64 of uploads are blocking — off the loop.
+        data = await asyncio.to_thread(disk_path.read_bytes)
         file_type = rec["file_type"]
         media_type = rec["media_type"]
         file_id = rec["id"]
         filename = rec["filename"]
 
         if file_type in ("image", "pdf"):
-            b64 = base64.b64encode(data).decode("utf-8")
+            b64 = await asyncio.to_thread(
+                lambda d=data: base64.b64encode(d).decode("utf-8"),
+            )
             images.append({
                 "type": "base64",
                 "media_type": media_type,

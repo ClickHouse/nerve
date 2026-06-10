@@ -4,6 +4,7 @@ skill_run_script, skill_create, skill_update.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -69,11 +70,15 @@ async def skill_get_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
         if skill.has_scripts:
             scripts_dir = ctx.skill_manager.skills_dir / skill_id / "scripts"
-            scripts = sorted(
-                str(f.relative_to(scripts_dir))
-                for f in scripts_dir.rglob("*")
-                if f.is_file()
-            )
+
+            def _list_scripts() -> list[str]:
+                return sorted(
+                    str(f.relative_to(scripts_dir))
+                    for f in scripts_dir.rglob("*")
+                    if f.is_file()
+                )
+
+            scripts = await asyncio.to_thread(_list_scripts)
             if scripts:
                 parts.append(f"\n**Scripts available** (use `skill_run_script` to execute):")
                 for s in scripts:

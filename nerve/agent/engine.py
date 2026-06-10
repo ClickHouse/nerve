@@ -465,7 +465,8 @@ class AgentEngine:
         logger.info("Worker onboarding: starting first-boot setup session")
 
         task_md = self.config.workspace / "TASK.md"
-        task_description = task_md.read_text(encoding="utf-8").strip()
+        raw_task = await asyncio.to_thread(task_md.read_text, encoding="utf-8")
+        task_description = raw_task.strip()
         # Strip the "# Task\n\n" prefix
         if task_description.startswith("# Task\n\n"):
             task_description = task_description[len("# Task\n\n"):]
@@ -644,6 +645,13 @@ class AgentEngine:
                 await self._xmemory_bridge.aclose()
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug("Error closing xmemory bridge: %s", e)
+
+        # Stop the memU bridge's dedicated event-loop thread.
+        if self._memory_bridge is not None:
+            try:
+                await self._memory_bridge.shutdown()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("Error shutting down memU bridge: %s", e)
 
     # ------------------------------------------------------------------ #
     #  Channel router                                                      #
@@ -874,9 +882,10 @@ class AgentEngine:
                     sessions_indexed += 1
 
             # Release memory after the sweep — prevents RSS ratcheting
-            # from intermediate list[float]→numpy conversions and JSON parsing.
+            # from intermediate list[float]→numpy conversions and JSON
+            # parsing.  gc.collect can take 100ms+ — keep it off the loop.
             if self._memory_bridge:
-                self._memory_bridge._release_memory()
+                await asyncio.to_thread(self._memory_bridge._release_memory)
 
             stats = {
                 "sessions_scanned": len(sessions),

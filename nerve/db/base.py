@@ -130,7 +130,9 @@ class Database(
                 try:
                     fp = workspace / row["file_path"]
                     if fp.exists():
-                        content = fp.read_text(encoding="utf-8")
+                        content = await asyncio.to_thread(
+                            fp.read_text, encoding="utf-8",
+                        )
                 except Exception as e:
                     logger.warning("Failed to read %s for FTS reseed: %s", row["file_path"], e)
                 await self.db.execute(

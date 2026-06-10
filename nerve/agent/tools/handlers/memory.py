@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import tempfile
 import time
 from pathlib import Path
 
@@ -266,6 +265,60 @@ async def session_context_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text("\n\n---\n\n".join(parts))
 
 
+def _fetch_history_rows(
+    db_path: str, date: str, end_date: str, limit: int,
+) -> list[dict]:
+    """Query items by happened_at range.  Sync — call via asyncio.to_thread.
+
+    ``date()`` on the column defeats any index, so this is a full scan of
+    memu_memory_items; with 20K+ rows it takes long enough to matter on
+    the event loop.
+    """
+    db = sqlite3.connect(db_path, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute(
+            "SELECT id, memory_type, summary, happened_at FROM memu_memory_items "
+            "WHERE happened_at IS NOT NULL "
+            "AND date(happened_at) >= date(?) AND date(happened_at) <= date(?) "
+            "ORDER BY happened_at DESC "
+            "LIMIT ?",
+            (date, end_date, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        db.close()
+
+
+def _fetch_records_rows(
+    db_path: str, date: str, end_date: str, limit: int, include_updated: bool,
+) -> list[dict]:
+    """Query items by created/updated range.  Sync — call via asyncio.to_thread."""
+    db = sqlite3.connect(db_path, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        if include_updated:
+            query = (
+                "SELECT id, memory_type, summary, created_at, updated_at FROM memu_memory_items "
+                "WHERE (date(created_at) >= date(?) AND date(created_at) <= date(?)) "
+                "   OR (date(updated_at) >= date(?) AND date(updated_at) <= date(?) AND date(updated_at) != date(created_at)) "
+                "ORDER BY created_at DESC "
+                "LIMIT ?"
+            )
+            rows = db.execute(query, (date, end_date, date, end_date, limit)).fetchall()
+        else:
+            query = (
+                "SELECT id, memory_type, summary, created_at, updated_at FROM memu_memory_items "
+                "WHERE date(created_at) >= date(?) AND date(created_at) <= date(?) "
+                "ORDER BY created_at DESC "
+                "LIMIT ?"
+            )
+            rows = db.execute(query, (date, end_date, limit)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        db.close()
+
+
 async def conversation_history_handler(ctx: ToolContext, args: dict) -> ToolResult:
     date = args["date"]
     end_date = args.get("end_date", "") or date
@@ -276,17 +329,9 @@ async def conversation_history_handler(ctx: ToolContext, args: dict) -> ToolResu
 
     try:
         db_path = _resolve_memu_db_path(ctx)
-        db = sqlite3.connect(db_path)
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
-            "SELECT id, memory_type, summary, happened_at FROM memu_memory_items "
-            "WHERE happened_at IS NOT NULL "
-            "AND date(happened_at) >= date(?) AND date(happened_at) <= date(?) "
-            "ORDER BY happened_at DESC "
-            "LIMIT ?",
-            (date, end_date, limit),
-        ).fetchall()
-        db.close()
+        rows = await asyncio.to_thread(
+            _fetch_history_rows, db_path, date, end_date, limit,
+        )
 
         if not rows:
             label = f"{date}" + (f" to {end_date}" if end_date != date else "")
@@ -313,28 +358,10 @@ async def memory_records_by_date_handler(ctx: ToolContext, args: dict) -> ToolRe
 
     try:
         db_path = _resolve_memu_db_path(ctx)
-        db = sqlite3.connect(db_path)
-        db.row_factory = sqlite3.Row
-
-        if include_updated:
-            query = (
-                "SELECT id, memory_type, summary, created_at, updated_at FROM memu_memory_items "
-                "WHERE (date(created_at) >= date(?) AND date(created_at) <= date(?)) "
-                "   OR (date(updated_at) >= date(?) AND date(updated_at) <= date(?) AND date(updated_at) != date(created_at)) "
-                "ORDER BY created_at DESC "
-                "LIMIT ?"
-            )
-            rows = db.execute(query, (date, end_date, date, end_date, limit)).fetchall()
-        else:
-            query = (
-                "SELECT id, memory_type, summary, created_at, updated_at FROM memu_memory_items "
-                "WHERE date(created_at) >= date(?) AND date(created_at) <= date(?) "
-                "ORDER BY created_at DESC "
-                "LIMIT ?"
-            )
-            rows = db.execute(query, (date, end_date, limit)).fetchall()
-
-        db.close()
+        rows = await asyncio.to_thread(
+            _fetch_records_rows, db_path, date, end_date, limit,
+            bool(include_updated),
+        )
 
         if not rows:
             label = f"{date}" + (f" to {end_date}" if end_date != date else "")
@@ -367,9 +394,13 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     memu_err: str | None = None
     try:
         mem_dir = Path("~/.nerve/memu-manual").expanduser()
-        mem_dir.mkdir(parents=True, exist_ok=True)
         mem_path = mem_dir / f"memorize-{int(time.time())}.txt"
-        mem_path.write_text(f"{memory_type}: {content}", encoding="utf-8")
+
+        def _write_memorize_file() -> None:
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            mem_path.write_text(f"{memory_type}: {content}", encoding="utf-8")
+
+        await asyncio.to_thread(_write_memorize_file)
 
         memu_ok = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
     except Exception as e:
