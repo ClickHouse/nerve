@@ -1443,3 +1443,26 @@ class TestCronLogSessionBackfill:
 
         logs = await db.get_cron_logs(job_id="multi")
         assert logs[0]["session_id"] == "cron:multi:20260110-120130"
+
+
+class TestSetCronLogSession:
+    """Linking a run log to its session while the run is in flight."""
+
+    @pytest.mark.asyncio
+    async def test_set_cron_log_session_links_running_row(self, db: Database):
+        log_id = await db.log_cron_start("job-live")
+        await db.set_cron_log_session(log_id, "cron:job-live:20260610-120000")
+
+        logs = await db.get_cron_logs(job_id="job-live")
+        assert logs[0]["session_id"] == "cron:job-live:20260610-120000"
+        assert logs[0]["finished_at"] is None  # still running, already linked
+
+    @pytest.mark.asyncio
+    async def test_finish_keeps_start_link(self, db: Database):
+        """log_cron_finish must not clobber the link set at start."""
+        log_id = await db.log_cron_start("job-live2")
+        await db.set_cron_log_session(log_id, "cron:job-live2:20260610-130000")
+        await db.log_cron_finish(log_id, "success", output="done")
+
+        logs = await db.get_cron_logs(job_id="job-live2")
+        assert logs[0]["session_id"] == "cron:job-live2:20260610-130000"
