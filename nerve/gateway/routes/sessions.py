@@ -280,7 +280,9 @@ async def get_modified_files(session_id: str, user: dict = Depends(require_auth)
         file_path = snap["file_path"]
         # Read current content from disk
         try:
-            current = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            current = await asyncio.to_thread(
+                Path(file_path).read_text, encoding="utf-8", errors="replace",
+            )
         except (FileNotFoundError, OSError):
             current = None
 
@@ -288,7 +290,7 @@ async def get_modified_files(session_id: str, user: dict = Depends(require_auth)
         full_snap = await deps.db.get_file_snapshot(session_id, file_path)
         original = full_snap["original_content"] if full_snap else None
 
-        stats = compute_quick_stats(original, current)
+        stats = await asyncio.to_thread(compute_quick_stats, original, current)
         total_add += stats["additions"]
         total_del += stats["deletions"]
 
@@ -344,14 +346,18 @@ async def get_file_diff(
 
     # Read current file from disk
     try:
-        current = Path(path).read_text(encoding="utf-8", errors="replace")
+        current = await asyncio.to_thread(
+            Path(path).read_text, encoding="utf-8", errors="replace",
+        )
     except (FileNotFoundError, OSError):
         current = None
 
     from nerve.gateway.diff import compute_file_diff
 
     config = get_config()
-    diff = compute_file_diff(
+    # Diffing large files is CPU-bound — off the event loop.
+    diff = await asyncio.to_thread(
+        compute_file_diff,
         original_content=original,
         current_content=current,
         file_path=path,

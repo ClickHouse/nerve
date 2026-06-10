@@ -107,27 +107,30 @@ class ProxyService:
             resp.raise_for_status()
             archive_bytes = resp.content
 
-        # Extract the binary from the tarball.
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            # The binary is named "cli-proxy-api" inside the archive.
-            binary_member = None
-            for member in tar.getmembers():
-                if member.name.endswith("cli-proxy-api") and member.isfile():
-                    binary_member = member
-                    break
+        def _extract_and_install() -> None:
+            """Untar + write the binary (CPU + disk) — off the event loop."""
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                # The binary is named "cli-proxy-api" inside the archive.
+                binary_member = None
+                for member in tar.getmembers():
+                    if member.name.endswith("cli-proxy-api") and member.isfile():
+                        binary_member = member
+                        break
 
-            if binary_member is None:
-                raise RuntimeError("cli-proxy-api binary not found in archive")
+                if binary_member is None:
+                    raise RuntimeError("cli-proxy-api binary not found in archive")
 
-            extracted = tar.extractfile(binary_member)
-            if extracted is None:
-                raise RuntimeError("Failed to extract cli-proxy-api from archive")
+                extracted = tar.extractfile(binary_member)
+                if extracted is None:
+                    raise RuntimeError("Failed to extract cli-proxy-api from archive")
 
-            dest.write_bytes(extracted.read())
+                dest.write_bytes(extracted.read())
 
-        # Make executable.
-        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            # Make executable.
+            dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        await asyncio.to_thread(_extract_and_install)
         logger.info("Installed CLIProxyAPI to %s", dest)
 
     # ------------------------------------------------------------------ #
@@ -161,11 +164,15 @@ class ProxyService:
     async def start(self) -> None:
         """Start the CLIProxyAPI subprocess."""
         binary = await self.ensure_binary()
-        config_path = self._write_proxy_config()
+        config_path = await asyncio.to_thread(self._write_proxy_config)
 
         log_file = self.config.proxy.log_file.expanduser()
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        log_fd = open(log_file, "a")  # noqa: SIM115
+
+        def _open_log():
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            return open(log_file, "a")  # noqa: SIM115
+
+        log_fd = await asyncio.to_thread(_open_log)
 
         self._process = await asyncio.create_subprocess_exec(
             str(binary),

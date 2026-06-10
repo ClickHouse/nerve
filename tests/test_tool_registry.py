@@ -294,3 +294,67 @@ class TestConcurrentSessionIsolation:
 
         # Both session_ids appeared exactly once each, in some order.
         assert sorted(captured) == ["session-A", "session-B"]
+
+
+# ---------------------------------------------------------------------------
+# Date-query helpers for conversation_history / memory_records_by_date
+# (sync functions executed via asyncio.to_thread by the handlers)
+# ---------------------------------------------------------------------------
+
+def _make_items_db(tmp_path):
+    import sqlite3
+
+    db_path = str(tmp_path / "memu.sqlite")
+    db = sqlite3.connect(db_path)
+    db.execute(
+        "CREATE TABLE memu_memory_items ("
+        " id TEXT PRIMARY KEY, memory_type TEXT, summary TEXT,"
+        " happened_at TEXT, created_at TEXT, updated_at TEXT)"
+    )
+    rows = [
+        ("i1", "event", "went hiking", "2026-06-01", "2026-06-02", "2026-06-02"),
+        ("i2", "event", "team meeting", "2026-06-03", "2026-06-03", "2026-06-03"),
+        ("i3", "profile", "likes coffee", None, "2026-06-03", "2026-06-05"),
+        ("i4", "knowledge", "project uses sqlite", None, "2026-05-20", "2026-05-20"),
+    ]
+    db.executemany("INSERT INTO memu_memory_items VALUES (?,?,?,?,?,?)", rows)
+    db.commit()
+    db.close()
+    return db_path
+
+
+class TestHistoryQueryHelpers:
+    def test_fetch_history_rows_filters_by_happened_at(self, tmp_path):
+        from nerve.agent.tools.handlers.memory import _fetch_history_rows
+
+        db_path = _make_items_db(tmp_path)
+        rows = _fetch_history_rows(db_path, "2026-06-01", "2026-06-02", limit=10)
+        assert [r["id"] for r in rows] == ["i1"]
+        rows = _fetch_history_rows(db_path, "2026-06-01", "2026-06-03", limit=10)
+        assert {r["id"] for r in rows} == {"i1", "i2"}
+        # NULL happened_at rows never appear
+        assert all(r["happened_at"] for r in rows)
+
+    def test_fetch_records_rows_created_window(self, tmp_path):
+        from nerve.agent.tools.handlers.memory import _fetch_records_rows
+
+        db_path = _make_items_db(tmp_path)
+        rows = _fetch_records_rows(
+            db_path, "2026-06-02", "2026-06-03", limit=10, include_updated=False,
+        )
+        assert {r["id"] for r in rows} == {"i1", "i2", "i3"}
+
+    def test_fetch_records_rows_include_updated(self, tmp_path):
+        from nerve.agent.tools.handlers.memory import _fetch_records_rows
+
+        db_path = _make_items_db(tmp_path)
+        # i3 was created 06-03 but updated 06-05 — only the updated filter
+        # window catches it on 06-05.
+        rows = _fetch_records_rows(
+            db_path, "2026-06-05", "2026-06-05", limit=10, include_updated=True,
+        )
+        assert {r["id"] for r in rows} == {"i3"}
+        rows = _fetch_records_rows(
+            db_path, "2026-06-05", "2026-06-05", limit=10, include_updated=False,
+        )
+        assert rows == []

@@ -11,6 +11,7 @@ all sessions).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -210,7 +211,9 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
     md_parts.append("\n## Updates\n")
     md_parts.append(f"- {datetime.now(timezone.utc).strftime('%Y-%m-%d')}: Created")
 
-    file_path.write_text("\n".join(md_parts), encoding="utf-8")
+    await asyncio.to_thread(
+        file_path.write_text, "\n".join(md_parts), encoding="utf-8",
+    )
 
     if ctx.db:
         rel_path = str(file_path.relative_to(ctx.workspace)) if ctx.workspace else str(file_path)
@@ -313,7 +316,9 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if ctx.workspace and (note or deadline or raw_tags or new_title):
             file_path = ctx.workspace / task["file_path"]
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
+                content = await asyncio.to_thread(
+                    file_path.read_text, encoding="utf-8",
+                )
                 if new_title:
                     content = re.sub(r"^# .+", f"# {new_title}", content, count=1)
                     await ctx.db.upsert_task(
@@ -349,7 +354,9 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                         )
                         if "**Tags:**" not in content:
                             content = content.replace("\n\n", f"\n**Tags:** {display_tags}\n\n", 1)
-                file_path.write_text(content, encoding="utf-8")
+                await asyncio.to_thread(
+                    file_path.write_text, content, encoding="utf-8",
+                )
 
     return ToolResult.text(f"Task {task_id} updated.")
 
@@ -365,7 +372,9 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if ctx.workspace:
             file_path = ctx.workspace / task["file_path"]
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
+                content = await asyncio.to_thread(
+                    file_path.read_text, encoding="utf-8",
+                )
                 _tasks_read.add(task_id)
                 return ToolResult.text(content)
 
@@ -395,7 +404,7 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text("Workspace not configured.")
 
     file_path = ctx.workspace / task["file_path"]
-    file_path.write_text(new_content, encoding="utf-8")
+    await asyncio.to_thread(file_path.write_text, new_content, encoding="utf-8")
 
     from nerve.tasks.models import (
         parse_task_frontmatter,
@@ -444,7 +453,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if ctx.workspace:
             src = ctx.workspace / task["file_path"]
             if src.exists():
-                content = src.read_text(encoding="utf-8")
+                content = await asyncio.to_thread(src.read_text, encoding="utf-8")
                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 if note:
                     content += f"\n- {today}: DONE — {note}"
@@ -452,8 +461,12 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     content += f"\n- {today}: DONE"
 
                 dst = _done_dir(ctx) / src.name
-                dst.write_text(content, encoding="utf-8")
-                src.unlink()
+
+                def _move_to_done() -> None:
+                    dst.write_text(content, encoding="utf-8")
+                    src.unlink()
+
+                await asyncio.to_thread(_move_to_done)
 
                 rel_path = str(dst.relative_to(ctx.workspace))
                 await ctx.db.upsert_task(

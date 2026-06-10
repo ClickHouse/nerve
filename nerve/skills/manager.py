@@ -113,22 +113,30 @@ class SkillManager:
         Returns all discovered skills. Also removes DB entries for skills
         that no longer exist on the filesystem.
         """
-        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(self.skills_dir.mkdir, parents=True, exist_ok=True)
         discovered: list[SkillMeta] = []
         found_ids: set[str] = set()
 
-        for skill_dir in sorted(self.skills_dir.iterdir()):
-            if not skill_dir.is_dir():
-                continue
-            skill_md = skill_dir / "SKILL.md"
-            if not skill_md.exists():
-                continue
+        def _scan_skill_dirs() -> list[tuple[Path, str]]:
+            """Collect (skill_dir, raw SKILL.md) pairs off the event loop."""
+            out: list[tuple[Path, str]] = []
+            for sdir in sorted(self.skills_dir.iterdir()):
+                if not sdir.is_dir():
+                    continue
+                smd = sdir / "SKILL.md"
+                if not smd.exists():
+                    continue
+                try:
+                    out.append((sdir, smd.read_text(encoding="utf-8")))
+                except OSError as e:
+                    logger.error("Failed to read skill %s: %s", sdir.name, e)
+            return out
 
+        for skill_dir, raw in await asyncio.to_thread(_scan_skill_dirs):
             skill_id = skill_dir.name
             found_ids.add(skill_id)
 
             try:
-                raw = skill_md.read_text(encoding="utf-8")
                 fm, body = _parse_skill_md(raw)
 
                 name = fm.get("name", skill_id)
@@ -216,7 +224,7 @@ class SkillManager:
         if not skill_md.exists():
             return None
 
-        raw = skill_md.read_text(encoding="utf-8")
+        raw = await asyncio.to_thread(skill_md.read_text, encoding="utf-8")
         fm, body = _parse_skill_md(raw)
 
         # Get metadata from cache or DB
@@ -260,11 +268,15 @@ class SkillManager:
         """Create a new skill directory + SKILL.md and index in DB."""
         skill_id = _slugify(name)
         skill_dir = self.skills_dir / skill_id
-        skill_dir.mkdir(parents=True, exist_ok=True)
 
         # Build SKILL.md
         raw = _build_skill_md(name, description, content, version)
-        (skill_dir / "SKILL.md").write_text(raw, encoding="utf-8")
+
+        def _write_skill() -> None:
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(raw, encoding="utf-8")
+
+        await asyncio.to_thread(_write_skill)
 
         # Sync to DB
         await self.db.upsert_skill(
@@ -286,7 +298,7 @@ class SkillManager:
         if not skill_md.exists():
             return None
 
-        skill_md.write_text(content, encoding="utf-8")
+        await asyncio.to_thread(skill_md.write_text, content, encoding="utf-8")
 
         # Re-parse and sync
         fm, body = _parse_skill_md(content)
@@ -315,7 +327,7 @@ class SkillManager:
         """Remove skill directory and DB record."""
         skill_dir = self.skills_dir / skill_id
         if skill_dir.exists():
-            shutil.rmtree(skill_dir)
+            await asyncio.to_thread(shutil.rmtree, skill_dir)
         await self.db.delete_skill_row(skill_id)
         self._cache.pop(skill_id, None)
         return True
@@ -335,7 +347,15 @@ class SkillManager:
         refs_dir = self.skills_dir / skill_id / "references"
         if not refs_dir.is_dir():
             return []
-        return sorted(str(f.relative_to(refs_dir)) for f in refs_dir.rglob("*") if f.is_file())
+
+        def _walk() -> list[str]:
+            return sorted(
+                str(f.relative_to(refs_dir))
+                for f in refs_dir.rglob("*")
+                if f.is_file()
+            )
+
+        return await asyncio.to_thread(_walk)
 
     async def read_reference(self, skill_id: str, rel_path: str) -> str | None:
         """Read a reference file from a skill."""
@@ -347,7 +367,7 @@ class SkillManager:
             return None
         if not ref_file.exists() or not ref_file.is_file():
             return None
-        return ref_file.read_text(encoding="utf-8")
+        return await asyncio.to_thread(ref_file.read_text, encoding="utf-8")
 
     async def run_script(self, skill_id: str, rel_path: str, args: str = "") -> str:
         """Execute a script from a skill's scripts/ directory."""

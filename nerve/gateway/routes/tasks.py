@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -111,7 +113,7 @@ async def get_task(task_id: str, user: dict = Depends(require_auth)):
     file_path = config.workspace / task["file_path"]
     content = ""
     if file_path.exists():
-        content = file_path.read_text(encoding="utf-8")
+        content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
     return {**dict(task), "content": content}
 
 
@@ -128,7 +130,9 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
         config = get_config()
         file_path = config.workspace / task["file_path"]
         if file_path.exists():
-            file_path.write_text(req.content, encoding="utf-8")
+            await asyncio.to_thread(
+                file_path.write_text, req.content, encoding="utf-8",
+            )
             # Re-sync title from markdown to SQLite
             from nerve.tasks.models import parse_task_title, parse_task_frontmatter
             new_title = parse_task_title(req.content)
