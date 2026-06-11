@@ -287,7 +287,3 @@ See [docs/config.md](docs/config.md) for all options.
 ```bash
 pytest tests/ -v
 ```
-
-## License
-
-MIT
