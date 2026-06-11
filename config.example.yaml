@@ -36,7 +36,14 @@ gateway:
 # Channels
 telegram:
   enabled: true
-  dm_policy: pairing             # "open" or "pairing" (require pairing code)
+  # DM authorization:
+  #   pairing — only users in allowed_users may talk to the bot. New users
+  #             authorize with a one-time code: run `nerve pair` on the
+  #             server, then send the bot `/pair <code>`. Paired IDs are
+  #             persisted to config.local.yaml automatically.
+  #   open    — anyone can talk to the bot (dangerous: full agent access).
+  dm_policy: pairing
+  # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
 
 # Quiet hours (local timezone)

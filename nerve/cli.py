@@ -26,12 +26,16 @@ from pathlib import Path
 
 import click
 
-from nerve.config import load_config, set_config
+from nerve.config import (
+    load_config,
+    resolve_config_dir,
+    set_config,
+    write_config_pointer,
+)
 
 # Default PID file location
 PID_DIR = Path("~/.nerve").expanduser()
 PID_FILE = PID_DIR / "nerve.pid"
-CONFIG_DIR_FILE = PID_DIR / "config_dir"
 LOG_FILE = PID_DIR / "nerve.log"
 
 
@@ -74,15 +78,7 @@ def _write_pid(pid: int, config_dir: Path | None = None) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(pid))
     if config_dir is not None:
-        CONFIG_DIR_FILE.write_text(str(config_dir.resolve()))
-
-
-def _read_config_dir() -> Path | None:
-    """Read stored config directory. Returns None if not available."""
-    try:
-        return Path(CONFIG_DIR_FILE.read_text().strip())
-    except (FileNotFoundError, ValueError):
-        return None
+        write_config_pointer(config_dir)
 
 
 def _remove_pid() -> None:
@@ -169,17 +165,27 @@ def _docker_compose(
 
 
 @click.group()
-@click.option("--config-dir", "-c", type=click.Path(), default=".", help="Config directory")
+@click.option(
+    "--config-dir", "-c", type=click.Path(), default=None,
+    help="Config directory (default: auto-detected — see `nerve doctor`)",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
 @click.pass_context
-def main(ctx: click.Context, config_dir: str, verbose: bool) -> None:
+def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     """Nerve — Personal AI Assistant"""
     setup_logging(verbose)
-    config = load_config(Path(config_dir))
+    # Resolve the config directory via the waterfall (flag → env → cwd →
+    # pointer file) so commands work from any directory, not just the
+    # install dir.
+    resolved_dir, config_source = resolve_config_dir(config_dir)
+    if not resolved_dir.is_absolute():
+        resolved_dir = resolved_dir.resolve()
+    config = load_config(resolved_dir)
     set_config(config)
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
-    ctx.obj["config_dir"] = config_dir
+    ctx.obj["config_dir"] = str(resolved_dir)
+    ctx.obj["config_source"] = config_source
     ctx.obj["verbose"] = verbose
 
 
@@ -209,6 +215,10 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     else:
         wizard = SetupWizard(config_dir, inside_docker=inside_docker)
         wizard.run()
+
+    # Remember where the config lives so every future `nerve` command
+    # finds it regardless of the caller's working directory.
+    write_config_pointer(config_dir)
 
     # Reload config after wizard writes files
     config = load_config(config_dir)
@@ -357,13 +367,9 @@ def restart(ctx: click.Context) -> None:
     helper runs in its own session and survives the parent's death.
     """
     config = ctx.obj["config"]
+    # Already resolved via the waterfall (flag → env → cwd → pointer), so
+    # this is an absolute path that doesn't depend on the caller's CWD.
     config_dir = Path(ctx.obj["config_dir"])
-
-    # Prefer the config dir stored by the running daemon — it's an absolute
-    # path that doesn't depend on the caller's CWD.
-    stored = _read_config_dir()
-    if stored is not None and stored.is_dir():
-        config_dir = stored
 
     # Docker mode: proxy to docker compose
     if _is_docker_mode(config):
@@ -654,11 +660,44 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
     click.echo("  nerve restart")
 
 
-def doctor_report(config) -> str:
+_CONFIG_SOURCE_LABELS = {
+    "flag": "--config-dir flag",
+    "env": "NERVE_CONFIG_DIR env var",
+    "cwd": "current directory",
+    "pointer": "~/.nerve/config_dir pointer",
+    "default": "current directory (no config found anywhere)",
+}
+
+
+def _check_api_connectivity(config) -> tuple[bool, str]:
+    """Make a 1-token API call through the configured provider.
+
+    Catches bad API keys, missing Bedrock model access, and wrong
+    inference-profile prefixes — at diagnosis time instead of first message.
+    """
+    model = config.agent.title_model
+    try:
+        client = config.create_anthropic_client(timeout=15.0)
+        client.messages.create(
+            model=model,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return True, f"model {model} reachable"
+    except Exception as e:
+        detail = str(e)
+        if len(detail) > 200:
+            detail = detail[:200] + "…"
+        return False, f"{model}: {detail}"
+
+
+def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
     Used by both the CLI ``nerve doctor`` command and the Telegram ``/doctor``
-    command so they share the same diagnostics.
+    command so they share the same diagnostics. ``check_api`` makes a real
+    (1-token) API call through the configured provider — enabled for the CLI,
+    skipped for the in-daemon Telegram handler to avoid blocking the loop.
     """
     lines: list[str] = []
     errors: list[str] = []
@@ -666,6 +705,41 @@ def doctor_report(config) -> str:
 
     lines.append("Nerve Doctor")
     lines.append("=" * 40)
+
+    # Where the config came from — surfaces CWD mixups immediately
+    config_dir = getattr(config, "config_dir", None)
+    if config_dir is not None:
+        source_label = _CONFIG_SOURCE_LABELS.get(config_source, config_source)
+        suffix = f" (via {source_label})" if source_label else ""
+        has_base = (Path(config_dir) / "config.yaml").exists()
+        has_local = (Path(config_dir) / "config.local.yaml").exists()
+        if has_base or has_local:
+            present = " + ".join(
+                n for n, ok in (
+                    ("config.yaml", has_base), ("config.local.yaml", has_local),
+                ) if ok
+            )
+            lines.append(f"[OK] Config: {config_dir} ({present}){suffix}")
+        else:
+            errors.append(
+                f"[ERR] No config files in {config_dir}{suffix} — "
+                "run 'nerve init', or point at an existing install with "
+                "-c/--config-dir or NERVE_CONFIG_DIR"
+            )
+
+    # Unknown / misspelled config keys
+    try:
+        from nerve.config import _deep_merge, validate_config_keys
+        merged: dict = {}
+        for name in ("config.yaml", "config.local.yaml"):
+            p = Path(config_dir or ".") / name
+            if p.exists():
+                import yaml as _yaml
+                merged = _deep_merge(merged, _yaml.safe_load(p.read_text()) or {})
+        for w in validate_config_keys(merged):
+            warnings.append(f"[WARN] config: {w}")
+    except Exception:
+        pass
 
     # Daemon status
     running, pid = _get_daemon_status()
@@ -717,8 +791,25 @@ def doctor_report(config) -> str:
         except Exception:
             warnings.append("[WARN] Proxy not running (starts with Nerve)")
 
-    # Check API keys
-    if config.proxy.enabled:
+    # Check API keys / provider
+    if config.provider.is_bedrock:
+        region = config.provider.aws_region or "(default)"
+        lines.append(f"[OK] Provider: AWS Bedrock, region {region}")
+        # Inference-profile prefix must match the region's geography
+        # (us./eu./apac.) — a mismatch means instant 400s.
+        from nerve.bootstrap import bedrock_geo_prefix
+        expected = bedrock_geo_prefix(config.provider.aws_region)
+        for label, model in (
+            ("agent.model", config.agent.model),
+            ("agent.cron_model", config.agent.cron_model),
+        ):
+            geo = model.split(".", 1)[0] if "." in model else ""
+            if geo in ("us", "eu", "apac", "global") and geo not in (expected, "global"):
+                warnings.append(
+                    f"[WARN] {label} '{model}' uses the '{geo}.' inference profile "
+                    f"but region {region} is '{expected}.' — expect 400 errors"
+                )
+    elif config.proxy.enabled:
         if config.anthropic_api_key:
             lines.append("[--] Anthropic API key set (proxy takes precedence)")
         else:
@@ -727,6 +818,14 @@ def doctor_report(config) -> str:
         lines.append(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
     else:
         errors.append("[ERR] Anthropic API key not set and proxy not enabled (config.local.yaml)")
+
+    # Live connectivity probe (CLI only — see check_api docstring note)
+    if check_api and (config.provider.is_bedrock or config.anthropic_api_key):
+        ok, detail = _check_api_connectivity(config)
+        if ok:
+            lines.append(f"[OK] Claude API: {detail}")
+        else:
+            errors.append(f"[ERR] Claude API: {detail}")
 
     if config.openai_api_key:
         lines.append(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]} (vector embeddings enabled)")
@@ -737,6 +836,17 @@ def doctor_report(config) -> str:
     if config.telegram.enabled:
         if config.telegram.bot_token:
             lines.append(f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}")
+            if config.telegram.dm_policy == "open":
+                warnings.append(
+                    "[WARN] telegram.dm_policy is 'open' — any Telegram user "
+                    "can talk to this bot"
+                )
+            elif not config.telegram.allowed_users:
+                warnings.append(
+                    "[WARN] telegram.allowed_users is empty — the bot rejects "
+                    "all DMs until you pair (run 'nerve pair', then send the "
+                    "bot /pair <code>)"
+                )
         else:
             errors.append("[ERR] Telegram enabled but bot_token not set")
     else:
@@ -829,10 +939,59 @@ def doctor_report(config) -> str:
 def doctor(ctx: click.Context) -> None:
     """Check config, DB, API keys, and connectivity."""
     config = ctx.obj["config"]
-    report = doctor_report(config)
+    report = doctor_report(
+        config,
+        config_source=ctx.obj.get("config_source", ""),
+        check_api=True,
+    )
     click.echo(report)
     if "[ERR]" in report:
         ctx.exit(1)
+
+
+@main.command()
+@click.pass_context
+def pair(ctx: click.Context) -> None:
+    """Generate a Telegram pairing code.
+
+    Send /pair <code> to your bot within an hour to authorize your
+    Telegram account. The paired user ID is persisted to
+    config.local.yaml (telegram.allowed_users).
+    """
+    config = ctx.obj["config"]
+
+    if not config.telegram.enabled or not config.telegram.bot_token:
+        click.echo("Telegram is not configured (telegram.bot_token missing).")
+        click.echo("Set it up in config.local.yaml, or re-run 'nerve init'.")
+        ctx.exit(1)
+        return
+
+    if config.telegram.dm_policy != "pairing":
+        click.echo(
+            f"telegram.dm_policy is '{config.telegram.dm_policy}' — pairing is "
+            "only used with dm_policy: pairing."
+        )
+        ctx.exit(1)
+        return
+
+    from nerve.pairing import CODE_TTL_SECONDS, generate_pairing_code
+
+    code = generate_pairing_code()
+    running, _pid = _get_daemon_status()
+
+    click.echo()
+    click.secho(f"  Pairing code: {code}", bold=True)
+    click.echo()
+    click.echo(f"  Send this to your bot:  /pair {code}")
+    click.echo(f"  Valid for {CODE_TTL_SECONDS // 60} minutes, single use.")
+    if not running:
+        click.echo()
+        click.secho(
+            "  Note: Nerve is not running — start it first ('nerve start'), "
+            "then send the command.",
+            fg="yellow",
+        )
+    click.echo()
 
 
 @main.command()

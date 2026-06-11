@@ -244,6 +244,8 @@ class TelegramChannel(BaseChannel):
             collections.OrderedDict()
         )
         self._message_cache_max = 200
+        # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
+        self._unauth_reply_times: dict[int, float] = {}
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
@@ -300,6 +302,7 @@ class TelegramChannel(BaseChannel):
 
         # Register handlers
         app.add_handler(CommandHandler("start", self._handle_start))
+        app.add_handler(CommandHandler("pair", self._handle_pair))
         app.add_handler(CommandHandler("session", self._handle_session))
         app.add_handler(CommandHandler("sessions", self._handle_sessions))
         app.add_handler(CommandHandler("new", self._handle_new_session))
@@ -341,10 +344,38 @@ class TelegramChannel(BaseChannel):
         self._last_update_time = time.monotonic()
         logger.info("Telegram bot started polling (with TCP keepalive)")
 
+        self._announce_auth_state()
+
         # Launch watchdog for monitoring + recovery
         self._watchdog_task = asyncio.create_task(
             self._run_watchdog(), name="telegram-polling-watchdog",
         )
+
+    def _announce_auth_state(self) -> None:
+        """Log how DM authorization is configured — loudly when it matters.
+
+        A fresh install with an empty allowlist used to be silently dead:
+        the bot polled fine but rejected every DM with only a log line.
+        Now pairing mode generates a code and tells the operator what to do.
+        """
+        tg = self.config.telegram
+        if tg.dm_policy == "open":
+            logger.warning(
+                "telegram.dm_policy is 'open' — ANY Telegram user can talk to "
+                "this bot and use the agent. Set dm_policy: pairing unless you "
+                "really want this."
+            )
+            return
+        if not self._allowed_users:
+            from nerve import pairing
+
+            code = pairing.get_or_create_pairing_code()
+            logger.info(
+                "Telegram: no allowed_users configured — pairing mode active. "
+                "Send the bot:  /pair %s  to authorize your account "
+                "(code valid for 1h; run `nerve pair` to get a fresh one).",
+                code,
+            )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -672,12 +703,33 @@ class TelegramChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def _is_authorized(self, user_id: int) -> bool:
-        """Check if a user is in the allowed_users whitelist."""
+        """Check if a user may talk to the bot.
+
+        dm_policy "open" authorizes everyone (a startup warning is logged).
+        Otherwise the allowed_users allowlist applies; an empty allowlist
+        blocks everyone (fail closed) until a user pairs via /pair.
+        """
+        if self.config.telegram.dm_policy == "open":
+            return True
         if not self._allowed_users:
             # No whitelist configured — block everyone (fail closed)
             logger.warning("No allowed_users configured — rejecting user %d", user_id)
             return False
         return user_id in self._allowed_users
+
+    def _should_reply_unauthorized(self, user_id: int) -> bool:
+        """Rate-limit replies to unauthorized users (once per 10 min each)."""
+        now = time.monotonic()
+        if now - self._unauth_reply_times.get(user_id, 0.0) < 600:
+            return False
+        self._unauth_reply_times[user_id] = now
+        # Bound the dict so strangers can't grow it unboundedly
+        if len(self._unauth_reply_times) > 500:
+            for uid, _ in sorted(
+                self._unauth_reply_times.items(), key=lambda kv: kv[1],
+            )[:250]:
+                self._unauth_reply_times.pop(uid, None)
+        return True
 
     # ------------------------------------------------------------------ #
     #  Command handlers — delegate to router for session management        #
@@ -693,9 +745,73 @@ class TelegramChannel(BaseChannel):
         user_id = update.effective_user.id
         if not self._is_authorized(user_id):
             logger.warning("Unauthorized /start from user %d", user_id)
+            # In pairing mode, tell the user how to pair instead of going
+            # silent — surfacing their ID is the single most useful hint.
+            if (
+                self.config.telegram.dm_policy == "pairing"
+                and self._should_reply_unauthorized(user_id)
+            ):
+                await update.message.reply_text(
+                    "This Nerve instance isn't paired with your account.\n"
+                    f"Your Telegram ID: {user_id}\n\n"
+                    "To pair, run `nerve pair` on the server, then send me:\n"
+                    "/pair <code>"
+                )
             return
         await update.message.reply_text(
             "Connected to Nerve. Send me a message to start chatting."
+        )
+
+    async def _handle_pair(self, update: Update, context: Any) -> None:
+        """Handle /pair <code> — authorize a user via a one-time pairing code."""
+        self._touch()
+        user_id = update.effective_user.id
+
+        if self._is_authorized(user_id):
+            await update.message.reply_text("Already paired — you're authorized.")
+            return
+
+        if self.config.telegram.dm_policy != "pairing":
+            logger.warning("Ignoring /pair from user %d (dm_policy != pairing)", user_id)
+            return
+
+        from nerve import pairing
+        from nerve.config import append_telegram_allowed_user
+
+        args = getattr(context, "args", None) or []
+        code = args[0].strip() if args else ""
+        if not code:
+            if self._should_reply_unauthorized(user_id):
+                await update.message.reply_text(
+                    "Usage: /pair <code>\n"
+                    "Get the code by running `nerve pair` on the server."
+                )
+            return
+
+        if not pairing.verify_pairing_code(code):
+            logger.warning("Failed /pair attempt from user %d", user_id)
+            if self._should_reply_unauthorized(user_id):
+                await update.message.reply_text(
+                    "Invalid or expired code. Run `nerve pair` on the server "
+                    "to get a fresh one."
+                )
+            return
+
+        # Success: authorize in memory and persist to config.local.yaml
+        self._allowed_users.add(user_id)
+        try:
+            append_telegram_allowed_user(self.config.config_dir, user_id)
+        except Exception:
+            logger.exception("Paired user %d but failed to persist to config", user_id)
+            await update.message.reply_text(
+                "Paired for this run, but saving to config failed — check "
+                "server logs. Add your ID to telegram.allowed_users manually "
+                "to make it permanent."
+            )
+            return
+        logger.info("Telegram user %d paired successfully", user_id)
+        await update.message.reply_text(
+            "✓ Paired. You're now authorized — send me a message to start chatting."
         )
         logger.info("Telegram user authorized: %d", user_id)
 
