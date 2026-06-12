@@ -128,6 +128,55 @@ class TestChannelMapping:
         sid2 = await sm.get_active_session("telegram:222", source="telegram")
         assert sid1 != sid2
 
+    async def test_auto_session_reused_when_active_despite_old_timestamp(
+        self, sm: SessionManager, db: Database,
+    ):
+        """An active session keeps the channel even if last_activity_at is stale.
+
+        A hung turn never reaches mark_active() at engine.run's end, so
+        last_activity_at freezes at turn-start. Without the active-status
+        carve-out in _is_within_sticky_period, a hang lasting longer than
+        sticky_period_minutes would orphan the session and route the
+        user's follow-up message into a fresh, empty one.
+        """
+        sid1 = await sm.get_active_session("telegram:333", source="telegram")
+        # Mark active and back-date timestamps to look like a hung turn that
+        # started long before the sticky-period cutoff.
+        await sm.mark_active(sid1, sdk_session_id="sdk-stuck")
+        await db.update_session_fields(sid1, {
+            "last_activity_at": "2020-01-01T00:00:00+00:00",
+        })
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = ?",
+            (sid1,),
+        )
+        await db.db.commit()
+        sid2 = await sm.get_active_session("telegram:333", source="telegram")
+        assert sid1 == sid2
+
+    async def test_auto_session_rotated_when_idle_after_sticky_period(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Idle sessions still roll over after the sticky period.
+
+        Once a hung session has been recovered (status flipped to idle by
+        the engine's exception path), the time-based cutoff applies again
+        and a new follow-up message mints a fresh session.
+        """
+        sid1 = await sm.get_active_session("telegram:444", source="telegram")
+        await sm.mark_active(sid1, sdk_session_id="sdk-x")
+        await sm.mark_idle(sid1)
+        await db.update_session_fields(sid1, {
+            "last_activity_at": "2020-01-01T00:00:00+00:00",
+        })
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = ?",
+            (sid1,),
+        )
+        await db.db.commit()
+        sid2 = await sm.get_active_session("telegram:444", source="telegram")
+        assert sid1 != sid2
+
     async def test_set_and_get_active_session(self, sm: SessionManager, db: Database):
         await sm.get_or_create("ch-1")
         await sm.set_active_session("telegram:123", "ch-1")
