@@ -5,6 +5,22 @@ Nerve uses two YAML config files:
 - `config.local.yaml` — Secrets and personal overrides (gitignored)
 
 Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
+Unknown keys are ignored but logged as warnings at startup (and shown by
+`nerve doctor`) so typos don't fail silently.
+
+## Config Directory Resolution
+
+`nerve` commands locate the config directory via a waterfall, so they work
+from any working directory:
+
+1. `--config-dir` / `-c` flag
+2. `NERVE_CONFIG_DIR` environment variable
+3. The current directory, if it contains `config.yaml` or `config.local.yaml`
+4. The pointer file `~/.nerve/config_dir` (written by `nerve init` and on
+   daemon start)
+5. The current directory (fresh-install fallback)
+
+`nerve doctor` reports which directory was used and how it was found.
 
 ## Core
 
@@ -42,8 +58,26 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 |-----|------|---------|-------------|
 | `telegram.enabled` | bool | `true` | Enable Telegram bot |
 | `telegram.bot_token` | string | - | Bot token from @BotFather |
-| `telegram.dm_policy` | string | `pairing` | `open` or `pairing` |
+| `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
+| `telegram.allowed_users` | list[int] | `[]` | Telegram user IDs allowed to DM the bot |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
+
+### Pairing
+
+With `dm_policy: pairing` (the default), the bot only talks to users in
+`allowed_users` and rejects everyone else. To authorize a user without
+editing config files:
+
+1. Run `nerve pair` on the server — it prints a one-time 6-digit code
+   (valid 1 hour). On a fresh install with no `allowed_users`, a code is
+   also generated automatically at startup and printed to the log.
+2. Send the bot `/pair <code>` from the Telegram account to authorize.
+3. The user ID is appended to `telegram.allowed_users` in
+   `config.local.yaml` and takes effect immediately.
+
+An unauthorized `/start` gets a reply with the sender's numeric ID and
+pairing instructions (rate-limited); all other messages from unauthorized
+users are ignored.
 
 ## Quiet Hours
 

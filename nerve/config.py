@@ -135,14 +135,30 @@ class TelegramConfig:
     bot_token: str = ""
     allowed_users: list[int] = field(default_factory=list)
     stream_mode: str = "partial"
+    # DM authorization policy:
+    #   "pairing" (default) — unknown users may pair with a one-time code
+    #                         (`nerve pair`); everyone else is rejected.
+    #   "open"              — anyone can talk to the bot. Dangerous: full
+    #                         agent access for any Telegram user. A warning
+    #                         is logged at startup.
+    dm_policy: str = "pairing"
 
     @classmethod
     def from_dict(cls, d: dict) -> TelegramConfig:
+        dm_policy = d.get("dm_policy", "pairing")
+        if dm_policy not in ("pairing", "open"):
+            logger.warning(
+                "telegram.dm_policy %r is not one of ('pairing', 'open') — "
+                "falling back to 'pairing'",
+                dm_policy,
+            )
+            dm_policy = "pairing"
         return cls(
             enabled=d.get("enabled", True),
             bot_token=d.get("bot_token", ""),
-            allowed_users=d.get("allowed_users", []),
+            allowed_users=[int(u) for u in d.get("allowed_users", []) or []],
             stream_mode=d.get("stream_mode", "partial"),
+            dm_policy=dm_policy,
         )
 
 
@@ -889,6 +905,11 @@ class NerveConfig:
     openai_api_key: str = ""
     brave_search_api_key: str = ""
 
+    # Where this config was loaded from (set by load_config, not a YAML key).
+    # Used by anything that needs to write back (e.g. Telegram pairing
+    # persisting allowed_users to config.local.yaml).
+    config_dir: Path = field(default_factory=Path.cwd)
+
     @property
     def anthropic_api_base_url(self) -> str:
         """Effective Anthropic API base URL — proxy or direct."""
@@ -1028,13 +1049,93 @@ def load_mcp_servers(config_dir: Path | None = None) -> list[McpServerConfig]:
     return _parse_mcp_servers(merged)
 
 
+# --- Config directory resolution ---
+#
+# Nerve commands used to be CWD-sensitive: running `nerve start` from any
+# directory other than the install dir silently loaded an empty config and
+# reported "fresh install".  Resolution now follows a waterfall so commands
+# work from anywhere:
+#
+#   1. Explicit --config-dir / -c flag
+#   2. NERVE_CONFIG_DIR environment variable
+#   3. Current directory, if it contains config.yaml or config.local.yaml
+#      (preserves the dev workflow of running nerve from a checkout)
+#   4. The pointer file ~/.nerve/config_dir (written by `nerve init` and on
+#      daemon start), if it names a directory that still has config files
+#   5. Current directory (fresh-install fallback)
+
+CONFIG_POINTER_FILE = Path("~/.nerve/config_dir")
+
+
+def _has_config_files(directory: Path) -> bool:
+    """True if the directory contains config.yaml or config.local.yaml."""
+    try:
+        return (directory / "config.yaml").exists() or (
+            directory / "config.local.yaml"
+        ).exists()
+    except OSError:
+        return False
+
+
+def read_config_pointer() -> Path | None:
+    """Read the persisted config directory pointer. None if absent/invalid."""
+    try:
+        raw = CONFIG_POINTER_FILE.expanduser().read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_dir() else None
+
+
+def write_config_pointer(config_dir: Path) -> None:
+    """Persist the config directory so future commands find it from any CWD.
+
+    Written by `nerve init` (after a successful apply) and on daemon start.
+    Best-effort: failure to write must never break the caller.
+    """
+    try:
+        pointer = CONFIG_POINTER_FILE.expanduser()
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not write config pointer %s: %s", CONFIG_POINTER_FILE, e)
+
+
+def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:
+    """Resolve the effective config directory.
+
+    Returns (directory, source) where source is one of:
+    "flag", "env", "cwd", "pointer", "default".
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser(), "flag"
+
+    env_dir = os.environ.get("NERVE_CONFIG_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser(), "env"
+
+    cwd = Path.cwd()
+    if _has_config_files(cwd):
+        return cwd, "cwd"
+
+    pointer = read_config_pointer()
+    if pointer is not None and _has_config_files(pointer):
+        return pointer, "pointer"
+
+    return cwd, "default"
+
+
 def load_config(config_dir: Path | None = None) -> NerveConfig:
     """Load config from config.yaml + config.local.yaml in the given directory.
 
-    If config_dir is None, uses the current working directory.
+    If config_dir is None, the directory is resolved via the waterfall in
+    :func:`resolve_config_dir` (flag/env/cwd/pointer), so commands behave the
+    same regardless of the caller's working directory.
     """
     if config_dir is None:
-        config_dir = Path.cwd()
+        config_dir, _source = resolve_config_dir()
 
     base_path = config_dir / "config.yaml"
     local_path = config_dir / "config.local.yaml"
@@ -1050,7 +1151,118 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
             local = yaml.safe_load(f) or {}
 
     merged = _deep_merge(base, local)
-    return NerveConfig.from_dict(merged)
+
+    # Surface typos and stale keys instead of silently ignoring them.
+    for warning in validate_config_keys(merged):
+        logger.warning("config: %s", warning)
+
+    config = NerveConfig.from_dict(merged)
+    config.config_dir = Path(config_dir)
+    return config
+
+
+# --- Unknown-key validation ---
+
+# YAML keys that are intentionally not dataclass fields — keyed by dotted
+# prefix ("" is the top level). claude_oauth_token / github_token are read
+# from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+_EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
+    "": {"claude_oauth_token", "github_token"},
+}
+
+# Subtrees we don't descend into: free-form mappings or lists of mappings
+# whose schema isn't a nested dataclass.
+_OPAQUE_PREFIXES = {
+    "mcp_servers",
+    "memory.categories",
+    "external_agents.targets",
+    "docker.extra_mounts",
+    "langfuse.redact_patterns",
+}
+
+
+def validate_config_keys(merged: dict) -> list[str]:
+    """Compare a merged config dict against the NerveConfig dataclass tree.
+
+    Returns human-readable warnings for keys that no dataclass field will
+    ever read (typos, removed options). Warning-only by design — unknown
+    keys must not break startup (forward/backward compatibility).
+    """
+    import dataclasses
+
+    warnings: list[str] = []
+
+    def _walk(d: dict, cls: type, prefix: str) -> None:
+        field_map = {f.name: f for f in dataclasses.fields(cls)}
+        allowed_extra = _EXTRA_ALLOWED_KEYS.get(prefix, set())
+        for key, value in d.items():
+            dotted = f"{prefix}.{key}" if prefix else key
+            if key not in field_map:
+                if key in allowed_extra:
+                    continue
+                warnings.append(
+                    f"unknown key '{dotted}' — it is ignored (typo or removed option?)"
+                )
+                continue
+            if dotted in _OPAQUE_PREFIXES:
+                continue
+            # Descend into nested dataclasses only
+            ftype = field_map[key].type
+            nested = _resolve_dataclass(ftype)
+            if nested is not None and isinstance(value, dict):
+                _walk(value, nested, dotted)
+
+    def _resolve_dataclass(ftype: Any) -> type | None:
+        """Map a (possibly string) field annotation to a dataclass type."""
+        if isinstance(ftype, type) and dataclasses.is_dataclass(ftype):
+            return ftype
+        if isinstance(ftype, str):
+            candidate = globals().get(ftype)
+            if candidate is None and ftype == "HouseOfAgentsConfig":
+                candidate = HouseOfAgentsConfig
+            if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
+                return candidate
+        return None
+
+    _walk(merged, NerveConfig, "")
+    return warnings
+
+
+# --- Write-back helpers ---
+
+
+def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
+    """Append a Telegram user ID to telegram.allowed_users in config.local.yaml.
+
+    Used by the pairing flow. Reads, merges, and rewrites the local config
+    (config.local.yaml is generated — comment loss is acceptable there).
+    Returns True if the file was updated (False if the ID was already present).
+    """
+    local_path = Path(config_dir) / "config.local.yaml"
+    data: dict[str, Any] = {}
+    if local_path.exists():
+        try:
+            data = yaml.safe_load(local_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as e:
+            logger.error("Cannot parse %s to persist pairing: %s", local_path, e)
+            return False
+
+    telegram = data.setdefault("telegram", {})
+    users = telegram.setdefault("allowed_users", [])
+    if user_id in users:
+        return False
+    users.append(user_id)
+
+    with open(local_path, "w", encoding="utf-8") as f:
+        f.write("# Nerve — Secrets (gitignored)\n")
+        f.write("# API keys, tokens, and other sensitive configuration.\n\n")
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    try:
+        os.chmod(local_path, 0o600)
+    except OSError:
+        pass
+    logger.info("Persisted Telegram user %d to %s", user_id, local_path)
+    return True
 
 
 # Singleton config instance, loaded lazily

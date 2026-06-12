@@ -190,6 +190,9 @@ class SetupChoices:
     timezone: str = "America/New_York"
     user_name: str = ""
     telegram_bot_token: str = ""
+    # Telegram user IDs authorized to DM the bot. Empty = pair after setup
+    # via `nerve pair` + /pair <code>.
+    telegram_allowed_users: list[int] = field(default_factory=list)
     password: str = ""  # plaintext during wizard, hashed at write time
     enabled_crons: list[str] = field(default_factory=list)
     # sync sources
@@ -352,6 +355,124 @@ def _resolve_gh_token() -> tuple[str, str]:
     return ("", "none")
 
 
+# --- Bedrock helpers ---
+
+
+def bedrock_geo_prefix(region: str) -> str:
+    """Map an AWS region to its Bedrock cross-region inference-profile prefix.
+
+    Bedrock inference profiles are geography-scoped: ``us.``, ``eu.`` and
+    ``apac.``. Writing a ``us.`` model ID for an ``eu-*`` region yields an
+    instant 400 ("The provided model identifier is invalid").
+    """
+    region = (region or "").lower()
+    if region.startswith("eu-"):
+        return "eu"
+    if region.startswith(("ap-", "au-")):
+        return "apac"
+    # us-*, ca-*, sa-*, mx-* and unknown regions route via the US profile
+    return "us"
+
+
+# --- Credential validators (used by the wizard and preflight) ---
+
+
+def _telegram_get_me(token: str, timeout: float = 7.0) -> tuple[bool, str]:
+    """Validate a Telegram bot token via getMe.
+
+    Returns (True, bot_username) or (False, error_description).
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(
+            f"https://api.telegram.org/bot{token}/getMe", timeout=timeout,
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("ok"):
+            return (True, data.get("result", {}).get("username", "") or "bot")
+        return (False, data.get("description", f"HTTP {resp.status_code}"))
+    except Exception as e:
+        return (False, str(e))
+
+
+def _check_openai_key(key: str, timeout: float = 7.0) -> tuple[bool, str]:
+    """Validate an OpenAI API key with a models list call."""
+    import httpx
+
+    try:
+        resp = httpx.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            return (True, "key valid")
+        detail = f"HTTP {resp.status_code}"
+        try:
+            detail = resp.json().get("error", {}).get("message", detail)
+        except Exception:
+            pass
+        return (False, detail)
+    except Exception as e:
+        return (False, str(e))
+
+
+# --- Wizard progress persistence ---
+#
+# The wizard collects ~10 steps of answers and used to be all-or-nothing:
+# a Ctrl+C (or a killed installer) threw everything away and the user had
+# to start over. Answers are now checkpointed after every step so an
+# interrupted setup resumes where it left off.
+
+INIT_STATE_FILE = Path("~/.nerve/init-state.json")
+
+
+def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
+    """Checkpoint wizard progress (best-effort — never breaks the wizard)."""
+    import dataclasses
+    from datetime import datetime
+
+    try:
+        data = dataclasses.asdict(choices)
+        data["workspace_path"] = str(choices.workspace_path)
+        state = {
+            "choices": data,
+            "completed": sorted(completed),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        path = INIT_STATE_FILE.expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+        os.chmod(path, 0o600)  # contains API keys
+    except OSError:
+        pass
+
+
+def _load_init_state() -> dict | None:
+    try:
+        return json.loads(
+            INIT_STATE_FILE.expanduser().read_text(encoding="utf-8")
+        )
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _clear_init_state() -> None:
+    INIT_STATE_FILE.expanduser().unlink(missing_ok=True)
+
+
+def _choices_from_dict(data: dict) -> SetupChoices:
+    """Rebuild SetupChoices from a saved state dict (ignores unknown keys)."""
+    import dataclasses
+
+    valid = {f.name for f in dataclasses.fields(SetupChoices)}
+    kwargs = {k: v for k, v in dict(data).items() if k in valid}
+    if "workspace_path" in kwargs:
+        kwargs["workspace_path"] = Path(kwargs["workspace_path"])
+    return SetupChoices(**kwargs)
+
+
 class SetupWizard:
     """Interactive first-run setup wizard."""
 
@@ -360,39 +481,113 @@ class SetupWizard:
         self.choices = SetupChoices()
         self._inside_docker = inside_docker
         self._step_counter = 0
+        self._completed_steps: set[str] = set()
         if inside_docker:
             self.choices.deployment = "docker"
+
+    def _planned_total(self) -> int | None:
+        """Total number of steps, known once the mode has been chosen."""
+        if "mode" not in self._completed_steps:
+            return None
+        total = 0 if self._inside_docker else 1  # deployment
+        total += 4  # mode, api keys, workspace, password
+        total += 6 if self.choices.mode == "personal" else 1
+        return total
 
     def _next_step(self, label: str) -> str:
         """Return a formatted step header with auto-incrementing number."""
         self._step_counter += 1
+        total = self._planned_total()
+        if total:
+            return f"Step {self._step_counter}/{total}: {label}"
         return f"Step {self._step_counter}: {label}"
 
+    def _do(self, name: str, step_fn) -> None:
+        """Run a wizard step with checkpointing.
+
+        Skips steps already answered in a resumed session (keeping the
+        step counter consistent) and saves progress after each step so an
+        interrupted wizard can resume instead of starting over.
+        """
+        if name in self._completed_steps:
+            self._step_counter += 1
+            return
+        step_fn()
+        self._completed_steps.add(name)
+        _save_init_state(self.choices, self._completed_steps)
+
+    def _maybe_resume(self) -> bool:
+        """Offer to resume an interrupted setup. Returns True if resumed."""
+        state = _load_init_state()
+        if not state or not state.get("completed"):
+            return False
+        completed = list(state.get("completed", []))
+        saved_at = state.get("saved_at", "")
+
+        click.clear()
+        click.secho("Interrupted setup found", fg="cyan", bold=True)
+        click.echo()
+        when = f" (saved {saved_at})" if saved_at else ""
+        click.secho(
+            f"A previous 'nerve init' didn't finish{when}.\n"
+            f"Answered steps: {', '.join(completed)}",
+            dim=True,
+        )
+        click.echo()
+        if click.confirm("Resume where you left off?", default=True):
+            try:
+                self.choices = _choices_from_dict(state.get("choices", {}))
+            except (TypeError, ValueError):
+                click.secho("  Saved answers unreadable — starting fresh.", fg="yellow")
+                _clear_init_state()
+                return False
+            if self._inside_docker:
+                self.choices.deployment = "docker"
+            self._completed_steps = set(completed)
+            click.echo()
+            return True
+        _clear_init_state()
+        return False
+
     def run(self) -> SetupChoices:
-        """Run the full interactive wizard. Returns choices (nothing written yet)."""
-        self._welcome()
-        if not self._inside_docker:
-            self._step_deployment()
-            if self.choices.deployment == "docker":
-                self._step_docker_credentials()
-                self._launch_docker()
-                return self.choices  # Never reached — execvp replaces process
-        self._step_mode()
-        self._step_api_keys()
-        self._step_workspace()
-        self._step_password()
-        if self.choices.mode == "personal":
-            self._step_identity()
-            self._step_channels()
-            self._step_sources()
-            self._step_crons()
-            self._step_houseofagents()
-            self._step_external_agents()
-        else:
-            self._step_worker_setup()
-        self._step_review()
-        self._apply()
-        self._done()
+        """Run the full interactive wizard.
+
+        Nothing is applied until the review step; answers are checkpointed
+        along the way so Ctrl+C never loses progress.
+        """
+        resumed = self._maybe_resume()
+        try:
+            if not resumed:
+                self._welcome()
+            if not self._inside_docker:
+                self._do("deployment", self._step_deployment)
+                if self.choices.deployment == "docker":
+                    self._do("docker_credentials", self._step_docker_credentials)
+                    self._launch_docker()
+                    return self.choices  # Never reached — execvp replaces process
+            self._do("mode", self._step_mode)
+            self._do("api_keys", self._step_api_keys)
+            self._do("workspace", self._step_workspace)
+            self._do("password", self._step_password)
+            if self.choices.mode == "personal":
+                self._do("identity", self._step_identity)
+                self._do("channels", self._step_channels)
+                self._do("sources", self._step_sources)
+                self._do("crons", self._step_crons)
+                self._do("houseofagents", self._step_houseofagents)
+                self._do("external_agents", self._step_external_agents)
+            else:
+                self._do("worker_setup", self._step_worker_setup)
+            self._step_review()
+            self._apply()
+            _clear_init_state()
+            self._preflight()
+            self._done()
+        except (KeyboardInterrupt, click.Abort):
+            click.echo()
+            click.secho("  Setup interrupted — your answers are saved.", fg="yellow")
+            click.secho("  Resume anytime with: nerve init", dim=True)
+            raise SystemExit(130)
         return self.choices
 
     # --- Welcome ---
@@ -789,10 +984,22 @@ class SetupWizard:
         if profile:
             self.choices.aws_profile = profile
 
+        # Bedrock model IDs are geography-scoped (us./eu./apac. inference
+        # profiles) — derive the right prefix from the region instead of
+        # assuming us. and failing with a 400 on the first message.
+        prefix = bedrock_geo_prefix(region)
+        click.echo()
+        click.secho(
+            f"  → Model IDs will use the '{prefix}.' inference-profile prefix\n"
+            f"    (e.g. {prefix}.anthropic.claude-opus-4-8) based on region {region}.",
+            fg="green",
+        )
         click.echo()
         click.secho(
             "  Make sure you have enabled Claude model access in the\n"
-            "  AWS Bedrock console for your region.",
+            "  AWS Bedrock console for your region. Not every model is\n"
+            "  offered in every geography — the preflight check at the end\n"
+            "  of setup will tell you if this one isn't.",
             fg="yellow",
         )
         click.echo()
@@ -977,10 +1184,46 @@ class SetupWizard:
         )
         click.echo()
         if click.confirm("Set up Telegram bot?", default=False):
-            token = click.prompt("  Bot token (from @BotFather)")
-            self.choices.telegram_bot_token = token
-            click.echo()
-            click.secho("  ✓ Telegram bot configured", fg="green")
+            token = click.prompt("  Bot token (from @BotFather)").strip()
+
+            # Validate immediately — a bad token is much cheaper to fix now
+            # than after the first silent failure.
+            click.echo("  Verifying token...", nl=False)
+            ok, detail = _telegram_get_me(token)
+            if ok:
+                click.secho(f" ✓ @{detail}", fg="green")
+            else:
+                click.secho(f" ✗ {detail}", fg="yellow")
+                if not click.confirm("  Keep this token anyway?", default=False):
+                    token = ""
+                    click.secho("  → Skipping Telegram.", dim=True)
+
+            if token:
+                self.choices.telegram_bot_token = token
+                click.echo()
+                click.secho(
+                    "  Only authorized users can talk to the bot. Enter your\n"
+                    "  numeric Telegram user ID to authorize yourself now\n"
+                    "  (message @userinfobot on Telegram to get it).\n\n"
+                    "  Or press Enter to skip — after setup, run 'nerve pair'\n"
+                    "  and send the bot /pair <code> to authorize.",
+                    dim=True,
+                )
+                click.echo()
+                uid_raw = click.prompt(
+                    "  Your Telegram user ID (Enter to skip)", default="",
+                ).strip()
+                if uid_raw:
+                    try:
+                        self.choices.telegram_allowed_users = [int(uid_raw)]
+                        click.secho("  ✓ You're authorized to DM the bot", fg="green")
+                    except ValueError:
+                        click.secho(
+                            "  Not a number — skipping. Pair later with 'nerve pair'.",
+                            fg="yellow",
+                        )
+                click.echo()
+                click.secho("  ✓ Telegram bot configured", fg="green")
         else:
             click.secho("  → Skipping Telegram. You can set it up later in config.local.yaml.", dim=True)
         click.echo()
@@ -1333,7 +1576,12 @@ class SetupWizard:
         else:
             api_status += "  OpenAI —"
 
-        tg_status = "configured" if self.choices.telegram_bot_token else "not configured"
+        if not self.choices.telegram_bot_token:
+            tg_status = "not configured"
+        elif self.choices.telegram_allowed_users:
+            tg_status = "configured (you're authorized)"
+        else:
+            tg_status = "configured (pair after setup)"
 
         click.secho("  ┌──────────────────────────────────────────────┐", dim=True)
         click.secho("  │            Setup Summary                     │", bold=True)
@@ -1388,12 +1636,17 @@ class SetupWizard:
 
         if not click.confirm("  Apply this configuration?", default=True):
             if click.confirm("  Restart setup?", default=True):
-                # Re-run the whole wizard
+                # Re-run the whole wizard from scratch
+                _clear_init_state()
                 self.choices = SetupChoices()
+                if self._inside_docker:
+                    self.choices.deployment = "docker"
+                self._completed_steps = set()
+                self._step_counter = 0
                 self.run()
                 raise SystemExit(0)
             else:
-                click.secho("  Aborted.", fg="yellow")
+                click.secho("  Aborted — your answers are saved; resume with 'nerve init'.", fg="yellow")
                 raise SystemExit(0)
 
     # --- Apply ---
@@ -1437,29 +1690,41 @@ class SetupWizard:
                 encoding="utf-8",
             )
 
-        # 6. Write config.yaml
+        # 6. Back up existing configs before regenerating — re-running init
+        # must never silently destroy hand edits (model tweaks, paired
+        # Telegram users, ...).
+        backed_up = []
+        for name in ("config.yaml", "config.local.yaml"):
+            existing = self.config_dir / name
+            if existing.exists():
+                shutil.copy2(existing, existing.with_suffix(existing.suffix + ".bak"))
+                backed_up.append(f"{name}.bak")
+        if backed_up:
+            click.echo(f"  Backed up existing config → {', '.join(backed_up)}")
+
+        # 7. Write config.yaml
         click.echo("  Writing config.yaml...", nl=False)
         self._write_config_yaml()
         click.secho(" ✓", fg="green")
 
-        # 7. Write config.local.yaml
+        # 8. Write config.local.yaml
         click.echo("  Writing config.local.yaml...", nl=False)
         self._write_config_local_yaml()
         click.secho(" ✓", fg="green")
 
-        # 8. Create ~/.nerve directory structure
+        # 9. Create ~/.nerve directory structure
         click.echo("  Setting up ~/.nerve/...", nl=False)
         nerve_dir = Path("~/.nerve").expanduser()
         nerve_dir.mkdir(parents=True, exist_ok=True)
         (nerve_dir / "cron").mkdir(parents=True, exist_ok=True)
         click.secho(" ✓", fg="green")
 
-        # 9. Write cron jobs
+        # 10. Write cron jobs
         click.echo("  Configuring cron jobs...", nl=False)
         self._write_cron_jobs()
         click.secho(" ✓", fg="green")
 
-        # 10. Configure external agents (Codex, Claude Code, ...) if any
+        # 11. Configure external agents (Codex, Claude Code, ...) if any
         if self.choices.external_agents:
             click.echo("  Configuring external agents...", nl=False)
             try:
@@ -1468,7 +1733,7 @@ class SetupWizard:
             except Exception as e:
                 click.secho(f" ✗ {e}", fg="red")
 
-        # 11. Build web UI (server mode only — Docker handles this in entrypoint)
+        # 12. Build web UI (server mode only — Docker handles this in entrypoint)
         if not self._inside_docker:
             self._build_web_ui()
 
@@ -1751,13 +2016,16 @@ class SetupWizard:
             }
             if self.choices.aws_profile:
                 config["provider"]["aws_profile"] = self.choices.aws_profile
-            # Override model names to Bedrock IDs
-            config["agent"]["model"] = "us.anthropic.claude-opus-4-8"
-            config["agent"]["cron_model"] = "us.anthropic.claude-sonnet-4-6"
-            config["agent"]["title_model"] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-            config["memory"]["recall_model"] = "us.anthropic.claude-sonnet-4-6"
-            config["memory"]["memorize_model"] = "us.anthropic.claude-sonnet-4-6"
-            config["memory"]["fast_model"] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+            # Override model names to Bedrock inference-profile IDs.
+            # The prefix is geography-scoped (us./eu./apac.) and must match
+            # the configured region or every call 400s.
+            geo = bedrock_geo_prefix(self.choices.aws_region)
+            config["agent"]["model"] = f"{geo}.anthropic.claude-opus-4-8"
+            config["agent"]["cron_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
+            config["agent"]["title_model"] = f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"
+            config["memory"]["recall_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
+            config["memory"]["memorize_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
+            config["memory"]["fast_model"] = f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"
 
         if self.choices.use_proxy:
             config["proxy"] = {
@@ -1805,6 +2073,10 @@ class SetupWizard:
             local["telegram"] = {
                 "bot_token": self.choices.telegram_bot_token,
             }
+            if self.choices.telegram_allowed_users:
+                local["telegram"]["allowed_users"] = list(
+                    self.choices.telegram_allowed_users
+                )
 
         # Sync credentials (secrets — go in local config)
         if self.choices.telegram_sync and self.choices.telegram_api_id:
@@ -1919,6 +2191,84 @@ class SetupWizard:
                 f.write("# Format is the same as system.yaml — see it for examples.\n\n")
                 f.write("jobs: []\n")
 
+    # --- Preflight ---
+
+    def _preflight(self) -> None:
+        """Validate the configuration that was just written with real calls.
+
+        Catches bad API keys, unavailable Bedrock models (wrong region /
+        no model access), and broken Telegram tokens at setup time instead
+        of at the first message. Failures are informative, never fatal.
+        """
+        click.echo()
+        click.secho("  Preflight checks:", bold=True)
+        failures: list[str] = []
+
+        # --- Claude API ---
+        if self.choices.use_proxy:
+            click.secho(
+                "    – Claude API: skipped (proxy mode — verified at first start)",
+                dim=True,
+            )
+        elif self.choices.claude_oauth_token:
+            click.secho(
+                "    – Claude API: skipped (OAuth token — verified on first use)",
+                dim=True,
+            )
+        elif self.choices.provider_type == "bedrock" or self.choices.anthropic_api_key:
+            click.echo("    · Claude API: testing...", nl=False)
+            try:
+                from nerve.cli import _check_api_connectivity
+                from nerve.config import load_config as _load_config
+
+                cfg = _load_config(self.config_dir)
+                ok, detail = _check_api_connectivity(cfg)
+            except Exception as e:  # never let preflight crash the wizard
+                ok, detail = False, str(e)
+            if ok:
+                click.secho(f" ✓ {detail}", fg="green")
+            else:
+                click.secho(f" ✗ {detail}", fg="red")
+                failures.append("Claude API")
+                if self.choices.provider_type == "bedrock":
+                    click.secho(
+                        "      Check Claude model access for your region in the AWS\n"
+                        "      Bedrock console. If this model isn't offered in your\n"
+                        "      geography, edit agent.model in config.yaml.",
+                        dim=True,
+                    )
+        else:
+            click.secho("    – Claude API: no credentials configured", dim=True)
+
+        # --- Telegram ---
+        if self.choices.telegram_bot_token:
+            click.echo("    · Telegram bot: testing...", nl=False)
+            ok, detail = _telegram_get_me(self.choices.telegram_bot_token)
+            if ok:
+                click.secho(f" ✓ @{detail}", fg="green")
+            else:
+                click.secho(f" ✗ {detail}", fg="red")
+                failures.append("Telegram")
+
+        # --- OpenAI (optional embeddings) ---
+        if self.choices.openai_api_key:
+            click.echo("    · OpenAI API: testing...", nl=False)
+            ok, detail = _check_openai_key(self.choices.openai_api_key)
+            if ok:
+                click.secho(f" ✓ {detail}", fg="green")
+            else:
+                click.secho(f" ✗ {detail}", fg="red")
+                failures.append("OpenAI")
+
+        if failures:
+            click.echo()
+            click.secho(
+                f"  ⚠ {len(failures)} check(s) failed: {', '.join(failures)}.\n"
+                "    Nerve will still start — fix the values in config.local.yaml\n"
+                "    (or config.yaml) and re-verify with 'nerve doctor'.",
+                fg="yellow",
+            )
+
     # --- Done ---
 
     def _done(self) -> None:
@@ -1943,6 +2293,12 @@ class SetupWizard:
         click.echo("    Edit SOUL.md to customize Nerve's personality")
         click.echo("    Edit USER.md to tell Nerve about yourself")
         click.echo()
+        if self.choices.telegram_bot_token and not self.choices.telegram_allowed_users:
+            click.secho("  Telegram pairing:", bold=True)
+            click.echo("    1. Start Nerve, then run: nerve pair")
+            click.echo("    2. Send the bot:  /pair <code>")
+            click.echo("    (until paired, the bot ignores all DMs)")
+            click.echo()
         click.secho(
             "  Tip: Nerve learns from every conversation. The more\n"
             "  you interact, the more useful it becomes.",
@@ -2006,6 +2362,19 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", default_ws))
     choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")
     choices.telegram_bot_token = os.environ.get("NERVE_TELEGRAM_BOT_TOKEN", "")
+    # Comma-separated Telegram user IDs allowed to DM the bot. Without this
+    # the bot starts in pairing mode (authorize via `nerve pair`).
+    allowed_raw = os.environ.get("NERVE_TELEGRAM_ALLOWED_USERS", "")
+    if allowed_raw.strip():
+        try:
+            choices.telegram_allowed_users = [
+                int(u.strip()) for u in allowed_raw.split(",") if u.strip()
+            ]
+        except ValueError:
+            raise click.ClickException(
+                f"NERVE_TELEGRAM_ALLOWED_USERS must be comma-separated numeric "
+                f"user IDs, got: {allowed_raw!r}"
+            )
     choices.password = os.environ.get("NERVE_PASSWORD", "")
 
     # Sources — auto-detect from available CLIs
