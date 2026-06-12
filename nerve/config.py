@@ -98,6 +98,38 @@ class ProviderConfig:
 
 
 @dataclass
+class PromptRewriteConfig:
+    """First-prompt rewrite — refine the opening message of a new chat.
+
+    When enabled, the web UI offers a toggle in the composer of a new
+    (empty) chat. With the toggle on, the first prompt is rewritten and
+    shown to the user for approval before anything is sent.
+    `enabled` here is the server-side master switch: it controls whether
+    the feature is offered at all (the per-user toggle lives in the UI).
+
+    The rewrite defaults to the main chat model (`agent.model`) — the
+    rewrite shapes the whole conversation, so quality wins over speed
+    here. It runs once per chat and the preview shows progress, so the
+    extra latency is acceptable. Set `model` to a fast model (e.g. the
+    title model) to trade quality for speed/cost.
+    """
+
+    enabled: bool = True
+    model: str = ""              # empty → falls back to agent.model
+    max_tokens: int = 1024
+    timeout_seconds: float = 45.0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> PromptRewriteConfig:
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            model=d.get("model", ""),
+            max_tokens=int(d.get("max_tokens", 1024)),
+            timeout_seconds=float(d.get("timeout_seconds", 45.0)),
+        )
+
+
+@dataclass
 class AgentConfig:
     model: str = "claude-opus-4-8"
     cron_model: str = "claude-sonnet-4-6"
@@ -113,6 +145,7 @@ class AgentConfig:
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
     cli_idle_timeout_seconds: int = 900
+    prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
@@ -126,6 +159,7 @@ class AgentConfig:
             effort=str(d.get("effort", "max")),
             context_1m=d.get("context_1m", True),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
+            prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 
 
