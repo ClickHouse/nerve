@@ -14,6 +14,10 @@ Usage:
 
 from __future__ import annotations
 
+# Must be first: applies BLAS thread caps and other process-env defaults
+# that have to be in place before numpy (or any BLAS user) is imported.
+import nerve._env  # noqa: F401  isort: skip
+
 import asyncio
 import logging
 import os

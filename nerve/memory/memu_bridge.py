@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Any, Coroutine
 from zoneinfo import ZoneInfo
 
+# Ensure BLAS thread caps are applied before numpy loads OpenBLAS — an
+# unbounded BLAS pool makes glibc fork() (subprocess spawning on the event
+# loop) block in OpenBLAS's atfork handler while the memU thread runs
+# vector searches.  See nerve/_env.py for the full mechanism.
+import nerve._env  # noqa: F401  isort: skip
+
 import numpy as np
 
 from nerve.config import NerveConfig
