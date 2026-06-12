@@ -9,14 +9,14 @@ import { ThemeToggle } from './ThemeToggle';
 
 const NAV_ITEMS = [
   { path: '/chat', icon: MessageSquare, label: 'Chat' },
+  { path: '/notifications', icon: Bell, label: 'Notifs' },
   { path: '/files', icon: FolderOpen, label: 'Files' },
   { path: '/tasks', icon: CheckSquare, label: 'Tasks' },
   { path: '/plans', icon: Lightbulb, label: 'Plans' },
   { path: '/skills', icon: Sparkles, label: 'Skills' },
   { path: '/mcp', icon: Plug, label: 'MCP' },
   { path: '/houseofagents', icon: Users, label: 'HoA', feature: 'hoa' as const },
-  { path: '/notifications', icon: Bell, label: 'Notifs' },
-  { path: '/sources', icon: Inbox, label: 'Inbox' },
+  { path: '/sources', icon: Inbox, label: 'Sources' },
   { path: '/cron', icon: Clock, label: 'Cron' },
   { path: '/memory', icon: Brain, label: 'Memory' },
   { path: '/diagnostics', icon: Activity, label: 'Diag' },
