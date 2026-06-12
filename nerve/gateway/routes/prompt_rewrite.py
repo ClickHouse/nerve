@@ -59,7 +59,7 @@ class RewriteRequest(BaseModel):
 
 
 def _effective_model(config) -> str:
-    return config.agent.prompt_rewrite.model or config.agent.title_model
+    return config.agent.prompt_rewrite.model or config.agent.model
 
 
 @router.get("/api/prompt-rewrite/status")

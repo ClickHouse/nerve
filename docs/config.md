@@ -41,9 +41,9 @@ from any working directory:
 | `agent.max_turns` | int | `50` | Max agentic turns per request |
 | `agent.max_concurrent` | int | `4` | Max concurrent agent sessions |
 | `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
-| `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.title_model`) |
+| `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
 | `agent.prompt_rewrite.max_tokens` | int | `1024` | Max tokens for the rewritten prompt |
-| `agent.prompt_rewrite.timeout_seconds` | float | `20.0` | Rewrite API call timeout |
+| `agent.prompt_rewrite.timeout_seconds` | float | `45.0` | Rewrite API call timeout |
 
 **Prompt rewrite:** when the ✨ toggle in the composer is on, the first prompt of a new chat is rewritten by a fast model to better express intent. The result is previewed (editable) and only sent after explicit approval — the user can always send the original instead. Trivial or already-clear prompts are sent unchanged without a preview.
 

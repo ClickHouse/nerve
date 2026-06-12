@@ -24,7 +24,7 @@ class TestPromptRewriteConfig:
         assert cfg.enabled is True
         assert cfg.model == ""
         assert cfg.max_tokens == 1024
-        assert cfg.timeout_seconds == 20.0
+        assert cfg.timeout_seconds == 45.0
 
     def test_from_dict_overrides(self):
         cfg = PromptRewriteConfig.from_dict({
@@ -116,8 +116,8 @@ class TestPromptRewriteRoutes:
         assert resp.status_code == 200
         body = resp.json()
         assert body["enabled"] is True
-        # No explicit model configured — falls back to title_model.
-        assert body["model"] == rewrite_app.config.agent.title_model
+        # No explicit model configured — falls back to the chat model.
+        assert body["model"] == rewrite_app.config.agent.model
 
     def test_status_respects_model_override(self, rewrite_app):
         rewrite_app.config.agent.prompt_rewrite.model = "custom-model"
@@ -165,7 +165,7 @@ class TestPromptRewriteRoutes:
         body = resp.json()
         assert body["changed"] is True
         assert body["rewritten"] == "Refined: do the thing, step by step."
-        assert body["model"] == rewrite_app.config.agent.title_model
+        assert body["model"] == rewrite_app.config.agent.model
         # The original prompt is the only user message sent to the model.
         assert len(fake.messages.calls) == 1
         call = fake.messages.calls[0]

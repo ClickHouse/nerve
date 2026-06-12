@@ -24,9 +24,9 @@ agent:
   # new chat with a fast model, preview it, and send only after approval.
   prompt_rewrite:
     enabled: true                # Master switch (per-user toggle is in the UI)
-    model: ""                    # Empty → falls back to title_model
+    model: ""                    # Empty → falls back to agent.model (chat model)
     max_tokens: 1024
-    timeout_seconds: 20
+    timeout_seconds: 45
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-4-8
   #   cron_model: us.anthropic.claude-sonnet-4-6
