@@ -21,6 +21,7 @@ export function getRendererType(source: string): RendererType {
   switch (type) {
     case 'gmail': return 'email';
     case 'github': return 'github';
+    case 'github_repos': return 'github';
     default: return 'default';
   }
 }

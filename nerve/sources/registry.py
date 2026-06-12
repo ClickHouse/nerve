@@ -133,4 +133,29 @@ def build_source_runners(
         ))
         logger.info("Registered source: github_events (batch=%d, repos=%s)", gh_events.batch_size, gh_events.repos or "all")
 
+    # GitHub Repos (monitor watched repos for new issues/PRs)
+    gh_repos = config.sync.github_repos
+    if gh_repos.enabled:
+        from nerve.sources.github_repos import GitHubReposSource
+
+        if not gh_repos.repos:
+            logger.warning(
+                "Source github_repos is enabled but no repos are configured — "
+                "it will be a no-op until sync.github_repos.repos is set",
+            )
+        source = GitHubReposSource(config={"repos": gh_repos.repos})
+        runners.append(SourceRunner(
+            source=source,
+            db=db,
+            batch_size=gh_repos.batch_size,
+            condense=gh_repos.condense,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
+            ttl_days=ttl_days,
+        ))
+        logger.info(
+            "Registered source: github_repos (batch=%d, repos=%s)",
+            gh_repos.batch_size, gh_repos.repos or "none",
+        )
+
     return runners

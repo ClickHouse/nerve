@@ -23,6 +23,7 @@ function sourceIcon(source: string) {
   switch (type) {
     case 'gmail': return <Mail size={12} className="text-hue-red" />;
     case 'github': return <Github size={12} className="text-hue-purple" />;
+    case 'github_repos': return <Github size={12} className="text-hue-purple" />;
     case 'telegram': return <MessageCircle size={12} className="text-hue-blue" />;
     default: return <Inbox size={12} className="text-text-dim" />;
   }

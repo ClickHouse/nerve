@@ -73,6 +73,11 @@ sync:
     # allow_repos = allowlist (empty = all); deny_repos takes precedence.
     allow_repos: []                # Example: ["ClickHouse/*", "myorg/myrepo"]
     deny_repos: []
+  github_repos:                    # Monitor a set of repos for NEW issues & PRs
+    enabled: false
+    schedule: "*/15 * * * *"
+    repos: []                      # Required: ["ClickHouse/clickhouse-go", "owner/repo"]
+    batch_size: 50
 
 # Memory (memU)
 memory:

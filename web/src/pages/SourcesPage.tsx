@@ -34,6 +34,7 @@ function sourceIcon(source: string) {
   switch (type) {
     case 'gmail': return <Mail size={14} className="text-hue-red" />;
     case 'github': return <Github size={14} className="text-hue-purple" />;
+    case 'github_repos': return <Github size={14} className="text-hue-purple" />;
     case 'telegram': return <MessageCircle size={14} className="text-hue-blue" />;
     default: return <Inbox size={14} className="text-text-dim" />;
   }
@@ -44,6 +45,7 @@ function sourceBadgeColor(source: string): string {
   switch (type) {
     case 'gmail': return 'text-red-600 bg-red-500/15';
     case 'github': return 'text-purple-600 bg-purple-500/15';
+    case 'github_repos': return 'text-purple-600 bg-purple-500/15';
     case 'telegram': return 'text-blue-600 bg-blue-500/15';
     default: return 'text-text-muted bg-surface-raised';
   }
