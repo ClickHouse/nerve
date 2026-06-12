@@ -257,6 +257,16 @@ export const api = {
       };
     }>('/observability/status'),
 
+  // Prompt rewrite — refine the first prompt of a new chat
+  getPromptRewriteStatus: () =>
+    request<{ enabled: boolean; model: string }>('/prompt-rewrite/status'),
+  rewritePrompt: (prompt: string, signal?: AbortSignal) =>
+    request<{ rewritten: string; changed: boolean; model: string }>('/prompt-rewrite', {
+      method: 'POST',
+      body: JSON.stringify({ prompt }),
+      signal,
+    }),
+
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
   triggerCronJob: (jobId: string) =>

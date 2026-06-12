@@ -20,6 +20,13 @@ agent:
   title_model: claude-haiku-4-5-20251001  # Session title generation
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 4              # Max concurrent agent sessions
+  # First-prompt rewrite — the web UI can refine the opening message of a
+  # new chat with a fast model, preview it, and send only after approval.
+  prompt_rewrite:
+    enabled: true                # Master switch (per-user toggle is in the UI)
+    model: ""                    # Empty → falls back to title_model
+    max_tokens: 1024
+    timeout_seconds: 20
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-4-8
   #   cron_model: us.anthropic.claude-sonnet-4-6
