@@ -293,6 +293,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           />
 
           <textarea
+            id="nerve-chat-input"
             ref={textareaRef}
             value={input}
             onChange={(e) => { setInput(e.target.value); handleInput(); }}
