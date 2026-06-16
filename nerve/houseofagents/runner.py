@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,7 +48,9 @@ async def _tail_session_jsonl(
 
     # Claude CLI writes session logs to ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
     # The cwd is encoded by replacing / with - (keeping the leading dash for absolute paths).
-    cwd_encoded = workspace.replace("/", "-")
+    # The CLI resolves the cwd symlink before encoding, so resolve the workspace
+    # realpath first (e.g. /root/nerve-workspace -> /Users/.../nerve-workspace).
+    cwd_encoded = os.path.realpath(workspace).replace("/", "-")
     projects_dir = Path.home() / ".claude" / "projects"
     jsonl_path = projects_dir / cwd_encoded / f"{inner_session_id}.jsonl"
 
