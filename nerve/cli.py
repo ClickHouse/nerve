@@ -1379,5 +1379,122 @@ def backfill_timestamps(ctx: click.Context, dry_run: bool) -> None:
     click.echo(f"\n{'Would update' if dry_run else 'Updated'} {updated} items, skipped {skipped}")
 
 
+def _fmt_bytes(n: int) -> str:
+    """Render a byte count as MB with one decimal."""
+    return f"{(n or 0) / (1024 * 1024):.1f} MB"
+
+
+@main.group(name="db")
+def db_group() -> None:
+    """Database maintenance (prune old data, vacuum to reclaim space)."""
+
+
+@db_group.command("prune")
+@click.option("--dry-run", is_flag=True, help="Report what would change without mutating")
+@click.pass_context
+def db_prune(ctx: click.Context, dry_run: bool) -> None:
+    """Compact old memorized messages and prune old telemetry + file snapshots.
+
+    Uses the configured retention windows (retention.retention_full_days for
+    message compaction, retention.retention_days for telemetry/snapshots).
+    Frees space inside the DB; run ``nerve db vacuum`` afterwards to shrink the
+    file on disk.
+    """
+    from nerve.db import Database
+
+    config = ctx.obj["config"]
+    db_path = Path("~/.nerve/nerve.db").expanduser()
+    if not db_path.exists():
+        click.echo(f"[ERR] Database not found: {db_path}")
+        ctx.exit(1)
+        return
+
+    full_days = config.retention.retention_full_days
+    days = config.retention.retention_days
+    click.echo(
+        f"{'[dry-run] ' if dry_run else ''}Pruning {db_path} "
+        f"(compact messages > {full_days}d, telemetry/snapshots > {days}d)"
+    )
+
+    async def _run() -> None:
+        database = Database(db_path, workspace=config.workspace)
+        await database.connect()
+        try:
+            report = await database.run_retention(
+                retention_days=days,
+                retention_full_days=full_days,
+                dry_run=dry_run,
+            )
+        finally:
+            await database.close()
+
+        verb = "Would compact" if dry_run else "Compacted"
+        click.echo(
+            f"  {verb} {report['messages_compacted']} messages "
+            f"(~{_fmt_bytes(report['message_bytes_reclaimed'])} of blocks/thinking)"
+        )
+        verb = "Would delete" if dry_run else "Deleted"
+        click.echo(f"  {verb} {report['telemetry_deleted']} telemetry rows:")
+        for table, n in report["by_table"].items():
+            click.echo(f"    {table}: {n}")
+        click.echo(
+            f"  {verb} {report['snapshots_deleted']} file snapshots "
+            f"(~{_fmt_bytes(report['snapshot_bytes_reclaimed'])})"
+        )
+        if not dry_run:
+            click.echo("\nFreed space inside the DB. Run `nerve db vacuum` to shrink the file.")
+
+    asyncio.run(_run())
+
+
+@db_group.command("vacuum")
+@click.pass_context
+def db_vacuum(ctx: click.Context) -> None:
+    """Rewrite the DB file to reclaim freed pages (shrinks the file on disk).
+
+    VACUUM takes a write lock and cannot run while the daemon holds the DB.
+    Stop the daemon first (`nerve stop`) for a clean run.
+    """
+    from nerve.db import Database
+
+    config = ctx.obj["config"]
+    db_path = Path("~/.nerve/nerve.db").expanduser()
+    if not db_path.exists():
+        click.echo(f"[ERR] Database not found: {db_path}")
+        ctx.exit(1)
+        return
+
+    running, _pid = _get_daemon_status()
+    if running:
+        click.echo(
+            "[WARN] Nerve daemon is running. VACUUM needs an exclusive lock and "
+            "will likely fail with 'database is locked'. Run `nerve stop` first."
+        )
+
+    size_before = db_path.stat().st_size
+    click.echo(f"Vacuuming {db_path} ({_fmt_bytes(size_before)})...")
+
+    async def _run() -> None:
+        database = Database(db_path, workspace=config.workspace)
+        await database.connect()
+        try:
+            await database.vacuum()
+        finally:
+            await database.close()
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        click.echo(f"[ERR] VACUUM failed: {e}")
+        ctx.exit(1)
+        return
+
+    size_after = db_path.stat().st_size
+    click.echo(
+        f"Done. {_fmt_bytes(size_before)} -> {_fmt_bytes(size_after)} "
+        f"(reclaimed {_fmt_bytes(size_before - size_after)})"
+    )
+
+
 if __name__ == "__main__":
     main()

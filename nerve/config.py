@@ -500,6 +500,38 @@ class SessionsConfig:
 
 
 @dataclass
+class RetentionConfig:
+    """Opt-in nerve.db retention: message compaction + telemetry pruning.
+
+    Disabled by default so an upstream merge mutates no existing user's data;
+    the operator opts in locally. When enabled, a background pass every
+    ``interval_hours`` drops the verbose ``blocks``/``thinking`` JSON of old,
+    already-memorized, non-starred, non-active messages (keeping ``content``),
+    prunes append-only telemetry + file snapshots older than
+    ``retention_days``, and checkpoints the WAL. The file is only shrunk by the
+    explicit ``nerve db vacuum`` command (VACUUM takes a write lock).
+
+    ``retention_full_days`` is the message-compaction window (default 30);
+    ``retention_days`` is the telemetry/snapshot window (default 90). Both
+    ints are clamped ``>= 1``.
+    """
+
+    enabled: bool = False
+    retention_days: int = 90
+    retention_full_days: int = 30
+    interval_hours: int = 24
+
+    @classmethod
+    def from_dict(cls, d: dict) -> RetentionConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            retention_days=max(1, int(d.get("retention_days", 90))),
+            retention_full_days=max(1, int(d.get("retention_full_days", 30))),
+            interval_hours=max(1, int(d.get("interval_hours", 24))),
+        )
+
+
+@dataclass
 class AuthConfig:
     password_hash: str = ""
     jwt_secret: str = ""
@@ -922,6 +954,7 @@ class NerveConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
@@ -1037,6 +1070,7 @@ class NerveConfig:
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {})),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
+            retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),
             channels=ChannelsConfig.from_dict(d.get("channels", {})),
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
