@@ -29,8 +29,13 @@ from claude_agent_sdk.types import (
 
 logger = logging.getLogger(__name__)
 
-# Default timeout for interactive tool waits (5 minutes)
-INTERACTION_TIMEOUT = 300
+# Default timeout for interactive tool waits.
+# Non-web sessions auto-deny upfront via `interactive_capable`, so this only
+# guards web sessions where the user might step away mid-approval. 5 minutes
+# was too short — by the time the user reads a plan and reaches for Approve,
+# the pending interaction is already gone and the button does nothing.
+# 24 hours is a safety net, not a UX constraint.
+INTERACTION_TIMEOUT = 24 * 60 * 60
 
 # Tools that require user interaction before execution
 INTERACTIVE_TOOLS = frozenset({
@@ -189,8 +194,9 @@ class InteractiveToolHandler:
                 "Session %s: interaction %s timed out after %ds",
                 self.session_id, interaction_id[:8], INTERACTION_TIMEOUT,
             )
+            hours = INTERACTION_TIMEOUT // 3600
             return PermissionResultDeny(
-                message=f"No response received after {INTERACTION_TIMEOUT // 60} minutes — timed out.",
+                message=f"No response received after {hours}h — timed out.",
             )
         except asyncio.CancelledError:
             self._pending.pop(interaction_id, None)
