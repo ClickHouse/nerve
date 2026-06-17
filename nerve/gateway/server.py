@@ -262,6 +262,76 @@ async def lifespan(app: FastAPI):
 
     notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
 
+    # Periodic backup (opt-in). Hourly tick; runs a bundle when the newest
+    # one in the target dir is older than interval_hours (or none exists).
+    # The heavy work (consistent DB snapshots + tar) runs in a thread so it
+    # never blocks the event loop. Failures notify high-priority — a backup
+    # that fails silently is worse than no backup at all.
+    async def _periodic_backup():
+        from nerve import backup as backup_mod
+
+        bcfg = config.backup
+        nerve_dir = Path("~/.nerve").expanduser()
+        interval_s = max(1, bcfg.interval_hours) * 3600
+        target = Path(bcfg.target_dir).expanduser() if bcfg.target_dir else None
+        while True:
+            await asyncio.sleep(3600)  # hourly tick
+            if not bcfg.enabled or target is None:
+                continue
+            try:
+                age = await asyncio.to_thread(
+                    backup_mod.latest_bundle_age_seconds, target,
+                )
+                if age is not None and age < interval_s:
+                    continue  # not due yet
+
+                result = await asyncio.to_thread(
+                    backup_mod.create_backup,
+                    nerve_dir,
+                    config.workspace,
+                    target,
+                    config_dir=config.config_dir,
+                    include_workspace=bcfg.include_workspace,
+                    include_secrets=True,
+                    workspace_excludes=bcfg.workspace_excludes,
+                )
+                deleted = await asyncio.to_thread(
+                    backup_mod.prune, target, bcfg.retention_count,
+                )
+                size_str = (
+                    f"{result.size / (1024 ** 3):.1f} GB"
+                    if result.size >= 1024 ** 3
+                    else f"{result.size / (1024 ** 2):.0f} MB"
+                )
+                logger.info(
+                    "Scheduled backup OK: %s (%s, pruned %d)",
+                    result.path.name, size_str, len(deleted),
+                )
+                if bcfg.notify_on_success:
+                    await notification_service.send_notification(
+                        session_id="system",
+                        title="💾 Backup OK",
+                        body=(
+                            f"{size_str}, {len(backup_mod.list_bundles(target))} "
+                            f"kept ({result.file_count} files)"
+                        ),
+                        priority="low",
+                    )
+            except Exception as e:
+                logger.error("Scheduled backup failed: %s", e, exc_info=True)
+                if bcfg.notify_on_failure:
+                    try:
+                        await notification_service.send_notification(
+                            session_id="system",
+                            title="⚠️ Nerve backup FAILED",
+                            body=f"{e}\n\nTarget: {target}",
+                            priority="high",
+                        )
+                    except Exception as ne:
+                        logger.error("Backup failure notify failed: %s", ne)
+
+    backup_task = asyncio.create_task(_periodic_backup())
+
     # Start the external-agents sync service. It re-renders
     # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace
     # identity files on a timer (config.external_agents.sync_interval_minutes).
@@ -371,6 +441,7 @@ async def lifespan(app: FastAPI):
         await cron_task.stop()
 
     notify_expiry_task.cancel()
+    backup_task.cancel()
     idle_sweep_task.cancel()
     memorize_task.cancel()
     cleanup_task.cancel()

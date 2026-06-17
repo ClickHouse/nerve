@@ -84,6 +84,22 @@ cron:
   system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
   jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
 
+# Backup (optional) — scheduled, verified snapshots of Nerve state into a
+# single portable bundle (nerve-backup-<host>-<ts>.tar.zst). Off by default.
+# Point target_dir at an external mount or a synced directory — the OFF-BOX
+# copy is what protects against a disk failure. The SQLite DBs are snapshotted
+# with the online-backup API, so bundles are consistent even while Nerve runs.
+# Manual use: `nerve backup` / `nerve restore BUNDLE` (no running server needed).
+# backup:
+#   enabled: false
+#   target_dir: ""              # e.g. /mnt/backup/nerve  (REQUIRED when enabled)
+#   interval_hours: 24          # scheduled cadence (an hourly tick fires when due)
+#   retention_count: 7          # keep the newest N bundles; prune older ones
+#   include_workspace: true     # include the workspace BRAIN (*.md, memory/, scripts/, skills/)
+#   workspace_excludes: []      # extra glob patterns to skip, e.g. ["*.png", "drafts"]
+#   notify_on_failure: true     # high-priority notify if a scheduled backup fails
+#   notify_on_success: false    # low-priority digest line on success
+
 # External MCP server (optional) — expose Nerve's tool registry to
 # external MCP clients (Codex, Claude Code, Cursor) over Streamable HTTP.
 # Off by default. Authentication reuses the gateway JWT
