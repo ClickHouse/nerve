@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -13,6 +17,12 @@ router = APIRouter()
 
 class NotificationAnswerRequest(BaseModel):
     answer: str
+
+
+class SilenceCreateRequest(BaseModel):
+    pattern: str
+    reason: str = ""
+    ttl_hours: float = 0
 
 
 @router.get("/api/notifications")
@@ -33,6 +43,68 @@ async def list_notifications(
     )
     pending_count = await deps.db.count_pending_notifications(channel="web")
     return {"notifications": notifications, "pending_count": pending_count}
+
+
+# --------------------------------------------------------------------- #
+#  Silences (deterministic suppression rules)                            #
+#                                                                        #
+#  Declared BEFORE the ``/{notification_id}`` route so the literal       #
+#  ``/silences`` path is not captured as a notification id.              #
+# --------------------------------------------------------------------- #
+
+
+@router.get("/api/notifications/silences")
+async def list_silences(
+    include_disabled: bool = False,
+    user: dict = Depends(require_auth),
+):
+    deps = get_deps()
+    silences = await deps.db.list_silences(include_disabled=include_disabled)
+    return {"silences": silences}
+
+
+@router.post("/api/notifications/silences")
+async def create_silence(
+    req: SilenceCreateRequest,
+    user: dict = Depends(require_auth),
+):
+    pattern = (req.pattern or "").strip()
+    if not pattern:
+        raise HTTPException(status_code=400, detail="pattern is required")
+    try:
+        re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise HTTPException(status_code=400, detail=f"invalid regex: {exc}")
+
+    expires_at = None
+    if req.ttl_hours and req.ttl_hours > 0:
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(hours=req.ttl_hours)
+        ).isoformat()
+
+    deps = get_deps()
+    silence_id = f"sil-{uuid.uuid4().hex[:8]}"
+    row = await deps.db.create_silence(
+        silence_id=silence_id,
+        pattern=pattern,
+        reason=(req.reason or "").strip(),
+        created_by="web",
+        expires_at=expires_at,
+    )
+    if deps.notification_service:
+        deps.notification_service.invalidate_silence_cache()
+    return row
+
+
+@router.delete("/api/notifications/silences/{silence_id}")
+async def delete_silence(silence_id: str, user: dict = Depends(require_auth)):
+    deps = get_deps()
+    ok = await deps.db.delete_silence(silence_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Silence not found")
+    if deps.notification_service:
+        deps.notification_service.invalidate_silence_cache()
+    return {"silence_id": silence_id, "deleted": True}
 
 
 @router.get("/api/notifications/{notification_id}")

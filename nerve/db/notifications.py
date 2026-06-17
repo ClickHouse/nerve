@@ -22,6 +22,7 @@ class NotificationStore:
         metadata: dict | None = None,
         target_kind: str | None = None,
         target_id: str | None = None,
+        status: str | None = None,
     ) -> dict:
         """Insert a notification row.
 
@@ -30,14 +31,20 @@ class NotificationStore:
         via the handler registry). ``target_kind`` and ``target_id`` are
         only populated for ``approval`` rows; left NULL otherwise so the
         legacy answer path stays untouched.
+
+        ``status`` defaults to ``None`` → ``'pending'`` (identical to the
+        column default, so existing callers are unchanged). The silence
+        path passes ``status='silenced'`` to insert a suppressed row that
+        is persisted for audit but never fanned out to channels.
         """
         now = datetime.now(timezone.utc).isoformat()
         await self.db.execute(
             """INSERT INTO notifications
-               (id, session_id, type, title, body, priority, options,
+               (id, session_id, type, title, body, priority, status, options,
                 expires_at, metadata, created_at, target_kind, target_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (notification_id, session_id, type, title, body, priority,
+             status or "pending",
              json.dumps(options) if options else None,
              expires_at, json.dumps(metadata or {}), now,
              target_kind, target_id),
@@ -186,3 +193,126 @@ class NotificationStore:
             f"UPDATE notifications SET {sets} WHERE id = ?", tuple(vals),
         )
         await self.db.commit()
+
+    # ------------------------------------------------------------------ #
+    #  Notification silences (deterministic suppression rules)             #
+    # ------------------------------------------------------------------ #
+
+    async def create_silence(
+        self,
+        silence_id: str,
+        pattern: str,
+        reason: str = "",
+        action: str = "silence",
+        created_by: str = "",
+        expires_at: str | None = None,
+    ) -> dict:
+        """Insert a silence rule.
+
+        ``pattern`` is a case-insensitive regex the notification service
+        matches against ``title + "\\n" + body``. ``expires_at`` NULL =
+        permanent. Returns the freshly-inserted row.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        await self.db.execute(
+            """INSERT INTO notification_silences
+               (id, pattern, action, reason, created_by, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (silence_id, pattern, action, reason, created_by, now, expires_at),
+        )
+        await self.db.commit()
+        row = await self.get_silence(silence_id)
+        return row or {"id": silence_id, "pattern": pattern}
+
+    async def get_silence(self, silence_id: str) -> dict | None:
+        async with self.db.execute(
+            "SELECT * FROM notification_silences WHERE id = ?", (silence_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def list_silences(self, include_disabled: bool = False) -> list[dict]:
+        """Return silence rules, newest first.
+
+        ``include_disabled=False`` (default) returns only enabled rules;
+        ``True`` returns every row regardless of the ``enabled`` flag.
+        """
+        where = "" if include_disabled else "WHERE enabled = 1"
+        async with self.db.execute(
+            f"SELECT * FROM notification_silences {where} "
+            "ORDER BY created_at DESC",
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def get_active_silences(self) -> list[dict]:
+        """Return enabled, non-expired silence rules, oldest first.
+
+        Oldest-first ordering gives the service a stable "first rule wins"
+        precedence. Used to (re)build the in-memory matcher cache.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.db.execute(
+            """SELECT * FROM notification_silences
+               WHERE enabled = 1 AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY created_at ASC""",
+            (now,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def delete_silence(self, silence_id: str) -> bool:
+        """Hard-delete a silence rule. Returns False if it didn't exist."""
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT id FROM notification_silences WHERE id = ?",
+                (silence_id,),
+            ) as cursor:
+                if not await cursor.fetchone():
+                    return False
+            await self.db.execute(
+                "DELETE FROM notification_silences WHERE id = ?", (silence_id,),
+            )
+        return True
+
+    async def record_silence_hit(self, silence_id: str) -> int:
+        """Bump ``hit_count`` + stamp ``last_hit_at``; return the new count.
+
+        Called every time a silence suppresses a delivery, so the user can
+        see how often a rule is firing.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._atomic():
+            await self.db.execute(
+                """UPDATE notification_silences
+                   SET hit_count = hit_count + 1, last_hit_at = ?
+                   WHERE id = ?""",
+                (now, silence_id),
+            )
+            async with self.db.execute(
+                "SELECT hit_count FROM notification_silences WHERE id = ?",
+                (silence_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def record_silence_override(self, silence_id: str) -> int:
+        """Bump ``override_count`` + stamp ``last_override_at``; return count.
+
+        Called when an agent force-sends a notification over a matching
+        rule. A climbing override count is a false-match signal: the
+        pattern is catching alerts that genuinely need to reach the user.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._atomic():
+            await self.db.execute(
+                """UPDATE notification_silences
+                   SET override_count = override_count + 1,
+                       last_override_at = ?
+                   WHERE id = ?""",
+                (now, silence_id),
+            )
+            async with self.db.execute(
+                "SELECT override_count FROM notification_silences WHERE id = ?",
+                (silence_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return row[0] if row else 0

@@ -648,6 +648,16 @@ NOTIFY_SCHEMA = {
             "description": "Priority level: 'low', 'normal', 'high', 'urgent'. Default: 'normal'",
             "default": "normal",
         },
+        "force": {
+            "type": "boolean",
+            "description": (
+                "Re-send a notification that was previously silenced. "
+                "Set true ONLY when you believe a silence rule matched this "
+                "notification incorrectly and it genuinely needs to reach the "
+                "user. Bypasses silence matching and delivers normally."
+            ),
+            "default": False,
+        },
     },
     "required": ["body"],
 }
@@ -734,6 +744,58 @@ PROPOSE_ACTION_SCHEMA = {
         },
     },
     "required": ["target_kind", "target_id", "title"],
+}
+
+NOTIFICATION_SILENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "op": {
+            "type": "string",
+            "description": (
+                "Operation: 'add' (create a rule), 'list' (show active "
+                "rules with hit/override counts), or 'remove' (delete by id)."
+            ),
+        },
+        "pattern": {
+            "type": "string",
+            "description": (
+                "For op=add (required): case-insensitive regex matched "
+                "against the notification's title + body. A matching "
+                "'notify' is suppressed (persisted, not delivered)."
+            ),
+            "default": "",
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "For op=add (strongly encouraged): why this alert class is "
+                "benign. Surfaced to the agent on every match and override."
+            ),
+            "default": "",
+        },
+        "ttl_hours": {
+            "type": "number",
+            "description": (
+                "For op=add: hours until the rule auto-expires. "
+                "0 (default) = permanent."
+            ),
+            "default": 0,
+        },
+        "example": {
+            "type": "string",
+            "description": (
+                "For op=add (optional): sample notification text; the tool "
+                "test-matches the pattern against it and echoes the result."
+            ),
+            "default": "",
+        },
+        "silence_id": {
+            "type": "string",
+            "description": "For op=remove (required): the silence id (sil-xxxx) to delete.",
+            "default": "",
+        },
+    },
+    "required": ["op"],
 }
 
 REACT_SCHEMA = {

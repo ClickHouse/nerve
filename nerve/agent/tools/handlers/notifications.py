@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     ASK_USER_SCHEMA,
+    NOTIFICATION_SILENCE_SCHEMA,
     NOTIFY_SCHEMA,
     PROPOSE_ACTION_SCHEMA,
     REACT_SCHEMA,
@@ -39,6 +43,7 @@ async def notify_handler(ctx: ToolContext, args: dict) -> ToolResult:
     title = args.get("title", "")
     body = args.get("body", "")
     priority = args.get("priority", "normal")
+    force = bool(args.get("force", False))
 
     try:
         notification_id = await ctx.notification_service.send_notification(
@@ -46,11 +51,72 @@ async def notify_handler(ctx: ToolContext, args: dict) -> ToolResult:
             title=title,
             body=body,
             priority=priority,
+            force=force,
         )
-        return ToolResult.text(f"Notification sent: {notification_id}")
     except Exception as e:
         logger.error("notify tool failed: %s", e)
         return ToolResult.text(f"Failed to send notification: {e}")
+
+    # Read the row back to learn the delivery outcome (normal / silenced /
+    # force-delivered over a match). One indexed PK lookup on the
+    # low-volume notify path; this keeps send_notification's ``-> str``
+    # contract so cron and other callers stay untouched.
+    status, meta = await _read_notify_outcome(
+        ctx.notification_service, notification_id,
+    )
+
+    if status == "silenced":
+        sil_id = meta.get("silenced_by", "?")
+        reason = meta.get("silence_reason") or "(no reason recorded)"
+        pattern = meta.get("silence_pattern", "")
+        hits = meta.get("silence_hit_count")
+        hits_str = f"   ({hits} hits)" if hits else ""
+        return ToolResult.text(
+            f"⚠ Notification {notification_id} was SILENCED and NOT delivered "
+            f"(matched {sil_id}).\n"
+            f"  reason:  {reason}\n"
+            f"  pattern: {pattern}{hits_str}\n"
+            "If you believe this match is INCORRECT and the alert genuinely "
+            "needs to reach the user, re-send the same notification with "
+            "force=true to bypass the silence."
+        )
+
+    if meta.get("force_sent_over_silence"):
+        sil_id = meta["force_sent_over_silence"]
+        count = meta.get("force_override_count")
+        count_str = f"; override #{count} recorded" if count else ""
+        return ToolResult.text(
+            f"Notification sent: {notification_id} "
+            f"(force-delivered over silence {sil_id}{count_str})."
+        )
+
+    return ToolResult.text(f"Notification sent: {notification_id}")
+
+
+async def _read_notify_outcome(service, notification_id: str) -> tuple[str | None, dict]:
+    """Fetch a notify row's status + parsed metadata for the result string.
+
+    Defensive: any read/parse failure degrades to ``(None, {})`` so the
+    handler still reports a plain "sent" rather than erroring.
+    """
+    try:
+        row = await service.db.get_notification(notification_id)
+    except Exception:
+        return None, {}
+    if not row:
+        return None, {}
+    raw = row.get("metadata")
+    meta: dict = {}
+    if isinstance(raw, dict):
+        meta = raw
+    elif isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                meta = parsed
+        except (json.JSONDecodeError, ValueError):
+            meta = {}
+    return row.get("status"), meta
 
 
 async def ask_user_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -174,6 +240,120 @@ async def propose_action_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(f"Failed to propose action: {e}")
 
 
+async def notification_silence_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Manage deterministic notification silence rules (add / list / remove).
+
+    Silences suppress known-benign ``notify`` classes at the service
+    chokepoint: a match is persisted but not delivered, and the sending
+    agent is told so it can force-send a wrong match. Create rules only
+    on explicit user instruction or a recorded MEMORY ruling.
+    """
+    if not ctx.db:
+        return ToolResult.text("Database not available.")
+
+    op = str(args.get("op", "")).strip().lower()
+    if op == "add":
+        return await _silence_add(ctx, args)
+    if op == "list":
+        return await _silence_list(ctx)
+    if op == "remove":
+        return await _silence_remove(ctx, args)
+    return ToolResult.text(
+        "notification_silence: 'op' must be one of add, list, remove."
+    )
+
+
+async def _silence_add(ctx: ToolContext, args: dict) -> ToolResult:
+    pattern = str(args.get("pattern", "")).strip()
+    if not pattern:
+        return ToolResult.text("notification_silence add: 'pattern' is required.")
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        return ToolResult.text(
+            f"notification_silence add: invalid regex {pattern!r}: {exc}"
+        )
+
+    reason = str(args.get("reason", "")).strip()
+    try:
+        ttl_hours = float(args.get("ttl_hours", 0) or 0)
+    except (TypeError, ValueError):
+        ttl_hours = 0.0
+    expires_at = None
+    if ttl_hours > 0:
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
+        ).isoformat()
+
+    silence_id = f"sil-{uuid.uuid4().hex[:8]}"
+    await ctx.db.create_silence(
+        silence_id=silence_id,
+        pattern=pattern,
+        reason=reason,
+        created_by=ctx.session_id,
+        expires_at=expires_at,
+    )
+    # Take effect immediately for the running service.
+    if ctx.notification_service:
+        ctx.notification_service.invalidate_silence_cache()
+
+    example = str(args.get("example", "")).strip()
+    example_line = ""
+    if example:
+        verdict = "WOULD match" if compiled.search(example) else "would NOT match"
+        example_line = f"\nExample {example!r} {verdict} this pattern."
+
+    ttl_str = "permanent" if not expires_at else f"expires in {ttl_hours:g}h"
+    reason_str = f" — {reason}" if reason else ""
+    return ToolResult.text(
+        f"Silence created: {silence_id}  pattern={pattern}  ({ttl_str}){reason_str}\n"
+        "Future 'notify' calls whose title+body match this pattern will be "
+        "suppressed (persisted as silenced, not delivered)." + example_line
+    )
+
+
+async def _silence_list(ctx: ToolContext) -> ToolResult:
+    rows = await ctx.db.list_silences()
+    if not rows:
+        return ToolResult.text("No active notification silences.")
+    lines: list[str] = []
+    for r in rows:
+        expires_at = r.get("expires_at")
+        expiry = (
+            "permanent" if not expires_at
+            else f"expires {str(expires_at)[:16].replace('T', ' ')}"
+        )
+        hits = r.get("hit_count") or 0
+        overrides = r.get("override_count") or 0
+        counters = f"{hits} hits"
+        if overrides:
+            counters += f", {overrides} override" + ("s" if overrides != 1 else "")
+        reason = r.get("reason") or ""
+        reason_str = f" — {reason}" if reason else ""
+        flag = "  ⚠ over-broad? (force-overridden)" if overrides else ""
+        lines.append(
+            f"{r['id']}  {r['pattern']}  {r.get('action', 'silence')}  "
+            f"{counters}  {expiry}{reason_str}{flag}"
+        )
+    return ToolResult.text(
+        "Active notification silences:\n" + "\n".join(lines)
+    )
+
+
+async def _silence_remove(ctx: ToolContext, args: dict) -> ToolResult:
+    silence_id = str(args.get("silence_id", "")).strip()
+    if not silence_id:
+        return ToolResult.text(
+            "notification_silence remove: 'silence_id' is required."
+        )
+    ok = await ctx.db.delete_silence(silence_id)
+    if not ok:
+        return ToolResult.text(f"No silence found with id {silence_id}.")
+    if ctx.notification_service:
+        ctx.notification_service.invalidate_silence_cache()
+    return ToolResult.text(f"Silence removed: {silence_id}.")
+
+
 async def react_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.engine:
         return ToolResult.text("Engine not available.")
@@ -294,6 +474,27 @@ PROPOSE_ACTION_SPEC = ToolSpec(
     handler=propose_action_handler,
 )
 
+NOTIFICATION_SILENCE_SPEC = ToolSpec(
+    name="notification_silence",
+    description=(
+        "Manage notification silence rules — deterministic, server-side "
+        "suppression of known-benign alert classes (the monitoring-system "
+        "'silence' pattern). A matching 'notify' is persisted but NOT "
+        "delivered; priority is never changed, and the sending agent is "
+        "told it was silenced (with reason + pattern) so it can re-send "
+        "with force=true if the match was wrong.\n"
+        "ops: 'add' (pattern [required] + reason [+ ttl_hours, example]), "
+        "'list' (active rules with hit/override counts — a non-zero "
+        "override count flags an over-broad pattern), 'remove' (silence_id).\n"
+        "CONTRACT: create a silence ONLY on explicit user instruction or a "
+        "recorded MEMORY ruling that an alert class is benign, and always "
+        "state the rule you created. Questions and approvals are never "
+        "silenced."
+    ),
+    input_schema=NOTIFICATION_SILENCE_SCHEMA,
+    handler=notification_silence_handler,
+)
+
 REACT_SPEC = ToolSpec(
     name="react",
     description=(
@@ -331,6 +532,7 @@ NOTIFICATION_SPECS = [
     NOTIFY_SPEC,
     ASK_USER_SPEC,
     PROPOSE_ACTION_SPEC,
+    NOTIFICATION_SILENCE_SPEC,
     REACT_SPEC,
     SEND_STICKER_SPEC,
     SEND_FILE_SPEC,

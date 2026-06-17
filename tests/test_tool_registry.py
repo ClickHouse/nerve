@@ -273,6 +273,9 @@ class TestConcurrentSessionIsolation:
 
         mock_service = AsyncMock()
         mock_service.send_notification = AsyncMock(side_effect=fake_send_notification)
+        # The notify handler reads the row back to detect silenced/force
+        # outcomes; None keeps it on the plain "sent" path for this test.
+        mock_service.db.get_notification = AsyncMock(return_value=None)
 
         ctx_a = ToolContext(session_id="session-A", notification_service=mock_service)
         ctx_b = ToolContext(session_id="session-B", notification_service=mock_service)
