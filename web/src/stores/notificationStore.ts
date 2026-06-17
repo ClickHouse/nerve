@@ -24,6 +24,23 @@ export interface Notification {
   metadata?: string | Record<string, unknown> | null;
 }
 
+// A deterministic suppression rule. Matched notify's are persisted as
+// status='silenced' and not delivered; priority is never changed.
+export interface Silence {
+  id: string;
+  pattern: string;
+  action: string;
+  reason: string;
+  created_by: string;
+  created_at: string;
+  expires_at: string | null;
+  hit_count: number;
+  last_hit_at: string | null;
+  override_count: number;
+  last_override_at: string | null;
+  enabled: number;
+}
+
 interface NotificationState {
   notifications: Notification[];
   pendingCount: number;
@@ -31,6 +48,7 @@ interface NotificationState {
   typeFilter: string;
   loading: boolean;
   toastQueue: Notification[];
+  silences: Silence[];
 
   loadNotifications: () => Promise<void>;
   setFilter: (f: string) => void;
@@ -41,6 +59,9 @@ interface NotificationState {
   handleWSNotification: (data: any) => void;
   handleWSNotificationAnswered: (data: any) => void;
   dismissToast: (id: string) => void;
+  loadSilences: () => Promise<void>;
+  addSilence: (pattern: string, reason: string, ttlHours: number) => Promise<void>;
+  removeSilence: (id: string) => Promise<void>;
 }
 
 export const useNotificationStore = create<NotificationState>((set, get) => ({
@@ -50,6 +71,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   typeFilter: '',
   loading: true,
   toastQueue: [],
+  silences: [],
 
   loadNotifications: async () => {
     try {
@@ -104,6 +126,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   },
 
   handleWSNotification: (data: any) => {
+    const silenced = data.silenced === true;
     const notif: Notification = {
       id: data.notification_id,
       session_id: data.session_id,
@@ -112,7 +135,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       title: data.title,
       body: data.body,
       priority: data.priority,
-      status: 'pending',
+      status: silenced ? 'silenced' : 'pending',
       options: data.options,
       answer: null,
       answered_by: null,
@@ -122,12 +145,23 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       target_kind: data.target_kind ?? null,
       target_id: data.target_id ?? null,
       option_labels: data.option_labels ?? null,
+      // Carry the silence context inline so the greyed row can render
+      // the reason/pattern without a metadata round-trip.
+      metadata: silenced
+        ? {
+            silenced_by: data.silenced_by ?? null,
+            silence_reason: data.silence_reason ?? '',
+            silence_pattern: data.silence_pattern ?? '',
+          }
+        : null,
     };
 
     set(s => ({
       notifications: [notif, ...s.notifications],
-      pendingCount: s.pendingCount + 1,
-      toastQueue: [...s.toastQueue, notif],
+      // A silenced notification was NOT delivered/escalated — it does not
+      // count as pending and never raises a toast/sound.
+      pendingCount: silenced ? s.pendingCount : s.pendingCount + 1,
+      toastQueue: silenced ? s.toastQueue : [...s.toastQueue, notif],
     }));
   },
 
@@ -144,5 +178,33 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
 
   dismissToast: (id: string) => {
     set(s => ({ toastQueue: s.toastQueue.filter(n => n.id !== id) }));
+  },
+
+  loadSilences: async () => {
+    try {
+      const data = await api.listSilences();
+      set({ silences: data.silences });
+    } catch (e) {
+      console.error('Failed to load silences:', e);
+    }
+  },
+
+  addSilence: async (pattern: string, reason: string, ttlHours: number) => {
+    try {
+      await api.createSilence(pattern, reason, ttlHours);
+      get().loadSilences();
+    } catch (e) {
+      console.error('Failed to create silence:', e);
+      throw e;
+    }
+  },
+
+  removeSilence: async (id: string) => {
+    try {
+      await api.deleteSilence(id);
+      get().loadSilences();
+    } catch (e) {
+      console.error('Failed to delete silence:', e);
+    }
   },
 }));
