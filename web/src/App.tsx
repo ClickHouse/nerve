@@ -104,17 +104,20 @@ function GlobalShortcuts() {
       description: 'Focus session search',
       section: 'global',
       action: () => {
-        if (!window.location.pathname.startsWith('/chat')) {
-          navigate('/chat');
-        }
-        // The sidebar input is unmounted unless hovered/focused/searched.
-        // Defer until after route change, then ensure the sidebar is open
-        // and ask it to mount + focus its search input.
-        setTimeout(() => {
+        const focusNow = () => {
           const store = useChatStore.getState();
           if (store.sidebarCollapsed) store.toggleSidebar();
+          // The sidebar search input is unmounted until something asks for it.
+          // requestSearchFocus bumps a nonce the sidebar subscribes to.
           store.requestSearchFocus();
-        }, 0);
+        };
+        if (!window.location.pathname.startsWith('/chat')) {
+          navigate('/chat');
+          // Wait one tick for ChatPage + SessionSidebar to mount.
+          setTimeout(focusNow, 0);
+        } else {
+          focusNow();
+        }
       },
     },
     {
