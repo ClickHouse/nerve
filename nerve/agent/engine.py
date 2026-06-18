@@ -1402,23 +1402,37 @@ class AgentEngine:
             ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
 
         where <encoded-cwd> is the absolute cwd path with every '/'
-        replaced by '-'.  If the file is gone (typically because the
-        container's /root/.claude was not bind-mounted and got wiped on
-        restart), passing --resume to the CLI fails with exit 1.
+        replaced by '-'.  The CLI resolves the cwd symlink before
+        encoding, so when the workspace is itself a symlink (e.g. the
+        Docker deployment's /root/nerve-workspace -> /Users/.../
+        nerve-workspace) the history lives under the *realpath*-encoded
+        directory, not the symlink-encoded one.  Check the realpath
+        first and fall back to the unresolved path for non-symlinked
+        layouts.
+
+        If the file is gone (typically because the container's
+        /root/.claude was not bind-mounted and got wiped on restart),
+        passing --resume to the CLI fails with exit 1.
 
         Best-effort check: any unexpected error returns True so we still
         attempt the resume and let the CLI surface the real error,
         rather than masking unrelated bugs.
         """
         try:
-            cwd = str(self.config.workspace)
-            encoded = cwd.replace("/", "-")
-            jsonl = (
-                os.path.expanduser("~/.claude/projects")
-                + "/" + encoded
-                + "/" + sdk_session_id + ".jsonl"
-            )
-            return os.path.isfile(jsonl)
+            projects = os.path.expanduser("~/.claude/projects")
+            workspace = str(self.config.workspace)
+            bases = [os.path.realpath(workspace)]
+            if workspace not in bases:
+                bases.append(workspace)
+            for base in bases:
+                encoded = base.replace("/", "-")
+                jsonl = (
+                    projects + "/" + encoded
+                    + "/" + sdk_session_id + ".jsonl"
+                )
+                if os.path.isfile(jsonl):
+                    return True
+            return False
         except Exception as e:
             logger.debug(
                 "Could not stat resume jsonl for %s: %s, assuming present",
