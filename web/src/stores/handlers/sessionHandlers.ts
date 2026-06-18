@@ -123,10 +123,13 @@ export function handleSessionSwitched(
   get: Get,
   _set: Set,
 ): void {
-  // Server assigned a session (e.g., on WebSocket connect via auto-session)
-  if (msg.session_id && !get().activeSession) {
-    get().switchSession(msg.session_id);
-  }
+  // Server assigned a session (e.g., on WebSocket connect via auto-session).
+  // Don't override if the URL already names a specific chat — ChatPage's
+  // useEffect[sessionId] will switch to it. Otherwise cmd+click on a chat
+  // would briefly land on the server's default and then flip to the URL.
+  if (!msg.session_id || get().activeSession) return;
+  if (typeof window !== 'undefined' && /^\/chat\/.+/.test(window.location.pathname)) return;
+  get().switchSession(msg.session_id);
 }
 
 export function handleSessionForked(

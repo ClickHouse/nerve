@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2 } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate } from '../../utils/dateGroups';
@@ -31,11 +32,10 @@ function formatShortDate(dateStr: string): string {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect, onCreate, onDelete, collapsed }: {
+export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed }: {
   sessions: Session[];
   activeSession: string;
   agentStatus: AgentStatus;
-  onSelect: (id: string) => void;
   onCreate: () => void;
   onDelete: (id: string) => void;
   collapsed?: boolean;
@@ -46,14 +46,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
   const [searchFocused, setSearchFocused] = useState(false);
   const [searchMounted, setSearchMounted] = useState(false);
   const [searchVisible, setSearchVisible] = useState(false);
+  // Programmatic mount trigger — set true when something (e.g. Cmd+K) wants
+  // the search input visible without a mouse hover or focus event.
+  const [searchPinned, setSearchPinned] = useState(false);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar } = useChatStore();
+  const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   const isSearching = localQuery.trim().length > 0;
-  const shouldShowSearch = searchHovered || searchFocused || isSearching;
+  const shouldShowSearch = searchHovered || searchFocused || isSearching || searchPinned;
 
   // Mount/unmount the search input with a fade transition (200ms).
   useEffect(() => {
@@ -79,6 +83,29 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
       return () => cancelAnimationFrame(id);
     }
   }, [searchMounted, searchVisible]);
+
+  // External "focus the search" request (e.g. Cmd+K). Pin the input so it
+  // mounts; the focus effect below takes over once it's in the DOM.
+  useEffect(() => {
+    if (searchFocusNonce > 0) setSearchPinned(true);
+  }, [searchFocusNonce]);
+
+  // Once the pinned input is in the DOM, focus + select it. We focus as soon
+  // as it's mounted (not after the fade-in) so the browser's focus event
+  // races less; the CSS transition still runs for the visual fade.
+  useEffect(() => {
+    if (searchPinned && searchMounted && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [searchPinned, searchMounted]);
+
+  // Release the pin only after onFocus has confirmed the focus landed —
+  // dropping it earlier risks a brief render with pinned=false AND
+  // focused=false, which collapses shouldShowSearch and fades the input out.
+  useEffect(() => {
+    if (searchPinned && searchFocused) setSearchPinned(false);
+  }, [searchPinned, searchFocused]);
 
   // Clean up pending close timer on unmount.
   useEffect(() => {
@@ -244,7 +271,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                       session={s}
                       isActive={s.id === activeSession}
                       isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
-                      onSelect={onSelect}
                       onDelete={onDelete}
                       onRename={renameSession}
                       onToggleStar={toggleStar}
@@ -269,7 +295,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     session={s}
                     isActive={s.id === activeSession}
                     isRunning
-                    onSelect={onSelect}
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
@@ -290,7 +315,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     session={s}
                     isActive={s.id === activeSession}
                     isRunning={false}
-                    onSelect={onSelect}
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
@@ -315,7 +339,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     session={s}
                     isActive={s.id === activeSession}
                     isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
-                    onSelect={onSelect}
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
@@ -351,10 +374,10 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                 </button>
 
                 {systemExpanded && systemSessions.map((s) => (
-                  <div
+                  <Link
                     key={s.id}
-                    onClick={() => onSelect(s.id)}
-                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors
+                    to={`/chat/${s.id}`}
+                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors no-underline
                       ${s.id === activeSession
                         ? 'bg-accent/10 text-text-muted'
                         : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
@@ -369,7 +392,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                       isActive={s.id === activeSession}
                       isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
                     />
-                  </div>
+                  </Link>
                 ))}
               </div>
             )}
@@ -417,11 +440,10 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRename, onToggleStar, showDate }: {
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, showDate }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
-  onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => Promise<void>;
   onToggleStar: (id: string) => Promise<void>;
@@ -478,9 +500,9 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
   }
 
   return (
-    <div
-      onClick={() => onSelect(session.id)}
-      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors
+    <Link
+      to={`/chat/${session.id}`}
+      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -507,7 +529,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
       {/* Menu trigger: starred → show star, on hover → three dots; unstarred → three dots on hover */}
       <div className="relative shrink-0" ref={menuRef}>
         <button
-          onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuOpen(!menuOpen); }}
           className={`p-0.5 cursor-pointer transition-opacity ${
             session.starred
               ? 'text-hue-yellow opacity-100 [&>*:first-child]:block [&>*:last-child]:hidden hover:[&>*:first-child]:hidden hover:[&>*:last-child]:block hover:text-text-muted'
@@ -528,6 +550,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
           <div className="absolute right-0 top-full mt-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[140px]">
             <button
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 onToggleStar(session.id);
                 setMenuOpen(false);
@@ -539,6 +562,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
             </button>
             <button
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 setRenameValue(cleanTitle(session));
                 setRenaming(true);
@@ -552,6 +576,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
             <div className="border-t border-border my-1" />
             <button
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 setMenuOpen(false);
                 onDelete(session.id);
@@ -564,6 +589,6 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
           </div>
         )}
       </div>
-    </div>
+    </Link>
   );
 }

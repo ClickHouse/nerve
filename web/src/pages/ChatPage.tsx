@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -32,6 +32,7 @@ function formatModelLabel(model: string): string {
 
 export function ChatPage() {
   const { sessionId } = useParams();
+  const navigate = useNavigate();
   const {
     sessions, activeSession, messages,
     streamingBlocks, isStreaming, loading,
@@ -41,6 +42,26 @@ export function ChatPage() {
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSidebar, openFilesPanel,
   } = useChatStore();
+
+  // URL → activeSession is handled by the useEffect[sessionId] below.
+  // activeSession → URL is intentionally NOT done as a mirror effect —
+  // that races with `loadSessions()` (which starts with sessions=[], so any
+  // "URL is unknown to us" check is unreliable on a fresh tab) and with the
+  // server's `session_switched` WS message that fires before our store
+  // knows the URL's session exists. Instead we navigate explicitly from
+  // each call-site that changes the active session without a URL change.
+  const handleCreateSession = useCallback(async () => {
+    await createSession();
+    const next = useChatStore.getState().activeSession;
+    if (next) navigate(`/chat/${next}`, { replace: true });
+  }, [createSession, navigate]);
+
+  const handleDeleteSession = useCallback(async (id: string) => {
+    await deleteSession(id);
+    const next = useChatStore.getState().activeSession;
+    if (next) navigate(`/chat/${next}`, { replace: true });
+    else navigate('/chat', { replace: true });
+  }, [deleteSession, navigate]);
 
   // Chat-scoped keyboard shortcuts. Global ones (new chat, search, modal,
   // Esc cascade) live in <GlobalShortcuts /> in App.tsx.
@@ -89,13 +110,29 @@ export function ChatPage() {
         const id = useChatStore.getState().activeSession;
         if (!id) return;
         if (window.confirm('Delete this conversation?')) {
-          void useChatStore.getState().deleteSession(id);
+          void handleDeleteSession(id);
         }
       },
     },
-  ], []);
+  ], [handleDeleteSession]);
 
   useKeyboardShortcuts(chatShortcuts);
+
+  // Mirror the active session's title into the browser tab. Same cleaning
+  // rules as the sidebar (strip leading '#' and 'Implement:' prefix).
+  // Restored to plain "Nerve" when leaving the chat page or when there's
+  // no active session yet.
+  useEffect(() => {
+    const session = sessions.find(s => s.id === activeSession);
+    if (!session) {
+      document.title = 'Nerve';
+      return;
+    }
+    const raw = session.title || session.id;
+    const clean = raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
+    document.title = clean;
+    return () => { document.title = 'Nerve'; };
+  }, [activeSession, sessions]);
 
   // Langfuse deep-link status — fetched once. Shows a small "external link"
   // icon when observability is enabled so we can jump from a session to
@@ -125,6 +162,7 @@ export function ChatPage() {
     });
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+
   const statusLabel = agentStatus.state === 'tool'
     ? `Using ${agentStatus.toolName}...`
     : STATUS_LABELS[agentStatus.state] || null;
@@ -138,9 +176,8 @@ export function ChatPage() {
         sessions={sessions}
         activeSession={activeSession}
         agentStatus={agentStatus}
-        onSelect={switchSession}
-        onCreate={() => createSession()}
-        onDelete={deleteSession}
+        onCreate={handleCreateSession}
+        onDelete={handleDeleteSession}
         collapsed={sidebarCollapsed}
       />
 

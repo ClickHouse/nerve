@@ -1,14 +1,19 @@
 import { useEffect } from 'react';
-import { isTypingTarget, matchesCombo, type ShortcutDef } from '../utils/keyboard';
+import { isSafeInInputCombo, isTypingTarget, matchesCombo, type ShortcutDef } from '../utils/keyboard';
 
 /**
  * Attach a `document`-level keydown listener that fires the first shortcut
  * whose combo matches the event. Order matters: more specific shortcuts
  * should come first.
  *
- * Skips when focus is inside an editable element unless the shortcut sets
- * `allowInInput: true`. Skips when the shortcut's `when()` predicate is
- * defined and returns false.
+ * When focus is inside an editable element, shortcuts still fire if either:
+ * - the shortcut sets `allowInInput: true`, or
+ * - the combo is "safe in input" by default (Cmd/Ctrl combos and Escape) —
+ *   pressing it can't be confused with typing.
+ *
+ * Set `allowInInput: false` explicitly to opt out of the safe-by-default
+ * behavior. Skips when the shortcut's `when()` predicate is defined and
+ * returns false.
  *
  * Pass the same array reference across renders if you can — otherwise we
  * re-register the listener on every render. In practice the callers below
@@ -20,7 +25,10 @@ export function useKeyboardShortcuts(shortcuts: ShortcutDef[]): void {
     const handler = (e: KeyboardEvent) => {
       const typing = isTypingTarget(e.target);
       for (const sc of shortcuts) {
-        if (typing && !sc.allowInInput) continue;
+        if (typing) {
+          const allowed = sc.allowInInput ?? isSafeInInputCombo(sc.combo);
+          if (!allowed) continue;
+        }
         if (sc.when && !sc.when()) continue;
         if (!matchesCombo(e, sc.combo)) continue;
         e.preventDefault();

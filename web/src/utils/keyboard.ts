@@ -28,6 +28,17 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   return false;
 }
 
+/**
+ * A combo is "safe in input" if pressing it can't be confused with typing —
+ * either it requires Cmd/Ctrl, or it's a non-printable key like Escape.
+ * Used as the default for `allowInInput` when a shortcut doesn't specify.
+ */
+export function isSafeInInputCombo(combo: ShortcutCombo): boolean {
+  if (combo.mod) return true;
+  if (combo.key === 'Escape') return true;
+  return false;
+}
+
 export interface ShortcutCombo {
   /** Requires Cmd (Mac) / Ctrl (other). */
   mod?: boolean;
@@ -49,7 +60,12 @@ export interface ShortcutDef {
   section: 'global' | 'chat' | 'input';
   /** Only fire when this returns true (e.g. only on /chat). */
   when?: () => boolean;
-  /** Default false: skipped when focus is in an editable element. */
+  /**
+   * Override the default behavior when focus is in an editable element.
+   * If unset, combos with Cmd/Ctrl or Escape fire by default; everything
+   * else is skipped. Set true to force-allow a printable combo, false to
+   * force-skip a Cmd/Ctrl combo.
+   */
   allowInInput?: boolean;
   action: (e: KeyboardEvent) => void;
 }

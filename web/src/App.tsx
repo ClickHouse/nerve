@@ -93,9 +93,11 @@ function GlobalShortcuts() {
       combo: { mod: true, shift: true, key: 'o' },
       description: 'New chat',
       section: 'global',
-      action: () => {
+      action: async () => {
         navigate('/chat');
-        void useChatStore.getState().createSession();
+        await useChatStore.getState().createSession();
+        const next = useChatStore.getState().activeSession;
+        if (next) navigate(`/chat/${next}`, { replace: true });
       },
     },
     {
@@ -103,22 +105,21 @@ function GlobalShortcuts() {
       combo: { mod: true, key: 'k' },
       description: 'Focus session search',
       section: 'global',
-      allowInInput: true, // allow even when focus is in chat textarea
       action: () => {
+        const focusNow = () => {
+          const store = useChatStore.getState();
+          if (store.sidebarCollapsed) store.toggleSidebar();
+          // The sidebar search input is unmounted until something asks for it.
+          // requestSearchFocus bumps a nonce the sidebar subscribes to.
+          store.requestSearchFocus();
+        };
         if (!window.location.pathname.startsWith('/chat')) {
           navigate('/chat');
+          // Wait one tick for ChatPage + SessionSidebar to mount.
+          setTimeout(focusNow, 0);
+        } else {
+          focusNow();
         }
-        // Defer focus until after route change paints the sidebar input.
-        setTimeout(() => {
-          if (useChatStore.getState().sidebarCollapsed) {
-            useChatStore.getState().toggleSidebar();
-          }
-          const el = document.getElementById('nerve-sidebar-search');
-          if (el instanceof HTMLInputElement) {
-            el.focus();
-            el.select();
-          }
-        }, 0);
       },
     },
     {
