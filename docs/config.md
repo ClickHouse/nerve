@@ -277,6 +277,29 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 
+## Retention
+
+Opt-in `nerve.db` maintenance. Disabled by default. When enabled, a background
+pass every `interval_hours` drops the verbose `blocks`/`thinking` JSON of old,
+already-memorized messages (keeping the rendered `content`), prunes append-only
+telemetry and file snapshots older than `retention_days`, and checkpoints the
+WAL. This frees space inside the database but does not shrink the file on disk;
+run `nerve db vacuum` once (with the daemon stopped) to reclaim it.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `retention.enabled` | bool | `false` | Master switch for the background retention pass |
+| `retention.retention_full_days` | int | `30` | Compact `blocks`/`thinking` of memorized messages older than this |
+| `retention.retention_days` | int | `90` | Prune telemetry and file snapshots older than this |
+| `retention.interval_hours` | int | `24` | How often the background pass runs |
+
+Manual commands (run regardless of `enabled`):
+
+- `nerve db prune [--dry-run]` runs one pass immediately. `--dry-run` reports
+  what would change without mutating.
+- `nerve db vacuum` rewrites the file to reclaim freed pages. It takes a write
+  lock, so stop the daemon first.
+
 ## Cron
 
 | Key | Type | Default | Description |

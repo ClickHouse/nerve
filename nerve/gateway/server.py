@@ -262,6 +262,33 @@ async def lifespan(app: FastAPI):
 
     notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
 
+    # Periodic DB retention (opt-in). Compacts old memorized messages'
+    # blocks/thinking JSON and prunes append-only telemetry + file snapshots,
+    # then checkpoints the WAL. No-ops unless retention.enabled is set. The
+    # file shrink (VACUUM) is an explicit operator step (`nerve db vacuum`),
+    # never on this loop.
+    async def _periodic_db_retention():
+        if not config.retention.enabled:
+            return
+        interval = config.retention.interval_hours * 3600
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                report = await db.run_retention(
+                    retention_days=config.retention.retention_days,
+                    retention_full_days=config.retention.retention_full_days,
+                )
+                if (
+                    report.get("messages_compacted")
+                    or report.get("telemetry_deleted")
+                    or report.get("snapshots_deleted")
+                ):
+                    logger.info("DB retention: %s", report)
+            except Exception as e:
+                logger.error("DB retention failed: %s", e)
+
+    db_retention_task = asyncio.create_task(_periodic_db_retention())
+
     # Periodic backup (opt-in). Hourly tick; runs a bundle when the newest
     # one in the target dir is older than interval_hours (or none exists).
     # The heavy work (consistent DB snapshots + tar) runs in a thread so it
@@ -440,6 +467,7 @@ async def lifespan(app: FastAPI):
     if cron_task:
         await cron_task.stop()
 
+    db_retention_task.cancel()
     notify_expiry_task.cancel()
     backup_task.cancel()
     idle_sweep_task.cancel()
