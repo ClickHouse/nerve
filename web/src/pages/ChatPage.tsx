@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -29,6 +29,7 @@ function formatModelLabel(model: string): string {
 
 export function ChatPage() {
   const { sessionId } = useParams();
+  const navigate = useNavigate();
   const {
     sessions, activeSession, messages,
     streamingBlocks, isStreaming, loading,
@@ -79,6 +80,16 @@ export function ChatPage() {
     });
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keep the URL in sync with activeSession. Covers createSession (which sets
+  // activeSession but can't navigate from inside the store), server-driven
+  // session_switched WS messages, and deleteSession's auto-pick fallback.
+  // `replace` avoids polluting browser history with intra-chat hops.
+  useEffect(() => {
+    if (activeSession && activeSession !== sessionId) {
+      navigate(`/chat/${activeSession}`, { replace: true });
+    }
+  }, [activeSession, sessionId, navigate]);
+
   const statusLabel = agentStatus.state === 'tool'
     ? `Using ${agentStatus.toolName}...`
     : STATUS_LABELS[agentStatus.state] || null;
@@ -92,7 +103,6 @@ export function ChatPage() {
         sessions={sessions}
         activeSession={activeSession}
         agentStatus={agentStatus}
-        onSelect={switchSession}
         onCreate={() => createSession()}
         onDelete={deleteSession}
         collapsed={sidebarCollapsed}
