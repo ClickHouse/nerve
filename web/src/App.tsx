@@ -68,4 +68,84 @@ function App() {
   );
 }
 
+<<<<<<< HEAD
+=======
+/**
+ * Global keyboard shortcuts — work on every page. Page-scoped chat shortcuts
+ * live in ChatPage so they only activate while the chat view is mounted.
+ *
+ * Esc behavior is intentionally cascaded:
+ *   1. ShortcutsModal swallows Esc first via capture-phase listener.
+ *   2. SessionSidebar's own listener clears search when active.
+ *   3. This handler stops generation only if streaming and nothing else
+ *      is claiming Esc (modal closed, search empty).
+ */
+function GlobalShortcuts() {
+  const navigate = useNavigate();
+
+  const shortcuts = useMemo<ShortcutDef[]>(() => [
+    {
+      id: 'global-new-chat',
+      combo: { mod: true, shift: true, key: 'o' },
+      description: 'New chat',
+      section: 'global',
+      action: async () => {
+        navigate('/chat');
+        await useChatStore.getState().createSession();
+        const next = useChatStore.getState().activeSession;
+        if (next) navigate(`/chat/${next}`, { replace: true });
+      },
+    },
+    {
+      id: 'global-focus-search',
+      combo: { mod: true, key: 'k' },
+      description: 'Focus session search',
+      section: 'global',
+      action: () => {
+        const focusNow = () => {
+          const store = useChatStore.getState();
+          if (store.sidebarCollapsed) store.toggleSidebar();
+          // The sidebar search input is unmounted until something asks for it.
+          // requestSearchFocus bumps a nonce the sidebar subscribes to.
+          store.requestSearchFocus();
+        };
+        if (!window.location.pathname.startsWith('/chat')) {
+          navigate('/chat');
+          // Wait one tick for ChatPage + SessionSidebar to mount.
+          setTimeout(focusNow, 0);
+        } else {
+          focusNow();
+        }
+      },
+    },
+    {
+      id: 'global-shortcuts-modal',
+      combo: { mod: true, key: '/' },
+      description: 'Show keyboard shortcuts',
+      section: 'global',
+      allowInInput: true,
+      action: () => useUIStore.getState().toggleShortcutsModal(),
+    },
+    {
+      id: 'global-esc-stop',
+      combo: { key: 'Escape' },
+      description: 'Stop generation',
+      section: 'global',
+      // Only fire when nothing else is claiming Esc:
+      // - modal handles its own Esc in capture phase
+      // - sidebar handles Esc only while searching
+      when: () => {
+        if (useUIStore.getState().shortcutsModalOpen) return false;
+        if (!useChatStore.getState().isStreaming) return false;
+        return true;
+      },
+      action: () => useChatStore.getState().stopSession(),
+    },
+  ], [navigate]);
+
+  useKeyboardShortcuts(shortcuts);
+  return null;
+}
+
+>>>>>>> bd63a27 (fix(chat): cmd+click opens the correct chat in a new tab)
 export default App;
