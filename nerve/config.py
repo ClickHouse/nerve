@@ -479,6 +479,40 @@ class CronConfig:
 
 
 @dataclass
+class BackupConfig:
+    """Scheduled backup of Nerve state to a local directory.
+
+    Opt-in: set ``target_dir`` to an external mount or a synced directory
+    (the off-box copy is what protects against a disk failure) and flip
+    ``enabled`` on. A bundle is a single ``nerve-backup-<host>-<ts>.tar.zst``
+    file produced by :mod:`nerve.backup`. The scheduled task notifies on
+    failure (silent backups that fail are worse than none).
+    """
+
+    enabled: bool = False            # opt-in; set target_dir first
+    target_dir: str = ""             # e.g. /mnt/backup/nerve or a synced dir
+    interval_hours: int = 24
+    retention_count: int = 7
+    include_workspace: bool = True
+    workspace_excludes: list[str] = field(default_factory=list)  # extra globs
+    notify_on_failure: bool = True   # high-priority notify
+    notify_on_success: bool = False  # low-priority digest line
+
+    @classmethod
+    def from_dict(cls, d: dict) -> BackupConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            target_dir=d.get("target_dir", ""),
+            interval_hours=int(d.get("interval_hours", 24)),
+            retention_count=int(d.get("retention_count", 7)),
+            include_workspace=bool(d.get("include_workspace", True)),
+            workspace_excludes=list(d.get("workspace_excludes", []) or []),
+            notify_on_failure=bool(d.get("notify_on_failure", True)),
+            notify_on_success=bool(d.get("notify_on_success", False)),
+        )
+
+
+@dataclass
 class SessionsConfig:
     archive_after_days: int = 30
     max_sessions: int = 500
@@ -953,6 +987,7 @@ class NerveConfig:
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
@@ -1069,6 +1104,7 @@ class NerveConfig:
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {})),
+            backup=BackupConfig.from_dict(d.get("backup", {})),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),

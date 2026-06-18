@@ -342,6 +342,17 @@ export const api = {
   dismissAllNotifications: () =>
     request<{ dismissed: number }>('/notifications/dismiss-all', { method: 'POST' }),
 
+  // Notification silences (deterministic suppression rules)
+  listSilences: () =>
+    request<{ silences: any[] }>('/notifications/silences'),
+  createSilence: (pattern: string, reason: string, ttl_hours: number) =>
+    request<any>('/notifications/silences', {
+      method: 'POST',
+      body: JSON.stringify({ pattern, reason, ttl_hours }),
+    }),
+  deleteSilence: (id: string) =>
+    request<any>(`/notifications/silences/${id}`, { method: 'DELETE' }),
+
   // houseofagents
   getHoaStatus: () =>
     request<{ enabled: boolean; available: boolean; version: string | null; default_mode: string; default_agents: string[] }>('/houseofagents/status'),

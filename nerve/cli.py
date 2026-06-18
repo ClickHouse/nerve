@@ -917,6 +917,49 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         if config.cron.jobs_file.exists():
             lines.append(f"[OK] User crons: {config.cron.jobs_file}")
 
+    # Check backups
+    backup_cfg = getattr(config, "backup", None)
+    if backup_cfg is not None and backup_cfg.enabled:
+        if not backup_cfg.target_dir:
+            warnings.append(
+                "[WARN] backup.enabled is true but backup.target_dir is empty "
+                "— no backups will run"
+            )
+        else:
+            try:
+                from nerve import backup as _backup_mod
+
+                target = Path(backup_cfg.target_dir).expanduser()
+                age = _backup_mod.latest_bundle_age_seconds(target)
+                kept = len(_backup_mod.list_bundles(target))
+                stale_after = 2 * max(1, backup_cfg.interval_hours) * 3600
+                if age is None:
+                    warnings.append(
+                        f"[WARN] Backups enabled but none found in {target}"
+                    )
+                else:
+                    age_h = age / 3600
+                    age_str = (
+                        f"{age_h:.1f}h" if age_h < 48 else f"{age_h / 24:.1f}d"
+                    )
+                    if age > stale_after:
+                        warnings.append(
+                            f"[WARN] Last backup is {age_str} old "
+                            f"(> 2× interval of {backup_cfg.interval_hours}h) "
+                            f"— check the scheduled job ({target})"
+                        )
+                    else:
+                        lines.append(
+                            f"[OK] Backups: last {age_str} ago, {kept} kept in {target}"
+                        )
+            except Exception as e:
+                warnings.append(f"[WARN] Backup check failed: {e}")
+    else:
+        lines.append(
+            "[--] Backups not configured — set backup.target_dir + enabled to "
+            "protect ~/.nerve against disk loss"
+        )
+
     # Check external tools
     import shutil
     for tool_name in ["gog", "gh"]:
@@ -1141,6 +1184,144 @@ def cron(ctx: click.Context, job_id: str) -> None:
             await close_db()
 
     asyncio.run(_run())
+
+
+@main.command()
+@click.option("--output", "-o", default=None, help="Target directory (default: backup.target_dir from config)")
+@click.option("--state-only", is_flag=True, help="Back up ~/.nerve state only (skip workspace BRAIN)")
+@click.option("--no-secrets", is_flag=True, help="Omit secrets (mcp-token, telegram session, certs, config.local.yaml)")
+@click.option("--quiet", "-q", is_flag=True, help="Only print errors")
+@click.pass_context
+def backup(ctx: click.Context, output: str | None, state_only: bool, no_secrets: bool, quiet: bool) -> None:
+    """Create a portable backup bundle of Nerve state.
+
+    Snapshots the SQLite DBs (consistent even while Nerve runs), the memU
+    sidecars, secrets, cron jobs, and the workspace BRAIN into a single
+    ``nerve-backup-<host>-<ts>.tar.zst`` file. Works without a running server.
+    """
+    from nerve import backup as backup_mod
+
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+
+    target = output or config.backup.target_dir
+    if not target:
+        raise click.ClickException(
+            "No target directory. Pass --output DIR, or set backup.target_dir "
+            "in config.yaml (an external mount or synced dir is recommended)."
+        )
+
+    nerve_dir = PID_DIR
+    include_workspace = config.backup.include_workspace and not state_only
+
+    if not quiet:
+        click.echo(f"Backing up to {target} ...")
+    try:
+        result = backup_mod.create_backup(
+            nerve_dir=nerve_dir,
+            workspace=config.workspace,
+            output_dir=Path(target).expanduser(),
+            config_dir=config_dir,
+            include_workspace=include_workspace,
+            include_secrets=not no_secrets,
+            state_only=state_only,
+            workspace_excludes=config.backup.workspace_excludes,
+        )
+    except backup_mod.BackupError as e:
+        raise click.ClickException(str(e))
+
+    if not quiet:
+        c = result.counts
+        click.echo(f"  Bundle:   {result.path}")
+        click.echo(f"  Size:     {result.size / (1024 ** 2):.1f} MB ({result.compression})")
+        click.echo(f"  Files:    {result.file_count}")
+        click.echo(
+            f"  Parity:   sessions={c.get('sessions')}, messages={c.get('messages')}, "
+            f"tasks={c.get('tasks')}, memU={c.get('memu_items')}"
+        )
+        if not result.include_secrets:
+            click.echo("  Secrets:  OMITTED (--no-secrets) — re-provision on restore")
+        if not result.include_workspace:
+            click.echo("  Workspace: skipped (state-only)")
+
+    # Apply retention when writing to the configured target.
+    if config.backup.retention_count and target == config.backup.target_dir:
+        deleted = backup_mod.prune(Path(target).expanduser(), config.backup.retention_count)
+        if deleted and not quiet:
+            click.echo(f"  Pruned:   {len(deleted)} old bundle(s) (keep {config.backup.retention_count})")
+
+
+@main.command()
+@click.argument("bundle")
+@click.option("--verify-only", is_flag=True, help="Check integrity without installing")
+@click.option("--force", is_flag=True, help="Relocate a non-empty ~/.nerve and restore over it")
+@click.pass_context
+def restore(ctx: click.Context, bundle: str, verify_only: bool, force: bool) -> None:
+    """Verify and restore a backup bundle.
+
+    Refuses to run against a live daemon (stop it first) and refuses to
+    overwrite a non-empty ~/.nerve without --force (which relocates the old
+    dir to ~/.nerve.pre-restore-<ts> rather than deleting it).
+    """
+    from nerve import backup as backup_mod
+
+    config = ctx.obj["config"]
+    bundle_path = Path(bundle).expanduser()
+    if not bundle_path.is_file():
+        raise click.ClickException(f"Bundle not found: {bundle_path}")
+
+    nerve_dir = PID_DIR
+
+    if verify_only:
+        try:
+            report = backup_mod.verify_bundle(bundle_path)
+        except backup_mod.BackupError as e:
+            raise click.ClickException(str(e))
+        m = report.manifest
+        click.echo(f"Bundle:   {bundle_path.name}")
+        click.echo(f"Created:  {m.get('created_at', '?')} on {m.get('host', '?')}")
+        click.echo(f"Nerve:    v{m.get('nerve_version', '?')} (schema v{m.get('schema_version', '?')}, git {m.get('git_sha', '')[:8] or '?'})")
+        click.echo(f"Parity:   {report.summary()}")
+        flags = m.get("flags", {})
+        click.echo(f"Flags:    secrets={flags.get('include_secrets')}, workspace={flags.get('include_workspace')}")
+        for w in report.warnings:
+            click.echo(f"  [WARN] {w}")
+        if report.ok:
+            click.echo("\n[OK] Bundle verified — safe to restore.")
+        else:
+            for e in report.errors:
+                click.echo(f"  [ERR] {e}")
+            click.echo(f"\n{len(report.errors)} error(s) — restore would be refused.")
+            ctx.exit(1)
+        return
+
+    # Only override the bundle's recorded config path when this box actually
+    # has a resolved config (otherwise let the bundle pointer decide — a
+    # faithful disaster-recovery restore).
+    cfg_dir = None
+    if ctx.obj.get("config_source") not in (None, "", "default"):
+        cfg_dir = Path(ctx.obj["config_dir"])
+
+    click.echo(f"Restoring {bundle_path.name} → {nerve_dir} ...")
+    try:
+        report = backup_mod.restore_bundle(
+            bundle_path,
+            nerve_dir=nerve_dir,
+            workspace=config.workspace,
+            config_dir=cfg_dir,
+            force=force,
+        )
+    except backup_mod.BackupError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(f"  Parity:   {report.summary()}")
+    flags = report.manifest.get("flags", {})
+    if not flags.get("include_secrets", True):
+        click.echo(
+            "  [WARN] This bundle had NO secrets — re-provision mcp-token, the "
+            "Telegram session, certs, and config.local.yaml before starting."
+        )
+    click.echo("\nRestore complete. Run 'nerve doctor' to verify, then 'nerve start'.")
 
 
 @main.command("migrate-openclaw")
