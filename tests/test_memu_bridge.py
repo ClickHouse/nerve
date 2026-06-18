@@ -879,3 +879,76 @@ class TestSqlitePragmas:
 
     def test_missing_db_does_not_raise(self, tmp_path):
         MemUBridge._setup_sqlite_pragmas(f"sqlite:///{tmp_path}/nope/missing.sqlite")
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestIndexedUpdateItemForwarding:
+    """Regression: the _indexed_update_item monkeypatch must forward item_id
+    by keyword.
+
+    memu-py 1.4.0's ``SQLiteMemoryItemRepo.update_item`` is keyword-only
+    (``def update_item(self, *, item_id, ...)``). The vector-index wrapper used
+    to forward ``item_id`` positionally, which raised "takes 1 positional
+    argument but 2 positional arguments (and 3 keyword-only arguments) were
+    given" — silently turning every ``memory_update`` tool call into
+    "Failed to update memory". ``delete_item(self, item_id)`` is NOT keyword
+    only, which is why deletes kept working and masked the bug.
+    """
+
+    def test_update_item_is_keyword_only_in_memu(self):
+        import inspect
+        import memu.app.service  # noqa: F401 — initialize package graph first
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        kind = inspect.signature(Repo.update_item).parameters["item_id"].kind
+        assert kind is inspect.Parameter.KEYWORD_ONLY, (
+            "memu update_item contract changed — revisit _indexed_update_item"
+        )
+
+    def test_wrapper_forwards_item_id_as_keyword(self):
+        import memu.app.service  # noqa: F401 — initialize package graph first
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        calls: list[str] = []
+
+        def spy_update(self, *, item_id, memory_type=None, summary=None,
+                       embedding=None, extra=None, tool_record=None):
+            calls.append(item_id)
+            return "spy-result"
+
+        # Snapshot the item-repo methods _patch_sqlite_bugs() reassigns so the
+        # test restores global state and does not leak into other tests.
+        names = (
+            "update_item", "delete_item", "clear_items", "list_items",
+            "create_item", "create_item_reinforce", "vector_search_items",
+        )
+        saved = {n: Repo.__dict__.get(n) for n in names}
+
+        Repo.update_item = spy_update
+        try:
+            # Returns None on success (the body falls through); the observable
+            # effect is that update_item gets wrapped in front of our spy.
+            MemUBridge._patch_sqlite_bugs()
+            assert Repo.update_item is not spy_update
+
+            stub = object.__new__(Repo)  # no _nerve_vec_index → index hook skipped
+            # Exactly how memu's crud layer calls it (all keyword) — used to raise.
+            result = Repo.update_item(
+                stub, item_id="mem-123", memory_type=None,
+                summary="updated", embedding=None,
+            )
+            assert result == "spy-result"
+            assert calls == ["mem-123"]
+        finally:
+            for name, fn in saved.items():
+                if fn is None:
+                    if name in Repo.__dict__:
+                        delattr(Repo, name)
+                else:
+                    setattr(Repo, name, fn)
