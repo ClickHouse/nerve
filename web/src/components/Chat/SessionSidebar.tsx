@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2 } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate } from '../../utils/dateGroups';
@@ -31,11 +32,10 @@ function formatShortDate(dateStr: string): string {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect, onCreate, onDelete, collapsed }: {
+export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed }: {
   sessions: Session[];
   activeSession: string;
   agentStatus: AgentStatus;
-  onSelect: (id: string) => void;
   onCreate: () => void;
   onDelete: (id: string) => void;
   collapsed?: boolean;
@@ -271,7 +271,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                       session={s}
                       isActive={s.id === activeSession}
                       isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
-                      onSelect={onSelect}
                       onDelete={onDelete}
                       onRename={renameSession}
                       onToggleStar={toggleStar}
@@ -296,7 +295,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     session={s}
                     isActive={s.id === activeSession}
                     isRunning
-                    onSelect={onSelect}
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
@@ -317,7 +315,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     session={s}
                     isActive={s.id === activeSession}
                     isRunning={false}
-                    onSelect={onSelect}
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
@@ -342,7 +339,6 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     session={s}
                     isActive={s.id === activeSession}
                     isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
-                    onSelect={onSelect}
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
@@ -378,10 +374,10 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                 </button>
 
                 {systemExpanded && systemSessions.map((s) => (
-                  <div
+                  <Link
                     key={s.id}
-                    onClick={() => onSelect(s.id)}
-                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors
+                    to={`/chat/${s.id}`}
+                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors no-underline
                       ${s.id === activeSession
                         ? 'bg-accent/10 text-text-muted'
                         : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
@@ -396,7 +392,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                       isActive={s.id === activeSession}
                       isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
                     />
-                  </div>
+                  </Link>
                 ))}
               </div>
             )}
@@ -444,11 +440,10 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRename, onToggleStar, showDate }: {
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, showDate }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
-  onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => Promise<void>;
   onToggleStar: (id: string) => Promise<void>;
@@ -505,9 +500,9 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
   }
 
   return (
-    <div
-      onClick={() => onSelect(session.id)}
-      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors
+    <Link
+      to={`/chat/${session.id}`}
+      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -534,7 +529,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
       {/* Menu trigger: starred → show star, on hover → three dots; unstarred → three dots on hover */}
       <div className="relative shrink-0" ref={menuRef}>
         <button
-          onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuOpen(!menuOpen); }}
           className={`p-0.5 cursor-pointer transition-opacity ${
             session.starred
               ? 'text-hue-yellow opacity-100 [&>*:first-child]:block [&>*:last-child]:hidden hover:[&>*:first-child]:hidden hover:[&>*:last-child]:block hover:text-text-muted'
@@ -555,6 +550,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
           <div className="absolute right-0 top-full mt-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[140px]">
             <button
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 onToggleStar(session.id);
                 setMenuOpen(false);
@@ -566,6 +562,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
             </button>
             <button
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 setRenameValue(cleanTitle(session));
                 setRenaming(true);
@@ -579,6 +576,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
             <div className="border-t border-border my-1" />
             <button
               onClick={(e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 setMenuOpen(false);
                 onDelete(session.id);
@@ -591,6 +589,6 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
           </div>
         )}
       </div>
-    </div>
+    </Link>
   );
 }
