@@ -126,15 +126,19 @@ export function ChatPage() {
     });
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Keep the URL in sync with activeSession. Covers createSession (which sets
-  // activeSession but can't navigate from inside the store), server-driven
-  // session_switched WS messages, and deleteSession's auto-pick fallback.
-  // `replace` avoids polluting browser history with intra-chat hops.
+  // Sync activeSession → URL, but only when the URL itself can't be source
+  // of truth: it has no sessionId yet (createSession, fresh load) or it
+  // points to a session that no longer exists (deleteSession auto-pick).
+  // Bare `activeSession !== sessionId` would fight the URL→switchSession
+  // effect above and loop on every click — the click sets sessionId
+  // instantly while activeSession only catches up after switchSession().
   useEffect(() => {
-    if (activeSession && activeSession !== sessionId) {
+    if (!activeSession) return;
+    const urlPointsToValid = !!sessionId && sessions.some(s => s.id === sessionId);
+    if (!urlPointsToValid && activeSession !== sessionId) {
       navigate(`/chat/${activeSession}`, { replace: true });
     }
-  }, [activeSession, sessionId, navigate]);
+  }, [activeSession, sessionId, sessions, navigate]);
 
   const statusLabel = agentStatus.state === 'tool'
     ? `Using ${agentStatus.toolName}...`
