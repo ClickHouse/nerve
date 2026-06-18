@@ -103,21 +103,17 @@ function GlobalShortcuts() {
       combo: { mod: true, key: 'k' },
       description: 'Focus session search',
       section: 'global',
-      allowInInput: true, // allow even when focus is in chat textarea
       action: () => {
         if (!window.location.pathname.startsWith('/chat')) {
           navigate('/chat');
         }
-        // Defer focus until after route change paints the sidebar input.
+        // The sidebar input is unmounted unless hovered/focused/searched.
+        // Defer until after route change, then ensure the sidebar is open
+        // and ask it to mount + focus its search input.
         setTimeout(() => {
-          if (useChatStore.getState().sidebarCollapsed) {
-            useChatStore.getState().toggleSidebar();
-          }
-          const el = document.getElementById('nerve-sidebar-search');
-          if (el instanceof HTMLInputElement) {
-            el.focus();
-            el.select();
-          }
+          const store = useChatStore.getState();
+          if (store.sidebarCollapsed) store.toggleSidebar();
+          store.requestSearchFocus();
         }, 0);
       },
     },

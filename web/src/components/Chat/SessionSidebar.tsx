@@ -46,14 +46,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
   const [searchFocused, setSearchFocused] = useState(false);
   const [searchMounted, setSearchMounted] = useState(false);
   const [searchVisible, setSearchVisible] = useState(false);
+  // Programmatic mount trigger — set true when something (e.g. Cmd+K) wants
+  // the search input visible without a mouse hover or focus event.
+  const [searchPinned, setSearchPinned] = useState(false);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar } = useChatStore();
+  const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   const isSearching = localQuery.trim().length > 0;
-  const shouldShowSearch = searchHovered || searchFocused || isSearching;
+  const shouldShowSearch = searchHovered || searchFocused || isSearching || searchPinned;
 
   // Mount/unmount the search input with a fade transition (200ms).
   useEffect(() => {
@@ -79,6 +83,22 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
       return () => cancelAnimationFrame(id);
     }
   }, [searchMounted, searchVisible]);
+
+  // External "focus the search" request (e.g. Cmd+K). Pin the input so it
+  // mounts; the focus effect below takes over once it's visible.
+  useEffect(() => {
+    if (searchFocusNonce > 0) setSearchPinned(true);
+  }, [searchFocusNonce]);
+
+  // Once the pinned input is mounted and faded in, focus + select it. Drop
+  // the pin — onFocus has set searchFocused, which keeps it open until blur.
+  useEffect(() => {
+    if (searchPinned && searchVisible && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+      setSearchPinned(false);
+    }
+  }, [searchPinned, searchVisible]);
 
   // Clean up pending close timer on unmount.
   useEffect(() => {
