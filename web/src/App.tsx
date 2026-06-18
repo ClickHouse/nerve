@@ -93,9 +93,11 @@ function GlobalShortcuts() {
       combo: { mod: true, shift: true, key: 'o' },
       description: 'New chat',
       section: 'global',
-      action: () => {
+      action: async () => {
         navigate('/chat');
-        void useChatStore.getState().createSession();
+        await useChatStore.getState().createSession();
+        const next = useChatStore.getState().activeSession;
+        if (next) navigate(`/chat/${next}`, { replace: true });
       },
     },
     {

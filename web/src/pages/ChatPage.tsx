@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
@@ -42,6 +42,26 @@ export function ChatPage() {
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSidebar, openFilesPanel,
   } = useChatStore();
+
+  // URL → activeSession is handled by the useEffect[sessionId] below.
+  // activeSession → URL is intentionally NOT done as a mirror effect —
+  // that races with `loadSessions()` (which starts with sessions=[], so any
+  // "URL is unknown to us" check is unreliable on a fresh tab) and with the
+  // server's `session_switched` WS message that fires before our store
+  // knows the URL's session exists. Instead we navigate explicitly from
+  // each call-site that changes the active session without a URL change.
+  const handleCreateSession = useCallback(async () => {
+    await createSession();
+    const next = useChatStore.getState().activeSession;
+    if (next) navigate(`/chat/${next}`, { replace: true });
+  }, [createSession, navigate]);
+
+  const handleDeleteSession = useCallback(async (id: string) => {
+    await deleteSession(id);
+    const next = useChatStore.getState().activeSession;
+    if (next) navigate(`/chat/${next}`, { replace: true });
+    else navigate('/chat', { replace: true });
+  }, [deleteSession, navigate]);
 
   // Chat-scoped keyboard shortcuts. Global ones (new chat, search, modal,
   // Esc cascade) live in <GlobalShortcuts /> in App.tsx.
@@ -90,11 +110,11 @@ export function ChatPage() {
         const id = useChatStore.getState().activeSession;
         if (!id) return;
         if (window.confirm('Delete this conversation?')) {
-          void useChatStore.getState().deleteSession(id);
+          void handleDeleteSession(id);
         }
       },
     },
-  ], []);
+  ], [handleDeleteSession]);
 
   useKeyboardShortcuts(chatShortcuts);
 
@@ -126,19 +146,6 @@ export function ChatPage() {
     });
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Sync activeSession → URL, but only when the URL itself can't be source
-  // of truth: it has no sessionId yet (createSession, fresh load) or it
-  // points to a session that no longer exists (deleteSession auto-pick).
-  // Bare `activeSession !== sessionId` would fight the URL→switchSession
-  // effect above and loop on every click — the click sets sessionId
-  // instantly while activeSession only catches up after switchSession().
-  useEffect(() => {
-    if (!activeSession) return;
-    const urlPointsToValid = !!sessionId && sessions.some(s => s.id === sessionId);
-    if (!urlPointsToValid && activeSession !== sessionId) {
-      navigate(`/chat/${activeSession}`, { replace: true });
-    }
-  }, [activeSession, sessionId, sessions, navigate]);
 
   const statusLabel = agentStatus.state === 'tool'
     ? `Using ${agentStatus.toolName}...`
@@ -153,8 +160,8 @@ export function ChatPage() {
         sessions={sessions}
         activeSession={activeSession}
         agentStatus={agentStatus}
-        onCreate={() => createSession()}
-        onDelete={deleteSession}
+        onCreate={handleCreateSession}
+        onDelete={handleDeleteSession}
         collapsed={sidebarCollapsed}
       />
 
