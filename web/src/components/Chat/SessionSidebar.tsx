@@ -85,20 +85,27 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
   }, [searchMounted, searchVisible]);
 
   // External "focus the search" request (e.g. Cmd+K). Pin the input so it
-  // mounts; the focus effect below takes over once it's visible.
+  // mounts; the focus effect below takes over once it's in the DOM.
   useEffect(() => {
     if (searchFocusNonce > 0) setSearchPinned(true);
   }, [searchFocusNonce]);
 
-  // Once the pinned input is mounted and faded in, focus + select it. Drop
-  // the pin — onFocus has set searchFocused, which keeps it open until blur.
+  // Once the pinned input is in the DOM, focus + select it. We focus as soon
+  // as it's mounted (not after the fade-in) so the browser's focus event
+  // races less; the CSS transition still runs for the visual fade.
   useEffect(() => {
-    if (searchPinned && searchVisible && inputRef.current) {
+    if (searchPinned && searchMounted && inputRef.current) {
       inputRef.current.focus();
       inputRef.current.select();
-      setSearchPinned(false);
     }
-  }, [searchPinned, searchVisible]);
+  }, [searchPinned, searchMounted]);
+
+  // Release the pin only after onFocus has confirmed the focus landed —
+  // dropping it earlier risks a brief render with pinned=false AND
+  // focused=false, which collapses shouldShowSearch and fades the input out.
+  useEffect(() => {
+    if (searchPinned && searchFocused) setSearchPinned(false);
+  }, [searchPinned, searchFocused]);
 
   // Clean up pending close timer on unmount.
   useEffect(() => {
