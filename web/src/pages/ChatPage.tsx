@@ -118,6 +118,22 @@ export function ChatPage() {
 
   useKeyboardShortcuts(chatShortcuts);
 
+  // Mirror the active session's title into the browser tab. Same cleaning
+  // rules as the sidebar (strip leading '#' and 'Implement:' prefix).
+  // Restored to plain "Nerve" when leaving the chat page or when there's
+  // no active session yet.
+  useEffect(() => {
+    const session = sessions.find(s => s.id === activeSession);
+    if (!session) {
+      document.title = 'Nerve';
+      return;
+    }
+    const raw = session.title || session.id;
+    const clean = raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
+    document.title = clean;
+    return () => { document.title = 'Nerve'; };
+  }, [activeSession, sessions]);
+
   // Langfuse deep-link status — fetched once. Shows a small "external link"
   // icon when observability is enabled so we can jump from a session to
   // its trace in Langfuse.
