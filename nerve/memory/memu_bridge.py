@@ -977,10 +977,15 @@ class MemUBridge:
             _original_delete_item = SQLiteMemoryItemRepo.delete_item
             _original_clear_items = SQLiteMemoryItemRepo.clear_items
 
-            def _indexed_update_item(self, item_id, *args, **kwargs):
-                result = _original_update_item(self, item_id, *args, **kwargs)
+            def _indexed_update_item(self, *args, **kwargs):
+                # Forward args verbatim. memu-py 1.4.0 makes update_item's
+                # parameters (including item_id) keyword-only, so forwarding
+                # item_id positionally raised "takes 1 positional argument but
+                # 2 were given" and silently failed every memory_update.
+                result = _original_update_item(self, *args, **kwargs)
+                item_id = kwargs.get("item_id", args[0] if args else None)
                 idx = _vec_index_note(self)
-                if idx is not None:
+                if idx is not None and item_id is not None:
                     cached = self.items.get(item_id)
                     if cached is not None and cached.embedding is not None:
                         idx.upsert(item_id, str(cached.memory_type), cached.embedding)
