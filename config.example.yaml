@@ -14,6 +14,8 @@ timezone: America/New_York
 # Agent
 agent:
   model: claude-opus-4-8         # Primary model for conversations
+  # Use claude-fable-5 for Anthropic's most capable (Mythos-class) model.
+  # Note: ~2x the cost of Opus 4.8 ($10/$50 per MTok in/out).
   cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
   title_model: claude-haiku-4-5-20251001  # Session title generation
   max_turns: 50                  # Max agentic turns per request
@@ -27,6 +29,13 @@ agent:
   # cron model.
   cron_thinking: high
   cron_effort: high
+  # First-prompt rewrite — the web UI can refine the opening message of a
+  # new chat with a fast model, preview it, and send only after approval.
+  prompt_rewrite:
+    enabled: true                # Master switch (per-user toggle is in the UI)
+    model: ""                    # Empty → falls back to agent.model (chat model)
+    max_tokens: 1024
+    timeout_seconds: 45
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-4-8
   #   cron_model: us.anthropic.claude-sonnet-4-6
@@ -43,7 +52,14 @@ gateway:
 # Channels
 telegram:
   enabled: true
-  dm_policy: pairing             # "open" or "pairing" (require pairing code)
+  # DM authorization:
+  #   pairing — only users in allowed_users may talk to the bot. New users
+  #             authorize with a one-time code: run `nerve pair` on the
+  #             server, then send the bot `/pair <code>`. Paired IDs are
+  #             persisted to config.local.yaml automatically.
+  #   open    — anyone can talk to the bot (dangerous: full agent access).
+  dm_policy: pairing
+  # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
 
 # Quiet hours (local timezone)
@@ -76,6 +92,22 @@ memory:
 cron:
   system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
   jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
+
+# Backup (optional) — scheduled, verified snapshots of Nerve state into a
+# single portable bundle (nerve-backup-<host>-<ts>.tar.zst). Off by default.
+# Point target_dir at an external mount or a synced directory — the OFF-BOX
+# copy is what protects against a disk failure. The SQLite DBs are snapshotted
+# with the online-backup API, so bundles are consistent even while Nerve runs.
+# Manual use: `nerve backup` / `nerve restore BUNDLE` (no running server needed).
+# backup:
+#   enabled: false
+#   target_dir: ""              # e.g. /mnt/backup/nerve  (REQUIRED when enabled)
+#   interval_hours: 24          # scheduled cadence (an hourly tick fires when due)
+#   retention_count: 7          # keep the newest N bundles; prune older ones
+#   include_workspace: true     # include the workspace BRAIN (*.md, memory/, scripts/, skills/)
+#   workspace_excludes: []      # extra glob patterns to skip, e.g. ["*.png", "drafts"]
+#   notify_on_failure: true     # high-priority notify if a scheduled backup fails
+#   notify_on_success: false    # low-priority digest line on success
 
 # External MCP server (optional) — expose Nerve's tool registry to
 # external MCP clients (Codex, Claude Code, Cursor) over Streamable HTTP.

@@ -1,20 +1,20 @@
-const FILTERS = [
-  { value: '', label: 'Active' },
-  { value: 'pending', label: 'Pending' },
-  { value: 'in_progress', label: 'In Progress' },
-  { value: 'done', label: 'Done' },
-  { value: 'deferred', label: 'Deferred' },
-];
+import { useTaskStatusStore } from '../../stores/taskStatusStore';
 
 export function TaskFilters({ active, onChange }: {
   active: string;
   onChange: (filter: string) => void;
 }) {
+  const statuses = useTaskStatusStore((s) => s.statuses);
+  const filters = [
+    { value: '', label: 'Active' },
+    ...statuses.map((s) => ({ value: s.name, label: s.label })),
+  ];
+
   return (
     <div className="flex gap-1">
-      {FILTERS.map(f => (
+      {filters.map(f => (
         <button
-          key={f.value}
+          key={f.value || 'active'}
           onClick={() => onChange(f.value)}
           className={`px-3 py-1.5 text-[13px] rounded-md cursor-pointer transition-colors
             ${active === f.value

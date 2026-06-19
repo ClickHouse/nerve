@@ -24,6 +24,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How often to scan for due session wakeups (ScheduleWakeup harness). The
+# tool clamps delays to >= 60s, so a 20s sweep keeps fire latency well under
+# the granularity the model can request.
+_WAKEUP_SWEEP_SECONDS = 20
+
+# ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
+# /loop command, so resolve them to a plain continuation instruction.
+_WAKEUP_SENTINELS = {"<<autonomous-loop>>", "<<autonomous-loop-dynamic>>"}
+_WAKEUP_SENTINEL_PROMPT = (
+    "[Scheduled wakeup] Continue the task you were pacing. If there is "
+    "nothing left to do, stop and don't reschedule."
+)
+
+
+def _resolve_wakeup_prompt(prompt: str) -> str:
+    """Map an autonomous-loop sentinel to a usable prompt; pass others through."""
+    return _WAKEUP_SENTINEL_PROMPT if prompt.strip() in _WAKEUP_SENTINELS else prompt
+
 
 def _parse_interval(interval: str) -> int:
     """Parse an interval string like '2h', '30m', '1h30m' into seconds."""
@@ -124,6 +142,16 @@ class CronService:
             CronTrigger(hour=3, minute=0),
             id="cleanup",
             name="Cleanup expired data",
+            replace_existing=True,
+        )
+
+        # Fire due session wakeups (ScheduleWakeup harness). The CLI's own
+        # scheduler is disabled; Nerve owns wakeup timing here.
+        self.scheduler.add_job(
+            self._sweep_wakeups,
+            IntervalTrigger(seconds=_WAKEUP_SWEEP_SECONDS),
+            id="wakeup_sweep",
+            name="Fire due session wakeups",
             replace_existing=True,
         )
 
@@ -288,9 +316,13 @@ class CronService:
         if not should_rotate:
             return False
 
-        # Memorize current context before rotation (safety net)
+        # Schedule memorization of the pre-rotation context (safety net).
+        # Scheduled, not awaited: memorization queues on a global lock and
+        # awaiting it would delay the run start by the whole queue wait.
+        # The lower bound is frozen at scheduling time, so clearing
+        # connected_at below cannot shrink the covered window.
         try:
-            await self.engine._memorize_session(session_id)
+            await self.engine.schedule_memorize(session_id)
         except Exception as e:
             logger.warning("Pre-rotation memorize failed for %s: %s", session_id, e)
 
@@ -367,21 +399,6 @@ class CronService:
 
         return list(jobs_by_id.values())
 
-    async def _has_pending_messages(
-        self, consumer: str, sources: list[str],
-    ) -> bool:
-        """Check if any of the listed sources have unread messages.
-
-        Uses existing consumer cursor position vs source max rowid.
-        Does not advance any cursors.
-        """
-        for source in sources:
-            cursor_seq = await self.db.get_consumer_cursor(consumer, source)
-            max_seq = await self.db.get_source_max_rowid(source)
-            if max_seq > cursor_seq:
-                return True
-        return False
-
     async def _run_job_wrapper(self, job: CronJob) -> None:
         """Wrapper to run a cron job with logging and optional lock."""
         if job.lock:
@@ -393,37 +410,59 @@ class CronService:
 
     async def _run_job_inner(self, job: CronJob) -> None:
         """Inner implementation of job execution."""
-        # Pre-check: skip if no new messages in monitored sources
-        if job.skip_when_idle:
-            has_pending = await self._has_pending_messages(
-                job.idle_consumer, job.skip_when_idle,
+        # Pre-check: skip if any configured run gate is unsatisfied.
+        if job.gates:
+            from nerve.cron.gates import GateContext, evaluate_gates
+
+            decision = await evaluate_gates(
+                job.gates, GateContext(job_id=job.id, db=self.db),
             )
-            if not has_pending:
-                logger.info(
-                    "Skipping cron job %s: no new messages in %s",
-                    job.id, job.skip_when_idle,
-                )
+            if not decision.should_run:
+                logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
 
         log_id = await self.db.log_cron_start(job.id)
         logger.info("Running cron job: %s (mode=%s)", job.id, job.session_mode)
+        session_id: str | None = None
 
         try:
             model = job.model or self.config.agent.cron_model
             rotated = False
+            base_prompt = job.resolve_prompt()
+
+            # Determine the session id up front and link the run log to it
+            # immediately, so the UI can open the chat of a *running* cron
+            # instead of waiting for the run to finish.
+            run_id: str | None = None
+            if job.session_mode == "persistent":
+                session_id = f"cron:{job.id}"
+            else:
+                # Isolated mode: per-run session. The run_id is generated
+                # here (the engine would otherwise generate an identical
+                # timestamp-based one) so the session id is known for the
+                # run log.
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                session_id = f"cron:{job.id}:{run_id}"
+            try:
+                await self.db.set_cron_log_session(log_id, session_id)
+            except Exception as e:
+                logger.warning(
+                    "Failed to link cron log %s to session %s: %s",
+                    log_id, session_id, e,
+                )
 
             if job.session_mode == "persistent":
                 # Persistent mode: reuse SDK context across runs
                 if job.context_rotate_at or job.context_rotate_hours > 0:
                     rotated = await self._maybe_rotate_context(
-                        f"cron:{job.id}", job.context_rotate_hours,
+                        session_id, job.context_rotate_hours,
                         rotate_at=job.context_rotate_at,
                     )
 
                 # Determine prompt: full on first run, short reminder on subsequent
-                prompt = job.prompt
+                prompt = base_prompt
                 if job.reminder_mode:
-                    session = await self.db.get_session(f"cron:{job.id}")
+                    session = await self.db.get_session(session_id)
                     is_resume = (
                         session
                         and session.get("sdk_session_id")
@@ -435,7 +474,7 @@ class CronService:
                             "task as before."
                         )
                     else:
-                        prompt = job.prompt.rstrip() + (
+                        prompt = base_prompt.rstrip() + (
                             "\n\n---\n"
                             "NOTE: This is a persistent cron with reminder "
                             "mode. On subsequent triggers you will receive "
@@ -449,28 +488,28 @@ class CronService:
                     model=model,
                 )
             else:
-                # Isolated mode: per-run session (existing behaviour)
-                run_id = (
-                    datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                    if self.config.sessions.cron_session_mode == "per_run"
-                    else None
-                )
                 response = await self.engine.run_cron(
                     job_id=job.id,
-                    prompt=job.prompt,
+                    prompt=base_prompt,
                     model=model,
                     run_id=run_id,
                 )
 
-            output = response[:2000]
+            # Keep the tail of the response — for multi-message runs the
+            # final summary lives at the end, not the beginning.
+            output = response if len(response) <= 2000 else "…" + response[-2000:]
             if rotated:
                 output = "[context rotated] " + output
-            await self.db.log_cron_finish(log_id, "success", output=output)
+            await self.db.log_cron_finish(
+                log_id, "success", output=output, session_id=session_id,
+            )
             logger.info("Cron job %s completed (%d chars)", job.id, len(response))
 
         except Exception as e:
             logger.error("Cron job %s failed: %s", job.id, e, exc_info=True)
-            await self.db.log_cron_finish(log_id, "error", error=str(e))
+            await self.db.log_cron_finish(
+                log_id, "error", error=str(e), session_id=session_id,
+            )
 
     async def _run_source_wrapper(self, runner: SourceRunner) -> None:
         """Wrapper to run a source ingestion with cron and source logging."""
@@ -516,6 +555,64 @@ class CronService:
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)
+
+    async def _sweep_wakeups(self) -> None:
+        """Fire due session wakeups recorded by the ScheduleWakeup hook.
+
+        Each due wakeup is atomically claimed (pending -> fired) so
+        overlapping sweeps can't double-fire it, then re-injected into its
+        session via ``engine.run(..., source="wakeup")``. The run is
+        dispatched (not awaited) so one long turn can't stall the sweep; the
+        per-session lock inside ``run`` serialises it behind any live turn.
+        """
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            due = await self.db.get_due_wakeups(now_iso)
+        except Exception as e:
+            logger.error("Wakeup sweep query failed: %s", e, exc_info=True)
+            return
+
+        for wakeup in due:
+            session_id = wakeup["session_id"]
+            # Skip sessions mid-turn; a still-running turn may itself be
+            # rescheduling. Leave the wakeup pending and retry next sweep.
+            if self.engine.sessions.is_running(session_id):
+                continue
+            try:
+                claimed = await self.db.claim_wakeup(wakeup["id"])
+            except Exception as e:
+                logger.error(
+                    "Failed to claim wakeup %s: %s", wakeup["id"], e,
+                )
+                continue
+            if not claimed:
+                continue
+            self._dispatch_wakeup(session_id, wakeup)
+
+    def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
+        """Spawn the engine run for a claimed wakeup with error logging."""
+        prompt = _resolve_wakeup_prompt(wakeup["prompt"])
+        logger.info(
+            "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
+        )
+        task = asyncio.create_task(
+            self.engine.run(
+                session_id=session_id,
+                user_message=prompt,
+                source="wakeup",
+                internal=True,
+            )
+        )
+
+        def _done(t: asyncio.Task) -> None:
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                logger.error(
+                    "Wakeup %s run failed for session %s: %s",
+                    wakeup["id"], session_id, exc,
+                )
+
+        task.add_done_callback(_done)
 
     async def run_job(self, job_id: str) -> None:
         """Run a specific job manually (used by CLI)."""
@@ -582,22 +679,29 @@ class CronService:
             "session_age_hours": session_age_hours,
         }
 
-    def list_jobs(self) -> list[dict]:
+    async def list_jobs(self) -> list[dict]:
         """List all registered jobs (cron + sources) with their next run times."""
         result = []
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
             next_run = sched_job.next_run_time if sched_job else None
+            try:
+                last_session_id = await self.db.get_latest_cron_session_id(job.id)
+            except Exception:
+                last_session_id = None
             result.append({
                 "id": job.id,
                 "type": "cron",
                 "source": job.metadata.get("_source", "unknown"),
                 "schedule": job.schedule,
                 "description": job.description,
+                "prompt_file": job.prompt_file,
                 "enabled": job.enabled,
                 "session_mode": job.session_mode,
                 "lock": job.lock,
+                "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
+                "last_session_id": last_session_id,
             })
 
         # Include source runners
@@ -615,6 +719,7 @@ class CronService:
                 "description": f"Source: {source_name} (ingestor)",
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
+                "last_session_id": None,
             })
 
         return result

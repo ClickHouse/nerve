@@ -5,6 +5,22 @@ Nerve uses two YAML config files:
 - `config.local.yaml` — Secrets and personal overrides (gitignored)
 
 Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
+Unknown keys are ignored but logged as warnings at startup (and shown by
+`nerve doctor`) so typos don't fail silently.
+
+## Config Directory Resolution
+
+`nerve` commands locate the config directory via a waterfall, so they work
+from any working directory:
+
+1. `--config-dir` / `-c` flag
+2. `NERVE_CONFIG_DIR` environment variable
+3. The current directory, if it contains `config.yaml` or `config.local.yaml`
+4. The pointer file `~/.nerve/config_dir` (written by `nerve init` and on
+   daemon start)
+5. The current directory (fresh-install fallback)
+
+`nerve doctor` reports which directory was used and how it was found.
 
 ## Core
 
@@ -28,6 +44,12 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 | `agent.effort` | string | `max` | Reasoning effort for the main model: `max` / `high` / `medium` / `low` |
 | `agent.cron_thinking` | string | `high` | Thinking budget for cron and hook sessions (which run on `cron_model`). Claude OAuth caps non-flagship models at `high` and rejects `max` with `level "max" not supported` — keep this at `high` unless you're using a provider that accepts `max` for the cron model. |
 | `agent.cron_effort` | string | `high` | Reasoning effort for cron and hook sessions. Same caveat as `cron_thinking`. |
+| `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
+| `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
+| `agent.prompt_rewrite.max_tokens` | int | `1024` | Max tokens for the rewritten prompt |
+| `agent.prompt_rewrite.timeout_seconds` | float | `45.0` | Rewrite API call timeout |
+
+**Prompt rewrite:** when the ✨ toggle in the composer is on, the first prompt of a new chat is rewritten by a fast model to better express intent. The result is previewed (editable) and only sent after explicit approval — the user can always send the original instead. Trivial or already-clear prompts are sent unchanged without a preview.
 
 **Note:** The engine uses a `can_use_tool` callback (not `bypassPermissions`) so that interactive tools (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`) can pause mid-turn for user input. All other tools are auto-approved. See [sdk-sessions.md](sdk-sessions.md#permissions--interactive-tools) for details.
 
@@ -46,8 +68,26 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 |-----|------|---------|-------------|
 | `telegram.enabled` | bool | `true` | Enable Telegram bot |
 | `telegram.bot_token` | string | - | Bot token from @BotFather |
-| `telegram.dm_policy` | string | `pairing` | `open` or `pairing` |
+| `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
+| `telegram.allowed_users` | list[int] | `[]` | Telegram user IDs allowed to DM the bot |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
+
+### Pairing
+
+With `dm_policy: pairing` (the default), the bot only talks to users in
+`allowed_users` and rejects everyone else. To authorize a user without
+editing config files:
+
+1. Run `nerve pair` on the server — it prints a one-time 6-digit code
+   (valid 1 hour). On a fresh install with no `allowed_users`, a code is
+   also generated automatically at startup and printed to the log.
+2. Send the bot `/pair <code>` from the Telegram account to authorize.
+3. The user ID is appended to `telegram.allowed_users` in
+   `config.local.yaml` and takes effect immediately.
+
+An unauthorized `/start` gets a reply with the sender's numeric ID and
+pairing instructions (rate-limited); all other messages from unauthorized
+users are ignored.
 
 ## Quiet Hours
 
@@ -107,6 +147,23 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 | `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
 | `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). |
+
+## xmemory (optional, alongside memU)
+
+[xmemory.ai](https://xmemory.ai) is an optional schema-backed memory layer that runs **alongside** memU — it never replaces it. Activated only when both `xmemory.api_key` and `xmemory.instance_id` are set (put them in `config.local.yaml`); otherwise it is completely inert (no SDK calls, zero overhead). The instance and its schema are created out of band on xmemory's side.
+
+When active:
+- The `memorize` tool **dual-writes**: memU (as always) plus an async `write_async` to xmemory. Failures on the xmemory side never fail the tool.
+- `memory_recall` appends xmemory's single synthesized answer (its `SINGLE_ANSWER` read mode) to memU's N items, run concurrently so the dual lookup is one round-trip.
+- The memorization **sweep** (session-close / cron) stays memU-only — it does not go through the `memorize` tool handler.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `xmemory.api_key` | string | *(empty)* | xmemory bearer token (invite-only). Secret → `config.local.yaml`. |
+| `xmemory.instance_id` | string | *(empty)* | The xmemory instance to bind. Both this and `api_key` are required to activate. |
+| `xmemory.api_url` | string | `https://api.xmemory.ai` | API base URL. |
+| `xmemory.extraction_logic` | string | `deep` | Write extraction mode: `deep` (accurate) or `fast` (high-volume). |
+| `xmemory.timeout` | float | `60.0` | Per-request timeout in seconds. |
 
 ## Docker
 
@@ -223,6 +280,29 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.archive_after_days` | int | `30` | Auto-archive idle/stopped sessions older than this |
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
+
+## Retention
+
+Opt-in `nerve.db` maintenance. Disabled by default. When enabled, a background
+pass every `interval_hours` drops the verbose `blocks`/`thinking` JSON of old,
+already-memorized messages (keeping the rendered `content`), prunes append-only
+telemetry and file snapshots older than `retention_days`, and checkpoints the
+WAL. This frees space inside the database but does not shrink the file on disk;
+run `nerve db vacuum` once (with the daemon stopped) to reclaim it.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `retention.enabled` | bool | `false` | Master switch for the background retention pass |
+| `retention.retention_full_days` | int | `30` | Compact `blocks`/`thinking` of memorized messages older than this |
+| `retention.retention_days` | int | `90` | Prune telemetry and file snapshots older than this |
+| `retention.interval_hours` | int | `24` | How often the background pass runs |
+
+Manual commands (run regardless of `enabled`):
+
+- `nerve db prune [--dry-run]` runs one pass immediately. `--dry-run` reports
+  what would change without mutating.
+- `nerve db vacuum` rewrites the file to reclaim freed pages. It takes a write
+  lock, so stop the daemon first.
 
 ## Cron
 

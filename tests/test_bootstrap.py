@@ -719,3 +719,212 @@ class TestSetupChoicesNewFields:
         c = SetupChoices()
         assert c.claude_oauth_token == ""
         assert c.github_token == ""
+
+
+class TestBedrockGeoPrefix:
+    """Region → Bedrock inference-profile prefix mapping."""
+
+    def test_us_regions(self) -> None:
+        from nerve.bootstrap import bedrock_geo_prefix
+        assert bedrock_geo_prefix("us-east-1") == "us"
+        assert bedrock_geo_prefix("us-west-2") == "us"
+
+    def test_eu_regions(self) -> None:
+        from nerve.bootstrap import bedrock_geo_prefix
+        assert bedrock_geo_prefix("eu-central-1") == "eu"
+        assert bedrock_geo_prefix("eu-west-3") == "eu"
+        assert bedrock_geo_prefix("EU-NORTH-1") == "eu"
+
+    def test_apac_regions(self) -> None:
+        from nerve.bootstrap import bedrock_geo_prefix
+        assert bedrock_geo_prefix("ap-southeast-2") == "apac"
+        assert bedrock_geo_prefix("ap-northeast-1") == "apac"
+
+    def test_other_regions_default_us(self) -> None:
+        from nerve.bootstrap import bedrock_geo_prefix
+        assert bedrock_geo_prefix("ca-central-1") == "us"
+        assert bedrock_geo_prefix("sa-east-1") == "us"
+        assert bedrock_geo_prefix("") == "us"
+
+
+class TestNonInteractiveBedrockRegion:
+    """Bedrock model IDs must match the configured region's geography."""
+
+    def test_eu_region_writes_eu_models(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "NERVE_PROVIDER": "bedrock",
+            "NERVE_AWS_REGION": "eu-central-1",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+
+        config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert config["provider"]["aws_region"] == "eu-central-1"
+        assert config["agent"]["model"].startswith("eu.anthropic.")
+        assert config["agent"]["cron_model"].startswith("eu.anthropic.")
+        assert config["memory"]["fast_model"].startswith("eu.anthropic.")
+
+    def test_us_region_writes_us_models(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "NERVE_PROVIDER": "bedrock",
+            "NERVE_AWS_REGION": "us-east-1",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+
+        config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert config["agent"]["model"].startswith("us.anthropic.")
+
+
+class TestNonInteractiveTelegramAllowedUsers:
+    """NERVE_TELEGRAM_ALLOWED_USERS env wiring."""
+
+    def test_allowed_users_written_to_local(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-tg",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TELEGRAM_BOT_TOKEN": "123456:ABC-test",
+            "NERVE_TELEGRAM_ALLOWED_USERS": "111, 222",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+
+        local = yaml.safe_load((tmp_path / "config.local.yaml").read_text())
+        assert local["telegram"]["allowed_users"] == [111, 222]
+
+    def test_invalid_allowed_users_rejected(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-tg",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TELEGRAM_BOT_TOKEN": "123456:ABC-test",
+            "NERVE_TELEGRAM_ALLOWED_USERS": "not-a-number",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(Exception):
+                run_non_interactive(tmp_path)
+
+
+class TestInitStatePersistence:
+    """Wizard progress checkpointing (resume support)."""
+
+    def test_save_load_round_trip(self) -> None:
+        from nerve.bootstrap import (
+            _choices_from_dict,
+            _load_init_state,
+            _save_init_state,
+        )
+
+        choices = SetupChoices()
+        choices.mode = "personal"
+        choices.anthropic_api_key = "sk-ant-saved"
+        choices.workspace_path = Path("/tmp/some-ws")
+        choices.telegram_allowed_users = [42]
+        _save_init_state(choices, {"deployment", "mode"})
+
+        state = _load_init_state()
+        assert state is not None
+        assert sorted(state["completed"]) == ["deployment", "mode"]
+
+        restored = _choices_from_dict(state["choices"])
+        assert restored.anthropic_api_key == "sk-ant-saved"
+        assert restored.workspace_path == Path("/tmp/some-ws")
+        assert restored.telegram_allowed_users == [42]
+
+    def test_clear(self) -> None:
+        from nerve.bootstrap import (
+            _clear_init_state,
+            _load_init_state,
+            _save_init_state,
+        )
+
+        _save_init_state(SetupChoices(), {"mode"})
+        _clear_init_state()
+        assert _load_init_state() is None
+
+    def test_state_file_permissions(self) -> None:
+        import nerve.bootstrap as bootstrap_mod
+        from nerve.bootstrap import _save_init_state
+
+        _save_init_state(SetupChoices(), {"mode"})
+        path = bootstrap_mod.INIT_STATE_FILE.expanduser()
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+    def test_choices_from_dict_ignores_unknown_keys(self) -> None:
+        from nerve.bootstrap import _choices_from_dict
+
+        restored = _choices_from_dict({"mode": "worker", "legacy_field": True})
+        assert restored.mode == "worker"
+
+    def test_load_missing_returns_none(self) -> None:
+        from nerve.bootstrap import _clear_init_state, _load_init_state
+
+        _clear_init_state()
+        assert _load_init_state() is None
+
+
+class TestApplyBackups:
+    """Re-running init must back up existing configs, not silently nuke them."""
+
+    def test_existing_configs_backed_up(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-one"
+        wizard.choices.workspace_path = tmp_path / "ws"
+        wizard.choices.mode = "personal"
+        wizard._apply()
+
+        # Hand-edit, then re-apply
+        (tmp_path / "config.yaml").write_text("# hand-edited\nworkspace: ~/custom\n")
+        wizard2 = SetupWizard(tmp_path)
+        wizard2.choices.anthropic_api_key = "sk-ant-two"
+        wizard2.choices.workspace_path = tmp_path / "ws"
+        wizard2.choices.mode = "personal"
+        wizard2._apply()
+
+        bak = tmp_path / "config.yaml.bak"
+        assert bak.exists()
+        assert bak.read_text().startswith("# hand-edited")
+        assert (tmp_path / "config.local.yaml.bak").exists()
+
+
+class TestStepCounter:
+    """Step numbering shows totals once the mode is known."""
+
+    def test_no_total_before_mode(self, tmp_path: Path) -> None:
+        wizard = SetupWizard(tmp_path)
+        assert wizard._next_step("Deployment") == "Step 1: Deployment"
+
+    def test_total_after_mode_personal(self, tmp_path: Path) -> None:
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step("Deployment")
+        wizard._next_step("Mode")
+        wizard.choices.mode = "personal"
+        wizard._completed_steps.add("mode")
+        assert wizard._next_step("API") == "Step 3/11: API"
+
+    def test_total_after_mode_worker(self, tmp_path: Path) -> None:
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step("Deployment")
+        wizard._next_step("Mode")
+        wizard.choices.mode = "worker"
+        wizard._completed_steps.add("mode")
+        assert wizard._next_step("API") == "Step 3/6: API"
+
+    def test_skipped_steps_keep_numbering(self, tmp_path: Path) -> None:
+        wizard = SetupWizard(tmp_path)
+        wizard._completed_steps = {"deployment", "mode"}
+        wizard.choices.mode = "personal"
+        wizard._do("deployment", lambda: None)
+        wizard._do("mode", lambda: None)
+        assert wizard._step_counter == 2
+        assert wizard._next_step("API") == "Step 3/11: API"

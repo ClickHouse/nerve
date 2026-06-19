@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -104,22 +105,24 @@ class HoAService:
             resp.raise_for_status()
             archive_bytes = resp.content
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        def _extract_and_install() -> None:
+            """Untar + write the binary (CPU + disk) — off the event loop."""
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                binary_member = None
+                for member in tar.getmembers():
+                    if member.name.endswith("houseofagents") and member.isfile():
+                        binary_member = member
+                        break
+                if binary_member is None:
+                    raise RuntimeError("houseofagents binary not found in archive")
+                extracted = tar.extractfile(binary_member)
+                if extracted is None:
+                    raise RuntimeError("Failed to extract houseofagents")
+                dest.write_bytes(extracted.read())
+            dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            binary_member = None
-            for member in tar.getmembers():
-                if member.name.endswith("houseofagents") and member.isfile():
-                    binary_member = member
-                    break
-            if binary_member is None:
-                raise RuntimeError("houseofagents binary not found in archive")
-            extracted = tar.extractfile(binary_member)
-            if extracted is None:
-                raise RuntimeError("Failed to extract houseofagents")
-            dest.write_bytes(extracted.read())
-
-        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        await asyncio.to_thread(_extract_and_install)
         logger.info("Installed houseofagents to %s", dest)
 
     async def _cargo_install(self, dest: Path) -> None:

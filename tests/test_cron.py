@@ -697,3 +697,364 @@ class TestRotateSession:
         cron_service._jobs = [_make_job(id="oneshot", session_mode="per_run")]
         with pytest.raises(ValueError, match="not persistent"):
             await cron_service.rotate_session("oneshot")
+# Context rotation — memorization must not block the run lifecycle
+# ---------------------------------------------------------------------------
+
+class TestRotationMemorize:
+    @pytest.mark.asyncio
+    async def test_rotation_schedules_background_memorize(self, cron_service):
+        """Rotation schedules memorization instead of awaiting it inline."""
+        cron_service.db.get_session = AsyncMock(return_value={
+            "connected_at": _hours_ago(30),
+        })
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:pers", rotate_hours=24,
+        )
+
+        assert rotated is True
+        cron_service.engine.schedule_memorize.assert_awaited_once_with(
+            "cron:pers",
+        )
+        cron_service.engine._memorize_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_rotation_no_memorize(self, cron_service):
+        """A session younger than the rotation window is left alone."""
+        cron_service.db.get_session = AsyncMock(return_value={
+            "connected_at": _hours_ago(1),
+        })
+
+        rotated = await cron_service._maybe_rotate_context(
+            "cron:pers", rotate_hours=24,
+        )
+
+        assert rotated is False
+        cron_service.engine.schedule_memorize.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Run gates — service-level skip/run behaviour
+# ---------------------------------------------------------------------------
+
+class TestRunGates:
+    @pytest.mark.asyncio
+    async def test_skips_when_tasks_gate_unsatisfied(self, cron_service):
+        """A tasks gate with no matching tasks skips the run entirely."""
+        cron_service.db.count_tasks = AsyncMock(return_value=0)
+        job = _make_job(
+            id="planner", run_if=[{"type": "tasks", "status": "pending"}],
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.log_cron_start.assert_not_called()
+        cron_service.engine.run_cron.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_when_tasks_gate_satisfied(self, cron_service):
+        """A tasks gate with matching tasks lets the run proceed."""
+        cron_service.db.count_tasks = AsyncMock(return_value=2)
+        job = _make_job(
+            id="planner", run_if=[{"type": "tasks", "status": "pending"}],
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.log_cron_start.assert_called_once_with("planner")
+        cron_service.engine.run_cron.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_gates_always_runs(self, cron_service):
+        """A job with no gates runs unconditionally (no gate queries)."""
+        job = _make_job(id="ungated")
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_skip_when_idle_skips(self, cron_service):
+        """Legacy skip_when_idle still gates via the messages gate path."""
+        cron_service.db.get_consumer_cursor = AsyncMock(return_value=9)
+        cron_service.db.get_source_max_rowid = AsyncMock(return_value=9)
+        job = _make_job(id="inbox", skip_when_idle=["gmail"])
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_and_semantics_one_gate_blocks(self, cron_service):
+        """With two gates, one unsatisfied is enough to skip (AND)."""
+        cron_service.db.count_tasks = AsyncMock(return_value=5)        # tasks: ok
+        cron_service.db.get_consumer_cursor = AsyncMock(return_value=9)
+        cron_service.db.get_source_max_rowid = AsyncMock(return_value=9)  # msgs: not ok
+        job = _make_job(
+            id="both",
+            run_if=[
+                {"type": "tasks", "status": "pending"},
+                {"type": "messages", "sources": ["gmail"]},
+            ],
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Prompt files (prompt_file)
+# ---------------------------------------------------------------------------
+
+class TestPromptFile:
+    def test_requires_prompt_or_prompt_file(self):
+        with pytest.raises(ValueError):
+            CronJob(id="x", schedule="1h")
+
+    def test_inline_prompt_resolves(self):
+        job = _make_job()
+        assert job.resolve_prompt() == "do stuff"
+
+    def test_prompt_file_resolves(self, tmp_path):
+        pf = tmp_path / "prompt.md"
+        pf.write_text("from file", encoding="utf-8")
+        job = CronJob(id="x", schedule="1h", prompt_file=str(pf))
+        assert job.resolve_prompt() == "from file"
+
+    def test_prompt_file_wins_over_inline(self, tmp_path):
+        pf = tmp_path / "prompt.md"
+        pf.write_text("file wins", encoding="utf-8")
+        job = CronJob(id="x", schedule="1h", prompt="inline", prompt_file=str(pf))
+        assert job.resolve_prompt() == "file wins"
+
+    def test_prompt_file_read_fresh_each_run(self, tmp_path):
+        pf = tmp_path / "prompt.md"
+        pf.write_text("v1", encoding="utf-8")
+        job = CronJob(id="x", schedule="1h", prompt_file=str(pf))
+        assert job.resolve_prompt() == "v1"
+        pf.write_text("v2", encoding="utf-8")
+        assert job.resolve_prompt() == "v2"
+
+    def test_missing_file_falls_back_to_inline(self, tmp_path):
+        job = CronJob(
+            id="x", schedule="1h",
+            prompt="fallback", prompt_file=str(tmp_path / "nope.md"),
+        )
+        assert job.resolve_prompt() == "fallback"
+
+    def test_missing_file_no_fallback_raises(self, tmp_path):
+        job = CronJob(
+            id="x", schedule="1h", prompt_file=str(tmp_path / "nope.md"),
+        )
+        with pytest.raises(RuntimeError):
+            job.resolve_prompt()
+
+    def test_from_dict_relative_to_base_dir(self, tmp_path):
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts" / "shared.md").write_text("shared!", encoding="utf-8")
+        job = CronJob.from_dict(
+            {"id": "x", "schedule": "1h", "prompt_file": "prompts/shared.md"},
+            base_dir=tmp_path,
+        )
+        assert job.resolve_prompt() == "shared!"
+
+    def test_load_jobs_shared_prompt_file(self, tmp_path):
+        from nerve.cron.jobs import load_jobs
+
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts" / "shared.md").write_text("same prompt", encoding="utf-8")
+        yaml_file = tmp_path / "jobs.yaml"
+        yaml_file.write_text(
+            "jobs:\n"
+            "  - id: a\n"
+            "    schedule: 1h\n"
+            "    prompt_file: prompts/shared.md\n"
+            "  - id: b\n"
+            "    schedule: 2h\n"
+            "    prompt_file: prompts/shared.md\n",
+            encoding="utf-8",
+        )
+        jobs = load_jobs(yaml_file)
+        assert len(jobs) == 2
+        assert jobs[0].resolve_prompt() == "same prompt"
+        assert jobs[1].resolve_prompt() == "same prompt"
+
+    def test_load_jobs_skips_job_without_any_prompt(self, tmp_path):
+        from nerve.cron.jobs import load_jobs
+
+        yaml_file = tmp_path / "jobs.yaml"
+        yaml_file.write_text(
+            "jobs:\n"
+            "  - id: bad\n"
+            "    schedule: 1h\n"
+            "  - id: good\n"
+            "    schedule: 1h\n"
+            "    prompt: hi\n",
+            encoding="utf-8",
+        )
+        jobs = load_jobs(yaml_file)
+        assert [j.id for j in jobs] == ["good"]
+
+    def test_save_jobs_round_trips_prompt_file(self, tmp_path):
+        from nerve.cron.jobs import load_jobs, save_jobs
+
+        (tmp_path / "p.md").write_text("x", encoding="utf-8")
+        job = CronJob.from_dict(
+            {"id": "x", "schedule": "1h", "prompt_file": "p.md"},
+            base_dir=tmp_path,
+        )
+        out = tmp_path / "out.yaml"
+        save_jobs([job], out)
+        loaded = load_jobs(out)
+        assert loaded[0].prompt_file == "p.md"
+        assert loaded[0].resolve_prompt() == "x"
+
+    @pytest.mark.asyncio
+    async def test_run_uses_prompt_file_content(self, cron_service, tmp_path):
+        pf = tmp_path / "prompt.md"
+        pf.write_text("file instructions", encoding="utf-8")
+        job = CronJob(id="filed", schedule="1h", prompt_file=str(pf))
+
+        await cron_service._run_job_inner(job)
+
+        kwargs = cron_service.engine.run_cron.call_args.kwargs
+        assert kwargs["prompt"] == "file instructions"
+
+    @pytest.mark.asyncio
+    async def test_run_unreadable_prompt_file_logs_error(self, cron_service, tmp_path):
+        job = CronJob(id="filed", schedule="1h", prompt_file=str(tmp_path / "nope.md"))
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_not_called()
+        args, kwargs = cron_service.db.log_cron_finish.call_args
+        assert args[1] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Run log output + session linking
+# ---------------------------------------------------------------------------
+
+class TestRunLogOutput:
+    @pytest.mark.asyncio
+    async def test_stores_tail_of_long_response(self, cron_service):
+        long = "begin " + ("x" * 3000) + " THE END"
+        cron_service.engine.run_cron = AsyncMock(return_value=long)
+        job = _make_job()
+
+        await cron_service._run_job_inner(job)
+
+        kwargs = cron_service.db.log_cron_finish.call_args.kwargs
+        output = kwargs["output"]
+        assert output.endswith("THE END")
+        assert output.startswith("…")
+        assert len(output) <= 2001  # tail + ellipsis
+
+    @pytest.mark.asyncio
+    async def test_stores_short_response_verbatim(self, cron_service):
+        cron_service.engine.run_cron = AsyncMock(return_value="all done")
+        job = _make_job()
+
+        await cron_service._run_job_inner(job)
+
+        kwargs = cron_service.db.log_cron_finish.call_args.kwargs
+        assert kwargs["output"] == "all done"
+
+    @pytest.mark.asyncio
+    async def test_isolated_run_links_session_id(self, cron_service):
+        job = _make_job(id="iso-job")
+
+        await cron_service._run_job_inner(job)
+
+        run_id = cron_service.engine.run_cron.call_args.kwargs["run_id"]
+        assert run_id  # service always generates one
+        kwargs = cron_service.db.log_cron_finish.call_args.kwargs
+        assert kwargs["session_id"] == f"cron:iso-job:{run_id}"
+
+    @pytest.mark.asyncio
+    async def test_persistent_run_links_session_id(self, cron_service):
+        cron_service.db.get_session = AsyncMock(return_value=None)
+        job = _make_job(id="pers-job", session_mode="persistent", context_rotate_hours=0)
+
+        await cron_service._run_job_inner(job)
+
+        kwargs = cron_service.db.log_cron_finish.call_args.kwargs
+        assert kwargs["session_id"] == "cron:pers-job"
+
+    @pytest.mark.asyncio
+    async def test_error_run_still_links_session_id(self, cron_service):
+        cron_service.engine.run_cron = AsyncMock(side_effect=RuntimeError("boom"))
+        job = _make_job(id="err-job")
+
+        await cron_service._run_job_inner(job)
+
+        args, kwargs = cron_service.db.log_cron_finish.call_args
+        assert args[1] == "error"
+        assert kwargs["session_id"].startswith("cron:err-job:")
+
+
+# ---------------------------------------------------------------------------
+# Live session linking (chat available while a run is in flight)
+# ---------------------------------------------------------------------------
+
+class TestLiveSessionLink:
+    @pytest.mark.asyncio
+    async def test_isolated_links_session_before_run(self, cron_service):
+        order: list[str] = []
+        cron_service.db.set_cron_log_session = AsyncMock(
+            side_effect=lambda *a, **k: order.append("link"),
+        )
+
+        async def _run(**kwargs):
+            order.append("run")
+            return "ok"
+
+        cron_service.engine.run_cron = AsyncMock(side_effect=_run)
+        job = _make_job(id="live-job")
+
+        await cron_service._run_job_inner(job)
+
+        assert order == ["link", "run"]
+        log_id, session_id = cron_service.db.set_cron_log_session.call_args.args
+        assert log_id == 1
+        assert session_id.startswith("cron:live-job:")
+        # Same session id must be used for the engine run
+        assert (
+            f"cron:live-job:{cron_service.engine.run_cron.call_args.kwargs['run_id']}"
+            == session_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_persistent_links_session_before_run(self, cron_service):
+        cron_service.db.get_session = AsyncMock(return_value=None)
+        job = _make_job(
+            id="pers-live", session_mode="persistent", context_rotate_hours=0,
+        )
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.set_cron_log_session.assert_awaited_once_with(
+            1, "cron:pers-live",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_link_when_prompt_unresolvable(self, cron_service, tmp_path):
+        job = CronJob(id="bad", schedule="1h", prompt_file=str(tmp_path / "nope.md"))
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.db.set_cron_log_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_link_failure_does_not_break_run(self, cron_service):
+        cron_service.db.set_cron_log_session = AsyncMock(
+            side_effect=RuntimeError("db locked"),
+        )
+        job = _make_job(id="resilient")
+
+        await cron_service._run_job_inner(job)
+
+        cron_service.engine.run_cron.assert_called_once()
+        args, kwargs = cron_service.db.log_cron_finish.call_args
+        assert args[1] == "success"

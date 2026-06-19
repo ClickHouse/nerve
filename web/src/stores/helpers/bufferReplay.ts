@@ -69,6 +69,18 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
       }
       break;
     }
+    case 'wakeup': {
+      if (!result.some((b) => b.type === 'wakeup')) {
+        result.unshift({ type: 'wakeup' });
+      }
+      break;
+    }
+    case 'auto_turn': {
+      if (!result.some((b) => b.type === 'auto')) {
+        result.unshift({ type: 'auto' });
+      }
+      break;
+    }
   }
   return result;
 }

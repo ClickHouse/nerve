@@ -49,6 +49,9 @@ class TestSessionMCPIsolation:
         """_notify_impl forwards the given session_id to the notification service."""
         mock_service = AsyncMock()
         mock_service.send_notification = AsyncMock(return_value="notif-abc")
+        # The handler reads the row back to detect silenced/force outcomes;
+        # a plain None keeps it on the "sent" path for this unit test.
+        mock_service.db.get_notification = AsyncMock(return_value=None)
 
         with patch("nerve.agent.tools._notification_service", mock_service):
             result = await _notify_impl(
@@ -61,6 +64,7 @@ class TestSessionMCPIsolation:
             title="Test",
             body="hello",
             priority="normal",
+            force=False,
         )
         assert "notif-abc" in result["content"][0]["text"]
 
@@ -99,6 +103,7 @@ class TestSessionMCPIsolation:
 
         mock_service = AsyncMock()
         mock_service.send_notification = AsyncMock(side_effect=fake_send_notification)
+        mock_service.db.get_notification = AsyncMock(return_value=None)
 
         with patch("nerve.agent.tools._notification_service", mock_service):
             # Both sessions call notify concurrently

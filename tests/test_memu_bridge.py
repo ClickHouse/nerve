@@ -683,3 +683,272 @@ class TestValidateDateValue:
     def test_non_string_non_number(self):
         assert MemUBridge._validate_date_value([2025]) is None
         assert MemUBridge._validate_date_value({"year": 2025}) is None
+
+
+# ---------------------------------------------------------------------------
+# _VectorIndex — persistent incremental matrix index
+# ---------------------------------------------------------------------------
+
+class _FakeItem:
+    def __init__(self, memory_type: str, embedding):
+        self.memory_type = memory_type
+        self.embedding = embedding
+
+
+class TestVectorIndex:
+    def _items(self):
+        import numpy as np
+        return {
+            "a": _FakeItem("event", np.array([1.0, 0.0, 0.0], dtype="float32")),
+            "b": _FakeItem("profile", np.array([0.0, 1.0, 0.0], dtype="float32")),
+            "c": _FakeItem("event", np.array([0.0, 0.0, 1.0], dtype="float32")),
+            "no-vec": _FakeItem("event", None),
+        }
+
+    def test_build_and_search(self):
+        from nerve.memory.memu_bridge import _VectorIndex
+        idx = _VectorIndex()
+        idx.build(self._items())
+        assert idx.count == 3  # embedding-less item excluded
+        hits = idx.search([1.0, 0.0, 0.0], k=2)
+        assert hits[0][0] == "a"
+        assert hits[0][1] == pytest.approx(1.0, abs=1e-4)
+
+    def test_type_filtered_search(self):
+        from nerve.memory.memu_bridge import _VectorIndex
+        idx = _VectorIndex()
+        idx.build(self._items())
+        # Without filter, "b" wins for [0,1,0]; with event filter it must not.
+        hits = idx.search([0.0, 1.0, 0.0], k=1, memory_type="event")
+        assert hits
+        assert hits[0][0] in ("a", "c")
+        # No matches for unknown type
+        assert idx.search([0.0, 1.0, 0.0], k=1, memory_type="nope") == []
+
+    def test_upsert_appends_and_updates(self):
+        from nerve.memory.memu_bridge import _VectorIndex
+        idx = _VectorIndex()
+        idx.build(self._items())
+        idx.upsert("d", "knowledge", [0.5, 0.5, 0.0])
+        assert idx.count == 4
+        hits = idx.search([0.5, 0.5, 0.0], k=1)
+        assert hits[0][0] == "d"
+        # Update in place — no growth
+        idx.upsert("d", "knowledge", [0.0, 0.0, 1.0])
+        assert idx.count == 4
+        hits = idx.search([0.0, 0.0, 1.0], k=1)
+        assert hits[0][0] in ("c", "d")
+
+    def test_remove_swaps_last_row(self):
+        from nerve.memory.memu_bridge import _VectorIndex
+        idx = _VectorIndex()
+        idx.build(self._items())
+        idx.remove("a")
+        assert idx.count == 2
+        assert "a" not in idx.id_to_row
+        # Remaining vectors still searchable
+        hits = idx.search([0.0, 1.0, 0.0], k=1)
+        assert hits[0][0] == "b"
+        # Removing a missing id is a no-op
+        idx.remove("missing")
+        assert idx.count == 2
+
+    def test_empty_index(self):
+        from nerve.memory.memu_bridge import _VectorIndex
+        idx = _VectorIndex()
+        idx.build({})
+        assert idx.count == 0
+        assert idx.search([1.0, 0.0, 0.0], k=5) == []
+        # Upsert into an empty index bootstraps the dimension
+        idx.upsert("x", "event", [1.0, 0.0])
+        assert idx.count == 1
+        assert idx.search([1.0, 0.0], k=1)[0][0] == "x"
+
+    def test_capacity_growth(self):
+        import numpy as np
+        from nerve.memory.memu_bridge import _VectorIndex
+        idx = _VectorIndex()
+        idx.build({})
+        rng = np.random.default_rng(42)
+        for i in range(600):  # exceeds initial 256 capacity
+            idx.upsert(f"item-{i}", "event", rng.random(8).astype("float32"))
+        assert idx.count == 600
+        assert idx.capacity >= 600
+
+    def test_vec_index_for_rebuilds_on_drift(self):
+        from nerve.memory.memu_bridge import _vec_index_for
+
+        class _Repo:
+            pass
+
+        repo = _Repo()
+        repo.items = self._items()
+        idx = _vec_index_for(repo)
+        assert idx.count == 3
+        # Mutate items WITHOUT going through the hooks — drift detected
+        import numpy as np
+        repo.items["e"] = _FakeItem("event", np.array([1.0, 1.0, 0.0], dtype="float32"))
+        idx2 = _vec_index_for(repo)
+        assert idx2.count == 4
+
+
+# ---------------------------------------------------------------------------
+# Dedicated memU event loop (_submit / shutdown)
+# ---------------------------------------------------------------------------
+
+class TestMemuLoop:
+    @pytest.mark.asyncio
+    async def test_submit_inline_fallback_without_loop(self, tmp_path):
+        """Bridges that never ran initialize() execute coroutines inline."""
+        bridge = MemUBridge(_make_config(tmp_path))
+
+        async def _probe():
+            return asyncio.get_running_loop()
+
+        loop = await bridge._submit(_probe())
+        assert loop is asyncio.get_running_loop()
+
+    @pytest.mark.asyncio
+    async def test_submit_runs_on_memu_loop(self, tmp_path):
+        """After _start_memu_loop, coroutines run on the dedicated loop."""
+        bridge = MemUBridge(_make_config(tmp_path))
+        bridge._start_memu_loop()
+        try:
+            async def _probe():
+                return asyncio.get_running_loop()
+
+            loop = await bridge._submit(_probe())
+            assert loop is bridge._memu_loop
+            assert loop is not asyncio.get_running_loop()
+
+            # Exceptions propagate back to the caller
+            async def _boom():
+                raise ValueError("kaput")
+
+            with pytest.raises(ValueError, match="kaput"):
+                await bridge._submit(_boom())
+        finally:
+            await bridge.shutdown()
+        assert bridge._memu_loop is None
+
+    @pytest.mark.asyncio
+    async def test_submit_timeout_cancels_memu_task(self, tmp_path):
+        """wait_for around _submit cancels the coroutine on the memU loop."""
+        bridge = MemUBridge(_make_config(tmp_path))
+        bridge._start_memu_loop()
+        cancelled = asyncio.Event()
+        main_loop = asyncio.get_running_loop()
+
+        async def _hang():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                main_loop.call_soon_threadsafe(cancelled.set)
+                raise
+
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(bridge._submit(_hang()), timeout=0.2)
+            await asyncio.wait_for(cancelled.wait(), timeout=5)
+        finally:
+            await bridge.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_idempotent(self, tmp_path):
+        bridge = MemUBridge(_make_config(tmp_path))
+        await bridge.shutdown()  # never started — must not raise
+        bridge._start_memu_loop()
+        await bridge.shutdown()
+        await bridge.shutdown()  # double shutdown is fine
+
+
+# ---------------------------------------------------------------------------
+# SQLite pragmas
+# ---------------------------------------------------------------------------
+
+class TestSqlitePragmas:
+    def test_wal_conversion(self, tmp_path):
+        db_path = tmp_path / "memu.sqlite"
+        _create_memu_schema(str(db_path))
+        assert sqlite3.connect(db_path).execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        MemUBridge._setup_sqlite_pragmas(f"sqlite:///{db_path}")
+        assert sqlite3.connect(db_path).execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        # Idempotent
+        MemUBridge._setup_sqlite_pragmas(f"sqlite:///{db_path}")
+        assert sqlite3.connect(db_path).execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    def test_missing_db_does_not_raise(self, tmp_path):
+        MemUBridge._setup_sqlite_pragmas(f"sqlite:///{tmp_path}/nope/missing.sqlite")
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestIndexedUpdateItemForwarding:
+    """Regression: the _indexed_update_item monkeypatch must forward item_id
+    by keyword.
+
+    memu-py 1.4.0's ``SQLiteMemoryItemRepo.update_item`` is keyword-only
+    (``def update_item(self, *, item_id, ...)``). The vector-index wrapper used
+    to forward ``item_id`` positionally, which raised "takes 1 positional
+    argument but 2 positional arguments (and 3 keyword-only arguments) were
+    given" — silently turning every ``memory_update`` tool call into
+    "Failed to update memory". ``delete_item(self, item_id)`` is NOT keyword
+    only, which is why deletes kept working and masked the bug.
+    """
+
+    def test_update_item_is_keyword_only_in_memu(self):
+        import inspect
+        import memu.app.service  # noqa: F401 — initialize package graph first
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        kind = inspect.signature(Repo.update_item).parameters["item_id"].kind
+        assert kind is inspect.Parameter.KEYWORD_ONLY, (
+            "memu update_item contract changed — revisit _indexed_update_item"
+        )
+
+    def test_wrapper_forwards_item_id_as_keyword(self):
+        import memu.app.service  # noqa: F401 — initialize package graph first
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        calls: list[str] = []
+
+        def spy_update(self, *, item_id, memory_type=None, summary=None,
+                       embedding=None, extra=None, tool_record=None):
+            calls.append(item_id)
+            return "spy-result"
+
+        # Snapshot the item-repo methods _patch_sqlite_bugs() reassigns so the
+        # test restores global state and does not leak into other tests.
+        names = (
+            "update_item", "delete_item", "clear_items", "list_items",
+            "create_item", "create_item_reinforce", "vector_search_items",
+        )
+        saved = {n: Repo.__dict__.get(n) for n in names}
+
+        Repo.update_item = spy_update
+        try:
+            # Returns None on success (the body falls through); the observable
+            # effect is that update_item gets wrapped in front of our spy.
+            MemUBridge._patch_sqlite_bugs()
+            assert Repo.update_item is not spy_update
+
+            stub = object.__new__(Repo)  # no _nerve_vec_index → index hook skipped
+            # Exactly how memu's crud layer calls it (all keyword) — used to raise.
+            result = Repo.update_item(
+                stub, item_id="mem-123", memory_type=None,
+                summary="updated", embedding=None,
+            )
+            assert result == "spy-result"
+            assert calls == ["mem-123"]
+        finally:
+            for name, fn in saved.items():
+                if fn is None:
+                    if name in Repo.__dict__:
+                        delattr(Repo, name)
+                else:
+                    setattr(Repo, name, fn)

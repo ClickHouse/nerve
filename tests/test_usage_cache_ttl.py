@@ -181,6 +181,16 @@ class TestPricing:
         assert c5m == 6.25
         assert c1h == 10.00
 
+    def test_fable_5_rates(self):
+        # Anchor: Fable 5 (Mythos-class) — ~2x Opus 4.8. Base $10/MTok input,
+        # $50/MTok output, 5m write = 1.25x = $12.50/MTok, 1h = 2.0x = $20/MTok.
+        from nerve.db.usage import _get_pricing
+        p_in, p_out, _, c5m, c1h, _ = _get_pricing("claude-fable-5")
+        assert p_in == 10
+        assert p_out == 50
+        assert c5m == 12.50
+        assert c1h == 20.00
+
 
 class TestEstimateCost:
     def test_falls_back_to_5m_when_split_absent(self):

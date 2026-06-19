@@ -2,14 +2,9 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Edit3, Eye, Save, Calendar, ExternalLink } from 'lucide-react';
 import { useTaskStore } from '../stores/taskStore';
+import { useTaskStatusStore } from '../stores/taskStatusStore';
+import { StatusBadge, StatusSelect } from '../components/Tasks/StatusControls';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
-
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
-  in_progress: 'bg-blue-400/10 text-hue-blue border-blue-400/20',
-  done: 'bg-emerald-400/10 text-hue-emerald border-emerald-400/20',
-  deferred: 'bg-border-subtle/50 text-text-muted border-border-subtle',
-};
 
 export function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
@@ -18,6 +13,7 @@ export function TaskDetailPage() {
     selectedTask, detailLoading, saving,
     loadTask, saveTaskContent, updateStatus, clearSelectedTask,
   } = useTaskStore();
+  const loadStatuses = useTaskStatusStore((s) => s.load);
 
   const [mode, setMode] = useState<'edit' | 'preview'>('preview');
   const [localContent, setLocalContent] = useState('');
@@ -26,6 +22,7 @@ export function TaskDetailPage() {
 
   useEffect(() => {
     if (taskId) loadTask(taskId);
+    loadStatuses();
     return () => clearSelectedTask();
   }, [taskId]);
 
@@ -128,19 +125,12 @@ export function TaskDetailPage() {
 
         {/* Meta row */}
         <div className="flex items-center gap-3 ml-9 text-[12px]">
-          <span className={`px-2 py-0.5 rounded-full border ${STATUS_STYLES[selectedTask.status] || STATUS_STYLES.deferred}`}>
-            {selectedTask.status}
-          </span>
-          <select
+          <StatusBadge status={selectedTask.status} />
+          <StatusSelect
             value={selectedTask.status}
-            onChange={(e) => updateStatus(selectedTask.id, e.target.value)}
+            onChange={(status) => updateStatus(selectedTask.id, status)}
             className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-text-muted outline-none cursor-pointer"
-          >
-            <option value="pending">Pending</option>
-            <option value="in_progress">In Progress</option>
-            <option value="done">Done</option>
-            <option value="deferred">Deferred</option>
-          </select>
+          />
           {selectedTask.deadline && (
             <span className="flex items-center gap-1 text-text-dim">
               <Calendar size={11} /> {selectedTask.deadline}

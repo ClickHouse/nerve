@@ -34,7 +34,18 @@ export interface FileBlockData {
   size?: number;
 }
 
-export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData;
+/** Leading marker on a turn that fired from a self-scheduled ScheduleWakeup. */
+export interface WakeupBlockData {
+  type: 'wakeup';
+}
+
+/** Leading marker on an autonomous turn the CLI ran on its own (e.g. after
+ *  a background task settled) — no user message preceded it. */
+export interface AutoTurnBlockData {
+  type: 'auto';
+}
+
+export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData | AutoTurnBlockData;
 
 export interface ChatMessage {
   id?: number;
@@ -59,6 +70,9 @@ export interface Session {
   model?: string;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
+  // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).
+  // Drives the sidebar "waiting" indicator. Set by backend + WS updates.
+  awaiting_input?: boolean;
   starred?: boolean;
 }
 
@@ -87,6 +101,9 @@ export interface PanelTab {
 
 // --- Session modified files & diff types ---
 
+/** Mirrors MAX_DIFF_LINES in nerve/gateway/diff.py — diffs are truncated past this. */
+export const MAX_DIFF_LINES = 2000;
+
 export interface DiffLine {
   type: 'addition' | 'deletion' | 'context' | 'info';
   content: string;
@@ -110,6 +127,8 @@ export interface FileDiff {
   binary: boolean;
   stats: { additions: number; deletions: number };
   hunks: DiffHunk[];
+  /** Raw git-style unified-diff string for the @pierre/diffs renderer. */
+  patch: string;
   truncated: boolean;
 }
 

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from nerve.config import get_config
@@ -20,31 +23,39 @@ router = APIRouter()
 
 # --- Memory files ---
 
+def _list_memory_files_sync(workspace: Path) -> list[dict]:
+    """Walk + stat memory markdown files.  Sync — call via asyncio.to_thread."""
+    files = []
+    memory_dir = workspace / "memory"
+    if memory_dir.exists():
+        for f in sorted(memory_dir.rglob("*.md")):
+            rel = f.relative_to(workspace)
+            st = f.stat()
+            files.append({
+                "path": str(rel),
+                "name": f.name,
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+            })
+
+    # Also include root-level md files
+    for f in sorted(workspace.glob("*.md")):
+        st = f.stat()
+        files.append({
+            "path": f.name,
+            "name": f.name,
+            "size": st.st_size,
+            "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+        })
+
+    return files
+
+
 @router.get("/api/memory/files")
 async def list_memory_files(user: dict = Depends(require_auth)):
     """List markdown files in workspace memory directory."""
     config = get_config()
-    memory_dir = config.workspace / "memory"
-    files = []
-    if memory_dir.exists():
-        for f in sorted(memory_dir.rglob("*.md")):
-            rel = f.relative_to(config.workspace)
-            files.append({
-                "path": str(rel),
-                "name": f.name,
-                "size": f.stat().st_size,
-                "modified": datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat(),
-            })
-
-    # Also include root-level md files
-    for f in sorted(config.workspace.glob("*.md")):
-        files.append({
-            "path": f.name,
-            "name": f.name,
-            "size": f.stat().st_size,
-            "modified": datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat(),
-        })
-
+    files = await asyncio.to_thread(_list_memory_files_sync, config.workspace)
     return {"files": files}
 
 
@@ -52,14 +63,14 @@ async def list_memory_files(user: dict = Depends(require_auth)):
 async def read_memory_file(file_path: str, user: dict = Depends(require_auth)):
     config = get_config()
     full_path = config.workspace / file_path
-    if not full_path.exists() or not full_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
     # Prevent path traversal
     try:
         full_path.resolve().relative_to(config.workspace.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
-    content = full_path.read_text(encoding="utf-8")
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    content = await asyncio.to_thread(full_path.read_text, encoding="utf-8")
     return {"path": file_path, "content": content}
 
 
@@ -75,8 +86,12 @@ async def write_memory_file(file_path: str, req: FileWriteRequest, user: dict = 
         full_path.resolve().relative_to(config.workspace.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(req.content, encoding="utf-8")
+
+    def _write() -> None:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(req.content, encoding="utf-8")
+
+    await asyncio.to_thread(_write)
     return {"path": file_path, "saved": True}
 
 
@@ -89,22 +104,16 @@ def _require_memu():
     return deps.engine._memory_bridge
 
 
-@router.get("/api/memory/memu")
-async def get_memu_data(user: dict = Depends(require_auth)):
-    """Get memU categories and items for the memory UI."""
-    deps = get_deps()
-    if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
-        return {"available": False, "categories": [], "items": [], "resources": []}
+def _read_memu_snapshot_sync(db_path: str) -> str:
+    """Read the full memU snapshot and JSON-encode it.
 
-    config = get_config()
-    dsn = config.memory.sqlite_dsn
-    # Extract file path from sqlite:///path
-    db_path = dsn.replace("sqlite:///", "")
-
+    Sync — call via asyncio.to_thread.  With 20K+ items this is a multi-MB
+    payload; both the table scans AND the json.dumps are deliberately done
+    in the worker thread so the event loop never pays for them.
+    """
+    db = sqlite3.connect(db_path, timeout=10)
+    db.row_factory = sqlite3.Row
     try:
-        db = sqlite3.connect(db_path)
-        db.row_factory = sqlite3.Row
-
         categories = []
         for row in db.execute("SELECT id, name, description, summary FROM memu_memory_categories ORDER BY name"):
             categories.append({
@@ -139,16 +148,33 @@ async def get_memu_data(user: dict = Depends(require_auth)):
         cat_items: dict[str, list[str]] = {}
         for row in db.execute("SELECT category_id, item_id FROM memu_category_items"):
             cat_items.setdefault(row["category_id"], []).append(row["item_id"])
-
+    finally:
         db.close()
 
-        return {
-            "available": True,
-            "categories": categories,
-            "items": items,
-            "resources": resources,
-            "category_items": cat_items,
-        }
+    return json.dumps({
+        "available": True,
+        "categories": categories,
+        "items": items,
+        "resources": resources,
+        "category_items": cat_items,
+    })
+
+
+@router.get("/api/memory/memu")
+async def get_memu_data(user: dict = Depends(require_auth)):
+    """Get memU categories and items for the memory UI."""
+    deps = get_deps()
+    if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
+        return {"available": False, "categories": [], "items": [], "resources": []}
+
+    config = get_config()
+    dsn = config.memory.sqlite_dsn
+    # Extract file path from sqlite:///path
+    db_path = dsn.replace("sqlite:///", "")
+
+    try:
+        payload = await asyncio.to_thread(_read_memu_snapshot_sync, db_path)
+        return Response(content=payload, media_type="application/json")
     except Exception as e:
         logger.error("Failed to read memU data: %s", e)
         return {"available": False, "categories": [], "items": [], "resources": [], "error": str(e)}

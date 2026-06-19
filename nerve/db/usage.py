@@ -14,6 +14,7 @@ from __future__ import annotations
 # Key: canonical model short-name substring → (input, output, cache_read,
 # cache_write_5m, cache_write_1h, web_search_per_req)
 MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
+    "fable-5":    (10,  50, 1.00, 12.50, 20.00, 0.01),  # Fable 5 (Mythos-class, ~2x Opus 4.8)
     "opus-4-8":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.8 standard
     "opus-4-7":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.7 standard
     "opus-4-6":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.6 standard

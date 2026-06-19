@@ -410,6 +410,18 @@ function StatusIndicator({ session, isActive, isRunning }: {
   isActive: boolean;
   isRunning: boolean;
 }) {
+  // Waiting for user input (AskUserQuestion / plan mode): pulsing blue dot.
+  // Takes priority over the running spinner/dot — the session is paused, not
+  // working, and needs the user's attention.
+  if (session.awaiting_input) {
+    return (
+      <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+      </span>
+    );
+  }
+
   // Active + running: spinner
   if (isActive && isRunning) {
     return <Loader2 size={12} className="shrink-0 text-accent animate-spin" />;

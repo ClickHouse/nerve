@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon } from 'lucide-react';
-import { useNotificationStore, type Notification } from '../stores/notificationStore';
+import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus } from 'lucide-react';
+import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
   answered: 'bg-emerald-400/10 text-hue-emerald border-emerald-400/20',
   expired: 'bg-border-subtle/50 text-text-muted border-border-subtle',
   dismissed: 'bg-border-subtle/50 text-text-dim border-border-subtle',
+  silenced: 'bg-border-subtle/50 text-text-dim border-border-subtle',
 };
 
 const PRIORITY_DOTS: Record<string, string> = {
@@ -28,6 +29,7 @@ const STATUS_FILTERS = [
   { label: 'Pending', value: 'pending' },
   { label: 'Answered', value: 'answered' },
   { label: 'Expired', value: 'expired' },
+  { label: 'Silenced', value: 'silenced' },
 ];
 
 const TYPE_FILTERS = [
@@ -89,6 +91,31 @@ function parseOptionLabels(notif: Notification): Record<string, string> | null {
     // Malformed JSON: just fall back to defaults.
   }
   return null;
+}
+
+interface SilenceInfo {
+  silenced_by?: string;
+  silence_reason?: string;
+  silence_pattern?: string;
+  silence_hit_count?: number;
+}
+
+function parseSilenceInfo(notif: Notification): SilenceInfo | null {
+  if (!notif.metadata) return null;
+  try {
+    const meta = typeof notif.metadata === 'string' ? JSON.parse(notif.metadata) : notif.metadata;
+    if (meta && typeof meta === 'object' && 'silenced_by' in meta) {
+      return meta as SilenceInfo;
+    }
+  } catch {
+    // Malformed JSON: nothing to surface.
+  }
+  return null;
+}
+
+function formatExpiry(expiresAt: string | null): string {
+  if (!expiresAt) return 'permanent';
+  return `expires ${expiresAt.slice(0, 16).replace('T', ' ')}`;
 }
 
 function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
@@ -247,6 +274,140 @@ function NotificationCard({ notif }: { notif: Notification }) {
           <span className="text-text-faint">(via {notif.answered_by})</span>
         </div>
       )}
+
+      {/* Silence context: why this was suppressed and not delivered */}
+      {notif.status === 'silenced' && (() => {
+        const info = parseSilenceInfo(notif);
+        return (
+          <div className="mt-2 flex items-start gap-1.5 text-[12px] text-text-dim">
+            <BellOff size={12} className="mt-0.5 shrink-0" />
+            <div className="min-w-0">
+              <span>Silenced{info?.silenced_by ? ` by ${info.silenced_by}` : ''} — not delivered.</span>
+              {info?.silence_reason && (
+                <span className="text-text-muted"> {info.silence_reason}</span>
+              )}
+              {info?.silence_pattern && (
+                <span className="ml-1 font-mono text-text-faint">[{info.silence_pattern}]</span>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+function SilenceRow({ s, onRemove }: { s: Silence; onRemove: () => void }) {
+  const overridden = s.override_count > 0;
+  return (
+    <div className="flex items-center gap-3 px-3 py-2 bg-surface-raised border border-border-subtle rounded-lg text-[12px]">
+      <code className="font-mono text-text-muted shrink-0">{s.id}</code>
+      <code className="font-mono text-accent truncate flex-1 min-w-0">{s.pattern}</code>
+      <span className="text-text-muted shrink-0">
+        {s.hit_count} hits
+        {overridden ? `, ${s.override_count} override${s.override_count !== 1 ? 's' : ''}` : ''}
+      </span>
+      <span className="text-text-faint shrink-0">{formatExpiry(s.expires_at)}</span>
+      {s.reason && (
+        <span className="text-text-dim truncate hidden md:block max-w-[14rem]" title={s.reason}>
+          {s.reason}
+        </span>
+      )}
+      {overridden && (
+        <span className="text-hue-yellow shrink-0" title="Force-overridden — this pattern may be too broad">⚠</span>
+      )}
+      <button
+        onClick={onRemove}
+        className="text-text-dim hover:text-hue-red cursor-pointer shrink-0"
+        title="Remove silence"
+      >
+        <Trash2 size={13} />
+      </button>
+    </div>
+  );
+}
+
+function SilencesPanel() {
+  const { silences, loadSilences, addSilence, removeSilence } = useNotificationStore();
+  const [pattern, setPattern] = useState('');
+  const [reason, setReason] = useState('');
+  const [ttlHours, setTtlHours] = useState('');
+  const [error, setError] = useState('');
+  const [adding, setAdding] = useState(false);
+
+  useEffect(() => { loadSilences(); }, []);
+
+  const submit = async () => {
+    const p = pattern.trim();
+    if (!p) { setError('Pattern is required'); return; }
+    try { new RegExp(p); } catch { setError('Invalid regex'); return; }
+    setAdding(true);
+    setError('');
+    try {
+      await addSilence(p, reason.trim(), Number(ttlHours) || 0);
+      setPattern(''); setReason(''); setTtlHours('');
+    } catch (e: any) {
+      setError(e?.message || 'Failed to create silence');
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  return (
+    <div className="max-w-3xl mx-auto mb-4 p-4 bg-surface border border-border-subtle rounded-lg">
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        <BellOff size={15} className="text-text-muted" />
+        <h2 className="text-sm font-semibold text-text">Silences</h2>
+        <span className="text-[12px] text-text-faint">
+          Suppress known-benign alert classes — matched notifications are recorded but not delivered (priority unchanged).
+        </span>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 mb-2">
+        <input
+          type="text"
+          value={pattern}
+          onChange={(e) => setPattern(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+          placeholder="Regex pattern (matches title + body)"
+          className="flex-1 min-w-[14rem] bg-surface-raised border border-border-subtle rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-accent font-mono"
+        />
+        <input
+          type="text"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+          placeholder="Reason"
+          className="flex-1 min-w-[10rem] bg-surface-raised border border-border-subtle rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
+        />
+        <input
+          type="number"
+          min="0"
+          value={ttlHours}
+          onChange={(e) => setTtlHours(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+          placeholder="TTL h (0=∞)"
+          className="w-28 bg-surface-raised border border-border-subtle rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
+        />
+        <button
+          onClick={submit}
+          disabled={adding}
+          className="flex items-center gap-1 px-3 py-1.5 bg-accent/15 text-accent rounded-lg text-sm border border-accent/30 hover:bg-accent/25 cursor-pointer disabled:opacity-50"
+        >
+          <Plus size={14} /> Add
+        </button>
+      </div>
+      {error && <div className="text-[12px] text-hue-red mb-2">{error}</div>}
+
+      {silences.length === 0 ? (
+        <div className="text-[12px] text-text-faint">No silences configured.</div>
+      ) : (
+        <div className="space-y-1.5">
+          {silences.map((s) => (
+            <SilenceRow key={s.id} s={s} onRemove={() => removeSilence(s.id)} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -256,6 +417,7 @@ export function NotificationsPage() {
     notifications, pendingCount, filter, typeFilter, loading,
     loadNotifications, setFilter, setTypeFilter, dismissAll,
   } = useNotificationStore();
+  const [showSilences, setShowSilences] = useState(false);
 
   useEffect(() => { loadNotifications(); }, []);
 
@@ -299,11 +461,24 @@ export function NotificationsPage() {
           ))}
         </div>
 
+        {/* Silences toggle */}
+        <button
+          onClick={() => setShowSilences(v => !v)}
+          className={`ml-auto flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border cursor-pointer transition-colors
+            ${showSilences
+              ? 'bg-accent/15 text-accent border-accent/30'
+              : 'border-border text-text-muted hover:text-text-secondary hover:bg-surface-raised'
+            }`}
+        >
+          <BellOff size={13} />
+          Silences
+        </button>
+
         {/* Dismiss All */}
         {pendingCount > 0 && (
           <button
             onClick={dismissAll}
-            className="ml-auto flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors"
           >
             <CheckCheck size={13} />
             Dismiss All
@@ -312,6 +487,7 @@ export function NotificationsPage() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
+        {showSilences && <SilencesPanel />}
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>
         ) : notifications.length === 0 ? (

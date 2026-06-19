@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -98,10 +99,91 @@ class NotificationService:
         self.db = db
         self.engine = engine
         self._hide_session_label: set[str] = set()  # Session ID prefixes that suppress the label
+        # In-memory cache of active silence rules (compiled regexes).
+        # ``None`` = not loaded yet; rebuilt lazily and invalidated on any
+        # silence mutation (tool / API). Silences are few (tens), so a
+        # full reload on change is cheap.
+        self._silence_cache: list[dict] | None = None
+        self._silence_cache_lock = asyncio.Lock()
 
     def hide_session_label_for(self, session_prefix: str) -> None:
         """Register a session ID (or prefix) that should not show the session label."""
         self._hide_session_label.add(session_prefix)
+
+    # ------------------------------------------------------------------ #
+    #  Silence matching (deterministic, server-side alert suppression)     #
+    # ------------------------------------------------------------------ #
+
+    def invalidate_silence_cache(self) -> None:
+        """Drop the compiled-rule cache so the next match reloads from DB.
+
+        Called by the management tool and the REST routes after any
+        add/remove so a new rule takes effect immediately.
+        """
+        self._silence_cache = None
+
+    async def _get_silence_rules(self) -> list[dict]:
+        """Return the cached list of compiled silence rules, loading lazily.
+
+        Each entry is ``{id, pattern, regex, reason, action}``. A rule
+        whose pattern fails to compile is dropped (logged) — a bad regex
+        disables only that rule and never blocks delivery (fail-open).
+        """
+        if self._silence_cache is not None:
+            return self._silence_cache
+        async with self._silence_cache_lock:
+            # Re-check under the lock: another coroutine may have loaded it.
+            if self._silence_cache is not None:
+                return self._silence_cache
+            try:
+                rows = await self.db.get_active_silences()
+            except Exception as exc:  # defensive: never block delivery
+                logger.warning("silence cache load failed: %s", exc)
+                self._silence_cache = []
+                return self._silence_cache
+            compiled: list[dict] = []
+            for row in rows:
+                pattern = row.get("pattern") or ""
+                try:
+                    regex = re.compile(pattern, re.IGNORECASE)
+                except re.error as exc:
+                    logger.warning(
+                        "silence %s has invalid regex %r: %s — skipping",
+                        row.get("id"), pattern, exc,
+                    )
+                    continue
+                compiled.append({
+                    "id": row.get("id"),
+                    "pattern": pattern,
+                    "regex": regex,
+                    "reason": row.get("reason") or "",
+                    "action": row.get("action") or "silence",
+                })
+            self._silence_cache = compiled
+            return compiled
+
+    async def _match_silence(self, title: str, body: str) -> dict | None:
+        """Return the first active silence rule matching ``title``+``body``.
+
+        Matching is ``re.search`` (case-insensitive) over
+        ``f"{title}\\n{body}"``. First rule wins (oldest-first order).
+        Returns ``None`` if nothing matches. Never raises — a defensive
+        try/except keeps a pathological rule from blocking delivery.
+        """
+        rules = await self._get_silence_rules()
+        if not rules:
+            return None
+        haystack = f"{title}\n{body}"
+        for rule in rules:
+            try:
+                if rule["regex"].search(haystack):
+                    return rule
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "silence %s match raised: %s", rule.get("id"), exc,
+                )
+                continue
+        return None
 
     def _should_show_session_label(self, session_id: str) -> bool:
         """Check whether the session label should be appended to this notification."""
@@ -122,15 +204,66 @@ class NotificationService:
         priority: str = "normal",
         channels: list[str] | None = None,
         silent: bool = False,
+        force: bool = False,
     ) -> str:
         """Fire-and-forget notification. Returns notification_id.
+
+        Before delivery, the title+body is checked against active
+        **silence** rules (deterministic suppression of known-benign
+        alert classes — see :meth:`_match_silence`). A matched ``notify``
+        is persisted with ``status='silenced'`` and **not delivered**;
+        priority is never modified. The caller learns it was silenced via
+        the notification metadata (and the tool layer surfaces the reason
+        + pattern), and can re-send with ``force=True`` to bypass a match
+        it judges incorrect.
+
+        Silences apply to ``notify`` only — ``ask_question`` /
+        ``propose_action`` go through their own paths and are never
+        suppressed (a silenced question would hang its session forever).
 
         Args:
             channels: Override default notification channels (e.g. ["telegram"]).
             silent: If True, deliver without sound (Telegram disable_notification).
+            force: If True, bypass silence matching and deliver normally.
+                A forced send that *still* matched a rule is delivered but
+                stamped + counted as an override for audit.
         """
         notification_id = f"notif-{uuid.uuid4().hex[:8]}"
+        match = await self._match_silence(title, body)
 
+        if match and not force:
+            # --- SILENCE: record + persist, do NOT deliver ---
+            hit_count = await self.db.record_silence_hit(match["id"])
+            await self.db.create_notification(
+                notification_id=notification_id,
+                session_id=session_id,
+                type="notify",
+                title=title,
+                body=body,
+                priority=priority,            # priority UNCHANGED
+                status="silenced",
+                metadata={
+                    "silenced_by": match["id"],
+                    "silence_reason": match["reason"],
+                    "silence_action": match["action"],
+                    "silence_pattern": match["pattern"],
+                    "silence_hit_count": hit_count,
+                },
+            )
+            await self._broadcast_silenced_web(
+                notification_id, session_id, title, body, priority, match,
+            )
+            return notification_id  # no _fanout → no telegram ping
+
+        # --- DELIVER (normal, or force-override of a match) ---
+        extra_meta: dict[str, Any] = {}
+        if match and force:
+            override_count = await self.db.record_silence_override(match["id"])
+            extra_meta = {
+                "force_sent_over_silence": match["id"],
+                "force_override_count": override_count,
+                "silence_pattern": match["pattern"],
+            }
         await self.db.create_notification(
             notification_id=notification_id,
             session_id=session_id,
@@ -138,6 +271,7 @@ class NotificationService:
             title=title,
             body=body,
             priority=priority,
+            metadata=extra_meta or None,
         )
 
         await self._fanout(
@@ -621,6 +755,47 @@ class NotificationService:
         }
         if option_labels:
             message["option_labels"] = option_labels
+        await broadcaster.broadcast("__global__", message)
+
+    async def _broadcast_silenced_web(
+        self,
+        notification_id: str,
+        session_id: str,
+        title: str,
+        body: str,
+        priority: str,
+        match: dict | None = None,
+    ) -> None:
+        """Surface a silenced ``notify`` on the web UI without delivering it.
+
+        Reuses the ``__global__`` notification event shape but flags
+        ``silenced=True`` so the web client renders a greyed row and skips
+        the toast/sound. We also stamp ``channels_delivered=["web"]`` so
+        the row appears in the web notifications list (which filters by
+        the ``web`` channel) — the suppression must stay *visible*, only
+        the escalation is filtered.
+        """
+        from nerve.agent.streaming import broadcaster
+
+        await self.db.update_notification(
+            notification_id, channels_delivered=json.dumps(["web"]),
+        )
+
+        message: dict[str, Any] = {
+            "type": "notification",
+            "notification_id": notification_id,
+            "notification_type": "notify",
+            "session_id": session_id,
+            "title": title,
+            "body": body,
+            "priority": priority,
+            "options": None,
+            "silenced": True,
+        }
+        if match:
+            message["silence_reason"] = match.get("reason", "")
+            message["silence_pattern"] = match.get("pattern", "")
+            message["silenced_by"] = match.get("id", "")
         await broadcaster.broadcast("__global__", message)
 
     def _resolve_telegram_chat_id(self) -> int | None:

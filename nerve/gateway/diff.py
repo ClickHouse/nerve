@@ -228,6 +228,11 @@ def _parse_unified_diff(
     if current_hunk:
         hunks.append(current_hunk)
 
+    # Raw git-style patch string for the @pierre/diffs renderer. Built from the
+    # same difflib output but truncated at whole-hunk boundaries so the emitted
+    # patch is always valid.
+    patch, patch_truncated = _build_patch(lines, short_path, MAX_DIFF_LINES)
+
     return {
         "path": file_path,
         "short_path": short_path,
@@ -235,8 +240,86 @@ def _parse_unified_diff(
         "binary": False,
         "stats": {"additions": additions, "deletions": deletions},
         "hunks": hunks,
-        "truncated": truncated,
+        "patch": patch,
+        "truncated": truncated or patch_truncated,
     }
+
+
+def _build_patch(
+    raw_lines: list[str],
+    short_path: str,
+    max_content_lines: int,
+) -> tuple[str, bool]:
+    """Assemble a git-style unified-diff patch from raw difflib output.
+
+    difflib's own ``---``/``+++`` header lines are regenerated as git-style
+    headers (with a leading ``diff --git`` line) so the @pierre/diffs parser
+    strips the ``a/``/``b/`` prefixes and detects the file correctly. Only
+    whole hunks are emitted; truncation always lands on a hunk boundary so the
+    result is a valid, parseable patch.
+
+    Returns ``(patch_text, truncated)``.
+    """
+    hunks: list[list[str]] = []
+    current: list[str] | None = None
+    for raw in raw_lines:
+        if raw.startswith(("---", "+++")):
+            continue  # regenerated below
+        if raw.startswith("@@"):
+            current = [raw]
+            hunks.append(current)
+        elif current is not None:
+            current.append(raw)
+
+    if not hunks:
+        return "", False
+
+    out: list[str] = [
+        f"diff --git a/{short_path} b/{short_path}\n",
+        f"--- a/{short_path}\n",
+        f"+++ b/{short_path}\n",
+    ]
+    total = 0
+    truncated = False
+    for hunk in hunks:
+        body = hunk[1:]
+        if total > 0 and total + len(body) > max_content_lines:
+            truncated = True
+            break
+        for line in hunk:
+            out.append(line if line.endswith("\n") else line + "\n")
+        total += len(body)
+    return "".join(out), truncated
+
+
+def _new_file_patch(short_path: str, lines: list[str]) -> str:
+    """git-style patch for a created file — every line is an addition."""
+    if not lines:
+        return ""
+    out = [
+        f"diff --git a/{short_path} b/{short_path}\n",
+        "new file mode 100644\n",
+        "--- /dev/null\n",
+        f"+++ b/{short_path}\n",
+        f"@@ -0,0 +1,{len(lines)} @@\n",
+    ]
+    out.extend(f"+{l}\n" for l in lines)
+    return "".join(out)
+
+
+def _deleted_file_patch(short_path: str, lines: list[str]) -> str:
+    """git-style patch for a deleted file — every line is a deletion."""
+    if not lines:
+        return ""
+    out = [
+        f"diff --git a/{short_path} b/{short_path}\n",
+        "deleted file mode 100644\n",
+        f"--- a/{short_path}\n",
+        "+++ /dev/null\n",
+        f"@@ -1,{len(lines)} +0,0 @@\n",
+    ]
+    out.extend(f"-{l}\n" for l in lines)
+    return "".join(out)
 
 
 def _make_new_file_diff(
@@ -267,6 +350,7 @@ def _make_new_file_diff(
                 for i, l in enumerate(lines)
             ],
         }] if lines else [],
+        "patch": _new_file_patch(short_path, lines),
         "truncated": truncated,
     }
 
@@ -299,6 +383,7 @@ def _make_deleted_file_diff(
                 for i, l in enumerate(lines)
             ],
         }] if lines else [],
+        "patch": _deleted_file_patch(short_path, lines),
         "truncated": truncated,
     }
 
@@ -315,5 +400,6 @@ def _empty_diff(
         "binary": False,
         "stats": {"additions": 0, "deletions": 0},
         "hunks": [],
+        "patch": "",
         "truncated": False,
     }

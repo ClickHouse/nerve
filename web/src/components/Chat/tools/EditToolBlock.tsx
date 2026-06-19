@@ -1,6 +1,10 @@
-import { useState } from 'react';
+import { useState, lazy, Suspense } from 'react';
 import { ChevronRight, ChevronDown, FileEdit, Loader2 } from 'lucide-react';
 import type { ToolCallBlockData } from '../../../types/chat';
+
+// The diff renderer pulls in @pierre/diffs + Shiki — only loaded when an Edit
+// block is expanded. Shares the lazy chunk with FileChangesPanel's DiffView.
+const EditDiff = lazy(() => import('../DiffView').then((m) => ({ default: m.EditDiff })));
 
 export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
@@ -8,9 +12,6 @@ export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
   const filePath = String(block.input.file_path || '');
   const oldString = String(block.input.old_string || '');
   const newString = String(block.input.new_string || '');
-
-  const oldLines = oldString.split('\n');
-  const newLines = newString.split('\n');
 
   return (
     <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
@@ -32,17 +33,16 @@ export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
       {expanded && (
         <div className="border-t border-border">
           {/* Diff view */}
-          <div className="font-mono text-[12px] overflow-x-auto max-h-80 overflow-y-auto">
-            {oldLines.map((line, i) => (
-              <div key={`old-${i}`} className="px-3 py-0.5 bg-diff-del-bg/15 text-diff-del/80">
-                <span className="select-none text-diff-del/40 mr-2">-</span>{line}
-              </div>
-            ))}
-            {newLines.map((line, i) => (
-              <div key={`new-${i}`} className="px-3 py-0.5 bg-diff-add-bg/15 text-diff-add/80">
-                <span className="select-none text-diff-add/40 mr-2">+</span>{line}
-              </div>
-            ))}
+          <div className="max-h-80 overflow-y-auto">
+            <Suspense
+              fallback={
+                <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+                  <Loader2 size={12} className="animate-spin" /> Loading diff…
+                </div>
+              }
+            >
+              <EditDiff fileName={filePath} oldString={oldString} newString={newString} />
+            </Suspense>
           </div>
 
           {/* Error */}

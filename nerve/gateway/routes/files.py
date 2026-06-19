@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import uuid
@@ -86,7 +87,7 @@ async def upload_files(
         file_type = _classify_file(media_type)
 
         disk_path = upload_dir / f"{file_id}_{filename}"
-        disk_path.write_bytes(data)
+        await asyncio.to_thread(disk_path.write_bytes, data)
 
         await deps.db.save_uploaded_file(
             file_id=file_id,

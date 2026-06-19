@@ -3,6 +3,7 @@ import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperc
 import { useChatStore } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
+import { PromptRewriteCard } from './PromptRewriteCard';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
   add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)', placeholder: 'Instructions...' },
@@ -14,6 +15,17 @@ const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; col
 
 // Actions that auto-focus the instruction input (need user input)
 const FOCUS_ACTIONS = new Set<QuoteAction>(['add', 'question', 'note']);
+
+// Prompt rewrite — refine the first message of a new chat before sending.
+const REWRITE_PREF_KEY = 'nerve_prompt_rewrite';
+const REWRITE_MIN_CHARS = 20;    // shorter prompts are sent as-is
+const REWRITE_MAX_CHARS = 6000;  // matches the backend cap
+
+type RewriteFlowState =
+  | { status: 'idle' }
+  | { status: 'loading'; original: string }
+  | { status: 'ready'; original: string; rewritten: string; model: string }
+  | { status: 'error'; original: string; message: string };
 
 interface AttachmentFile {
   id: string;
@@ -44,8 +56,51 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const updateQuoteInstruction = useChatStore(s => s.updateQuoteInstruction);
   const clearQuotes = useChatStore(s => s.clearQuotes);
   const activeSession = useChatStore(s => s.activeSession);
+  const isNewChat = useChatStore(s => s.messages.length === 0);
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
+
+  // ── Prompt rewrite ──
+  // Server-side availability (config master switch) + per-user toggle.
+  const [rewriteAvailable, setRewriteAvailable] = useState(false);
+  const [rewriteEnabled, setRewriteEnabled] = useState(
+    () => localStorage.getItem(REWRITE_PREF_KEY) === '1',
+  );
+  const [rewrite, setRewrite] = useState<RewriteFlowState>({ status: 'idle' });
+  const rewriteAbortRef = useRef<AbortController | null>(null);
+  const rewriteActive = rewrite.status !== 'idle';
+
+  useEffect(() => {
+    api.getPromptRewriteStatus()
+      .then(s => setRewriteAvailable(s.enabled))
+      .catch(() => setRewriteAvailable(false));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(REWRITE_PREF_KEY, rewriteEnabled ? '1' : '0');
+  }, [rewriteEnabled]);
+
+  const cancelRewrite = useCallback((refocus = true) => {
+    rewriteAbortRef.current?.abort();
+    rewriteAbortRef.current = null;
+    setRewrite({ status: 'idle' });
+    if (refocus) setTimeout(() => textareaRef.current?.focus(), 0);
+  }, []);
+
+  // Discard any pending rewrite preview when switching sessions.
+  useEffect(() => {
+    cancelRewrite(false);
+  }, [activeSession, cancelRewrite]);
+
+  // Esc anywhere dismisses the preview (cancels an in-flight rewrite).
+  useEffect(() => {
+    if (!rewriteActive) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') cancelRewrite();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [rewriteActive, cancelRewrite]);
 
   // Auto-focus instruction input when a new quote is added
   useEffect(() => {
@@ -138,12 +193,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
 
   const allUploaded = attachments.length === 0 || attachments.every(a => !a.uploading);
   const hasContent = input.trim() || quotes.length > 0 || attachments.some(a => a.uploadedId);
-  const canSend = !disabled && !isStreaming && hasContent && allUploaded;
+  const canSend = !disabled && !isStreaming && !rewriteActive && hasContent && allUploaded;
 
-  const handleSend = () => {
-    const message = composeMessage();
-    if (!message && attachments.length === 0) return;
-
+  /** Actually dispatch a message (with current attachments) and reset the composer. */
+  const dispatchSend = (message: string) => {
     const fileIds = attachments.filter(a => a.uploadedId).map(a => a.uploadedId!);
     const imageBlocks = attachments
       .filter(a => a.uploadedId && a.uploadedMeta?.file_type === 'image')
@@ -159,7 +212,56 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     // Clean up previews
     attachments.forEach(a => { if (a.preview) URL.revokeObjectURL(a.preview); });
     setAttachments([]);
+    rewriteAbortRef.current?.abort();
+    rewriteAbortRef.current = null;
+    setRewrite({ status: 'idle' });
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
+  };
+
+  /** Request a rewrite and open the preview card. Sends nothing by itself. */
+  const startRewrite = async (message: string) => {
+    rewriteAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    rewriteAbortRef.current = ctrl;
+    setRewrite({ status: 'loading', original: message });
+    try {
+      const res = await api.rewritePrompt(message, ctrl.signal);
+      if (ctrl.signal.aborted) return;
+      if (!res.changed) {
+        // Model judged the prompt fine as-is — send the original directly.
+        dispatchSend(message);
+        return;
+      }
+      setRewrite({
+        status: 'ready',
+        original: message,
+        rewritten: res.rewritten,
+        model: res.model,
+      });
+    } catch (e) {
+      if (ctrl.signal.aborted) return;
+      setRewrite({
+        status: 'error',
+        original: message,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const handleSend = () => {
+    const message = composeMessage();
+    if (!message && attachments.length === 0) return;
+
+    // First message of a new chat with rewrite on → preview instead of send.
+    const shouldRewrite =
+      rewriteAvailable && rewriteEnabled && isNewChat && rewrite.status === 'idle' &&
+      message.trim().length >= REWRITE_MIN_CHARS && message.length <= REWRITE_MAX_CHARS;
+    if (shouldRewrite) {
+      void startRewrite(message);
+      return;
+    }
+
+    dispatchSend(message);
   };
 
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -246,6 +348,26 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
         </div>
       )}
 
+      {/* Prompt rewrite preview */}
+      {rewrite.status !== 'idle' && (
+        <div className="px-4 pt-3 pb-1">
+          <div className="max-w-3xl mx-auto">
+            <PromptRewriteCard
+              state={
+                rewrite.status === 'loading' ? { status: 'loading' }
+                : rewrite.status === 'ready' ? { status: 'ready', rewritten: rewrite.rewritten, model: rewrite.model }
+                : { status: 'error', message: rewrite.message }
+              }
+              original={rewrite.original}
+              onApprove={(text) => dispatchSend(text)}
+              onSendOriginal={() => dispatchSend(rewrite.original)}
+              onDiscard={() => cancelRewrite()}
+              onRetry={() => void startRewrite(rewrite.original)}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Quote cards */}
       {quotes.length > 0 && (
         <div className="px-4 pt-3 pb-1">
@@ -281,12 +403,30 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           {/* File attach button */}
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || isStreaming}
+            disabled={disabled || isStreaming || rewriteActive}
             className="w-10 h-10 text-text-muted hover:text-text-secondary rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0 disabled:opacity-30"
             title="Attach files"
           >
             <Paperclip size={18} />
           </button>
+
+          {/* Prompt rewrite toggle — only on a fresh chat, where it applies */}
+          {rewriteAvailable && isNewChat && (
+            <button
+              onClick={() => setRewriteEnabled(v => !v)}
+              disabled={disabled || isStreaming || rewriteActive}
+              className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
+                rewriteEnabled
+                  ? 'text-hue-purple bg-purple-500/10 hover:bg-purple-500/15 shadow-[inset_0_0_0_1px_rgba(168,85,247,0.25)]'
+                  : 'text-text-muted hover:text-text-secondary'
+              }`}
+              title={rewriteEnabled
+                ? 'Prompt rewrite on — your first message will be refined for approval before sending'
+                : 'Prompt rewrite off — click to refine your first message with AI before sending'}
+            >
+              <Sparkles size={18} />
+            </button>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -306,9 +446,14 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             onChange={(e) => { setInput(e.target.value); handleInput(); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={quotes.length > 0 ? 'Add context (optional)...' : attachments.length > 0 ? 'Add a message (optional)...' : 'Send a message...'}
+            placeholder={
+              quotes.length > 0 ? 'Add context (optional)...'
+              : attachments.length > 0 ? 'Add a message (optional)...'
+              : rewriteAvailable && rewriteEnabled && isNewChat ? 'Send a message — it will be refined before sending...'
+              : 'Send a message...'
+            }
             rows={1}
-            disabled={disabled}
+            disabled={disabled || rewriteActive}
             className="flex-1 px-4 py-3 bg-surface-raised border border-border rounded-xl text-[15px] text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
           {isStreaming ? (

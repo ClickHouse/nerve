@@ -2,13 +2,7 @@ import { useNavigate } from 'react-router-dom';
 import { Calendar, Clock, ExternalLink } from 'lucide-react';
 import type { Task } from '../../stores/taskStore';
 import { formatTimeAgo } from '../../utils/dateGroups';
-
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
-  in_progress: 'bg-blue-400/10 text-hue-blue border-blue-400/20',
-  done: 'bg-emerald-400/10 text-hue-emerald border-emerald-400/20',
-  deferred: 'bg-border-subtle/50 text-text-muted border-border-subtle',
-};
+import { StatusBadge, StatusSelect } from './StatusControls';
 
 export function TaskCard({ task, onStatusChange }: {
   task: Task;
@@ -25,9 +19,7 @@ export function TaskCard({ task, onStatusChange }: {
         <div className="min-w-0 flex-1">
           <h3 className="font-medium text-[15px] text-text mb-1">{task.title}</h3>
           <div className="flex items-center gap-3 text-[12px]">
-            <span className={`px-2 py-0.5 rounded-full border ${STATUS_STYLES[task.status] || STATUS_STYLES.deferred}`}>
-              {task.status}
-            </span>
+            <StatusBadge status={task.status} />
             {task.deadline && (
               <span className="flex items-center gap-1 text-text-dim">
                 <Calendar size={11} /> {task.deadline}
@@ -57,16 +49,11 @@ export function TaskCard({ task, onStatusChange }: {
               <ExternalLink size={14} />
             </a>
           )}
-          <select
+          <StatusSelect
             value={task.status}
-            onChange={(e) => onStatusChange(task.id, e.target.value)}
+            onChange={(status) => onStatusChange(task.id, status)}
             className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-text-muted outline-none cursor-pointer"
-          >
-            <option value="pending">Pending</option>
-            <option value="in_progress">In Progress</option>
-            <option value="done">Done</option>
-            <option value="deferred">Deferred</option>
-          </select>
+          />
         </div>
       </div>
     </div>

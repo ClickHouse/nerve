@@ -1,5 +1,15 @@
 const API_BASE = '/api';
 
+export interface TaskStatusDef {
+  name: string;
+  label: string;
+  color: string;
+  description: string;
+  is_system: number;
+  sort_order: number;
+  created_at?: string;
+}
+
 let authToken: string | null = localStorage.getItem('nerve_token');
 
 export function setToken(token: string) {
@@ -115,6 +125,16 @@ export const api = {
   updateTask: (id: string, data: { status?: string; note?: string; content?: string }) =>
     request<any>(`/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
 
+  // Task statuses (configurable)
+  listTaskStatuses: () =>
+    request<{ statuses: TaskStatusDef[] }>('/task-statuses'),
+  createTaskStatus: (data: { name: string; label?: string; color?: string; description?: string }) =>
+    request<TaskStatusDef>('/task-statuses', { method: 'POST', body: JSON.stringify(data) }),
+  updateTaskStatus: (name: string, data: { label?: string; color?: string; description?: string; sort_order?: number }) =>
+    request<TaskStatusDef>(`/task-statuses/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteTaskStatus: (name: string) =>
+    request<{ name: string; deleted: boolean }>(`/task-statuses/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
   // Memory
   listMemoryFiles: () => request<{ files: any[] }>('/memory/files'),
   readMemoryFile: (path: string) =>
@@ -222,8 +242,9 @@ export const api = {
 
   // Diagnostics
   getDiagnostics: () => request<any>('/diagnostics'),
-  getCronLogs: (jobId?: string, limit = 50) =>
-    request<{ logs: any[] }>(`/cron/logs?job_id=${jobId || ''}&limit=${limit}`),
+  getCronLogs: (jobId?: string, limit = 50, offset = 0) =>
+    request<{ logs: any[]; total: number; limit: number; offset: number }>(
+      `/cron/logs?job_id=${jobId || ''}&limit=${limit}&offset=${offset}`),
 
   // Observability — lightweight status for UI deep-links
   getObservabilityStatus: () =>
@@ -235,6 +256,16 @@ export const api = {
         last_flush_at: string | null;
       };
     }>('/observability/status'),
+
+  // Prompt rewrite — refine the first prompt of a new chat
+  getPromptRewriteStatus: () =>
+    request<{ enabled: boolean; model: string }>('/prompt-rewrite/status'),
+  rewritePrompt: (prompt: string, signal?: AbortSignal) =>
+    request<{ rewritten: string; changed: boolean; model: string }>('/prompt-rewrite', {
+      method: 'POST',
+      body: JSON.stringify({ prompt }),
+      signal,
+    }),
 
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
@@ -310,6 +341,17 @@ export const api = {
     request<any>(`/notifications/${id}/dismiss`, { method: 'POST' }),
   dismissAllNotifications: () =>
     request<{ dismissed: number }>('/notifications/dismiss-all', { method: 'POST' }),
+
+  // Notification silences (deterministic suppression rules)
+  listSilences: () =>
+    request<{ silences: any[] }>('/notifications/silences'),
+  createSilence: (pattern: string, reason: string, ttl_hours: number) =>
+    request<any>('/notifications/silences', {
+      method: 'POST',
+      body: JSON.stringify({ pattern, reason, ttl_hours }),
+    }),
+  deleteSilence: (id: string) =>
+    request<any>(`/notifications/silences/${id}`, { method: 'DELETE' }),
 
   // houseofagents
   getHoaStatus: () =>

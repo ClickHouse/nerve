@@ -14,6 +14,10 @@ Usage:
 
 from __future__ import annotations
 
+# Must be first: applies BLAS thread caps and other process-env defaults
+# that have to be in place before numpy (or any BLAS user) is imported.
+import nerve._env  # noqa: F401  isort: skip
+
 import asyncio
 import logging
 import os
@@ -26,12 +30,16 @@ from pathlib import Path
 
 import click
 
-from nerve.config import load_config, set_config
+from nerve.config import (
+    load_config,
+    resolve_config_dir,
+    set_config,
+    write_config_pointer,
+)
 
 # Default PID file location
 PID_DIR = Path("~/.nerve").expanduser()
 PID_FILE = PID_DIR / "nerve.pid"
-CONFIG_DIR_FILE = PID_DIR / "config_dir"
 LOG_FILE = PID_DIR / "nerve.log"
 
 
@@ -74,15 +82,7 @@ def _write_pid(pid: int, config_dir: Path | None = None) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(pid))
     if config_dir is not None:
-        CONFIG_DIR_FILE.write_text(str(config_dir.resolve()))
-
-
-def _read_config_dir() -> Path | None:
-    """Read stored config directory. Returns None if not available."""
-    try:
-        return Path(CONFIG_DIR_FILE.read_text().strip())
-    except (FileNotFoundError, ValueError):
-        return None
+        write_config_pointer(config_dir)
 
 
 def _remove_pid() -> None:
@@ -169,17 +169,27 @@ def _docker_compose(
 
 
 @click.group()
-@click.option("--config-dir", "-c", type=click.Path(), default=".", help="Config directory")
+@click.option(
+    "--config-dir", "-c", type=click.Path(), default=None,
+    help="Config directory (default: auto-detected — see `nerve doctor`)",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
 @click.pass_context
-def main(ctx: click.Context, config_dir: str, verbose: bool) -> None:
+def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     """Nerve — Personal AI Assistant"""
     setup_logging(verbose)
-    config = load_config(Path(config_dir))
+    # Resolve the config directory via the waterfall (flag → env → cwd →
+    # pointer file) so commands work from any directory, not just the
+    # install dir.
+    resolved_dir, config_source = resolve_config_dir(config_dir)
+    if not resolved_dir.is_absolute():
+        resolved_dir = resolved_dir.resolve()
+    config = load_config(resolved_dir)
     set_config(config)
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
-    ctx.obj["config_dir"] = config_dir
+    ctx.obj["config_dir"] = str(resolved_dir)
+    ctx.obj["config_source"] = config_source
     ctx.obj["verbose"] = verbose
 
 
@@ -209,6 +219,10 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     else:
         wizard = SetupWizard(config_dir, inside_docker=inside_docker)
         wizard.run()
+
+    # Remember where the config lives so every future `nerve` command
+    # finds it regardless of the caller's working directory.
+    write_config_pointer(config_dir)
 
     # Reload config after wizard writes files
     config = load_config(config_dir)
@@ -357,13 +371,9 @@ def restart(ctx: click.Context) -> None:
     helper runs in its own session and survives the parent's death.
     """
     config = ctx.obj["config"]
+    # Already resolved via the waterfall (flag → env → cwd → pointer), so
+    # this is an absolute path that doesn't depend on the caller's CWD.
     config_dir = Path(ctx.obj["config_dir"])
-
-    # Prefer the config dir stored by the running daemon — it's an absolute
-    # path that doesn't depend on the caller's CWD.
-    stored = _read_config_dir()
-    if stored is not None and stored.is_dir():
-        config_dir = stored
 
     # Docker mode: proxy to docker compose
     if _is_docker_mode(config):
@@ -654,11 +664,44 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
     click.echo("  nerve restart")
 
 
-def doctor_report(config) -> str:
+_CONFIG_SOURCE_LABELS = {
+    "flag": "--config-dir flag",
+    "env": "NERVE_CONFIG_DIR env var",
+    "cwd": "current directory",
+    "pointer": "~/.nerve/config_dir pointer",
+    "default": "current directory (no config found anywhere)",
+}
+
+
+def _check_api_connectivity(config) -> tuple[bool, str]:
+    """Make a 1-token API call through the configured provider.
+
+    Catches bad API keys, missing Bedrock model access, and wrong
+    inference-profile prefixes — at diagnosis time instead of first message.
+    """
+    model = config.agent.title_model
+    try:
+        client = config.create_anthropic_client(timeout=15.0)
+        client.messages.create(
+            model=model,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return True, f"model {model} reachable"
+    except Exception as e:
+        detail = str(e)
+        if len(detail) > 200:
+            detail = detail[:200] + "…"
+        return False, f"{model}: {detail}"
+
+
+def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
     Used by both the CLI ``nerve doctor`` command and the Telegram ``/doctor``
-    command so they share the same diagnostics.
+    command so they share the same diagnostics. ``check_api`` makes a real
+    (1-token) API call through the configured provider — enabled for the CLI,
+    skipped for the in-daemon Telegram handler to avoid blocking the loop.
     """
     lines: list[str] = []
     errors: list[str] = []
@@ -666,6 +709,41 @@ def doctor_report(config) -> str:
 
     lines.append("Nerve Doctor")
     lines.append("=" * 40)
+
+    # Where the config came from — surfaces CWD mixups immediately
+    config_dir = getattr(config, "config_dir", None)
+    if config_dir is not None:
+        source_label = _CONFIG_SOURCE_LABELS.get(config_source, config_source)
+        suffix = f" (via {source_label})" if source_label else ""
+        has_base = (Path(config_dir) / "config.yaml").exists()
+        has_local = (Path(config_dir) / "config.local.yaml").exists()
+        if has_base or has_local:
+            present = " + ".join(
+                n for n, ok in (
+                    ("config.yaml", has_base), ("config.local.yaml", has_local),
+                ) if ok
+            )
+            lines.append(f"[OK] Config: {config_dir} ({present}){suffix}")
+        else:
+            errors.append(
+                f"[ERR] No config files in {config_dir}{suffix} — "
+                "run 'nerve init', or point at an existing install with "
+                "-c/--config-dir or NERVE_CONFIG_DIR"
+            )
+
+    # Unknown / misspelled config keys
+    try:
+        from nerve.config import _deep_merge, validate_config_keys
+        merged: dict = {}
+        for name in ("config.yaml", "config.local.yaml"):
+            p = Path(config_dir or ".") / name
+            if p.exists():
+                import yaml as _yaml
+                merged = _deep_merge(merged, _yaml.safe_load(p.read_text()) or {})
+        for w in validate_config_keys(merged):
+            warnings.append(f"[WARN] config: {w}")
+    except Exception:
+        pass
 
     # Daemon status
     running, pid = _get_daemon_status()
@@ -717,8 +795,25 @@ def doctor_report(config) -> str:
         except Exception:
             warnings.append("[WARN] Proxy not running (starts with Nerve)")
 
-    # Check API keys
-    if config.proxy.enabled:
+    # Check API keys / provider
+    if config.provider.is_bedrock:
+        region = config.provider.aws_region or "(default)"
+        lines.append(f"[OK] Provider: AWS Bedrock, region {region}")
+        # Inference-profile prefix must match the region's geography
+        # (us./eu./apac.) — a mismatch means instant 400s.
+        from nerve.bootstrap import bedrock_geo_prefix
+        expected = bedrock_geo_prefix(config.provider.aws_region)
+        for label, model in (
+            ("agent.model", config.agent.model),
+            ("agent.cron_model", config.agent.cron_model),
+        ):
+            geo = model.split(".", 1)[0] if "." in model else ""
+            if geo in ("us", "eu", "apac", "global") and geo not in (expected, "global"):
+                warnings.append(
+                    f"[WARN] {label} '{model}' uses the '{geo}.' inference profile "
+                    f"but region {region} is '{expected}.' — expect 400 errors"
+                )
+    elif config.proxy.enabled:
         if config.anthropic_api_key:
             lines.append("[--] Anthropic API key set (proxy takes precedence)")
         else:
@@ -727,6 +822,14 @@ def doctor_report(config) -> str:
         lines.append(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
     else:
         errors.append("[ERR] Anthropic API key not set and proxy not enabled (config.local.yaml)")
+
+    # Live connectivity probe (CLI only — see check_api docstring note)
+    if check_api and (config.provider.is_bedrock or config.anthropic_api_key):
+        ok, detail = _check_api_connectivity(config)
+        if ok:
+            lines.append(f"[OK] Claude API: {detail}")
+        else:
+            errors.append(f"[ERR] Claude API: {detail}")
 
     if config.openai_api_key:
         lines.append(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]} (vector embeddings enabled)")
@@ -737,6 +840,17 @@ def doctor_report(config) -> str:
     if config.telegram.enabled:
         if config.telegram.bot_token:
             lines.append(f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}")
+            if config.telegram.dm_policy == "open":
+                warnings.append(
+                    "[WARN] telegram.dm_policy is 'open' — any Telegram user "
+                    "can talk to this bot"
+                )
+            elif not config.telegram.allowed_users:
+                warnings.append(
+                    "[WARN] telegram.allowed_users is empty — the bot rejects "
+                    "all DMs until you pair (run 'nerve pair', then send the "
+                    "bot /pair <code>)"
+                )
         else:
             errors.append("[ERR] Telegram enabled but bot_token not set")
     else:
@@ -803,6 +917,49 @@ def doctor_report(config) -> str:
         if config.cron.jobs_file.exists():
             lines.append(f"[OK] User crons: {config.cron.jobs_file}")
 
+    # Check backups
+    backup_cfg = getattr(config, "backup", None)
+    if backup_cfg is not None and backup_cfg.enabled:
+        if not backup_cfg.target_dir:
+            warnings.append(
+                "[WARN] backup.enabled is true but backup.target_dir is empty "
+                "— no backups will run"
+            )
+        else:
+            try:
+                from nerve import backup as _backup_mod
+
+                target = Path(backup_cfg.target_dir).expanduser()
+                age = _backup_mod.latest_bundle_age_seconds(target)
+                kept = len(_backup_mod.list_bundles(target))
+                stale_after = 2 * max(1, backup_cfg.interval_hours) * 3600
+                if age is None:
+                    warnings.append(
+                        f"[WARN] Backups enabled but none found in {target}"
+                    )
+                else:
+                    age_h = age / 3600
+                    age_str = (
+                        f"{age_h:.1f}h" if age_h < 48 else f"{age_h / 24:.1f}d"
+                    )
+                    if age > stale_after:
+                        warnings.append(
+                            f"[WARN] Last backup is {age_str} old "
+                            f"(> 2× interval of {backup_cfg.interval_hours}h) "
+                            f"— check the scheduled job ({target})"
+                        )
+                    else:
+                        lines.append(
+                            f"[OK] Backups: last {age_str} ago, {kept} kept in {target}"
+                        )
+            except Exception as e:
+                warnings.append(f"[WARN] Backup check failed: {e}")
+    else:
+        lines.append(
+            "[--] Backups not configured — set backup.target_dir + enabled to "
+            "protect ~/.nerve against disk loss"
+        )
+
     # Check external tools
     import shutil
     for tool_name in ["gog", "gh"]:
@@ -829,10 +986,59 @@ def doctor_report(config) -> str:
 def doctor(ctx: click.Context) -> None:
     """Check config, DB, API keys, and connectivity."""
     config = ctx.obj["config"]
-    report = doctor_report(config)
+    report = doctor_report(
+        config,
+        config_source=ctx.obj.get("config_source", ""),
+        check_api=True,
+    )
     click.echo(report)
     if "[ERR]" in report:
         ctx.exit(1)
+
+
+@main.command()
+@click.pass_context
+def pair(ctx: click.Context) -> None:
+    """Generate a Telegram pairing code.
+
+    Send /pair <code> to your bot within an hour to authorize your
+    Telegram account. The paired user ID is persisted to
+    config.local.yaml (telegram.allowed_users).
+    """
+    config = ctx.obj["config"]
+
+    if not config.telegram.enabled or not config.telegram.bot_token:
+        click.echo("Telegram is not configured (telegram.bot_token missing).")
+        click.echo("Set it up in config.local.yaml, or re-run 'nerve init'.")
+        ctx.exit(1)
+        return
+
+    if config.telegram.dm_policy != "pairing":
+        click.echo(
+            f"telegram.dm_policy is '{config.telegram.dm_policy}' — pairing is "
+            "only used with dm_policy: pairing."
+        )
+        ctx.exit(1)
+        return
+
+    from nerve.pairing import CODE_TTL_SECONDS, generate_pairing_code
+
+    code = generate_pairing_code()
+    running, _pid = _get_daemon_status()
+
+    click.echo()
+    click.secho(f"  Pairing code: {code}", bold=True)
+    click.echo()
+    click.echo(f"  Send this to your bot:  /pair {code}")
+    click.echo(f"  Valid for {CODE_TTL_SECONDS // 60} minutes, single use.")
+    if not running:
+        click.echo()
+        click.secho(
+            "  Note: Nerve is not running — start it first ('nerve start'), "
+            "then send the command.",
+            fg="yellow",
+        )
+    click.echo()
 
 
 @main.command()
@@ -978,6 +1184,144 @@ def cron(ctx: click.Context, job_id: str) -> None:
             await close_db()
 
     asyncio.run(_run())
+
+
+@main.command()
+@click.option("--output", "-o", default=None, help="Target directory (default: backup.target_dir from config)")
+@click.option("--state-only", is_flag=True, help="Back up ~/.nerve state only (skip workspace BRAIN)")
+@click.option("--no-secrets", is_flag=True, help="Omit secrets (mcp-token, telegram session, certs, config.local.yaml)")
+@click.option("--quiet", "-q", is_flag=True, help="Only print errors")
+@click.pass_context
+def backup(ctx: click.Context, output: str | None, state_only: bool, no_secrets: bool, quiet: bool) -> None:
+    """Create a portable backup bundle of Nerve state.
+
+    Snapshots the SQLite DBs (consistent even while Nerve runs), the memU
+    sidecars, secrets, cron jobs, and the workspace BRAIN into a single
+    ``nerve-backup-<host>-<ts>.tar.zst`` file. Works without a running server.
+    """
+    from nerve import backup as backup_mod
+
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+
+    target = output or config.backup.target_dir
+    if not target:
+        raise click.ClickException(
+            "No target directory. Pass --output DIR, or set backup.target_dir "
+            "in config.yaml (an external mount or synced dir is recommended)."
+        )
+
+    nerve_dir = PID_DIR
+    include_workspace = config.backup.include_workspace and not state_only
+
+    if not quiet:
+        click.echo(f"Backing up to {target} ...")
+    try:
+        result = backup_mod.create_backup(
+            nerve_dir=nerve_dir,
+            workspace=config.workspace,
+            output_dir=Path(target).expanduser(),
+            config_dir=config_dir,
+            include_workspace=include_workspace,
+            include_secrets=not no_secrets,
+            state_only=state_only,
+            workspace_excludes=config.backup.workspace_excludes,
+        )
+    except backup_mod.BackupError as e:
+        raise click.ClickException(str(e))
+
+    if not quiet:
+        c = result.counts
+        click.echo(f"  Bundle:   {result.path}")
+        click.echo(f"  Size:     {result.size / (1024 ** 2):.1f} MB ({result.compression})")
+        click.echo(f"  Files:    {result.file_count}")
+        click.echo(
+            f"  Parity:   sessions={c.get('sessions')}, messages={c.get('messages')}, "
+            f"tasks={c.get('tasks')}, memU={c.get('memu_items')}"
+        )
+        if not result.include_secrets:
+            click.echo("  Secrets:  OMITTED (--no-secrets) — re-provision on restore")
+        if not result.include_workspace:
+            click.echo("  Workspace: skipped (state-only)")
+
+    # Apply retention when writing to the configured target.
+    if config.backup.retention_count and target == config.backup.target_dir:
+        deleted = backup_mod.prune(Path(target).expanduser(), config.backup.retention_count)
+        if deleted and not quiet:
+            click.echo(f"  Pruned:   {len(deleted)} old bundle(s) (keep {config.backup.retention_count})")
+
+
+@main.command()
+@click.argument("bundle")
+@click.option("--verify-only", is_flag=True, help="Check integrity without installing")
+@click.option("--force", is_flag=True, help="Relocate a non-empty ~/.nerve and restore over it")
+@click.pass_context
+def restore(ctx: click.Context, bundle: str, verify_only: bool, force: bool) -> None:
+    """Verify and restore a backup bundle.
+
+    Refuses to run against a live daemon (stop it first) and refuses to
+    overwrite a non-empty ~/.nerve without --force (which relocates the old
+    dir to ~/.nerve.pre-restore-<ts> rather than deleting it).
+    """
+    from nerve import backup as backup_mod
+
+    config = ctx.obj["config"]
+    bundle_path = Path(bundle).expanduser()
+    if not bundle_path.is_file():
+        raise click.ClickException(f"Bundle not found: {bundle_path}")
+
+    nerve_dir = PID_DIR
+
+    if verify_only:
+        try:
+            report = backup_mod.verify_bundle(bundle_path)
+        except backup_mod.BackupError as e:
+            raise click.ClickException(str(e))
+        m = report.manifest
+        click.echo(f"Bundle:   {bundle_path.name}")
+        click.echo(f"Created:  {m.get('created_at', '?')} on {m.get('host', '?')}")
+        click.echo(f"Nerve:    v{m.get('nerve_version', '?')} (schema v{m.get('schema_version', '?')}, git {m.get('git_sha', '')[:8] or '?'})")
+        click.echo(f"Parity:   {report.summary()}")
+        flags = m.get("flags", {})
+        click.echo(f"Flags:    secrets={flags.get('include_secrets')}, workspace={flags.get('include_workspace')}")
+        for w in report.warnings:
+            click.echo(f"  [WARN] {w}")
+        if report.ok:
+            click.echo("\n[OK] Bundle verified — safe to restore.")
+        else:
+            for e in report.errors:
+                click.echo(f"  [ERR] {e}")
+            click.echo(f"\n{len(report.errors)} error(s) — restore would be refused.")
+            ctx.exit(1)
+        return
+
+    # Only override the bundle's recorded config path when this box actually
+    # has a resolved config (otherwise let the bundle pointer decide — a
+    # faithful disaster-recovery restore).
+    cfg_dir = None
+    if ctx.obj.get("config_source") not in (None, "", "default"):
+        cfg_dir = Path(ctx.obj["config_dir"])
+
+    click.echo(f"Restoring {bundle_path.name} → {nerve_dir} ...")
+    try:
+        report = backup_mod.restore_bundle(
+            bundle_path,
+            nerve_dir=nerve_dir,
+            workspace=config.workspace,
+            config_dir=cfg_dir,
+            force=force,
+        )
+    except backup_mod.BackupError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(f"  Parity:   {report.summary()}")
+    flags = report.manifest.get("flags", {})
+    if not flags.get("include_secrets", True):
+        click.echo(
+            "  [WARN] This bundle had NO secrets — re-provision mcp-token, the "
+            "Telegram session, certs, and config.local.yaml before starting."
+        )
+    click.echo("\nRestore complete. Run 'nerve doctor' to verify, then 'nerve start'.")
 
 
 @main.command("migrate-openclaw")
@@ -1214,6 +1558,123 @@ def backfill_timestamps(ctx: click.Context, dry_run: bool) -> None:
     db.close()
 
     click.echo(f"\n{'Would update' if dry_run else 'Updated'} {updated} items, skipped {skipped}")
+
+
+def _fmt_bytes(n: int) -> str:
+    """Render a byte count as MB with one decimal."""
+    return f"{(n or 0) / (1024 * 1024):.1f} MB"
+
+
+@main.group(name="db")
+def db_group() -> None:
+    """Database maintenance (prune old data, vacuum to reclaim space)."""
+
+
+@db_group.command("prune")
+@click.option("--dry-run", is_flag=True, help="Report what would change without mutating")
+@click.pass_context
+def db_prune(ctx: click.Context, dry_run: bool) -> None:
+    """Compact old memorized messages and prune old telemetry + file snapshots.
+
+    Uses the configured retention windows (retention.retention_full_days for
+    message compaction, retention.retention_days for telemetry/snapshots).
+    Frees space inside the DB; run ``nerve db vacuum`` afterwards to shrink the
+    file on disk.
+    """
+    from nerve.db import Database
+
+    config = ctx.obj["config"]
+    db_path = Path("~/.nerve/nerve.db").expanduser()
+    if not db_path.exists():
+        click.echo(f"[ERR] Database not found: {db_path}")
+        ctx.exit(1)
+        return
+
+    full_days = config.retention.retention_full_days
+    days = config.retention.retention_days
+    click.echo(
+        f"{'[dry-run] ' if dry_run else ''}Pruning {db_path} "
+        f"(compact messages > {full_days}d, telemetry/snapshots > {days}d)"
+    )
+
+    async def _run() -> None:
+        database = Database(db_path, workspace=config.workspace)
+        await database.connect()
+        try:
+            report = await database.run_retention(
+                retention_days=days,
+                retention_full_days=full_days,
+                dry_run=dry_run,
+            )
+        finally:
+            await database.close()
+
+        verb = "Would compact" if dry_run else "Compacted"
+        click.echo(
+            f"  {verb} {report['messages_compacted']} messages "
+            f"(~{_fmt_bytes(report['message_bytes_reclaimed'])} of blocks/thinking)"
+        )
+        verb = "Would delete" if dry_run else "Deleted"
+        click.echo(f"  {verb} {report['telemetry_deleted']} telemetry rows:")
+        for table, n in report["by_table"].items():
+            click.echo(f"    {table}: {n}")
+        click.echo(
+            f"  {verb} {report['snapshots_deleted']} file snapshots "
+            f"(~{_fmt_bytes(report['snapshot_bytes_reclaimed'])})"
+        )
+        if not dry_run:
+            click.echo("\nFreed space inside the DB. Run `nerve db vacuum` to shrink the file.")
+
+    asyncio.run(_run())
+
+
+@db_group.command("vacuum")
+@click.pass_context
+def db_vacuum(ctx: click.Context) -> None:
+    """Rewrite the DB file to reclaim freed pages (shrinks the file on disk).
+
+    VACUUM takes a write lock and cannot run while the daemon holds the DB.
+    Stop the daemon first (`nerve stop`) for a clean run.
+    """
+    from nerve.db import Database
+
+    config = ctx.obj["config"]
+    db_path = Path("~/.nerve/nerve.db").expanduser()
+    if not db_path.exists():
+        click.echo(f"[ERR] Database not found: {db_path}")
+        ctx.exit(1)
+        return
+
+    running, _pid = _get_daemon_status()
+    if running:
+        click.echo(
+            "[WARN] Nerve daemon is running. VACUUM needs an exclusive lock and "
+            "will likely fail with 'database is locked'. Run `nerve stop` first."
+        )
+
+    size_before = db_path.stat().st_size
+    click.echo(f"Vacuuming {db_path} ({_fmt_bytes(size_before)})...")
+
+    async def _run() -> None:
+        database = Database(db_path, workspace=config.workspace)
+        await database.connect()
+        try:
+            await database.vacuum()
+        finally:
+            await database.close()
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        click.echo(f"[ERR] VACUUM failed: {e}")
+        ctx.exit(1)
+        return
+
+    size_after = db_path.stat().st_size
+    click.echo(
+        f"Done. {_fmt_bytes(size_before)} -> {_fmt_bytes(size_after)} "
+        f"(reclaimed {_fmt_bytes(size_before - size_after)})"
+    )
 
 
 if __name__ == "__main__":
