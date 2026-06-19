@@ -93,9 +93,14 @@ class TaskStore:
     async def count_tasks(
         self,
         status: str | None = None,
-        tag: str | None = None,
+        tag: str | list[str] | None = None,
     ) -> int:
-        """Count tasks matching the given filters (without limit/offset)."""
+        """Count tasks matching the given filters (without limit/offset).
+
+        ``tag`` may be a single tag or a list of tags. A list is OR-matched
+        (a task counts if it carries *any* of the tags) within one COUNT(*),
+        so each matching task is counted at most once.
+        """
         conditions: list[str] = []
         params: list = []
 
@@ -108,8 +113,16 @@ class TaskStore:
             conditions.append("status != 'done'")
 
         if tag:
-            conditions.append("',' || tags || ',' LIKE ?")
-            params.append(f"%,{tag.strip().lower()},%")
+            tags = [tag] if isinstance(tag, str) else list(tag)
+            tag_clauses: list[str] = []
+            for t in tags:
+                t = str(t).strip().lower()
+                if not t:
+                    continue
+                tag_clauses.append("',' || tags || ',' LIKE ?")
+                params.append(f"%,{t},%")
+            if tag_clauses:
+                conditions.append("(" + " OR ".join(tag_clauses) + ")")
 
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
         async with self.db.execute(

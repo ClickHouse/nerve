@@ -146,7 +146,7 @@ class TasksGate(CronGate):
         type: tasks
         status: pending            # status name, list of names, "all",
                                    # or omitted (= any non-done task)
-        tag: backend               # optional tag filter
+        tag: backend               # optional tag filter; a list ORs the tags
         min_count: 1               # minimum matching tasks (default 1)
 
     ``status`` semantics:
@@ -162,7 +162,7 @@ class TasksGate(CronGate):
     def __init__(
         self,
         targets: list[str | None],
-        tag: str | None = None,
+        tag: str | list[str] | None = None,
         min_count: int = 1,
     ) -> None:
         # Each element is passed straight to ``count_tasks(status=...)``:
@@ -184,7 +184,11 @@ class TasksGate(CronGate):
     def describe(self) -> str:
         labels = ["open" if t is None else t for t in self.targets]
         status_str = "/".join(labels)
-        tag_str = f" tagged '{self.tag}'" if self.tag else ""
+        if self.tag:
+            tags = [self.tag] if isinstance(self.tag, str) else list(self.tag)
+            tag_str = f" tagged '{'/'.join(tags)}'"
+        else:
+            tag_str = ""
         thresh = "" if self.min_count == 1 else f" (>= {self.min_count})"
         return f"{status_str} tasks{tag_str}{thresh} exist"
 
@@ -212,6 +216,13 @@ class TasksGate(CronGate):
             )
 
         tag = spec.get("tag")
+        if tag is not None and not isinstance(tag, (str, list, tuple)):
+            raise GateConfigError(
+                f"'tasks' gate 'tag' must be a string or list, "
+                f"got {type(tag).__name__}"
+            )
+        if isinstance(tag, (list, tuple)):
+            tag = [str(t) for t in tag]
         return cls(targets=targets, tag=tag, min_count=min_count)
 
 
