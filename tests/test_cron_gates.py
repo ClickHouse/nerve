@@ -101,6 +101,19 @@ class TestTasksGate:
         await gate.is_satisfied(_ctx(db))
         db.count_tasks.assert_awaited_once_with(status="pending", tag="backend")
 
+    @pytest.mark.asyncio
+    async def test_tag_list_passed_through(self):
+        """A list of tags is forwarded to count_tasks (OR-matched there)."""
+        db = _db(count_tasks=1)
+        gate = TasksGate(targets=["pending"], tag=["pr-open", "pr-fix"])
+        await gate.is_satisfied(_ctx(db))
+        db.count_tasks.assert_awaited_once_with(
+            status="pending", tag=["pr-open", "pr-fix"])
+
+    def test_describe_tag_list(self):
+        d = TasksGate(targets=["pending"], tag=["a", "b"]).describe()
+        assert "tagged 'a/b'" in d
+
     def test_min_count_floor_is_one(self):
         assert TasksGate(targets=["pending"], min_count=0).min_count == 1
         assert TasksGate(targets=["pending"], min_count=-5).min_count == 1
@@ -142,6 +155,19 @@ class TestTasksGate:
             {"type": "tasks", "status": "pending", "tag": "ci", "min_count": 4})
         assert gate.tag == "ci"
         assert gate.min_count == 4
+
+    def test_from_config_tag_list(self):
+        gate = TasksGate.from_config(
+            {"type": "tasks", "tag": ["pr-open", "pr-fix"]})
+        assert gate.tag == ["pr-open", "pr-fix"]
+
+    def test_from_config_tag_tuple_coerced_to_str_list(self):
+        gate = TasksGate.from_config({"type": "tasks", "tag": (1, 2)})
+        assert gate.tag == ["1", "2"]
+
+    def test_from_config_bad_tag_type(self):
+        with pytest.raises(GateConfigError):
+            TasksGate.from_config({"type": "tasks", "tag": 123})
 
     def test_from_config_bad_status_type(self):
         with pytest.raises(GateConfigError):

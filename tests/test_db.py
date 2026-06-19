@@ -559,6 +559,46 @@ class TestTaskSearch:
         results = await db.list_tasks(tag="ci")
         assert len(results) == 2
 
+    async def test_count_tasks_tag_filter(self, db: Database):
+        """count_tasks supports a single tag and an OR-matched list of tags."""
+        await db.upsert_task(
+            task_id="t-p0", file_path="f1.md", title="P0 task",
+            status="pending", tags="p0,ci",
+        )
+        await db.upsert_task(
+            task_id="t-p2", file_path="f2.md", title="P2 task",
+            status="pending", tags="p2,ci",
+        )
+        await db.upsert_task(
+            task_id="t-x", file_path="f3.md", title="X task",
+            status="pending", tags="x",
+        )
+
+        # Single tag.
+        assert await db.count_tasks(tag="ci") == 2
+        assert await db.count_tasks(tag="p0") == 1
+
+        # A list of tags is OR-matched.
+        assert await db.count_tasks(tag=["p0", "p2"]) == 2
+        assert await db.count_tasks(tag=["p0", "p2", "x"]) == 3
+
+        # A task carrying several of the listed tags is still counted once.
+        assert await db.count_tasks(tag=["ci", "p0"]) == 2
+
+        # No matches; empty list means "no tag filter".
+        assert await db.count_tasks(tag=["nope"]) == 0
+        assert await db.count_tasks(tag=[]) == 3
+
+        # status + tag combine (AND).
+        await db.upsert_task(
+            task_id="t-done", file_path="f4.md", title="Done task",
+            status="done", tags="ci",
+        )
+        assert await db.count_tasks(status="pending", tag="ci") == 2
+        assert await db.count_tasks(status="all", tag="ci") == 3
+        # Default (no status) excludes done.
+        assert await db.count_tasks(tag="ci") == 2
+
     async def test_list_tasks_sort_and_pagination(self, db: Database):
         """list_tasks should respect sort + limit/offset, and count_tasks
         should return the total ignoring pagination."""
