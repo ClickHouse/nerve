@@ -316,6 +316,38 @@ class GitHubEventsSyncConfig:
 
 
 @dataclass
+class GitHubReposSyncConfig:
+    """Config for the GitHub Repos source (monitor watched repos for new issues/PRs).
+
+    Unlike ``github`` (notifications) and ``github_events`` (your own activity),
+    this source watches an explicit set of repositories for newly-created issues
+    and pull requests. ``repos`` is required — an empty list makes the source a
+    no-op.
+    """
+    enabled: bool = False
+    schedule: str = "*/15 * * * *"
+    repos: list[str] = field(default_factory=list)  # required; empty = no-op
+    batch_size: int = 50
+    condense: bool = False
+    processor: str = "agent"
+    prompt_hint: str = ""
+    model: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> GitHubReposSyncConfig:
+        return cls(
+            enabled=d.get("enabled", False),
+            schedule=d.get("schedule", "*/15 * * * *"),
+            repos=d.get("repos", []),
+            batch_size=d.get("batch_size", 50),
+            condense=d.get("condense", False),
+            processor=d.get("processor", "agent"),
+            prompt_hint=d.get("prompt_hint", ""),
+            model=d.get("model", ""),
+        )
+
+
+@dataclass
 class CodexOriginConfig:
     """A single Codex thread sync origin.
 
@@ -410,6 +442,7 @@ class SyncConfig:
     gmail: GmailSyncConfig = field(default_factory=GmailSyncConfig)
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
+    github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
     codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
@@ -421,6 +454,7 @@ class SyncConfig:
             gmail=GmailSyncConfig.from_dict(d.get("gmail", {})),
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
+            github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
             codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),
