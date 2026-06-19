@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +13,7 @@ from nerve.cron.gates import (
     CronGate,
     GateConfigError,
     GateContext,
+    GitHubPrActivityGate,
     MessagesGate,
     TasksGate,
     build_gate,
@@ -330,3 +333,152 @@ class TestCronJobGates:
         })
         assert len(job.gates) == 1
         assert isinstance(job.gates[0], TasksGate)
+
+
+# ---------------------------------------------------------------------------
+# GitHubPrActivityGate
+# ---------------------------------------------------------------------------
+
+class TestGitHubPrActivityGate:
+    """Fingerprints an author's open PRs; fires only when the fingerprint moves."""
+
+    def _gate(self, tmp_path, fingerprint, *, force_hours=8.0):
+        """A gate with the network fingerprint stubbed and state under tmp_path."""
+        gate = GitHubPrActivityGate(author="bot", force_run_after_hours=force_hours)
+
+        async def _fp():
+            return fingerprint
+
+        gate._fingerprint = _fp
+        gate._state_path = lambda job_id: tmp_path / f"st_{job_id}.json"
+        return gate
+
+    @staticmethod
+    def _seed(tmp_path, job_id, fingerprint, last_fire):
+        (tmp_path / f"st_{job_id}.json").write_text(
+            json.dumps({"fingerprint": fingerprint, "last_fire": last_fire.isoformat()})
+        )
+
+    # -- gating logic -------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_first_run_fires_and_records(self, tmp_path):
+        gate = self._gate(tmp_path, "fp-abc")
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is True
+        saved = json.loads((tmp_path / "st_j.json").read_text())
+        assert saved["fingerprint"] == "fp-abc"
+
+    @pytest.mark.asyncio
+    async def test_unchanged_fingerprint_skips(self, tmp_path):
+        gate = self._gate(tmp_path, "fp-abc")
+        self._seed(tmp_path, "j", "fp-abc", datetime.now(timezone.utc))
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is False
+
+    @pytest.mark.asyncio
+    async def test_changed_fingerprint_fires_and_updates(self, tmp_path):
+        gate = self._gate(tmp_path, "fp-new")
+        self._seed(tmp_path, "j", "fp-old", datetime.now(timezone.utc))
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is True
+        saved = json.loads((tmp_path / "st_j.json").read_text())
+        assert saved["fingerprint"] == "fp-new"
+
+    @pytest.mark.asyncio
+    async def test_fail_open_when_gh_fails(self, tmp_path):
+        # _fingerprint() == None models a total gh failure → run anyway.
+        gate = self._gate(tmp_path, None)
+        self._seed(tmp_path, "j", "fp-abc", datetime.now(timezone.utc))
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is True
+
+    @pytest.mark.asyncio
+    async def test_force_run_when_stale(self, tmp_path):
+        gate = self._gate(tmp_path, "fp-abc", force_hours=8.0)
+        self._seed(tmp_path, "j", "fp-abc",
+                   datetime.now(timezone.utc) - timedelta(hours=9))
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is True
+
+    @pytest.mark.asyncio
+    async def test_no_force_when_recent(self, tmp_path):
+        gate = self._gate(tmp_path, "fp-abc", force_hours=8.0)
+        self._seed(tmp_path, "j", "fp-abc",
+                   datetime.now(timezone.utc) - timedelta(hours=1))
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is False
+
+    @pytest.mark.asyncio
+    async def test_force_disabled_with_zero_hours(self, tmp_path):
+        gate = self._gate(tmp_path, "fp-abc", force_hours=0)
+        self._seed(tmp_path, "j", "fp-abc",
+                   datetime.now(timezone.utc) - timedelta(days=30))
+        assert await gate.is_satisfied(_ctx(AsyncMock(), "j")) is False
+
+    # -- fingerprint computation -------------------------------------------
+
+    @staticmethod
+    def _fake_gh(prs, detail_by_number):
+        async def _gh(*args, timeout=30.0):
+            if args[:2] == ("search", "prs"):
+                return json.dumps(prs)
+            if args[:2] == ("pr", "view"):
+                return json.dumps(detail_by_number[int(args[2])])
+            return None
+        return _gh
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_stable_and_change_sensitive(self):
+        prs = [{"repository": {"nameWithOwner": "owner/repo"}, "number": 1}]
+        detail = {
+            "state": "OPEN", "reviewDecision": None, "headRefOid": "sha1",
+            "statusCheckRollup": [
+                {"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        }
+        gate = GitHubPrActivityGate(author="bot")
+
+        gate._gh = self._fake_gh(prs, {1: detail})
+        fp1 = await gate._fingerprint()
+        assert fp1 is not None
+
+        # Identical data → identical hash (no spurious fire).
+        gate._gh = self._fake_gh(prs, {1: dict(detail)})
+        assert await gate._fingerprint() == fp1
+
+        # A CI conclusion flip moves the hash — the signal a comment-based
+        # source would miss entirely.
+        flipped = dict(detail, statusCheckRollup=[
+            {"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}])
+        gate._gh = self._fake_gh(prs, {1: flipped})
+        assert await gate._fingerprint() != fp1
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_none_on_gh_failure(self):
+        gate = GitHubPrActivityGate(author="bot")
+
+        async def _fail(*args, timeout=30.0):
+            return None
+
+        gate._gh = _fail
+        assert await gate._fingerprint() is None
+
+    # -- from_config / describe / registry ---------------------------------
+
+    def test_from_config_requires_author(self):
+        with pytest.raises(GateConfigError):
+            GitHubPrActivityGate.from_config({"type": "github_pr_activity"})
+
+    def test_from_config_parses_hours(self):
+        gate = GitHubPrActivityGate.from_config({
+            "type": "github_pr_activity", "author": "bot",
+            "force_run_after_hours": 4})
+        assert gate.author == "bot"
+        assert gate.force_run_after_hours == 4.0
+
+    def test_from_config_bad_hours(self):
+        with pytest.raises(GateConfigError):
+            GitHubPrActivityGate.from_config({
+                "type": "github_pr_activity", "author": "bot",
+                "force_run_after_hours": "lots"})
+
+    def test_describe_mentions_author(self):
+        assert "bot" in GitHubPrActivityGate(author="bot").describe()
+
+    def test_build_gate_via_registry(self):
+        gate = build_gate({"type": "github_pr_activity", "author": "bot"})
+        assert isinstance(gate, GitHubPrActivityGate)

@@ -29,9 +29,14 @@ hold.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
@@ -215,11 +220,204 @@ class TasksGate(CronGate):
         return cls(targets=targets, tag=tag, min_count=min_count)
 
 
+class GitHubPrActivityGate(CronGate):
+    """Satisfied only when an author's open PRs show *new* activity.
+
+    The motivating case: wake an expensive (LLM) PR-monitor cron only when
+    something it actually acts on has changed on one of the author's open
+    PRs — merge/close (``state``), a new commit (``headRefOid``), a review
+    verdict (``reviewDecision``), or a CI transition (``statusCheckRollup``)
+    — instead of every N minutes for the entire lifetime of an open PR.
+
+    Why a dedicated gate (not the ``messages``/``tasks`` gates): comments and
+    @-mentions arrive via the ``github`` sync source, but **CI status changes
+    and silent merges do not** (a check flipping red posts no comment), so a
+    poll-based signal is required. A PR's ``updatedAt`` is *not* enough — check
+    runs attach to the head commit, not the PR, so CI changes often don't bump
+    it; we therefore fingerprint the CI rollup directly.
+
+    Mechanics (cheap, non-LLM): shell out to ``gh`` (same async-subprocess
+    pattern as ``nerve.sources.github``), hash the fields above across all of
+    the author's open PRs, and compare to the fingerprint stored at the last
+    fire (a sentinel file under ``~/.nerve/cache``). Fire iff the fingerprint
+    changed. A ``force_run_after_hours`` safety net guarantees a periodic wake
+    even if a signal is somehow missed, and any ``gh`` failure fails *open*
+    (fires) so a transient error can never strand a PR.
+
+    Compose it with a cheap ``tasks`` gate (evaluated first) so the network
+    calls only happen when there's actually a PR task to monitor::
+
+        run_if:
+          - type: tasks                 # DB-only: any open-PR task at all?
+            status: in_progress
+            tag: pr-open
+          - type: github_pr_activity    # network: did any open PR change?
+            author: my-bot
+            force_run_after_hours: 8
+
+    Config:
+
+    * ``author`` (required) — GitHub login whose open PRs to watch.
+    * ``force_run_after_hours`` (default 8) — force a run if this long has
+      elapsed since the last fire; ``0`` disables the safety net.
+    """
+
+    type = "github_pr_activity"
+
+    def __init__(self, author: str, force_run_after_hours: float = 8.0) -> None:
+        if not author:
+            raise GateConfigError(
+                "'github_pr_activity' gate requires a non-empty 'author'"
+            )
+        self.author = author
+        self.force_run_after_hours = force_run_after_hours
+
+    async def is_satisfied(self, ctx: GateContext) -> bool:
+        fp = await self._fingerprint()
+        if fp is None:
+            # gh failed entirely — fail open (run) rather than risk stranding a PR.
+            logger.warning(
+                "github_pr_activity: gh query failed; allowing run (fail-open)"
+            )
+            return True
+
+        prev_fp, last_fire = self._load_state(ctx.job_id)
+        now = datetime.now(timezone.utc)
+
+        changed = prev_fp is None or fp != prev_fp
+        stale = (
+            self.force_run_after_hours > 0
+            and last_fire is not None
+            and (now - last_fire) >= timedelta(hours=self.force_run_after_hours)
+        )
+        if changed or stale:
+            # Record the state we're firing on. If the monitor crashes mid-run
+            # the worst case is one missed change, bounded by force_run_after_hours.
+            self._save_state(ctx.job_id, fp, now)
+            return True
+        return False
+
+    def describe(self) -> str:
+        return (
+            f"new activity on {self.author}'s open PRs "
+            f"(state/CI/review change; force every {self.force_run_after_hours}h)"
+        )
+
+    @classmethod
+    def from_config(cls, spec: dict) -> "GitHubPrActivityGate":
+        author = spec.get("author")
+        hours = spec.get("force_run_after_hours", 8)
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            raise GateConfigError(
+                "'github_pr_activity' gate 'force_run_after_hours' must be a "
+                f"number, got {hours!r}"
+            )
+        return cls(author=author, force_run_after_hours=hours)
+
+    # --- internals ---------------------------------------------------------
+
+    async def _fingerprint(self) -> str | None:
+        """Hash the monitor-relevant state of every open PR. None on gh failure."""
+        prs = await self._list_open_prs()
+        if prs is None:
+            return None
+        entries: list[dict] = []
+        for repo, number in sorted(prs):
+            detail = await self._pr_detail(repo, number)
+            if detail is None:
+                return None  # partial data -> treat as failure (fail-open upstream)
+            entries.append(detail)
+        blob = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    async def _list_open_prs(self) -> list[tuple[str, int]] | None:
+        out = await self._gh(
+            "search", "prs", "--author", self.author, "--state", "open",
+            "--json", "repository,number", "--limit", "100",
+        )
+        if out is None:
+            return None
+        data = json.loads(out) if out.strip() else []
+        return [(d["repository"]["nameWithOwner"], int(d["number"])) for d in data]
+
+    async def _pr_detail(self, repo: str, number: int) -> dict | None:
+        out = await self._gh(
+            "pr", "view", str(number), "--repo", repo,
+            "--json", "state,reviewDecision,headRefOid,statusCheckRollup",
+        )
+        if out is None:
+            return None
+        d = json.loads(out)
+        checks = sorted(
+            (c.get("name", ""), c.get("status", ""), c.get("conclusion", ""))
+            for c in (d.get("statusCheckRollup") or [])
+        )
+        return {
+            "repo": repo,
+            "number": number,
+            "state": d.get("state"),
+            "review": d.get("reviewDecision"),
+            "head": d.get("headRefOid"),
+            "checks": checks,
+        }
+
+    @staticmethod
+    async def _gh(*args: str, timeout: float = 30.0) -> str | None:
+        """Run a ``gh`` command (inherits the daemon's gh auth). None on failure.
+
+        Mirrors ``nerve.sources.github`` — the proven pattern for calling gh
+        from inside the daemon's event loop.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gh", *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+            if proc.returncode != 0:
+                logger.debug("gh %s failed: %s", args, stderr.decode()[:200])
+                return None
+            return stdout.decode()
+        except Exception as e:  # noqa: BLE001 — caller treats None as fail-open
+            logger.debug("gh %s error: %s", args, e)
+            return None
+
+    def _state_path(self, job_id: str) -> Path:
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in job_id)
+        d = Path.home() / ".nerve" / "cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"pr_activity_{safe}.json"
+
+    def _load_state(self, job_id: str) -> tuple[str | None, datetime | None]:
+        try:
+            raw = json.loads(self._state_path(job_id).read_text(encoding="utf-8"))
+            fp = raw.get("fingerprint")
+            lf = raw.get("last_fire")
+            return fp, (datetime.fromisoformat(lf) if lf else None)
+        except Exception:
+            return None, None
+
+    def _save_state(self, job_id: str, fingerprint: str, now: datetime) -> None:
+        try:
+            self._state_path(job_id).write_text(
+                json.dumps({"fingerprint": fingerprint, "last_fire": now.isoformat()}),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001 — non-fatal; worst case is an extra run
+            logger.warning("github_pr_activity: could not persist state: %s", e)
+
+
 #: Maps a gate's ``type`` key to its implementing class. Register new gate
 #: types here to make them usable from config.
 GATE_REGISTRY: dict[str, type[CronGate]] = {
     MessagesGate.type: MessagesGate,
     TasksGate.type: TasksGate,
+    GitHubPrActivityGate.type: GitHubPrActivityGate,
 }
 
 
