@@ -179,6 +179,19 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+# Busy timeout (seconds) for this module's own sqlite3 connections. The online
+# snapshot reads the *live* nerve.db/memu.sqlite while the gateway is writing,
+# so without a wait it could fail with "database is locked". The stdlib
+# ``timeout=`` arg maps to sqlite3_busy_timeout under the hood; 10s matches the
+# gateway's ``PRAGMA busy_timeout=10000`` (see ``nerve/db/base.py``).
+_SQLITE_TIMEOUT = 10.0
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    """Open a sqlite3 connection with the shared busy timeout applied."""
+    return sqlite3.connect(str(path), timeout=_SQLITE_TIMEOUT)
+
+
 def _nerve_version() -> str:
     try:
         from importlib.metadata import version
@@ -246,9 +259,9 @@ def _snapshot_db(src: Path, dst: Path) -> None:
     if not src.exists():
         raise BackupError(f"database not found: {src}")
 
-    source = sqlite3.connect(str(src))
+    source = _connect(src)
     try:
-        dest = sqlite3.connect(str(dst))
+        dest = _connect(dst)
         try:
             # pages>0 copies incrementally, retrying pages dirtied by a
             # concurrent writer rather than holding a long read lock.
@@ -258,7 +271,7 @@ def _snapshot_db(src: Path, dst: Path) -> None:
     finally:
         source.close()
 
-    check = sqlite3.connect(str(dst))
+    check = _connect(dst)
     try:
         row = check.execute("PRAGMA integrity_check").fetchone()
     finally:
@@ -272,7 +285,7 @@ def _snapshot_db(src: Path, dst: Path) -> None:
 def _db_schema_version(db_path: Path) -> int:
     """Read the persisted schema version from a nerve.db (0 if absent)."""
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = _connect(db_path)
         try:
             row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
             return int(row[0]) if row and row[0] is not None else 0
@@ -285,7 +298,7 @@ def _db_schema_version(db_path: Path) -> int:
 def _count(db_path: Path, table: str) -> int | None:
     """COUNT(*) of a table, or None when the DB/table is unavailable."""
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = _connect(db_path)
         try:
             row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
             return int(row[0]) if row else None
@@ -692,7 +705,7 @@ def verify_bundle(path: Path, extract_to: Path | None = None) -> VerifyReport:
                 )
                 continue
             try:
-                conn = sqlite3.connect(str(fp))
+                conn = _connect(fp)
                 try:
                     row = conn.execute("PRAGMA integrity_check").fetchone()
                 finally:
