@@ -39,6 +39,41 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = max(v for v, _ in discover_migrations()) if discover_migrations() else 0
 
 
+# Connection pragmas applied on every ``connect()``. These mirror the tuning
+# memU already uses for its own SQLite connections (see
+# ``nerve/memory/memu_bridge.py``) — the primary operational DB is where the
+# heaviest cron/CLI/backup contention happens, yet it was never tuned.
+#
+# Why each one matters:
+#   journal_mode=WAL   — readers don't block the single writer. This setting is
+#                        durable (persists in the DB file), but re-asserting it
+#                        on every open is harmless and keeps intent explicit.
+#   busy_timeout=10000 — milliseconds to wait+retry on a locked DB instead of
+#                        failing instantly with "database is locked". The
+#                        gateway, every CLI command (``nerve sync``/``doctor``/
+#                        ``db prune``), and the scheduled backup are separate
+#                        connections to one file; WAL allows a single writer,
+#                        so the others must briefly queue rather than error.
+#   synchronous=NORMAL — safe under WAL (no corruption risk; only the most
+#                        recent transaction can be lost on an OS/power crash)
+#                        and skips the fsync that FULL forces on *every* commit
+#                        — the per-commit cost behind write-lock "wait hours".
+#   foreign_keys=ON    — enforce FK constraints (per-connection; off by default).
+#   temp_store=MEMORY  — keep temp tables/indices in RAM.
+#   cache_size=-16000  — ~16 MB page cache (negative value = KiB).
+#
+# All but ``journal_mode`` are *per-connection* and must be re-applied on every
+# open — which is exactly why this is centralized rather than set inline.
+_DEFAULT_PRAGMAS: dict[str, object] = {
+    "journal_mode": "WAL",
+    "busy_timeout": 10000,
+    "synchronous": "NORMAL",
+    "foreign_keys": "ON",
+    "temp_store": "MEMORY",
+    "cache_size": -16000,
+}
+
+
 class Database(
     SessionStore,
     MessageStore,
@@ -71,14 +106,27 @@ class Database(
         self.workspace = workspace
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        # Per-connection pragmas (see _DEFAULT_PRAGMAS). Copied per instance so
+        # a caller or test can tune them before connect() (e.g. busy_timeout=0).
+        self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
+
+    async def _apply_pragmas(self) -> None:
+        """Apply the connection pragmas (see :data:`_DEFAULT_PRAGMAS`).
+
+        Pragma names and values are module-controlled constants, never user
+        input, so interpolating them into the statement is safe.
+        """
+        for name, value in self._pragmas.items():
+            await self.db.execute(f"PRAGMA {name}={value}")
 
     async def connect(self) -> None:
-        """Open the database connection and apply migrations."""
+        """Open the database connection, tune it, and apply migrations."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA foreign_keys=ON")
+        # Apply pragmas BEFORE migrations so the migration writes also run under
+        # the tuned busy_timeout/synchronous settings and contend politely.
+        await self._apply_pragmas()
         await run_migrations(self._db)
         await self._check_fts_integrity()
 
