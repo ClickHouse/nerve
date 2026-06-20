@@ -3118,11 +3118,29 @@ class AgentEngine:
     #  Idle client sweep                                                   #
     # ------------------------------------------------------------------ #
 
+    def _has_live_background_tasks(self, session_id: str) -> bool:
+        """Whether *session_id* has a background task still running.
+
+        The idle sweep consults this so it never discards a client that is
+        parked on a live Bash/Agent ``run_in_background`` (or Monitor) task:
+        discarding tears down the idle-stream watcher (``_idle_stream_watcher``)
+        that delivers the task's completion turn, so the session would never
+        wake when the task settles.
+        """
+        registry = self._bg_task_registry.get(session_id)
+        return bool(registry) and any(
+            entry.get("status") == "running" for entry in registry.values()
+        )
+
     async def run_idle_client_sweep(self) -> int:
         """Disconnect clients that have been idle beyond the configured timeout.
 
         Idle clients still hold a claude CLI subprocess. Discarding them frees
         resources while preserving sdk_session_id for seamless resume later.
+
+        Sessions parked on a live background task are skipped: discarding their
+        client kills the idle-stream watcher that delivers the task's
+        completion turn, so the session would never wake when the task settles.
 
         Returns count of clients disconnected.
         """
@@ -3131,19 +3149,27 @@ class AgentEngine:
             return 0
 
         idle_ids = self.sessions.get_idle_client_ids(timeout_minutes * 60)
+        discarded = 0
         for sid in idle_ids:
+            if self._has_live_background_tasks(sid):
+                logger.info(
+                    "Idle sweep: keeping session %s — background task in flight",
+                    sid,
+                )
+                continue
             logger.info("Auto-closing idle client for session %s", sid)
             # background_memorize: free the claude subprocess now; indexing
             # follows whenever the memorize queue drains.
             await self._discard_client(sid, background_memorize=True)
+            discarded += 1
 
-        if idle_ids:
+        if discarded:
             logger.info(
                 "Idle client sweep: disconnected %d client(s), %d still active",
-                len(idle_ids),
+                discarded,
                 len(self.sessions._clients),
             )
-        return len(idle_ids)
+        return discarded
 
     # ------------------------------------------------------------------ #
     #  Title generation                                                    #
