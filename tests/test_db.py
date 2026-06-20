@@ -595,6 +595,142 @@ class TestTaskSearch:
         assert await db.count_tasks(status="done") == 0
 
 
+@pytest.mark.asyncio
+class TestTaskFtsJoinRegression:
+    """Guards against the tasks_fts join-key format regression.
+
+    The FTS join key must be the RAW task_id so readers can join on
+    ``f.task_id = t.id``. A past regression stored a space-normalized slug in
+    ``upsert_task`` while the reseed path and readers expected the raw id,
+    making ~96% of tasks invisible to FTS search and to dedup. These tests fail
+    if the writer (upsert_task / reseed) and the reader joins drift apart again.
+
+    Note: the older TestTaskSearch tests pass with EITHER format because, in a
+    single fresh DB, upsert and the readers agree — and the id-substring /
+    title LIKE fallbacks mask a dead FTS join. These tests deliberately probe
+    body/tag-only words and the no-fallback dedup path to catch the real bug.
+    """
+
+    DATED_ID = "2026-02-11-distribution-pipeline-rework"
+
+    async def _create(self, db, task_id, title, content="", status="pending", tags=""):
+        await db.upsert_task(
+            task_id=task_id, file_path=f"memory/tasks/active/{task_id}.md",
+            title=title, status=status, content=content, tags=tags,
+        )
+
+    async def test_fts_row_stores_raw_id(self, db: Database):
+        """upsert_task must store the raw id as the FTS join key (not a slug)."""
+        await self._create(db, self.DATED_ID, "Pipeline rework")
+        async with db.db.execute("SELECT task_id FROM tasks_fts") as cur:
+            row = await cur.fetchone()
+        assert row[0] == self.DATED_ID  # raw, NOT "2026 02 11 ..."
+
+    async def test_content_only_word_found_for_dated_task(self, db: Database):
+        """A word only in the BODY (not title/slug) is reachable only via the
+        FTS join — the exact path the regression broke for dated ids."""
+        await self._create(
+            db, self.DATED_ID, title="Pipeline rework",
+            content="The throughput bottleneck is the shuffler stage.",
+        )
+        # "shuffler" is in neither the title nor the slug → only FTS can find it.
+        results = await db.search_tasks("shuffler")
+        assert [r["id"] for r in results] == [self.DATED_ID]
+
+    async def test_tag_only_word_found_for_dated_task(self, db: Database):
+        """Tags are indexed into FTS content; reachable only via the join."""
+        await self._create(
+            db, self.DATED_ID, title="Pipeline rework",
+            content="body", tags="backfill,throughput",
+        )
+        results = await db.search_tasks("backfill")
+        assert [r["id"] for r in results] == [self.DATED_ID]
+
+    async def test_search_similar_finds_dated_task(self, db: Database):
+        """search_tasks_similar (dedup) has NO LIKE fallback — it relies purely
+        on the FTS join, so it silently broke for dated ids. Guard it."""
+        await self._create(
+            db, self.DATED_ID, title="Distribution pipeline rework",
+            content="rework the distribution pipeline",
+        )
+        sim = await db.search_tasks_similar("distribution pipeline")
+        assert self.DATED_ID in [r["id"] for r in sim]
+
+
+@pytest.mark.asyncio
+class TestTaskFtsReseed:
+    """Guards the FTS integrity reseed: it must produce joinable raw-id rows and
+    read task content from the configured workspace, not the DB directory."""
+
+    async def test_reseed_produces_joinable_raw_id_rows(self, tmp_path):
+        """After a reseed (triggered by a count mismatch), tasks stay reachable
+        via the FTS join. The reseed writes raw-id rows; readers join on t.id."""
+        db = Database(tmp_path / "t.db", workspace=tmp_path)
+        await db.connect()
+        try:
+            await db.upsert_task(
+                task_id="2026-03-01-redis-eviction",
+                file_path="memory/tasks/active/2026-03-01-redis-eviction.md",
+                title="Redis eviction tuning", status="pending", content="",
+            )
+            # Force a tasks/tasks_fts count mismatch so the check reseeds.
+            await db.db.execute(
+                "INSERT INTO tasks_fts (task_id, title, content) VALUES ('x','y','z')"
+            )
+            await db.db.commit()
+            await db._check_fts_integrity()
+            # The reseed wrote a single raw-id row...
+            async with db.db.execute("SELECT task_id FROM tasks_fts") as cur:
+                rows = [r[0] async for r in cur]
+            assert rows == ["2026-03-01-redis-eviction"]
+            # ...reachable via the FTS join. Use search_tasks_similar (dedup),
+            # which has NO LIKE fallback, so it isolates the join: with the old
+            # space-form reader join this returns nothing for a reseeded row.
+            sim = await db.search_tasks_similar("eviction")
+            assert "2026-03-01-redis-eviction" in [r["id"] for r in sim]
+        finally:
+            await db.close()
+
+    async def test_reseed_reads_content_from_workspace_not_db_dir(self, tmp_path):
+        """The reseed must resolve task file_path against the workspace root,
+        not the DB directory — otherwise body content is silently empty.
+
+        DB dir and workspace are deliberately different so this fails with the
+        old ``self.db_path.parent`` behaviour.
+        """
+        db_dir = tmp_path / ".nerve"
+        workspace = tmp_path / "workspace"
+        db_dir.mkdir()
+        workspace.mkdir()
+        db = Database(db_dir / "t.db", workspace=workspace)
+        await db.connect()
+        try:
+            file_path = "memory/tasks/active/2026-03-02-segment-merge.md"
+            md = workspace / file_path
+            md.parent.mkdir(parents=True, exist_ok=True)
+            md.write_text(
+                "# Segment merge\n\nDistinct body marker: quasarflux\n",
+                encoding="utf-8",
+            )
+            # Index with EMPTY content; only the reseed (reading the file from
+            # the workspace) can make the body word searchable.
+            await db.upsert_task(
+                task_id="2026-03-02-segment-merge", file_path=file_path,
+                title="Segment merge", status="pending", content="",
+            )
+            assert await db.search_tasks("quasarflux") == []  # not indexed yet
+            # Force a mismatch → reseed reads the file from the workspace.
+            await db.db.execute(
+                "INSERT INTO tasks_fts (task_id, title, content) VALUES ('x','y','z')"
+            )
+            await db.db.commit()
+            await db._check_fts_integrity()
+            results = await db.search_tasks("quasarflux")
+            assert "2026-03-02-segment-merge" in [r["id"] for r in results]
+        finally:
+            await db.close()
+
+
 class TestTagParsing:
     """Test tag string parsing handles various agent input formats."""
 
@@ -1144,3 +1280,189 @@ class TestConsumerCursors:
         cursors = await db.list_consumer_cursors()
         assert len(cursors) == 1
         assert cursors[0]["consumer"] == "active"
+
+
+class TestCronLogSessions:
+    """cron_logs.session_id linking (v33) + latest-session lookup."""
+
+    @pytest.mark.asyncio
+    async def test_log_cron_finish_stores_session_id(self, db: Database):
+        log_id = await db.log_cron_start("job-a")
+        await db.log_cron_finish(
+            log_id, "success", output="ok", session_id="cron:job-a:20260101-000000",
+        )
+        logs = await db.get_cron_logs(job_id="job-a")
+        assert logs[0]["session_id"] == "cron:job-a:20260101-000000"
+
+    @pytest.mark.asyncio
+    async def test_log_cron_finish_without_session_id(self, db: Database):
+        log_id = await db.log_cron_start("source:gmail")
+        await db.log_cron_finish(log_id, "success", output="3 ingested")
+        logs = await db.get_cron_logs(job_id="source:gmail")
+        assert logs[0]["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_per_run(self, db: Database):
+        await db.create_session("cron:job-a:20260101-000000", source="cron")
+        await db.create_session("cron:job-a:20260102-000000", source="cron")
+        await db.db.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:10+00:00", "cron:job-a:20260101-000000"),
+        )
+        await db.db.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE id = ?",
+            ("2026-01-02T00:00:10+00:00", "cron:job-a:20260102-000000"),
+        )
+        await db.db.commit()
+
+        latest = await db.get_latest_cron_session_id("job-a")
+        assert latest == "cron:job-a:20260102-000000"
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_persistent(self, db: Database):
+        await db.create_session("cron:job-b", source="cron")
+        latest = await db.get_latest_cron_session_id("job-b")
+        assert latest == "cron:job-b"
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_no_prefix_bleed(self, db: Database):
+        """job-a must not match job-a-extended's sessions."""
+        await db.create_session("cron:job-a-extended:20260101-000000", source="cron")
+        assert await db.get_latest_cron_session_id("job-a") is None
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_missing(self, db: Database):
+        assert await db.get_latest_cron_session_id("ghost") is None
+
+    @pytest.mark.asyncio
+    async def test_latest_cron_session_underscore_not_wildcard(self, db: Database):
+        """LIKE special chars in job ids must be escaped."""
+        await db.create_session("cron:jobXa:20260101-000000", source="cron")
+        assert await db.get_latest_cron_session_id("job_a") is None
+        await db.create_session("cron:job_a:20260102-000000", source="cron")
+        assert (
+            await db.get_latest_cron_session_id("job_a")
+            == "cron:job_a:20260102-000000"
+        )
+
+
+class TestCronLogPagination:
+    @pytest.mark.asyncio
+    async def test_offset_pagination_and_count(self, db: Database):
+        ids = []
+        for _ in range(7):
+            log_id = await db.log_cron_start("job-p")
+            await db.log_cron_finish(log_id, "success", output="x")
+            ids.append(log_id)
+
+        assert await db.count_cron_logs(job_id="job-p") == 7
+        assert await db.count_cron_logs() == 7
+
+        page1 = await db.get_cron_logs(job_id="job-p", limit=3, offset=0)
+        page2 = await db.get_cron_logs(job_id="job-p", limit=3, offset=3)
+        page3 = await db.get_cron_logs(job_id="job-p", limit=3, offset=6)
+
+        got = [row["id"] for row in page1 + page2 + page3]
+        assert got == sorted(ids, reverse=True)  # newest first, no overlap
+        assert len(page3) == 1
+
+class TestCronLogSessionBackfill:
+    """v34 best-effort backfill of cron_logs.session_id."""
+
+    @pytest.mark.asyncio
+    async def test_backfill_matches_runs_and_persistent(self, db: Database):
+        from nerve.db.migrations import v035_backfill_cron_log_sessions as v034
+
+        # Per-run session + a matching log row one second later.
+        await db.create_session("cron:iso-job:20260110-120000", source="cron")
+        iso_log = await db.log_cron_start("iso-job")
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = '2026-01-10 12:00:01' WHERE id = ?",
+            (iso_log,),
+        )
+
+        # Persistent session + a log row with no per-run candidate.
+        await db.create_session("cron:pers-job", source="cron")
+        pers_log = await db.log_cron_start("pers-job")
+
+        # Log too far from the only run session (outside tolerance).
+        await db.create_session("cron:far-job:20260101-000000", source="cron")
+        far_log = await db.log_cron_start("far-job")
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = '2026-01-05 00:00:00' WHERE id = ?",
+            (far_log,),
+        )
+
+        # Source-runner log — no sessions at all.
+        src_log = await db.log_cron_start("source:gmail")
+        await db.db.commit()
+
+        await v034.up(db.db)
+        await db.db.commit()
+
+        rows = {
+            r["id"]: r
+            for r in await db.get_cron_logs(limit=50)
+        }
+        assert rows[iso_log]["session_id"] == "cron:iso-job:20260110-120000"
+        assert rows[pers_log]["session_id"] == "cron:pers-job"
+        assert rows[far_log]["session_id"] is None
+        assert rows[src_log]["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_backfill_does_not_touch_existing_links(self, db: Database):
+        from nerve.db.migrations import v035_backfill_cron_log_sessions as v034
+
+        await db.create_session("cron:job-x:20260110-120000", source="cron")
+        log_id = await db.log_cron_start("job-x")
+        await db.log_cron_finish(
+            log_id, "success", output="ok", session_id="cron:job-x:custom",
+        )
+
+        await v034.up(db.db)
+        await db.db.commit()
+
+        logs = await db.get_cron_logs(job_id="job-x")
+        assert logs[0]["session_id"] == "cron:job-x:custom"
+
+    @pytest.mark.asyncio
+    async def test_backfill_picks_closest_run(self, db: Database):
+        from nerve.db.migrations import v035_backfill_cron_log_sessions as v034
+
+        await db.create_session("cron:multi:20260110-120000", source="cron")
+        await db.create_session("cron:multi:20260110-120130", source="cron")
+        log_id = await db.log_cron_start("multi")
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = '2026-01-10 12:01:25' WHERE id = ?",
+            (log_id,),
+        )
+        await db.db.commit()
+
+        await v034.up(db.db)
+        await db.db.commit()
+
+        logs = await db.get_cron_logs(job_id="multi")
+        assert logs[0]["session_id"] == "cron:multi:20260110-120130"
+
+
+class TestSetCronLogSession:
+    """Linking a run log to its session while the run is in flight."""
+
+    @pytest.mark.asyncio
+    async def test_set_cron_log_session_links_running_row(self, db: Database):
+        log_id = await db.log_cron_start("job-live")
+        await db.set_cron_log_session(log_id, "cron:job-live:20260610-120000")
+
+        logs = await db.get_cron_logs(job_id="job-live")
+        assert logs[0]["session_id"] == "cron:job-live:20260610-120000"
+        assert logs[0]["finished_at"] is None  # still running, already linked
+
+    @pytest.mark.asyncio
+    async def test_finish_keeps_start_link(self, db: Database):
+        """log_cron_finish must not clobber the link set at start."""
+        log_id = await db.log_cron_start("job-live2")
+        await db.set_cron_log_session(log_id, "cron:job-live2:20260610-130000")
+        await db.log_cron_finish(log_id, "success", output="done")
+
+        logs = await db.get_cron_logs(job_id="job-live2")
+        assert logs[0]["session_id"] == "cron:job-live2:20260610-130000"

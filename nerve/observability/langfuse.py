@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
@@ -47,6 +47,7 @@ _host: str = ""
 _redact_patterns: list[re.Pattern[str]] = []
 _last_flush_at: str | None = None
 _auth_ok: bool = False
+_usage_rewriter: bool = False
 
 
 def is_enabled() -> bool:
@@ -61,6 +62,7 @@ def get_status() -> dict[str, Any]:
         "host": _host or None,
         "auth_ok": _auth_ok,
         "last_flush_at": _last_flush_at,
+        "usage_rewriter": _usage_rewriter,
     }
 
 
@@ -71,7 +73,7 @@ def init_langfuse(config: Any) -> bool:
     packages, or auth failure). Never raises — observability must not be
     able to take down the gateway.
     """
-    global _enabled, _host, _redact_patterns, _auth_ok
+    global _enabled, _host, _redact_patterns, _auth_ok, _usage_rewriter
 
     lf = getattr(config, "langfuse", None)
     if lf is None:
@@ -117,6 +119,29 @@ def init_langfuse(config: Any) -> bool:
             "Langfuse: auth_check raised (%s) — observability disabled", e,
         )
         return False
+
+    # Wrap the Langfuse OTLP exporter so LangSmith agent spans get
+    # cache-aware usage attributes. Without this, Langfuse prices every
+    # cached input token at the full uncached rate (~5-10x overcount on
+    # agent sessions). See nerve/observability/usage_rewrite.py.
+    try:
+        from nerve.observability.usage_rewrite import install_usage_rewriter
+        _usage_rewriter = install_usage_rewriter(client)
+        if _usage_rewriter:
+            logger.info("Langfuse: cache-aware usage rewriter installed")
+        else:
+            logger.warning(
+                "Langfuse: usage rewriter not installed (SDK layout "
+                "mismatch?) — agent-loop costs in Langfuse will overcount "
+                "cached input tokens"
+            )
+    except Exception as e:
+        _usage_rewriter = False
+        logger.warning(
+            "Langfuse: usage rewriter installation failed (%s) — "
+            "agent-loop costs in Langfuse will overcount cached input "
+            "tokens", e,
+        )
 
     # Wrap Claude Agent SDK. Failure here disables agent tracing but doesn't
     # disable the rest — direct Anthropic instrumentation can still cover
@@ -170,8 +195,12 @@ def attributes(
 ) -> Iterator[None]:
     """Wrap a block so OTEL spans inside it carry these Langfuse attributes.
 
-    No-op when Langfuse is disabled. Never raises — wrap-failure must not
-    take down the caller.
+    No-op when Langfuse is disabled. Setup failures (missing optional
+    package, ``propagate_attributes`` raising on bad kwargs) are logged
+    and the block runs without propagation. Exceptions thrown into the
+    yielded block (e.g. ``asyncio.TimeoutError`` from the engine's idle-
+    timeout path) propagate normally — they are never swallowed and never
+    converted into a spurious ``RuntimeError`` from a double-yield.
     """
     if not _enabled:
         yield
@@ -196,11 +225,20 @@ def attributes(
         if clean_meta:
             kwargs["metadata"] = clean_meta
 
-    try:
-        with propagate_attributes(**kwargs):
-            yield
-    except Exception as e:
-        logger.debug("Langfuse propagate_attributes failed (%s) — continuing", e)
+    # Guard ENTER only — never wrap the yield. ExitStack closes the inner
+    # context on the way out even when the yielded block raises, so spans
+    # are still finalized correctly. A previous version wrapped the yield
+    # in a try/except Exception and yielded a second time on failure,
+    # which produced "RuntimeError: generator didn't stop after throw()"
+    # whenever an exception was thrown into the yield, masking the real
+    # exception (e.g. the engine's asyncio.TimeoutError).
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(propagate_attributes(**kwargs))
+        except Exception as e:
+            logger.debug(
+                "Langfuse propagate_attributes failed (%s) — continuing", e,
+            )
         yield
 
 

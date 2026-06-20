@@ -47,6 +47,12 @@ export function hydrateMessage(raw: any): ChatMessage {
     if (b.type === 'file') {
       return { type: 'file' as const, url: b.url || '', filename: b.filename || '', size: b.size };
     }
+    if (b.type === 'wakeup') {
+      return { type: 'wakeup' as const };
+    }
+    if (b.type === 'auto') {
+      return { type: 'auto' as const };
+    }
     // Default: text
     return { type: 'text' as const, content: b.content || '' };
   });

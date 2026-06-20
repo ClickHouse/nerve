@@ -174,6 +174,20 @@ nerve migrate-openclaw --timeout 180  # longer per-session timeout
 
 Resumes automatically — skips sessions already indexed in the database.
 
+## xmemory (optional structured layer)
+
+[xmemory.ai](https://xmemory.ai) is an optional **schema-backed** memory store that can run alongside memU. memU keeps free-form facts in a semantic index; xmemory keeps typed objects/relations defined by a schema and answers natural-language queries from that knowledge graph. The two are complementary and run side by side — xmemory never replaces memU.
+
+It is inert unless both `xmemory.api_key` and `xmemory.instance_id` are configured (see [config reference](config.md#xmemory-optional-alongside-memu)). The instance and its schema are created out of band on xmemory's side; Nerve only binds to an existing instance.
+
+When active:
+
+- **`memorize` dual-writes** — the fact goes to memU (file + extraction, as always) **and** is enqueued to xmemory via async `write_async`. xmemory failures are swallowed (logged) so the tool never fails on them. The result message shows `(+ xmemory)` when the xmemory enqueue succeeded.
+- **`memory_recall` adds a synthesized answer** — alongside memU's N items + category breadcrumbs, recall runs xmemory's `SINGLE_ANSWER` read **concurrently** and appends a `[xmemory] synthesized answer` section. When xmemory is disabled or returns nothing, recall output is byte-for-byte the memU-only shape.
+- **The memorization sweep stays memU-only** — session-close / cron indexing goes through the bridge directly, not the `memorize` tool handler, so it is unaffected.
+
+Implementation: `nerve/memory/xmemory_bridge.py` (`XmemoryBridge`), wired into `ToolContext.xmemory_bridge` next to `memory_bridge`. Backed by the `xmemory-ai` SDK (`AsyncXmemoryClient`).
+
 ## Web UI
 
 - **Files tab** (`/files`) — File browser with markdown editing for workspace files

@@ -11,13 +11,20 @@ import ctypes
 import gc
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Coroutine
 from zoneinfo import ZoneInfo
+
+# Ensure BLAS thread caps are applied before numpy loads OpenBLAS — an
+# unbounded BLAS pool makes glibc fork() (subprocess spawning on the event
+# loop) block in OpenBLAS's atfork handler while the memU thread runs
+# vector searches.  See nerve/_env.py for the full mechanism.
+import nerve._env  # noqa: F401  isort: skip
 
 import numpy as np
 
@@ -28,6 +35,229 @@ logger = logging.getLogger(__name__)
 
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
+
+# Max characters for a category breadcrumb in recall() output. A category
+# summary is a whole rolled-up topic document (often 5–20KB); recall must
+# surface it as a short navigable pointer, not dump the document.
+_CATEGORY_BREADCRUMB_MAXLEN = 200
+
+
+def _category_breadcrumb(name: str, description: str, summary: str) -> str:
+    """Build a short one-line breadcrumb for a category recall hit.
+
+    Prefers the curated ``description`` (a 1-line purpose). Falls back to the
+    first meaningful line of the rolled-up ``summary`` (with any ``[ref:ID]``
+    citation markers stripped). Never returns the full summary — that is what
+    ``memory_expand_category`` is for.
+    """
+    text = (description or "").strip()
+    if not text:
+        try:
+            from memu.utils.references import strip_references
+        except Exception:  # pragma: no cover - defensive
+            def strip_references(t: str | None) -> str | None:
+                return t
+        for raw in (summary or "").splitlines():
+            line = (strip_references(raw) or "").strip()
+            # Skip markdown headers — they just repeat the category name,
+            # which is returned separately. Take the first real content line.
+            if not line or line.startswith("#"):
+                continue
+            line = line.lstrip("-*").strip()
+            if line:
+                text = line
+                break
+    if len(text) > _CATEGORY_BREADCRUMB_MAXLEN:
+        text = text[: _CATEGORY_BREADCRUMB_MAXLEN - 1].rstrip() + "…"
+    return text
+
+
+class _VectorIndex:
+    """Incremental brute-force vector index over memU item embeddings.
+
+    ``cosine_topk`` re-stacks every embedding into a fresh ``(n, dim)``
+    matrix on each call — ~130 MB of allocation+copy per search with 20K+
+    items.  This index keeps ONE persistent float32 matrix (amortised
+    capacity growth), appends rows as items are created, and answers
+    similarity queries with a single mat-vec.
+
+    Not thread-safe by itself — all mutations and searches happen on the
+    dedicated memU event-loop thread, which serialises access.
+    """
+
+    __slots__ = (
+        "count", "capacity", "dim", "matrix", "norms", "ids", "types",
+        "id_to_row", "seen_items_len", "dirty",
+    )
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.capacity = 0
+        self.dim = 0
+        self.matrix: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.ids: list[str] = []
+        self.types: np.ndarray | None = None  # dtype='U32', parallel to rows
+        self.id_to_row: dict[str, int] = {}
+        # Snapshot of len(repo.items) at last sync — drift triggers rebuild.
+        self.seen_items_len = -1
+        self.dirty = True
+
+    def _ensure_capacity(self, extra: int = 1) -> None:
+        needed = self.count + extra
+        if self.matrix is not None and needed <= self.capacity:
+            return
+        new_cap = max(256, needed, int(self.capacity * 3 // 2))
+        new_matrix = np.zeros((new_cap, self.dim), dtype=np.float32)
+        new_norms = np.zeros(new_cap, dtype=np.float32)
+        new_types = np.zeros(new_cap, dtype="U32")
+        if self.matrix is not None and self.count:
+            new_matrix[: self.count] = self.matrix[: self.count]
+            new_norms[: self.count] = self.norms[: self.count]
+            new_types[: self.count] = self.types[: self.count]
+        self.matrix, self.norms, self.types = new_matrix, new_norms, new_types
+        self.capacity = new_cap
+
+    @staticmethod
+    def _as_vec(embedding: Any) -> np.ndarray | None:
+        if embedding is None:
+            return None
+        try:
+            vec = np.asarray(embedding, dtype=np.float32)
+        except (ValueError, TypeError):
+            return None
+        if vec.ndim != 1 or not vec.size:
+            return None
+        return vec
+
+    def build(self, items: dict[str, Any]) -> None:
+        """(Re)build the index from the repo's in-memory item cache."""
+        rows: list[tuple[str, str, np.ndarray]] = []
+        dim = 0
+        for item_id, item in items.items():
+            vec = self._as_vec(getattr(item, "embedding", None))
+            if vec is None:
+                continue
+            if not dim:
+                dim = int(vec.shape[0])
+            if vec.shape[0] != dim:
+                continue  # mixed dims — skip outliers
+            rows.append((item_id, str(getattr(item, "memory_type", "")), vec))
+
+        self.dim = dim
+        self.count = len(rows)
+        self.capacity = max(256, self.count * 3 // 2)
+        self.ids = [r[0] for r in rows]
+        self.id_to_row = {item_id: i for i, (item_id, _, _) in enumerate(rows)}
+        if dim:
+            self.matrix = np.zeros((self.capacity, dim), dtype=np.float32)
+            self.norms = np.zeros(self.capacity, dtype=np.float32)
+            self.types = np.zeros(self.capacity, dtype="U32")
+            for i, (_, mtype, vec) in enumerate(rows):
+                self.matrix[i] = vec
+                self.types[i] = mtype
+            self.norms[: self.count] = np.linalg.norm(
+                self.matrix[: self.count], axis=1,
+            )
+        else:
+            self.matrix = self.norms = self.types = None
+            self.capacity = 0
+        self.seen_items_len = len(items)
+        self.dirty = False
+
+    def upsert(self, item_id: str, memory_type: str, embedding: Any) -> None:
+        vec = self._as_vec(embedding)
+        if vec is None:
+            return
+        if not self.dim:
+            self.dim = int(vec.shape[0])
+        if vec.shape[0] != self.dim:
+            self.dirty = True  # dim change — force rebuild on next search
+            return
+        row = self.id_to_row.get(item_id)
+        if row is None:
+            self._ensure_capacity()
+            row = self.count
+            self.count += 1
+            self.ids.append(item_id)
+            self.id_to_row[item_id] = row
+        self.matrix[row] = vec
+        self.norms[row] = float(np.linalg.norm(vec))
+        self.types[row] = memory_type
+
+    def remove(self, item_id: str) -> None:
+        row = self.id_to_row.pop(item_id, None)
+        if row is None:
+            return
+        last = self.count - 1
+        if row != last:
+            self.matrix[row] = self.matrix[last]
+            self.norms[row] = self.norms[last]
+            self.types[row] = self.types[last]
+            moved_id = self.ids[last]
+            self.ids[row] = moved_id
+            self.id_to_row[moved_id] = row
+        self.ids.pop()
+        self.count = last
+
+    def search(
+        self, query_vec: Any, k: int, memory_type: str | None = None,
+    ) -> list[tuple[str, float]]:
+        """Cosine top-k via one mat-vec over the persistent matrix."""
+        if not self.count or self.matrix is None:
+            return []
+        q = self._as_vec(query_vec)
+        if q is None or q.shape[0] != self.dim:
+            return []
+        q_norm = float(np.linalg.norm(q))
+        scores = (self.matrix[: self.count] @ q) / (
+            self.norms[: self.count] * q_norm + 1e-9
+        )
+        if memory_type is not None:
+            mask = self.types[: self.count] == memory_type
+            if not mask.any():
+                return []
+            scores = np.where(mask, scores, -np.inf)
+        k = min(k, self.count)
+        if k <= 0:
+            return []
+        top = np.argpartition(scores, -k)[-k:]
+        top = top[np.argsort(scores[top])[::-1]]
+        return [
+            (self.ids[i], float(scores[i]))
+            for i in top
+            if np.isfinite(scores[i])
+        ]
+
+
+def _vec_index_for(repo: Any) -> _VectorIndex:
+    """Get (lazily building) the vector index attached to an item repo.
+
+    Rebuilds when marked dirty or when the repo cache size drifted from the
+    last sync (something mutated items without going through our hooks).
+    """
+    idx: _VectorIndex | None = getattr(repo, "_nerve_vec_index", None)
+    if idx is None:
+        idx = _VectorIndex()
+        repo._nerve_vec_index = idx
+    if idx.dirty or idx.seen_items_len != len(repo.items):
+        idx.build(repo.items)
+    return idx
+
+
+def _vec_index_note(repo: Any) -> _VectorIndex | None:
+    """Return the index for mutation hooks (no build) — None if not built."""
+    return getattr(repo, "_nerve_vec_index", None)
+
+
+def _log_audit_failure(future: Any) -> None:
+    """Done-callback for cross-loop audit writes — log, never raise."""
+    try:
+        exc = future.exception()
+    except Exception:  # pragma: no cover - cancelled
+        return
+    if exc is not None:
+        logger.warning("Audit log failed: %s", exc)
 
 
 class _BedrockLLMClient:
@@ -417,14 +647,146 @@ class MemUBridge:
         # Debounce tracking for file re-indexing (path -> asyncio.Task)
         self._reindex_tasks: dict[str, asyncio.Task] = {}
         self._anthropic_client: Any | None = None  # Lazy sync Anthropic
+        # Dedicated event loop (own thread) that runs ALL memU service
+        # coroutines.  memU's async pipeline steps call synchronous
+        # SQLite/numpy work inline; isolating the whole service on its own
+        # loop keeps those blocking calls off the main event loop.
+        self._memu_loop: asyncio.AbstractEventLoop | None = None
+        self._memu_thread: threading.Thread | None = None
+        # Main loop handle — captured in initialize() so audit writes
+        # (aiosqlite, bound to the main loop) can be routed back to it
+        # when triggered from the memU loop.
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+
+    # ------------------------------------------------------------------
+    # Dedicated memU event loop
+    # ------------------------------------------------------------------
+
+    def _start_memu_loop(self) -> None:
+        """Spawn the daemon thread running the memU event loop (idempotent)."""
+        if self._memu_loop is not None and not self._memu_loop.is_closed():
+            return
+        ready = threading.Event()
+
+        def _run() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._memu_loop = loop
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                # Drain pending tasks so cancellations complete cleanly.
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True),
+                    )
+                loop.close()
+
+        self._memu_thread = threading.Thread(
+            target=_run, name="memu-loop", daemon=True,
+        )
+        self._memu_thread.start()
+        ready.wait(timeout=10)
+
+    async def _submit(self, coro: Coroutine) -> Any:
+        """Run ``coro`` on the memU event loop and await its result.
+
+        Falls back to awaiting inline when the memU loop isn't running
+        (unit tests construct bridges without ``initialize()``) or when the
+        caller is already executing ON the memU loop (re-entrant impl
+        calls).  Cancelling the returned awaitable cancels the task on the
+        memU loop (``run_coroutine_threadsafe`` propagates cancellation),
+        so ``asyncio.wait_for`` timeouts behave exactly as before.
+        """
+        loop = self._memu_loop
+        if loop is None or loop.is_closed():
+            return await coro
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - defensive
+            running = None
+        if running is loop:
+            return await coro
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return await asyncio.wrap_future(future)
+
+    async def shutdown(self) -> None:
+        """Close LLM clients and stop the memU event loop thread."""
+        loop = self._memu_loop
+        if loop is not None and not loop.is_closed():
+            try:
+                await asyncio.wait_for(
+                    self._submit(self._close_service_impl()), timeout=10,
+                )
+            except Exception as e:
+                logger.debug("memU client close during shutdown: %s", e)
+            loop.call_soon_threadsafe(loop.stop)
+        self._memu_loop = None
+        thread = self._memu_thread
+        self._memu_thread = None
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 5)
+        self._available = False
+        self._metrics.service_available = False
+
+    async def _close_service_impl(self) -> None:
+        """Close LLM transports + DB engine.  Runs on the memU loop."""
+        if not self._service:
+            return
+        for profile, client in list(
+            getattr(self._service, "_llm_clients", {}).items()
+        ):
+            try:
+                if isinstance(client, _BedrockLLMClient):
+                    await client.close()
+                else:
+                    inner = getattr(client, "client", None)
+                    http = getattr(inner, "_client", None) or getattr(
+                        inner, "http_client", None,
+                    )
+                    if http is not None and hasattr(http, "aclose"):
+                        await http.aclose()
+            except Exception as e:
+                logger.debug("Closing LLM client %s: %s", profile, e)
+        try:
+            sessions = getattr(self._service.database, "_sessions", None)
+            if sessions is not None:
+                sessions.close()
+        except Exception as e:
+            logger.debug("Closing memU DB engine: %s", e)
 
     async def _audit(self, action: str, target_type: str, target_id: str | None = None,
                      source: str = "bridge", details: dict | None = None) -> None:
-        if self._audit_db:
-            try:
-                await self._audit_db.log_audit(action, target_type, target_id, source, details)
-            except Exception as e:
-                logger.warning("Audit log failed: %s", e)
+        """Best-effort audit write.
+
+        ``_audit_db`` is aiosqlite bound to the main event loop.  When
+        called from the memU loop, schedule the write on the main loop
+        instead of awaiting it here (fire-and-forget — audit is advisory).
+        """
+        if not self._audit_db:
+            return
+        coro = self._audit_db.log_audit(action, target_type, target_id, source, details)
+        main_loop = self._main_loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - defensive
+            running = None
+        if (
+            main_loop is not None
+            and running is not main_loop
+            and not main_loop.is_closed()
+        ):
+            future = asyncio.run_coroutine_threadsafe(coro, main_loop)
+            future.add_done_callback(_log_audit_failure)
+            return
+        try:
+            await coro
+        except Exception as e:
+            logger.warning("Audit log failed: %s", e)
 
     # memU version these patches were written for. If the installed version
     # differs, the internal APIs we monkey-patch may have changed.
@@ -574,14 +936,20 @@ class MemUBridge:
 
             # Fix 3: vector_search_items calls list_items() on every query,
             # re-reading and JSON-parsing all embeddings from SQLite (~2s for 3K items).
-            # The items cache (self.items) is already kept in sync by create/update/delete,
-            # so use it directly when available.
+            # Worse, cosine_topk re-stacks every embedding into a brand-new
+            # (n, dim) float32 matrix per call (~130 MB with 20K items).
+            # Use the persistent incremental _VectorIndex instead: one
+            # mat-vec per query, rows appended as items are created.
             from memu.database.sqlite.repositories.memory_item_repo import SQLiteMemoryItemRepo
             from memu.database.inmemory.vector import cosine_topk, cosine_topk_salience
 
             _original_vector_search = SQLiteMemoryItemRepo.vector_search_items
 
             def _fast_vector_search(self, query_vec, top_k, where=None, *, ranking="similarity", recency_decay_days=30.0):
+                # Fast path: persistent matrix index (no filters, default ranking).
+                if self.items and not where and ranking == "similarity":
+                    return _vec_index_for(self).search(query_vec, top_k)
+
                 # Use in-memory cache when it's populated and no filters applied
                 if self.items and not where:
                     pool = self.items
@@ -601,6 +969,47 @@ class MemUBridge:
                 return cosine_topk(query_vec, [(i.id, i.embedding) for i in pool.values()], k=top_k)
 
             SQLiteMemoryItemRepo.vector_search_items = _fast_vector_search
+
+            # Keep the vector index in sync on update/delete/clear.  Creates
+            # are handled by the create_item wrapper installed in
+            # _initialize_impl (which also converts embeddings to numpy).
+            _original_update_item = SQLiteMemoryItemRepo.update_item
+            _original_delete_item = SQLiteMemoryItemRepo.delete_item
+            _original_clear_items = SQLiteMemoryItemRepo.clear_items
+
+            def _indexed_update_item(self, *args, **kwargs):
+                # Forward args verbatim. memu-py 1.4.0 makes update_item's
+                # parameters (including item_id) keyword-only, so forwarding
+                # item_id positionally raised "takes 1 positional argument but
+                # 2 were given" and silently failed every memory_update.
+                result = _original_update_item(self, *args, **kwargs)
+                item_id = kwargs.get("item_id", args[0] if args else None)
+                idx = _vec_index_note(self)
+                if idx is not None and item_id is not None:
+                    cached = self.items.get(item_id)
+                    if cached is not None and cached.embedding is not None:
+                        idx.upsert(item_id, str(cached.memory_type), cached.embedding)
+                    idx.seen_items_len = len(self.items)
+                return result
+
+            def _indexed_delete_item(self, item_id, *args, **kwargs):
+                result = _original_delete_item(self, item_id, *args, **kwargs)
+                idx = _vec_index_note(self)
+                if idx is not None:
+                    idx.remove(item_id)
+                    idx.seen_items_len = len(self.items)
+                return result
+
+            def _indexed_clear_items(self, *args, **kwargs):
+                result = _original_clear_items(self, *args, **kwargs)
+                idx = _vec_index_note(self)
+                if idx is not None:
+                    idx.dirty = True
+                return result
+
+            SQLiteMemoryItemRepo.update_item = _indexed_update_item
+            SQLiteMemoryItemRepo.delete_item = _indexed_delete_item
+            SQLiteMemoryItemRepo.clear_items = _indexed_clear_items
 
             # Same fix for category repo
             from memu.database.sqlite.repositories.memory_category_repo import SQLiteMemoryCategoryRepo
@@ -731,14 +1140,13 @@ class MemUBridge:
             ):
                 threshold = _SEMANTIC_DEDUP_THRESHOLD
                 if threshold > 0 and embedding is not None and self.items:
-                    corpus = [
-                        (iid, item.embedding)
-                        for iid, item in self.items.items()
-                        if item.memory_type == memory_type and item.embedding is not None
-                    ]
-                    if corpus:
-                        hits = cosine_topk(embedding, corpus, k=1)
-                        if hits and hits[0][1] >= threshold:
+                    # Type-filtered top-1 via the persistent matrix index —
+                    # no per-item corpus rebuild.
+                    hits = _vec_index_for(self).search(
+                        embedding, k=1, memory_type=str(memory_type),
+                    )
+                    if hits:
+                        if hits[0][1] >= threshold:
                             match_id, score = hits[0]
                             matched = self.items[match_id]
                             logger.info(
@@ -868,8 +1276,75 @@ class MemUBridge:
         except Exception as exc:
             logger.warning("memU datetime sanitization skipped: %s", exc)
 
+    @staticmethod
+    def _setup_sqlite_pragmas(sqlite_dsn: str) -> None:
+        """One-time SQLite tuning for the memU database.
+
+        ``journal_mode=WAL`` is a persistent database property: writers no
+        longer block readers and commits stop paying the rollback-journal
+        create/delete cycle.  Run before memu-py opens the database (the
+        conversion needs no other connections).
+        """
+        import sqlite3 as _sqlite3
+
+        db_path = sqlite_dsn.replace("sqlite:///", "")
+        try:
+            conn = _sqlite3.connect(db_path, timeout=10)
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            conn.close()
+            if str(mode).lower() != "wal":
+                logger.warning(
+                    "memU DB journal_mode is %r (wanted WAL) — concurrent "
+                    "readers will block on writers", mode,
+                )
+            else:
+                logger.info("memU DB journal_mode=WAL")
+        except Exception as exc:
+            logger.warning("memU WAL setup skipped: %s", exc)
+
+    def _attach_engine_pragmas(self) -> None:
+        """Per-connection pragmas for memU's SQLAlchemy engine.
+
+        ``synchronous`` and ``busy_timeout`` are per-connection settings
+        (unlike journal_mode), so they must be applied on every new pooled
+        connection via the ``connect`` event.  ``synchronous=NORMAL`` is
+        the recommended pairing with WAL (fsync on checkpoint, not on every
+        commit); ``busy_timeout`` stops concurrent writers from failing
+        fast with "database is locked".
+        """
+        try:
+            from sqlalchemy import event
+
+            engine = self._service.database._sessions.engine
+
+            @event.listens_for(engine, "connect")
+            def _set_pragmas(dbapi_conn, _record):  # pragma: no cover - thin
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA busy_timeout=10000")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.close()
+
+            # Recycle connections opened before the listener existed
+            # (table-creation during MemoryService init).
+            engine.dispose()
+            logger.info("memU engine pragmas attached (busy_timeout, synchronous=NORMAL)")
+        except Exception as exc:
+            logger.warning("Could not attach memU engine pragmas: %s", exc)
+
     async def initialize(self) -> bool:
-        """Initialize the memU service with SQLite persistence."""
+        """Initialize the memU service.
+
+        Spawns the dedicated memU event-loop thread, then runs the actual
+        initialization there: memU's pipelines execute synchronous SQLite
+        and numpy work inline, so the service must live where that cannot
+        stall the main event loop.
+        """
+        self._main_loop = asyncio.get_running_loop()
+        self._start_memu_loop()
+        return await self._submit(self._initialize_impl())
+
+    async def _initialize_impl(self) -> bool:
+        """Initialize the memU service with SQLite persistence (memU loop)."""
         try:
             from memu.app.service import MemoryService
 
@@ -890,6 +1365,12 @@ class MemUBridge:
             # non-string values, breaking list_items() and the entire item
             # cache.  Sanitize on startup and add a defensive type adapter.
             self._sanitize_memu_datetimes(sqlite_dsn)
+
+            # ── SQLite tuning ──
+            # Convert to WAL once (persistent) so writers stop blocking
+            # readers; per-connection pragmas are attached to the engine
+            # right after the service is constructed.
+            self._setup_sqlite_pragmas(sqlite_dsn)
 
             # ── Bedrock detection ──
             # When provider is Bedrock, anthropic_api_base_url and
@@ -1013,6 +1494,9 @@ class MemUBridge:
             self._metrics.service_available = True
             self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
             logger.info("memU service initialized with SQLite at %s", sqlite_dsn)
+
+            # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
+            self._attach_engine_pragmas()
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
@@ -1252,6 +1736,10 @@ class MemUBridge:
                 # Release the list[float] objects immediately
                 self._release_memory()
 
+                # Pre-build the persistent vector index so the first
+                # search doesn't pay the full matrix stack.
+                _vec_index_for(self._service.database.memory_item_repo)
+
                 logger.info(
                     "Preloaded %d items and %d categories into vector cache "
                     "(%d embeddings converted to numpy float32)",
@@ -1262,20 +1750,32 @@ class MemUBridge:
             except Exception as e:
                 logger.warning("Failed to preload vector cache: %s", e)
 
-            # Monkey-patch create_item to keep new embeddings as numpy too.
+            # Monkey-patch create_item to keep new embeddings as numpy and
+            # append them to the persistent vector index.
             from memu.database.sqlite.repositories.memory_item_repo import SQLiteMemoryItemRepo
-            _original_create_item = SQLiteMemoryItemRepo.create_item
 
-            def _numpy_create_item(self, *args, **kwargs):
-                result = _original_create_item(self, *args, **kwargs)
-                # Convert the newly cached item's embedding to numpy
-                if result and hasattr(result, "id"):
-                    cached = self.items.get(result.id)
-                    if cached and cached.embedding is not None and not isinstance(cached.embedding, np.ndarray):
-                        cached.__dict__["embedding"] = np.array(cached.embedding, dtype=np.float32)
-                return result
+            if not getattr(SQLiteMemoryItemRepo.create_item, "_nerve_numpy_wrapped", False):
+                _original_create_item = SQLiteMemoryItemRepo.create_item
 
-            SQLiteMemoryItemRepo.create_item = _numpy_create_item
+                def _numpy_create_item(self, *args, **kwargs):
+                    result = _original_create_item(self, *args, **kwargs)
+                    # Convert the newly cached item's embedding to numpy
+                    if result and hasattr(result, "id"):
+                        cached = self.items.get(result.id)
+                        if cached and cached.embedding is not None and not isinstance(cached.embedding, np.ndarray):
+                            cached.__dict__["embedding"] = np.array(cached.embedding, dtype=np.float32)
+                        idx = _vec_index_note(self)
+                        if idx is not None:
+                            if cached is not None and cached.embedding is not None:
+                                idx.upsert(
+                                    result.id, str(cached.memory_type),
+                                    cached.embedding,
+                                )
+                            idx.seen_items_len = len(self.items)
+                    return result
+
+                _numpy_create_item._nerve_numpy_wrapped = True  # type: ignore[attr-defined]
+                SQLiteMemoryItemRepo.create_item = _numpy_create_item
 
             return True
 
@@ -1303,7 +1803,9 @@ class MemUBridge:
             if cat_cfg.name in existing:
                 continue
             try:
-                await self.create_category(cat_cfg.name, cat_cfg.description)
+                # Already on the memU loop (called from _initialize_impl) —
+                # invoke the impl directly instead of re-submitting.
+                await self._create_category_impl(cat_cfg.name, cat_cfg.description)
             except Exception as e:
                 logger.warning("Failed to seed category %s: %s", cat_cfg.name, e)
 
@@ -1508,6 +2010,14 @@ class MemUBridge:
     async def _reset_llm_clients(self) -> None:
         """Evict cached LLM clients and force fresh HTTP connections.
 
+        Proxy: the clients (and their httpx transports) live on the memU
+        event loop, so the reset must run there.
+        """
+        await self._submit(self._reset_llm_clients_impl())
+
+    async def _reset_llm_clients_impl(self) -> None:
+        """Reset LLM clients (memU loop).
+
         After a timeout the API may be rate-limiting, overloaded, or the
         connection may be stale.  We close the transport, evict the cached
         client so _get_llm_base_client() creates a new one, then re-apply
@@ -1604,11 +2114,15 @@ class MemUBridge:
                 )
                 t0 = time.monotonic()
 
+                # The memorize pipeline interleaves async LLM calls with
+                # synchronous SQLite writes and numpy work — run it on the
+                # dedicated memU loop.  Cancellation (wait_for timeout)
+                # propagates through _submit to the memU-loop task.
                 response = await asyncio.wait_for(
-                    self._service.memorize(
+                    self._submit(self._service.memorize(
                         resource_url=file_path,
                         modality=modality,
-                    ),
+                    )),
                     timeout=self._MEMORIZE_TIMEOUT,
                 )
 
@@ -1629,7 +2143,9 @@ class MemUBridge:
                             name=f"filter-knowledge-{Path(file_path).name}",
                         )
 
-                self._release_memory()
+                # gc.collect + malloc_trim can take 100ms+ on a large heap
+                # — run off the event loop.
+                await asyncio.to_thread(self._release_memory)
                 return True
 
             except asyncio.TimeoutError:
@@ -1701,7 +2217,7 @@ class MemUBridge:
             attempt += 1
 
         logger.error("memU memorize_file gave up after %d attempts for %s", attempt, file_path)
-        self._release_memory()
+        await asyncio.to_thread(self._release_memory)
         return False
 
     async def memorize_conversation(self, session_id: str, messages: list[dict]) -> bool:
@@ -1736,14 +2252,22 @@ class MemUBridge:
 
         now = int(time.time())
         conv_dir = Path("~/.nerve/memu-conversations").expanduser()
-        conv_dir.mkdir(parents=True, exist_ok=True)
         conv_path = conv_dir / f"session-{session_id}-{now}.json"
-        conv_path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+        def _write_conversation() -> int:
+            """JSON-encode and write the conversation (off the event loop —
+            10K messages serialize to multiple MB)."""
+            conv_dir.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(entries, ensure_ascii=False)
+            conv_path.write_text(payload, encoding="utf-8")
+            return len(payload.encode("utf-8"))
+
+        payload_bytes = await asyncio.to_thread(_write_conversation)
 
         try:
             logger.info(
                 "Memorizing conversation: session=%s, messages=%d, file=%s (%d bytes)",
-                session_id, len(entries), conv_path.name, conv_path.stat().st_size,
+                session_id, len(entries), conv_path.name, payload_bytes,
             )
             ok = await self.memorize_file(str(conv_path), modality="conversation")
 
@@ -1800,6 +2324,7 @@ class MemUBridge:
         try:
             db = sqlite3.connect(db_path, timeout=10)
             db.row_factory = sqlite3.Row
+            db.execute("PRAGMA synchronous=NORMAL")
 
             rows = db.execute(
                 "SELECT id, memory_type, summary, extra "
@@ -2047,23 +2572,40 @@ class MemUBridge:
 
         return []
 
-    async def recall(self, query: str, limit: int = 10) -> list[dict[str, str]]:
+    async def recall(
+        self, query: str, limit: int = 10, category_limit: int = 5,
+    ) -> list[dict[str, str]]:
         """Recall relevant memories via semantic search.
 
-        Returns list of dicts with keys: id, type, summary.
-        Category results use id="cat:<id>".
+        Returns a list of dicts with keys: id, type, summary (plus ``name``
+        for category hits). Items come first (atomic, full content), followed
+        by category hits rendered as short breadcrumbs (``id="cat:<id>"``).
+
+        memU is hierarchical: an item is one atomic fact, a category is a
+        rolled-up topic *document* (often 5–20KB) that indexes many items.
+        Returning category documents verbatim blows past tool-output size
+        limits and duplicates the items, so category hits are reduced to a
+        one-line breadcrumb. Drill into a category's items with
+        ``expand_category`` / the ``memory_expand_category`` tool.
+
+        Args:
+            limit: max item hits to return (full content).
+            category_limit: max category breadcrumbs to return.
         """
         if not self._available or not self._service:
             return []
         op_id = self._metrics.begin_op("recall", query[:80])
         try:
-            result = await self._service.retrieve(
+            # Retrieve runs vector search (numpy) and possibly SQLite reads
+            # inline — keep it on the memU loop.
+            result = await self._submit(self._service.retrieve(
                 queries=[{"role": "user", "content": query}],
-            )
+            ))
 
-            memories: list[dict[str, str]] = []
+            items_out: list[dict[str, str]] = []
+            cats_out: list[dict[str, str]] = []
 
-            # Extract from items (individual memory entries)
+            # Items — individual memory entries, returned with full content.
             for item in result.get("items", []):
                 if isinstance(item, dict):
                     text = item.get("summary", item.get("content", ""))
@@ -2078,41 +2620,110 @@ class MemUBridge:
                     item_id = ""
                     mtype = ""
                 if text:
-                    memories.append({"id": item_id, "type": mtype, "summary": text})
+                    items_out.append({"id": item_id, "type": mtype, "summary": text})
 
-            # Extract from categories (higher-level summaries)
+            # Categories — reduced to a one-line breadcrumb (never the full doc).
             for cat in result.get("categories", []):
                 if isinstance(cat, dict):
                     summary = cat.get("summary", "")
+                    description = cat.get("description", "")
                     name = cat.get("name", "")
                     cat_id = cat.get("id", "")
                 elif hasattr(cat, "summary"):
                     summary = cat.summary
+                    description = getattr(cat, "description", "")
                     name = getattr(cat, "name", "")
                     cat_id = getattr(cat, "id", "")
                 else:
                     continue
-                if summary:
-                    memories.append({
+                crumb = _category_breadcrumb(name, description, summary)
+                if crumb or name:
+                    cats_out.append({
                         "id": f"cat:{cat_id}",
                         "type": "category",
-                        "summary": f"[{name}] {summary}" if name else summary,
+                        "name": name,
+                        "summary": crumb,
                     })
 
             self._metrics.end_op(op_id, success=True)
-            return memories[:limit]
+            return items_out[:limit] + cats_out[:category_limit]
 
         except Exception as e:
             logger.error("memU recall failed: %s", e)
             self._metrics.end_op(op_id, success=False, error=str(e))
             return []
 
+    async def expand_category(
+        self, category_id: str, query: str = "", limit: int = 20,
+    ) -> dict[str, Any]:
+        """Drill into a category and return its constituent memory items.
+
+        Categories surface in ``recall`` as one-line breadcrumbs; this expands
+        one into its atomic items via the ``memu_category_items`` membership
+        table. Results are ordered most-recent-first and bounded by ``limit``;
+        an optional ``query`` keyword-filters item summaries.
+
+        Returns a dict: ``{name, total, items: [{id, type, summary}]}``.
+        ``name`` is ``None`` when the category id is unknown.
+        """
+        if not self._available or not self._service:
+            return {"name": None, "total": 0, "items": []}
+
+        cat_id = category_id[4:] if category_id.startswith("cat:") else category_id
+        cat_id = cat_id.strip()
+        if not cat_id:
+            return {"name": None, "total": 0, "items": []}
+
+        def _run() -> dict[str, Any]:
+            import sqlite3
+
+            dsn = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+            db = sqlite3.connect(dsn)
+            db.row_factory = sqlite3.Row
+            try:
+                crow = db.execute(
+                    "SELECT name FROM memu_memory_categories WHERE id = ?",
+                    (cat_id,),
+                ).fetchone()
+                if not crow:
+                    return {"name": None, "total": 0, "items": []}
+                total = db.execute(
+                    "SELECT count(*) FROM memu_category_items WHERE category_id = ?",
+                    (cat_id,),
+                ).fetchone()[0]
+                sql = (
+                    "SELECT i.id, i.memory_type, i.summary "
+                    "FROM memu_category_items ci "
+                    "JOIN memu_memory_items i ON i.id = ci.item_id "
+                    "WHERE ci.category_id = ?"
+                )
+                params: list[Any] = [cat_id]
+                if query:
+                    sql += " AND lower(i.summary) LIKE ?"
+                    params.append(f"%{query.lower()}%")
+                sql += " ORDER BY i.updated_at DESC, i.created_at DESC LIMIT ?"
+                params.append(limit)
+                rows = db.execute(sql, params).fetchall()
+                items = [
+                    {"id": r["id"], "type": r["memory_type"], "summary": r["summary"]}
+                    for r in rows
+                ]
+                return {"name": crow["name"], "total": total, "items": items}
+            finally:
+                db.close()
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as e:
+            logger.error("expand_category failed for %s: %s", cat_id, e)
+            return {"name": None, "total": 0, "items": []}
+
     async def list_items(self) -> list[dict[str, Any]]:
         """List all memory items."""
         if not self._available or not self._service:
             return []
         try:
-            result = await self._service.list_memory_items(where=None)
+            result = await self._submit(self._service.list_memory_items(where=None))
             items = []
             for item in result.get("items", []):
                 items.append({
@@ -2133,7 +2744,7 @@ class MemUBridge:
         if not self._available or not self._service:
             return []
         try:
-            result = await self._service.list_memory_categories(where=None)
+            result = await self._submit(self._service.list_memory_categories(where=None))
             cats = []
             for cat in result.get("categories", []):
                 cats.append({
@@ -2166,7 +2777,7 @@ class MemUBridge:
                 kwargs["memory_type"] = memory_type
             if categories is not None:
                 kwargs["memory_categories"] = categories
-            await self._service.update_memory_item(**kwargs)
+            await self._submit(self._service.update_memory_item(**kwargs))
             logger.info("Updated memory item: %s", memory_id)
             await self._audit("item_updated", "item", memory_id, source, {
                 "content_changed": content is not None,
@@ -2183,7 +2794,7 @@ class MemUBridge:
         if not self._available or not self._service:
             return False
         try:
-            await self._service.delete_memory_item(memory_id=memory_id)
+            await self._submit(self._service.delete_memory_item(memory_id=memory_id))
             logger.info("Deleted memory item: %s", memory_id)
             await self._audit("item_deleted", "item", memory_id, source)
             return True
@@ -2194,6 +2805,12 @@ class MemUBridge:
     async def create_category(self, name: str, description: str, source: str = "bridge") -> bool:
         """Create a new memory category at runtime."""
         if not self._available or not self._service:
+            return False
+        return await self._submit(self._create_category_impl(name, description, source))
+
+    async def _create_category_impl(self, name: str, description: str, source: str = "bridge") -> bool:
+        """Create a category — repo write + context mutation (memU loop)."""
+        if not self._service:
             return False
         try:
             # Generate embedding for the category (requires OpenAI key)
@@ -2244,6 +2861,18 @@ class MemUBridge:
         """Update a category's summary and/or description, then re-embed."""
         if not self._available or not self._service:
             return False
+        return await self._submit(
+            self._update_category_impl(category_id, summary, description, source),
+        )
+
+    async def _update_category_impl(
+        self,
+        category_id: str,
+        summary: str | None = None,
+        description: str | None = None,
+        source: str = "bridge",
+    ) -> bool:
+        """Update a category — embed + repo write (memU loop)."""
         try:
             repo = self._service.database.memory_category_repo
             cat = repo.categories.get(category_id)
@@ -2290,18 +2919,15 @@ class MemUBridge:
         if not self._available or not self._service:
             return 0
 
-        # Get already-indexed resource URLs
+        # Get already-indexed resource URLs.  The first list_resources()
+        # call reads + JSON-parses every resource row — memU loop.
         existing_urls: set[str] = set()
         try:
-            resources = self._service.database.resource_repo.list_resources()
-            for res_id, res in resources.items():
-                url = getattr(res, "url", "")
-                if url:
-                    existing_urls.add(url)
+            existing_urls = await self._submit(self._list_resource_urls_impl())
         except Exception as e:
             logger.warning("Could not load existing resources: %s", e)
 
-        md_files = self._collect_md_files(workspace)
+        md_files = await asyncio.to_thread(self._collect_md_files, workspace)
         indexed_count = 0
 
         for file_path, file_type in md_files:
@@ -2315,6 +2941,16 @@ class MemUBridge:
 
         logger.info("Indexed %d new files into memU (%d already indexed)", indexed_count, len(existing_urls))
         return indexed_count
+
+    async def _list_resource_urls_impl(self) -> set[str]:
+        """Collect indexed resource URLs (sync repo read — memU loop)."""
+        urls: set[str] = set()
+        resources = self._service.database.resource_repo.list_resources()
+        for _res_id, res in resources.items():
+            url = getattr(res, "url", "")
+            if url:
+                urls.add(url)
+        return urls
 
     async def reindex_file(self, file_path: str) -> bool:
         """Re-index a single file after edit, with 5s debounce."""
@@ -2339,15 +2975,7 @@ class MemUBridge:
 
         op_id = self._metrics.begin_op("reindex_file", file_path)
         try:
-            # Find and remove old resource entries for this URL
-            resources = self._service.database.resource_repo.list_resources()
-            for res_id, res in resources.items():
-                if getattr(res, "url", "") == file_path:
-                    # Find items linked to this resource and delete them
-                    items = self._service.database.memory_item_repo.list_items()
-                    for item_id, item in items.items():
-                        if getattr(item, "resource_id", None) == res_id:
-                            await self._service.delete_memory_item(memory_id=item_id)
+            await self._submit(self._clear_file_entries_impl(file_path))
             logger.debug("Cleared old entries for %s", file_path)
         except Exception as e:
             logger.warning("Failed to clear old entries for %s: %s", file_path, e)
@@ -2361,6 +2989,17 @@ class MemUBridge:
         result = await self.memorize_file(file_path, modality=modality)
         self._metrics.end_op(op_id, success=result)
         return result
+
+    async def _clear_file_entries_impl(self, file_path: str) -> None:
+        """Remove old resource + item entries for a URL (memU loop)."""
+        resources = self._service.database.resource_repo.list_resources()
+        for res_id, res in resources.items():
+            if getattr(res, "url", "") == file_path:
+                # Find items linked to this resource and delete them
+                items = self._service.database.memory_item_repo.list_items()
+                for item_id, item in items.items():
+                    if getattr(item, "resource_id", None) == res_id:
+                        await self._service.delete_memory_item(memory_id=item_id)
 
     def _collect_md_files(self, workspace: Path) -> list[tuple[Path, str]]:
         """Collect all .md files that should be indexed."""

@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api/client';
+import { useTaskStatusStore } from '../../stores/taskStatusStore';
+import { StatusBadge, StatusSelect } from './StatusControls';
 
 interface Task {
   id: string;
@@ -10,17 +12,12 @@ interface Task {
   created_at: string;
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  pending: 'text-hue-yellow',
-  in_progress: 'text-hue-blue',
-  done: 'text-hue-green',
-  deferred: 'text-text-muted',
-};
-
 export function TaskList() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState('');
   const [loading, setLoading] = useState(true);
+  const statuses = useTaskStatusStore((s) => s.statuses);
+  const loadStatuses = useTaskStatusStore((s) => s.load);
 
   const loadTasks = async () => {
     try {
@@ -33,6 +30,7 @@ export function TaskList() {
     }
   };
 
+  useEffect(() => { loadStatuses(); }, []);
   useEffect(() => { loadTasks(); }, [filter]);
 
   const handleStatusChange = async (id: string, newStatus: string) => {
@@ -50,10 +48,9 @@ export function TaskList() {
           className="text-sm px-2 py-1 bg-surface-raised border border-border-subtle rounded text-text outline-none"
         >
           <option value="">Active</option>
-          <option value="pending">Pending</option>
-          <option value="in_progress">In Progress</option>
-          <option value="done">Done</option>
-          <option value="deferred">Deferred</option>
+          {statuses.map((s) => (
+            <option key={s.name} value={s.name}>{s.label}</option>
+          ))}
         </select>
       </div>
 
@@ -71,22 +68,17 @@ export function TaskList() {
               <div className="flex items-start justify-between">
                 <div>
                   <div className="font-medium">{task.title}</div>
-                  <div className="text-xs text-text-dim mt-1">
-                    <span className={STATUS_COLORS[task.status] || ''}>{task.status}</span>
-                    {task.deadline && <span className="ml-2">Due: {task.deadline}</span>}
-                    {task.source && <span className="ml-2">from {task.source}</span>}
+                  <div className="text-xs text-text-dim mt-1 flex items-center gap-2">
+                    <StatusBadge status={task.status} />
+                    {task.deadline && <span>Due: {task.deadline}</span>}
+                    {task.source && <span>from {task.source}</span>}
                   </div>
                 </div>
-                <select
+                <StatusSelect
                   value={task.status}
-                  onChange={(e) => handleStatusChange(task.id, e.target.value)}
+                  onChange={(status) => handleStatusChange(task.id, status)}
                   className="text-xs px-1.5 py-0.5 bg-surface-raised border border-border-subtle rounded text-text-muted outline-none"
-                >
-                  <option value="pending">Pending</option>
-                  <option value="in_progress">In Progress</option>
-                  <option value="done">Done</option>
-                  <option value="deferred">Deferred</option>
-                </select>
+                />
               </div>
             </div>
           ))}

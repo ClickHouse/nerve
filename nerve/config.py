@@ -98,6 +98,38 @@ class ProviderConfig:
 
 
 @dataclass
+class PromptRewriteConfig:
+    """First-prompt rewrite — refine the opening message of a new chat.
+
+    When enabled, the web UI offers a toggle in the composer of a new
+    (empty) chat. With the toggle on, the first prompt is rewritten and
+    shown to the user for approval before anything is sent.
+    `enabled` here is the server-side master switch: it controls whether
+    the feature is offered at all (the per-user toggle lives in the UI).
+
+    The rewrite defaults to the main chat model (`agent.model`) — the
+    rewrite shapes the whole conversation, so quality wins over speed
+    here. It runs once per chat and the preview shows progress, so the
+    extra latency is acceptable. Set `model` to a fast model (e.g. the
+    title model) to trade quality for speed/cost.
+    """
+
+    enabled: bool = True
+    model: str = ""              # empty → falls back to agent.model
+    max_tokens: int = 1024
+    timeout_seconds: float = 45.0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> PromptRewriteConfig:
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            model=d.get("model", ""),
+            max_tokens=int(d.get("max_tokens", 1024)),
+            timeout_seconds=float(d.get("timeout_seconds", 45.0)),
+        )
+
+
+@dataclass
 class AgentConfig:
     model: str = "claude-opus-4-8"
     cron_model: str = "claude-sonnet-4-6"
@@ -128,6 +160,7 @@ class AgentConfig:
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
     cli_idle_timeout_seconds: int = 900
+    prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
@@ -146,6 +179,7 @@ class AgentConfig:
                 d.get("context_1m_excluded_models", []) or []
             ),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
+            prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 
     def context_1m_enabled_for(self, model: str | None) -> bool:
@@ -166,14 +200,30 @@ class TelegramConfig:
     bot_token: str = ""
     allowed_users: list[int] = field(default_factory=list)
     stream_mode: str = "partial"
+    # DM authorization policy:
+    #   "pairing" (default) — unknown users may pair with a one-time code
+    #                         (`nerve pair`); everyone else is rejected.
+    #   "open"              — anyone can talk to the bot. Dangerous: full
+    #                         agent access for any Telegram user. A warning
+    #                         is logged at startup.
+    dm_policy: str = "pairing"
 
     @classmethod
     def from_dict(cls, d: dict) -> TelegramConfig:
+        dm_policy = d.get("dm_policy", "pairing")
+        if dm_policy not in ("pairing", "open"):
+            logger.warning(
+                "telegram.dm_policy %r is not one of ('pairing', 'open') — "
+                "falling back to 'pairing'",
+                dm_policy,
+            )
+            dm_policy = "pairing"
         return cls(
             enabled=d.get("enabled", True),
             bot_token=d.get("bot_token", ""),
-            allowed_users=d.get("allowed_users", []),
+            allowed_users=[int(u) for u in d.get("allowed_users", []) or []],
             stream_mode=d.get("stream_mode", "partial"),
+            dm_policy=dm_policy,
         )
 
 
@@ -460,6 +510,40 @@ class CronConfig:
 
 
 @dataclass
+class BackupConfig:
+    """Scheduled backup of Nerve state to a local directory.
+
+    Opt-in: set ``target_dir`` to an external mount or a synced directory
+    (the off-box copy is what protects against a disk failure) and flip
+    ``enabled`` on. A bundle is a single ``nerve-backup-<host>-<ts>.tar.zst``
+    file produced by :mod:`nerve.backup`. The scheduled task notifies on
+    failure (silent backups that fail are worse than none).
+    """
+
+    enabled: bool = False            # opt-in; set target_dir first
+    target_dir: str = ""             # e.g. /mnt/backup/nerve or a synced dir
+    interval_hours: int = 24
+    retention_count: int = 7
+    include_workspace: bool = True
+    workspace_excludes: list[str] = field(default_factory=list)  # extra globs
+    notify_on_failure: bool = True   # high-priority notify
+    notify_on_success: bool = False  # low-priority digest line
+
+    @classmethod
+    def from_dict(cls, d: dict) -> BackupConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            target_dir=d.get("target_dir", ""),
+            interval_hours=int(d.get("interval_hours", 24)),
+            retention_count=int(d.get("retention_count", 7)),
+            include_workspace=bool(d.get("include_workspace", True)),
+            workspace_excludes=list(d.get("workspace_excludes", []) or []),
+            notify_on_failure=bool(d.get("notify_on_failure", True)),
+            notify_on_success=bool(d.get("notify_on_success", False)),
+        )
+
+
+@dataclass
 class SessionsConfig:
     archive_after_days: int = 30
     max_sessions: int = 500
@@ -477,6 +561,38 @@ class SessionsConfig:
             memorize_interval_minutes=d.get("memorize_interval_minutes", 30),
             sticky_period_minutes=d.get("sticky_period_minutes", 120),
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
+        )
+
+
+@dataclass
+class RetentionConfig:
+    """Opt-in nerve.db retention: message compaction + telemetry pruning.
+
+    Disabled by default so an upstream merge mutates no existing user's data;
+    the operator opts in locally. When enabled, a background pass every
+    ``interval_hours`` drops the verbose ``blocks``/``thinking`` JSON of old,
+    already-memorized, non-starred, non-active messages (keeping ``content``),
+    prunes append-only telemetry + file snapshots older than
+    ``retention_days``, and checkpoints the WAL. The file is only shrunk by the
+    explicit ``nerve db vacuum`` command (VACUUM takes a write lock).
+
+    ``retention_full_days`` is the message-compaction window (default 30);
+    ``retention_days`` is the telemetry/snapshot window (default 90). Both
+    ints are clamped ``>= 1``.
+    """
+
+    enabled: bool = False
+    retention_days: int = 90
+    retention_full_days: int = 30
+    interval_hours: int = 24
+
+    @classmethod
+    def from_dict(cls, d: dict) -> RetentionConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            retention_days=max(1, int(d.get("retention_days", 90))),
+            retention_full_days=max(1, int(d.get("retention_full_days", 30))),
+            interval_hours=max(1, int(d.get("interval_hours", 24))),
         )
 
 
@@ -854,6 +970,41 @@ class LangfuseConfig:
 
 
 @dataclass
+class XmemoryConfig:
+    """xmemory.ai structured memory — optional, runs alongside memU.
+
+    Activated only when both ``api_key`` (the bearer token) and
+    ``instance_id`` are set. When active, the ``memorize`` tool dual-writes
+    to xmemory (async) and ``memory_recall`` appends xmemory's synthesized
+    answer to the memU results. The memorization sweep stays memU-only.
+
+    Empty keys = no-op, zero overhead, no SDK calls. The instance and its
+    schema are created out of band (by the operator) on xmemory's side.
+    """
+
+    api_key: str = ""
+    instance_id: str = ""
+    api_url: str = "https://api.xmemory.ai"
+    extraction_logic: str = "deep"  # "deep" (default) or "fast"
+    timeout: float = 60.0
+
+    @property
+    def enabled(self) -> bool:
+        """True only when both the token and an instance are configured."""
+        return bool(self.api_key and self.instance_id)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "XmemoryConfig":
+        return cls(
+            api_key=d.get("api_key", ""),
+            instance_id=d.get("instance_id", ""),
+            api_url=d.get("api_url", "https://api.xmemory.ai"),
+            extraction_logic=d.get("extraction_logic", "deep"),
+            timeout=float(d.get("timeout", 60.0)),
+        )
+
+
+@dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
     timezone: str = "America/New_York"
@@ -867,7 +1018,9 @@ class NerveConfig:
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
@@ -875,6 +1028,7 @@ class NerveConfig:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+    xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
@@ -883,6 +1037,11 @@ class NerveConfig:
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     brave_search_api_key: str = ""
+
+    # Where this config was loaded from (set by load_config, not a YAML key).
+    # Used by anything that needs to write back (e.g. Telegram pairing
+    # persisting allowed_users to config.local.yaml).
+    config_dir: Path = field(default_factory=Path.cwd)
 
     @property
     def anthropic_api_base_url(self) -> str:
@@ -976,7 +1135,9 @@ class NerveConfig:
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {})),
+            backup=BackupConfig.from_dict(d.get("backup", {})),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
+            retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),
             channels=ChannelsConfig.from_dict(d.get("channels", {})),
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
@@ -984,6 +1145,7 @@ class NerveConfig:
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
+            xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
@@ -1022,13 +1184,93 @@ def load_mcp_servers(config_dir: Path | None = None) -> list[McpServerConfig]:
     return _parse_mcp_servers(merged)
 
 
+# --- Config directory resolution ---
+#
+# Nerve commands used to be CWD-sensitive: running `nerve start` from any
+# directory other than the install dir silently loaded an empty config and
+# reported "fresh install".  Resolution now follows a waterfall so commands
+# work from anywhere:
+#
+#   1. Explicit --config-dir / -c flag
+#   2. NERVE_CONFIG_DIR environment variable
+#   3. Current directory, if it contains config.yaml or config.local.yaml
+#      (preserves the dev workflow of running nerve from a checkout)
+#   4. The pointer file ~/.nerve/config_dir (written by `nerve init` and on
+#      daemon start), if it names a directory that still has config files
+#   5. Current directory (fresh-install fallback)
+
+CONFIG_POINTER_FILE = Path("~/.nerve/config_dir")
+
+
+def _has_config_files(directory: Path) -> bool:
+    """True if the directory contains config.yaml or config.local.yaml."""
+    try:
+        return (directory / "config.yaml").exists() or (
+            directory / "config.local.yaml"
+        ).exists()
+    except OSError:
+        return False
+
+
+def read_config_pointer() -> Path | None:
+    """Read the persisted config directory pointer. None if absent/invalid."""
+    try:
+        raw = CONFIG_POINTER_FILE.expanduser().read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_dir() else None
+
+
+def write_config_pointer(config_dir: Path) -> None:
+    """Persist the config directory so future commands find it from any CWD.
+
+    Written by `nerve init` (after a successful apply) and on daemon start.
+    Best-effort: failure to write must never break the caller.
+    """
+    try:
+        pointer = CONFIG_POINTER_FILE.expanduser()
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not write config pointer %s: %s", CONFIG_POINTER_FILE, e)
+
+
+def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:
+    """Resolve the effective config directory.
+
+    Returns (directory, source) where source is one of:
+    "flag", "env", "cwd", "pointer", "default".
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser(), "flag"
+
+    env_dir = os.environ.get("NERVE_CONFIG_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser(), "env"
+
+    cwd = Path.cwd()
+    if _has_config_files(cwd):
+        return cwd, "cwd"
+
+    pointer = read_config_pointer()
+    if pointer is not None and _has_config_files(pointer):
+        return pointer, "pointer"
+
+    return cwd, "default"
+
+
 def load_config(config_dir: Path | None = None) -> NerveConfig:
     """Load config from config.yaml + config.local.yaml in the given directory.
 
-    If config_dir is None, uses the current working directory.
+    If config_dir is None, the directory is resolved via the waterfall in
+    :func:`resolve_config_dir` (flag/env/cwd/pointer), so commands behave the
+    same regardless of the caller's working directory.
     """
     if config_dir is None:
-        config_dir = Path.cwd()
+        config_dir, _source = resolve_config_dir()
 
     base_path = config_dir / "config.yaml"
     local_path = config_dir / "config.local.yaml"
@@ -1044,7 +1286,118 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
             local = yaml.safe_load(f) or {}
 
     merged = _deep_merge(base, local)
-    return NerveConfig.from_dict(merged)
+
+    # Surface typos and stale keys instead of silently ignoring them.
+    for warning in validate_config_keys(merged):
+        logger.warning("config: %s", warning)
+
+    config = NerveConfig.from_dict(merged)
+    config.config_dir = Path(config_dir)
+    return config
+
+
+# --- Unknown-key validation ---
+
+# YAML keys that are intentionally not dataclass fields — keyed by dotted
+# prefix ("" is the top level). claude_oauth_token / github_token are read
+# from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+_EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
+    "": {"claude_oauth_token", "github_token"},
+}
+
+# Subtrees we don't descend into: free-form mappings or lists of mappings
+# whose schema isn't a nested dataclass.
+_OPAQUE_PREFIXES = {
+    "mcp_servers",
+    "memory.categories",
+    "external_agents.targets",
+    "docker.extra_mounts",
+    "langfuse.redact_patterns",
+}
+
+
+def validate_config_keys(merged: dict) -> list[str]:
+    """Compare a merged config dict against the NerveConfig dataclass tree.
+
+    Returns human-readable warnings for keys that no dataclass field will
+    ever read (typos, removed options). Warning-only by design — unknown
+    keys must not break startup (forward/backward compatibility).
+    """
+    import dataclasses
+
+    warnings: list[str] = []
+
+    def _walk(d: dict, cls: type, prefix: str) -> None:
+        field_map = {f.name: f for f in dataclasses.fields(cls)}
+        allowed_extra = _EXTRA_ALLOWED_KEYS.get(prefix, set())
+        for key, value in d.items():
+            dotted = f"{prefix}.{key}" if prefix else key
+            if key not in field_map:
+                if key in allowed_extra:
+                    continue
+                warnings.append(
+                    f"unknown key '{dotted}' — it is ignored (typo or removed option?)"
+                )
+                continue
+            if dotted in _OPAQUE_PREFIXES:
+                continue
+            # Descend into nested dataclasses only
+            ftype = field_map[key].type
+            nested = _resolve_dataclass(ftype)
+            if nested is not None and isinstance(value, dict):
+                _walk(value, nested, dotted)
+
+    def _resolve_dataclass(ftype: Any) -> type | None:
+        """Map a (possibly string) field annotation to a dataclass type."""
+        if isinstance(ftype, type) and dataclasses.is_dataclass(ftype):
+            return ftype
+        if isinstance(ftype, str):
+            candidate = globals().get(ftype)
+            if candidate is None and ftype == "HouseOfAgentsConfig":
+                candidate = HouseOfAgentsConfig
+            if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
+                return candidate
+        return None
+
+    _walk(merged, NerveConfig, "")
+    return warnings
+
+
+# --- Write-back helpers ---
+
+
+def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
+    """Append a Telegram user ID to telegram.allowed_users in config.local.yaml.
+
+    Used by the pairing flow. Reads, merges, and rewrites the local config
+    (config.local.yaml is generated — comment loss is acceptable there).
+    Returns True if the file was updated (False if the ID was already present).
+    """
+    local_path = Path(config_dir) / "config.local.yaml"
+    data: dict[str, Any] = {}
+    if local_path.exists():
+        try:
+            data = yaml.safe_load(local_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as e:
+            logger.error("Cannot parse %s to persist pairing: %s", local_path, e)
+            return False
+
+    telegram = data.setdefault("telegram", {})
+    users = telegram.setdefault("allowed_users", [])
+    if user_id in users:
+        return False
+    users.append(user_id)
+
+    with open(local_path, "w", encoding="utf-8") as f:
+        f.write("# Nerve — Secrets (gitignored)\n")
+        f.write("# API keys, tokens, and other sensitive configuration.\n\n")
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    try:
+        os.chmod(local_path, 0o600)
+    except OSError:
+        pass
+    logger.info("Persisted Telegram user %d to %s", user_id, local_path)
+    return True
 
 
 # Singleton config instance, loaded lazily

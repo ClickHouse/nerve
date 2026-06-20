@@ -95,6 +95,31 @@ via a hardcoded `MODEL_PRICING` dict and the SDK's
 they're independent calculations. Treat Langfuse as a second source of
 truth for catching local cost-tracking bugs.
 
+### Prompt-cache pricing (usage rewriter)
+
+The LangSmith `claude-agent-sdk` integration reports usage in
+LangSmith's canonical format: `input_tokens` *includes* prompt-cache
+reads and writes, with the breakdown only in `input_token_details`.
+Langfuse's OTEL ingestion doesn't read that detail field, so without
+correction it prices every cached token at the full uncached input rate
+— a ~5-10x cost overcount on agent sessions, which are typically >95%
+cache reads billed at 10% of the input price.
+
+Nerve fixes this at export time: `init_langfuse` wraps the Langfuse
+OTLP exporter with `nerve/observability/usage_rewrite.py`, which
+rewrites each agent span's `gen_ai.usage.*` attributes from the
+accurate `langsmith.metadata.usage_metadata` payload into the same
+shape `opentelemetry-instrumentation-anthropic` emits (uncached input +
+explicit cache-read / cache-creation counts). Langfuse then applies its
+managed per-model cache prices.
+
+The diagnostics status block reports this as `usage_rewriter: true`.
+If it's `false` while `enabled` is `true`, the SDK layout probably
+changed underneath the installer — agent costs in Langfuse will be
+inflated until it's fixed. Known approximation: 1-hour cache writes are
+priced at the 5-minute rate (Langfuse's OTEL mapping has no separate 1h
+key).
+
 ## Troubleshooting
 
 - **Spans aren't appearing.** Check `/api/observability/status` —

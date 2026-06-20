@@ -373,8 +373,20 @@ Response: {
 }
 ```
 
-#### `GET /api/cron/logs?job_id=&limit=50`
-Get cron job execution logs.
+#### `GET /api/cron/logs?job_id=&limit=50&offset=0`
+Get cron job execution logs, newest first. `limit` is clamped to 1–200;
+combine with `offset` for pagination. Each log row carries the
+`session_id` of the chat session the run executed in (null for source
+runners).
+
+```json
+Response: {
+  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", ... } ],
+  "total": 234,
+  "limit": 50,
+  "offset": 0
+}
+```
 
 ### Health
 

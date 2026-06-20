@@ -22,12 +22,18 @@ async def get_db() -> Database:
     return _db
 
 
-async def init_db(db_path: Path | None = None) -> Database:
-    """Initialize the global database."""
+async def init_db(db_path: Path | None = None, workspace: Path | None = None) -> Database:
+    """Initialize the global database.
+
+    Args:
+        db_path: Path to the SQLite file. Defaults to ``~/.nerve/nerve.db``.
+        workspace: Workspace root for resolving task file paths during FTS
+            reseed. When omitted, the DB falls back to the DB's parent dir.
+    """
     global _db
     if db_path is None:
         db_path = Path("~/.nerve/nerve.db").expanduser()
-    _db = Database(db_path)
+    _db = Database(db_path, workspace=workspace)
     await _db.connect()
     return _db
 

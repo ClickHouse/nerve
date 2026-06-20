@@ -1,10 +1,13 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import { ArrowLeft, FilePlus, FileEdit, FileX, Loader2, RefreshCw } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
 import { api } from '../../api/client';
-import { DiffView } from './DiffView';
 import { SelectionToolbar } from './SelectionToolbar';
 import type { FileDiff, ModifiedFileSummary } from '../../types/chat';
+
+// The diff renderer pulls in @pierre/diffs + Shiki — only loaded when a file
+// diff is actually opened, keeping it off the initial bundle.
+const DiffView = lazy(() => import('./DiffView').then((m) => ({ default: m.DiffView })));
 
 // ------------------------------------------------------------------ //
 //  File list view                                                      //
@@ -132,7 +135,17 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
         {error && (
           <div className="px-4 py-4 text-[13px] text-hue-red">Failed to load diff: {error}</div>
         )}
-        {diff && !loading && <DiffView diff={diff} />}
+        {diff && !loading && (
+          <Suspense
+            fallback={
+              <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint">
+                <Loader2 size={14} className="animate-spin" /> Loading diff…
+              </div>
+            }
+          >
+            <DiffView diff={diff} />
+          </Suspense>
+        )}
       </div>
     </div>
   );

@@ -19,12 +19,15 @@ export type WSMessage =
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
-  | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string }
+  | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string; silenced?: boolean; silence_reason?: string; silence_pattern?: string; silenced_by?: string }
   | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean }
   | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
   | { type: 'session_running'; session_id: string; is_running: boolean }
-  | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'timeout' }[] }
+  | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
+  | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'hoa_progress'; session_id: string; event: Record<string, unknown> }
+  | { type: 'wakeup'; session_id: string }
+  | { type: 'auto_turn'; session_id: string }
   | { type: 'pong' };
 
 type MessageHandler = (msg: WSMessage) => void;

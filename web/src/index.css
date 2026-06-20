@@ -341,6 +341,29 @@ body {
   animation: quote-slide-in 0.15s ease-out;
 }
 
+/* Prompt rewrite preview card */
+@keyframes rewrite-card-enter {
+  from { opacity: 0; transform: translateY(8px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.rewrite-card {
+  animation: rewrite-card-enter 0.18s ease-out;
+}
+@keyframes rewrite-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.rewrite-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--theme-surface-raised) 25%,
+    var(--theme-surface-hover) 50%,
+    var(--theme-surface-raised) 75%
+  );
+  background-size: 200% 100%;
+  animation: rewrite-shimmer 1.4s ease-in-out infinite;
+}
+
 /* Plan panel slide-in */
 @keyframes plan-panel-enter {
   from { opacity: 0; transform: translateX(20px); }

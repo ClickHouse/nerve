@@ -226,6 +226,27 @@ export function handleSessionRunning(
   });
 }
 
+export function handleSessionAwaitingInput(
+  msg: Extract<WSMessage, { type: 'session_awaiting_input' }>,
+  _get: Get,
+  set: Set,
+): void {
+  // Global broadcast: a session entered or left the "waiting for input" state
+  // (paused on AskUserQuestion / plan mode). Drives the sidebar blue dot.
+  set(s => ({
+    sessions: s.sessions.map(sess =>
+      sess.id === msg.session_id
+        ? { ...sess, awaiting_input: msg.awaiting }
+        : sess,
+    ),
+    searchResults: s.searchResults?.map(sess =>
+      sess.id === msg.session_id
+        ? { ...sess, awaiting_input: msg.awaiting }
+        : sess,
+    ) ?? null,
+  }));
+}
+
 export function handleAnswerInjected(
   msg: Extract<WSMessage, { type: 'answer_injected' }>,
   get: Get,

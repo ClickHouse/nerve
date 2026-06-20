@@ -65,6 +65,23 @@ get_python_version() {
 
 trap 'error "Installation failed at line $LINENO. See above for details."' ERR
 
+# A clean message on Ctrl+C / SIGTERM beats silent death: tell the user
+# what state they're in and how to continue.
+on_interrupt() {
+    trap - INT TERM ERR
+    printf "\n"
+    warn "Interrupted."
+    if [ "${INSTALL_DONE:-0}" = "1" ]; then
+        info "Installation itself is complete — finish setup anytime with: nerve init"
+        info "(setup answers are saved; it resumes where you left off)"
+    else
+        info "Re-run the installer to continue — completed steps are skipped."
+    fi
+    exit 130
+}
+trap on_interrupt INT TERM
+INSTALL_DONE=0
+
 # --- OS Detection ---
 
 detect_os() {
@@ -450,20 +467,66 @@ setup_path() {
 
 # --- Run nerve init ---
 
-run_init() {
-    step "Running Nerve setup"
+INIT_COMPLETED=0
+INIT_SKIPPED=0
 
+run_init() {
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
     local config_local="$INSTALL_DIR/config.local.yaml"
 
     if [ "$IS_UPGRADE" = "1" ] && [ -f "$config_local" ]; then
         info "Existing configuration found — skipping setup wizard"
         info "Run 'nerve init' to reconfigure"
+        INIT_COMPLETED=1
         return
     fi
 
+    # Clear boundary between installation and configuration: everything is
+    # installed at this point — the wizard is optional and resumable.
+    printf "\n"
+    printf "${BOLD}${GREEN}  Installation complete.${NC}\n"
+    printf "\n"
+    printf "  Next: an interactive setup wizard configures your API keys,\n"
+    printf "  workspace, and channels. It takes a few minutes; Ctrl+C is\n"
+    printf "  safe — answers are saved and ${BOLD}nerve init${NC} resumes later.\n"
+    printf "\n"
+
+    if ! confirm "Run the setup wizard now?"; then
+        info "Skipping setup. Run it later with: nerve init"
+        INIT_SKIPPED=1
+        return
+    fi
+
+    step "Running Nerve setup"
     cd "$INSTALL_DIR" || exit 1
-    "$nerve_bin" init
+    # Don't let a wizard abort look like a failed installation (set -e).
+    if "$nerve_bin" init; then
+        INIT_COMPLETED=1
+    else
+        printf "\n"
+        warn "Setup did not finish. Installation itself is complete."
+        info "Resume setup anytime with: nerve init"
+        INIT_SKIPPED=1
+    fi
+}
+
+# --- Offer to start the daemon ---
+
+offer_start() {
+    # Only when freshly configured and interactive
+    if [ "$INIT_COMPLETED" != "1" ] || [ "$IS_UPGRADE" = "1" ]; then
+        return
+    fi
+    printf "\n"
+    if ! confirm "Start Nerve now?"; then
+        return
+    fi
+    local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
+    if "$nerve_bin" start; then
+        NERVE_STARTED=1
+    else
+        warn "Start failed — check logs with: nerve logs"
+    fi
 }
 
 # --- Summary ---
@@ -478,6 +541,14 @@ print_summary() {
     if [ "$IS_UPGRADE" = "1" ]; then
         printf "  ${BOLD}Upgrade complete.${NC} Restart to apply changes:\n"
         printf "    ${CYAN}nerve restart${NC}\n"
+    elif [ "${NERVE_STARTED:-0}" = "1" ]; then
+        printf "  ${BOLD}Nerve is running.${NC}\n"
+        printf "    ${CYAN}http://localhost:8900${NC}     Open the web UI\n"
+        printf "    ${CYAN}nerve logs${NC}            Follow daemon logs\n"
+    elif [ "$INIT_SKIPPED" = "1" ]; then
+        printf "  ${BOLD}Finish setup, then start:${NC}\n"
+        printf "    ${CYAN}nerve init${NC}            Resume the setup wizard\n"
+        printf "    ${CYAN}nerve start${NC}           Start as daemon\n"
     else
         printf "  ${BOLD}Get started:${NC}\n"
         printf "    ${CYAN}nerve start${NC}           Start as daemon\n"
@@ -502,6 +573,7 @@ print_summary() {
         warn "nerve is not yet on PATH in this shell session"
         printf "  Run: ${BOLD}source ~/.bashrc${NC}  (or restart your terminal)\n\n"
     fi
+    printf "  ${DIM}Installer finished — you can close this terminal.${NC}\n\n"
 }
 
 # --- Usage ---
@@ -564,8 +636,11 @@ main() {
     setup_python_env
     build_web_ui
     setup_path
+    INSTALL_DONE=1
     run_init
+    offer_start
     print_summary
+    exit 0
 }
 
 main "$@"

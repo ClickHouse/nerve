@@ -8,7 +8,6 @@ trigger any actual sync work (that's the cron-driven source runners).
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import datetime, timezone
 
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
@@ -97,16 +96,11 @@ async def sync_status_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text("Database not available.")
 
     if source == "all":
-        # Collate known sources from sync_cursors + source_run_log.
+        # Collate known sources from sync_cursors + source_run_log
+        # (async DB layer — never raw sqlite3 on the event loop).
         known: set[str] = set()
         try:
-            db_path = str(ctx.db.db_path)
-            conn = sqlite3.connect(db_path)
-            for row in conn.execute("SELECT DISTINCT source FROM sync_cursors"):
-                known.add(row[0])
-            for row in conn.execute("SELECT DISTINCT source FROM source_run_log"):
-                known.add(row[0])
-            conn.close()
+            known = set(await ctx.db.get_known_source_names())
         except Exception:
             pass
         # Always include the base types

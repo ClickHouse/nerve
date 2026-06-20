@@ -1,6 +1,7 @@
 """Tests for nerve.agent.engine — pure helpers (no SDK state)."""
 
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +14,10 @@ from nerve.agent.engine import AgentEngine
 @pytest.mark.parametrize(
     "value, model, expected",
     [
+        # Fable 5 (Mythos-class) supports the full effort ladder
+        ("max",    "claude-fable-5",            "max"),
+        ("xhigh",  "claude-fable-5",            "xhigh"),
+        ("low",    "claude-fable-5",            "low"),
         # Opus 4.8 supports every level (same ladder as 4.7)
         ("max",    "claude-opus-4-8",           "max"),
         ("xhigh",  "claude-opus-4-8",           "xhigh"),
@@ -188,7 +193,11 @@ class TestSdkResumeFileExists:
             captured["path"] = path
             return True
 
-        with patch("nerve.agent.engine.os.path.isfile", side_effect=_capture):
+        # Pin realpath to identity so this test exercises only the
+        # slash-encoding, independent of any host symlinks.  Symlink
+        # resolution itself is covered by the symlinked-workspace tests.
+        with patch("nerve.agent.engine.os.path.realpath", side_effect=lambda p: p), \
+             patch("nerve.agent.engine.os.path.isfile", side_effect=_capture):
             engine._sdk_resume_file_exists("sid-abc")
 
         assert "-root-nerve-workspace" in captured["path"]
@@ -207,3 +216,67 @@ class TestSdkResumeFileExists:
             engine._sdk_resume_file_exists("myid")
 
         assert captured["path"].endswith("myid.jsonl")
+
+    def test_symlinked_workspace_checks_realpath(self, tmp_path, monkeypatch):
+        """A symlinked workspace finds its history under the *resolved*
+        (realpath) directory, matching where the CLI actually writes it.
+
+        Regression test for resume-history loss on the Docker deployment,
+        where config.workspace (/root/nerve-workspace) is a symlink and
+        the guard previously checked the unresolved-path-encoded dir,
+        which never exists, then wiped the stored sdk_session_id.
+        """
+        real_ws = tmp_path / "real-workspace"
+        real_ws.mkdir()
+        link_ws = tmp_path / "linked-workspace"
+        link_ws.symlink_to(real_ws)
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        sid = "11111111-2222-3333-4444-555555555555"
+        encoded = os.path.realpath(str(link_ws)).replace("/", "-")
+        proj_dir = fake_home / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        (proj_dir / f"{sid}.jsonl").write_text("{}")
+
+        engine = _make_engine(str(link_ws))
+        assert engine._sdk_resume_file_exists(sid) is True
+
+    def test_symlinked_workspace_missing_returns_false(self, tmp_path, monkeypatch):
+        """Symlinked workspace, but the .jsonl genuinely does not exist:
+        the guard returns False so the caller starts a fresh conversation."""
+        real_ws = tmp_path / "real-workspace"
+        real_ws.mkdir()
+        link_ws = tmp_path / "linked-workspace"
+        link_ws.symlink_to(real_ws)
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        encoded = os.path.realpath(str(link_ws)).replace("/", "-")
+        (fake_home / ".claude" / "projects" / encoded).mkdir(parents=True)
+
+        engine = _make_engine(str(link_ws))
+        assert engine._sdk_resume_file_exists("does-not-exist") is False
+
+    def test_falls_back_to_unresolved_path(self, tmp_path, monkeypatch):
+        """If history lives under the unresolved (symlink) encoding, the
+        fallback still finds it (non-symlinked layouts, or a future CLI
+        that stops resolving the cwd)."""
+        real_ws = tmp_path / "real-workspace"
+        real_ws.mkdir()
+        link_ws = tmp_path / "linked-workspace"
+        link_ws.symlink_to(real_ws)
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        sid = "abcd"
+        encoded_unresolved = str(link_ws).replace("/", "-")
+        proj_dir = fake_home / ".claude" / "projects" / encoded_unresolved
+        proj_dir.mkdir(parents=True)
+        (proj_dir / f"{sid}.jsonl").write_text("{}")
+
+        engine = _make_engine(str(link_ws))
+        assert engine._sdk_resume_file_exists(sid) is True

@@ -45,7 +45,32 @@ jobs:
     prompt: "Check for overdue tasks..."
     target: telegram
     enabled: true
+
+  - id: repo-watch-nerve
+    schedule: "1h"
+    prompt_file: prompts/repo-watch.md   # Relative to this YAML's directory
+    enabled: true
+
+  - id: repo-watch-other
+    schedule: "1h"
+    prompt_file: prompts/repo-watch.md   # Same prompt, shared between jobs
+    enabled: true
 ```
+
+### Prompt Files
+
+Instead of an inline `prompt`, a job can point at a file with `prompt_file`.
+This keeps long prompts out of the YAML and lets multiple jobs share one
+prompt definition.
+
+- Relative paths resolve against the directory of the YAML file the job was
+  loaded from (e.g. `prompts/repo-watch.md` next to `jobs.yaml` →
+  `~/.nerve/cron/prompts/repo-watch.md`). Absolute paths and `~` work too.
+- The file is read fresh on **every run** — edits take effect on the next
+  trigger without a restart.
+- If both `prompt` and `prompt_file` are set, the file wins; the inline
+  prompt is used as a fallback when the file can't be read.
+- A job must define at least one of `prompt` / `prompt_file`.
 
 ## Job Fields
 
@@ -53,7 +78,8 @@ jobs:
 |-------|------|----------|-------------|
 | `id` | string | yes | Unique job identifier |
 | `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`) |
-| `prompt` | string | yes | Message sent to the agent |
+| `prompt` | string | yes* | Message sent to the agent |
+| `prompt_file` | string | yes* | Path to a file containing the prompt (relative to the YAML's directory). Read fresh each run; shareable between jobs. *One of `prompt`/`prompt_file` is required |
 | `description` | string | no | Human-readable description |
 | `model` | string | no | Override model (default: `agent.cron_model`) |
 | `target` | string | no | Delivery channel (default: `telegram`) |
@@ -62,6 +88,93 @@ jobs:
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once on startup if the job missed a run while the server was down (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
+| `lock` | bool | no | Prevent concurrent runs of this job — the next fire waits for the previous one (default: false) |
+| `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
+
+## Run Gates
+
+A **run gate** is a precondition evaluated right before a job fires. It answers
+one question: *should this cron run right now?* Gates let a job stay idle until
+there is actually something to do — no agent session is spawned (and nothing is
+logged beyond a skip line) when a gate is unsatisfied.
+
+Declare gates with the `run_if` key — a list of gate specs. **All gates must be
+satisfied (logical AND)** for the job to run:
+
+```yaml
+jobs:
+  - id: task-planner
+    schedule: "0 */4 * * *"
+    prompt: "Review open tasks and propose plans..."
+    run_if:
+      - type: tasks            # only when there's something to plan
+        status: pending
+```
+
+When multiple gates are listed, the job runs only if every one passes:
+
+```yaml
+  - id: triage
+    schedule: "30m"
+    prompt: "Triage incoming work..."
+    run_if:
+      - type: tasks            # there is an open task AND
+        status: pending
+      - type: messages         # a source has unread mail
+        sources: [gmail, github]
+```
+
+Gates are **fail-open**: if a gate errors while checking (e.g. a transient DB
+issue), the run proceeds rather than being skipped — an occasional wasted run
+beats a cron that silently never fires.
+
+### Gate types
+
+#### `tasks`
+
+Satisfied when enough tasks match a status/tag filter. The canonical use is
+"only run the planner when there is something to plan."
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `status` | string \| list \| `"all"` | omitted = any **open** (non-done) task | Status name(s) to count. A list counts across all of them; `"all"` counts every task regardless of status |
+| `tag` | string | — | Optional tag filter |
+| `min_count` | int | 1 | Minimum number of matching tasks required to run |
+
+```yaml
+run_if:
+  - type: tasks
+    status: [pending, in_progress]   # any of these statuses
+    tag: backend                     # ...tagged "backend"
+    min_count: 3                     # ...and at least 3 of them
+```
+
+#### `messages`
+
+Satisfied when monitored sync sources have unread messages (compares each
+source's max ingested rowid against the consumer cursor; never advances it).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sources` | list | — (required) | Source names to check (e.g. `gmail`, `github`) |
+| `consumer` | string | `inbox` | Consumer cursor name used for the unread check |
+
+```yaml
+run_if:
+  - type: messages
+    sources: [gmail, github]
+    consumer: inbox
+```
+
+> **Legacy shorthand.** The older `skip_when_idle: [<sources>]` /
+> `idle_consumer: <name>` fields still work — they are translated into an
+> equivalent `messages` gate at load time. Prefer `run_if` for new jobs.
+
+### Adding a new gate type
+
+Gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`, set its
+`type`, implement `is_satisfied`, `describe`, and `from_config`, then register
+the class in `GATE_REGISTRY`. It becomes usable from `run_if` immediately.
 
 ## Session Modes
 
@@ -123,7 +236,7 @@ These ship in `~/.nerve/cron/system.yaml` and are managed by `nerve init`. Runni
 |-----|----------|-------------|-------------|:--------:|:------:|
 | `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
-| `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. | ✅ default | ✅ default |
+| `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | ✅ default |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
 

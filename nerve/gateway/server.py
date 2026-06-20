@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize database
     db_path = Path("~/.nerve/nerve.db").expanduser()
-    db = await init_db(db_path)
+    db = await init_db(db_path, workspace=config.workspace)
     logger.info("Database initialized at %s", db_path)
 
     # Optional Langfuse observability — must be set up BEFORE the engine
@@ -262,6 +262,103 @@ async def lifespan(app: FastAPI):
 
     notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
 
+    # Periodic DB retention (opt-in). Compacts old memorized messages'
+    # blocks/thinking JSON and prunes append-only telemetry + file snapshots,
+    # then checkpoints the WAL. No-ops unless retention.enabled is set. The
+    # file shrink (VACUUM) is an explicit operator step (`nerve db vacuum`),
+    # never on this loop.
+    async def _periodic_db_retention():
+        if not config.retention.enabled:
+            return
+        interval = config.retention.interval_hours * 3600
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                report = await db.run_retention(
+                    retention_days=config.retention.retention_days,
+                    retention_full_days=config.retention.retention_full_days,
+                )
+                if (
+                    report.get("messages_compacted")
+                    or report.get("telemetry_deleted")
+                    or report.get("snapshots_deleted")
+                ):
+                    logger.info("DB retention: %s", report)
+            except Exception as e:
+                logger.error("DB retention failed: %s", e)
+
+    db_retention_task = asyncio.create_task(_periodic_db_retention())
+
+    # Periodic backup (opt-in). Hourly tick; runs a bundle when the newest
+    # one in the target dir is older than interval_hours (or none exists).
+    # The heavy work (consistent DB snapshots + tar) runs in a thread so it
+    # never blocks the event loop. Failures notify high-priority — a backup
+    # that fails silently is worse than no backup at all.
+    async def _periodic_backup():
+        from nerve import backup as backup_mod
+
+        bcfg = config.backup
+        nerve_dir = Path("~/.nerve").expanduser()
+        interval_s = max(1, bcfg.interval_hours) * 3600
+        target = Path(bcfg.target_dir).expanduser() if bcfg.target_dir else None
+        while True:
+            await asyncio.sleep(3600)  # hourly tick
+            if not bcfg.enabled or target is None:
+                continue
+            try:
+                age = await asyncio.to_thread(
+                    backup_mod.latest_bundle_age_seconds, target,
+                )
+                if age is not None and age < interval_s:
+                    continue  # not due yet
+
+                result = await asyncio.to_thread(
+                    backup_mod.create_backup,
+                    nerve_dir,
+                    config.workspace,
+                    target,
+                    config_dir=config.config_dir,
+                    include_workspace=bcfg.include_workspace,
+                    include_secrets=True,
+                    workspace_excludes=bcfg.workspace_excludes,
+                )
+                deleted = await asyncio.to_thread(
+                    backup_mod.prune, target, bcfg.retention_count,
+                )
+                size_str = (
+                    f"{result.size / (1024 ** 3):.1f} GB"
+                    if result.size >= 1024 ** 3
+                    else f"{result.size / (1024 ** 2):.0f} MB"
+                )
+                logger.info(
+                    "Scheduled backup OK: %s (%s, pruned %d)",
+                    result.path.name, size_str, len(deleted),
+                )
+                if bcfg.notify_on_success:
+                    await notification_service.send_notification(
+                        session_id="system",
+                        title="💾 Backup OK",
+                        body=(
+                            f"{size_str}, {len(backup_mod.list_bundles(target))} "
+                            f"kept ({result.file_count} files)"
+                        ),
+                        priority="low",
+                    )
+            except Exception as e:
+                logger.error("Scheduled backup failed: %s", e, exc_info=True)
+                if bcfg.notify_on_failure:
+                    try:
+                        await notification_service.send_notification(
+                            session_id="system",
+                            title="⚠️ Nerve backup FAILED",
+                            body=f"{e}\n\nTarget: {target}",
+                            priority="high",
+                        )
+                    except Exception as ne:
+                        logger.error("Backup failure notify failed: %s", ne)
+
+    backup_task = asyncio.create_task(_periodic_backup())
+
     # Start the external-agents sync service. It re-renders
     # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace
     # identity files on a timer (config.external_agents.sync_interval_minutes).
@@ -370,7 +467,9 @@ async def lifespan(app: FastAPI):
     if cron_task:
         await cron_task.stop()
 
+    db_retention_task.cancel()
     notify_expiry_task.cancel()
+    backup_task.cancel()
     idle_sweep_task.cancel()
     memorize_task.cancel()
     cleanup_task.cancel()
@@ -650,14 +749,17 @@ async def _load_uploaded_files(
             logger.warning("Uploaded file not found on disk: %s", disk_path)
             continue
 
-        data = disk_path.read_bytes()
+        # Multi-MB reads + base64 of uploads are blocking — off the loop.
+        data = await asyncio.to_thread(disk_path.read_bytes)
         file_type = rec["file_type"]
         media_type = rec["media_type"]
         file_id = rec["id"]
         filename = rec["filename"]
 
         if file_type in ("image", "pdf"):
-            b64 = base64.b64encode(data).decode("utf-8")
+            b64 = await asyncio.to_thread(
+                lambda d=data: base64.b64encode(d).decode("utf-8"),
+            )
             images.append({
                 "type": "base64",
                 "media_type": media_type,

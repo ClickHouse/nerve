@@ -57,6 +57,11 @@ TASK_CREATE_SCHEMA = {
             "description": "Deadline in YYYY-MM-DD format",
             "default": "",
         },
+        "status": {
+            "type": "string",
+            "description": "Initial status. Must be one of the configured task statuses (see task_status_list). Defaults to 'pending' when omitted.",
+            "default": "",
+        },
         "tags": {
             "type": "string",
             "description": "Comma-separated tags (e.g. 'urgent,backend,bug')",
@@ -76,7 +81,7 @@ TASK_LIST_SCHEMA = {
     "properties": {
         "status": {
             "type": "string",
-            "description": "Filter: 'pending', 'in_progress', 'done', 'deferred', 'open' (all non-done), or 'all' (everything). Default (empty) = all non-done.",
+            "description": "Filter by a configured status name (see task_status_list), 'open'/'' for all non-done, or 'all' for everything. Default (empty) = all non-done.",
             "default": "",
         },
         "tag": {
@@ -99,7 +104,7 @@ TASK_UPDATE_SCHEMA = {
         "task_id": {"type": "string", "description": "Task ID"},
         "status": {
             "type": "string",
-            "description": "New status: pending, in_progress, done, deferred",
+            "description": "New status. Must be one of the configured task statuses (see task_status_list). Invalid values are rejected with the list of valid options.",
             "default": "",
         },
         "note": {
@@ -159,15 +164,73 @@ TASK_DONE_SCHEMA = {
     "required": ["task_id"],
 }
 
+TASK_STATUS_LIST_SCHEMA = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+}
+
+TASK_STATUS_CREATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Status identifier — lowercase letters, digits, and underscores (e.g. 'blocked', 'in_review').",
+        },
+        "label": {
+            "type": "string",
+            "description": "Human-readable label shown in the UI (e.g. 'In Review'). Defaults to a title-cased version of name.",
+            "default": "",
+        },
+        "color": {
+            "type": "string",
+            "description": "Hex color like '#3b82f6'. A random color is chosen if omitted.",
+            "default": "",
+        },
+        "description": {
+            "type": "string",
+            "description": "Optional explanation of what this status means.",
+            "default": "",
+        },
+    },
+    "required": ["name"],
+}
+
 # ----- Memory tools -----
 
 MEMORY_RECALL_SCHEMA = {
     "type": "object",
     "properties": {
         "query": {"type": "string", "description": "What to search for in memory"},
-        "limit": {"type": "number", "description": "Max results", "default": 10},
+        "limit": {"type": "number", "description": "Max memory items to return", "default": 10},
+        "category_limit": {
+            "type": "number",
+            "description": "Max related-topic breadcrumbs (categories) to return",
+            "default": 5,
+        },
     },
     "required": ["query"],
+}
+
+MEMORY_EXPAND_CATEGORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category_id": {
+            "type": "string",
+            "description": "Category id from a recall breadcrumb. The 'cat:' prefix is accepted and stripped.",
+        },
+        "query": {
+            "type": "string",
+            "description": "Optional keyword to filter the category's items by their text.",
+            "default": "",
+        },
+        "limit": {
+            "type": "number",
+            "description": "Max items to return (most recent first). Default 20.",
+            "default": 20,
+        },
+    },
+    "required": ["category_id"],
 }
 
 SESSION_CONTEXT_SCHEMA = {
@@ -585,6 +648,16 @@ NOTIFY_SCHEMA = {
             "description": "Priority level: 'low', 'normal', 'high', 'urgent'. Default: 'normal'",
             "default": "normal",
         },
+        "force": {
+            "type": "boolean",
+            "description": (
+                "Re-send a notification that was previously silenced. "
+                "Set true ONLY when you believe a silence rule matched this "
+                "notification incorrectly and it genuinely needs to reach the "
+                "user. Bypasses silence matching and delivers normally."
+            ),
+            "default": False,
+        },
     },
     "required": ["body"],
 }
@@ -671,6 +744,58 @@ PROPOSE_ACTION_SCHEMA = {
         },
     },
     "required": ["target_kind", "target_id", "title"],
+}
+
+NOTIFICATION_SILENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "op": {
+            "type": "string",
+            "description": (
+                "Operation: 'add' (create a rule), 'list' (show active "
+                "rules with hit/override counts), or 'remove' (delete by id)."
+            ),
+        },
+        "pattern": {
+            "type": "string",
+            "description": (
+                "For op=add (required): case-insensitive regex matched "
+                "against the notification's title + body. A matching "
+                "'notify' is suppressed (persisted, not delivered)."
+            ),
+            "default": "",
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "For op=add (strongly encouraged): why this alert class is "
+                "benign. Surfaced to the agent on every match and override."
+            ),
+            "default": "",
+        },
+        "ttl_hours": {
+            "type": "number",
+            "description": (
+                "For op=add: hours until the rule auto-expires. "
+                "0 (default) = permanent."
+            ),
+            "default": 0,
+        },
+        "example": {
+            "type": "string",
+            "description": (
+                "For op=add (optional): sample notification text; the tool "
+                "test-matches the pattern against it and echoes the result."
+            ),
+            "default": "",
+        },
+        "silence_id": {
+            "type": "string",
+            "description": "For op=remove (required): the silence id (sil-xxxx) to delete.",
+            "default": "",
+        },
+    },
+    "required": ["op"],
 }
 
 REACT_SCHEMA = {

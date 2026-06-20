@@ -31,10 +31,9 @@ logger = logging.getLogger(__name__)
 
 # Default timeout for interactive tool waits.
 # Non-web sessions auto-deny upfront via `interactive_capable`, so this only
-# guards web sessions where the user might step away mid-approval. 5 minutes
-# was too short — by the time the user reads a plan and reaches for Approve,
-# the pending interaction is already gone and the button does nothing.
-# 24 hours is a safety net, not a UX constraint.
+# guards web sessions where the user might step away mid-approval. Upstream
+# uses 1h; I extended it to 24h after pending interactions kept timing out
+# during long plan reads — keep that here.
 INTERACTION_TIMEOUT = 24 * 60 * 60
 
 # Tools that require user interaction before execution
@@ -180,6 +179,9 @@ class InteractiveToolHandler:
             "tool_name": tool_name,
             "tool_input": tool_input,
         })
+        # Tell every connected client this session is now waiting for input,
+        # so the sidebar can show the "waiting" indicator (blue dot).
+        await self._broadcast_awaiting()
 
         logger.info(
             "Session %s: waiting for user input on %s (interaction %s)",
@@ -187,38 +189,59 @@ class InteractiveToolHandler:
         )
 
         try:
-            await asyncio.wait_for(pending.event.wait(), timeout=INTERACTION_TIMEOUT)
-        except asyncio.TimeoutError:
+            try:
+                await asyncio.wait_for(pending.event.wait(), timeout=INTERACTION_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Session %s: interaction %s timed out after %ds",
+                    self.session_id, interaction_id[:8], INTERACTION_TIMEOUT,
+                )
+                return PermissionResultDeny(
+                    message=f"No response received after {_humanize_seconds(INTERACTION_TIMEOUT)} — timed out.",
+                )
+            except asyncio.CancelledError:
+                logger.info("Session %s: interaction %s cancelled", self.session_id, interaction_id[:8])
+                return PermissionResultDeny(
+                    message="Session stopped by user.",
+                    interrupt=True,
+                )
+
+            if pending.denied:
+                logger.info("Session %s: %s denied by user", self.session_id, tool_name)
+                return PermissionResultDeny(message=pending.deny_message or "Declined by user.")
+
+            # For AskUserQuestion: inject answers into the tool input
+            if tool_name == "AskUserQuestion" and pending.result:
+                updated = {**tool_input, "answers": pending.result}
+                return PermissionResultAllow(updated_input=updated)
+
+            # For ExitPlanMode/EnterPlanMode: just allow
+            return PermissionResultAllow()
+        finally:
+            # Always drop the pending entry and refresh the waiting indicator,
+            # regardless of how the wait resolved (answered, denied, timeout,
+            # cancelled). has_pending then reflects any remaining interaction.
             self._pending.pop(interaction_id, None)
-            logger.warning(
-                "Session %s: interaction %s timed out after %ds",
-                self.session_id, interaction_id[:8], INTERACTION_TIMEOUT,
+            await self._broadcast_awaiting()
+
+    async def _broadcast_awaiting(self) -> None:
+        """Broadcast this session's waiting-for-input state to all clients.
+
+        Sent on the global channel so every connected client updates the
+        sidebar indicator for this session, even when viewing another one.
+        Best-effort: a broadcast failure must not break the interaction flow.
+        """
+        try:
+            await self._broadcast("__global__", {
+                "type": "session_awaiting_input",
+                "session_id": self.session_id,
+                "awaiting": self.has_pending,
+            })
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(
+                "Failed to broadcast awaiting-input state for %s: %s",
+                self.session_id, e,
             )
-            hours = INTERACTION_TIMEOUT // 3600
-            return PermissionResultDeny(
-                message=f"No response received after {hours}h — timed out.",
-            )
-        except asyncio.CancelledError:
-            self._pending.pop(interaction_id, None)
-            logger.info("Session %s: interaction %s cancelled", self.session_id, interaction_id[:8])
-            return PermissionResultDeny(
-                message="Session stopped by user.",
-                interrupt=True,
-            )
-
-        self._pending.pop(interaction_id, None)
-
-        if pending.denied:
-            logger.info("Session %s: %s denied by user", self.session_id, tool_name)
-            return PermissionResultDeny(message=pending.deny_message or "Declined by user.")
-
-        # For AskUserQuestion: inject answers into the tool input
-        if tool_name == "AskUserQuestion" and pending.result:
-            updated = {**tool_input, "answers": pending.result}
-            return PermissionResultAllow(updated_input=updated)
-
-        # For ExitPlanMode/EnterPlanMode: just allow
-        return PermissionResultAllow()
 
     def resolve(self, interaction_id: str, result: dict[str, Any] | None = None) -> bool:
         """Resolve a pending interaction with the user's answer.
@@ -309,6 +332,16 @@ def get_handler(session_id: str) -> InteractiveToolHandler | None:
     return _handlers.get(session_id)
 
 
+def get_awaiting_ids() -> set[str]:
+    """Return session IDs currently paused waiting for user input.
+
+    Mirrors ``SessionManager.get_running_ids`` for the interactive layer:
+    the REST sessions list uses it so a freshly-loaded UI shows the
+    "waiting for input" indicator without relying on the live broadcast.
+    """
+    return {sid for sid, handler in _handlers.items() if handler.has_pending}
+
+
 def _interaction_type(tool_name: str) -> str:
     """Map tool name to a UI-friendly interaction type."""
     return {
@@ -316,3 +349,12 @@ def _interaction_type(tool_name: str) -> str:
         "ExitPlanMode": "plan_exit",
         "EnterPlanMode": "plan_enter",
     }.get(tool_name, "unknown")
+
+
+def _humanize_seconds(seconds: int) -> str:
+    """Human-readable duration for timeout messages (e.g. '1 hour', '5 minutes')."""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    minutes = max(1, seconds // 60)
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
