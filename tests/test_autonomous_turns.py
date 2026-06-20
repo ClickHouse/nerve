@@ -487,3 +487,68 @@ async def test_process_sdk_message_returns_true_on_result():
     assert st.sdk_session_id == "sdk-9"
     assert st.last_usage == {"input_tokens": 1}
     assert st.result_meta["total_cost_usd"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# run_idle_client_sweep — never discard a client parked on a live bg task
+# ---------------------------------------------------------------------------
+
+
+def test_has_live_background_tasks():
+    engine = _make_engine()
+    engine._bg_task_registry = {
+        "running": {"t1": {"status": "running"}},
+        "settled": {"t2": {"status": "done"}},
+        "mixed": {"t3": {"status": "done"}, "t4": {"status": "running"}},
+    }
+    assert engine._has_live_background_tasks("running") is True
+    assert engine._has_live_background_tasks("settled") is False
+    assert engine._has_live_background_tasks("mixed") is True
+    assert engine._has_live_background_tasks("unknown") is False
+
+
+@pytest.mark.asyncio
+async def test_idle_sweep_skips_sessions_with_live_background_tasks():
+    """Regression: a session parked on a live background task must survive the
+    idle sweep — discarding its client would tear down the idle-stream watcher
+    that delivers the task's completion turn (the lost-wakeup bug)."""
+    engine = _make_engine()
+    engine.config.sessions = SimpleNamespace(client_idle_timeout_minutes=60)
+    engine.sessions = SimpleNamespace(
+        get_idle_client_ids=lambda _timeout: ["busy", "free"],
+        _clients={"busy": object(), "free": object()},
+    )
+    engine._bg_task_registry = {
+        "busy": {"t1": {"task_id": "t1", "status": "running"}},
+        "free": {"t2": {"task_id": "t2", "status": "done"}},
+    }
+    discarded: list[str] = []
+
+    async def _fake_discard(sid, **_kw):
+        discarded.append(sid)
+
+    engine._discard_client = _fake_discard
+
+    n = await engine.run_idle_client_sweep()
+
+    assert discarded == ["free"]  # only the session with no live bg task
+    assert n == 1
+    assert "busy" in engine._bg_task_registry  # left intact for its watcher
+
+
+@pytest.mark.asyncio
+async def test_idle_sweep_disabled_when_timeout_zero():
+    engine = _make_engine()
+    engine.config.sessions = SimpleNamespace(client_idle_timeout_minutes=0)
+    called = False
+
+    def _should_not_run(_timeout):
+        nonlocal called
+        called = True
+        return []
+
+    engine.sessions = SimpleNamespace(
+        get_idle_client_ids=_should_not_run, _clients={},
+    )
+    assert await engine.run_idle_client_sweep() == 0
+    assert called is False  # short-circuits before touching the session store
