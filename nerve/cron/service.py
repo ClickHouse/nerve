@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -75,7 +76,8 @@ class CronService:
         self.config = config
         self.engine = engine
         self.db = db
-        self.scheduler = AsyncIOScheduler()
+        self.timezone = ZoneInfo(config.timezone)
+        self.scheduler = AsyncIOScheduler(timezone=self.timezone)
         self._jobs: list[CronJob] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
@@ -119,10 +121,14 @@ class CronService:
                 schedule_str = getattr(source_config, "schedule", "*/15 * * * *")
 
                 try:
-                    trigger = CronTrigger.from_crontab(schedule_str)
+                    trigger = CronTrigger.from_crontab(
+                        schedule_str, timezone=self.timezone,
+                    )
                 except ValueError:
                     seconds = _parse_interval(schedule_str)
-                    trigger = IntervalTrigger(seconds=seconds)
+                    trigger = IntervalTrigger(
+                        seconds=seconds, timezone=self.timezone,
+                    )
 
                 self.scheduler.add_job(
                     self._run_source_wrapper,
@@ -139,7 +145,7 @@ class CronService:
         # Daily cleanup of expired messages and consumer cursors
         self.scheduler.add_job(
             self._cleanup_expired,
-            CronTrigger(hour=3, minute=0),
+            CronTrigger(hour=3, minute=0, timezone=self.timezone),
             id="cleanup",
             name="Cleanup expired data",
             replace_existing=True,
@@ -149,7 +155,9 @@ class CronService:
         # scheduler is disabled; Nerve owns wakeup timing here.
         self.scheduler.add_job(
             self._sweep_wakeups,
-            IntervalTrigger(seconds=_WAKEUP_SWEEP_SECONDS),
+            IntervalTrigger(
+                seconds=_WAKEUP_SWEEP_SECONDS, timezone=self.timezone,
+            ),
             id="wakeup_sweep",
             name="Fire due session wakeups",
             replace_existing=True,
@@ -178,7 +186,9 @@ class CronService:
         the cadence survives restarts (persistent timer).
         """
         try:
-            return CronTrigger.from_crontab(job.schedule)
+            return CronTrigger.from_crontab(
+                job.schedule, timezone=self.timezone,
+            )
         except ValueError:
             pass
 
@@ -189,8 +199,12 @@ class CronService:
             logger.debug(
                 "Aligning interval for %s: start_date=%s", job.id, start_date,
             )
-            return IntervalTrigger(seconds=seconds, start_date=start_date)
-        return IntervalTrigger(seconds=seconds)
+            return IntervalTrigger(
+                seconds=seconds,
+                start_date=start_date,
+                timezone=self.timezone,
+            )
+        return IntervalTrigger(seconds=seconds, timezone=self.timezone)
 
     async def _catchup_missed_jobs(self) -> None:
         """Fire jobs that should have run while the server was down.
@@ -210,7 +224,7 @@ class CronService:
                 continue  # first-ever run — no catch-up
 
             last_time = _parse_timestamp(last_run["finished_at"])
-            if self._is_overdue(job, last_time, now):
+            if self._is_overdue(job, last_time, now, self.timezone):
                 overdue.append(job)
 
         if not overdue:
@@ -225,10 +239,17 @@ class CronService:
         )
 
     @staticmethod
-    def _is_overdue(job: CronJob, last_run: datetime, now: datetime) -> bool:
+    def _is_overdue(
+        job: CronJob,
+        last_run: datetime,
+        now: datetime,
+        trigger_timezone: tzinfo | None = None,
+    ) -> bool:
         """Check if a job should have fired between *last_run* and *now*."""
         try:
-            trigger = CronTrigger.from_crontab(job.schedule)
+            trigger = CronTrigger.from_crontab(
+                job.schedule, timezone=trigger_timezone or timezone.utc,
+            )
             next_fire = trigger.get_next_fire_time(last_run, last_run)
             return next_fire is not None and next_fire < now
         except ValueError:
@@ -282,8 +303,7 @@ class CronService:
                 logger.warning("Invalid context_rotate_at: %s", rotate_at)
                 return False
 
-            local_tz = datetime.now().astimezone().tzinfo
-            today_rotate = datetime.now(local_tz).replace(
+            today_rotate = now.astimezone(self.timezone).replace(
                 hour=hour, minute=minute, second=0, microsecond=0,
             )
             today_rotate_utc = today_rotate.astimezone(timezone.utc)
