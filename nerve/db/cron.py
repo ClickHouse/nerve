@@ -84,6 +84,22 @@ class CronStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def get_last_cron_run(self, job_id: str) -> dict | None:
+        """Get the most recent cron_logs entry for a job, regardless of status.
+
+        Unlike get_last_successful_cron_run, this ignores status, so a job
+        that has only ever errored still has a reference point for catch-up.
+        Ordered by started_at (always set via the column default) so a row
+        whose run never finished still sorts correctly.
+        """
+        async with self.db.execute(
+            "SELECT * FROM cron_logs WHERE job_id = ? "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     async def get_latest_cron_session_id(self, job_id: str) -> str | None:
         """Return the most recently active session id for a cron job.
 

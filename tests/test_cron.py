@@ -10,7 +10,12 @@ import pytest
 import pytest_asyncio
 
 from nerve.cron.jobs import CronJob
-from nerve.cron.service import CronService, _parse_interval, _parse_timestamp
+from nerve.cron.service import (
+    CronService,
+    _crontab_to_trigger,
+    _parse_interval,
+    _parse_timestamp,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +48,13 @@ def _hours_ago(h: float) -> str:
     return (_utc_now() - timedelta(hours=h)).isoformat()
 
 
-def _make_cron_log(finished_at: str) -> dict:
-    return {"job_id": "test-job", "finished_at": finished_at, "status": "success"}
+def _make_cron_log(finished_at: str, status: str = "success") -> dict:
+    return {
+        "job_id": "test-job",
+        "started_at": finished_at,
+        "finished_at": finished_at,
+        "status": status,
+    }
 
 
 @pytest_asyncio.fixture
@@ -64,6 +74,7 @@ async def cron_service():
     db.log_cron_start = AsyncMock(return_value=1)
     db.log_cron_finish = AsyncMock()
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
+    db.get_last_cron_run = AsyncMock(return_value=None)
 
     svc = CronService(config, engine, db)
     return svc
@@ -119,6 +130,82 @@ class TestParseInterval:
 
 
 # ---------------------------------------------------------------------------
+# _crontab_to_trigger: Unix day-of-week semantics
+# ---------------------------------------------------------------------------
+
+# A Saturday, so "next fire" lands on a distinct weekday for any DOW value.
+_DOW_BASE = datetime(2026, 6, 20, 0, 0, tzinfo=timezone.utc)
+
+
+def _fire_weekdays(schedule: str) -> set[str]:
+    """Collect the weekday abbreviations a crontab fires on within one week."""
+    trigger = _crontab_to_trigger(schedule)
+    end = _DOW_BASE + timedelta(days=8)
+    days: set[str] = set()
+    prev = None
+    cur = _DOW_BASE
+    while True:
+        fire = trigger.get_next_fire_time(prev, cur)
+        if fire is None or fire > end:
+            break
+        days.add(fire.strftime("%a"))
+        prev = fire
+        # Jump to the start of the next day so per-minute schedules don't loop.
+        cur = fire.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return days
+
+
+class TestCrontabToTrigger:
+    def test_numeric_monday_fires_monday(self):
+        """The bug: Unix DOW 1 (Monday) was firing Tuesday via from_crontab."""
+        fire = _crontab_to_trigger("0 13 * * 1").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Monday"
+        assert (fire.hour, fire.minute) == (13, 0)
+
+    def test_numeric_sunday_fires_sunday(self):
+        fire = _crontab_to_trigger("0 13 * * 0").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Sunday"
+
+    def test_seven_also_means_sunday(self):
+        fire = _crontab_to_trigger("0 13 * * 7").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Sunday"
+
+    def test_range_weekdays_only(self):
+        assert _fire_weekdays("* * * * 1-5") == {"Mon", "Tue", "Wed", "Thu", "Fri"}
+
+    def test_list_monday_and_thursday(self):
+        assert _fire_weekdays("0 9 * * 1,4") == {"Mon", "Thu"}
+
+    def test_star_dow_fires_every_day(self):
+        assert _fire_weekdays("0 9 * * *") == {
+            "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+        }
+
+    def test_day_name_passthrough(self):
+        """Already-named DOW values are left intact (and stay correct)."""
+        fire = _crontab_to_trigger("0 13 * * mon").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Monday"
+
+    @pytest.mark.parametrize(
+        "schedule",
+        ["0 5 * * *", "*/30 * * * *", "0 */4 * * *", "17 */4 * * *", "13 13 * * *"],
+    )
+    def test_non_dow_fields_match_from_crontab(self, schedule):
+        """Schedules without a numeric DOW behave exactly like from_crontab."""
+        from apscheduler.triggers.cron import CronTrigger
+
+        ours = _crontab_to_trigger(schedule).get_next_fire_time(None, _DOW_BASE)
+        ref = CronTrigger.from_crontab(schedule).get_next_fire_time(None, _DOW_BASE)
+        assert ours == ref
+
+    @pytest.mark.parametrize("schedule", ["4h", "30m", "1h30m", "???", ""])
+    def test_non_crontab_raises_value_error(self, schedule):
+        """Interval strings must still raise so the IntervalTrigger path runs."""
+        with pytest.raises(ValueError):
+            _crontab_to_trigger(schedule)
+
+
+# ---------------------------------------------------------------------------
 # _is_overdue
 # ---------------------------------------------------------------------------
 
@@ -156,6 +243,19 @@ class TestIsOverdue:
         job = _make_job(schedule="1h")
         last_run = _utc_now() - timedelta(hours=10)
         assert CronService._is_overdue(job, last_run, _utc_now()) is True
+
+    def test_weekly_overdue_after_exactly_one_week(self):
+        """A weekly Monday job is overdue one week later, not 6 or 8 days."""
+        job = _make_job(schedule="0 13 * * 1")  # Mondays 13:00 UTC
+        last_run = datetime(2026, 6, 15, 13, 0, tzinfo=timezone.utc)  # a Monday
+        # Six days later (Sunday): the next Monday fire has not arrived yet.
+        assert CronService._is_overdue(
+            job, last_run, last_run + timedelta(days=6),
+        ) is False
+        # Just past the next Monday fire, so now overdue.
+        assert CronService._is_overdue(
+            job, last_run, last_run + timedelta(days=7, minutes=1),
+        ) is True
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +428,98 @@ class TestCatchupMissedJobs:
         await cron_service._catchup_missed_jobs()
 
         cron_service.db.log_cron_start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_never_succeeded_with_error_history_catches_up(self, cron_service):
+        """A weekly job that only ever errored still catches up after a miss.
+
+        Previously a job with no successful run was skipped forever, so a
+        weekly job that missed its first fire across a restart was starved.
+        """
+        job = _make_job(id="weekly-erroring", schedule="0 13 * * 1")
+        cron_service._jobs = [job]
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        # An 8-day-old attempt of any status guarantees a missed weekly fire
+        # regardless of which weekday the test runs on.
+        cron_service.db.get_last_cron_run.return_value = (
+            _make_cron_log(_hours_ago(8 * 24), status="error")
+        )
+
+        await cron_service._catchup_missed_jobs()
+
+        cron_service.db.log_cron_start.assert_called_once_with("weekly-erroring")
+        cron_service.engine.run_cron.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_history_uses_server_start_and_does_not_fire(self, cron_service):
+        """A job with no history at all is anchored to server start, not fired."""
+        job = _make_job(id="brand-new", schedule="0 13 * * 1")
+        cron_service._jobs = [job]
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = None
+        cron_service._server_start_time = _utc_now()
+
+        await cron_service._catchup_missed_jobs()
+
+        cron_service.db.log_cron_start.assert_not_called()
+        cron_service.engine.run_cron.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _catchup_baseline: which reference time catch-up measures against
+# ---------------------------------------------------------------------------
+
+class TestCatchupBaseline:
+    @pytest.mark.asyncio
+    async def test_prefers_last_successful_run(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        ts = _hours_ago(50)
+        cron_service.db.get_last_successful_cron_run.return_value = _make_cron_log(ts)
+        cron_service.db.get_last_cron_run.return_value = _make_cron_log(_hours_ago(1))
+
+        now = _utc_now()
+        baseline = await cron_service._catchup_baseline(job, now)
+
+        assert baseline == _parse_timestamp(ts)
+        # The success path must short-circuit before the any-status lookup.
+        cron_service.db.get_last_cron_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_last_attempt_when_never_succeeded(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        ts = _hours_ago(30)
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = (
+            _make_cron_log(ts, status="error")
+        )
+
+        baseline = await cron_service._catchup_baseline(job, _utc_now())
+
+        assert baseline == _parse_timestamp(ts)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_server_start_with_no_history(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = None
+        start = _utc_now() - timedelta(minutes=2)
+        cron_service._server_start_time = start
+
+        baseline = await cron_service._catchup_baseline(job, _utc_now())
+
+        assert baseline == start
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_now_when_server_start_unset(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = None
+        cron_service._server_start_time = None
+
+        now = _utc_now()
+        baseline = await cron_service._catchup_baseline(job, now)
+
+        assert baseline == now
 
 
 # ---------------------------------------------------------------------------
