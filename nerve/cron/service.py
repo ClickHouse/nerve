@@ -146,9 +146,13 @@ class CronService:
         self._jobs: list[CronJob] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
+        # Set when the scheduler starts; used as the catch-up baseline for a
+        # job that has no run history yet (so it is not fired spuriously).
+        self._server_start_time: datetime | None = None
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
+        self._server_start_time = datetime.now(timezone.utc)
         # Load job definitions from both files
         self._jobs = self._load_merged_jobs()
 
@@ -272,12 +276,8 @@ class CronService:
             if not job.enabled or not job.catchup:
                 continue
 
-            last_run = await self.db.get_last_successful_cron_run(job.id)
-            if not last_run or not last_run.get("finished_at"):
-                continue  # first-ever run — no catch-up
-
-            last_time = _parse_timestamp(last_run["finished_at"])
-            if self._is_overdue(job, last_time, now):
+            baseline = await self._catchup_baseline(job, now)
+            if self._is_overdue(job, baseline, now):
                 overdue.append(job)
 
         if not overdue:
@@ -290,6 +290,33 @@ class CronService:
         await asyncio.gather(
             *(self._run_job_wrapper(job) for job in overdue),
         )
+
+    async def _catchup_baseline(self, job: CronJob, now: datetime) -> datetime:
+        """Reference time a missed fire is measured against for catch-up.
+
+        Prefers the last successful run. If the job has never succeeded, it
+        falls back to its most recent attempt of any status (so a job that
+        has only ever errored is still retried after a missed fire), and
+        finally to the server start time.
+
+        Anchoring a job with no history to the server start time means a
+        brand-new, not-yet-due job is never fired spuriously: its first fire
+        is still in the future, so it is not overdue. This is what restores
+        catch-up for a weekly job that missed its first fire during one of
+        the daemon restarts (previously such a job was skipped forever
+        because it had no successful run to measure against).
+        """
+        last_success = await self.db.get_last_successful_cron_run(job.id)
+        if last_success and last_success.get("finished_at"):
+            return _parse_timestamp(last_success["finished_at"])
+
+        last_attempt = await self.db.get_last_cron_run(job.id)
+        if last_attempt:
+            stamp = last_attempt.get("finished_at") or last_attempt.get("started_at")
+            if stamp:
+                return _parse_timestamp(stamp)
+
+        return self._server_start_time or now
 
     @staticmethod
     def _is_overdue(job: CronJob, last_run: datetime, now: datetime) -> bool:

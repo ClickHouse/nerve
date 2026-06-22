@@ -48,8 +48,13 @@ def _hours_ago(h: float) -> str:
     return (_utc_now() - timedelta(hours=h)).isoformat()
 
 
-def _make_cron_log(finished_at: str) -> dict:
-    return {"job_id": "test-job", "finished_at": finished_at, "status": "success"}
+def _make_cron_log(finished_at: str, status: str = "success") -> dict:
+    return {
+        "job_id": "test-job",
+        "started_at": finished_at,
+        "finished_at": finished_at,
+        "status": status,
+    }
 
 
 @pytest_asyncio.fixture
@@ -69,6 +74,7 @@ async def cron_service():
     db.log_cron_start = AsyncMock(return_value=1)
     db.log_cron_finish = AsyncMock()
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
+    db.get_last_cron_run = AsyncMock(return_value=None)
 
     svc = CronService(config, engine, db)
     return svc
@@ -422,6 +428,98 @@ class TestCatchupMissedJobs:
         await cron_service._catchup_missed_jobs()
 
         cron_service.db.log_cron_start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_never_succeeded_with_error_history_catches_up(self, cron_service):
+        """A weekly job that only ever errored still catches up after a miss.
+
+        Previously a job with no successful run was skipped forever, so a
+        weekly job that missed its first fire across a restart was starved.
+        """
+        job = _make_job(id="weekly-erroring", schedule="0 13 * * 1")
+        cron_service._jobs = [job]
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        # An 8-day-old attempt of any status guarantees a missed weekly fire
+        # regardless of which weekday the test runs on.
+        cron_service.db.get_last_cron_run.return_value = (
+            _make_cron_log(_hours_ago(8 * 24), status="error")
+        )
+
+        await cron_service._catchup_missed_jobs()
+
+        cron_service.db.log_cron_start.assert_called_once_with("weekly-erroring")
+        cron_service.engine.run_cron.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_history_uses_server_start_and_does_not_fire(self, cron_service):
+        """A job with no history at all is anchored to server start, not fired."""
+        job = _make_job(id="brand-new", schedule="0 13 * * 1")
+        cron_service._jobs = [job]
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = None
+        cron_service._server_start_time = _utc_now()
+
+        await cron_service._catchup_missed_jobs()
+
+        cron_service.db.log_cron_start.assert_not_called()
+        cron_service.engine.run_cron.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _catchup_baseline: which reference time catch-up measures against
+# ---------------------------------------------------------------------------
+
+class TestCatchupBaseline:
+    @pytest.mark.asyncio
+    async def test_prefers_last_successful_run(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        ts = _hours_ago(50)
+        cron_service.db.get_last_successful_cron_run.return_value = _make_cron_log(ts)
+        cron_service.db.get_last_cron_run.return_value = _make_cron_log(_hours_ago(1))
+
+        now = _utc_now()
+        baseline = await cron_service._catchup_baseline(job, now)
+
+        assert baseline == _parse_timestamp(ts)
+        # The success path must short-circuit before the any-status lookup.
+        cron_service.db.get_last_cron_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_last_attempt_when_never_succeeded(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        ts = _hours_ago(30)
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = (
+            _make_cron_log(ts, status="error")
+        )
+
+        baseline = await cron_service._catchup_baseline(job, _utc_now())
+
+        assert baseline == _parse_timestamp(ts)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_server_start_with_no_history(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = None
+        start = _utc_now() - timedelta(minutes=2)
+        cron_service._server_start_time = start
+
+        baseline = await cron_service._catchup_baseline(job, _utc_now())
+
+        assert baseline == start
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_now_when_server_start_unset(self, cron_service):
+        job = _make_job(schedule="0 13 * * 1")
+        cron_service.db.get_last_successful_cron_run.return_value = None
+        cron_service.db.get_last_cron_run.return_value = None
+        cron_service._server_start_time = None
+
+        now = _utc_now()
+        baseline = await cron_service._catchup_baseline(job, now)
+
+        assert baseline == now
 
 
 # ---------------------------------------------------------------------------
