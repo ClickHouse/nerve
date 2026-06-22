@@ -30,6 +30,43 @@ _MAX_COMMENT_CHARS = 2_000
 _MAX_CONCURRENT_FETCHES = 5
 
 
+def _collect_actors(
+    subject_user: str,
+    assignees: list[str],
+    comment: dict[str, Any] | None,
+    latest_review: dict[str, Any] | None,
+    inline_comments: list[dict[str, Any]],
+    recent_comments: list[dict[str, Any]],
+) -> list[str]:
+    """Every GitHub login involved in a notification, de-duplicated.
+
+    Order-preserving (first occurrence wins) with case-insensitive de-dup;
+    empty and placeholder ("?") logins are skipped. Surfaced as the ``actors``
+    metadata key so the inbox guardrail can allow/deny a notification by who is
+    involved (see :mod:`nerve.sources.filters`). The raw ``/notifications``
+    payload carries no actor, but enrichment has already fetched these logins
+    for the rendered content.
+    """
+    candidates: list[str] = [subject_user, *assignees]
+    if comment:
+        candidates.append(comment.get("user", ""))
+    if latest_review:
+        candidates.append(latest_review.get("user", ""))
+    candidates.extend(ic.get("user", "") for ic in inline_comments)
+    candidates.extend(rc.get("user", "") for rc in recent_comments)
+
+    actors: list[str] = []
+    seen: set[str] = set()
+    for login in candidates:
+        if not login or login == "?":
+            continue
+        key = login.lower()
+        if key not in seen:
+            seen.add(key)
+            actors.append(login)
+    return actors
+
+
 class GitHubSource(Source):
     """GitHub notification source using the gh CLI."""
 
@@ -181,6 +218,13 @@ class GitHubSource(Source):
                             f"\n{rc_user} ({rc_date}):\n{rc_body}"
                         )
 
+                # Surface every involved login so the inbox guardrail can
+                # allow/deny by actor (the raw notification carries no actor).
+                actors = _collect_actors(
+                    subject_user, assignees, comment, latest_review,
+                    inline_comments, recent_comments,
+                )
+
                 records.append(SourceRecord(
                     id=notif.get("id", ""),
                     source="github",
@@ -195,6 +239,7 @@ class GitHubSource(Source):
                         "subject_url": html_url,
                         "repo_name": repo_name,
                         "repo_url": repo.get("html_url", ""),
+                        "actors": actors,
                     },
                 ))
 
