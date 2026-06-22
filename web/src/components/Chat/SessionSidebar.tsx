@@ -45,7 +45,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, virtualSession, discardVirtualSession } = useChatStore();
 
   const isSearching = localQuery.trim().length > 0;
 
@@ -198,6 +198,34 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
           </div>
         ) : (
           <>
+            {/* Virtual "new chat" — pinned at the very top until the first
+                message materializes it server-side. */}
+            {virtualSession && (
+              <div
+                onClick={() => onSelect(virtualSession.id)}
+                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-sm transition-colors
+                  ${virtualSession.id === activeSession
+                    ? 'bg-accent/10 text-text'
+                    : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
+                  }`}
+              >
+                <MessageSquare size={13} className="shrink-0 opacity-50" />
+                <div className="flex-1 min-w-0">
+                  <div className="truncate text-[13px] italic">New chat</div>
+                </div>
+                {virtualSession.id === activeSession && activeIsRunning && (
+                  <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
+                )}
+                <button
+                  onClick={(e) => { e.stopPropagation(); discardVirtualSession(); }}
+                  className="p-0.5 text-text-faint hover:text-text-muted opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
+                  title="Discard new chat"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            )}
+
             {/* Pinned running sessions */}
             {pinnedRunning.length > 0 && (
               <div>
@@ -241,7 +269,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
             )}
 
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && (
+            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
               <div className="px-3 py-2 text-[11px] text-text-faint">No conversations yet</div>
             )}
 
@@ -385,6 +413,8 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
   const [renameValue, setRenameValue] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Unsent draft for this chat (hidden on the active one — its text is in the box).
+  const hasDraft = useChatStore(s => !!(s.drafts[session.id] || '').trim());
 
   // Close menu on outside click
   useEffect(() => {
@@ -446,6 +476,13 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
       <div className="flex-1 min-w-0">
         <div className="truncate text-[13px]">{cleanTitle(session)}</div>
       </div>
+
+      {/* Unsent draft marker */}
+      {hasDraft && !isActive && (
+        <span title="Unsent draft" className="shrink-0 flex items-center">
+          <Pencil size={11} className="text-text-faint" />
+        </span>
+      )}
 
       {/* Status indicator (always visible) */}
       <StatusIndicator session={session} isActive={isActive} isRunning={isRunning} />
