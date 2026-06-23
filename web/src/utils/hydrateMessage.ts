@@ -39,6 +39,9 @@ export function hydrateMessage(raw: any): ChatMessage {
         result: b.result,
         isError: b.is_error,
         status: 'complete' as const,
+        // Dynamic-workflow snapshot, folded into the block by the backend
+        // (merge_workflow_into_call) so the panel reconstructs after reload.
+        workflow: b.workflow,
       };
     }
     if (b.type === 'image') {

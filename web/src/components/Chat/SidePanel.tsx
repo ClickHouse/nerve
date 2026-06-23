@@ -1,10 +1,11 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban } from 'lucide-react';
+import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban, Workflow as WorkflowIcon } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
 import { MarkdownContent } from './MarkdownContent';
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
 import { FileChangesPanel } from './FileChangesPanel';
+import { WorkflowPanel } from './WorkflowPanel';
 import type { PanelTab } from '../../types/chat';
 
 const TAB_ICONS: Record<string, typeof Bot> = {
@@ -12,6 +13,7 @@ const TAB_ICONS: Record<string, typeof Bot> = {
   Explore: Search,
   'general-purpose': Wrench,
   files: Files,
+  Workflow: WorkflowIcon,
 };
 
 const TAB_COLORS: Record<string, string> = {
@@ -19,6 +21,7 @@ const TAB_COLORS: Record<string, string> = {
   Explore: 'text-hue-cyan',
   'general-purpose': 'text-link',
   files: 'text-hue-teal',
+  Workflow: 'text-hue-violet',
 };
 
 function formatElapsed(startedAt: number, completedAt?: number): string {
@@ -332,7 +335,9 @@ export function SidePanel() {
       {/* Content area */}
       {activeTab.type === 'files'
         ? <FileChangesPanel />
-        : <TabContent tab={activeTab} containerRef={containerRef} />
+        : activeTab.type === 'workflow'
+          ? <WorkflowPanel tab={activeTab} />
+          : <TabContent tab={activeTab} containerRef={containerRef} />
       }
 
       {/* Footer actions (approve/decline for plans) */}

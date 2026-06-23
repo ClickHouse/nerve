@@ -37,6 +37,7 @@ def _make_engine() -> AgentEngine:
         ),
     )
     engine._bg_task_registry = {}
+    engine._workflows = {}
     engine._idle_watchers = {}
     engine._session_locks = {}
     return engine
@@ -199,6 +200,63 @@ async def test_non_task_subtypes_ignored():
         )
         bc.broadcast.assert_not_called()
     assert "s1" not in engine._bg_task_registry
+
+
+@pytest.mark.asyncio
+async def test_workflow_task_emits_progress_and_persists():
+    """A dynamic-workflow task (task_type=local_workflow, workflow_progress on
+    task_progress, terminal via task_updated) drives workflow_progress events
+    and persists the final snapshot. Shapes mirror a real captured run."""
+    engine = _make_engine()
+    engine.db = SimpleNamespace(merge_workflow_into_call=AsyncMock())
+    # _process_sdk_message would have registered the Workflow tool_use id.
+    engine._workflows["s1"] = {"wf-tool": {"name": "Workflow", "snapshot": None}}
+
+    wf_events = []
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_workflow_progress = AsyncMock(
+            side_effect=lambda sid, tid, snap: wf_events.append((tid, snap)),
+        )
+        await engine._handle_system_message("s1", SystemMessage(
+            subtype="task_started",
+            data=_sys_msg(
+                "task_started", task_id="wt", tool_use_id="wf-tool",
+                task_type="local_workflow", workflow_name="verify-ui",
+                description="tiny workflow",
+            ),
+        ))
+        await engine._handle_system_message("s1", SystemMessage(
+            subtype="task_progress",
+            data=_sys_msg(
+                "task_progress", task_id="wt", tool_use_id="wf-tool",
+                description="tiny workflow",
+                workflow_progress=[
+                    {"type": "workflow_agent", "label": "echo", "phaseIndex": 1,
+                     "phaseTitle": "Echo", "state": "running", "model": "opus",
+                     "tokens": 100, "toolCalls": 0},
+                ],
+            ),
+        ))
+        await engine._handle_system_message("s1", SystemMessage(
+            subtype="task_updated",
+            data=_sys_msg(
+                "task_updated", task_id="wt", tool_use_id="wf-tool",
+                patch={"status": "completed", "end_time": 1},
+            ),
+        ))
+
+    # Chip relabeled; workflow name captured from the CLI's workflow_name.
+    assert engine._bg_task_registry["s1"]["wt"]["tool"] == "Workflow"
+    # One progress broadcast per task message.
+    assert len(wf_events) == 3
+    tid, last = wf_events[-1]
+    assert tid == "wf-tool"
+    assert last["name"] == "verify-ui"
+    assert last["status"] == "completed"
+    assert last["agentCount"] == 1  # carried over from the progress snapshot
+    # Terminal snapshot persisted onto the Workflow block.
+    engine.db.merge_workflow_into_call.assert_awaited_once()
 
 
 def test_prune_bg_tasks_drops_settled():

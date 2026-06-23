@@ -315,6 +315,14 @@ class AgentEngine:
         # task_started / task_updated / task_notification system messages:
         # session_id -> task_id -> {task_id, label, tool, status}.
         self._bg_task_registry: dict[str, dict[str, dict[str, Any]]] = {}
+        # Per-session dynamic-workflow registry: session_id -> tool_use_id ->
+        # {name, snapshot}. The tool_use_id is captured when a ``Workflow``
+        # tool call streams; later task_* system messages carrying a
+        # ``workflow_progress`` tree are matched back to it so the UI can
+        # render a live phase/agent panel. The last snapshot is cached so the
+        # terminal task_notification (which omits the tree) can still settle
+        # the panel and persist the final state.
+        self._workflows: dict[str, dict[str, dict[str, Any]]] = {}
         # Per-session active channel — set on run() entry, cleared on exit.
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
@@ -1869,6 +1877,16 @@ class AgentEngine:
                             description=str(tool_input.get("description", "")),
                             model=str(tool_input.get("model", "")) or None,
                         )
+                    # Track dynamic workflows.  A ``Workflow`` tool call spawns
+                    # a background runtime; later task_* system messages carry
+                    # its progress tree keyed by this tool_use_id.  Register it
+                    # now so _handle_system_message can recognize those events
+                    # even before the first ``workflow_progress`` payload.
+                    if tool_name == "Workflow" and tool_use_id:
+                        self._workflows.setdefault(session_id, {})[tool_use_id] = {
+                            "name": self._derive_workflow_name(tool_input),
+                            "snapshot": None,
+                        }
                     st.tool_calls_log.append({
                         "tool": tool_name,
                         "input": tool_input,
@@ -1991,12 +2009,173 @@ class AgentEngine:
             if not entry["label"]:
                 entry["label"] = data.get("summary") or task_id
 
+        # Dynamic-workflow progress. A workflow task is recognized either by
+        # its tool_use_id (captured when the ``Workflow`` tool streamed) or by
+        # the presence of a ``workflow_progress`` tree on the message. We emit
+        # a dedicated event so the UI can render a live phase/agent panel —
+        # independent of the coarse background-task chip above.
+        tool_use_id = data.get("tool_use_id") or getattr(message, "tool_use_id", None)
+        wf_reg = self._workflows.get(session_id) or {}
+        wp = data.get("workflow_progress")
+        task_type = str(data.get("task_type") or "")
+        is_workflow = bool(tool_use_id) and (
+            tool_use_id in wf_reg
+            or (isinstance(wp, list) and len(wp) > 0)
+            or "workflow" in task_type
+        )
+        if is_workflow:
+            entry["tool"] = "Workflow"
+            # The CLI reports the workflow name on task_started — authoritative
+            # (and better than the tool-input guess for inline scripts).
+            wf_name = data.get("workflow_name")
+            if wf_name:
+                self._workflows.setdefault(session_id, {}).setdefault(
+                    tool_use_id, {"name": "Workflow", "snapshot": None},
+                )["name"] = str(wf_name)
+            await self._emit_workflow_progress(
+                session_id, tool_use_id, subtype, data, message, wp,
+            )
+
         if changed:
             await broadcaster.broadcast(session_id, {
                 "type": "background_tasks_update",
                 "session_id": session_id,
                 "tasks": list(registry.values()),
             })
+
+    async def _emit_workflow_progress(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        subtype: str,
+        data: dict,
+        message: Any,
+        wp: Any,
+    ) -> None:
+        """Build, cache, broadcast (and on terminal, persist) a workflow
+        progress snapshot for the ``Workflow`` call ``tool_use_id``."""
+        reg = self._workflows.setdefault(session_id, {})
+        cached = reg.setdefault(tool_use_id, {"name": "Workflow", "snapshot": None})
+
+        # task_progress carries the full tree; task_notification omits it, so
+        # fall back to the last cached snapshot to settle the panel.
+        if isinstance(wp, list) and wp:
+            snapshot = self._build_workflow_snapshot(wp)
+        else:
+            prev = cached.get("snapshot") or {}
+            snapshot = {
+                "phases": prev.get("phases", []),
+                "agents": prev.get("agents", []),
+                "totalTokens": prev.get("totalTokens", 0),
+                "totalToolCalls": prev.get("totalToolCalls", 0),
+                "agentCount": prev.get("agentCount", 0),
+            }
+
+        status = self._workflow_status(subtype, data, message)
+        snapshot["name"] = cached.get("name") or "Workflow"
+        snapshot["status"] = status
+        summary = (
+            data.get("summary")
+            or data.get("description")
+            or getattr(message, "summary", "")
+            or getattr(message, "description", "")
+        )
+        if summary:
+            snapshot["summary"] = str(summary)[:2000]
+
+        cached["snapshot"] = snapshot
+        await broadcaster.broadcast_workflow_progress(session_id, tool_use_id, snapshot)
+
+        if status in ("completed", "failed", "stopped"):
+            try:
+                await self.db.merge_workflow_into_call(session_id, tool_use_id, snapshot)
+            except Exception as e:  # persistence is best-effort
+                logger.debug("merge_workflow_into_call failed for %s: %s", tool_use_id, e)
+
+    @staticmethod
+    def _workflow_status(subtype: str, data: dict, message: Any) -> str:
+        """Map a task_* system message to a workflow status string
+        (running / completed / failed / stopped)."""
+        if subtype in ("task_started", "task_progress"):
+            return "running"
+        if subtype == "task_updated":
+            patch = data.get("patch") or {}
+            s = str(patch.get("status") or "")
+            if s == "killed":
+                return "stopped"
+            return s or "running"
+        if subtype == "task_notification":
+            return str(
+                data.get("status") or getattr(message, "status", "") or "completed"
+            )
+        return "running"
+
+    @staticmethod
+    def _derive_workflow_name(tool_input: Any) -> str:
+        """Best-effort workflow name: the ``name`` arg for a named workflow,
+        else ``meta.name`` parsed from an inline script, else "Workflow"."""
+        if not isinstance(tool_input, dict):
+            return "Workflow"
+        name = tool_input.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        script = tool_input.get("script")
+        if isinstance(script, str):
+            m = re.search(r"name\s*:\s*['\"]([^'\"]+)['\"]", script)
+            if m:
+                return m.group(1)
+        return "Workflow"
+
+    @staticmethod
+    def _fold_workflow_snapshots(
+        ordered_blocks: list | None, wf_reg: dict | None,
+    ) -> None:
+        """Attach cached workflow snapshots onto their ``Workflow`` tool_call
+        blocks (in place), so a settled-within-turn workflow persists its tree."""
+        if not wf_reg or not ordered_blocks:
+            return
+        for ob in ordered_blocks:
+            if not isinstance(ob, dict) or ob.get("type") != "tool_call":
+                continue
+            snap = (wf_reg.get(ob.get("tool_use_id")) or {}).get("snapshot")
+            if snap:
+                ob["workflow"] = snap
+
+    @staticmethod
+    def _build_workflow_snapshot(wp: list) -> dict:
+        """Normalize the CLI's flat ``workflow_progress`` list into a
+        {phases, agents, totals} snapshot for the UI."""
+        phases: list[dict] = []
+        agents: list[dict] = []
+        for e in wp:
+            if not isinstance(e, dict):
+                continue
+            etype = e.get("type")
+            if etype == "workflow_phase":
+                phases.append({"index": e.get("index"), "title": e.get("title")})
+            elif etype == "workflow_agent":
+                summary = e.get("lastToolSummary")
+                agents.append({
+                    "label": e.get("label"),
+                    "phaseIndex": e.get("phaseIndex"),
+                    "phaseTitle": e.get("phaseTitle"),
+                    "state": e.get("state"),
+                    "model": e.get("model"),
+                    "tokens": e.get("tokens"),
+                    "toolCalls": e.get("toolCalls"),
+                    "lastToolName": e.get("lastToolName"),
+                    "lastToolSummary": str(summary)[:200] if summary else None,
+                    "durationMs": e.get("durationMs"),
+                })
+        total_tokens = sum(int(a.get("tokens") or 0) for a in agents)
+        total_tool_calls = sum(int(a.get("toolCalls") or 0) for a in agents)
+        return {
+            "phases": phases,
+            "agents": agents,
+            "totalTokens": total_tokens,
+            "totalToolCalls": total_tool_calls,
+            "agentCount": len(agents),
+        }
 
     def _prune_bg_tasks(self, session_id: str) -> None:
         """Drop settled background tasks from the registry.
@@ -2005,12 +2184,24 @@ class AgentEngine:
         accumulate forever. Running tasks are kept.
         """
         registry = self._bg_task_registry.get(session_id)
-        if not registry:
-            return
-        for tid in [t for t, e in registry.items() if e.get("status") != "running"]:
-            del registry[tid]
-        if not registry:
-            self._bg_task_registry.pop(session_id, None)
+        if registry:
+            for tid in [t for t, e in registry.items() if e.get("status") != "running"]:
+                del registry[tid]
+            if not registry:
+                self._bg_task_registry.pop(session_id, None)
+
+        # Drop settled workflows too (terminal snapshot already broadcast +
+        # persisted); keep running ones so late progress still maps back.
+        wf_reg = self._workflows.get(session_id)
+        if wf_reg:
+            terminal = {"completed", "failed", "stopped"}
+            for tuid in [
+                t for t, e in wf_reg.items()
+                if (e.get("snapshot") or {}).get("status") in terminal
+            ]:
+                del wf_reg[tuid]
+            if not wf_reg:
+                self._workflows.pop(session_id, None)
 
     async def _finalize_turn(
         self, session_id: str, st: _TurnState, channel: str | None,
@@ -2024,6 +2215,13 @@ class AgentEngine:
         """
         # Merge tool results into tool_calls_log
         self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
+
+        # Fold the latest dynamic-workflow snapshot onto its ``Workflow`` block
+        # so the panel reconstructs after reload. This covers workflows that
+        # settle *within* the launching turn — before the message row exists,
+        # so the out-of-band merge_workflow_into_call has nothing to patch.
+        # Longer workflows that settle after finalize are handled by that merge.
+        self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
         # Store assistant message in DB
         await self.sessions.add_message(
