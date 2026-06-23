@@ -36,6 +36,15 @@ dependencies = [
     "opentelemetry-instrumentation-anthropic>=0.40.0",
 ]
 
+[project.optional-dependencies]
+# Test/dev dependencies. Install with: uv pip install -e ".[test]"
+# Upper bounds guard CI against surprise major-version breaks (notably the
+# pytest-asyncio 1.x event_loop changes the suite's conftest relies on).
+test = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.24,<2",
+]
+
 [project.scripts]
 nerve = "nerve.cli:main"
 

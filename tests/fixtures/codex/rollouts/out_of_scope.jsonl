@@ -1,0 +1,3 @@
+{"timestamp":"2026-05-19T17:00:00.000Z","type":"session_meta","payload":{"id":"99999999-aaaa-bbbb-cccc-dddddddddddd","timestamp":"2026-05-19T17:00:00.000Z","cwd":"/tmp/some-other-project","originator":"codex_exec","cli_version":"0.130.0","source":"exec","model_provider":"openai","base_instructions":{"text":""}}}
+{"timestamp":"2026-05-19T17:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"this thread is not in scope — must be skipped"}}
+{"timestamp":"2026-05-19T17:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"agent reply we should NOT ingest","phase":"final_answer"}}
