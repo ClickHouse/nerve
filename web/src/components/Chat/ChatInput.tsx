@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
 import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2 } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
@@ -55,6 +55,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const removeQuote = useChatStore(s => s.removeQuote);
   const updateQuoteInstruction = useChatStore(s => s.updateQuoteInstruction);
   const clearQuotes = useChatStore(s => s.clearQuotes);
+  const setDraft = useChatStore(s => s.setDraft);
   const activeSession = useChatStore(s => s.activeSession);
   const isNewChat = useChatStore(s => s.messages.length === 0);
 
@@ -91,6 +92,23 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   useEffect(() => {
     cancelRewrite(false);
   }, [activeSession, cancelRewrite]);
+
+  // Load this chat's saved draft when switching sessions — an empty box for a
+  // chat with no draft, the unfinished text for one that has it. Reads via
+  // getState so a draft mutation (the keystrokes below) doesn't reload mid-edit.
+  // Focus the composer on every switch so you can start typing right away.
+  useEffect(() => {
+    setInput(useChatStore.getState().drafts[activeSession] ?? '');
+    if (activeSession) setTimeout(() => textareaRef.current?.focus(), 0);
+  }, [activeSession]);
+
+  // Keep the textarea height in sync with its content (typing + draft load).
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+  }, [input]);
 
   // Esc anywhere dismisses the preview (cancels an in-flight rewrite).
   useEffect(() => {
@@ -208,6 +226,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
 
     onSend(message, fileIds.length > 0 ? fileIds : undefined, imageBlocks.length > 0 ? imageBlocks : undefined);
     setInput('');
+    setDraft(activeSession, '');
     clearQuotes();
     // Clean up previews
     attachments.forEach(a => { if (a.preview) URL.revokeObjectURL(a.preview); });
@@ -215,7 +234,6 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     rewriteAbortRef.current?.abort();
     rewriteAbortRef.current = null;
     setRewrite({ status: 'idle' });
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
   };
 
   /** Request a rewrite and open the preview card. Sends nothing by itself. */
@@ -322,14 +340,6 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     const files = Array.from(e.dataTransfer.files);
     if (files.length > 0) {
       addFiles(files);
-    }
-  };
-
-  const handleInput = () => {
-    const el = textareaRef.current;
-    if (el) {
-      el.style.height = 'auto';
-      el.style.height = Math.min(el.scrollHeight, 200) + 'px';
     }
   };
 
@@ -443,7 +453,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             id="nerve-chat-input"
             ref={textareaRef}
             value={input}
-            onChange={(e) => { setInput(e.target.value); handleInput(); }}
+            onChange={(e) => { setInput(e.target.value); setDraft(activeSession, e.target.value); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             placeholder={

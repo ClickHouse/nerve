@@ -14,6 +14,8 @@ Design:
   which mirrors the ``type:`` field in the YAML spec.
 * Adding a new gate = subclass :class:`CronGate`, set ``type``, implement the
   three abstract methods, and register the class in :data:`GATE_REGISTRY`.
+  (Out-of-tree gates can instead be dropped into the gate-plugins directory
+  and auto-registered at startup — see :mod:`nerve.cron.gate_plugins`.)
 
 Example config::
 

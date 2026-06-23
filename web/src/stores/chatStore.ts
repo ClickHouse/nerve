@@ -10,7 +10,7 @@ import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected } from './handlers/sessionHandlers';
-import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress } from './handlers/panelHandlers';
+import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
@@ -53,9 +53,28 @@ const QUOTE_DEFAULTS: Record<QuoteAction, string> = {
 
 let _quoteId = 0;
 
+// WS event types that mutate the *active* chat view — stream tokens, panels,
+// interaction prompts, file changes. They're dropped when their session_id
+// doesn't match the active session: a reconnect binds the socket to the
+// channel's last real session (server.py get_last_session), which — while a
+// not-yet-sent "new chat" is on screen — differs from it, and the replayed
+// buffer would otherwise hijack the view with a phantom "Thinking…" and a
+// disabled composer. Sidebar/list events (session_running, session_updated, …)
+// stay unguarded so background sessions keep updating their row.
+const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
+  'thinking', 'token', 'tool_use', 'tool_result', 'done', 'stopped', 'error',
+  'wakeup', 'auto_turn', 'session_status', 'plan_update', 'subagent_start',
+  'subagent_complete', 'hoa_progress', 'interaction', 'file_changed',
+]);
+
 interface ChatState {
   sessions: Session[];
   activeSession: string;
+  // Not-yet-persisted "new chat" from the + button. Materializes in the API
+  // on the first sent message; rendered pinned at the top of the sidebar.
+  virtualSession: Session | null;
+  // Per-session unsent input text, keyed by session id (incl. the virtual one).
+  drafts: Record<string, string>;
   messages: ChatMessage[];
   // Streaming state — blocks built incrementally
   streamingBlocks: MessageBlock[];
@@ -114,7 +133,9 @@ interface ChatState {
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
-  createSession: (title?: string) => Promise<void>;
+  createSession: () => Promise<void>;
+  discardVirtualSession: () => void;
+  setDraft: (sessionId: string, text: string) => void;
   deleteSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
@@ -149,6 +170,8 @@ interface ChatState {
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   activeSession: '',
+  virtualSession: null,
+  drafts: {},
   messages: [],
   streamingBlocks: [],
   isStreaming: false,
@@ -335,6 +358,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   switchSession: async (id: string) => {
+    // Leaving an untouched (empty-draft) virtual chat discards it, so the
+    // sidebar never accumulates empty "New chat" entries.
+    const vs = get().virtualSession;
+    if (vs && get().activeSession === vs.id && id !== vs.id
+        && !(get().drafts[vs.id] || '').trim()) {
+      set((s) => {
+        const drafts = { ...s.drafts };
+        delete drafts[vs.id];
+        return { virtualSession: null, drafts };
+      });
+    }
     if (id === get().activeSession && get().messages.length > 0) return;
     // Clear all auto-close timers
     clearAllAutoCloseTimers();
@@ -345,6 +379,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       panels: [], activePanelId: null, panelVisible: false,
       modifiedFiles: [], modifiedFilesCount: 0, backgroundTasks: [],
     });
+    // A virtual chat isn't known to the server (it's created on first send),
+    // so don't announce a switch to it — that would raise "Session not found"
+    // and drop the socket. The active-session event guard isolates the view
+    // from the previously-bound session, and there's nothing to fetch.
+    if (id === get().virtualSession?.id) {
+      set({ loading: false });
+      return;
+    }
     ws.switchSession(id);
     try {
       const data = await api.getMessages(id);
@@ -381,15 +423,45 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  createSession: async (title?: string) => {
-    try {
-      const session = await api.createSession(title);
-      await get().loadSessions();
-      await get().switchSession(session.id);
-    } catch (e) {
-      console.error('Failed to create session:', e);
+  createSession: async () => {
+    // The + button no longer hits the API: it mints a local "virtual" chat
+    // that's created server-side (POST) only on its first message, then adopts
+    // the server id. Reuse an existing unsent one rather than stacking empty
+    // chats. The temp id is a full UUID so it never collides with a real
+    // server id (uuid4()[:8]) and is never sent to the backend.
+    const existing = get().virtualSession;
+    if (existing) {
+      if (get().activeSession !== existing.id) await get().switchSession(existing.id);
+      return;
+    }
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const virtual: Session = {
+      id, title: '', source: 'web', status: 'created',
+      updated_at: now, is_running: false,
+    };
+    set({ virtualSession: virtual });
+    await get().switchSession(id);
+  },
+
+  discardVirtualSession: () => {
+    const vs = get().virtualSession;
+    if (!vs) return;
+    set((s) => {
+      const drafts = { ...s.drafts };
+      delete drafts[vs.id];
+      return { virtualSession: null, drafts };
+    });
+    // If it was the active chat, fall back to the most recent real session.
+    if (get().activeSession === vs.id) {
+      const remaining = get().sessions;
+      if (remaining.length > 0) get().switchSession(remaining[0].id);
+      else set({ activeSession: '', messages: [] });
     }
   },
+
+  setDraft: (sessionId: string, text: string) =>
+    set((s) => ({ drafts: { ...s.drafts, [sessionId]: text } })),
 
   deleteSession: async (id: string) => {
     try {
@@ -464,8 +536,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set(s => ({ searchFocusNonce: s.searchFocusNonce + 1 }));
   },
 
-  sendMessage: (content: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => {
-    const session = get().activeSession;
+  sendMessage: async (content: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => {
+    let session = get().activeSession;
     const blocks: import('../types/chat').MessageBlock[] = [];
     if (content) blocks.push({ type: 'text', content });
     if (imageBlocks) {
@@ -473,15 +545,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
         blocks.push({ type: 'image', url: img.url, filename: img.filename, media_type: img.media_type });
       }
     }
+    const vs = get().virtualSession;
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
     set((state) => ({
-      messages: [...state.messages, { role: 'user', blocks }],
+      messages: [...state.messages, { role: 'user' as const, blocks }],
       streamingBlocks: [],
       isStreaming: true,
-      agentStatus: { state: 'thinking' },
+      agentStatus: { state: 'thinking' as const },
     }));
+    // First message in a virtual "new chat": create it in the API now
+    // (deferred from the + click) and adopt the server-minted id for this turn,
+    // so it becomes a real, selectable session that survives switching away.
+    if (vs && vs.id === session) {
+      try {
+        const real: Session = await api.createSession();
+        session = real.id;
+        set((state) => {
+          const drafts = { ...state.drafts };
+          delete drafts[vs.id];
+          return {
+            // Don't yank the view if the user navigated away during the POST.
+            ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
+            virtualSession: null,
+            drafts,
+            // POST /api/sessions returns a partial row (no updated_at); fill
+            // the fields the sidebar needs so date-grouping doesn't choke.
+            sessions: [
+              { ...real, title: 'New chat', is_running: true, updated_at: new Date().toISOString() },
+              ...state.sessions,
+            ],
+          };
+        });
+      } catch (e) {
+        console.error('Failed to create session:', e);
+        set((state) => ({
+          messages: [
+            ...state.messages.slice(0, -1),
+            { role: 'assistant' as const, blocks: [{ type: 'text', content: 'Error: could not start the chat. Please retry.' }] },
+          ],
+          streamingBlocks: [],
+          isStreaming: false,
+          agentStatus: { state: 'idle' },
+        }));
+        return;
+      }
+    }
     const status = ws.sendMessage(content, session, fileIds);
     if (status === 'dropped') {
       // The message could not reach the server. Revert the optimistic
@@ -514,6 +624,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // ------------------------------------------------------------------ //
 
   handleWSMessage: (msg: WSMessage) => {
+    const sid = (msg as { session_id?: string }).session_id;
+    if (sid && sid !== get().activeSession && VIEW_SCOPED_EVENTS.has(msg.type)) return;
     switch (msg.type) {
       // Streaming
       case 'thinking':     return handleThinking(msg, get, set);
@@ -540,6 +652,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'subagent_start':     return handleSubagentStart(msg, get, set);
       case 'subagent_complete':  return handleSubagentComplete(msg, get, set);
       case 'hoa_progress':       return handleHoaProgress(msg, get, set);
+      case 'workflow_progress':  return handleWorkflowProgress(msg, get, set);
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'file_changed':             return handleFileChanged(msg, get, set);

@@ -194,3 +194,54 @@ async def test_runner_all_dropped_still_advances_cursor(db):
     rows, _ = await db.list_source_messages(source="github", limit=100)
     assert rows == []
     assert await db.get_sync_cursor("github") == "c2"
+
+
+# ---------------------------------------------------------------------------
+# Actor guardrail — the "actors" metadata key (list of involved GitHub logins)
+# ---------------------------------------------------------------------------
+
+def test_actor_allowlist_keeps_record_if_any_involved_login_matches():
+    rule = FieldRule(field="actors", allow=["alice", "bob"])
+    # list-valued: kept if ANY involved login is on the allowlist
+    assert rule.passes(_rec(actors=["bob", "stranger"])) is True
+    assert rule.passes(_rec(actors=["alice"])) is True
+    assert rule.passes(_rec(actors=["stranger", "drive-by"])) is False
+
+
+def test_actor_denylist_drops_if_any_login_matches():
+    rule = FieldRule(field="actors", deny=["spammer"])
+    assert rule.passes(_rec(actors=["trusted", "spammer"])) is False
+    assert rule.passes(_rec(actors=["trusted"])) is True
+
+
+def test_actor_allowlist_absent_or_empty_actors_fails_closed():
+    rule = FieldRule(field="actors", allow=["alice"])
+    assert rule.passes(_rec()) is False             # no "actors" key at all
+    assert rule.passes(_rec(actors=[])) is False    # present but empty
+
+
+def test_repo_and_actor_guardrails_and_together():
+    flt = InboxFilter(rules=[
+        FieldRule(field="repo_name", allow=["ClickHouse/*"]),
+        FieldRule(field="actors", allow=["alice", "bob"]),
+    ])
+    assert flt.passes(_rec("ClickHouse/nerve", actors=["bob"])) is True
+    # right repo, untrusted actor → dropped
+    assert flt.passes(_rec("ClickHouse/nerve", actors=["stranger"])) is False
+    # trusted actor, wrong repo → dropped
+    assert flt.passes(_rec("other/repo", actors=["bob"])) is False
+
+
+def test_actor_deny_wins_even_when_an_allowed_actor_is_present():
+    # Security-critical: a denied login co-occurring with an allowed one is
+    # still dropped (deny takes precedence over allow).
+    rule = FieldRule(field="actors", allow=["alice", "bob"], deny=["spammer"])
+    assert rule.passes(_rec(actors=["alice"])) is True
+    assert rule.passes(_rec(actors=["alice", "spammer"])) is False
+
+
+def test_actor_allowlist_is_case_insensitive():
+    rule = FieldRule(field="actors", allow=["Alice"])
+    assert rule.passes(_rec(actors=["alice"])) is True
+    assert rule.passes(_rec(actors=["ALICE"])) is True
+    assert rule.passes(_rec(actors=["bob"])) is False

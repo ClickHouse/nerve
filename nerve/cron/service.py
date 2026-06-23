@@ -59,6 +59,73 @@ def _parse_interval(interval: str) -> int:
     return total or 7200  # Default 2h
 
 
+# Unix crontab day-of-week numbering is 0=Sun..6=Sat (7 also means Sun).
+# APScheduler's numeric day_of_week is 0=Mon..6=Sun, and CronTrigger.from_crontab
+# does NOT remap, so a numeric DOW like "1" (Unix Monday) gets read as APScheduler
+# 1 = Tuesday, i.e. every numeric-DOW cron fires one weekday late. APScheduler does
+# accept unambiguous three-letter day names, so we translate the numbers to names.
+_UNIX_DOW_TO_NAME = {
+    0: "sun", 1: "mon", 2: "tue", 3: "wed",
+    4: "thu", 5: "fri", 6: "sat", 7: "sun",
+}
+
+
+def _remap_dow_value(value: str) -> str:
+    """Map a single Unix DOW number to an APScheduler day name.
+
+    Non-numeric atoms (already a name like ``mon``, or ``*``) and numbers
+    outside 0-7 pass through unchanged so APScheduler can validate them.
+    """
+    v = value.strip()
+    if v.isdigit() and int(v) in _UNIX_DOW_TO_NAME:
+        return _UNIX_DOW_TO_NAME[int(v)]
+    return v
+
+
+def _remap_dow_atom(atom: str) -> str:
+    """Remap one comma-separated DOW atom, preserving range and step syntax.
+
+    Handles ``*``, single values (``1``), ranges (``1-5``), and any of those
+    with a step suffix (``*/2``, ``1-5/2``). Only the numeric components are
+    translated; everything else is left intact.
+    """
+    base, sep, step = atom.partition("/")
+    if base in ("*", ""):
+        remapped = base
+    elif "-" in base:
+        lo, _, hi = base.partition("-")
+        remapped = f"{_remap_dow_value(lo)}-{_remap_dow_value(hi)}"
+    else:
+        remapped = _remap_dow_value(base)
+    return f"{remapped}{sep}{step}" if sep else remapped
+
+
+def _crontab_to_trigger(schedule: str) -> CronTrigger:
+    """Build a CronTrigger from a 5-field crontab string with Unix DOW semantics.
+
+    Drop-in replacement for ``CronTrigger.from_crontab`` that fixes the
+    day-of-week off-by-one (see ``_UNIX_DOW_TO_NAME``). Only the DOW field is
+    treated differently; the other four fields and the no-explicit-timezone
+    behaviour are identical to ``from_crontab``. Raises ``ValueError`` for
+    anything that is not a 5-field expression, so interval strings like ``4h``
+    keep falling through to the IntervalTrigger path.
+    """
+    fields = schedule.split()
+    if len(fields) != 5:
+        raise ValueError(f"Not a 5-field crontab expression: {schedule!r}")
+    minute, hour, day, month, day_of_week = fields
+    remapped_dow = ",".join(
+        _remap_dow_atom(atom) for atom in day_of_week.split(",")
+    )
+    return CronTrigger(
+        minute=minute,
+        hour=hour,
+        day=day,
+        month=month,
+        day_of_week=remapped_dow,
+    )
+
+
 def _parse_timestamp(ts: str) -> datetime:
     """Parse a UTC timestamp string from the database into an aware datetime."""
     if "T" not in ts:
@@ -82,6 +149,13 @@ class CronService:
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
+        # Register drop-in custom gate plugins BEFORE jobs are parsed, so their
+        # `type` keys are present in GATE_REGISTRY when each job's run_if specs
+        # are built (CronJob builds its gates at construction time).
+        from nerve.cron.gate_plugins import load_gate_plugins
+
+        load_gate_plugins(self.config.cron.gate_plugins_dir)
+
         # Load job definitions from both files
         self._jobs = self._load_merged_jobs()
 
@@ -119,7 +193,7 @@ class CronService:
                 schedule_str = getattr(source_config, "schedule", "*/15 * * * *")
 
                 try:
-                    trigger = CronTrigger.from_crontab(schedule_str)
+                    trigger = _crontab_to_trigger(schedule_str)
                 except ValueError:
                     seconds = _parse_interval(schedule_str)
                     trigger = IntervalTrigger(seconds=seconds)
@@ -178,7 +252,7 @@ class CronService:
         the cadence survives restarts (persistent timer).
         """
         try:
-            return CronTrigger.from_crontab(job.schedule)
+            return _crontab_to_trigger(job.schedule)
         except ValueError:
             pass
 
@@ -228,7 +302,7 @@ class CronService:
     def _is_overdue(job: CronJob, last_run: datetime, now: datetime) -> bool:
         """Check if a job should have fired between *last_run* and *now*."""
         try:
-            trigger = CronTrigger.from_crontab(job.schedule)
+            trigger = _crontab_to_trigger(job.schedule)
             next_fire = trigger.get_next_fire_time(last_run, last_run)
             return next_fire is not None and next_fire < now
         except ValueError:

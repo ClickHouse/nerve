@@ -147,6 +147,37 @@ export function handleToolUse(
     return;
   }
 
+  // Is this a dynamic-workflow launch? The Workflow tool spawns a background
+  // runtime; the chat shows a compact card and the live phase/agent tree
+  // lives in a dedicated side-panel tab keyed by this tool_use_id.
+  if (msg.tool === 'Workflow') {
+    const toolUseId = msg.tool_use_id || '';
+    const name = String(msg.input?.name || 'Workflow');
+    const blocks = [...state.streamingBlocks];
+    blocks.push({
+      type: 'tool_call',
+      toolUseId,
+      tool: msg.tool,
+      input: msg.input,
+      status: 'running',
+    });
+    set({ streamingBlocks: blocks, agentStatus: { state: 'tool', toolName: msg.tool } });
+    get().openPanelTab({
+      id: toolUseId,
+      type: 'workflow',
+      label: name,
+      subagentType: 'Workflow',
+      description: '',
+      content: null,
+      prompt: '',
+      streaming: true,
+      status: 'running',
+      startedAt: Date.now(),
+      blocks: [],
+    });
+    return;
+  }
+
   // Is this a child tool call inside a running sub-agent?
   const parentId = msg.parent_tool_use_id;
   if (parentId && state.panels.some(p => p.id === parentId && p.status === 'running')) {
@@ -193,6 +224,20 @@ export function handleToolResult(
   set: Set,
 ): void {
   const state = get();
+
+  // A Workflow tool returns immediately with its run id while the workflow
+  // keeps running in the background. Record the result on the chat card but
+  // DO NOT close the panel — it settles later via a terminal workflow_progress.
+  const workflowTab = state.panels.find(p => p.id === msg.tool_use_id && p.type === 'workflow');
+  if (workflowTab) {
+    const blocks = state.streamingBlocks.map(b =>
+      b.type === 'tool_call' && b.toolUseId === msg.tool_use_id
+        ? { ...b, result: msg.result, isError: msg.is_error, status: 'complete' as const }
+        : b
+    );
+    set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' } });
+    return;
+  }
 
   // Is this a sub-agent (Task) completing?
   // Check if this tool_use_id matches a panel tab (= it's a Task result)
@@ -282,6 +327,9 @@ export function handleToolResult(
 /** Mark any still-running panel tabs as complete & schedule auto-close. */
 function finalizeRunningPanels(get: Get): void {
   for (const panel of get().panels) {
+    // Workflows run in the background past the launching turn — they settle
+    // on their own terminal workflow_progress, not when this turn ends.
+    if (panel.type === 'workflow') continue;
     if (panel.status === 'running') {
       get().updatePanelTab(panel.id, {
         status: 'complete',
