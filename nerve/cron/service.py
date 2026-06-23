@@ -314,6 +314,8 @@ class CronService:
     async def _maybe_rotate_context(
         self, session_id: str, rotate_hours: int,
         rotate_at: str = "",
+        *,
+        force: bool = False,
     ) -> bool:
         """Check if a persistent cron session's context should be rotated.
 
@@ -326,28 +328,33 @@ class CronService:
         Returns True if rotation was performed.
         """
         session = await self.db.get_session(session_id)
-        if not session or not session.get("connected_at"):
-            return False
-
-        connected_at_str = session["connected_at"]
-        try:
-            ts = connected_at_str
-            if "T" not in ts:
-                ts = ts.replace(" ", "T")
-            if not ts.endswith(("Z", "+00:00")):
-                ts += "+00:00"
-            connected_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            logger.warning(
-                "Invalid connected_at for %s: %s", session_id, connected_at_str,
-            )
+        if not session:
             return False
 
         now = datetime.now(timezone.utc)
-        should_rotate = False
-        reason = ""
+        should_rotate = force
+        reason = "manual" if force else ""
 
-        if rotate_at:
+        connected_at = None
+        connected_at_str = session.get("connected_at")
+        if connected_at_str:
+            try:
+                ts = connected_at_str
+                if "T" not in ts:
+                    ts = ts.replace(" ", "T")
+                if not ts.endswith(("Z", "+00:00")):
+                    ts += "+00:00"
+                connected_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Invalid connected_at for %s: %s", session_id, connected_at_str,
+                )
+                if not force:
+                    return False
+        elif not force:
+            return False
+
+        if not should_rotate and rotate_at:
             # Time-of-day rotation: rotate if session started before today's
             # rotate_at and current time is past it.
             try:
@@ -365,7 +372,7 @@ class CronService:
             if now >= today_rotate_utc and connected_at < today_rotate_utc:
                 should_rotate = True
                 reason = f"rotate_at={rotate_at}"
-        elif rotate_hours > 0:
+        elif not should_rotate and rotate_hours > 0:
             age_hours = (now - connected_at).total_seconds() / 3600
             if age_hours >= rotate_hours:
                 should_rotate = True
@@ -705,8 +712,9 @@ class CronService:
             except (ValueError, TypeError):
                 pass
 
-        # Force rotation (rotate_hours=0 ensures any positive age passes)
-        rotated = await self._maybe_rotate_context(session_id, rotate_hours=0)
+        rotated = await self._maybe_rotate_context(
+            session_id, rotate_hours=0, force=True,
+        )
 
         logger.info(
             "Manual rotation for %s: rotated=%s age=%.1fh",
