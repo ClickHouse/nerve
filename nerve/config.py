@@ -271,6 +271,14 @@ class GitHubSyncConfig:
     # pass); deny_repos is a denylist and takes precedence over allow_repos.
     allow_repos: list[str] = field(default_factory=list)
     deny_repos: list[str] = field(default_factory=list)
+    # Actor guardrails — limit which GitHub logins can land a notification in
+    # the inbox, matched on the "actors" metadata key (every login involved in
+    # the notification: issue/PR author, assignees, comment & review authors).
+    # Same semantics as allow_repos/deny_repos — case-insensitive globs, deny
+    # wins, and a non-empty allow_actors is fail-closed (a notification with no
+    # matching actor is dropped before it reaches the inbox). Empty = all pass.
+    allow_actors: list[str] = field(default_factory=list)
+    deny_actors: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> GitHubSyncConfig:
@@ -284,6 +292,8 @@ class GitHubSyncConfig:
             condense=d.get("condense", False),
             allow_repos=d.get("allow_repos", []),
             deny_repos=d.get("deny_repos", []),
+            allow_actors=d.get("allow_actors", []),
+            deny_actors=d.get("deny_actors", []),
         )
 
 
