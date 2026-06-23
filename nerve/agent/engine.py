@@ -2017,11 +2017,21 @@ class AgentEngine:
         tool_use_id = data.get("tool_use_id") or getattr(message, "tool_use_id", None)
         wf_reg = self._workflows.get(session_id) or {}
         wp = data.get("workflow_progress")
+        task_type = str(data.get("task_type") or "")
         is_workflow = bool(tool_use_id) and (
-            tool_use_id in wf_reg or (isinstance(wp, list) and len(wp) > 0)
+            tool_use_id in wf_reg
+            or (isinstance(wp, list) and len(wp) > 0)
+            or "workflow" in task_type
         )
         if is_workflow:
             entry["tool"] = "Workflow"
+            # The CLI reports the workflow name on task_started — authoritative
+            # (and better than the tool-input guess for inline scripts).
+            wf_name = data.get("workflow_name")
+            if wf_name:
+                self._workflows.setdefault(session_id, {}).setdefault(
+                    tool_use_id, {"name": "Workflow", "snapshot": None},
+                )["name"] = str(wf_name)
             await self._emit_workflow_progress(
                 session_id, tool_use_id, subtype, data, message, wp,
             )

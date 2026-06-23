@@ -26,9 +26,16 @@ export function WorkflowToolBlock({ block }: { block: ToolCallBlockData }) {
   const agents = wf?.agents || [];
   const total = wf?.agentCount ?? agents.length;
   const done = agents.filter(a => a.state === 'done').length;
-  const phaseCount = wf?.phases.length || 0;
+  // Phase rows aren't always emitted (e.g. single-phase runs), but agents
+  // still carry phaseIndex — fall back to the distinct phases they reference.
+  const agentPhases = new Set(
+    agents.map(a => a.phaseIndex).filter((x): x is number => typeof x === 'number'),
+  );
+  const phaseCount = Math.max(wf?.phases.length || 0, agentPhases.size);
   const curPhase = wf ? deriveCurrentPhase(wf) : 0;
-  const curPhaseTitle = wf?.phases.find(p => p.index === curPhase)?.title;
+  const curPhaseTitle =
+    wf?.phases.find(p => p.index === curPhase)?.title
+    || agents.find(a => a.phaseIndex === curPhase)?.phaseTitle;
   const tokens = wf?.totalTokens || 0;
 
   const hasTab = panels.some(p => p.id === block.toolUseId);

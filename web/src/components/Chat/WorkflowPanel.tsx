@@ -88,7 +88,7 @@ export function WorkflowPanel({ tab }: { tab: PanelTab }) {
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-text-faint font-mono mb-3 pb-2 border-b border-border-subtle">
         <span><span className="text-text-secondary">{done}</span>/{total} agents done</span>
         {running > 0 && <span><span className="text-hue-amber">{running}</span> running</span>}
-        <span>{wf.phases.length} phases</span>
+        <span>{groups.length} phases</span>
         {wf.totalTokens ? <span>{fmtTokens(wf.totalTokens)} tokens</span> : null}
         {wf.totalToolCalls ? <span>{wf.totalToolCalls} tool calls</span> : null}
       </div>
