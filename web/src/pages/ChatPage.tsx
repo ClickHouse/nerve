@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
@@ -10,6 +10,9 @@ import { SidePanel } from '../components/Chat/SidePanel';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
 import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'lucide-react';
 import { api } from '../api/client';
+import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
+import type { ShortcutDef } from '../utils/keyboard';
+import type { ChatMessage, TextBlockData } from '../types/chat';
 
 const STATUS_LABELS: Record<string, string> = {
   thinking: 'Thinking...',
@@ -40,17 +43,60 @@ export function ChatPage() {
     sendMessage, stopSession, toggleSidebar, openFilesPanel,
   } = useChatStore();
 
-  // Cmd/Ctrl + \ toggles side panel
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === '\\') {
-        e.preventDefault();
-        useChatStore.getState().togglePanel();
-      }
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  // Chat-scoped keyboard shortcuts. Global ones (new chat, search, modal,
+  // Esc cascade) live in <GlobalShortcuts /> in App.tsx.
+  const chatShortcuts = useMemo<ShortcutDef[]>(() => [
+    {
+      id: 'chat-toggle-panel',
+      combo: { mod: true, key: '\\' },
+      description: 'Toggle side panel',
+      section: 'chat',
+      action: () => useChatStore.getState().togglePanel(),
+    },
+    {
+      id: 'chat-toggle-sidebar',
+      combo: { mod: true, shift: true, key: 's' },
+      description: 'Toggle session sidebar',
+      section: 'chat',
+      action: () => useChatStore.getState().toggleSidebar(),
+    },
+    {
+      id: 'chat-focus-input',
+      combo: { mod: true, shift: true, key: ';' },
+      description: 'Focus message input',
+      section: 'chat',
+      allowInInput: true,
+      action: () => {
+        const el = document.getElementById('nerve-chat-input');
+        if (el instanceof HTMLTextAreaElement) el.focus();
+      },
+    },
+    {
+      id: 'chat-copy-last',
+      combo: { mod: true, shift: true, key: 'c' },
+      description: 'Copy last response',
+      section: 'chat',
+      action: () => {
+        const text = getLastAssistantText(useChatStore.getState().messages);
+        if (text) void navigator.clipboard.writeText(text);
+      },
+    },
+    {
+      id: 'chat-delete-current',
+      combo: { mod: true, shift: true, key: 'Backspace' },
+      description: 'Delete current conversation',
+      section: 'chat',
+      action: () => {
+        const id = useChatStore.getState().activeSession;
+        if (!id) return;
+        if (window.confirm('Delete this conversation?')) {
+          void useChatStore.getState().deleteSession(id);
+        }
+      },
+    },
+  ], []);
+
+  useKeyboardShortcuts(chatShortcuts);
 
   // URL → activeSession is handled by the useEffect[sessionId] below.
   // activeSession → URL is intentionally NOT done as a mirror effect —
@@ -230,4 +276,18 @@ export function ChatPage() {
       </div>
     </div>
   );
+}
+
+/** Walk messages backwards, return the joined text of the most recent assistant turn. */
+function getLastAssistantText(messages: ChatMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'assistant') continue;
+    const text = m.blocks
+      .filter((b): b is TextBlockData => b.type === 'text')
+      .map((b) => b.content)
+      .join('\n');
+    return text || null;
+  }
+  return null;
 }

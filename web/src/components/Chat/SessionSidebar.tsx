@@ -42,12 +42,77 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 }) {
   const [systemExpanded, setSystemExpanded] = useState(false);
   const [localQuery, setLocalQuery] = useState('');
+  const [searchHovered, setSearchHovered] = useState(false);
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [searchMounted, setSearchMounted] = useState(false);
+  const [searchVisible, setSearchVisible] = useState(false);
+  // Programmatic mount trigger — set true when something (e.g. Cmd+K) wants
+  // the search input visible without a mouse hover or focus event.
+  const [searchPinned, setSearchPinned] = useState(false);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, virtualSession, discardVirtualSession } = useChatStore();
+  const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   const isSearching = localQuery.trim().length > 0;
+  const shouldShowSearch = searchHovered || searchFocused || isSearching || searchPinned;
+
+  // Mount/unmount the search input with a fade transition (200ms).
+  useEffect(() => {
+    if (shouldShowSearch) {
+      if (closeTimerRef.current) {
+        clearTimeout(closeTimerRef.current);
+        closeTimerRef.current = null;
+      }
+      setSearchMounted(true);
+    } else if (searchMounted) {
+      setSearchVisible(false);
+      closeTimerRef.current = setTimeout(() => {
+        setSearchMounted(false);
+        closeTimerRef.current = null;
+      }, 200);
+    }
+  }, [shouldShowSearch, searchMounted]);
+
+  // After mount, flip to visible on next frame so the CSS transition runs.
+  useEffect(() => {
+    if (searchMounted && !searchVisible) {
+      const id = requestAnimationFrame(() => setSearchVisible(true));
+      return () => cancelAnimationFrame(id);
+    }
+  }, [searchMounted, searchVisible]);
+
+  // External "focus the search" request (e.g. Cmd+K). Pin the input so it
+  // mounts; the focus effect below takes over once it's in the DOM.
+  useEffect(() => {
+    if (searchFocusNonce > 0) setSearchPinned(true);
+  }, [searchFocusNonce]);
+
+  // Once the pinned input is in the DOM, focus + select it. We focus as soon
+  // as it's mounted (not after the fade-in) so the browser's focus event
+  // races less; the CSS transition still runs for the visual fade.
+  useEffect(() => {
+    if (searchPinned && searchMounted && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [searchPinned, searchMounted]);
+
+  // Release the pin only after onFocus has confirmed the focus landed —
+  // dropping it earlier risks a brief render with pinned=false AND
+  // focused=false, which collapses shouldShowSearch and fades the input out.
+  useEffect(() => {
+    if (searchPinned && searchFocused) setSearchPinned(false);
+  }, [searchPinned, searchFocused]);
+
+  // Clean up pending close timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    };
+  }, []);
 
   // Debounced search
   const handleSearchChange = useCallback((value: string) => {
@@ -125,37 +190,58 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   return (
     <div className={`bg-surface border-r border-border-subtle flex flex-col shrink-0 transition-all duration-200 overflow-hidden ${collapsed ? 'w-0 border-r-0' : 'w-60'}`}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-border-subtle">
-        <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">Conversations</span>
-        <button
-          onClick={onCreate}
-          className="w-5 h-5 rounded flex items-center justify-center text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
-          title="New session"
-        >
-          <Plus size={12} />
-        </button>
-      </div>
+      {/* Search + New chat */}
+      <div className="px-2 py-1.5 border-b border-border-subtle">
+        <div className="relative h-7">
+          {/* Search pill (always visible, hover-zone trigger) */}
+          <button
+            type="button"
+            onMouseEnter={() => setSearchHovered(true)}
+            onMouseLeave={() => setSearchHovered(false)}
+            className="absolute left-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 rounded-full border border-border-subtle flex items-center gap-1 text-[11px] text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer z-10"
+          >
+            <Search size={11} className="pointer-events-none" />
+            <span>Search sessions</span>
+          </button>
 
-      {/* Search */}
-      <div className="px-2 py-1.5">
-        <div className="relative">
-          <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-faint" />
-          <input
-            ref={inputRef}
-            type="text"
-            value={localQuery}
-            onChange={e => handleSearchChange(e.target.value)}
-            placeholder="Search sessions..."
-            className="w-full bg-surface-raised border border-border rounded-md text-[12px] text-text-secondary placeholder-text-faint pl-7 pr-7 py-1.5 outline-none focus:border-text-faint transition-colors"
-          />
-          {isSearching && (
-            <button
-              onClick={() => { setLocalQuery(''); clearSearch(); }}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-text-faint hover:text-text-muted cursor-pointer"
-            >
-              <X size={12} />
-            </button>
+          {/* New chat pill (hidden under input when open) */}
+          <button
+            onClick={onCreate}
+            title="New chat"
+            className="absolute right-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 rounded-full border border-border-subtle flex items-center gap-1 text-[11px] text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
+          >
+            <Plus size={11} />
+            <span>New chat</span>
+          </button>
+
+          {searchMounted && (
+            <>
+              <input
+                id="nerve-sidebar-search"
+                ref={inputRef}
+                type="text"
+                value={localQuery}
+                onChange={e => handleSearchChange(e.target.value)}
+                onFocus={() => setSearchFocused(true)}
+                onBlur={() => setSearchFocused(false)}
+                onMouseEnter={() => setSearchHovered(true)}
+                onMouseLeave={() => setSearchHovered(false)}
+                placeholder="Search sessions..."
+                className={`absolute inset-0 w-full h-full bg-surface-raised border border-border rounded-md text-[12px] text-text-secondary placeholder-text-faint pl-7 pr-7 outline-none focus:border-text-faint transition-all duration-200 ease-out z-20 ${
+                  searchVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                }`}
+              />
+              {isSearching && (
+                <button
+                  onClick={() => { setLocalQuery(''); clearSearch(); }}
+                  className={`absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-text-faint hover:text-text-muted cursor-pointer transition-opacity duration-200 z-30 ${
+                    searchVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                  }`}
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -200,9 +286,9 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
             {/* Virtual "new chat" — pinned at the very top until the first
                 message materializes it server-side. */}
             {virtualSession && (
-              <div
-                onClick={() => onSelect(virtualSession.id)}
-                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-sm transition-colors
+              <Link
+                to={`/chat/${virtualSession.id}`}
+                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-sm transition-colors no-underline
                   ${virtualSession.id === activeSession
                     ? 'bg-accent/10 text-text'
                     : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -216,13 +302,13 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
                 )}
                 <button
-                  onClick={(e) => { e.stopPropagation(); discardVirtualSession(); }}
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); discardVirtualSession(); }}
                   className="p-0.5 text-text-faint hover:text-text-muted opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
                   title="Discard new chat"
                 >
                   <X size={13} />
                 </button>
-              </div>
+              </Link>
             )}
 
             {/* Pinned running sessions */}

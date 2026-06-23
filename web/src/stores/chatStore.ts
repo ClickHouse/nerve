@@ -128,6 +128,8 @@ interface ChatState {
   searchQuery: string;
   searchResults: Session[] | null;  // null = not searching
   searchLoading: boolean;
+  /** Bumped whenever something wants the sidebar search input focused (e.g. Cmd+K). */
+  searchFocusNonce: number;
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
@@ -139,6 +141,8 @@ interface ChatState {
   toggleStar: (id: string) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
   clearSearch: () => void;
+  /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
+  requestSearchFocus: () => void;
   sendMessage: (content: string) => void;
   stopSession: () => void;
   handleWSMessage: (msg: WSMessage) => void;
@@ -189,6 +193,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   searchQuery: '',
   searchResults: null,
   searchLoading: false,
+  searchFocusNonce: 0,
 
   addQuote: (text: string, action: QuoteAction) => {
     const id = `q${++_quoteId}`;
@@ -525,6 +530,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   clearSearch: () => {
     set({ searchQuery: '', searchResults: null, searchLoading: false });
+  },
+
+  requestSearchFocus: () => {
+    set(s => ({ searchFocusNonce: s.searchFocusNonce + 1 }));
   },
 
   sendMessage: async (content: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => {
