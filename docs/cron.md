@@ -170,11 +170,77 @@ run_if:
 > `idle_consumer: <name>` fields still work — they are translated into an
 > equivalent `messages` gate at load time. Prefer `run_if` for new jobs.
 
-### Adding a new gate type
+### Adding a built-in gate type
 
-Gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`, set its
-`type`, implement `is_satisfied`, `describe`, and `from_config`, then register
-the class in `GATE_REGISTRY`. It becomes usable from `run_if` immediately.
+Built-in gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`,
+set its `type`, implement `is_satisfied`, `describe`, and `from_config`, then
+register the class in `GATE_REGISTRY`. It becomes usable from `run_if`
+immediately. This is the right path for gates that ship with Nerve.
+
+### Custom gate plugins (drop-in)
+
+To add your **own** gate without editing core source, drop a `.py` file into
+the gate-plugins directory — `~/.nerve/cron/gates/` by default (overridable via
+the `cron.gate_plugins_dir` config key). On daemon startup Nerve imports each
+file and registers every `CronGate` subclass it defines with a non-empty
+`type`. After that, `run_if` can reference your gate by `type` exactly like a
+built-in. Because this never touches `nerve/cron/gates.py`, your custom gates
+don't conflict when you pull Nerve upstream.
+
+```python
+# ~/.nerve/cron/gates/stale_tasks.py
+from nerve.cron.gates import CronGate, GateContext
+
+
+class StaleTasksGate(CronGate):
+    type = "stale_tasks"
+
+    def __init__(self, min_age_minutes: int = 30):
+        self.min_age_minutes = min_age_minutes
+
+    async def is_satisfied(self, ctx: GateContext) -> bool:
+        # ctx exposes {job_id, db} — DB-only (see note below).
+        ...
+
+    def describe(self) -> str:
+        return f"stale tasks older than {self.min_age_minutes}m"
+
+    @classmethod
+    def from_config(cls, spec: dict) -> "StaleTasksGate":
+        return cls(min_age_minutes=int(spec.get("min_age_minutes", 30)))
+```
+
+```yaml
+# ~/.nerve/cron/jobs.yaml — reference it like any built-in gate
+run_if:
+  - type: stale_tasks
+    min_age_minutes: 60
+```
+
+A gate must implement the same three methods as a built-in (`is_satisfied`,
+`describe`, `from_config`).
+
+**Rules** (all fail-safe — a bad plugin never crashes the daemon):
+
+- Files whose name starts with `_` (and `__pycache__`) are ignored.
+- A plugin whose `type` collides with an already-registered gate is skipped
+  with a warning: a **built-in always wins**, and among two plugins the **first
+  loaded (filename-sorted) wins**.
+- Any import error in a plugin file is logged (naming the file) and that file
+  is skipped; the rest still load.
+- **No hot-reload:** adding or changing a plugin requires a daemon restart —
+  the same as every other piece of cron config.
+
+> **Context is DB-only.** A gate receives `GateContext{job_id, db}`, which is
+> enough for DB-driven conditions (task counts, source cursors, age filters). A
+> gate that needs live runtime state — e.g. which sessions are currently
+> running — is **not** supported by this loader; that would require widening
+> the gate context, a separate change.
+
+> **Trust note.** Files in the gate-plugins directory are imported (executed)
+> at daemon startup. This is the same trust model as `config.yaml`, configured
+> MCP servers, and cron prompt files — all user-controlled code/config the
+> daemon already loads. Only place files you trust in this directory.
 
 ## Session Modes
 

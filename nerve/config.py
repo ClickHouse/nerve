@@ -503,12 +503,16 @@ class MemoryConfig:
 class CronConfig:
     jobs_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/jobs.yaml"))
     system_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/system.yaml"))
+    # Directory scanned at startup for drop-in custom gate plugins (.py files
+    # defining CronGate subclasses). See nerve/cron/gate_plugins.py.
+    gate_plugins_dir: Path = field(default_factory=lambda: Path("~/.nerve/cron/gates"))
 
     @classmethod
     def from_dict(cls, d: dict) -> CronConfig:
         return cls(
             jobs_file=_expand_path(d.get("jobs_file", "~/.nerve/cron/jobs.yaml")) or Path("~/.nerve/cron/jobs.yaml"),
             system_file=_expand_path(d.get("system_file", "~/.nerve/cron/system.yaml")) or Path("~/.nerve/cron/system.yaml"),
+            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir", "~/.nerve/cron/gates")) or Path("~/.nerve/cron/gates"),
         )
 
 
