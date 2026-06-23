@@ -3033,6 +3033,44 @@ class AgentEngine:
     #  Cron / Hook runs                                                    #
     # ------------------------------------------------------------------ #
 
+    async def _teardown_oneshot_client(
+        self, session_id: str, *, keepalive_if_bg: bool = True,
+    ) -> None:
+        """Tear down a one-shot (cron / hook) run's SDK client.
+
+        One-shot runs normally discard the client immediately to avoid leaking
+        claude CLI subprocesses. The exception is a run that yields while a
+        ``run_in_background`` task is still live: discarding here kills the
+        subprocess and the idle-stream watcher that delivers the task's
+        completion turn, so the agent would never resume to finish its work
+        (the fix-worker "strand" failure). In that case keep the client alive —
+        exactly as an interactive/web session does — and let
+        ``run_idle_client_sweep`` reap it once the task settles (it already
+        skips live-background-task sessions for the same reason).
+
+        ``keepalive_if_bg`` MUST be False for runs whose ``session_id`` is
+        reused across runs (``run_persistent_cron``'s stable ``cron:{job_id}``):
+        parking such a client would let the NEXT scheduled run reuse the same
+        client/conversation while the prior run's background task is still in
+        flight, interleaving the two. Keep-alive is only safe for the
+        unique-per-run isolated paths (``run_cron`` / ``run_hook``).
+        """
+        # Optimistic check: a task that settles between the watcher's last drain
+        # and here still reads as live, parking a client whose work is actually
+        # done — harmless, the next idle sweep reaps it.
+        if keepalive_if_bg and self._has_live_background_tasks(session_id):
+            logger.info(
+                "One-shot session %s parked on a live background task — keeping "
+                "client alive so its completion turn can resume the run; the "
+                "idle sweep reaps it once the task settles.",
+                session_id,
+            )
+            return
+        # background_memorize: returning promptly closes the run log and frees
+        # APScheduler to fire the next run — memorization queues on a global
+        # lock and must not gate the run lifecycle.
+        await self._discard_client(session_id, background_memorize=True)
+
     async def run_cron(
         self,
         job_id: str,
@@ -3042,8 +3080,11 @@ class AgentEngine:
     ) -> str:
         """Run an agent turn for a cron job in an isolated session.
 
-        The SDK client is discarded immediately after the run completes
-        to avoid leaking claude CLI subprocesses for one-shot jobs.
+        The SDK client is normally discarded immediately after the run
+        completes to avoid leaking claude CLI subprocesses for one-shot jobs —
+        unless the run yielded with a live ``run_in_background`` task, in which
+        case it is kept alive so the agent can resume when the task completes
+        (see ``_teardown_oneshot_client``).
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -3057,10 +3098,7 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            # background_memorize: returning promptly closes the cron run
-            # log and frees APScheduler to fire the next run — memorization
-            # queues on a global lock and must not gate the run lifecycle.
-            await self._discard_client(session_id, background_memorize=True)
+            await self._teardown_oneshot_client(session_id)
 
     async def run_persistent_cron(
         self,
@@ -3071,9 +3109,13 @@ class AgentEngine:
         """Run a persistent cron job that maintains context across runs.
 
         Uses a stable session_id (cron:{job_id}) so the SDK resumes
-        conversation context on subsequent triggers.  The client is
-        discarded after each run to free the subprocess, but
-        sdk_session_id is preserved for the next resume.
+        conversation context on subsequent triggers.  The client is discarded
+        after each run to free the subprocess (sdk_session_id is preserved for
+        the next resume). Unlike the isolated one-shot paths it does NOT keep
+        the client alive for a live background task: the stable session is
+        reused by the next run, which would collide with the parked task — so a
+        persistent-cron background task that outlives its run is not resumed
+        (use an isolated cron for long background work).
         """
         session_id = f"cron:{job_id}"
         await self.sessions.get_or_create(
@@ -3087,8 +3129,10 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            # See run_cron: memorization must not gate the run lifecycle.
-            await self._discard_client(session_id, background_memorize=True)
+            # Stable session_id is reused by the next run, which would collide
+            # with a parked background task — so persistent crons always discard
+            # (no keep-alive). See _teardown_oneshot_client.
+            await self._teardown_oneshot_client(session_id, keepalive_if_bg=False)
 
     async def run_hook(
         self,
@@ -3099,7 +3143,10 @@ class AgentEngine:
     ) -> str:
         """Run an agent turn for a webhook in an isolated session.
 
-        The SDK client is discarded immediately after the run completes.
+        The SDK client is normally discarded immediately after the run
+        completes — unless the run yielded with a live ``run_in_background``
+        task, in which case it is kept alive so the agent can resume when the
+        task completes (see ``_teardown_oneshot_client``).
         """
         session = await self.sessions.create_hook_session(hook_name, hook_id)
         session_id = session["id"]
@@ -3111,8 +3158,7 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            # See run_cron: memorization must not gate the run lifecycle.
-            await self._discard_client(session_id, background_memorize=True)
+            await self._teardown_oneshot_client(session_id)
 
     # ------------------------------------------------------------------ #
     #  Idle client sweep                                                   #
