@@ -652,6 +652,30 @@ class TestRotationMemorize:
             "cron:pers", preserve_sdk_id=False,
         )
 
+    @pytest.mark.asyncio
+    async def test_manual_rotation_forces_disabled_rotation_window(self, cron_service):
+        """Manual rotation clears context even when scheduled rotation is disabled."""
+        cron_service._jobs = [
+            _make_job(
+                id="pers", session_mode="persistent", context_rotate_hours=0,
+            ),
+        ]
+        cron_service.db.get_session = AsyncMock(return_value={
+            "connected_at": _hours_ago(1),
+            "sdk_session_id": "sdk-123",
+        })
+
+        result = await cron_service.rotate_session("pers")
+
+        assert result["rotated"] is True
+        assert result["session_age_hours"] is not None
+        cron_service.engine.schedule_memorize.assert_awaited_once_with(
+            "cron:pers",
+        )
+        cron_service.engine.sessions.mark_idle.assert_awaited_once_with(
+            "cron:pers", preserve_sdk_id=False,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Run gates — service-level skip/run behaviour

@@ -131,6 +131,13 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     setPrevQuoteCount(quotes.length);
   }, [quotes.length, prevQuoteCount, quotes]);
 
+  // Auto-focus textarea when active session changes (new chat or session switch)
+  useEffect(() => {
+    if (activeSession && !disabled && textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  }, [activeSession, disabled]);
+
   // Cleanup object URLs on unmount
   useEffect(() => {
     return () => {
@@ -443,6 +450,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           />
 
           <textarea
+            id="nerve-chat-input"
             ref={textareaRef}
             value={input}
             onChange={(e) => { setInput(e.target.value); setDraft(activeSession, e.target.value); }}
