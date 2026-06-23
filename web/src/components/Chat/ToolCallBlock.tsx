@@ -12,6 +12,7 @@ import { CCTaskToolBlock } from './tools/CCTaskToolBlock';
 import { ScheduleWakeupBlock } from './tools/ScheduleWakeupBlock';
 import { SourceToolBlock } from './tools/SourceToolBlock';
 import { SubagentToolBlock } from './tools/SubagentToolBlock';
+import { WorkflowToolBlock } from './tools/WorkflowToolBlock';
 import { HoAToolBlock } from './tools/HoAToolBlock';
 import { QuestionBlock } from './tools/QuestionBlock';
 import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
@@ -45,6 +46,9 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
     case 'Agent':
     case 'Task':
       return <SubagentToolBlock block={block} />;
+    // Dynamic workflow: compact card in chat; live phase/agent tree in panel.
+    case 'Workflow':
+      return <WorkflowToolBlock block={block} />;
     // Claude Code 2.1+ task tools (replacement for TodoWrite). Compact card
     // in chat; full list shown by the TaskPanel below the message stream.
     case 'TaskCreate':

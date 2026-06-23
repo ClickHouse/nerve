@@ -167,6 +167,58 @@ class MessageStore:
         await self.db.commit()
         return msg_id
 
+    async def merge_workflow_into_call(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        workflow: dict,
+    ) -> int | None:
+        """Attach a dynamic-workflow progress snapshot to its ``Workflow``
+        ``tool_call`` block so it survives reload.
+
+        A workflow runs in the background and can settle *after* the turn
+        that launched it was already persisted, so the snapshot is folded
+        into the stored block out-of-band (keyed by ``tool_use_id``). Unlike
+        :meth:`merge_tool_result_into_call`, normal Nerve turns store every
+        block inside a single assistant message with no per-block
+        ``external_id`` — so we locate the row by scanning recent messages
+        whose ``blocks`` JSON mentions the id.
+
+        Returns the message ``id`` that was updated, or ``None`` if no
+        matching tool_call block exists.
+        """
+        async with self.db.execute(
+            "SELECT id, blocks FROM messages "
+            "WHERE session_id = ? AND blocks LIKE ? "
+            "ORDER BY id DESC LIMIT 10",
+            (session_id, f"%{tool_use_id}%"),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            blocks_json = row["blocks"]
+            if not blocks_json:
+                continue
+            try:
+                blocks = json.loads(blocks_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            updated = False
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_call" and b.get("tool_use_id") == tool_use_id:
+                    b["workflow"] = workflow
+                    updated = True
+                    break
+            if updated:
+                await self.db.execute(
+                    "UPDATE messages SET blocks = ? WHERE id = ?",
+                    (json.dumps(blocks), row["id"]),
+                )
+                await self.db.commit()
+                return row["id"]
+        return None
+
     async def get_messages(
         self, session_id: str, limit: int = 500, offset: int = 0
     ) -> list[dict]:

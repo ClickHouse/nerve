@@ -10,7 +10,7 @@ import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected } from './handlers/sessionHandlers';
-import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress } from './handlers/panelHandlers';
+import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
@@ -531,6 +531,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'subagent_start':     return handleSubagentStart(msg, get, set);
       case 'subagent_complete':  return handleSubagentComplete(msg, get, set);
       case 'hoa_progress':       return handleHoaProgress(msg, get, set);
+      case 'workflow_progress':  return handleWorkflowProgress(msg, get, set);
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'file_changed':             return handleFileChanged(msg, get, set);

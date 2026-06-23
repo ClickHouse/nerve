@@ -69,6 +69,16 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
       }
       break;
     }
+    case 'workflow_progress': {
+      for (let i = result.length - 1; i >= 0; i--) {
+        const b = result[i];
+        if (b.type === 'tool_call' && b.toolUseId === event.tool_use_id) {
+          result[i] = { ...b, workflow: event.workflow };
+          break;
+        }
+      }
+      break;
+    }
     case 'wakeup': {
       if (!result.some((b) => b.type === 'wakeup')) {
         result.unshift({ type: 'wakeup' });
@@ -97,6 +107,27 @@ export function rebuildPanelTabsFromBuffer(
   // Claude Code 2.1.x renamed the subagent tool from "Task" → "Agent"; we
   // match both so old chat history still rebuilds panels correctly.
   for (const event of events) {
+    // Dynamic-workflow launch — open a workflow tab (settled later by the
+    // workflow_progress pass below).
+    if (event.type === 'tool_use' && event.tool === 'Workflow') {
+      const toolUseId = event.tool_use_id || '';
+      const tab: PanelTab = {
+        id: toolUseId,
+        type: 'workflow',
+        label: String(event.input?.name || 'Workflow'),
+        subagentType: 'Workflow',
+        description: '',
+        content: null,
+        prompt: '',
+        streaming: true,
+        status: 'running',
+        startedAt: Date.now(),
+        blocks: [],
+      };
+      panels.push(tab);
+      panelMap.set(toolUseId, tab);
+      continue;
+    }
     if (event.type === 'tool_use' && (event.tool === 'Agent' || event.tool === 'Task')) {
       const subagentType = String(event.input?.subagent_type || event.input?.model || 'agent');
       const toolUseId = event.tool_use_id || '';
@@ -167,6 +198,22 @@ export function rebuildPanelTabsFromBuffer(
         }
       }
     }
+  }
+
+  // Third pass: settle workflow tabs from their progress snapshots (last wins).
+  for (const event of events) {
+    if (event.type !== 'workflow_progress') continue;
+    const panel = panelMap.get(event.tool_use_id);
+    if (!panel) continue;
+    const wf = event.workflow;
+    const terminal = wf.status === 'completed' || wf.status === 'failed' || wf.status === 'stopped';
+    panel.workflow = wf;
+    panel.label = wf.name || panel.label;
+    panel.status = wf.status === 'failed' ? 'error' : terminal ? 'complete' : 'running';
+    panel.streaming = !terminal;
+    panel.isError = wf.status === 'failed';
+    if (terminal && wf.summary) panel.content = wf.summary;
+    if (terminal) panel.completedAt = Date.now();
   }
 
   // Focus last running tab, or last tab overall

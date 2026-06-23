@@ -18,6 +18,41 @@ export interface ToolCallBlockData {
   status: 'running' | 'complete';
   /** houseofagents NDJSON progress events (populated during hoa_execute runs) */
   hoaEvents?: Record<string, unknown>[];
+  /** Dynamic-workflow progress snapshot (populated during Workflow runs) */
+  workflow?: WorkflowSnapshot;
+}
+
+// --- Dynamic workflow (Claude Code Workflow tool) progress ---
+
+export interface WorkflowPhase {
+  index?: number;
+  title?: string;
+}
+
+export interface WorkflowAgent {
+  label?: string;
+  phaseIndex?: number;
+  phaseTitle?: string;
+  /** queued | running | done | failed (CLI vocabulary) */
+  state?: string;
+  model?: string;
+  tokens?: number;
+  toolCalls?: number;
+  lastToolName?: string;
+  lastToolSummary?: string;
+  durationMs?: number;
+}
+
+export interface WorkflowSnapshot {
+  name: string;
+  /** running | completed | failed | stopped */
+  status: string;
+  summary?: string;
+  phases: WorkflowPhase[];
+  agents: WorkflowAgent[];
+  totalTokens?: number;
+  totalToolCalls?: number;
+  agentCount?: number;
 }
 
 export interface ImageBlockData {
@@ -84,9 +119,9 @@ export type AgentStatus =
 
 export interface PanelTab {
   id: string;              // toolUseId
-  type: 'plan' | 'subagent' | 'files';
-  label: string;           // "Plan", "Explore", "Agent", "Files"
-  subagentType: string;    // "Plan", "Explore", "general-purpose"
+  type: 'plan' | 'subagent' | 'files' | 'workflow';
+  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow"
+  subagentType: string;    // "Plan", "Explore", "general-purpose", "Workflow"
   description: string;
   model?: string;
   content: string | null;
@@ -97,6 +132,8 @@ export interface PanelTab {
   completedAt?: number;
   isError?: boolean;
   blocks: MessageBlock[];  // live sub-agent activity (same types as main chat)
+  /** For type==='workflow': the live phase/agent progress tree. */
+  workflow?: WorkflowSnapshot;
 }
 
 // --- Session modified files & diff types ---
