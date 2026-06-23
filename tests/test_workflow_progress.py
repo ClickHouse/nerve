@@ -98,6 +98,27 @@ class TestDeriveName:
         assert AgentEngine._derive_workflow_name(None) == "Workflow"
 
 
+class TestFoldSnapshots:
+    def test_folds_cached_snapshot_onto_workflow_block(self):
+        blocks = [
+            {"type": "text", "content": "hi"},
+            {"type": "tool_call", "tool": "Workflow", "tool_use_id": "wf-1", "input": {}},
+            {"type": "tool_call", "tool": "Bash", "tool_use_id": "b-1", "input": {}},
+        ]
+        wf_reg = {"wf-1": {"name": "x", "snapshot": {"status": "completed", "agents": []}}}
+        AgentEngine._fold_workflow_snapshots(blocks, wf_reg)
+        assert blocks[1]["workflow"] == {"status": "completed", "agents": []}
+        assert "workflow" not in blocks[2]  # non-matching block untouched
+
+    def test_noop_without_registry_or_blocks(self):
+        # Should not raise on empty/None inputs.
+        AgentEngine._fold_workflow_snapshots(None, {"wf-1": {"snapshot": {}}})
+        AgentEngine._fold_workflow_snapshots([], None)
+        blocks = [{"type": "tool_call", "tool": "Workflow", "tool_use_id": "wf-1"}]
+        AgentEngine._fold_workflow_snapshots(blocks, {"wf-1": {"snapshot": None}})
+        assert "workflow" not in blocks[0]  # cached snapshot is None → skip
+
+
 @pytest.mark.asyncio
 class TestBroadcastEnvelope:
     async def test_workflow_progress_envelope(self):

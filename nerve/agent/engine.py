@@ -2127,6 +2127,21 @@ class AgentEngine:
         return "Workflow"
 
     @staticmethod
+    def _fold_workflow_snapshots(
+        ordered_blocks: list | None, wf_reg: dict | None,
+    ) -> None:
+        """Attach cached workflow snapshots onto their ``Workflow`` tool_call
+        blocks (in place), so a settled-within-turn workflow persists its tree."""
+        if not wf_reg or not ordered_blocks:
+            return
+        for ob in ordered_blocks:
+            if not isinstance(ob, dict) or ob.get("type") != "tool_call":
+                continue
+            snap = (wf_reg.get(ob.get("tool_use_id")) or {}).get("snapshot")
+            if snap:
+                ob["workflow"] = snap
+
+    @staticmethod
     def _build_workflow_snapshot(wp: list) -> dict:
         """Normalize the CLI's flat ``workflow_progress`` list into a
         {phases, agents, totals} snapshot for the UI."""
@@ -2200,6 +2215,13 @@ class AgentEngine:
         """
         # Merge tool results into tool_calls_log
         self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
+
+        # Fold the latest dynamic-workflow snapshot onto its ``Workflow`` block
+        # so the panel reconstructs after reload. This covers workflows that
+        # settle *within* the launching turn — before the message row exists,
+        # so the out-of-band merge_workflow_into_call has nothing to patch.
+        # Longer workflows that settle after finalize are handled by that merge.
+        self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
         # Store assistant message in DB
         await self.sessions.add_message(
