@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -52,10 +53,10 @@ def _make_cron_log(finished_at: str) -> dict:
     return {"job_id": "test-job", "finished_at": finished_at, "status": "success"}
 
 
-@pytest_asyncio.fixture
-async def cron_service():
+def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     """Minimal CronService with mocked dependencies."""
     config = MagicMock()
+    config.timezone = timezone_name
     config.cron.system_file = MagicMock()
     config.cron.jobs_file = MagicMock()
     config.agent.cron_model = "test-model"
@@ -70,8 +71,13 @@ async def cron_service():
     db.log_cron_finish = AsyncMock()
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
 
-    svc = CronService(config, engine, db)
-    return svc
+    return CronService(config, engine, db)
+
+
+@pytest_asyncio.fixture
+async def cron_service():
+    """Minimal CronService with mocked dependencies."""
+    return _make_cron_service()
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +127,18 @@ class TestParseInterval:
 
     def test_default_on_garbage(self):
         assert _parse_interval("???") == 7200
+
+
+# ---------------------------------------------------------------------------
+# Configured timezone
+# ---------------------------------------------------------------------------
+
+class TestConfiguredTimezone:
+    def test_scheduler_uses_configured_timezone(self):
+        svc = _make_cron_service("America/New_York")
+
+        assert str(svc.timezone) == "America/New_York"
+        assert str(svc.scheduler.timezone) == "America/New_York"
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +256,20 @@ class TestIsOverdue:
         last_run = _utc_now() - timedelta(hours=10)
         assert CronService._is_overdue(job, last_run, _utc_now()) is True
 
+    def test_crontab_uses_configured_timezone(self):
+        """Catch-up checks crontab fires in the configured timezone."""
+        job = _make_job(schedule="0 9 * * *")
+        last_run = datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 1, 14, 30, tzinfo=timezone.utc)
+
+        assert (
+            CronService._is_overdue(
+                job, last_run, now, ZoneInfo("America/New_York"),
+            )
+            is True
+        )
+        assert CronService._is_overdue(job, last_run, now, timezone.utc) is False
+
     def test_weekly_overdue_after_exactly_one_week(self):
         """A weekly Monday job is overdue one week later, not 6 or 8 days."""
         job = _make_job(schedule="0 13 * * 1")  # Mondays 13:00 UTC
@@ -301,6 +333,26 @@ class TestMakeTrigger:
 
         from apscheduler.triggers.cron import CronTrigger
         assert isinstance(trigger, CronTrigger)
+
+    @pytest.mark.asyncio
+    async def test_crontab_uses_configured_timezone(self):
+        svc = _make_cron_service("America/Los_Angeles")
+
+        trigger = await svc._make_trigger(_make_job(schedule="30 11 * * *"))
+
+        from apscheduler.triggers.cron import CronTrigger
+        assert isinstance(trigger, CronTrigger)
+        assert str(trigger.timezone) == "America/Los_Angeles"
+
+    @pytest.mark.asyncio
+    async def test_interval_uses_configured_timezone(self):
+        svc = _make_cron_service("America/Los_Angeles")
+
+        trigger = await svc._make_trigger(_make_job(schedule="4h"))
+
+        from apscheduler.triggers.interval import IntervalTrigger
+        assert isinstance(trigger, IntervalTrigger)
+        assert str(trigger.timezone) == "America/Los_Angeles"
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +624,33 @@ class TestRotationMemorize:
 
         assert rotated is False
         cron_service.engine.schedule_memorize.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rotate_at_uses_configured_timezone(self):
+        """Daily rotate_at uses config timezone, not the server timezone."""
+        svc = _make_cron_service("America/New_York")
+        svc.db.get_session = AsyncMock(return_value={
+            "connected_at": "2026-01-01T13:59:00+00:00",
+        })
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                fixed = datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc)
+                if tz is None:
+                    return fixed.replace(tzinfo=None)
+                return fixed.astimezone(tz)
+
+        with patch("nerve.cron.service.datetime", FixedDateTime):
+            rotated = await svc._maybe_rotate_context(
+                "cron:pers", rotate_hours=0, rotate_at="09:00",
+            )
+
+        assert rotated is True
+        svc.engine.schedule_memorize.assert_awaited_once_with("cron:pers")
+        svc.engine.sessions.mark_idle.assert_awaited_once_with(
+            "cron:pers", preserve_sdk_id=False,
+        )
 
     @pytest.mark.asyncio
     async def test_manual_rotation_forces_disabled_rotation_window(self, cron_service):
