@@ -1,4 +1,5 @@
 import { getToken } from './client';
+import type { WorkflowSnapshot } from '../types/chat';
 
 export type WSMessage =
   | { type: 'token'; session_id: string; content: string; parent_tool_use_id?: string }
@@ -26,6 +27,7 @@ export type WSMessage =
   | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'hoa_progress'; session_id: string; event: Record<string, unknown> }
+  | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }
   | { type: 'wakeup'; session_id: string }
   | { type: 'auto_turn'; session_id: string }
   | { type: 'pong' };

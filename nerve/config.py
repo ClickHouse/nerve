@@ -139,6 +139,12 @@ class AgentConfig:
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
+    # Substrings of model names for which the context-1m beta header must NOT
+    # be sent (some subscriptions reject the beta for specific models — e.g.
+    # claude-sonnet-4-6 returns 400 "long context beta not yet available for
+    # this subscription"). Match is case-insensitive substring on the resolved
+    # model name. Empty list = send beta for all models when context_1m=True.
+    context_1m_excluded_models: list[str] = field(default_factory=list)
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
@@ -158,8 +164,22 @@ class AgentConfig:
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
             context_1m=d.get("context_1m", True),
+            context_1m_excluded_models=list(
+                d.get("context_1m_excluded_models", []) or []
+            ),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
+        )
+
+    def context_1m_enabled_for(self, model: str | None) -> bool:
+        """Whether the context-1m beta applies to *model* (or the default
+        model when None).  False if globally disabled or if the model name
+        matches any entry in ``context_1m_excluded_models``."""
+        if not self.context_1m:
+            return False
+        resolved = (model or self.model).lower()
+        return not any(
+            tok and tok.lower() in resolved for tok in self.context_1m_excluded_models
         )
 
 
@@ -271,6 +291,14 @@ class GitHubSyncConfig:
     # pass); deny_repos is a denylist and takes precedence over allow_repos.
     allow_repos: list[str] = field(default_factory=list)
     deny_repos: list[str] = field(default_factory=list)
+    # Actor guardrails — limit which GitHub logins can land a notification in
+    # the inbox, matched on the "actors" metadata key (every login involved in
+    # the notification: issue/PR author, assignees, comment & review authors).
+    # Same semantics as allow_repos/deny_repos — case-insensitive globs, deny
+    # wins, and a non-empty allow_actors is fail-closed (a notification with no
+    # matching actor is dropped before it reaches the inbox). Empty = all pass.
+    allow_actors: list[str] = field(default_factory=list)
+    deny_actors: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> GitHubSyncConfig:
@@ -284,6 +312,8 @@ class GitHubSyncConfig:
             condense=d.get("condense", False),
             allow_repos=d.get("allow_repos", []),
             deny_repos=d.get("deny_repos", []),
+            allow_actors=d.get("allow_actors", []),
+            deny_actors=d.get("deny_actors", []),
         )
 
 
@@ -503,12 +533,16 @@ class MemoryConfig:
 class CronConfig:
     jobs_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/jobs.yaml"))
     system_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/system.yaml"))
+    # Directory scanned at startup for drop-in custom gate plugins (.py files
+    # defining CronGate subclasses). See nerve/cron/gate_plugins.py.
+    gate_plugins_dir: Path = field(default_factory=lambda: Path("~/.nerve/cron/gates"))
 
     @classmethod
     def from_dict(cls, d: dict) -> CronConfig:
         return cls(
             jobs_file=_expand_path(d.get("jobs_file", "~/.nerve/cron/jobs.yaml")) or Path("~/.nerve/cron/jobs.yaml"),
             system_file=_expand_path(d.get("system_file", "~/.nerve/cron/system.yaml")) or Path("~/.nerve/cron/system.yaml"),
+            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir", "~/.nerve/cron/gates")) or Path("~/.nerve/cron/gates"),
         )
 
 

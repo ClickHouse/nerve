@@ -304,3 +304,118 @@ class TestShutdownFlush:
         await engine.shutdown()
 
         assert not engine._memorize_bg_tasks
+
+
+# ---------------------------------------------------------------------------
+# Cron teardown — keep the client alive while a background task is still live
+# ---------------------------------------------------------------------------
+
+class TestOneShotRunKeepsClientForLiveBackgroundTasks:
+    """The capability this enables: a one-shot (cron / hook) agent can start a
+    ``run_in_background`` build/test, yield its turn, and be resumed when the
+    task completes — instead of being torn down and stranded.
+
+    The idle-stream watcher (``_idle_stream_watcher``) already delivers a
+    background task's completion as a fresh autonomous turn, and
+    ``run_idle_client_sweep`` already SKIPS discarding a client that has a live
+    background task for exactly that reason — but only while the SDK client is
+    alive. The one place that violates the contract is the cron teardown:
+    ``run_cron`` / ``run_persistent_cron`` discard the client in their
+    ``finally`` unconditionally, killing the subprocess + watcher at the first
+    yield, so the task is orphaned and the run never resumes to finish its work.
+
+    Intended behaviour: when the run yields with a live background task, the
+    cron teardown must NOT discard — leave the client alive so the watcher can
+    deliver the completion turn; the existing idle sweep reaps it once the task
+    settles. (A bounded safety-net for a task that never settles belongs in the
+    sweep, not here.) NOTE: run_persistent_cron is excluded — its session_id is
+    stable/reused across runs, so it always discards (keep-alive would let the
+    next run collide with the parked task); only the unique-per-run isolated
+    paths (run_cron / run_hook) keep the client alive.
+
+    Regression for the 2026-06-22 fix-worker strand (clickhouse-java#2721:
+    background-and-yield in an isolated cron run left the task locked, never
+    resumed).
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_cron_keeps_client_when_bg_task_live(self):
+        engine = _make_engine()
+        engine.sessions.create_cron_session = AsyncMock(
+            return_value={"id": "cron:job:1"},
+        )
+        engine.run = AsyncMock(return_value="done")
+        engine._discard_client = AsyncMock()
+        # Agent yielded while a backgrounded build was still running.
+        engine._bg_task_registry["cron:job:1"] = {
+            "bg1": {"task_id": "bg1", "label": "mvn -pl client-v2 test",
+                    "tool": "Bash", "status": "running"},
+        }
+        assert engine._has_live_background_tasks("cron:job:1") is True
+
+        result = await engine.run_cron("job", "prompt")
+
+        assert result == "done"
+        # Kept alive: the idle-stream watcher delivers the completion turn and
+        # the idle sweep reaps the client once the task settles.
+        engine._discard_client.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_persistent_cron_discards_even_with_live_bg_task(self):
+        """Persistent crons reuse a STABLE session_id across runs, so parking
+        the client on a live bg task would let the next scheduled run collide
+        with the still-in-flight task on the same client/conversation. They
+        therefore always discard — keep-alive is only safe for the unique-per-
+        run isolated paths (run_cron / run_hook)."""
+        engine = _make_engine()
+        engine.sessions.get_or_create = AsyncMock(return_value={"id": "cron:job"})
+        engine.run = AsyncMock(return_value="done")
+        engine._discard_client = AsyncMock()
+        engine._bg_task_registry["cron:job"] = {
+            "bg1": {"task_id": "bg1", "label": "build", "tool": "Bash",
+                    "status": "running"},
+        }
+        assert engine._has_live_background_tasks("cron:job") is True
+
+        result = await engine.run_persistent_cron("job", "prompt")
+
+        assert result == "done"
+        # Discarded despite the live bg task (stable session reuse hazard).
+        engine._discard_client.assert_awaited_once_with(
+            "cron:job", background_memorize=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_hook_keeps_client_when_bg_task_live(self):
+        engine = _make_engine()
+        engine.sessions.create_hook_session = AsyncMock(
+            return_value={"id": "hook:deploy:1"},
+        )
+        engine.run = AsyncMock(return_value="done")
+        engine._discard_client = AsyncMock()
+        engine._bg_task_registry["hook:deploy:1"] = {
+            "bg1": {"task_id": "bg1", "label": "deploy", "tool": "Bash",
+                    "status": "running"},
+        }
+        assert engine._has_live_background_tasks("hook:deploy:1") is True
+
+        result = await engine.run_hook("deploy", "1", "prompt")
+
+        assert result == "done"
+        engine._discard_client.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_hook_discards_when_no_bg_task(self):
+        engine = _make_engine()
+        engine.sessions.create_hook_session = AsyncMock(
+            return_value={"id": "hook:deploy:2"},
+        )
+        engine.run = AsyncMock(return_value="done")
+        engine._discard_client = AsyncMock()
+
+        result = await engine.run_hook("deploy", "2", "prompt")
+
+        assert result == "done"
+        engine._discard_client.assert_awaited_once_with(
+            "hook:deploy:2", background_memorize=True,
+        )

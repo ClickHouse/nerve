@@ -11,7 +11,12 @@ import pytest
 import pytest_asyncio
 
 from nerve.cron.jobs import CronJob
-from nerve.cron.service import CronService, _parse_interval, _parse_timestamp
+from nerve.cron.service import (
+    CronService,
+    _crontab_to_trigger,
+    _parse_interval,
+    _parse_timestamp,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +142,82 @@ class TestConfiguredTimezone:
 
 
 # ---------------------------------------------------------------------------
+# _crontab_to_trigger: Unix day-of-week semantics
+# ---------------------------------------------------------------------------
+
+# A Saturday, so "next fire" lands on a distinct weekday for any DOW value.
+_DOW_BASE = datetime(2026, 6, 20, 0, 0, tzinfo=timezone.utc)
+
+
+def _fire_weekdays(schedule: str) -> set[str]:
+    """Collect the weekday abbreviations a crontab fires on within one week."""
+    trigger = _crontab_to_trigger(schedule)
+    end = _DOW_BASE + timedelta(days=8)
+    days: set[str] = set()
+    prev = None
+    cur = _DOW_BASE
+    while True:
+        fire = trigger.get_next_fire_time(prev, cur)
+        if fire is None or fire > end:
+            break
+        days.add(fire.strftime("%a"))
+        prev = fire
+        # Jump to the start of the next day so per-minute schedules don't loop.
+        cur = fire.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return days
+
+
+class TestCrontabToTrigger:
+    def test_numeric_monday_fires_monday(self):
+        """The bug: Unix DOW 1 (Monday) was firing Tuesday via from_crontab."""
+        fire = _crontab_to_trigger("0 13 * * 1").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Monday"
+        assert (fire.hour, fire.minute) == (13, 0)
+
+    def test_numeric_sunday_fires_sunday(self):
+        fire = _crontab_to_trigger("0 13 * * 0").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Sunday"
+
+    def test_seven_also_means_sunday(self):
+        fire = _crontab_to_trigger("0 13 * * 7").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Sunday"
+
+    def test_range_weekdays_only(self):
+        assert _fire_weekdays("* * * * 1-5") == {"Mon", "Tue", "Wed", "Thu", "Fri"}
+
+    def test_list_monday_and_thursday(self):
+        assert _fire_weekdays("0 9 * * 1,4") == {"Mon", "Thu"}
+
+    def test_star_dow_fires_every_day(self):
+        assert _fire_weekdays("0 9 * * *") == {
+            "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+        }
+
+    def test_day_name_passthrough(self):
+        """Already-named DOW values are left intact (and stay correct)."""
+        fire = _crontab_to_trigger("0 13 * * mon").get_next_fire_time(None, _DOW_BASE)
+        assert fire.strftime("%A") == "Monday"
+
+    @pytest.mark.parametrize(
+        "schedule",
+        ["0 5 * * *", "*/30 * * * *", "0 */4 * * *", "17 */4 * * *", "13 13 * * *"],
+    )
+    def test_non_dow_fields_match_from_crontab(self, schedule):
+        """Schedules without a numeric DOW behave exactly like from_crontab."""
+        from apscheduler.triggers.cron import CronTrigger
+
+        ours = _crontab_to_trigger(schedule).get_next_fire_time(None, _DOW_BASE)
+        ref = CronTrigger.from_crontab(schedule).get_next_fire_time(None, _DOW_BASE)
+        assert ours == ref
+
+    @pytest.mark.parametrize("schedule", ["4h", "30m", "1h30m", "???", ""])
+    def test_non_crontab_raises_value_error(self, schedule):
+        """Interval strings must still raise so the IntervalTrigger path runs."""
+        with pytest.raises(ValueError):
+            _crontab_to_trigger(schedule)
+
+
+# ---------------------------------------------------------------------------
 # _is_overdue
 # ---------------------------------------------------------------------------
 
@@ -188,6 +269,19 @@ class TestIsOverdue:
             is True
         )
         assert CronService._is_overdue(job, last_run, now, timezone.utc) is False
+
+    def test_weekly_overdue_after_exactly_one_week(self):
+        """A weekly Monday job is overdue one week later, not 6 or 8 days."""
+        job = _make_job(schedule="0 13 * * 1")  # Mondays 13:00 UTC
+        last_run = datetime(2026, 6, 15, 13, 0, tzinfo=timezone.utc)  # a Monday
+        # Six days later (Sunday): the next Monday fire has not arrived yet.
+        assert CronService._is_overdue(
+            job, last_run, last_run + timedelta(days=6),
+        ) is False
+        # Just past the next Monday fire, so now overdue.
+        assert CronService._is_overdue(
+            job, last_run, last_run + timedelta(days=7, minutes=1),
+        ) is True
 
 
 # ---------------------------------------------------------------------------

@@ -246,6 +246,26 @@ class StreamBroadcaster:
             "is_error": is_error,
         })
 
+    async def broadcast_workflow_progress(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        workflow: dict[str, Any],
+    ) -> None:
+        """Broadcast a dynamic-workflow progress snapshot.
+
+        ``workflow`` is the normalized progress tree (phases + agents +
+        totals + status) parsed from the CLI's ``task_progress``
+        ``workflow_progress`` payload. The UI renders it in a dedicated
+        side-panel tab keyed by ``tool_use_id`` (the Workflow tool call).
+        """
+        await self.broadcast(session_id, {
+            "type": "workflow_progress",
+            "session_id": session_id,
+            "tool_use_id": tool_use_id,
+            "workflow": workflow,
+        })
+
     async def broadcast_error(self, session_id: str, error: str) -> None:
         await self.broadcast(session_id, {"type": "error", "session_id": session_id, "error": error})
 

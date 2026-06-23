@@ -10,6 +10,7 @@ cover the engine pieces that surface that activity:
 """
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -37,6 +38,7 @@ def _make_engine() -> AgentEngine:
         ),
     )
     engine._bg_task_registry = {}
+    engine._workflows = {}
     engine._idle_watchers = {}
     engine._session_locks = {}
     return engine
@@ -199,6 +201,63 @@ async def test_non_task_subtypes_ignored():
         )
         bc.broadcast.assert_not_called()
     assert "s1" not in engine._bg_task_registry
+
+
+@pytest.mark.asyncio
+async def test_workflow_task_emits_progress_and_persists():
+    """A dynamic-workflow task (task_type=local_workflow, workflow_progress on
+    task_progress, terminal via task_updated) drives workflow_progress events
+    and persists the final snapshot. Shapes mirror a real captured run."""
+    engine = _make_engine()
+    engine.db = SimpleNamespace(merge_workflow_into_call=AsyncMock())
+    # _process_sdk_message would have registered the Workflow tool_use id.
+    engine._workflows["s1"] = {"wf-tool": {"name": "Workflow", "snapshot": None}}
+
+    wf_events = []
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_workflow_progress = AsyncMock(
+            side_effect=lambda sid, tid, snap: wf_events.append((tid, snap)),
+        )
+        await engine._handle_system_message("s1", SystemMessage(
+            subtype="task_started",
+            data=_sys_msg(
+                "task_started", task_id="wt", tool_use_id="wf-tool",
+                task_type="local_workflow", workflow_name="verify-ui",
+                description="tiny workflow",
+            ),
+        ))
+        await engine._handle_system_message("s1", SystemMessage(
+            subtype="task_progress",
+            data=_sys_msg(
+                "task_progress", task_id="wt", tool_use_id="wf-tool",
+                description="tiny workflow",
+                workflow_progress=[
+                    {"type": "workflow_agent", "label": "echo", "phaseIndex": 1,
+                     "phaseTitle": "Echo", "state": "running", "model": "opus",
+                     "tokens": 100, "toolCalls": 0},
+                ],
+            ),
+        ))
+        await engine._handle_system_message("s1", SystemMessage(
+            subtype="task_updated",
+            data=_sys_msg(
+                "task_updated", task_id="wt", tool_use_id="wf-tool",
+                patch={"status": "completed", "end_time": 1},
+            ),
+        ))
+
+    # Chip relabeled; workflow name captured from the CLI's workflow_name.
+    assert engine._bg_task_registry["s1"]["wt"]["tool"] == "Workflow"
+    # One progress broadcast per task message.
+    assert len(wf_events) == 3
+    tid, last = wf_events[-1]
+    assert tid == "wf-tool"
+    assert last["name"] == "verify-ui"
+    assert last["status"] == "completed"
+    assert last["agentCount"] == 1  # carried over from the progress snapshot
+    # Terminal snapshot persisted onto the Workflow block.
+    engine.db.merge_workflow_into_call.assert_awaited_once()
 
 
 def test_prune_bg_tasks_drops_settled():
@@ -552,3 +611,86 @@ async def test_idle_sweep_disabled_when_timeout_zero():
     )
     assert await engine.run_idle_client_sweep() == 0
     assert called is False  # short-circuits before touching the session store
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: a parked one-shot session resumes when its bg task completes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_idle_watcher_resumes_parked_session_on_background_completion():
+    """The payoff of keeping a one-shot (cron/hook) client alive.
+
+    A cron/hook run that yields while a ``run_in_background`` task is still live
+    is now KEPT ALIVE (``_teardown_oneshot_client`` skips the discard). This
+    drives the REAL ``_idle_stream_watcher`` against that parked client and
+    proves the end-to-end resume: when the task settles, the watcher delivers
+    the completion as an autonomous turn — the agent resumes and finishes its
+    work with no new ``run()`` — and the task flips out of "live" so the idle
+    sweep can then reap the client (the same lifecycle a web session uses).
+
+    Together with the run_cron/run_hook keep-alive tests (teardown is deferred)
+    and the idle-sweep tests (reaped once settled), this closes the loop on the
+    2026-06-22 fix-worker strand.
+    """
+    engine = _make_engine()
+    engine._IDLE_STREAM_POLL_SECONDS = 0.05  # snappy poll for the test
+    stream = _FakeStream([])  # agent just yielded — nothing buffered yet
+    client = _fake_client(stream)
+    finalized = _patch_finalize(engine)
+
+    # The parked state: a background task still running after the yield.
+    engine._bg_task_registry["s1"] = {
+        "t1": {"task_id": "t1", "label": "mvn -pl client-v2 test",
+               "tool": "Bash", "status": "running"},
+    }
+    assert engine._has_live_background_tasks("s1") is True
+    engine._is_client_dead = lambda _c: False
+    engine.sessions = SimpleNamespace(
+        get_client=lambda _sid: client,
+        is_running=lambda _sid: False,
+        register_task=lambda _sid, _task: None,
+        mark_running=lambda _sid: None,
+        mark_not_running=lambda _sid: None,
+    )
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_token = AsyncMock()
+        bc.is_buffering = lambda sid: False
+        bc.start_buffering = lambda sid: None
+        bc.stop_buffering = lambda sid: []
+        bc.mark_turn_open = lambda sid: None
+        bc.is_turn_open = lambda sid: False
+
+        watcher = asyncio.create_task(
+            engine._idle_stream_watcher("s1", client, "cron", None),
+        )
+        try:
+            # Background task completes: the CLI emits its settle + a follow-up
+            # autonomous turn into the live client's stream.
+            stream.push(_sys_msg("task_notification", task_id="t1",
+                                 status="completed", output_file="/tmp/x",
+                                 summary="done"))
+            stream.push(_sys_msg("init", cwd="/tmp"))
+            stream.push(_assistant_text(
+                "Build passed; pushed the fix and updated the task."))
+            stream.push(_result_msg())
+
+            for _ in range(100):  # up to ~5s
+                if finalized:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
+
+    # The watcher resumed the parked session as exactly one autonomous turn.
+    assert len(finalized) == 1
+    assert finalized[0].full_response_text == (
+        "Build passed; pushed the fix and updated the task."
+    )
+    # Task settled → no longer live → the idle sweep may now reap the client.
+    assert engine._has_live_background_tasks("s1") is False

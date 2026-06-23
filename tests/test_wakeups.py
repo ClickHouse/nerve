@@ -142,6 +142,7 @@ class TestWakeupSweep:
     async def svc(self, db):
         await db.create_session("s1", source="web")
         config = MagicMock()
+        config.timezone = "UTC"
         engine = AsyncMock()
         # is_running is synchronous — default to "not running".
         engine.sessions = MagicMock()

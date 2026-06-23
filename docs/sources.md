@@ -138,6 +138,8 @@ sync:
     condense: true                # Haiku extraction for long notifications
     allow_repos: []               # Guardrail allowlist — empty = all repos. Example: ["ClickHouse/*"]
     deny_repos: []                # Guardrail denylist — always dropped (takes precedence)
+    allow_actors: []              # Guardrail allowlist of GitHub logins — empty = all. Example: ["alice", "bob"]
+    deny_actors: []               # Guardrail denylist of GitHub logins — always dropped (takes precedence)
 
   github_events:
     enabled: true
@@ -207,6 +209,30 @@ With `allow_repos` empty (the default), all repos pass — behavior is unchanged
 |-------|------|---------|-------------|
 | `github.allow_repos` | list | `[]` | Allowlist of repo globs. Empty = all repos pass |
 | `github.deny_repos` | list | `[]` | Denylist of repo globs. Takes precedence over `allow_repos` |
+
+### GitHub actor guardrail
+
+The GitHub notification source also matches on `actors` — the list of every GitHub login
+involved in a notification (issue/PR author, assignees, and comment/review authors). This
+restricts **who** can put a notification in front of the worker, so a drive-by `@mention`
+from an untrusted account is dropped before the agent ever sees it:
+
+```yaml
+sync:
+  github:
+    allow_actors: ["alice", "bob"]   # Only notifications involving these logins reach the inbox
+    deny_actors:  ["noisy-bot"]       # Always dropped, even if otherwise allowed
+```
+
+`actors` is list-valued, so a notification is kept when **any** involved login matches the
+allowlist. A non-empty `allow_actors` is **fail-closed**: a notification with no
+identifiable actor (e.g. enrichment failed) is dropped. With `allow_actors` empty (the
+default), all actors pass — behavior is unchanged. The repo and actor rules AND together.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.allow_actors` | list | `[]` | Allowlist of GitHub login globs. Empty = all actors pass |
+| `github.deny_actors` | list | `[]` | Denylist of GitHub login globs. Takes precedence over `allow_actors` |
 
 ### Extending to other sources
 

@@ -86,15 +86,19 @@ def build_source_runners(
     # GitHub (notifications)
     gh = config.sync.github
     if gh.enabled:
-        from nerve.sources.filters import InboxFilter
+        from nerve.sources.filters import FieldRule, InboxFilter
         from nerve.sources.github import GitHubSource
 
         source = GitHubSource()
-        # Guardrail: restrict which repos reach the inbox (matched on the
-        # "repo_name" metadata key set by GitHubSource).
-        gh_filter = InboxFilter.from_field(
-            "repo_name", allow=gh.allow_repos, deny=gh.deny_repos,
-        )
+        # Guardrails: restrict which repos (matched on the "repo_name" metadata
+        # key) and which GitHub actors (matched on the "actors" metadata key —
+        # every login involved in a notification) reach the inbox. The two rules
+        # AND together; within each, deny wins and a non-empty allow is
+        # fail-closed.
+        gh_filter = InboxFilter(rules=[
+            FieldRule(field="repo_name", allow=gh.allow_repos, deny=gh.deny_repos),
+            FieldRule(field="actors", allow=gh.allow_actors, deny=gh.deny_actors),
+        ])
         runners.append(SourceRunner(
             source=source,
             db=db,
@@ -107,8 +111,11 @@ def build_source_runners(
         ))
         if gh_filter.active:
             logger.info(
-                "Registered source: github (batch=%d, guardrail: allow=%s deny=%s)",
-                gh.batch_size, gh.allow_repos or "*", gh.deny_repos or [],
+                "Registered source: github (batch=%d, guardrail: "
+                "repos allow=%s deny=%s; actors allow=%s deny=%s)",
+                gh.batch_size,
+                gh.allow_repos or "*", gh.deny_repos or [],
+                gh.allow_actors or "*", gh.deny_actors or [],
             )
         else:
             logger.info("Registered source: github (batch=%d)", gh.batch_size)
