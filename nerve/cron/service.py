@@ -82,6 +82,13 @@ class CronService:
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
+        # Register drop-in custom gate plugins BEFORE jobs are parsed, so their
+        # `type` keys are present in GATE_REGISTRY when each job's run_if specs
+        # are built (CronJob builds its gates at construction time).
+        from nerve.cron.gate_plugins import load_gate_plugins
+
+        load_gate_plugins(self.config.cron.gate_plugins_dir)
+
         # Load job definitions from both files
         self._jobs = self._load_merged_jobs()
 
