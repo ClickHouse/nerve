@@ -43,13 +43,105 @@ PID_FILE = PID_DIR / "nerve.pid"
 LOG_FILE = PID_DIR / "nerve.log"
 
 
-def setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+def _add_trace_context(logger, method_name, event_dict):
+    """structlog processor — inject OTel trace_id/span_id when a span is active.
+
+    No-op when no telemetry provider is set (the span context is invalid),
+    so this is safe whether or not OTLP export is enabled.
+    """
+    try:
+        from opentelemetry import trace
+
+        ctx = trace.get_current_span().get_span_context()
+        if ctx and ctx.is_valid:
+            event_dict["trace_id"] = format(ctx.trace_id, "032x")
+            event_dict["span_id"] = format(ctx.span_id, "016x")
+    except Exception:
+        pass
+    return event_dict
+
+
+def _console_renderer(_logger, _name, event_dict: dict) -> str:
+    """Render a log record in Nerve's classic console format.
+
+    Preserves ``HH:MM:SS [LEVEL] name: message``, appending any structured
+    key/values and ``trace_id``/``span_id`` when present.
+    """
+    ts = event_dict.pop("timestamp", "")
+    level = str(event_dict.pop("level", "info")).upper()
+    name = event_dict.pop("logger", "") or event_dict.pop("logger_name", "")
+    event = event_dict.pop("event", "")
+    trace_id = event_dict.pop("trace_id", None)
+    span_id = event_dict.pop("span_id", None)
+    # `format_exc_info` (in the processor chain) renders any exc_info into
+    # this "exception" string; append it on its own lines like stdlib does.
+    exception = event_dict.pop("exception", None)
+    line = f"{ts} [{level}] {name}: {event}"
+    extras = " ".join(
+        f"{k}={v}" for k, v in event_dict.items() if not k.startswith("_")
     )
+    if extras:
+        line += " " + extras
+    if trace_id:
+        line += f" trace_id={trace_id} span_id={span_id}"
+    if exception:
+        line += "\n" + exception
+    return line
+
+
+def setup_logging(verbose: bool = False, log_format: str | None = None) -> None:
+    """Configure structured logging (idempotent).
+
+    All existing ``logging.getLogger(__name__)`` call sites are bridged
+    through structlog's ``ProcessorFormatter`` — no call-site changes. The
+    console renderer preserves the classic ``HH:MM:SS [LEVEL] name: msg``
+    format by default; ``log_format="json"`` (or ``NERVE_LOG_FORMAT=json``)
+    emits JSON. ``trace_id``/``span_id`` are injected whenever an OTel span
+    is active.
+    """
+    import structlog
+
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = (log_format or os.environ.get("NERVE_LOG_FORMAT", "console")).lower()
+
+    shared_processors = [
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        _add_trace_context,
+        # Render any exc_info (from logger.exception / exc_info=True) into an
+        # "exception" string so both the console and JSON renderers include
+        # the traceback instead of dropping or choking on the raw tuple.
+        structlog.processors.format_exc_info,
+    ]
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if fmt == "json"
+        else _console_renderer
+    )
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            renderer,
+        ],
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    # Idempotent: replace any handlers we (or basicConfig) installed before,
+    # but preserve the OTLP log-export handler attached by otel.init_otel —
+    # otherwise a later setup_logging() call would silently kill log export.
+    for h in list(root.handlers):
+        cls = type(h)
+        if cls.__name__ == "LoggingHandler" and cls.__module__.startswith("opentelemetry"):
+            continue
+        root.removeHandler(h)
+    root.addHandler(handler)
+    root.setLevel(level)
+
     # Quiet noisy loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -186,6 +278,11 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
         resolved_dir = resolved_dir.resolve()
     config = load_config(resolved_dir)
     set_config(config)
+    # Re-apply logging with the configured format now that config is loaded
+    # (the early call above used the console/env default). An explicit
+    # NERVE_LOG_FORMAT env var still wins.
+    if os.environ.get("NERVE_LOG_FORMAT") is None and config.telemetry.log_format != "console":
+        setup_logging(verbose, log_format=config.telemetry.log_format)
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
     ctx.obj["config_dir"] = str(resolved_dir)

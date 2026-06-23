@@ -36,6 +36,11 @@ from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
 )
+from nerve.observability import otel
+from nerve.observability.otel import (
+    init_otel,
+    shutdown as otel_shutdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +139,13 @@ async def lifespan(app: FastAPI):
     db = await init_db(db_path, workspace=config.workspace)
     logger.info("Database initialized at %s", db_path)
 
+    # Generic OTLP export — must be set up BEFORE init_langfuse so Nerve
+    # owns the global OTel TracerProvider. Langfuse v3 then reuses our
+    # provider (it only creates its own when the global is still a proxy),
+    # so spans fan out to both the OTLP endpoint and Langfuse. No-op when
+    # telemetry.endpoint is unset. Never raises.
+    init_otel(config)
+
     # Optional Langfuse observability — must be set up BEFORE the engine
     # creates SDK clients so the configure_claude_agent_sdk() patches are
     # in place when the SDK initializes its OTEL tracer provider. Failures
@@ -230,10 +242,12 @@ async def lifespan(app: FastAPI):
                     _memorize_stats["last_run_at"] = datetime.now(timezone.utc).isoformat()
                     _memorize_stats["last_result"] = result
                     _memorize_stats["total_runs"] += 1
+                    otel.memorize_runs.add(1)
             except Exception as e:
                 logger.error("Memorization sweep failed: %s", e)
                 _memorize_stats["total_errors"] += 1
                 _memorize_stats["last_result"] = {"error": str(e)}
+                otel.memorize_errors.add(1)
 
     memorize_task = asyncio.create_task(_periodic_memorize())
 
@@ -481,6 +495,11 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(langfuse_flush)
     except Exception as e:
         logger.debug("Langfuse flush during shutdown failed: %s", e)
+    # Flush + shut down OTLP providers (sync, may block on the network).
+    try:
+        await asyncio.to_thread(otel_shutdown)
+    except Exception as e:
+        logger.debug("OTel shutdown failed: %s", e)
     await close_db()
     if proxy_service:
         await proxy_service.stop()
@@ -510,6 +529,15 @@ def create_app() -> FastAPI:
     # of that compresses ~3-4x. minimum_size=1024 skips tiny responses
     # where the framing overhead would dominate.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    # OpenTelemetry FastAPI instrumentation (HTTP server spans + metrics).
+    # Gated on config so disabled installs pay no per-request overhead. The
+    # OTLP providers are set up later in lifespan (init_otel); the
+    # instrumentor binds to OTel's global proxy tracer/meter, which resolve
+    # to those providers once set.
+    _tel = get_config().telemetry
+    if _tel.enabled and (_tel.traces or _tel.metrics):
+        otel.instrument_app(app)
 
     # REST routes
     app.include_router(register_all_routes())

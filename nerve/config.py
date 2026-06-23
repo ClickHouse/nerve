@@ -973,6 +973,64 @@ class LangfuseConfig:
 
 
 @dataclass
+class TelemetryConfig:
+    """Generic OpenTelemetry (OTLP) export — optional, vendor-neutral.
+
+    Exports traces, metrics, and logs over OTLP to an endpoint **you**
+    run (a collector, or any OTLP-speaking backend — Grafana/Tempo,
+    Honeycomb, Datadog, etc.). Nerve does not run a collector. Activated
+    by setting ``endpoint``; empty endpoint = no-op, zero overhead. Can
+    run alongside the Langfuse integration (both receive the same spans).
+
+    Standard ``OTEL_EXPORTER_OTLP_*`` environment variables are honored by
+    the exporters directly; the fields here are a convenience that seed
+    those env vars from config (operator-set env always wins).
+
+    ``log_format`` is honored even with no ``endpoint`` configured —
+    structured JSON console logs are useful for any log shipper.
+    """
+
+    endpoint: str = ""                      # e.g. http://localhost:4318 — empty disables
+    protocol: str = "http/protobuf"         # "http/protobuf" | "grpc"
+    headers: dict[str, str] = field(default_factory=dict)  # OTLP auth headers
+    service_name: str = "nerve"
+    traces: bool = True
+    metrics: bool = True
+    logs: bool = False                      # OTLP log export off unless asked
+    system_metrics: bool = True             # process/runtime metrics sampler
+    metric_interval_ms: int = 60000
+    log_format: str = "console"             # "console" (default) or "json"
+
+    @property
+    def enabled(self) -> bool:
+        """True only when an OTLP endpoint is configured."""
+        return bool(self.endpoint.strip())
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TelemetryConfig":
+        log_format = d.get("log_format", "console")
+        if log_format not in ("console", "json"):
+            logger.warning(
+                "telemetry.log_format %r is not one of ('console', 'json') — "
+                "falling back to 'console'", log_format,
+            )
+            log_format = "console"
+        return cls(
+            endpoint=d.get("endpoint", ""),
+            protocol=d.get("protocol", "http/protobuf"),
+            headers=dict(d.get("headers", {}) or {}),
+            service_name=d.get("service_name", "nerve"),
+            traces=bool(d.get("traces", True)),
+            metrics=bool(d.get("metrics", True)),
+            logs=bool(d.get("logs", False)),
+            system_metrics=bool(d.get("system_metrics", True)),
+            # Guard against 0/negative intervals that would break the reader.
+            metric_interval_ms=max(1000, int(d.get("metric_interval_ms", 60000))),
+            log_format=log_format,
+        )
+
+
+@dataclass
 class XmemoryConfig:
     """xmemory.ai structured memory — optional, runs alongside memU.
 
@@ -1031,6 +1089,7 @@ class NerveConfig:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
@@ -1148,6 +1207,7 @@ class NerveConfig:
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
+            telemetry=TelemetryConfig.from_dict(d.get("telemetry", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
@@ -1316,6 +1376,7 @@ _OPAQUE_PREFIXES = {
     "external_agents.targets",
     "docker.extra_mounts",
     "langfuse.redact_patterns",
+    "telemetry.headers",
 }
 
 

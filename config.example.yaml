@@ -124,3 +124,20 @@ cron:
 #   host: https://cloud.langfuse.com
 #   # redact_patterns:           # optional — strip these regexes from spans
 #   #   - "sk-ant-[A-Za-z0-9_\\-]{20,}"
+
+# Telemetry (optional) — generic OpenTelemetry (OTLP) export of traces,
+# metrics, and logs to an endpoint YOU run (a collector, or any OTLP backend:
+# Grafana/Tempo, Honeycomb, Datadog, ...). Nerve does not run a collector.
+# Off until `endpoint` is set; coexists with langfuse above. Standard
+# OTEL_EXPORTER_OTLP_* env vars are honored and override these. See
+# docs/observability.md.
+# telemetry:
+#   endpoint: http://localhost:4318   # OTLP endpoint — empty disables export
+#   protocol: http/protobuf           # "http/protobuf" or "grpc"
+#   # headers: {authorization: "Bearer <token>"}   # OTLP auth (set in config.local.yaml)
+#   traces: true
+#   metrics: true
+#   logs: false                       # OTLP log export (off by default)
+#   system_metrics: true              # process/runtime metrics
+#   log_format: console               # "console" (default) or "json" — honored even
+#                                     # without an endpoint (NERVE_LOG_FORMAT overrides)

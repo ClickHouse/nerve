@@ -1,5 +1,6 @@
 """Observability integrations.
 
-Currently houses the Langfuse adapter. Other backends (Helicone, Phoenix,
-plain OTEL collectors) can sit alongside in this package if ever needed.
+Houses the Langfuse adapter (``langfuse``) and a vendor-neutral OpenTelemetry
+OTLP exporter (``otel``). Both are optional and config-driven; they can run
+together (Langfuse reuses the OTel-provided global tracer provider).
 """

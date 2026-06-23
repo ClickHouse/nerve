@@ -133,3 +133,106 @@ key).
   buffers spans and ships them async. If memory is tight you can drop
   the Anthropic instrumentation by editing `init_langfuse`, or deploy
   Langfuse self-hosted on a separate machine.
+
+---
+
+# Observability — OpenTelemetry (OTLP)
+
+A vendor-neutral alternative (or complement) to Langfuse: export **traces,
+metrics, and logs** over OTLP to an endpoint **you** run. Nerve does **not**
+package or run a collector — point it at your own collector or any
+OTLP-speaking backend (Grafana Alloy/Tempo/Mimir/Loki, Honeycomb, Datadog,
+Grafana Cloud, …).
+
+Off by default: with no `telemetry.endpoint`, there is zero overhead and no
+per-request instrumentation. It can run **alongside** Langfuse — Nerve owns
+the global OTel tracer provider and Langfuse attaches to it, so the same spans
+reach both.
+
+## What gets captured
+
+- **Traces:** FastAPI HTTP server requests, outbound `httpx` calls, the Claude
+  Agent SDK agent loop + tool calls, and direct Anthropic (memU) calls — the
+  same spans Langfuse sees, plus HTTP server/client spans.
+- **Metrics:** HTTP server metrics, system/process metrics (CPU, memory, GC),
+  and a few nerve counters: `nerve.memorize.runs` / `.errors`,
+  `nerve.notifications.sent`, `nerve.agent.turns`.
+- **Logs (opt-in):** stdlib logs exported over OTLP with `trace_id`/`span_id`
+  correlation, when `telemetry.logs: true`.
+
+## Setup
+
+1. Run an OTLP endpoint (your collector or backend). For local testing,
+   `otel-tui` or `otelcol-contrib` with the `debug` exporter on `:4318` works.
+2. Configure Nerve (`config.yaml`; put secrets/headers in `config.local.yaml`):
+
+   ```yaml
+   telemetry:
+     endpoint: http://localhost:4318    # empty disables export
+     protocol: http/protobuf            # or "grpc"
+     # headers: {authorization: "Bearer <token>"}
+     traces: true
+     metrics: true
+     logs: false
+     system_metrics: true
+     log_format: console                # or "json"
+   ```
+
+3. Standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS` /
+   `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_SERVICE_NAME` environment variables
+   are honored by the exporters and **override** the config values.
+
+## Configuration reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `telemetry.endpoint` | `""` | OTLP endpoint. Empty = disabled. |
+| `telemetry.protocol` | `http/protobuf` | `http/protobuf` or `grpc` (grpc needs `opentelemetry-exporter-otlp-proto-grpc`). |
+| `telemetry.headers` | `{}` | OTLP auth headers (set in `config.local.yaml`). |
+| `telemetry.service_name` | `nerve` | `service.name` resource attribute. |
+| `telemetry.traces` | `true` | Export traces. |
+| `telemetry.metrics` | `true` | Export metrics. |
+| `telemetry.logs` | `false` | Export logs over OTLP. |
+| `telemetry.system_metrics` | `true` | Process/runtime metrics sampler. |
+| `telemetry.metric_interval_ms` | `60000` | Metric export interval. |
+| `telemetry.log_format` | `console` | Console log rendering: `console` or `json`. Honored even with no endpoint; `NERVE_LOG_FORMAT` overrides. |
+
+## Logging
+
+Console logs keep the classic `HH:MM:SS [LEVEL] name: message` format and gain
+`trace_id`/`span_id` when a span is active. Set `telemetry.log_format: json`
+(or `NERVE_LOG_FORMAT=json`) to emit JSON for a log shipper — this is
+independent of OTLP export.
+
+## Privacy / PII
+
+Unlike the Langfuse integration, the OTLP path has **no redaction**. Be
+deliberate about what you export and where:
+
+- **Traces** capture request URLs (incl. query strings), outbound URLs, and
+  agent/tool span attributes.
+- **`telemetry.logs: true` exports *all* stdlib log bodies** over OTLP, which
+  in this codebase can include prompt/response content and tokens. It is
+  off by default for that reason — enable it only when exporting to a trusted
+  backend, and prefer keeping logs local (console/file) when pointing at a
+  third-party endpoint.
+- `langfuse.redact_patterns` does **not** apply here. If you need scrubbing on
+  this path, do it at your collector (an attributes/redaction processor)
+  before forwarding to a third-party backend.
+
+## Running alongside Langfuse
+
+Both can be enabled at once. Nerve initializes the OTLP provider first, so
+Langfuse v3 reuses it rather than creating its own; agent spans then export to
+both. Langfuse's cache-aware usage rewriter is unaffected.
+
+## Troubleshooting
+
+- **Nothing arrives.** Check `/api/diagnostics` → `otel.enabled`. If false,
+  `telemetry.endpoint` is unset. Confirm your endpoint includes the scheme
+  (`http://…`) and is reachable.
+- **`protocol: grpc` does nothing.** The grpc exporter is optional; install
+  `opentelemetry-exporter-otlp-proto-grpc` or use `http/protobuf` (default).
+  Nerve logs a warning and falls back to http.
+- **Logs lack trace IDs.** Trace correlation only populates inside an active
+  span; startup logs before a request/turn won't have one.

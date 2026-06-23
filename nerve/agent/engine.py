@@ -57,6 +57,7 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, load_mcp_servers
 from nerve.db import Database
+from nerve.observability import otel
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
@@ -2159,6 +2160,7 @@ class AgentEngine:
                 # mark_running below.
                 self.sessions.pop_stop_request(session_id)
                 self.sessions.mark_running(session_id)
+                otel.agent_turns.add(1)
                 if channel is not None:
                     self._active_channel[session_id] = channel
                 # Mark the turn as in flight so the finally below can

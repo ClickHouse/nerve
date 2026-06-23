@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nerve.notifications import handlers as _handlers
+from nerve.observability import otel
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -278,6 +279,7 @@ class NotificationService:
             notification_id, session_id, "notify", title, body, priority,
             channels=channels, silent=silent,
         )
+        otel.notifications_sent.add(1)
 
         return notification_id
 
