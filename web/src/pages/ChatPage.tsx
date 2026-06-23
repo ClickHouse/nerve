@@ -30,7 +30,7 @@ function formatModelLabel(model: string): string {
 export function ChatPage() {
   const { sessionId } = useParams();
   const {
-    sessions, activeSession, messages,
+    sessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
     agentStatus, contextUsage, currentTodos, currentCCTasks,
     sidebarCollapsed, panels,
@@ -113,7 +113,9 @@ export function ChatPage() {
                 {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
               </button>
               <span className="font-medium text-[15px]">
-                {sessions.find(s => s.id === activeSession)?.title || activeSession}
+                {virtualSession?.id === activeSession
+                  ? 'New chat'
+                  : (sessions.find(s => s.id === activeSession)?.title || activeSession)}
               </span>
               {(() => {
                 const model = sessions.find(s => s.id === activeSession)?.model;

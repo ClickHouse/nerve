@@ -10,6 +10,7 @@
  * naturally produces the correct top-to-bottom group sequence.
  */
 export function getDateGroup(updatedAt: string): string {
+  if (!updatedAt) return 'Recent';
   const now = new Date();
   const date = new Date(updatedAt.includes('T') ? updatedAt : updatedAt.replace(' ', 'T') + 'Z');
 
