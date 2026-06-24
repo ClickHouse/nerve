@@ -11,6 +11,25 @@ timezone: America/New_York
 #   aws_region: us-east-1      # AWS region for Bedrock
 #   # aws_profile: ""          # Optional: AWS SSO profile name
 
+# Local proxy (CLIProxyAPI) — optional. Routes Anthropic API calls through
+# Claude Code OAuth, and is the Anthropic↔OpenAI translation layer that local
+# Ollama models are reached through. Required for the ollama block below.
+# proxy:
+#   enabled: false
+#   port: 8317
+#   host: 127.0.0.1
+
+# Local Ollama — expose locally-installed Ollama models as selectable chat
+# models in the web composer's model picker. Ollama speaks an OpenAI-compatible
+# API, so this requires proxy.enabled: true (the proxy translates the
+# Anthropic requests the SDK emits). Models are auto-discovered at runtime
+# from the running Ollama server (GET /api/tags) — whatever you've pulled
+# locally shows up automatically, no need to list models here.
+# ollama:
+#   enabled: false
+#   host: 127.0.0.1
+#   port: 11434
+
 # Agent
 agent:
   model: claude-opus-4-8         # Primary model for conversations

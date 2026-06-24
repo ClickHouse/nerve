@@ -59,6 +59,13 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const activeSession = useChatStore(s => s.activeSession);
   const isNewChat = useChatStore(s => s.messages.length === 0);
 
+  // ── Model picker ──
+  const availableModels = useChatStore(s => s.availableModels);
+  const selectedModel = useChatStore(s => s.selectedModel);
+  const modelsDefault = useChatStore(s => s.modelsDefault);
+  const setSelectedModel = useChatStore(s => s.setSelectedModel);
+  const loadModels = useChatStore(s => s.loadModels);
+
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
   // ── Prompt rewrite ──
@@ -76,6 +83,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       .then(s => setRewriteAvailable(s.enabled))
       .catch(() => setRewriteAvailable(false));
   }, []);
+
+  // Load selectable models once — the picker only renders when more than the
+  // default model is offered (i.e. local Ollama models are configured).
+  useEffect(() => { loadModels(); }, [loadModels]);
 
   useEffect(() => {
     localStorage.setItem(REWRITE_PREF_KEY, rewriteEnabled ? '1' : '0');
@@ -437,6 +448,34 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               <Sparkles size={18} />
             </button>
           )}
+          {/* Model picker — only when more than one model is offered (local
+              Ollama models configured + available). Hidden otherwise so the
+              composer is unchanged for the default single-model setup. */}
+          {availableModels.length > 1 && (
+            <select
+              value={selectedModel ?? modelsDefault ?? ''}
+              onChange={(e) => setSelectedModel(e.target.value === modelsDefault ? null : e.target.value)}
+              disabled={disabled || isStreaming || rewriteActive}
+              title="Model for your next message"
+              className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
+            >
+              {availableModels.some(m => m.provider === 'anthropic') && (
+                <optgroup label="Anthropic">
+                  {availableModels.filter(m => m.provider === 'anthropic').map(m => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
+                  ))}
+                </optgroup>
+              )}
+              {availableModels.some(m => m.provider === 'ollama') && (
+                <optgroup label="Ollama (local)">
+                  {availableModels.filter(m => m.provider === 'ollama').map(m => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
+          )}
+
           <input
             ref={fileInputRef}
             type="file"

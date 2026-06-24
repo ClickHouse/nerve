@@ -151,11 +151,54 @@ class ProxyService:
             "request-retry": 3,
         }
 
+        # Register a local Ollama server as an OpenAI-compatible upstream so
+        # its models become selectable. CLIProxyAPI translates the Anthropic
+        # requests the SDK emits into OpenAI calls against Ollama's /v1 API.
+        ollama_provider = self._build_ollama_provider()
+        if ollama_provider is not None:
+            proxy_cfg["openai-compatibility"] = [ollama_provider]
+
         self._config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._config_path, "w") as f:
             yaml.safe_dump(proxy_cfg, f, default_flow_style=False, sort_keys=False)
 
         return self._config_path
+
+    def _build_ollama_provider(self) -> dict[str, Any] | None:
+        """Build the CLIProxyAPI ``openai-compatibility`` entry for Ollama.
+
+        Returns ``None`` when Ollama is disabled or no models are installed.
+        Models are auto-discovered from Ollama's ``/api/tags`` so the picker
+        reflects whatever is pulled locally. Each model is exposed under its
+        own name as the alias the client selects.
+        """
+        ollama = self.config.ollama
+        if not ollama.enabled:
+            return None
+
+        from nerve.ollama import discover_models
+
+        models = discover_models(ollama.base_url)
+        if not models:
+            logger.warning(
+                "Ollama enabled but no models discovered at %s — the local "
+                "server may be down or have no models pulled. Skipping the "
+                "Ollama proxy upstream.",
+                ollama.base_url,
+            )
+            return None
+
+        logger.info(
+            "Registering Ollama upstream (%s) with %d model(s): %s",
+            ollama.openai_base_url, len(models), ", ".join(models),
+        )
+        return {
+            "name": "ollama",
+            "base-url": ollama.openai_base_url,
+            # Ollama ignores the API key, but CLIProxyAPI requires an entry.
+            "api-key-entries": [{"api-key": "ollama"}],
+            "models": [{"name": m, "alias": m} for m in models],
+        }
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                          #
