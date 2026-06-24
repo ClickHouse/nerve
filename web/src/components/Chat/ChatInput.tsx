@@ -3,6 +3,7 @@ import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperc
 import { useChatStore } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
+import { randomUUID } from '../../utils/uuid';
 import { PromptRewriteCard } from './PromptRewriteCard';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
@@ -158,7 +159,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
 
   const addFiles = useCallback(async (files: File[]) => {
     const newAttachments: AttachmentFile[] = files.map(file => ({
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       file,
       preview: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
       uploading: true,
