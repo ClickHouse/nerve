@@ -151,6 +151,17 @@ class AgentConfig:
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
     cli_idle_timeout_seconds: int = 900
+    # When True, background sub-agents (the Agent tool with run_in_background, or
+    # background Bash) get the SAME auto-approved tool permissions as foreground
+    # agents, via a PreToolUse hook that pre-approves all non-interactive tools.
+    # Background tasks are detached and non-blocking, so the CLI never surfaces an
+    # approval prompt for them — the can_use_tool callback is never invoked for
+    # their nested Write/Edit/Bash calls, and the CLI denies them by default.
+    # A PreToolUse hook DOES fire for those nested calls (it is a programmatic
+    # callback, not a user prompt), so returning permissionDecision="allow" there
+    # grants the permission. Set False to restore the CLI default (background
+    # sub-agent writes denied; build/write agents must then run in foreground).
+    background_agent_permissions: bool = True
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @classmethod
@@ -168,6 +179,9 @@ class AgentConfig:
                 d.get("context_1m_excluded_models", []) or []
             ),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
+            background_agent_permissions=bool(
+                d.get("background_agent_permissions", True)
+            ),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 

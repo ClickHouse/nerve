@@ -280,3 +280,72 @@ class TestSdkResumeFileExists:
 
         engine = _make_engine(str(link_ws))
         assert engine._sdk_resume_file_exists(sid) is True
+
+
+# ---------------------------------------------------------------------------
+# _build_hooks — background-agent permission parity
+# ---------------------------------------------------------------------------
+
+def _make_hook_engine(background_agent_permissions: bool) -> AgentEngine:
+    """Minimal engine stub for exercising _build_hooks's PreToolUse wiring."""
+    engine = AgentEngine.__new__(AgentEngine)
+    engine.config = SimpleNamespace(
+        agent=SimpleNamespace(
+            background_agent_permissions=background_agent_permissions,
+        ),
+    )
+    return engine
+
+
+def _catch_all_grant_hook(hooks: dict):
+    """Return the catch-all (matcher=None) PreToolUse hook callback, or None."""
+    for matcher in hooks.get("PreToolUse", []):
+        if matcher.matcher is None:
+            return matcher.hooks[0]
+    return None
+
+
+class TestBuildHooksBackgroundPermissions:
+    """The catch-all PreToolUse hook gives background sub-agents (whose nested
+    tool calls never reach can_use_tool) the same permissions as foreground."""
+
+    @pytest.mark.asyncio
+    async def test_grants_non_interactive_tools_when_enabled(self):
+        engine = _make_hook_engine(True)
+        hooks = engine._build_hooks("sess-x")
+        grant = _catch_all_grant_hook(hooks)
+        assert grant is not None, "permission-grant hook should be registered"
+
+        # Permission-requiring, non-interactive tools are pre-approved so a
+        # detached background sub-agent can run them without a prompt.
+        for tool in ("Bash", "Write", "Edit", "NotebookEdit", "Glob",
+                     "mcp__some_server__write_thing"):
+            out = await grant({"tool_name": tool}, "tid", None)
+            spec = out["hookSpecificOutput"]
+            assert spec.get("permissionDecision") == "allow", tool
+
+    @pytest.mark.asyncio
+    async def test_defers_interactive_and_read_when_enabled(self):
+        engine = _make_hook_engine(True)
+        grant = _catch_all_grant_hook(engine._build_hooks("sess-x"))
+
+        # Interactive tools defer to can_use_tool (pause / inject / deny):
+        # the hook must NOT pre-decide them, or the web pause-for-input breaks.
+        for tool in ("AskUserQuestion", "ExitPlanMode", "EnterPlanMode"):
+            out = await grant({"tool_name": tool}, "tid", None)
+            assert "permissionDecision" not in out["hookSpecificOutput"], tool
+
+        # Read defers to the image validator (a deny there must win), so the
+        # catch-all hook leaves it untouched.
+        out = await grant({"tool_name": "Read"}, "tid", None)
+        assert "permissionDecision" not in out["hookSpecificOutput"]
+
+    @pytest.mark.asyncio
+    async def test_no_grant_hook_when_disabled(self):
+        engine = _make_hook_engine(False)
+        hooks = engine._build_hooks("sess-y")
+        assert _catch_all_grant_hook(hooks) is None
+        # Snapshot + image-validator hooks stay registered regardless.
+        matchers = {m.matcher for m in hooks["PreToolUse"]}
+        assert "Edit|Write|NotebookEdit" in matchers
+        assert "Read" in matchers

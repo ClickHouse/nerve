@@ -1192,7 +1192,7 @@ class AgentEngine:
         through ``engine.run(..., source="wakeup")`` (the CLI's own
         autonomous firing is suppressed — see ``_build_env``).
         """
-        from nerve.agent.interactive import _read_file_safe
+        from nerve.agent.interactive import INTERACTIVE_TOOLS, _read_file_safe
 
         captured_files: set[str] = set()
 
@@ -1265,17 +1265,58 @@ class AgentEngine:
                 )
             return {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
 
+        async def _grant_permission_hook(hook_input, tool_use_id, context):
+            """PreToolUse hook: pre-approve non-interactive tools.
+
+            Background sub-agents (the Agent tool with run_in_background) run
+            detached and non-blocking, so the CLI never surfaces an approval
+            prompt for their nested tool calls — the ``can_use_tool`` callback
+            is never invoked for them and the CLI denies their Write/Edit/Bash
+            by default. A PreToolUse hook, however, DOES fire for those nested
+            calls (it is a programmatic callback, not a user-facing prompt), so
+            returning ``permissionDecision: "allow"`` here grants the same
+            auto-approval foreground agents already get via ``can_use_tool``.
+
+            Interactive tools and Read are left untouched: interactive tools
+            defer to ``can_use_tool`` (pause / inject answers / deny), and Read
+            defers to the image validator above plus the CLI's read-only
+            auto-allow. This keeps the web pause-for-input flow intact while
+            giving background sub-agents permission parity with the foreground.
+            """
+            tool_name = hook_input.get("tool_name", "")
+            if tool_name in INTERACTIVE_TOOLS or tool_name == "Read":
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": (
+                        "nerve: auto-approved (background-agent permission parity)"
+                    ),
+                }
+            }
+
+        pre_tool_use = [
+            HookMatcher(
+                matcher="Edit|Write|NotebookEdit",
+                hooks=[_snapshot_hook],
+            ),
+            HookMatcher(
+                matcher="Read",
+                hooks=[_validate_image_hook],
+            ),
+        ]
+        # Catch-all permission grant so background sub-agents (whose nested
+        # tool calls never reach can_use_tool) inherit foreground's tool
+        # permissions. Registered last so the snapshot/validator hooks still
+        # run for their tools; a deny from the validator wins over this allow.
+        if self.config.agent.background_agent_permissions:
+            pre_tool_use.append(
+                HookMatcher(matcher=None, hooks=[_grant_permission_hook])
+            )
+
         return {
-            "PreToolUse": [
-                HookMatcher(
-                    matcher="Edit|Write|NotebookEdit",
-                    hooks=[_snapshot_hook],
-                ),
-                HookMatcher(
-                    matcher="Read",
-                    hooks=[_validate_image_hook],
-                ),
-            ],
+            "PreToolUse": pre_tool_use,
             "PostToolUse": [
                 HookMatcher(
                     matcher="ScheduleWakeup",
