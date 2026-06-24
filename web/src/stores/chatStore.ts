@@ -4,6 +4,7 @@ import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
 import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary } from '../types/chat';
 import { hydrateMessage } from '../utils/hydrateMessage';
+import { randomUUID } from '../utils/uuid';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
@@ -447,7 +448,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (get().activeSession !== existing.id) await get().switchSession(existing.id);
       return;
     }
-    const id = crypto.randomUUID();
+    const id = randomUUID();
     const now = new Date().toISOString();
     const virtual: Session = {
       id, title: '', source: 'web', status: 'created',
