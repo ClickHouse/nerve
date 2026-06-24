@@ -128,6 +128,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error("CLIProxyAPI proxy failed to start: %s", e)
             raise
+    elif config.ollama.enabled:
+        # Ollama needs the proxy as its Anthropic↔OpenAI translation layer.
+        logger.warning(
+            "ollama.enabled is true but proxy.enabled is false — Ollama "
+            "models require the CLIProxyAPI proxy and will NOT be offered. "
+            "Set proxy.enabled: true to use local Ollama models.",
+        )
 
     # Initialize database
     db_path = Path("~/.nerve/nerve.db").expanduser()
@@ -580,6 +587,9 @@ def create_app() -> FastAPI:
                     user_text = data.get("content", "")
                     session_id = data.get("session_id", active_session)
                     file_ids = data.get("file_ids", [])
+                    # Optional per-message model override from the composer's
+                    # model picker (Anthropic default or a local Ollama model).
+                    selected_model = data.get("model") or None
 
                     if session_id != active_session:
                         # Switch sessions
@@ -603,6 +613,7 @@ def create_app() -> FastAPI:
                             user_message=user_text,
                             source="web",
                             channel="web",
+                            model=selected_model,
                             images=images or None,
                             image_refs=image_refs or None,
                         )

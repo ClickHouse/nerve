@@ -327,6 +327,10 @@ class AgentEngine:
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
         self._active_channel: dict[str, str] = {}
+        # Resolved model bound to each session's live SDK client. Used to
+        # detect mid-session model switches (the CLI fixes its model at
+        # connect time, so a change requires recreating the client).
+        self._session_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
@@ -973,19 +977,28 @@ class AgentEngine:
         else:
             system_prompt = system_prompt_str
 
-        thinking_config = self._parse_thinking_config(
-            self.config.agent.thinking,
-            model or self.config.agent.model,
+        # Local Ollama models are reached through the proxy and speak the
+        # OpenAI-translated API — Anthropic-only knobs (extended thinking,
+        # effort, the context-1m beta) don't apply and may break translation,
+        # so suppress them for non-Claude models.
+        selected_model = model or self.config.agent.model
+        is_ollama_model = (
+            self.config.ollama.enabled and "claude" not in selected_model.lower()
         )
-        effort = self._effective_effort(
-            self.config.agent.effort,
-            model or self.config.agent.model,
+
+        thinking_config = (
+            None if is_ollama_model
+            else self._parse_thinking_config(self.config.agent.thinking, selected_model)
+        )
+        effort = (
+            None if is_ollama_model
+            else self._effective_effort(self.config.agent.effort, selected_model)
         )
         # Some subscriptions reject the context-1m beta for specific models
         # (e.g. claude-sonnet-4-6) — skip the beta header for those.
         betas = (
             ["context-1m-2025-08-07"]
-            if self.config.agent.context_1m_enabled_for(model)
+            if not is_ollama_model and self.config.agent.context_1m_enabled_for(model)
             else []
         )
 
@@ -1468,12 +1481,28 @@ class AgentEngine:
         lock = self.sessions.get_lock(session_id)
         async with lock:
             client = self.sessions.get_client(session_id)
+            requested_model = model or self.config.agent.model
             if client is not None:
+                bound_model = self._session_models.get(session_id)
                 # Health check: verify the underlying CLI process is still alive
                 if self._is_client_dead(client):
                     logger.warning(
                         "Client process for session %s is dead, recreating",
                         session_id,
+                    )
+                    self._stop_idle_watcher(session_id)
+                    self.sessions.remove_client(session_id)
+                    unregister_handler(session_id)
+                    await self._safe_disconnect(client)
+                    client = None
+                elif bound_model is not None and bound_model != requested_model:
+                    # Model switched mid-session (e.g. the composer's picker
+                    # moved from the Anthropic default to a local Ollama
+                    # model). The CLI binds its model at connect time, so
+                    # tear the client down and recreate it below.
+                    logger.info(
+                        "Session %s model changed (%s → %s), recreating client",
+                        session_id, bound_model, requested_model,
                     )
                     self._stop_idle_watcher(session_id)
                     self.sessions.remove_client(session_id)
@@ -1568,6 +1597,7 @@ class AgentEngine:
 
             # Record connected_at and the resolved model
             resolved_model = options.model
+            self._session_models[session_id] = resolved_model
             now = datetime.now(timezone.utc).isoformat()
             connected_at = session.get("connected_at") if session and sdk_resume_id else now
             await self.sessions.mark_active(

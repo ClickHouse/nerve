@@ -130,6 +130,12 @@ interface ChatState {
   searchLoading: boolean;
   /** Bumped whenever something wants the sidebar search input focused (e.g. Cmd+K). */
   searchFocusNonce: number;
+  // Composer model picker: options from GET /api/models (Anthropic default +
+  // locally-installed Ollama models), the server's default id, and the user's
+  // current pick (null = use the server default).
+  availableModels: { id: string; provider: string }[];
+  modelsDefault: string | null;
+  selectedModel: string | null;
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
@@ -144,6 +150,10 @@ interface ChatState {
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
   sendMessage: (content: string) => void;
+  /** Fetch selectable models for the composer picker (GET /api/models). */
+  loadModels: () => Promise<void>;
+  /** Set the model for the next message (null → server default). */
+  setSelectedModel: (model: string | null) => void;
   stopSession: () => void;
   handleWSMessage: (msg: WSMessage) => void;
   addQuote: (text: string, action: QuoteAction) => void;
@@ -194,6 +204,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   searchResults: null,
   searchLoading: false,
   searchFocusNonce: 0,
+  availableModels: [],
+  modelsDefault: null,
+  selectedModel: localStorage.getItem('nerve_selected_model') || null,
 
   addQuote: (text: string, action: QuoteAction) => {
     const id = `q${++_quoteId}`;
@@ -536,6 +549,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set(s => ({ searchFocusNonce: s.searchFocusNonce + 1 }));
   },
 
+  loadModels: async () => {
+    try {
+      const res = await api.getModels();
+      set((state) => {
+        // Drop a stale pick (e.g. an Ollama model no longer installed) so we
+        // never send a model the server can't route.
+        const ids = new Set(res.models.map(m => m.id));
+        const keep = state.selectedModel && ids.has(state.selectedModel)
+          ? state.selectedModel : null;
+        if (keep !== state.selectedModel) localStorage.removeItem('nerve_selected_model');
+        return { availableModels: res.models, modelsDefault: res.default, selectedModel: keep };
+      });
+    } catch (e) {
+      console.error('Failed to load models:', e);
+    }
+  },
+
+  setSelectedModel: (model: string | null) => {
+    if (model) localStorage.setItem('nerve_selected_model', model);
+    else localStorage.removeItem('nerve_selected_model');
+    set({ selectedModel: model });
+  },
+
   sendMessage: async (content: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => {
     let session = get().activeSession;
     const blocks: import('../types/chat').MessageBlock[] = [];
@@ -592,7 +628,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
     }
-    const status = ws.sendMessage(content, session, fileIds);
+    const status = ws.sendMessage(content, session, fileIds, get().selectedModel ?? undefined);
     if (status === 'dropped') {
       // The message could not reach the server. Revert the optimistic
       // state and surface the failure inline so the user knows to retry.

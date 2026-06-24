@@ -63,6 +63,15 @@ export const api = {
 
   authStatus: () => request<{ auth_required: boolean }>('/auth/status'),
 
+  // Models — chat models offered to the composer's picker (Anthropic default
+  // plus any locally-installed Ollama models, auto-discovered server-side).
+  getModels: () =>
+    request<{
+      default: string;
+      models: { id: string; provider: string }[];
+      ollama: { enabled: boolean; routable: boolean; available: boolean };
+    }>('/models'),
+
   // Sessions
   listSessions: () => request<{ sessions: any[] }>('/sessions'),
   searchSessions: (q: string) =>

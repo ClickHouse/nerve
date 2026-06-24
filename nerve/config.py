@@ -718,6 +718,48 @@ class ProxyConfig:
 
 
 @dataclass
+class OllamaConfig:
+    """Local Ollama server — exposes its models as selectable chat models.
+
+    Ollama speaks an OpenAI-compatible API (``/v1``), not the Anthropic
+    Messages API the Claude Agent SDK uses. So Ollama models are routed
+    through the bundled CLIProxyAPI, which translates Anthropic ↔ OpenAI
+    and is registered with Ollama as an ``openai-compatibility`` upstream.
+
+    Requirement: this only takes effect when the proxy is also enabled
+    (``proxy.enabled: true``) — the proxy is the translation layer. When
+    ``enabled`` is true but the proxy is off, Ollama models are not offered
+    (a warning is logged at startup).
+
+    Models are auto-discovered at runtime from Ollama's native
+    ``GET /api/tags`` endpoint, so whatever you have pulled locally shows
+    up in the model picker with no extra config.
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 11434
+
+    @property
+    def base_url(self) -> str:
+        """Native Ollama base URL (used for ``/api/tags`` discovery)."""
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def openai_base_url(self) -> str:
+        """OpenAI-compatible base URL (registered as a proxy upstream)."""
+        return f"http://{self.host}:{self.port}/v1"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> OllamaConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            host=d.get("host", "127.0.0.1"),
+            port=int(d.get("port", 11434)),
+        )
+
+
+@dataclass
 class McpEndpointConfig:
     """Nerve's own MCP server endpoint (Nerve-as-MCP-server).
 
@@ -1063,6 +1105,7 @@ class NerveConfig:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
@@ -1097,6 +1140,15 @@ class NerveConfig:
         if self.proxy.enabled:
             return self.proxy.api_key
         return self.anthropic_api_key
+
+    @property
+    def ollama_routable(self) -> bool:
+        """True when Ollama models can actually be served.
+
+        Requires both Ollama enabled and the proxy running (the proxy is
+        the Anthropic↔OpenAI translation layer Ollama is reached through).
+        """
+        return self.ollama.enabled and self.proxy.enabled
 
     def create_anthropic_client(self, timeout: float = 60.0) -> Any:
         """Create an Anthropic client based on the configured provider.
@@ -1180,6 +1232,7 @@ class NerveConfig:
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
             docker=DockerConfig.from_dict(d.get("docker", {})),
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
+            ollama=OllamaConfig.from_dict(d.get("ollama", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
