@@ -134,6 +134,11 @@ export interface PanelTab {
   blocks: MessageBlock[];  // live sub-agent activity (same types as main chat)
   /** For type==='workflow': the live phase/agent progress tree. */
   workflow?: WorkflowSnapshot;
+  /** True for a sub-agent spawned with run_in_background. The Agent tool returns
+   *  immediately (a task id) while the sub-agent keeps streaming, so the panel
+   *  must stay open + running until the background task settles — otherwise its
+   *  later tools/thoughts spill into the main chat instead of this panel. */
+  background?: boolean;
 }
 
 // --- Session modified files & diff types ---

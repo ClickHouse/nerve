@@ -131,6 +131,7 @@ export function rebuildPanelTabsFromBuffer(
     if (event.type === 'tool_use' && (event.tool === 'Agent' || event.tool === 'Task')) {
       const subagentType = String(event.input?.subagent_type || event.input?.model || 'agent');
       const toolUseId = event.tool_use_id || '';
+      const isBackground = event.input?.run_in_background === true;
       const block = blocks.find(
         b => b.type === 'tool_call' && b.toolUseId === toolUseId,
       );
@@ -154,6 +155,7 @@ export function rebuildPanelTabsFromBuffer(
         completedAt: isComplete ? Date.now() : undefined,
         isError: block?.type === 'tool_call' ? block.isError : false,
         blocks: [],
+        background: isBackground,
       };
       panels.push(tab);
       panelMap.set(toolUseId, tab);
