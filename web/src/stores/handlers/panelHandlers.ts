@@ -80,6 +80,12 @@ export function handleSubagentComplete(
   // Server-side sub-agent lifecycle event — mark complete
   const tab = state.panels.find(p => p.id === msg.tool_use_id);
   if (tab) {
+    // A background sub-agent's "complete" fires immediately when the Agent tool
+    // returns its task id — but the sub-agent keeps streaming afterward. Keep
+    // the panel running; it settles when the background task actually ends
+    // (handleBackgroundTasksUpdate). Completing here would send its later
+    // tools/thoughts into the main chat instead of this panel.
+    if (tab.background) return;
     get().updatePanelTab(msg.tool_use_id, {
       status: msg.is_error ? 'error' : 'complete',
       isError: msg.is_error || false,

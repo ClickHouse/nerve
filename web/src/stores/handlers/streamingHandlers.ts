@@ -38,20 +38,26 @@ export function handleThinking(
 ): void {
   const state = get();
   const parentId = msg.parent_tool_use_id;
-  if (parentId && state.panels.some(p => p.id === parentId && p.status === 'running')) {
-    set(s => ({
-      panels: appendBlockToPanel(s.panels, parentId, { type: 'thinking', content: msg.content }),
-    }));
-  } else {
-    const blocks = [...state.streamingBlocks];
-    const last = blocks[blocks.length - 1];
-    if (last?.type === 'thinking') {
-      blocks[blocks.length - 1] = { ...last, content: last.content + msg.content };
-    } else {
-      blocks.push({ type: 'thinking', content: msg.content });
+  if (parentId) {
+    // Sub-agent output — belongs to its side-panel, never the main chat (mirrors
+    // the replay invariant in applyStreamEvent). Route to the panel by id
+    // regardless of its status: a background sub-agent's panel may already be
+    // marked complete by the time its thoughts stream in.
+    if (state.panels.some(p => p.id === parentId)) {
+      set(s => ({
+        panels: appendBlockToPanel(s.panels, parentId, { type: 'thinking', content: msg.content }),
+      }));
     }
-    set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' } });
+    return;
   }
+  const blocks = [...state.streamingBlocks];
+  const last = blocks[blocks.length - 1];
+  if (last?.type === 'thinking') {
+    blocks[blocks.length - 1] = { ...last, content: last.content + msg.content };
+  } else {
+    blocks.push({ type: 'thinking', content: msg.content });
+  }
+  set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' } });
 }
 
 export function handleToken(
@@ -61,20 +67,24 @@ export function handleToken(
 ): void {
   const state = get();
   const parentId = msg.parent_tool_use_id;
-  if (parentId && state.panels.some(p => p.id === parentId && p.status === 'running')) {
-    set(s => ({
-      panels: appendBlockToPanel(s.panels, parentId, { type: 'text', content: msg.content }),
-    }));
-  } else {
-    const blocks = [...state.streamingBlocks];
-    const last = blocks[blocks.length - 1];
-    if (last?.type === 'text') {
-      blocks[blocks.length - 1] = { ...last, content: last.content + msg.content };
-    } else {
-      blocks.push({ type: 'text', content: msg.content });
+  if (parentId) {
+    // Sub-agent output — route to its side-panel by id (any status), never the
+    // main chat. See handleThinking for the rationale.
+    if (state.panels.some(p => p.id === parentId)) {
+      set(s => ({
+        panels: appendBlockToPanel(s.panels, parentId, { type: 'text', content: msg.content }),
+      }));
     }
-    set({ streamingBlocks: blocks, agentStatus: { state: 'writing' } });
+    return;
   }
+  const blocks = [...state.streamingBlocks];
+  const last = blocks[blocks.length - 1];
+  if (last?.type === 'text') {
+    blocks[blocks.length - 1] = { ...last, content: last.content + msg.content };
+  } else {
+    blocks.push({ type: 'text', content: msg.content });
+  }
+  set({ streamingBlocks: blocks, agentStatus: { state: 'writing' } });
 }
 
 export function handleWakeup(
@@ -130,6 +140,10 @@ export function handleToolUse(
     // Open panel tab
     const subagentType = String(msg.input?.subagent_type || msg.input?.model || 'agent');
     const isPlan = subagentType === 'Plan';
+    // Background sub-agents (run_in_background) detach: the Agent tool returns a
+    // task id immediately, then the sub-agent streams its work afterward. Flag
+    // the panel so the immediate result/complete don't close it prematurely.
+    const isBackground = msg.input?.run_in_background === true;
     get().openPanelTab({
       id: toolUseId,
       type: isPlan ? 'plan' : 'subagent',
@@ -143,6 +157,7 @@ export function handleToolUse(
       status: 'running',
       startedAt: Date.now(),
       blocks: [],
+      background: isBackground,
     });
     return;
   }
@@ -178,44 +193,50 @@ export function handleToolUse(
     return;
   }
 
-  // Is this a child tool call inside a running sub-agent?
+  // Is this a child tool call inside a sub-agent? Route to the panel by id —
+  // regardless of status, and never into the main chat (mirrors replay). A
+  // background sub-agent's panel is already 'complete' by the time its nested
+  // tools stream in; the old `status === 'running'` gate sent them to the chat.
   const parentId = msg.parent_tool_use_id;
-  if (parentId && state.panels.some(p => p.id === parentId && p.status === 'running')) {
-    set(s => ({
-      panels: appendBlockToPanel(s.panels, parentId, {
-        type: 'tool_call',
-        toolUseId: msg.tool_use_id || '',
-        tool: msg.tool,
-        input: msg.input,
-        status: 'running',
-      }),
-    }));
-  } else {
-    // Normal: add to main chat
-    const blocks = [...state.streamingBlocks];
-    blocks.push({
-      type: 'tool_call',
-      toolUseId: msg.tool_use_id || '',
-      tool: msg.tool,
-      input: msg.input,
-      status: 'running',
-    });
-    const extraUpdate: Record<string, unknown> = {};
-    if (msg.tool === 'TodoWrite' && Array.isArray(msg.input?.todos)) {
-      extraUpdate.currentTodos = msg.input.todos as TodoItem[];
+  if (parentId) {
+    if (state.panels.some(p => p.id === parentId)) {
+      set(s => ({
+        panels: appendBlockToPanel(s.panels, parentId, {
+          type: 'tool_call',
+          toolUseId: msg.tool_use_id || '',
+          tool: msg.tool,
+          input: msg.input,
+          status: 'running',
+        }),
+      }));
     }
-    // Optimistically reflect Claude Code task tool calls in the panel before
-    // the result arrives. TaskCreate adds a placeholder row (real ID lands on
-    // tool_result); TaskUpdate mutates by taskId so the row reacts instantly.
-    if (msg.tool === 'TaskCreate') {
-      const input = (msg.input ?? {}) as Record<string, unknown>;
-      extraUpdate.currentCCTasks = applyCCTaskCreateInput(state.currentCCTasks, input, msg.tool_use_id || '');
-    } else if (msg.tool === 'TaskUpdate') {
-      const input = (msg.input ?? {}) as Record<string, unknown>;
-      extraUpdate.currentCCTasks = applyCCTaskUpdateInput(state.currentCCTasks, input);
-    }
-    set({ streamingBlocks: blocks, agentStatus: { state: 'tool', toolName: msg.tool }, ...extraUpdate });
+    return;
   }
+
+  // Normal: add to main chat
+  const blocks = [...state.streamingBlocks];
+  blocks.push({
+    type: 'tool_call',
+    toolUseId: msg.tool_use_id || '',
+    tool: msg.tool,
+    input: msg.input,
+    status: 'running',
+  });
+  const extraUpdate: Record<string, unknown> = {};
+  if (msg.tool === 'TodoWrite' && Array.isArray(msg.input?.todos)) {
+    extraUpdate.currentTodos = msg.input.todos as TodoItem[];
+  }
+  // Optimistically reflect Claude Code task tool calls in the panel before
+  // the result arrives. TaskCreate adds a placeholder row (real ID lands on
+  // tool_result); TaskUpdate mutates by taskId so the row reacts instantly.
+  if (msg.tool === 'TaskCreate') {
+    const input = (msg.input ?? {}) as Record<string, unknown>;
+    extraUpdate.currentCCTasks = applyCCTaskCreateInput(state.currentCCTasks, input, msg.tool_use_id || '');
+  } else if (msg.tool === 'TaskUpdate') {
+    const input = (msg.input ?? {}) as Record<string, unknown>;
+    extraUpdate.currentCCTasks = applyCCTaskUpdateInput(state.currentCCTasks, input);
+  }
+  set({ streamingBlocks: blocks, agentStatus: { state: 'tool', toolName: msg.tool }, ...extraUpdate });
 }
 
 export function handleToolResult(
@@ -230,6 +251,22 @@ export function handleToolResult(
   // DO NOT close the panel — it settles later via a terminal workflow_progress.
   const workflowTab = state.panels.find(p => p.id === msg.tool_use_id && p.type === 'workflow');
   if (workflowTab) {
+    const blocks = state.streamingBlocks.map(b =>
+      b.type === 'tool_call' && b.toolUseId === msg.tool_use_id
+        ? { ...b, result: msg.result, isError: msg.is_error, status: 'complete' as const }
+        : b
+    );
+    set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' } });
+    return;
+  }
+
+  // A background sub-agent behaves like a workflow: the Agent tool returns its
+  // task id immediately while the sub-agent keeps streaming. Record the result
+  // on the inline chat card but DO NOT complete or auto-close the panel — its
+  // tools/thoughts are still arriving. The panel settles via
+  // handleBackgroundTasksUpdate when the background task is no longer running.
+  const backgroundTab = state.panels.find(p => p.id === msg.tool_use_id && p.background);
+  if (backgroundTab) {
     const blocks = state.streamingBlocks.map(b =>
       b.type === 'tool_call' && b.toolUseId === msg.tool_use_id
         ? { ...b, result: msg.result, isError: msg.is_error, status: 'complete' as const }
@@ -267,13 +304,20 @@ export function handleToolResult(
     return;
   }
 
-  // Is this a child tool result inside a sub-agent?
+  // Is this a child tool result inside a sub-agent? Route to the panel by id
+  // (any status), never into the main chat — mirrors replay and matches the
+  // tool_use handler above so a background sub-agent's results land in its panel.
   const parentId = msg.parent_tool_use_id;
-  if (parentId && state.panels.some(p => p.id === parentId && p.status === 'running')) {
-    set(s => ({
-      panels: updateToolResultInPanel(s.panels, parentId, msg.tool_use_id || '', msg.result, msg.is_error),
-    }));
-  } else {
+  if (parentId) {
+    if (state.panels.some(p => p.id === parentId)) {
+      set(s => ({
+        panels: updateToolResultInPanel(s.panels, parentId, msg.tool_use_id || '', msg.result, msg.is_error),
+      }));
+    }
+    return;
+  }
+
+  {
     // Normal: update main chat
     const blocks = state.streamingBlocks.map(b => {
       if (b.type === 'tool_call' && b.toolUseId === msg.tool_use_id) {
@@ -325,11 +369,15 @@ export function handleToolResult(
 // ------------------------------------------------------------------ //
 
 /** Mark any still-running panel tabs as complete & schedule auto-close. */
-function finalizeRunningPanels(get: Get): void {
+function finalizeRunningPanels(get: Get, includeBackground = false): void {
   for (const panel of get().panels) {
     // Workflows run in the background past the launching turn — they settle
     // on their own terminal workflow_progress, not when this turn ends.
     if (panel.type === 'workflow') continue;
+    // Background sub-agents likewise keep streaming after the launching turn
+    // ends — leave their panels running until the background task settles
+    // (handleBackgroundTasksUpdate). An explicit /stop settles them anyway.
+    if (panel.background && !includeBackground) continue;
     if (panel.status === 'running') {
       get().updatePanelTab(panel.id, {
         status: 'complete',
@@ -411,7 +459,8 @@ export function handleStopped(
     isStreaming: false,
     agentStatus: { state: 'idle' },
   }));
-  finalizeRunningPanels(get);
+  // Explicit stop ends everything, including any detached background sub-agents.
+  finalizeRunningPanels(get, true);
   get().loadSessions();
 }
 
