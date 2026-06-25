@@ -1,14 +1,16 @@
 import { useState, useRef, type ReactNode } from 'react';
 import { Copy, Check } from 'lucide-react';
+import { copyToClipboard } from '../../utils/clipboard';
 
 export function CodeBlock({ className, children }: { className?: string; children: ReactNode }) {
   const [copied, setCopied] = useState(false);
   const codeRef = useRef<HTMLElement>(null);
   const language = className?.replace(/^.*?language-/, '').replace(/\s.*$/, '') || '';
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     const text = codeRef.current?.textContent || '';
-    navigator.clipboard.writeText(text);
+    const ok = await copyToClipboard(text);
+    if (!ok) return;
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
