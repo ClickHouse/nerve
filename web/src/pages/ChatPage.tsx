@@ -12,6 +12,7 @@ import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'luc
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import type { ShortcutDef } from '../utils/keyboard';
+import { copyToClipboard } from '../utils/clipboard';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
 const STATUS_LABELS: Record<string, string> = {
@@ -78,7 +79,7 @@ export function ChatPage() {
       section: 'chat',
       action: () => {
         const text = getLastAssistantText(useChatStore.getState().messages);
-        if (text) void navigator.clipboard.writeText(text);
+        if (text) void copyToClipboard(text);
       },
     },
     {
