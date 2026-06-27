@@ -141,6 +141,13 @@ interface ChatState {
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
   createSession: () => Promise<void>;
+  /**
+   * Materialize the virtual "new chat" in the API and adopt the server-minted
+   * id, returning it. No-op (returns the active id unchanged) once the chat is
+   * already a real, persisted session. Pass `running: true` when a message is
+   * being sent at the same time so the sidebar row shows the spinner instantly.
+   */
+  ensureRealSession: (running?: boolean) => Promise<string>;
   discardVirtualSession: () => void;
   setDraft: (sessionId: string, text: string) => void;
   deleteSession: (id: string) => Promise<void>;
@@ -458,6 +465,39 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await get().switchSession(id);
   },
 
+  ensureRealSession: async (running = false) => {
+    const session = get().activeSession;
+    const vs = get().virtualSession;
+    // Already a real, persisted session (or no virtual chat) — nothing to do.
+    if (!vs || vs.id !== session) return session;
+    // Create it server-side (deferred from the + click) and adopt the
+    // server-minted id, so anything needing a persisted session — the first
+    // message OR a file upload before it — targets a real row, not the
+    // client-only temp id (which the backend has never seen → 404).
+    const real: Session = await api.createSession();
+    set((state) => {
+      const drafts = { ...state.drafts };
+      // Carry any unsent draft text across to the real id so the composer,
+      // which reloads from drafts[activeSession] on id change, doesn't blank.
+      const carried = drafts[vs.id];
+      delete drafts[vs.id];
+      if (carried !== undefined) drafts[real.id] = carried;
+      return {
+        // Don't yank the view if the user navigated away during the POST.
+        ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
+        virtualSession: null,
+        drafts,
+        // POST /api/sessions returns a partial row (no updated_at); fill the
+        // fields the sidebar needs so date-grouping doesn't choke.
+        sessions: [
+          { ...real, title: 'New chat', is_running: running, updated_at: new Date().toISOString() },
+          ...state.sessions,
+        ],
+      };
+    });
+    return real.id;
+  },
+
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
@@ -592,29 +632,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },
     }));
-    // First message in a virtual "new chat": create it in the API now
+    // First message in a virtual "new chat": materialize it in the API now
     // (deferred from the + click) and adopt the server-minted id for this turn,
     // so it becomes a real, selectable session that survives switching away.
     if (vs && vs.id === session) {
       try {
-        const real: Session = await api.createSession();
-        session = real.id;
-        set((state) => {
-          const drafts = { ...state.drafts };
-          delete drafts[vs.id];
-          return {
-            // Don't yank the view if the user navigated away during the POST.
-            ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
-            virtualSession: null,
-            drafts,
-            // POST /api/sessions returns a partial row (no updated_at); fill
-            // the fields the sidebar needs so date-grouping doesn't choke.
-            sessions: [
-              { ...real, title: 'New chat', is_running: true, updated_at: new Date().toISOString() },
-              ...state.sessions,
-            ],
-          };
-        });
+        session = await get().ensureRealSession(true);
       } catch (e) {
         console.error('Failed to create session:', e);
         set((state) => ({

@@ -58,6 +58,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const clearQuotes = useChatStore(s => s.clearQuotes);
   const setDraft = useChatStore(s => s.setDraft);
   const activeSession = useChatStore(s => s.activeSession);
+  const ensureRealSession = useChatStore(s => s.ensureRealSession);
   const isNewChat = useChatStore(s => s.messages.length === 0);
 
   // ── Model picker ──
@@ -169,7 +170,12 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
 
     // Upload all files
     try {
-      const result = await api.uploadFiles(files, activeSession);
+      // A brand-new chat is only a client-side "virtual" session until its
+      // first message. The upload endpoint requires a persisted session, so
+      // materialize it first and upload against the real server id — otherwise
+      // the temp id 404s ("Session not found").
+      const sid = await ensureRealSession();
+      const result = await api.uploadFiles(files, sid);
       setAttachments(prev => prev.map(a => {
         const idx = newAttachments.findIndex(n => n.id === a.id);
         if (idx >= 0 && result.files[idx]) {
@@ -191,7 +197,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
         return a;
       }));
     }
-  }, [activeSession]);
+  }, [ensureRealSession]);
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments(prev => {
