@@ -17,6 +17,7 @@ export type WSMessage =
   | { type: 'session_archived'; session_id: string }
   | { type: 'plan_update'; session_id: string; content: string }
   | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter'; tool_name: string; tool_input: Record<string, unknown> }
+  | { type: 'interaction_resolved'; session_id: string; interaction_id: string }
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
