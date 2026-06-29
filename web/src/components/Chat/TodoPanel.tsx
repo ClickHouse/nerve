@@ -99,7 +99,7 @@ export function TodoPanel({
 
   return (
     <div className={`border-t border-border-subtle bg-bg-sunken shrink-0 transition-all duration-300 ${allDone ? 'opacity-60' : ''}`}>
-      <div className="max-w-3xl mx-auto px-5 py-2.5">
+      <div className="max-w-[var(--chat-width)] mx-auto px-5 py-2.5">
         <div className="flex items-center gap-2 mb-1.5">
           <span className="text-[11px] font-medium text-text-faint uppercase tracking-wider">Tasks</span>
           <span className="text-[10px] text-text-faint">

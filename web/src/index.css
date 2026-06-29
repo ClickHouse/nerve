@@ -52,6 +52,14 @@
   --color-hue-violet: var(--theme-hue-violet);
 }
 
+/* ── Layout (theme-independent) ── */
+:root {
+  /* Conversation reading-column max width. Defaults to the previous fixed
+     768px cap; ChatWidthHandle overrides this on :root at runtime so the
+     column is drag-resizable (persisted to localStorage 'nerve_chat_width'). */
+  --chat-width: 48rem; /* 768px */
+}
+
 /* ── Dark palette (default) ── */
 :root {
   color-scheme: dark;
