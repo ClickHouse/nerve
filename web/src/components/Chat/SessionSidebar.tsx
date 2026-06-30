@@ -53,8 +53,33 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, virtualSession, discardVirtualSession } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
+
+  // Drag-to-resize the session list. It is left-anchored against the nav rail,
+  // so the width tracks the cursor 1:1. The width transition is disabled while
+  // dragging so it stays responsive.
+  const [isDragging, setIsDragging] = useState(false);
+  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const handleMove = (ev: MouseEvent) => setSidebarWidth(startWidth + (ev.clientX - startX));
+    const handleUp = () => {
+      setIsDragging(false);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevSelect;
+      document.removeEventListener('mousemove', handleMove);
+      document.removeEventListener('mouseup', handleUp);
+    };
+    document.addEventListener('mousemove', handleMove);
+    document.addEventListener('mouseup', handleUp);
+  }, [sidebarWidth, setSidebarWidth]);
 
   const isSearching = localQuery.trim().length > 0;
   const shouldShowSearch = searchHovered || searchFocused || isSearching || searchPinned;
@@ -189,7 +214,21 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   }, [runningSystemCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className={`bg-surface border-r border-border-subtle flex flex-col shrink-0 transition-all duration-200 overflow-hidden ${collapsed ? 'w-0 border-r-0' : 'w-60'}`}>
+    <div
+      className={`bg-surface border-r border-border-subtle flex flex-col shrink-0 overflow-hidden relative ${collapsed ? 'border-r-0' : ''} ${isDragging ? '' : 'transition-all duration-200'}`}
+      style={{ width: collapsed ? 0 : sidebarWidth }}
+    >
+      {/* Drag-to-resize handle on the right edge (hidden when collapsed). */}
+      {!collapsed && (
+        <div
+          onMouseDown={handleResizeStart}
+          className="group/resize absolute top-0 right-0 bottom-0 z-20 w-2 cursor-col-resize"
+          title="Drag to resize the session list"
+        >
+          <div className={`absolute inset-y-0 right-0 w-px transition-colors ${isDragging ? 'bg-accent' : 'bg-transparent group-hover/resize:bg-accent/50'}`} />
+        </div>
+      )}
+
       {/* Search + New chat */}
       <div className="px-2 py-1.5 border-b border-border-subtle">
         <div className="relative h-7">
