@@ -54,6 +54,23 @@ class TestBroadcaster:
         assert len(r1) == 1
         assert len(r2) == 1
 
+    async def test_broadcast_exclude_skips_origin_listener(self):
+        bc = StreamBroadcaster()
+        sender_msgs, other_msgs = [], []
+
+        async def sender(sid, msg):
+            sender_msgs.append(msg)
+
+        async def other(sid, msg):
+            other_msgs.append(msg)
+
+        await bc.register("s1", "sender", sender)
+        await bc.register("s1", "other", other)
+        await bc.broadcast("s1", {"type": "user_message"}, exclude="sender")
+
+        assert sender_msgs == []      # origin listener is skipped
+        assert len(other_msgs) == 1   # every other listener still receives
+
     async def test_failed_listener_doesnt_block(self):
         bc = StreamBroadcaster()
         received = []
