@@ -56,13 +56,21 @@ export function ChatWidthHandle() {
   return (
     <div
       onMouseDown={handleResizeStart}
-      className="group absolute top-0 bottom-0 z-20 hidden w-3 -translate-x-1/2 cursor-col-resize md:block"
+      className="group absolute top-0 bottom-0 z-20 hidden w-4 -translate-x-1/2 cursor-col-resize md:block"
       style={{ left: 'min(calc(50% + var(--chat-width) / 2), calc(100% - 8px))' }}
       title="Drag to resize the conversation width"
     >
+      {/* Full-height guide line: appears on hover/drag to show the resize axis. */}
       <div
         className={`absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors ${
-          isDragging ? 'bg-accent' : 'bg-transparent group-hover:bg-accent/40'
+          isDragging ? 'bg-accent/60' : 'bg-transparent group-hover:bg-accent/30'
+        }`}
+      />
+      {/* Persistent grip so the resize affordance is discoverable at rest;
+          brightens and grows on hover/drag. */}
+      <div
+        className={`absolute left-1/2 top-1/2 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full transition-all duration-150 ${
+          isDragging ? 'h-16 bg-accent' : 'h-10 bg-accent/40 group-hover:h-16 group-hover:bg-accent'
         }`}
       />
     </div>
