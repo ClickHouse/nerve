@@ -106,6 +106,12 @@ interface ChatState {
   activePanelId: string | null;
   panelVisible: boolean;
   panelWidth: number;
+  // Conversation reading-column width in px (drag-resizable, persisted to
+  // localStorage 'nerve_chat_width'). Default 768 = the previous fixed cap.
+  chatWidth: number;
+  // Session list (left sidebar) width in px (drag-resizable, persisted to
+  // localStorage 'nerve_sidebar_width'). Default 240 = the previous w-60.
+  sidebarWidth: number;
 
   // Pending interactive tool (AskUserQuestion, ExitPlanMode, etc.)
   pendingInteraction: {
@@ -175,6 +181,8 @@ interface ChatState {
   updatePanelTab: (tabId: string, updates: Partial<PanelTab>) => void;
   togglePanel: () => void;
   setPanelWidth: (width: number) => void;
+  setChatWidth: (width: number) => void;
+  setSidebarWidth: (width: number) => void;
   pruneCompletedTabs: () => void;
   // Interactions
   answerInteraction: (result: Record<string, string> | null) => void;
@@ -203,6 +211,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activePanelId: null,
   panelVisible: false,
   panelWidth: parseFloat(localStorage.getItem('nerve_panel_width') || '45'),
+  chatWidth: parseFloat(localStorage.getItem('nerve_chat_width') || '768'),
+  sidebarWidth: parseFloat(localStorage.getItem('nerve_sidebar_width') || '240'),
   pendingInteraction: null,
   sidebarCollapsed: localStorage.getItem('nerve_sidebar_collapsed') === 'true',
   modifiedFiles: [],
@@ -283,6 +293,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const clamped = Math.max(20, Math.min(65, width));
     localStorage.setItem('nerve_panel_width', String(clamped));
     set({ panelWidth: clamped });
+  },
+
+  setChatWidth: (width: number) => {
+    // Clamp to a readable band (~60 chars min, very wide max). Mirrors the
+    // setPanelWidth persistence pattern above.
+    const clamped = Math.max(480, Math.min(2000, width));
+    localStorage.setItem('nerve_chat_width', String(clamped));
+    set({ chatWidth: clamped });
+  },
+
+  setSidebarWidth: (width: number) => {
+    const clamped = Math.max(180, Math.min(480, width));
+    localStorage.setItem('nerve_sidebar_width', String(clamped));
+    set({ sidebarWidth: clamped });
   },
 
   pruneCompletedTabs: () => {
