@@ -89,6 +89,37 @@ async def test_awaiting_input_broadcast_and_registry():
 
 
 @pytest.mark.asyncio
+async def test_resolve_broadcasts_interaction_resolved():
+    """Resolving emits a session-scoped interaction_resolved event so parallel
+    clients clear their pending poll/plan prompt instead of re-prompting."""
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    handler = InteractiveToolHandler("sess-resolved", broadcast, interactive_capable=True)
+    register_handler("sess-resolved", handler)
+    try:
+        task = asyncio.create_task(
+            handler._handle_interactive("AskUserQuestion", {"questions": []})
+        )
+        await _wait_until_pending(handler)
+        interaction = next(m for (_c, m) in messages if m["type"] == "interaction")
+
+        assert handler.resolve(interaction["interaction_id"], {"q": "a"})
+        await task
+
+        resolved = [(c, m) for (c, m) in messages if m["type"] == "interaction_resolved"]
+        assert resolved, "expected an interaction_resolved broadcast"
+        channel, msg = resolved[-1]
+        assert channel == "sess-resolved"
+        assert msg["session_id"] == "sess-resolved"
+        assert msg["interaction_id"] == interaction["interaction_id"]
+    finally:
+        unregister_handler("sess-resolved")
+
+
+@pytest.mark.asyncio
 async def test_cancel_all_clears_awaiting():
     """Stopping a session mid-wait denies the interaction and clears the flag."""
     messages: list[tuple[str, dict]] = []

@@ -219,6 +219,21 @@ class InteractiveToolHandler:
             # cancelled). has_pending then reflects any remaining interaction.
             self._pending.pop(interaction_id, None)
             await self._broadcast_awaiting()
+            # Tell every client this interaction is settled so parallel clients
+            # clear their pending poll/plan prompt (the answering client cleared
+            # it locally). Buffered for reconnect replay on the session channel.
+            # Best-effort: a broadcast failure must not break the interaction flow.
+            try:
+                await self._broadcast(self.session_id, {
+                    "type": "interaction_resolved",
+                    "session_id": self.session_id,
+                    "interaction_id": interaction_id,
+                })
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to broadcast interaction_resolved for %s: %s",
+                    self.session_id, e,
+                )
 
     async def _broadcast_awaiting(self) -> None:
         """Broadcast this session's waiting-for-input state to all clients.

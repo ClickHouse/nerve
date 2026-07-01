@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { FileCheck, Play, Ban, Check } from 'lucide-react';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { useChatStore } from '../../../stores/chatStore';
@@ -16,6 +16,11 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
     (isExitPlan && pendingInteraction.interactionType === 'plan_exit') ||
     (isEnterPlan && pendingInteraction.interactionType === 'plan_enter')
   );
+  // Latch that the prompt was once live. A later disappearance then means it was
+  // resolved (here or by a parallel client) — distinguishes the post-resolution
+  // settling window from the pre-prompt one so we don't show a stale "waiting".
+  const seenInteractive = useRef(false);
+  if (isInteractive) seenInteractive.current = true;
 
   // Already responded or tool completed
   if (responded || block.status === 'complete') {
@@ -35,14 +40,18 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
     );
   }
 
-  // Waiting for user input
+  // Waiting for user input (pre-prompt), or settling after another client
+  // resolved it while this client's tool_result hasn't landed yet.
   if (!isInteractive) {
+    const settling = seenInteractive.current;
     return (
       <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
         <div className="px-3 py-2.5 flex items-center gap-2">
           <FileCheck size={14} className="text-text-muted animate-pulse" />
           <span className="text-[13px] text-text-muted">
-            {isExitPlan ? 'Waiting to approve plan...' : 'Waiting to enter plan mode...'}
+            {settling
+              ? 'Resolving…'
+              : (isExitPlan ? 'Waiting to approve plan...' : 'Waiting to enter plan mode...')}
           </span>
         </div>
       </div>

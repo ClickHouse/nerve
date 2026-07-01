@@ -29,6 +29,18 @@ export function handleInteraction(
   }
 }
 
+export function handleInteractionResolved(
+  msg: Extract<WSMessage, { type: 'interaction_resolved' }>,
+  get: Get,
+  set: Set,
+): void {
+  // The interaction was answered/denied (possibly by a parallel client) — drop
+  // the pending prompt so this client's poll/plan UI stops soliciting an answer.
+  if (get().pendingInteraction?.interactionId === msg.interaction_id) {
+    set({ pendingInteraction: null });
+  }
+}
+
 export function handleFileChanged(
   msg: Extract<WSMessage, { type: 'file_changed' }>,
   _get: Get,
