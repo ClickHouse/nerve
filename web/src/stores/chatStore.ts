@@ -9,7 +9,7 @@ import { randomUUID } from '../utils/uuid';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn } from './handlers/streamingHandlers';
+import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
@@ -64,8 +64,9 @@ let _quoteId = 0;
 // stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'done', 'stopped', 'error',
-  'wakeup', 'auto_turn', 'session_status', 'plan_update', 'subagent_start',
-  'subagent_complete', 'hoa_progress', 'interaction', 'file_changed',
+  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
+  'subagent_start', 'subagent_complete', 'hoa_progress', 'interaction',
+  'file_changed',
 ]);
 
 interface ChatState {
@@ -719,6 +720,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'done':         return handleDone(msg, get, set);
       case 'wakeup':       return handleWakeup(msg, get, set);
       case 'auto_turn':    return handleAutoTurn(msg, get, set);
+      case 'model_changed': return handleModelChanged(msg, get, set);
       case 'stopped':      return handleStopped(msg, get, set);
       case 'error':        return handleError(msg, get, set);
       // Sessions

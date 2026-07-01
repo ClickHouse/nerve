@@ -251,6 +251,36 @@ def _parse_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
     return None
 
 
+def _model_family(model: str) -> str:
+    """Normalize a model identifier to a comparable family name.
+
+    The same model family shows up under many identifiers depending on
+    provider routing and release: a bare alias, a dated release id, a
+    Bedrock inference-profile id, or a context-window-suffixed alias.
+    Serving-model change detection compares *families*, so none of these
+    synonyms may register as a change:
+
+        example-model-2            -> example-model-2
+        example-model-2-20260101   -> example-model-2
+        us.provider.example-model-2-20260101-v1:0 -> example-model-2
+        example-model-2[1m]        -> example-model-2
+        example-model-2-latest     -> example-model-2
+    """
+    m = model.strip().lower()
+    # Provider routing prefix: "us.anthropic.", "global.anthropic.", ...
+    if "anthropic." in m:
+        m = m.rsplit("anthropic.", 1)[1]
+    # Context-window suffix: "...[1m]"
+    m = m.split("[", 1)[0]
+    # Bedrock version suffix: "-v1:0" / "-v2"
+    m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+    # "-latest" alias suffix
+    m = re.sub(r"-latest$", "", m)
+    # Trailing release date: "-20260601"
+    m = re.sub(r"-20\d{6}$", "", m)
+    return m
+
+
 @dataclass
 class _TurnState:
     """Accumulates one agent turn's worth of streamed content.
@@ -331,6 +361,14 @@ class AgentEngine:
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
         self._session_models: dict[str, str] = {}
+        # Last model *observed* serving each session (from
+        # AssistantMessage.model). The API may silently serve a different
+        # model than requested — e.g. a capacity fallback from a frontier
+        # model to the previous tier — and switch back later. Transitions
+        # are surfaced as model_change blocks/events (_track_serving_model).
+        # Seeded from session metadata on client creation so detection
+        # survives restarts without re-firing on every resume.
+        self._observed_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
@@ -1550,12 +1588,27 @@ class AgentEngine:
                     unregister_handler(session_id)
                     await self._safe_disconnect(client)
                     client = None
+                    # Deliberate switch — drop the observed-model baseline so
+                    # the first message on the new model doesn't fire a
+                    # model_change event for a change the user asked for.
+                    self._observed_models.pop(session_id, None)
                 else:
                     return client
 
             # Check for stored SDK session ID for resume
             session = await self.db.get_session(session_id)
             sdk_resume_id = session.get("sdk_session_id") if session else None
+
+            # Seed the serving-model baseline from the last persisted
+            # observation so downgrade detection survives restarts without
+            # re-firing an event on every resumed session.
+            if session and session_id not in self._observed_models:
+                try:
+                    _meta = json.loads(session.get("metadata") or "{}")
+                except (TypeError, ValueError):
+                    _meta = {}
+                if _meta.get("observed_model"):
+                    self._observed_models[session_id] = _meta["observed_model"]
 
             # For forks, use the source session's SDK ID
             if fork_from and not sdk_resume_id:
@@ -1863,6 +1916,54 @@ class AgentEngine:
     #  Shared per-message processing (user runs + autonomous turns)        #
     # ------------------------------------------------------------------ #
 
+    async def _track_serving_model(
+        self, session_id: str, model: str, st: _TurnState,
+    ) -> None:
+        """Detect serving-model transitions and surface them.
+
+        The API can serve a session with a different model than the one
+        configured — e.g. a capacity fallback from a frontier model to
+        the previous tier — and later switch back, all without any
+        explicit signal beyond ``AssistantMessage.model``. Compare each
+        main-agent message's model against the last observed one (or the
+        configured model for the first observation) and, when the model
+        *family* changes:
+
+        - append a ``model_change`` block to the turn (persisted with the
+          message, so the transition stays visible in history),
+        - broadcast a ``model_changed`` event for the live UI,
+        - log it (warning when it moves away from the configured model,
+          info when it returns).
+
+        Family comparison (see ``_model_family``) keeps alias/dated/
+        Bedrock spellings of the same model from registering as changes.
+        """
+        prev = self._observed_models.get(session_id)
+        self._observed_models[session_id] = model
+        configured = self._session_models.get(session_id)
+        baseline = prev or configured
+        if not baseline or _model_family(model) == _model_family(baseline):
+            return
+        downgrade = bool(
+            configured and _model_family(model) != _model_family(configured),
+        )
+        log = logger.warning if downgrade else logger.info
+        log(
+            "Session %s serving model changed: %s → %s%s",
+            session_id, baseline, model,
+            f" (away from configured {configured})" if downgrade else "",
+        )
+        st.ordered_blocks.append({
+            "type": "model_change",
+            "from": baseline,
+            "to": model,
+            "downgrade": downgrade,
+        })
+        await broadcaster.broadcast_model_changed(
+            session_id, from_model=baseline, to_model=model,
+            downgrade=downgrade,
+        )
+
     async def _process_sdk_message(
         self, session_id: str, message: Any, st: _TurnState,
     ) -> bool:
@@ -1885,13 +1986,18 @@ class AgentEngine:
 
         if isinstance(message, AssistantMessage):
             st.got_content = True
-            # Capture model from assistant message (more reliable than config)
-            msg_model = getattr(message, "model", None)
-            if msg_model:
-                st.last_model = msg_model
             # Extract parent_tool_use_id — set when this message comes from
             # a sub-agent (Task/Agent) rather than the main agent
             parent_id = getattr(message, "parent_tool_use_id", None)
+            # Capture model from assistant message (more reliable than
+            # config). Main-agent messages only: sub-agents legitimately
+            # run different models (Agent tool `model` opt, built-in agent
+            # defaults), which must not pollute turn cost attribution or
+            # fire serving-model change events.
+            msg_model = getattr(message, "model", None)
+            if msg_model and parent_id is None:
+                st.last_model = msg_model
+                await self._track_serving_model(session_id, msg_model, st)
 
             for block in message.content:
                 if isinstance(block, TextBlock):
@@ -2330,6 +2436,10 @@ class AgentEngine:
             session_record = await self.db.get_session(session_id)
             meta = json.loads(session_record.get("metadata") or "{}") if session_record else {}
             meta["last_usage"] = usage_data
+            if st.last_model:
+                # Baseline for serving-model change detection across
+                # restarts (see _track_serving_model).
+                meta["observed_model"] = st.last_model
 
             # Extract server_tool_use counts
             server_tool = st.last_usage.get("server_tool_use") or {}

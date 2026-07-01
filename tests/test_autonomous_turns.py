@@ -41,6 +41,8 @@ def _make_engine() -> AgentEngine:
     engine._workflows = {}
     engine._idle_watchers = {}
     engine._session_locks = {}
+    engine._session_models = {}
+    engine._observed_models = {}
     return engine
 
 

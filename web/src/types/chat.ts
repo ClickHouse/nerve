@@ -80,7 +80,17 @@ export interface AutoTurnBlockData {
   type: 'auto';
 }
 
-export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData | AutoTurnBlockData;
+/** Marker emitted when the API switched the model serving this session —
+ *  e.g. a silent capacity downgrade away from the configured model
+ *  (downgrade: true), or the later recovery back to it. */
+export interface ModelChangeBlockData {
+  type: 'model_change';
+  from?: string;
+  to: string;
+  downgrade?: boolean;
+}
+
+export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData | AutoTurnBlockData | ModelChangeBlockData;
 
 export interface ChatMessage {
   id?: number;

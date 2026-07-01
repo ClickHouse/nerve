@@ -101,6 +101,25 @@ export function handleWakeup(
   set({ streamingBlocks: blocks, isStreaming: true });
 }
 
+export function handleModelChanged(
+  msg: Extract<WSMessage, { type: 'model_changed' }>,
+  get: Get,
+  set: Set,
+): void {
+  // The API switched the model serving this session (e.g. a capacity
+  // downgrade away from the configured model, or the recovery back).
+  // Append a marker chip at the current stream position — the backend
+  // persists the matching block, so it survives reload.
+  const blocks = [...get().streamingBlocks];
+  blocks.push({
+    type: 'model_change',
+    from: msg.from_model,
+    to: msg.to_model,
+    downgrade: msg.downgrade,
+  });
+  set({ streamingBlocks: blocks });
+}
+
 export function handleAutoTurn(
   _msg: Extract<WSMessage, { type: 'auto_turn' }>,
   get: Get,
