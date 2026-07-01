@@ -40,6 +40,8 @@ from any working directory:
 | `agent.cron_model` | string | `claude-sonnet-4-6` | Model for cron jobs (cheaper) |
 | `agent.max_turns` | int | `50` | Max agentic turns per request |
 | `agent.max_concurrent` | int | `4` | Max concurrent agent sessions |
+| `agent.thinking` | string | `max` | Thinking budget for the main model: `max` / `high` / `medium` / `low` / `disabled` / `adaptive` / explicit token count. Automatically capped at `high` for cron and hook sessions when `proxy.enabled` is true (Claude OAuth subscription rejects `max` on non-flagship models like Sonnet). |
+| `agent.effort` | string | `max` | Reasoning effort for the main model: `max` / `high` / `medium` / `low`. Same OAuth+cron cap as `thinking`. |
 | `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
 | `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
 | `agent.prompt_rewrite.max_tokens` | int | `1024` | Max tokens for the rewritten prompt |

@@ -70,6 +70,35 @@ except ImportError:
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
+_OAUTH_CRON_CAP = "high"
+
+
+def _select_thinking_effort(config: Any, source: str) -> tuple[str, str]:
+    """Pick (thinking, effort) for a session, downgrading only under OAuth.
+
+    Cron and hook sessions run on ``agent.cron_model`` (typically Sonnet).
+    Under Claude OAuth (subscription) Sonnet caps thinking/effort at
+    ``high`` and the CLI rejects ``max`` with::
+
+        API Error: 400 level "max" not supported, valid levels: low, medium, high
+
+    OAuth mode in nerve is gated by the local cli-proxy-api wrapping
+    the user's subscription credentials — i.e. ``config.proxy.enabled``.
+    When that's on AND the session is cron/hook, cap both knobs to
+    ``high``. API users (no proxy) and interactive sessions keep the
+    user's configured value unchanged — defaults stay ``max`` for
+    everyone, only the narrow OAuth+cron path is downgraded.
+    """
+    thinking = config.agent.thinking
+    effort = config.agent.effort
+    if source in ("cron", "hook") and config.proxy.enabled:
+        if thinking == "max":
+            thinking = _OAUTH_CRON_CAP
+        if effort == "max":
+            effort = _OAUTH_CRON_CAP
+    return thinking, effort
+
+
 # Anthropic API image limits
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -315,22 +344,10 @@ class AgentEngine:
         # task_started / task_updated / task_notification system messages:
         # session_id -> task_id -> {task_id, label, tool, status}.
         self._bg_task_registry: dict[str, dict[str, dict[str, Any]]] = {}
-        # Per-session dynamic-workflow registry: session_id -> tool_use_id ->
-        # {name, snapshot}. The tool_use_id is captured when a ``Workflow``
-        # tool call streams; later task_* system messages carrying a
-        # ``workflow_progress`` tree are matched back to it so the UI can
-        # render a live phase/agent panel. The last snapshot is cached so the
-        # terminal task_notification (which omits the tree) can still settle
-        # the panel and persist the final state.
-        self._workflows: dict[str, dict[str, dict[str, Any]]] = {}
         # Per-session active channel — set on run() entry, cleared on exit.
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
         self._active_channel: dict[str, str] = {}
-        # Resolved model bound to each session's live SDK client. Used to
-        # detect mid-session model switches (the CLI fixes its model at
-        # connect time, so a change requires recreating the client).
-        self._session_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
@@ -977,28 +994,25 @@ class AgentEngine:
         else:
             system_prompt = system_prompt_str
 
-        # Local Ollama models are reached through the proxy and speak the
-        # OpenAI-translated API — Anthropic-only knobs (extended thinking,
-        # effort, the context-1m beta) don't apply and may break translation,
-        # so suppress them for non-Claude models.
-        selected_model = model or self.config.agent.model
-        is_ollama_model = (
-            self.config.ollama.enabled and "claude" not in selected_model.lower()
+        # Pick raw thinking/effort by source (cron/hook → cron_* overrides,
+        # interactive → main settings), then cap each to what the resolved
+        # model actually supports.
+        thinking_value, effort_value = _select_thinking_effort(
+            self.config, source,
         )
-
-        thinking_config = (
-            None if is_ollama_model
-            else self._parse_thinking_config(self.config.agent.thinking, selected_model)
+        thinking_config = self._parse_thinking_config(
+            thinking_value,
+            model or self.config.agent.model,
         )
-        effort = (
-            None if is_ollama_model
-            else self._effective_effort(self.config.agent.effort, selected_model)
+        effort = self._effective_effort(
+            effort_value,
+            model or self.config.agent.model,
         )
         # Some subscriptions reject the context-1m beta for specific models
         # (e.g. claude-sonnet-4-6) — skip the beta header for those.
         betas = (
             ["context-1m-2025-08-07"]
-            if not is_ollama_model and self.config.agent.context_1m_enabled_for(model)
+            if self.config.agent.context_1m_enabled_for(model)
             else []
         )
 
@@ -1192,7 +1206,7 @@ class AgentEngine:
         through ``engine.run(..., source="wakeup")`` (the CLI's own
         autonomous firing is suppressed — see ``_build_env``).
         """
-        from nerve.agent.interactive import INTERACTIVE_TOOLS, _read_file_safe
+        from nerve.agent.interactive import _read_file_safe
 
         captured_files: set[str] = set()
 
@@ -1265,58 +1279,17 @@ class AgentEngine:
                 )
             return {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
 
-        async def _grant_permission_hook(hook_input, tool_use_id, context):
-            """PreToolUse hook: pre-approve non-interactive tools.
-
-            Background sub-agents (the Agent tool with run_in_background) run
-            detached and non-blocking, so the CLI never surfaces an approval
-            prompt for their nested tool calls — the ``can_use_tool`` callback
-            is never invoked for them and the CLI denies their Write/Edit/Bash
-            by default. A PreToolUse hook, however, DOES fire for those nested
-            calls (it is a programmatic callback, not a user-facing prompt), so
-            returning ``permissionDecision: "allow"`` here grants the same
-            auto-approval foreground agents already get via ``can_use_tool``.
-
-            Interactive tools and Read are left untouched: interactive tools
-            defer to ``can_use_tool`` (pause / inject answers / deny), and Read
-            defers to the image validator above plus the CLI's read-only
-            auto-allow. This keeps the web pause-for-input flow intact while
-            giving background sub-agents permission parity with the foreground.
-            """
-            tool_name = hook_input.get("tool_name", "")
-            if tool_name in INTERACTIVE_TOOLS or tool_name == "Read":
-                return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": (
-                        "nerve: auto-approved (background-agent permission parity)"
-                    ),
-                }
-            }
-
-        pre_tool_use = [
-            HookMatcher(
-                matcher="Edit|Write|NotebookEdit",
-                hooks=[_snapshot_hook],
-            ),
-            HookMatcher(
-                matcher="Read",
-                hooks=[_validate_image_hook],
-            ),
-        ]
-        # Catch-all permission grant so background sub-agents (whose nested
-        # tool calls never reach can_use_tool) inherit foreground's tool
-        # permissions. Registered last so the snapshot/validator hooks still
-        # run for their tools; a deny from the validator wins over this allow.
-        if self.config.agent.background_agent_permissions:
-            pre_tool_use.append(
-                HookMatcher(matcher=None, hooks=[_grant_permission_hook])
-            )
-
         return {
-            "PreToolUse": pre_tool_use,
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="Edit|Write|NotebookEdit",
+                    hooks=[_snapshot_hook],
+                ),
+                HookMatcher(
+                    matcher="Read",
+                    hooks=[_validate_image_hook],
+                ),
+            ],
             "PostToolUse": [
                 HookMatcher(
                     matcher="ScheduleWakeup",
@@ -1522,28 +1495,12 @@ class AgentEngine:
         lock = self.sessions.get_lock(session_id)
         async with lock:
             client = self.sessions.get_client(session_id)
-            requested_model = model or self.config.agent.model
             if client is not None:
-                bound_model = self._session_models.get(session_id)
                 # Health check: verify the underlying CLI process is still alive
                 if self._is_client_dead(client):
                     logger.warning(
                         "Client process for session %s is dead, recreating",
                         session_id,
-                    )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = None
-                elif bound_model is not None and bound_model != requested_model:
-                    # Model switched mid-session (e.g. the composer's picker
-                    # moved from the Anthropic default to a local Ollama
-                    # model). The CLI binds its model at connect time, so
-                    # tear the client down and recreate it below.
-                    logger.info(
-                        "Session %s model changed (%s → %s), recreating client",
-                        session_id, bound_model, requested_model,
                     )
                     self._stop_idle_watcher(session_id)
                     self.sessions.remove_client(session_id)
@@ -1638,7 +1595,6 @@ class AgentEngine:
 
             # Record connected_at and the resolved model
             resolved_model = options.model
-            self._session_models[session_id] = resolved_model
             now = datetime.now(timezone.utc).isoformat()
             connected_at = session.get("connected_at") if session and sdk_resume_id else now
             await self.sessions.mark_active(
@@ -1952,16 +1908,6 @@ class AgentEngine:
                             description=str(tool_input.get("description", "")),
                             model=str(tool_input.get("model", "")) or None,
                         )
-                    # Track dynamic workflows.  A ``Workflow`` tool call spawns
-                    # a background runtime; later task_* system messages carry
-                    # its progress tree keyed by this tool_use_id.  Register it
-                    # now so _handle_system_message can recognize those events
-                    # even before the first ``workflow_progress`` payload.
-                    if tool_name == "Workflow" and tool_use_id:
-                        self._workflows.setdefault(session_id, {})[tool_use_id] = {
-                            "name": self._derive_workflow_name(tool_input),
-                            "snapshot": None,
-                        }
                     st.tool_calls_log.append({
                         "tool": tool_name,
                         "input": tool_input,
@@ -2084,173 +2030,12 @@ class AgentEngine:
             if not entry["label"]:
                 entry["label"] = data.get("summary") or task_id
 
-        # Dynamic-workflow progress. A workflow task is recognized either by
-        # its tool_use_id (captured when the ``Workflow`` tool streamed) or by
-        # the presence of a ``workflow_progress`` tree on the message. We emit
-        # a dedicated event so the UI can render a live phase/agent panel —
-        # independent of the coarse background-task chip above.
-        tool_use_id = data.get("tool_use_id") or getattr(message, "tool_use_id", None)
-        wf_reg = self._workflows.get(session_id) or {}
-        wp = data.get("workflow_progress")
-        task_type = str(data.get("task_type") or "")
-        is_workflow = bool(tool_use_id) and (
-            tool_use_id in wf_reg
-            or (isinstance(wp, list) and len(wp) > 0)
-            or "workflow" in task_type
-        )
-        if is_workflow:
-            entry["tool"] = "Workflow"
-            # The CLI reports the workflow name on task_started — authoritative
-            # (and better than the tool-input guess for inline scripts).
-            wf_name = data.get("workflow_name")
-            if wf_name:
-                self._workflows.setdefault(session_id, {}).setdefault(
-                    tool_use_id, {"name": "Workflow", "snapshot": None},
-                )["name"] = str(wf_name)
-            await self._emit_workflow_progress(
-                session_id, tool_use_id, subtype, data, message, wp,
-            )
-
         if changed:
             await broadcaster.broadcast(session_id, {
                 "type": "background_tasks_update",
                 "session_id": session_id,
                 "tasks": list(registry.values()),
             })
-
-    async def _emit_workflow_progress(
-        self,
-        session_id: str,
-        tool_use_id: str,
-        subtype: str,
-        data: dict,
-        message: Any,
-        wp: Any,
-    ) -> None:
-        """Build, cache, broadcast (and on terminal, persist) a workflow
-        progress snapshot for the ``Workflow`` call ``tool_use_id``."""
-        reg = self._workflows.setdefault(session_id, {})
-        cached = reg.setdefault(tool_use_id, {"name": "Workflow", "snapshot": None})
-
-        # task_progress carries the full tree; task_notification omits it, so
-        # fall back to the last cached snapshot to settle the panel.
-        if isinstance(wp, list) and wp:
-            snapshot = self._build_workflow_snapshot(wp)
-        else:
-            prev = cached.get("snapshot") or {}
-            snapshot = {
-                "phases": prev.get("phases", []),
-                "agents": prev.get("agents", []),
-                "totalTokens": prev.get("totalTokens", 0),
-                "totalToolCalls": prev.get("totalToolCalls", 0),
-                "agentCount": prev.get("agentCount", 0),
-            }
-
-        status = self._workflow_status(subtype, data, message)
-        snapshot["name"] = cached.get("name") or "Workflow"
-        snapshot["status"] = status
-        summary = (
-            data.get("summary")
-            or data.get("description")
-            or getattr(message, "summary", "")
-            or getattr(message, "description", "")
-        )
-        if summary:
-            snapshot["summary"] = str(summary)[:2000]
-
-        cached["snapshot"] = snapshot
-        await broadcaster.broadcast_workflow_progress(session_id, tool_use_id, snapshot)
-
-        if status in ("completed", "failed", "stopped"):
-            try:
-                await self.db.merge_workflow_into_call(session_id, tool_use_id, snapshot)
-            except Exception as e:  # persistence is best-effort
-                logger.debug("merge_workflow_into_call failed for %s: %s", tool_use_id, e)
-
-    @staticmethod
-    def _workflow_status(subtype: str, data: dict, message: Any) -> str:
-        """Map a task_* system message to a workflow status string
-        (running / completed / failed / stopped)."""
-        if subtype in ("task_started", "task_progress"):
-            return "running"
-        if subtype == "task_updated":
-            patch = data.get("patch") or {}
-            s = str(patch.get("status") or "")
-            if s == "killed":
-                return "stopped"
-            return s or "running"
-        if subtype == "task_notification":
-            return str(
-                data.get("status") or getattr(message, "status", "") or "completed"
-            )
-        return "running"
-
-    @staticmethod
-    def _derive_workflow_name(tool_input: Any) -> str:
-        """Best-effort workflow name: the ``name`` arg for a named workflow,
-        else ``meta.name`` parsed from an inline script, else "Workflow"."""
-        if not isinstance(tool_input, dict):
-            return "Workflow"
-        name = tool_input.get("name")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-        script = tool_input.get("script")
-        if isinstance(script, str):
-            m = re.search(r"name\s*:\s*['\"]([^'\"]+)['\"]", script)
-            if m:
-                return m.group(1)
-        return "Workflow"
-
-    @staticmethod
-    def _fold_workflow_snapshots(
-        ordered_blocks: list | None, wf_reg: dict | None,
-    ) -> None:
-        """Attach cached workflow snapshots onto their ``Workflow`` tool_call
-        blocks (in place), so a settled-within-turn workflow persists its tree."""
-        if not wf_reg or not ordered_blocks:
-            return
-        for ob in ordered_blocks:
-            if not isinstance(ob, dict) or ob.get("type") != "tool_call":
-                continue
-            snap = (wf_reg.get(ob.get("tool_use_id")) or {}).get("snapshot")
-            if snap:
-                ob["workflow"] = snap
-
-    @staticmethod
-    def _build_workflow_snapshot(wp: list) -> dict:
-        """Normalize the CLI's flat ``workflow_progress`` list into a
-        {phases, agents, totals} snapshot for the UI."""
-        phases: list[dict] = []
-        agents: list[dict] = []
-        for e in wp:
-            if not isinstance(e, dict):
-                continue
-            etype = e.get("type")
-            if etype == "workflow_phase":
-                phases.append({"index": e.get("index"), "title": e.get("title")})
-            elif etype == "workflow_agent":
-                summary = e.get("lastToolSummary")
-                agents.append({
-                    "label": e.get("label"),
-                    "phaseIndex": e.get("phaseIndex"),
-                    "phaseTitle": e.get("phaseTitle"),
-                    "state": e.get("state"),
-                    "model": e.get("model"),
-                    "tokens": e.get("tokens"),
-                    "toolCalls": e.get("toolCalls"),
-                    "lastToolName": e.get("lastToolName"),
-                    "lastToolSummary": str(summary)[:200] if summary else None,
-                    "durationMs": e.get("durationMs"),
-                })
-        total_tokens = sum(int(a.get("tokens") or 0) for a in agents)
-        total_tool_calls = sum(int(a.get("toolCalls") or 0) for a in agents)
-        return {
-            "phases": phases,
-            "agents": agents,
-            "totalTokens": total_tokens,
-            "totalToolCalls": total_tool_calls,
-            "agentCount": len(agents),
-        }
 
     def _prune_bg_tasks(self, session_id: str) -> None:
         """Drop settled background tasks from the registry.
@@ -2259,24 +2044,12 @@ class AgentEngine:
         accumulate forever. Running tasks are kept.
         """
         registry = self._bg_task_registry.get(session_id)
-        if registry:
-            for tid in [t for t, e in registry.items() if e.get("status") != "running"]:
-                del registry[tid]
-            if not registry:
-                self._bg_task_registry.pop(session_id, None)
-
-        # Drop settled workflows too (terminal snapshot already broadcast +
-        # persisted); keep running ones so late progress still maps back.
-        wf_reg = self._workflows.get(session_id)
-        if wf_reg:
-            terminal = {"completed", "failed", "stopped"}
-            for tuid in [
-                t for t, e in wf_reg.items()
-                if (e.get("snapshot") or {}).get("status") in terminal
-            ]:
-                del wf_reg[tuid]
-            if not wf_reg:
-                self._workflows.pop(session_id, None)
+        if not registry:
+            return
+        for tid in [t for t, e in registry.items() if e.get("status") != "running"]:
+            del registry[tid]
+        if not registry:
+            self._bg_task_registry.pop(session_id, None)
 
     async def _finalize_turn(
         self, session_id: str, st: _TurnState, channel: str | None,
@@ -2290,13 +2063,6 @@ class AgentEngine:
         """
         # Merge tool results into tool_calls_log
         self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
-
-        # Fold the latest dynamic-workflow snapshot onto its ``Workflow`` block
-        # so the panel reconstructs after reload. This covers workflows that
-        # settle *within* the launching turn — before the message row exists,
-        # so the out-of-band merge_workflow_into_call has nothing to patch.
-        # Longer workflows that settle after finalize are handled by that merge.
-        self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
         # Store assistant message in DB
         await self.sessions.add_message(
@@ -3310,44 +3076,6 @@ class AgentEngine:
     #  Cron / Hook runs                                                    #
     # ------------------------------------------------------------------ #
 
-    async def _teardown_oneshot_client(
-        self, session_id: str, *, keepalive_if_bg: bool = True,
-    ) -> None:
-        """Tear down a one-shot (cron / hook) run's SDK client.
-
-        One-shot runs normally discard the client immediately to avoid leaking
-        claude CLI subprocesses. The exception is a run that yields while a
-        ``run_in_background`` task is still live: discarding here kills the
-        subprocess and the idle-stream watcher that delivers the task's
-        completion turn, so the agent would never resume to finish its work
-        (the fix-worker "strand" failure). In that case keep the client alive —
-        exactly as an interactive/web session does — and let
-        ``run_idle_client_sweep`` reap it once the task settles (it already
-        skips live-background-task sessions for the same reason).
-
-        ``keepalive_if_bg`` MUST be False for runs whose ``session_id`` is
-        reused across runs (``run_persistent_cron``'s stable ``cron:{job_id}``):
-        parking such a client would let the NEXT scheduled run reuse the same
-        client/conversation while the prior run's background task is still in
-        flight, interleaving the two. Keep-alive is only safe for the
-        unique-per-run isolated paths (``run_cron`` / ``run_hook``).
-        """
-        # Optimistic check: a task that settles between the watcher's last drain
-        # and here still reads as live, parking a client whose work is actually
-        # done — harmless, the next idle sweep reaps it.
-        if keepalive_if_bg and self._has_live_background_tasks(session_id):
-            logger.info(
-                "One-shot session %s parked on a live background task — keeping "
-                "client alive so its completion turn can resume the run; the "
-                "idle sweep reaps it once the task settles.",
-                session_id,
-            )
-            return
-        # background_memorize: returning promptly closes the run log and frees
-        # APScheduler to fire the next run — memorization queues on a global
-        # lock and must not gate the run lifecycle.
-        await self._discard_client(session_id, background_memorize=True)
-
     async def run_cron(
         self,
         job_id: str,
@@ -3357,11 +3085,8 @@ class AgentEngine:
     ) -> str:
         """Run an agent turn for a cron job in an isolated session.
 
-        The SDK client is normally discarded immediately after the run
-        completes to avoid leaking claude CLI subprocesses for one-shot jobs —
-        unless the run yielded with a live ``run_in_background`` task, in which
-        case it is kept alive so the agent can resume when the task completes
-        (see ``_teardown_oneshot_client``).
+        The SDK client is discarded immediately after the run completes
+        to avoid leaking claude CLI subprocesses for one-shot jobs.
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -3375,7 +3100,10 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            await self._teardown_oneshot_client(session_id)
+            # background_memorize: returning promptly closes the cron run
+            # log and frees APScheduler to fire the next run — memorization
+            # queues on a global lock and must not gate the run lifecycle.
+            await self._discard_client(session_id, background_memorize=True)
 
     async def run_persistent_cron(
         self,
@@ -3386,13 +3114,9 @@ class AgentEngine:
         """Run a persistent cron job that maintains context across runs.
 
         Uses a stable session_id (cron:{job_id}) so the SDK resumes
-        conversation context on subsequent triggers.  The client is discarded
-        after each run to free the subprocess (sdk_session_id is preserved for
-        the next resume). Unlike the isolated one-shot paths it does NOT keep
-        the client alive for a live background task: the stable session is
-        reused by the next run, which would collide with the parked task — so a
-        persistent-cron background task that outlives its run is not resumed
-        (use an isolated cron for long background work).
+        conversation context on subsequent triggers.  The client is
+        discarded after each run to free the subprocess, but
+        sdk_session_id is preserved for the next resume.
         """
         session_id = f"cron:{job_id}"
         await self.sessions.get_or_create(
@@ -3406,10 +3130,8 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            # Stable session_id is reused by the next run, which would collide
-            # with a parked background task — so persistent crons always discard
-            # (no keep-alive). See _teardown_oneshot_client.
-            await self._teardown_oneshot_client(session_id, keepalive_if_bg=False)
+            # See run_cron: memorization must not gate the run lifecycle.
+            await self._discard_client(session_id, background_memorize=True)
 
     async def run_hook(
         self,
@@ -3420,10 +3142,7 @@ class AgentEngine:
     ) -> str:
         """Run an agent turn for a webhook in an isolated session.
 
-        The SDK client is normally discarded immediately after the run
-        completes — unless the run yielded with a live ``run_in_background``
-        task, in which case it is kept alive so the agent can resume when the
-        task completes (see ``_teardown_oneshot_client``).
+        The SDK client is discarded immediately after the run completes.
         """
         session = await self.sessions.create_hook_session(hook_name, hook_id)
         session_id = session["id"]
@@ -3435,7 +3154,8 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            await self._teardown_oneshot_client(session_id)
+            # See run_cron: memorization must not gate the run lifecycle.
+            await self._discard_client(session_id, background_memorize=True)
 
     # ------------------------------------------------------------------ #
     #  Idle client sweep                                                   #

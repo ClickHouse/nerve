@@ -151,17 +151,6 @@ class AgentConfig:
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
     cli_idle_timeout_seconds: int = 900
-    # When True, background sub-agents (the Agent tool with run_in_background, or
-    # background Bash) get the SAME auto-approved tool permissions as foreground
-    # agents, via a PreToolUse hook that pre-approves all non-interactive tools.
-    # Background tasks are detached and non-blocking, so the CLI never surfaces an
-    # approval prompt for them — the can_use_tool callback is never invoked for
-    # their nested Write/Edit/Bash calls, and the CLI denies them by default.
-    # A PreToolUse hook DOES fire for those nested calls (it is a programmatic
-    # callback, not a user prompt), so returning permissionDecision="allow" there
-    # grants the permission. Set False to restore the CLI default (background
-    # sub-agent writes denied; build/write agents must then run in foreground).
-    background_agent_permissions: bool = True
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @classmethod
@@ -179,9 +168,6 @@ class AgentConfig:
                 d.get("context_1m_excluded_models", []) or []
             ),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
-            background_agent_permissions=bool(
-                d.get("background_agent_permissions", True)
-            ),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 
@@ -305,14 +291,6 @@ class GitHubSyncConfig:
     # pass); deny_repos is a denylist and takes precedence over allow_repos.
     allow_repos: list[str] = field(default_factory=list)
     deny_repos: list[str] = field(default_factory=list)
-    # Actor guardrails — limit which GitHub logins can land a notification in
-    # the inbox, matched on the "actors" metadata key (every login involved in
-    # the notification: issue/PR author, assignees, comment & review authors).
-    # Same semantics as allow_repos/deny_repos — case-insensitive globs, deny
-    # wins, and a non-empty allow_actors is fail-closed (a notification with no
-    # matching actor is dropped before it reaches the inbox). Empty = all pass.
-    allow_actors: list[str] = field(default_factory=list)
-    deny_actors: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> GitHubSyncConfig:
@@ -326,8 +304,6 @@ class GitHubSyncConfig:
             condense=d.get("condense", False),
             allow_repos=d.get("allow_repos", []),
             deny_repos=d.get("deny_repos", []),
-            allow_actors=d.get("allow_actors", []),
-            deny_actors=d.get("deny_actors", []),
         )
 
 
@@ -547,16 +523,12 @@ class MemoryConfig:
 class CronConfig:
     jobs_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/jobs.yaml"))
     system_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/system.yaml"))
-    # Directory scanned at startup for drop-in custom gate plugins (.py files
-    # defining CronGate subclasses). See nerve/cron/gate_plugins.py.
-    gate_plugins_dir: Path = field(default_factory=lambda: Path("~/.nerve/cron/gates"))
 
     @classmethod
     def from_dict(cls, d: dict) -> CronConfig:
         return cls(
             jobs_file=_expand_path(d.get("jobs_file", "~/.nerve/cron/jobs.yaml")) or Path("~/.nerve/cron/jobs.yaml"),
             system_file=_expand_path(d.get("system_file", "~/.nerve/cron/system.yaml")) or Path("~/.nerve/cron/system.yaml"),
-            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir", "~/.nerve/cron/gates")) or Path("~/.nerve/cron/gates"),
         )
 
 
@@ -728,48 +700,6 @@ class ProxyConfig:
             auth_dir=_expand_path(d.get("auth_dir", "~/.nerve/cli-proxy-auth")) or Path("~/.nerve/cli-proxy-auth"),
             api_key=d.get("api_key", "sk-nerve-local-proxy"),
             log_file=_expand_path(d.get("log_file", "~/.nerve/proxy.log")) or Path("~/.nerve/proxy.log"),
-        )
-
-
-@dataclass
-class OllamaConfig:
-    """Local Ollama server — exposes its models as selectable chat models.
-
-    Ollama speaks an OpenAI-compatible API (``/v1``), not the Anthropic
-    Messages API the Claude Agent SDK uses. So Ollama models are routed
-    through the bundled CLIProxyAPI, which translates Anthropic ↔ OpenAI
-    and is registered with Ollama as an ``openai-compatibility`` upstream.
-
-    Requirement: this only takes effect when the proxy is also enabled
-    (``proxy.enabled: true``) — the proxy is the translation layer. When
-    ``enabled`` is true but the proxy is off, Ollama models are not offered
-    (a warning is logged at startup).
-
-    Models are auto-discovered at runtime from Ollama's native
-    ``GET /api/tags`` endpoint, so whatever you have pulled locally shows
-    up in the model picker with no extra config.
-    """
-
-    enabled: bool = False
-    host: str = "127.0.0.1"
-    port: int = 11434
-
-    @property
-    def base_url(self) -> str:
-        """Native Ollama base URL (used for ``/api/tags`` discovery)."""
-        return f"http://{self.host}:{self.port}"
-
-    @property
-    def openai_base_url(self) -> str:
-        """OpenAI-compatible base URL (registered as a proxy upstream)."""
-        return f"http://{self.host}:{self.port}/v1"
-
-    @classmethod
-    def from_dict(cls, d: dict) -> OllamaConfig:
-        return cls(
-            enabled=bool(d.get("enabled", False)),
-            host=d.get("host", "127.0.0.1"),
-            port=int(d.get("port", 11434)),
         )
 
 
@@ -1119,7 +1049,6 @@ class NerveConfig:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
-    ollama: OllamaConfig = field(default_factory=OllamaConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
@@ -1154,15 +1083,6 @@ class NerveConfig:
         if self.proxy.enabled:
             return self.proxy.api_key
         return self.anthropic_api_key
-
-    @property
-    def ollama_routable(self) -> bool:
-        """True when Ollama models can actually be served.
-
-        Requires both Ollama enabled and the proxy running (the proxy is
-        the Anthropic↔OpenAI translation layer Ollama is reached through).
-        """
-        return self.ollama.enabled and self.proxy.enabled
 
     def create_anthropic_client(self, timeout: float = 60.0) -> Any:
         """Create an Anthropic client based on the configured provider.
@@ -1246,7 +1166,6 @@ class NerveConfig:
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
             docker=DockerConfig.from_dict(d.get("docker", {})),
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
-            ollama=OllamaConfig.from_dict(d.get("ollama", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
