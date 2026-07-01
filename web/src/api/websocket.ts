@@ -30,6 +30,7 @@ export type WSMessage =
   | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }
   | { type: 'wakeup'; session_id: string }
   | { type: 'auto_turn'; session_id: string }
+  | { type: 'model_changed'; session_id: string; from_model: string; to_model: string; downgrade: boolean }
   | { type: 'pong' };
 
 type MessageHandler = (msg: WSMessage) => void;

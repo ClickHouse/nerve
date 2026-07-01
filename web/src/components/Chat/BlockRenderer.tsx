@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Download, FileText, Clock, RefreshCw } from 'lucide-react';
+import { Download, FileText, Clock, RefreshCw, TrendingDown, TrendingUp } from 'lucide-react';
 import type { MessageBlock } from '../../types/chat';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
@@ -50,6 +50,32 @@ export function BlockRenderer({
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-surface">
                   <RefreshCw size={11} />
                   Background continuation
+                </span>
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            );
+          case 'model_change':
+            // The API switched the model serving this session — amber when
+            // it moved away from the configured model (downgrade), muted
+            // when it changed back (recovery).
+            return (
+              <div key={i} className="flex items-center gap-1.5 my-1.5 text-xs text-text-muted">
+                <span className="h-px flex-1 bg-border" />
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border ${
+                    item.downgrade
+                      ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                      : 'border-border bg-surface'
+                  }`}
+                  title={
+                    item.downgrade
+                      ? 'The API downgraded this session away from its configured model'
+                      : 'The model serving this session changed'
+                  }
+                >
+                  {item.downgrade ? <TrendingDown size={11} /> : <TrendingUp size={11} />}
+                  {item.downgrade ? 'Model downgraded' : 'Model changed'}:
+                  {item.from ? ` ${item.from} → ` : ' '}{item.to}
                 </span>
                 <span className="h-px flex-1 bg-border" />
               </div>

@@ -56,6 +56,9 @@ export function hydrateMessage(raw: any): ChatMessage {
     if (b.type === 'auto') {
       return { type: 'auto' as const };
     }
+    if (b.type === 'model_change') {
+      return { type: 'model_change' as const, from: b.from, to: b.to || '', downgrade: b.downgrade };
+    }
     // Default: text
     return { type: 'text' as const, content: b.content || '' };
   });
