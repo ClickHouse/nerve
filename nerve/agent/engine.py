@@ -1701,6 +1701,13 @@ class AgentEngine:
             )
             await self.db.update_session_fields(session_id, {"model": resolved_model})
 
+            # A brand-new CLI process starts its cumulative cost counter at
+            # zero — zero the persisted baseline so the first turn's delta
+            # is exact.  The reset inference in compute_turn_cost remains
+            # as a backstop for any recycle path that bypasses this (e.g.
+            # a `nerve restart` racing an in-flight turn).
+            await self._reset_cost_baseline(session_id)
+
             logger.info(
                 "Created persistent client for session %s%s",
                 session_id,
@@ -1708,6 +1715,31 @@ class AgentEngine:
                 " (forked)" if is_fork else "",
             )
             return client
+
+    async def _reset_cost_baseline(self, session_id: str) -> None:
+        """Zero the persisted SDK cumulative-cost baseline for a session.
+
+        Called right after a new CLI client is created: the fresh process
+        reports ``total_cost_usd`` cumulatively from zero, so the stored
+        high-water mark from the previous client must not be diffed
+        against it (see compute_turn_cost in nerve.db.usage).
+
+        Re-reads the session row so concurrent metadata writers are not
+        clobbered; accounting must never break a turn, so failures are
+        logged and swallowed.
+        """
+        try:
+            session = await self.db.get_session(session_id)
+            if not session:
+                return
+            meta = json.loads(session.get("metadata") or "{}")
+            if meta.get("_sdk_cumulative_cost"):
+                meta["_sdk_cumulative_cost"] = 0
+                await self.db.update_session_metadata(session_id, meta)
+        except Exception as e:
+            logger.warning(
+                "Failed to reset cost baseline for %s: %s", session_id, e,
+            )
 
     async def _discard_client(
         self, session_id: str, clear_resume: bool = False,
@@ -2447,22 +2479,38 @@ class AgentEngine:
             web_fetch = server_tool.get("web_fetch_requests", 0)
 
             # Calculate per-turn cost.
-            # NOTE: The SDK's total_cost_usd is *cumulative* across the
-            # entire SDK session, NOT per-invocation.  We track the last
-            # known cumulative value in session metadata so we can compute
-            # the delta for this turn.
-            from nerve.db.usage import estimate_turn_cost, extract_cache_ttl_split
+            # NOTE: The SDK's total_cost_usd is *cumulative* per CLI client
+            # process, NOT per-invocation.  We track the last known
+            # cumulative value in session metadata and compute the delta
+            # for this turn.  The counter resets whenever the client is
+            # recycled (idle sweep, oneshot cron teardown, restart, model
+            # switch) — compute_turn_cost detects the reset and attributes
+            # the new cumulative to this turn instead of recording $0.
+            from nerve.db.usage import compute_turn_cost, extract_cache_ttl_split
             sdk_cost = (st.result_meta or {}).get("total_cost_usd")
             current_session_cost = (
                 session_record.get("total_cost_usd", 0) if session_record else 0
             ) or 0
 
+            prev_cumulative = meta.get("_sdk_cumulative_cost", 0) or 0
+            turn_cost, cost_source = compute_turn_cost(
+                sdk_cost, prev_cumulative, st.last_usage, model=st.last_model,
+            )
+            if cost_source == "sdk_reset":
+                logger.info(
+                    "SDK cost counter reset for %s (%.4f < %.4f) — client "
+                    "recycle; attributing new cumulative to this turn",
+                    session_id, sdk_cost, prev_cumulative,
+                )
+            elif cost_source == "estimate_backstop":
+                logger.warning(
+                    "SDK reported no turn cost (cumulative %.4f, prev %.4f) "
+                    "despite token traffic for %s — using token-based "
+                    "estimate $%.4f",
+                    sdk_cost, prev_cumulative, session_id, turn_cost,
+                )
             if sdk_cost is not None:
-                prev_cumulative = meta.get("_sdk_cumulative_cost", 0) or 0
-                turn_cost = max(sdk_cost - prev_cumulative, 0)
                 meta["_sdk_cumulative_cost"] = sdk_cost
-            else:
-                turn_cost = estimate_turn_cost(st.last_usage, model=st.last_model)
 
             # Save metadata (includes _sdk_cumulative_cost update)
             await self.db.update_session_metadata(session_id, meta)

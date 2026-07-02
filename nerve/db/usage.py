@@ -350,6 +350,66 @@ def estimate_turn_cost(usage: dict, model: str | None = None) -> float:
     return round(cost, 6)
 
 
+def compute_turn_cost(
+    sdk_cost: float | None,
+    prev_cumulative: float,
+    usage: dict | None,
+    model: str | None = None,
+) -> tuple[float, str]:
+    """Derive this turn's cost from the SDK's cumulative cost counter.
+
+    The Claude Agent SDK reports ``ResultMessage.total_cost_usd`` as a
+    *cumulative* total per CLI client process. The caller persists the
+    last seen cumulative value (``_sdk_cumulative_cost`` in session
+    metadata) and passes it as ``prev_cumulative``; the normal per-turn
+    cost is the delta between the two.
+
+    Two counter failure modes are handled explicitly (this logic has
+    produced two accounting incidents — v024 fixed over-counting when
+    the cumulative was treated as per-turn; the reset handling below
+    fixes under-counting):
+
+    * **Counter reset** — every client recycle (idle sweep, oneshot
+      cron teardown, ``nerve restart``, model switch) starts a fresh
+      CLI process whose cumulative begins near zero, i.e. *below* the
+      persisted high-water mark. A naive ``max(delta, 0)`` clamp
+      records $0 for the first turn on the new client — typically the
+      most expensive turn, since it replays the resumed context. The
+      new process's cumulative IS its spend so far, so attribute it to
+      this turn instead.
+
+    * **Zero with traffic** — the counter reports no spend while the
+      turn moved real tokens (stuck counter, provider that doesn't
+      price usage). Fall back to the token-based estimate so the row
+      never records a silent zero.
+
+    Returns ``(turn_cost, source)`` where ``source`` is one of:
+
+    - ``"sdk_delta"`` — normal cumulative delta (also covers genuinely
+      free/tiny turns, which legitimately stay at ~0);
+    - ``"sdk_reset"`` — counter went backwards, new cumulative used;
+    - ``"estimate"`` — SDK reported no cost at all;
+    - ``"estimate_backstop"`` — SDK cost was zero-ish despite real
+      token traffic, token-based estimate used.
+    """
+    usage = usage or {}
+    if sdk_cost is None:
+        return estimate_turn_cost(usage, model=model), "estimate"
+
+    if sdk_cost >= prev_cumulative:
+        turn_cost, source = sdk_cost - prev_cumulative, "sdk_delta"
+    else:
+        turn_cost, source = sdk_cost, "sdk_reset"
+
+    # Backstop: zero-ish cost with real token traffic → the counter lied
+    # some other way; trust the token-based estimate instead.
+    if turn_cost <= 0:
+        est = estimate_turn_cost(usage, model=model)
+        if est > 0.0005:
+            return est, "estimate_backstop"
+    return turn_cost, source
+
+
 def estimate_cost_from_totals(totals: dict, model: str | None = None) -> float:
     """Estimate USD cost from aggregated totals.
 
