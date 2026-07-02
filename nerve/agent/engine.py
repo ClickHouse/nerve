@@ -1028,9 +1028,16 @@ class AgentEngine:
             None if is_ollama_model
             else self._parse_thinking_config(self.config.agent.thinking, selected_model)
         )
+        # Cron- and hook-sourced turns are sensing / triage work that fires
+        # far more often than interactive sessions; run them at the lower
+        # cron_effort to cut token spend. Interactive sources (web, telegram,
+        # wakeup) keep the full agent.effort.
+        base_effort = self._base_effort_for_source(
+            source, self.config.agent.effort, self.config.agent.cron_effort
+        )
         effort = (
             None if is_ollama_model
-            else self._effective_effort(self.config.agent.effort, selected_model)
+            else self._effective_effort(base_effort, selected_model)
         )
         # Some subscriptions reject the context-1m beta for specific models
         # (e.g. claude-sonnet-4-6) — skip the beta header for those.
@@ -1457,6 +1464,23 @@ class AgentEngine:
         "sonnet-4-6": ("low", "medium", "high"),
     }
     _EFFORT_RANK: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+    # Sources whose turns are sensing / triage work and use ``cron_effort``
+    # instead of the interactive ``effort``. Everything else (web, telegram,
+    # wakeup, ...) is treated as interactive.
+    _CRON_EFFORT_SOURCES: frozenset[str] = frozenset({"cron", "hook"})
+
+    @staticmethod
+    def _base_effort_for_source(source: str, effort: str, cron_effort: str) -> str:
+        """Pick the raw effort string for a turn based on its source.
+
+        Cron and hook turns use ``cron_effort``; interactive sources keep the
+        full ``effort``. The result is still passed through
+        :meth:`_effective_effort` for model-cap clamping.
+        """
+        if source in AgentEngine._CRON_EFFORT_SOURCES:
+            return cron_effort
+        return effort
 
     @staticmethod
     def _effective_effort(value: str, model: str | None = None) -> str | None:
