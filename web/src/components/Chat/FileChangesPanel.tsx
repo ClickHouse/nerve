@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, lazy, Suspense } from 'react';
-import { ArrowLeft, FilePlus, FileEdit, FileX, Loader2, RefreshCw } from 'lucide-react';
+import { ArrowLeft, FilePlus, FileEdit, FileX, Loader2, RefreshCw, WrapText } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { SelectionToolbar } from './SelectionToolbar';
@@ -79,12 +79,22 @@ function FileCard({ file, onClick }: { file: ModifiedFileSummary; onClick: () =>
 //  Detail view (loads diff on demand)                                  //
 // ------------------------------------------------------------------ //
 
+// Persisted line-wrap preference for diff inspection (shared across sessions).
+const WRAP_STORAGE_KEY = 'nerve_diff_wrap';
+
 function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: () => void }) {
   const activeSession = useChatStore(s => s.activeSession);
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [wrap, setWrap] = useState(() => localStorage.getItem(WRAP_STORAGE_KEY) === 'true');
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const toggleWrap = () => {
+    const next = !wrap;
+    setWrap(next);
+    localStorage.setItem(WRAP_STORAGE_KEY, String(next));
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -119,6 +129,16 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
             <span className="text-diff-del">&minus;{diff.stats.deletions}</span>
           )}
         </div>
+        <button
+          onClick={toggleWrap}
+          aria-pressed={wrap}
+          className={`ml-auto w-5 h-5 flex items-center justify-center cursor-pointer transition-colors ${
+            wrap ? 'text-accent' : 'text-text-faint hover:text-text-muted'
+          }`}
+          title={wrap ? 'Disable line wrapping' : 'Enable line wrapping'}
+        >
+          <WrapText size={13} />
+        </button>
       </div>
       <div className="text-[11px] text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised">
         {file.short_path}
@@ -143,7 +163,7 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
               </div>
             }
           >
-            <DiffView diff={diff} />
+            <DiffView diff={diff} wrap={wrap} />
           </Suspense>
         )}
       </div>
