@@ -411,9 +411,9 @@ class NotificationService:
 
         - For ``type=approval`` rows: look up the dispatcher in the
           handler registry, run it, audit-log the outcome, then flip
-          the row's status. Snooze answers advance ``expires_at`` and
-          keep the row pending so a later re-delivery tick can surface
-          it again.
+          the row's status. Snooze answers keep the row pending and
+          stamp ``redeliver_at`` so the periodic maintenance tick
+          (:meth:`redeliver_due`) fans it out again with a fresh card.
         - For ``type=question`` rows (legacy): persist the answer,
           inject it back into the originating session, broadcast.
         - Fire-and-forget ``type=notify`` rows do not flow through this
@@ -564,11 +564,35 @@ class NotificationService:
 
         await self._append_approval_audit(result.audit_event)
 
-        # Snooze keeps the row pending with a future expiry so a later
-        # re-delivery tick (wired in PR 2) can surface it again.
-        if result.snooze_until is not None and result.ok:
+        # Snooze keeps the row pending and stamps ``redeliver_at`` so
+        # the periodic maintenance tick (:meth:`redeliver_due`) fans it
+        # out again at the snooze time. ``expires_at`` moves past the
+        # re-delivery point so the expiry sweep cannot kill the row
+        # before it resurfaces.
+        snoozed = result.snooze_until is not None and result.ok
+        snooze_until = result.snooze_until
+        if snoozed:
+            try:
+                snooze_dt = datetime.fromisoformat(snooze_until)
+            except ValueError:
+                # A dispatcher returned a malformed timestamp. Fall back
+                # to a 24h snooze rather than crash the answer route
+                # (which would leave the row pending with its Telegram
+                # buttons already consumed — the exact silent-loss shape
+                # this path exists to prevent).
+                logger.warning(
+                    "dispatcher returned malformed snooze_until %r for %s; "
+                    "defaulting to +24h",
+                    snooze_until, notification_id,
+                )
+                snooze_dt = datetime.now(timezone.utc) + timedelta(hours=24)
+                snooze_until = snooze_dt.isoformat()
+            expiry_hours = self.config.notifications.default_expiry_hours
+            new_expires_at = (
+                snooze_dt + timedelta(hours=expiry_hours)
+            ).isoformat()
             await self.db.snooze_notification(
-                notification_id, result.snooze_until,
+                notification_id, snooze_until, new_expires_at,
             )
         else:
             await self.db.answer_notification(
@@ -576,29 +600,30 @@ class NotificationService:
             )
 
         from nerve.agent.streaming import broadcaster
-        broadcast_status = (
-            "snoozed" if (result.snooze_until and result.ok) else "answered"
-        )
-        await broadcaster.broadcast("__global__", {
+        payload = {
             "type": "notification_answered",
             "notification_id": notification_id,
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
-            "approval_status": broadcast_status,
+            "approval_status": "snoozed" if snoozed else "answered",
             "dispatch_ok": result.ok,
-        })
+        }
+        if snoozed:
+            payload["snooze_until"] = snooze_until
+        await broadcaster.broadcast("__global__", payload)
 
         return True
 
     async def _append_approval_audit(self, event: dict[str, Any]) -> None:
-        """Append an ``approval-acted`` record to the mechanical-actions log.
+        """Append an approval-lifecycle record to the mechanical-actions log.
 
         Uses the same audit log that the propose-mechanical-action
         primitive writes to (``~/.nerve/mechanical-actions/audit.jsonl``)
         so the proposal lifecycle (``proposed`` -> ``approval-acted``
-        -> ``approved``/``declined``/``executed``) is visible in one
-        place. The shared helper module
+        -> ``approved``/``declined``/``executed``, plus
+        ``approval-expired`` when a card dies unanswered) is visible in
+        one place. The shared helper module
         ``scripts/_mechanical_action.py`` lives under the workspace, so
         we import it dynamically by path rather than as a real Python
         package.
@@ -625,8 +650,9 @@ class NotificationService:
         # so the helper validation stays strict for everything else.
         record = {"ts": ts, **event}
         valid = getattr(helper, "VALID_EVENTS", None)
-        if isinstance(valid, set) and "approval-acted" not in valid:
-            valid.add("approval-acted")
+        event_name = event.get("event")
+        if isinstance(valid, set) and event_name and event_name not in valid:
+            valid.add(event_name)
 
         try:
             await asyncio.to_thread(helper.append_audit, record, None)
@@ -673,6 +699,7 @@ class NotificationService:
         channels: list[str] | None = None,
         silent: bool = False,
         option_labels: dict[str, str] | None = None,
+        extra_web: dict[str, Any] | None = None,
     ) -> None:
         """Deliver notification to all configured channels in parallel.
 
@@ -681,6 +708,10 @@ class NotificationService:
         as the answer string) to the human-facing label rendered on the
         button. ``None`` for the legacy ``question`` path, where the
         label and the value are identical.
+
+        ``extra_web`` merges additional fields into the web broadcast
+        payload only — the re-delivery tick uses it to flag
+        ``redelivered: true`` so the UI can badge a resurfaced card.
         """
         target_channels = channels or self.config.notifications.channels
 
@@ -692,6 +723,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         option_labels=option_labels,
+                        extra=extra_web,
                     )
                     return "web"
                 elif channel_name == "telegram":
@@ -734,13 +766,15 @@ class NotificationService:
         priority: str,
         options: list[str] | None,
         option_labels: dict[str, str] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """Broadcast notification to web UI via the global broadcaster.
 
         For approval-kind rows we also include ``option_labels`` so the
         web NotificationCard can render readable button text while the
         button click still sends the canonical ``value`` back through
-        the answer endpoint.
+        the answer endpoint. ``extra`` fields (e.g. ``redelivered``)
+        are merged into the payload verbatim.
         """
         from nerve.agent.streaming import broadcaster
         message = {
@@ -755,6 +789,8 @@ class NotificationService:
         }
         if option_labels:
             message["option_labels"] = option_labels
+        if extra:
+            message.update(extra)
         await broadcaster.broadcast("__global__", message)
 
     async def _broadcast_silenced_web(
@@ -823,6 +859,26 @@ class NotificationService:
             return None
         return channel._app.bot
 
+    def _build_telegram_text(
+        self, session_id: str, title: str, body: str, priority: str,
+    ) -> str:
+        """Compose the Telegram message text for a notification.
+
+        Shared by the initial delivery, the re-delivery tick, and the
+        expiry edit (which rebuilds the original text to append a
+        status line).
+        """
+        priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
+        if title:
+            text = f"{priority_prefix}{title}"
+            if body:
+                text += f"\n\n{body}"
+        else:
+            text = body or ""
+        if self._should_show_session_label(session_id):
+            text += f"\n\nSession: {session_id}"
+        return text
+
     async def _deliver_telegram(
         self,
         notification_id: str,
@@ -845,16 +901,7 @@ class NotificationService:
         if not chat_id:
             return None
 
-        # Build message text
-        priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
-        if title:
-            text = f"{priority_prefix}{title}"
-            if body:
-                text += f"\n\n{body}"
-        else:
-            text = body or ""
-        if self._should_show_session_label(session_id):
-            text += f"\n\nSession: {session_id}"
+        text = self._build_telegram_text(session_id, title, body, priority)
 
         if notif_type in ("question", "approval") and options:
             button_labels: list[tuple[str, str]] = []
@@ -960,9 +1007,276 @@ class NotificationService:
         return str(msg.message_id)
 
     # ------------------------------------------------------------------ #
-    #  Expiry (called by periodic background task)                         #
+    #  Maintenance (called by the periodic background tick)                #
     # ------------------------------------------------------------------ #
 
+    async def redeliver_due(self) -> int:
+        """Re-fan-out pending rows whose ``redeliver_at`` has passed.
+
+        This is the re-delivery tick that makes "Snooze 24h" a real
+        round trip: the snoozed row resurfaces as a fresh Telegram card
+        (new inline keyboard, new message id stored) and a fresh web
+        broadcast flagged ``redelivered: true``. Each cycle bumps
+        ``redelivery_count``; at ``config.notifications.max_redeliveries``
+        the row expires (with reporting) instead of re-sending, so an
+        auto-snoozing loop can't nag forever.
+
+        Returns the number of notifications re-delivered.
+        """
+        rows = await self.db.get_due_redeliveries()
+        if not rows:
+            return 0
+
+        max_redeliveries = self.config.notifications.max_redeliveries
+        redelivered = 0
+        capped: list[dict[str, Any]] = []
+
+        for notif in rows:
+            if (notif.get("redelivery_count") or 0) >= max_redeliveries:
+                capped.append(notif)
+                continue
+            try:
+                await self._redeliver_one(notif)
+                redelivered += 1
+            except Exception as exc:  # defensive: one bad row ≠ dead tick
+                logger.error(
+                    "re-delivery failed for %s: %s", notif.get("id"), exc,
+                )
+
+        if capped:
+            expired: list[dict[str, Any]] = []
+            for notif in capped:
+                if await self.db.expire_notification(notif["id"]):
+                    row = dict(notif)
+                    row["status"] = "expired"
+                    expired.append(row)
+            logger.info(
+                "%d snoozed notification(s) hit the re-delivery cap (%d) "
+                "and expired: %s",
+                len(expired), max_redeliveries,
+                ", ".join(r["id"] for r in expired),
+            )
+            await self._report_expired(expired)
+
+        return redelivered
+
+    async def _redeliver_one(self, notif: dict[str, Any]) -> None:
+        """Fan a single snoozed row back out to its channels."""
+        notification_id = notif["id"]
+        options = json.loads(notif["options"]) if notif.get("options") else None
+        try:
+            metadata = json.loads(notif["metadata"]) if notif.get("metadata") else {}
+        except (TypeError, ValueError):
+            metadata = {}
+        option_labels = metadata.get("option_labels") or None
+        new_count = (notif.get("redelivery_count") or 0) + 1
+
+        # Restart the expiry window: a resurfaced card needs a full
+        # answering window, and (edge case) a row whose original expiry
+        # already passed must not be reaped by the expire pass of the
+        # very sweep that just re-delivered it.
+        new_expires_at = (
+            datetime.now(timezone.utc)
+            + timedelta(hours=self.config.notifications.default_expiry_hours)
+        ).isoformat()
+
+        # Bump the counter *before* the fanout so a mid-fanout crash
+        # can't replay the send every 15 minutes.
+        marked = await self.db.mark_notification_redelivered(
+            notification_id, new_expires_at,
+        )
+        if not marked:
+            return  # answered/expired between select and mark
+
+        logger.info(
+            "Re-delivering snoozed notification %s (cycle %d)",
+            notification_id, new_count,
+        )
+        await self._fanout(
+            notification_id,
+            notif["session_id"],
+            notif["type"],
+            notif.get("title") or "",
+            notif.get("body") or "",
+            notif.get("priority") or "normal",
+            options=options,
+            option_labels=option_labels,
+            extra_web={"redelivered": True, "redelivery_count": new_count},
+        )
+
     async def expire_stale(self) -> int:
-        """Expire pending notifications past their expiry time."""
-        return await self.db.expire_notifications()
+        """Expire pending notifications past their expiry time.
+
+        Unlike the original blind status flip, every expired
+        ``question``/``approval`` is reported: the asking session gets
+        an internal note (questions), the mechanical-actions audit log
+        gets an ``approval-expired`` event (approvals), the web UI gets
+        a ``notification_expired`` broadcast, and the Telegram card is
+        edited to show it expired. ``notify``-kind expiry stays silent.
+        """
+        rows = await self.db.expire_due_notifications()
+        if rows:
+            await self._report_expired(rows)
+        return len(rows)
+
+    async def _report_expired(self, rows: list[dict[str, Any]]) -> None:
+        """Report expired questions/approvals to every interested party.
+
+        Silent-by-construction expiry was the bug: the asking session
+        believed the user simply never replied, and the user's card just
+        vanished. Each reporting leg is individually best-effort so one
+        failure (e.g. a Telegram edit on an old message) never blocks
+        the others.
+        """
+        reportable = [
+            r for r in rows if r.get("type") in ("question", "approval")
+        ]
+        if not reportable:
+            return
+
+        from nerve.agent.streaming import broadcaster
+
+        for notif in reportable:
+            # Web: gray the card live.
+            try:
+                await broadcaster.broadcast("__global__", {
+                    "type": "notification_expired",
+                    "notification_id": notif["id"],
+                    "session_id": notif["session_id"],
+                    "notification_type": notif["type"],
+                    "title": notif.get("title") or "",
+                })
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "expiry broadcast failed for %s: %s", notif["id"], exc,
+                )
+
+            # Telegram: mark the card expired, drop dead buttons.
+            await self._edit_telegram_expired(notif)
+
+            # Approvals: the proposer is the mechanical pipeline, not a
+            # conversation — record the expiry in its audit log.
+            if notif.get("type") == "approval":
+                await self._append_approval_audit({
+                    "event": "approval-expired",
+                    "notification_id": notif["id"],
+                    "target_kind": notif.get("target_kind") or "",
+                    "target_id": notif.get("target_id") or "",
+                    "redelivery_count": notif.get("redelivery_count") or 0,
+                })
+
+        # Questions: tell the asking session its question died, so the
+        # agent can adapt (re-ask, escalate, or record "no decision").
+        # Batched per session — one injection per sweep, not per row.
+        questions = [r for r in reportable if r.get("type") == "question"]
+        by_session: dict[str, list[dict[str, Any]]] = {}
+        for notif in questions:
+            by_session.setdefault(notif["session_id"], []).append(notif)
+        for session_id, session_rows in by_session.items():
+            await self._inject_expiry_note(session_id, session_rows)
+
+    async def _inject_expiry_note(
+        self, session_id: str, rows: list[dict[str, Any]],
+    ) -> None:
+        """Inject an expired-unanswered note into the asking session.
+
+        Dispatched unconditionally — ``engine.run`` serializes per
+        session, so a mid-turn session just processes the note when its
+        current turn finishes (same pattern as the wakeup dispatcher;
+        deliberately NOT the stale ``is_running`` skip that drops
+        answers). Skipped for external (satellite) sessions, whose
+        conversation loop Nerve doesn't own, and archived/missing
+        sessions — those got the web broadcast and nothing more.
+        """
+        try:
+            session = await self.db.get_session(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "expiry injection: session lookup failed for %s: %s",
+                session_id, exc,
+            )
+            return
+        if not session:
+            logger.info(
+                "expiry injection: session %s missing — broadcast only",
+                session_id,
+            )
+            return
+        if session.get("status") == "archived":
+            logger.info(
+                "expiry injection: session %s archived — broadcast only",
+                session_id,
+            )
+            return
+        if session.get("source") == "external":
+            logger.info(
+                "expiry injection: session %s is external — broadcast only",
+                session_id,
+            )
+            return
+
+        if len(rows) == 1:
+            message = (
+                f"[Question expired unanswered: {rows[0].get('title') or ''}]"
+            )
+        else:
+            titles = "\n".join(
+                f"- {r.get('title') or ''}" for r in rows
+            )
+            message = f"[Questions expired unanswered]\n{titles}"
+
+        task = asyncio.create_task(
+            self.engine.run(
+                session_id=session_id,
+                user_message=message,
+                source="notification:expiry",
+                internal=True,
+            )
+        )
+        task.add_done_callback(self._on_answer_task_done)
+
+    async def _edit_telegram_expired(self, notif: dict[str, Any]) -> None:
+        """Best-effort edit of the Telegram card to show it expired.
+
+        Rebuilds the original message text from the row (same builder
+        the delivery used) and appends the status line, dropping the
+        now-dead inline keyboard. Telegram refuses edits on old
+        messages (>48h) — all failures are swallowed by design.
+        """
+        message_id = notif.get("telegram_message_id")
+        if not message_id:
+            return
+        bot = self._get_telegram_bot()
+        if not bot:
+            return
+        chat_id = notif.get("telegram_chat_id") or self._resolve_telegram_chat_id()
+        if not chat_id:
+            return
+
+        text = self._build_telegram_text(
+            notif["session_id"],
+            notif.get("title") or "",
+            notif.get("body") or "",
+            notif.get("priority") or "normal",
+        )
+        text += "\n\n⏰ Expired unanswered"
+
+        from nerve.channels.telegram import _md_to_tg_html
+        from telegram.constants import ParseMode
+
+        try:
+            await bot.edit_message_text(
+                chat_id=int(chat_id), message_id=int(message_id),
+                text=_md_to_tg_html(text), parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            try:
+                await bot.edit_message_text(
+                    chat_id=int(chat_id), message_id=int(message_id),
+                    text=text,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "telegram expiry edit failed for %s: %s",
+                    notif["id"], exc,
+                )

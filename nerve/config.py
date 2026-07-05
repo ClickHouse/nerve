@@ -666,6 +666,7 @@ class NotificationsConfig:
     channels: list[str] = field(default_factory=lambda: ["web", "telegram"])
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     default_expiry_hours: int = 48            # Auto-expire unanswered questions
+    max_redeliveries: int = 3                 # Per-row cap on snooze/re-delivery cycles
     priority_prefixes: dict[str, str] = field(default_factory=lambda: {
         "high": "⚠️ ",
         "urgent": "🚨 ",
@@ -677,6 +678,7 @@ class NotificationsConfig:
             channels=d.get("channels", ["web", "telegram"]),
             telegram_chat_id=d.get("telegram_chat_id"),
             default_expiry_hours=d.get("default_expiry_hours", 48),
+            max_redeliveries=d.get("max_redeliveries", 3),
             priority_prefixes=d.get("priority_prefixes", {
                 "high": "⚠️ ",
                 "urgent": "🚨 ",
