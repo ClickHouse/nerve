@@ -182,6 +182,11 @@ export interface FileDiff {
   /** Raw git-style unified-diff string for the @pierre/diffs renderer. */
   patch: string;
   truncated: boolean;
+  /** Markdown files only: post-change file content (original for deleted
+   *  files) for the rendered-preview toggle. Null for non-markdown files. */
+  markdown_content?: string | null;
+  /** True when markdown_content was cut at MAX_DIFF_LINES. */
+  markdown_truncated?: boolean;
 }
 
 export interface ModifiedFileSummary {
