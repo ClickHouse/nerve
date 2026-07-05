@@ -75,6 +75,16 @@ export function handleNotificationAnswered(
   );
 }
 
+export function handleNotificationExpired(
+  msg: Extract<WSMessage, { type: 'notification_expired' }>,
+  _get: Get,
+  _set: Set,
+): void {
+  import('../notificationStore').then(({ useNotificationStore }) =>
+    useNotificationStore.getState().handleWSNotificationExpired(msg)
+  );
+}
+
 export function handleBackgroundTasksUpdate(
   msg: Extract<WSMessage, { type: 'background_tasks_update' }>,
   get: Get,

@@ -1515,17 +1515,52 @@ class TelegramChannel(BaseChannel):
         )
 
         if success:
-            await query.answer(f"Answered: {answer}")
+            status_line = f"\u2705 Answered: {answer}"
+            toast = f"Answered: {answer}"
+            # A snooze keeps the row pending with redeliver_at stamped \u2014
+            # confirm on the card that it will come back, instead of the
+            # generic answered state (which read as "handled, gone").
+            snoozed_until = await self._get_snoozed_until(notification_id)
+            if snoozed_until:
+                status_line = (
+                    f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
+                )
+                toast = f"Snoozed until {snoozed_until}"
+            await query.answer(toast)
             try:
                 original = query.message.text or ""
                 await query.edit_message_text(
-                    text=f"{original}\n\n\u2705 Answered: {answer}",
+                    text=f"{original}\n\n{status_line}",
                     reply_markup=None,
                 )
             except Exception:
                 pass
         else:
             await query.answer("Already answered or expired", show_alert=True)
+
+    async def _get_snoozed_until(self, notification_id: str) -> str | None:
+        """Return a human-readable re-delivery time if the row was snoozed.
+
+        After ``handle_answer`` succeeds, a snoozed approval is the only
+        outcome that leaves the row ``pending`` with ``redeliver_at``
+        set. Rendered in the host's local timezone. None when the answer
+        was a final decision (or anything fails \u2014 this is cosmetic).
+        """
+        try:
+            notif = await self._notification_service.db.get_notification(
+                notification_id,
+            )
+            if (
+                not notif
+                or notif.get("status") != "pending"
+                or not notif.get("redeliver_at")
+            ):
+                return None
+            from datetime import datetime
+            dt = datetime.fromisoformat(notif["redeliver_at"])
+            return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        except Exception:
+            return None
 
     async def _handle_reply(self, update: Update, context: Any) -> None:
         """Handle /reply <text> — answer the most recent pending question."""

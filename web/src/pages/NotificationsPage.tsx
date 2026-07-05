@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus } from 'lucide-react';
+import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus, RotateCw, Clock } from 'lucide-react';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 
 const STATUS_STYLES: Record<string, string> = {
@@ -118,6 +118,14 @@ function formatExpiry(expiresAt: string | null): string {
   return `expires ${expiresAt.slice(0, 16).replace('T', ' ')}`;
 }
 
+function formatLocalTime(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso.slice(0, 16).replace('T', ' ');
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
+
 function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
   const [text, setText] = useState('');
   const [open, setOpen] = useState(false);
@@ -201,6 +209,15 @@ function NotificationCard({ notif }: { notif: Notification }) {
           )}
         </div>
         <div className="flex items-center gap-2 text-[12px] shrink-0">
+          {(notif.redelivery_count ?? 0) > 0 && (
+            <span
+              className="flex items-center gap-1 px-2 py-0.5 rounded-full border bg-sky-400/10 text-hue-blue border-sky-400/20"
+              title={`Re-delivered after snooze (cycle ${notif.redelivery_count})`}
+            >
+              <RotateCw size={10} />
+              {(notif.redelivery_count ?? 0) > 1 ? `×${notif.redelivery_count}` : 're-delivered'}
+            </span>
+          )}
           <span className={`px-2 py-0.5 rounded-full border ${STATUS_STYLES[notif.status] || STATUS_STYLES.dismissed}`}>
             {notif.status}
           </span>
@@ -264,6 +281,16 @@ function NotificationCard({ notif }: { notif: Notification }) {
               </button>
             );
           })}
+        </div>
+      )}
+
+      {/* Snoozed: still pending server-side, will be re-delivered */}
+      {notif.status === 'pending' && notif.redeliver_at && (
+        <div className="mt-2 flex items-center gap-1.5 text-[12px] text-text-dim">
+          <Clock size={12} className="shrink-0" />
+          <span>
+            Snoozed — returns {formatLocalTime(notif.redeliver_at)}. You can still decide now.
+          </span>
         </div>
       )}
 

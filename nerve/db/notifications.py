@@ -137,26 +137,71 @@ class NotificationStore:
         await self.db.commit()
         return cursor.rowcount
 
-    async def expire_notifications(self) -> int:
+    async def expire_due_notifications(self) -> list[dict]:
+        """Flip pending rows past their expiry to ``expired``.
+
+        Returns the affected rows (as they were *before* the flip, with
+        ``status`` already rewritten to ``'expired'`` in the returned
+        dicts) so the service layer can report each expiry — inject a
+        note into the asking session, audit-log approvals, gray the web
+        card, edit the Telegram message. Select-then-update runs inside
+        one transaction so a concurrent answer can't slip between the
+        two statements.
+        """
         now = datetime.now(timezone.utc).isoformat()
-        cursor = await self.db.execute(
-            """UPDATE notifications SET status = 'expired'
-               WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?""",
-            (now,),
-        )
-        await self.db.commit()
-        return cursor.rowcount
+        async with self._atomic():
+            async with self.db.execute(
+                """SELECT * FROM notifications
+                   WHERE status = 'pending'
+                     AND expires_at IS NOT NULL AND expires_at < ?""",
+                (now,),
+            ) as cursor:
+                rows = [dict(row) async for row in cursor]
+            if rows:
+                placeholders = ",".join("?" for _ in rows)
+                await self.db.execute(
+                    f"""UPDATE notifications SET status = 'expired'
+                        WHERE id IN ({placeholders})""",
+                    tuple(r["id"] for r in rows),
+                )
+        for r in rows:
+            r["status"] = "expired"
+        return rows
+
+    async def expire_notification(self, notification_id: str) -> bool:
+        """Flip a single pending row to ``expired``.
+
+        Used by the re-delivery tick when a row hits the
+        ``max_redeliveries`` cap: instead of another fanout, it expires
+        (with reporting) even though ``expires_at`` may still be in the
+        future. Returns False if the row is not pending.
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                (notification_id,),
+            ) as cursor:
+                if not await cursor.fetchone():
+                    return False
+            await self.db.execute(
+                "UPDATE notifications SET status = 'expired' WHERE id = ?",
+                (notification_id,),
+            )
+        return True
 
     async def snooze_notification(
-        self, notification_id: str, new_expires_at: str,
+        self, notification_id: str, redeliver_at: str, new_expires_at: str,
     ) -> bool:
-        """Push a pending notification's expiry forward.
+        """Queue a pending notification for re-delivery.
 
-        Used by the ``approval`` dispatcher when the user picks
-        ``snooze_24h``: the row stays at status=pending so a later
-        re-delivery tick (wired in PR 2) can surface it again, but the
-        expiry advances so it does not get caught by ``expire_stale``
-        in the meantime.
+        Used when the user picks ``snooze_24h`` on an approval: the row
+        stays at status=pending, ``redeliver_at`` marks when the
+        periodic maintenance tick should fan it out again (fresh
+        Telegram card + web broadcast), and ``expires_at`` advances past
+        the re-delivery time so the row cannot expire before it
+        resurfaces. Re-snoozing after a re-delivery simply sets
+        ``redeliver_at`` again — each snooze buys another cycle, up to
+        ``config.notifications.max_redeliveries``.
 
         Returns True on success, False if the row is not pending.
         """
@@ -168,9 +213,62 @@ class NotificationStore:
                 if not await cursor.fetchone():
                     return False
             await self.db.execute(
-                "UPDATE notifications SET expires_at = ? WHERE id = ?",
-                (new_expires_at, notification_id),
+                """UPDATE notifications SET redeliver_at = ?, expires_at = ?
+                   WHERE id = ?""",
+                (redeliver_at, new_expires_at, notification_id),
             )
+        return True
+
+    async def get_due_redeliveries(self) -> list[dict]:
+        """Return pending rows whose ``redeliver_at`` has passed.
+
+        Oldest-first so long-waiting rows resurface before fresher ones
+        when several come due in the same sweep.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.db.execute(
+            """SELECT * FROM notifications
+               WHERE status = 'pending'
+                 AND redeliver_at IS NOT NULL AND redeliver_at <= ?
+               ORDER BY created_at ASC""",
+            (now,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def mark_notification_redelivered(
+        self, notification_id: str, new_expires_at: str | None = None,
+    ) -> bool:
+        """Record one re-delivery: bump the count, clear ``redeliver_at``.
+
+        ``new_expires_at`` (when given) restarts the expiry window so
+        the fresh card gets a full answering window — without it, a row
+        whose original expiry already passed would be expired by the
+        very next pass of the same sweep that just re-delivered it.
+        Returns False if the row is not pending.
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                (notification_id,),
+            ) as cursor:
+                if not await cursor.fetchone():
+                    return False
+            if new_expires_at is not None:
+                await self.db.execute(
+                    """UPDATE notifications
+                       SET redelivery_count = redelivery_count + 1,
+                           redeliver_at = NULL, expires_at = ?
+                       WHERE id = ?""",
+                    (new_expires_at, notification_id),
+                )
+            else:
+                await self.db.execute(
+                    """UPDATE notifications
+                       SET redelivery_count = redelivery_count + 1,
+                           redeliver_at = NULL
+                       WHERE id = ?""",
+                    (notification_id,),
+                )
         return True
 
     async def count_pending_notifications(self, channel: str | None = None) -> int:

@@ -7,8 +7,10 @@ their target type (a mechanical-action proposal, a plan, etc.) and
 return a structured ``DispatchResult`` so the service can audit-log the
 outcome uniformly.
 
-PR 1 ships one dispatcher: ``mechanical-action``. PR 2 will add the
-``plan`` dispatcher and the per-target re-delivery wiring.
+One dispatcher ships today: ``mechanical-action``. Snoozed approvals
+are re-surfaced by the notification service's periodic maintenance
+tick (``NotificationService.redeliver_due``); a future ``plan``
+dispatcher can register here without service changes.
 
 Design notes:
 
@@ -62,8 +64,11 @@ class DispatchResult:
       mechanical-actions audit log. Already includes the dispatcher's
       own event name (``approval-acted``); the service adds the
       notification id and timestamp.
-    - ``snooze_until``: ISO-8601 UTC timestamp for the new expiry when
-      the decision is a snooze. None for approve / decline.
+    - ``snooze_until``: ISO-8601 UTC timestamp for when a snoozed
+      notification should be re-delivered. The service stamps it into
+      the row's ``redeliver_at`` (and pushes ``expires_at`` past it) so
+      the periodic maintenance tick re-surfaces the card. None for
+      approve / decline.
     """
 
     ok: bool
@@ -151,9 +156,9 @@ def _dispatch_mechanical_action(
     Snooze: rather than touch the queue file directly, this dispatcher
     calls ``mechanical-action.sh snooze <id> --hours 24`` and lets the
     decide-side script record the audit event and update the queue
-    entry's ``not_before`` field. PR 2 wires the re-delivery scheduler;
-    until then, the snooze just keeps the proposal in queue/ with a
-    future ``not_before`` timestamp.
+    entry's ``not_before`` field. The returned ``snooze_until`` makes
+    the service stamp the notification row's ``redeliver_at``, and the
+    periodic maintenance tick re-delivers the card at that time.
     """
     notif_id = notification.get("id", "")
     base_event: dict[str, Any] = {
