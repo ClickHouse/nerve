@@ -28,8 +28,10 @@ export const DIFF_THEME_CSS = `:host {
  * Shared @pierre/diffs options for every Nerve diff render — unified layout,
  * Nerve theming, and no library file header (Nerve renders its own chrome).
  * `themeType` follows the app theme store ('system' | 'light' | 'dark').
+ * `wrap` switches long lines from horizontal scrolling (the default) to
+ * soft wrapping.
  */
-export function useDiffOptions() {
+export function useDiffOptions(opts?: { wrap?: boolean }) {
   const themeType = useThemeStore((s) => s.preference);
   return {
     diffStyle: 'unified' as const,
@@ -38,5 +40,6 @@ export function useDiffOptions() {
     disableFileHeader: true,
     diffIndicators: 'classic' as const,
     unsafeCSS: DIFF_THEME_CSS,
+    overflow: opts?.wrap ? ('wrap' as const) : ('scroll' as const),
   };
 }
