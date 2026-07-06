@@ -160,11 +160,10 @@ class MessageStore:
                 break
         if not updated:
             return None
-        await self.db.execute(
+        await self._write(
             "UPDATE messages SET blocks = ? WHERE id = ?",
             (json.dumps(blocks), msg_id),
         )
-        await self.db.commit()
         return msg_id
 
     async def merge_workflow_into_call(
@@ -211,11 +210,10 @@ class MessageStore:
                     updated = True
                     break
             if updated:
-                await self.db.execute(
+                await self._write(
                     "UPDATE messages SET blocks = ? WHERE id = ?",
                     (json.dumps(blocks), row["id"]),
                 )
-                await self.db.commit()
                 return row["id"]
         return None
 
@@ -242,13 +240,12 @@ class MessageStore:
         Uses INSERT OR IGNORE so only the first touch per session+file is stored.
         """
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT OR IGNORE INTO session_file_snapshots
                (session_id, file_path, original_content, created_at)
                VALUES (?, ?, ?, ?)""",
             (session_id, file_path, content, now),
         )
-        await self.db.commit()
 
     async def get_file_snapshot(
         self, session_id: str, file_path: str,
@@ -272,11 +269,10 @@ class MessageStore:
 
     async def delete_session_snapshots(self, session_id: str) -> None:
         """Delete all file snapshots for a session."""
-        await self.db.execute(
+        await self._write(
             "DELETE FROM session_file_snapshots WHERE session_id = ?",
             (session_id,),
         )
-        await self.db.commit()
 
     async def count_messages(self, session_id: str) -> int:
         async with self.db.execute(

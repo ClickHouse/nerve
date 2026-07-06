@@ -133,19 +133,17 @@ class TaskStore:
 
     async def update_task_status(self, task_id: str, status: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
             (status, now, task_id),
         )
-        await self.db.commit()
 
     async def update_task_tags(self, task_id: str, tags: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "UPDATE tasks SET tags = ?, updated_at = ? WHERE id = ?",
             (tags, now, task_id),
         )
-        await self.db.commit()
 
     # ── FTS query building ───────────────────────────────────────────────
 
@@ -374,18 +372,16 @@ class TaskStore:
 
     async def rebuild_fts(self) -> None:
         """Clear the FTS index. Caller must re-populate via upsert_task()."""
-        await self.db.execute("DELETE FROM tasks_fts")
-        await self.db.commit()
+        await self._write("DELETE FROM tasks_fts")
 
     async def update_task_escalation(
         self, task_id: str, level: int, reminded_at: str | None = None
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "UPDATE tasks SET escalation_level = ?, last_reminded_at = ?, updated_at = ? WHERE id = ?",
             (level, reminded_at or now, now, task_id),
         )
-        await self.db.commit()
 
     async def get_task_health_stats(self) -> dict:
         """Get task and FTS counts for diagnostics (replaces raw sqlite3 calls)."""

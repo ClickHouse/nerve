@@ -20,12 +20,11 @@ class FileStore:
         disk_path: str,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO uploaded_files (id, session_id, filename, media_type, file_type, file_size, disk_path, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (file_id, session_id, filename, media_type, file_type, file_size, disk_path, now),
         )
-        await self.db.commit()
 
     async def get_uploaded_file(self, file_id: str) -> dict | None:
         async with self.db.execute(
@@ -51,9 +50,8 @@ class FileStore:
             (session_id,),
         ) as cursor:
             paths = [row[0] async for row in cursor]
-        await self.db.execute(
+        await self._write(
             "DELETE FROM uploaded_files WHERE session_id = ?",
             (session_id,),
         )
-        await self.db.commit()
         return paths

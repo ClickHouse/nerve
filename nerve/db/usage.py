@@ -78,7 +78,7 @@ class UsageStore:
         API returns the split; otherwise both default to 0 and only the
         aggregate is preserved.
         """
-        await self.db.execute(
+        await self._write(
             "INSERT INTO session_usage "
             "(session_id, input_tokens, output_tokens, "
             "cache_creation_input_tokens, cache_read_input_tokens, "
@@ -96,7 +96,6 @@ class UsageStore:
                 web_search_requests, web_fetch_requests,
             ),
         )
-        await self.db.commit()
 
     async def get_session_usage_totals(self, session_id: str) -> dict:
         """Aggregate token usage for a session."""
@@ -284,10 +283,9 @@ class UsageStore:
 
     async def delete_session_usage(self, session_id: str) -> None:
         """Delete all usage records for a session (cascade on delete)."""
-        await self.db.execute(
+        await self._write(
             "DELETE FROM session_usage WHERE session_id = ?", (session_id,),
         )
-        await self.db.commit()
 
 
 def extract_cache_ttl_split(usage: dict) -> tuple[int, int]:

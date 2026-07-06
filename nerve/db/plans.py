@@ -20,12 +20,11 @@ class PlanStore:
         plan_type: str = "generic",
     ) -> dict:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO plans (id, task_id, session_id, content, model, version, parent_plan_id, plan_type, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plan_id, task_id, session_id, content, model, version, parent_plan_id, plan_type, now),
         )
-        await self.db.commit()
         return {"id": plan_id, "task_id": task_id, "version": version, "plan_type": plan_type}
 
     async def get_plan(self, plan_id: str) -> dict | None:
@@ -66,10 +65,9 @@ class PlanStore:
         sets = ", ".join(f"{k} = ?" for k in fields)
         vals = list(fields.values())
         vals.append(plan_id)
-        await self.db.execute(
+        await self._write(
             f"UPDATE plans SET {sets} WHERE id = ?", tuple(vals),
         )
-        await self.db.commit()
 
     async def get_plans_for_task(self, task_id: str) -> list[dict]:
         async with self.db.execute(

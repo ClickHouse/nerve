@@ -62,27 +62,21 @@ class WakeupStore:
         Returns ``True`` only for the caller that actually flipped the row,
         so overlapping sweeps can never fire the same wakeup twice.
         """
-        cursor = await self.db.execute(
+        result = await self._write(
             "UPDATE session_wakeups SET status = 'fired' "
             "WHERE id = ? AND status = 'pending'",
             (wakeup_id,),
         )
-        claimed = (cursor.rowcount or 0) == 1
-        await cursor.close()
-        await self.db.commit()
-        return claimed
+        return (result.rowcount or 0) == 1
 
     async def cancel_wakeups_for_session(self, session_id: str) -> int:
         """Delete all pending wakeups for a session. Returns rows removed."""
-        cursor = await self.db.execute(
+        result = await self._write(
             "DELETE FROM session_wakeups "
             "WHERE session_id = ? AND status = 'pending'",
             (session_id,),
         )
-        deleted = cursor.rowcount or 0
-        await cursor.close()
-        await self.db.commit()
-        return deleted
+        return result.rowcount or 0
 
     async def list_pending_wakeups(self, session_id: str | None = None) -> list[dict]:
         """List pending wakeups, optionally scoped to one session."""
