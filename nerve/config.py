@@ -138,6 +138,12 @@ class AgentConfig:
     max_concurrent: int = 4
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
+    # Effort for cron- and hook-sourced turns (sensing / triage work). These
+    # fire far more often than interactive sessions and rarely need Opus-tier
+    # deliberation, so they default lower than `effort` above to cut token
+    # spend. Applied in engine._build_options when source is "cron" or "hook";
+    # interactive sources (web, telegram, wakeup) keep the full `effort`.
+    cron_effort: str = "medium"  # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
     # Substrings of model names for which the context-1m beta header must NOT
     # be sent (some subscriptions reject the beta for specific models — e.g.
@@ -174,6 +180,7 @@ class AgentConfig:
             max_concurrent=d.get("max_concurrent", 4),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
+            cron_effort=str(d.get("cron_effort", "medium")),
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=list(
                 d.get("context_1m_excluded_models", []) or []

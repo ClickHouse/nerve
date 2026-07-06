@@ -10,6 +10,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage
 
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
+from nerve.config import AgentConfig
 
 
 @pytest.mark.parametrize(
@@ -58,6 +59,47 @@ def test_effective_effort(value, model, expected):
 def test_effective_effort_model_default_none():
     # Signature symmetry with _parse_thinking_config
     assert AgentEngine._effective_effort("max") == "max"
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        # Interactive sources keep the full interactive effort.
+        ("web",      "max"),
+        ("telegram", "max"),
+        ("wakeup",   "max"),
+        ("api",      "max"),
+        # Cron and hook turns drop to cron_effort.
+        ("cron",     "medium"),
+        ("hook",     "medium"),
+    ],
+)
+def test_base_effort_for_source(source, expected):
+    assert AgentEngine._base_effort_for_source(source, "max", "medium") == expected
+
+
+def test_base_effort_for_source_then_capped():
+    # A cron turn at the default cron_effort stays "medium" after the model-cap
+    # pass on Sonnet 4.6 (which tops out at "high", so medium is unaffected).
+    base = AgentEngine._base_effort_for_source("cron", "max", "medium")
+    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "medium"
+    # Sonnet 5 is not in the cap table, so cron_effort passes through unchanged.
+    assert AgentEngine._effective_effort(base, "claude-sonnet-5") == "medium"
+    # An interactive turn keeps "max", which caps to "high" on Sonnet 4.6.
+    base = AgentEngine._base_effort_for_source("web", "max", "medium")
+    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "high"
+    # A cron turn whose cron_effort is left at "max" still caps to the model max.
+    base = AgentEngine._base_effort_for_source("cron", "max", "max")
+    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "high"
+
+
+def test_agent_config_cron_effort_default_and_override():
+    # Default is medium when unset.
+    assert AgentConfig.from_dict({}).cron_effort == "medium"
+    # Explicit value is respected, and interactive effort stays independent.
+    cfg = AgentConfig.from_dict({"cron_effort": "low"})
+    assert cfg.cron_effort == "low"
+    assert cfg.effort == "max"
 
 
 # ---------------------------------------------------------------------------
