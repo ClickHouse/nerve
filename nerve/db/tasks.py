@@ -149,8 +149,15 @@ class TaskStore:
 
     # ── FTS query building ───────────────────────────────────────────────
 
-    # Characters that are FTS5 syntax or punctuation — replaced with spaces.
-    _FTS_CLEAN_RE = re.compile(r'["\*\(\)\-:/\\#\.\,\;\'\[\]\{\}@!?\^~`]')
+    # Anything that is NOT a word character (unicode letters, digits,
+    # underscore) is FTS5 syntax or punctuation — replaced with spaces.
+    # Allowlist rather than blocklist: the old punctuation blocklist
+    # missed characters like `$`, `+`, `=`, `&`, `%`, which slipped into
+    # the MATCH expression as barewords and raised `fts5: syntax error`
+    # (e.g. any query containing a dollar amount).  Every char `\w`
+    # keeps is legal in an unquoted FTS5 bareword: ASCII alphanumerics,
+    # underscore, and codepoints > 127.
+    _FTS_CLEAN_RE = re.compile(r"[^\w]")
 
     # Common stop words filtered from search queries.
     _FTS_STOP_WORDS = frozenset({

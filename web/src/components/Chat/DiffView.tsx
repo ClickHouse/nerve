@@ -15,8 +15,8 @@ function Notice({ children }: { children: React.ReactNode }) {
 //  DiffView — backend-computed file diff, rendered from a patch string //
 // ------------------------------------------------------------------ //
 
-export function DiffView({ diff }: { diff: FileDiff }) {
-  const options = useDiffOptions();
+export function DiffView({ diff, wrap }: { diff: FileDiff; wrap?: boolean }) {
+  const options = useDiffOptions({ wrap });
 
   if (diff.binary) {
     return <Notice>Binary file — diff not available</Notice>;

@@ -4,11 +4,13 @@ import asyncio
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from claude_agent_sdk import AssistantMessage
 
-from nerve.agent.engine import AgentEngine
+from nerve.agent.engine import AgentEngine, _TurnState, _model_family
+from nerve.config import AgentConfig
 
 
 @pytest.mark.parametrize(
@@ -57,6 +59,47 @@ def test_effective_effort(value, model, expected):
 def test_effective_effort_model_default_none():
     # Signature symmetry with _parse_thinking_config
     assert AgentEngine._effective_effort("max") == "max"
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        # Interactive sources keep the full interactive effort.
+        ("web",      "max"),
+        ("telegram", "max"),
+        ("wakeup",   "max"),
+        ("api",      "max"),
+        # Cron and hook turns drop to cron_effort.
+        ("cron",     "medium"),
+        ("hook",     "medium"),
+    ],
+)
+def test_base_effort_for_source(source, expected):
+    assert AgentEngine._base_effort_for_source(source, "max", "medium") == expected
+
+
+def test_base_effort_for_source_then_capped():
+    # A cron turn at the default cron_effort stays "medium" after the model-cap
+    # pass on Sonnet 4.6 (which tops out at "high", so medium is unaffected).
+    base = AgentEngine._base_effort_for_source("cron", "max", "medium")
+    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "medium"
+    # Sonnet 5 is not in the cap table, so cron_effort passes through unchanged.
+    assert AgentEngine._effective_effort(base, "claude-sonnet-5") == "medium"
+    # An interactive turn keeps "max", which caps to "high" on Sonnet 4.6.
+    base = AgentEngine._base_effort_for_source("web", "max", "medium")
+    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "high"
+    # A cron turn whose cron_effort is left at "max" still caps to the model max.
+    base = AgentEngine._base_effort_for_source("cron", "max", "max")
+    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "high"
+
+
+def test_agent_config_cron_effort_default_and_override():
+    # Default is medium when unset.
+    assert AgentConfig.from_dict({}).cron_effort == "medium"
+    # Explicit value is respected, and interactive effort stays independent.
+    cfg = AgentConfig.from_dict({"cron_effort": "low"})
+    assert cfg.cron_effort == "low"
+    assert cfg.effort == "max"
 
 
 # ---------------------------------------------------------------------------
@@ -349,3 +392,170 @@ class TestBuildHooksBackgroundPermissions:
         matchers = {m.matcher for m in hooks["PreToolUse"]}
         assert "Edit|Write|NotebookEdit" in matchers
         assert "Read" in matchers
+
+
+# ---------------------------------------------------------------------------
+# _model_family — serving-model identifier normalization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        # Bare alias passes through
+        ("claude-fable-5",                    "claude-fable-5"),
+        ("claude-opus-4-8",                   "claude-opus-4-8"),
+        # Dated release ids collapse onto the alias
+        ("claude-fable-5-20260601",           "claude-fable-5"),
+        ("claude-opus-4-8-20260115",          "claude-opus-4-8"),
+        # Bedrock inference-profile spellings
+        ("us.anthropic.claude-fable-5-20260601-v1:0", "claude-fable-5"),
+        ("global.anthropic.claude-fable-5",   "claude-fable-5"),
+        # Context-window suffix
+        ("claude-sonnet-4-5[1m]",             "claude-sonnet-4-5"),
+        # "-latest" alias
+        ("claude-haiku-4-5-latest",           "claude-haiku-4-5"),
+        # Case / whitespace robustness
+        ("  Claude-Fable-5-20260601 ",        "claude-fable-5"),
+        # Version-looking tails that are NOT dates stay intact
+        ("claude-opus-4",                     "claude-opus-4"),
+        ("claude-3-5-sonnet-20241022",        "claude-3-5-sonnet"),
+    ],
+)
+def test_model_family(model, expected):
+    assert _model_family(model) == expected
+
+
+def test_model_family_distinguishes_real_changes():
+    # The pair that matters: a frontier model downgrading to the prior tier
+    # must NOT normalize to the same family.
+    assert _model_family("claude-fable-5-20260601") != _model_family(
+        "claude-opus-4-8-20260115",
+    )
+
+
+# ---------------------------------------------------------------------------
+# _track_serving_model — downgrade / recovery detection via
+# _process_sdk_message (the shared user-run + autonomous-turn path)
+# ---------------------------------------------------------------------------
+
+
+def _make_model_engine(configured: str | None = "claude-fable-5") -> AgentEngine:
+    """Minimal AgentEngine stub for serving-model tracking tests."""
+    engine = AgentEngine.__new__(AgentEngine)
+    engine._session_models = {"s1": configured} if configured else {}
+    engine._observed_models = {}
+    engine._workflows = {}
+    return engine
+
+
+def _assistant(model: str, parent_tool_use_id: str | None = None) -> AssistantMessage:
+    return AssistantMessage(
+        content=[], model=model, parent_tool_use_id=parent_tool_use_id,
+    )
+
+
+class TestServingModelTracking:
+    @pytest.mark.asyncio
+    async def test_first_message_downgrade_fires_event(self):
+        engine = _make_model_engine()
+        st = _TurnState()
+        with patch("nerve.agent.engine.broadcaster") as bc:
+            bc.broadcast_model_changed = AsyncMock()
+            await engine._process_sdk_message(
+                "s1", _assistant("claude-opus-4-8-20260115"), st,
+            )
+        assert st.last_model == "claude-opus-4-8-20260115"
+        assert st.ordered_blocks == [{
+            "type": "model_change",
+            "from": "claude-fable-5",
+            "to": "claude-opus-4-8-20260115",
+            "downgrade": True,
+        }]
+        bc.broadcast_model_changed.assert_awaited_once_with(
+            "s1",
+            from_model="claude-fable-5",
+            to_model="claude-opus-4-8-20260115",
+            downgrade=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_family_dated_id_is_not_a_change(self):
+        engine = _make_model_engine()
+        st = _TurnState()
+        with patch("nerve.agent.engine.broadcaster") as bc:
+            bc.broadcast_model_changed = AsyncMock()
+            await engine._process_sdk_message(
+                "s1", _assistant("claude-fable-5-20260601"), st,
+            )
+        assert st.ordered_blocks == []
+        bc.broadcast_model_changed.assert_not_awaited()
+        # Baseline still updated for subsequent comparisons
+        assert engine._observed_models["s1"] == "claude-fable-5-20260601"
+
+    @pytest.mark.asyncio
+    async def test_recovery_back_to_configured_is_not_downgrade(self):
+        engine = _make_model_engine()
+        engine._observed_models["s1"] = "claude-opus-4-8-20260115"
+        st = _TurnState()
+        with patch("nerve.agent.engine.broadcaster") as bc:
+            bc.broadcast_model_changed = AsyncMock()
+            await engine._process_sdk_message(
+                "s1", _assistant("claude-fable-5-20260601"), st,
+            )
+        assert st.ordered_blocks == [{
+            "type": "model_change",
+            "from": "claude-opus-4-8-20260115",
+            "to": "claude-fable-5-20260601",
+            "downgrade": False,
+        }]
+
+    @pytest.mark.asyncio
+    async def test_mid_session_transition_uses_observed_baseline(self):
+        engine = _make_model_engine()
+        st = _TurnState()
+        with patch("nerve.agent.engine.broadcaster") as bc:
+            bc.broadcast_model_changed = AsyncMock()
+            await engine._process_sdk_message(
+                "s1", _assistant("claude-fable-5-20260601"), st,
+            )
+            await engine._process_sdk_message(
+                "s1", _assistant("claude-opus-4-8-20260115"), st,
+            )
+        # Only the second message fires; "from" is the observed dated id,
+        # not the configured alias.
+        assert len(st.ordered_blocks) == 1
+        assert st.ordered_blocks[0]["from"] == "claude-fable-5-20260601"
+        assert st.ordered_blocks[0]["downgrade"] is True
+
+    @pytest.mark.asyncio
+    async def test_subagent_messages_are_ignored(self):
+        engine = _make_model_engine()
+        st = _TurnState()
+        with patch("nerve.agent.engine.broadcaster") as bc:
+            bc.broadcast_model_changed = AsyncMock()
+            await engine._process_sdk_message(
+                "s1",
+                _assistant("claude-haiku-4-5", parent_tool_use_id="tu_1"),
+                st,
+            )
+        # Sub-agents legitimately run other models — no event, no baseline
+        # pollution, and no cost-attribution model override.
+        assert st.last_model is None
+        assert st.ordered_blocks == []
+        assert "s1" not in engine._observed_models
+        bc.broadcast_model_changed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_configured_model_first_message_is_quiet(self):
+        engine = _make_model_engine(configured=None)
+        st = _TurnState()
+        with patch("nerve.agent.engine.broadcaster") as bc:
+            bc.broadcast_model_changed = AsyncMock()
+            await engine._process_sdk_message(
+                "s1", _assistant("claude-opus-4-8-20260115"), st,
+            )
+        # Nothing to compare against — record the baseline silently.
+        assert st.ordered_blocks == []
+        bc.broadcast_model_changed.assert_not_awaited()
+        assert engine._observed_models["s1"] == "claude-opus-4-8-20260115"

@@ -91,6 +91,15 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
       }
       break;
     }
+    case 'model_changed': {
+      result.push({
+        type: 'model_change',
+        from: event.from_model,
+        to: event.to_model,
+        downgrade: event.downgrade,
+      });
+      break;
+    }
   }
   return result;
 }

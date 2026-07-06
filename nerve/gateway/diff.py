@@ -21,6 +21,15 @@ logger = logging.getLogger(__name__)
 # Truncate diffs beyond this many output lines to keep payloads bounded.
 MAX_DIFF_LINES = 2000
 
+# Files with these suffixes get a rendered-markdown preview toggle in the UI;
+# their diff response carries the preview source alongside the patch.
+MARKDOWN_SUFFIXES = (".md", ".markdown")
+
+
+def is_markdown_file(file_path: str) -> bool:
+    """True when the path looks like a markdown document."""
+    return file_path.lower().endswith(MARKDOWN_SUFFIXES)
+
 
 # ------------------------------------------------------------------ #
 #  Public API                                                          #
@@ -51,22 +60,26 @@ def compute_file_diff(
 
     # New file
     if original_content is None and current_content is not None:
-        return _make_new_file_diff(current_content, file_path, short)
+        diff = _make_new_file_diff(current_content, file_path, short)
 
     # Deleted file
-    if current_content is None and original_content is not None:
-        return _make_deleted_file_diff(original_content, file_path, short)
+    elif current_content is None and original_content is not None:
+        diff = _make_deleted_file_diff(original_content, file_path, short)
 
     # Both missing — shouldn't happen, treat as unchanged
-    if original_content is None and current_content is None:
-        return _empty_diff(file_path, short, "unchanged")
+    elif original_content is None and current_content is None:
+        diff = _empty_diff(file_path, short, "unchanged")
 
     # Both exist — real diff
-    assert original_content is not None and current_content is not None
-    if original_content == current_content:
-        return _empty_diff(file_path, short, "unchanged")
+    elif original_content == current_content:
+        diff = _empty_diff(file_path, short, "unchanged")
 
-    return _compute_difflib(original_content, current_content, file_path, short, context_lines)
+    else:
+        assert original_content is not None and current_content is not None
+        diff = _compute_difflib(original_content, current_content, file_path, short, context_lines)
+
+    _attach_markdown_preview(diff, file_path, original_content, current_content)
+    return diff
 
 
 def compute_quick_stats(
@@ -106,6 +119,33 @@ def shorten_path(file_path: str, workspace: str | None = None) -> str:
 # ------------------------------------------------------------------ #
 #  Internal helpers                                                    #
 # ------------------------------------------------------------------ #
+
+def _attach_markdown_preview(
+    diff: dict[str, Any],
+    file_path: str,
+    original_content: str | None,
+    current_content: str | None,
+) -> None:
+    """Add the rendered-preview source for markdown files.
+
+    ``markdown_content`` is the post-change content (what the file looks like
+    now), falling back to the original for deleted files so the preview can
+    still show what was removed. Always ``None`` for non-markdown files.
+    Truncated at ``MAX_DIFF_LINES`` lines to keep payloads bounded, mirroring
+    the patch truncation.
+    """
+    content: str | None = None
+    truncated = False
+    if is_markdown_file(file_path):
+        content = current_content if current_content is not None else original_content
+        if content is not None:
+            lines = content.splitlines()
+            if len(lines) > MAX_DIFF_LINES:
+                content = "\n".join(lines[:MAX_DIFF_LINES])
+                truncated = True
+    diff["markdown_content"] = content
+    diff["markdown_truncated"] = truncated
+
 
 def _shorten_path(file_path: str, workspace: str | None = None) -> str:
     """Strip workspace prefix for display."""

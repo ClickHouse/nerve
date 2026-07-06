@@ -16,6 +16,11 @@ export interface Notification {
   answered_at: string | null;
   created_at: string;
   expires_at: string | null;
+  // Set while a snoozed row waits for the maintenance tick to fan it
+  // back out. Present on pending rows only; cleared on re-delivery.
+  redeliver_at?: string | null;
+  // How many times the row has been re-delivered (snooze round trips).
+  redelivery_count?: number;
   target_kind?: string | null;
   target_id?: string | null;
   // Optional label map for approval-kind rows: value -> human label.
@@ -58,6 +63,7 @@ interface NotificationState {
   dismissAll: () => Promise<void>;
   handleWSNotification: (data: any) => void;
   handleWSNotificationAnswered: (data: any) => void;
+  handleWSNotificationExpired: (data: any) => void;
   dismissToast: (id: string) => void;
   loadSilences: () => Promise<void>;
   addSilence: (pattern: string, reason: string, ttlHours: number) => Promise<void>;
@@ -127,6 +133,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
 
   handleWSNotification: (data: any) => {
     const silenced = data.silenced === true;
+    const redelivered = data.redelivered === true;
     const notif: Notification = {
       id: data.notification_id,
       session_id: data.session_id,
@@ -142,6 +149,8 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       answered_at: null,
       created_at: new Date().toISOString(),
       expires_at: null,
+      redeliver_at: null,
+      redelivery_count: data.redelivery_count ?? 0,
       target_kind: data.target_kind ?? null,
       target_id: data.target_id ?? null,
       option_labels: data.option_labels ?? null,
@@ -156,16 +165,43 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         : null,
     };
 
-    set(s => ({
-      notifications: [notif, ...s.notifications],
-      // A silenced notification was NOT delivered/escalated — it does not
-      // count as pending and never raises a toast/sound.
-      pendingCount: silenced ? s.pendingCount : s.pendingCount + 1,
-      toastQueue: silenced ? s.toastQueue : [...s.toastQueue, notif],
-    }));
+    set(s => {
+      // A re-delivered (previously snoozed) row already exists in the
+      // list — refresh it in place and move it to the top instead of
+      // duplicating. Its pending count was never decremented on snooze,
+      // so it doesn't count again.
+      const existing = redelivered
+        ? s.notifications.find(n => n.id === notif.id)
+        : undefined;
+      const rest = existing
+        ? s.notifications.filter(n => n.id !== notif.id)
+        : s.notifications;
+      return {
+        notifications: [existing ? { ...existing, ...notif } : notif, ...rest],
+        // A silenced notification was NOT delivered/escalated — it does not
+        // count as pending and never raises a toast/sound. A re-delivered
+        // row was already pending (snooze never decremented it), so it
+        // must not count twice.
+        pendingCount: silenced || redelivered ? s.pendingCount : s.pendingCount + 1,
+        toastQueue: silenced ? s.toastQueue : [...s.toastQueue, notif],
+      };
+    });
   },
 
   handleWSNotificationAnswered: (data: any) => {
+    // A snoozed approval stays pending server-side — mirror that: keep
+    // the row actionable, stamp when it will resurface, leave the
+    // pending count alone (matches the server's pending_count).
+    if (data.approval_status === 'snoozed') {
+      set(s => ({
+        notifications: s.notifications.map(n =>
+          n.id === data.notification_id
+            ? { ...n, status: 'pending', redeliver_at: data.snooze_until ?? null }
+            : n
+        ),
+      }));
+      return;
+    }
     set(s => ({
       notifications: s.notifications.map(n =>
         n.id === data.notification_id
@@ -174,6 +210,22 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       ),
       pendingCount: Math.max(0, s.pendingCount - 1),
     }));
+  },
+
+  handleWSNotificationExpired: (data: any) => {
+    set(s => {
+      const wasPending = s.notifications.some(
+        n => n.id === data.notification_id && n.status === 'pending'
+      );
+      return {
+        notifications: s.notifications.map(n =>
+          n.id === data.notification_id ? { ...n, status: 'expired' } : n
+        ),
+        pendingCount: wasPending
+          ? Math.max(0, s.pendingCount - 1)
+          : s.pendingCount,
+      };
+    });
   },
 
   dismissToast: (id: string) => {

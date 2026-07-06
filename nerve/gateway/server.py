@@ -256,10 +256,21 @@ async def lifespan(app: FastAPI):
 
     idle_sweep_task = asyncio.create_task(_periodic_idle_sweep())
 
-    # Periodic notification expiry (every 15 minutes)
-    async def _periodic_notify_expiry():
+    # Periodic notification maintenance (every 15 minutes): re-deliver
+    # snoozed rows, then expire stale ones. Ordered so a row whose
+    # redeliver_at AND expires_at both passed gets its last chance
+    # (re-delivery restarts the expiry window) instead of dying.
+    async def _periodic_notify_maintenance():
         while True:
             await asyncio.sleep(15 * 60)
+            try:
+                redelivered = await notification_service.redeliver_due()
+                if redelivered:
+                    logger.info(
+                        "Re-delivered %d snoozed notifications", redelivered,
+                    )
+            except Exception as e:
+                logger.error("Notification re-delivery failed: %s", e)
             try:
                 expired = await notification_service.expire_stale()
                 if expired:
@@ -267,7 +278,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error("Notification expiry failed: %s", e)
 
-    notify_expiry_task = asyncio.create_task(_periodic_notify_expiry())
+    notify_maintenance_task = asyncio.create_task(_periodic_notify_maintenance())
 
     # Periodic DB retention (opt-in). Compacts old memorized messages'
     # blocks/thinking JSON and prunes append-only telemetry + file snapshots,
@@ -475,7 +486,7 @@ async def lifespan(app: FastAPI):
         await cron_task.stop()
 
     db_retention_task.cancel()
-    notify_expiry_task.cancel()
+    notify_maintenance_task.cancel()
     backup_task.cancel()
     idle_sweep_task.cancel()
     memorize_task.cancel()

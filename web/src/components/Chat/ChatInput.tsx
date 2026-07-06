@@ -379,7 +379,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Prompt rewrite preview */}
       {rewrite.status !== 'idle' && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-3xl mx-auto">
+          <div className="max-w-[var(--chat-width)] mx-auto">
             <PromptRewriteCard
               state={
                 rewrite.status === 'loading' ? { status: 'loading' }
@@ -399,7 +399,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Quote cards */}
       {quotes.length > 0 && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-3xl mx-auto space-y-2">
+          <div className="max-w-[var(--chat-width)] mx-auto space-y-2">
             {quotes.map((quote, idx) => (
               <QuoteCard
                 key={quote.id}
@@ -417,7 +417,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Attachment previews */}
       {attachments.length > 0 && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-3xl mx-auto flex gap-2 flex-wrap">
+          <div className="max-w-[var(--chat-width)] mx-auto flex gap-2 flex-wrap">
             {attachments.map(a => (
               <AttachmentPreview key={a.id} attachment={a} onRemove={() => removeAttachment(a.id)} />
             ))}
@@ -427,7 +427,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
 
       {/* Main input */}
       <div className="px-4 py-3">
-        <div className="max-w-3xl mx-auto flex gap-3 items-end">
+        <div className="max-w-[var(--chat-width)] mx-auto flex gap-3 items-end">
           {/* File attach button */}
           <button
             onClick={() => fileInputRef.current?.click()}
