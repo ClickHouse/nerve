@@ -82,6 +82,7 @@ prompt definition.
 | `prompt_file` | string | yes* | Path to a file containing the prompt (relative to the YAML's directory). Read fresh each run; shareable between jobs. *One of `prompt`/`prompt_file` is required |
 | `description` | string | no | Human-readable description |
 | `model` | string | no | Override model (default: `agent.cron_model`) |
+| `cache_ttl` | string | no | Prompt-cache TTL override for this job's sessions: `5m`, `1h`, or `auto` (default: `agent.cache_ttl`). Sparse-schedule persistent jobs benefit from `1h` — see `nerve/agent/cache_policy.py` |
 | `target` | string | no | Delivery channel (default: `telegram`) |
 | `session_mode` | string | no | `isolated` (new session per run), `persistent` (reuse context), or `main` |
 | `context_rotate_hours` | int | no | Hours before a persistent job rotates to a fresh chat (default: 24, 0 = never). The old chat is preserved |

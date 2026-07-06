@@ -40,6 +40,8 @@ from any working directory:
 | `agent.cron_model` | string | `claude-sonnet-4-6` | Model for cron jobs (cheaper) |
 | `agent.max_turns` | int | `50` | Max agentic turns per request |
 | `agent.max_concurrent` | int | `4` | Max concurrent agent sessions |
+| `agent.cache_ttl` | string | `"5m"` | Prompt-cache write TTL policy: `5m` (status quo), `1h` (always request the 1-hour TTL), or `auto` (per session at client-build time: sparse-cadence sessions — persistent crons, wakeup loops, spaced chats — get `1h`; dense sessions stay on `5m`). Per-cron-job override via `cache_ttl` in jobs.yaml. See `nerve/agent/cache_policy.py` |
+| `agent.cache_ttl_excluded_models` | list | `[]` | Model-name substrings that never request the 1h TTL |
 | `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
 | `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
 | `agent.prompt_rewrite.max_tokens` | int | `1024` | Max tokens for the rewritten prompt |

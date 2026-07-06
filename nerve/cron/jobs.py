@@ -33,6 +33,9 @@ class CronJob:
     prompt_file: str = ""
     description: str = ""
     model: str = ""  # Override model; empty = use config default
+    # Per-job prompt-cache TTL override: "5m", "1h" or "auto"; empty = use
+    # agent.cache_ttl from config. See nerve/agent/cache_policy.py.
+    cache_ttl: str = ""
     session_mode: str = "isolated"  # "isolated" (new session per run) or "persistent" (reuse context)
     context_rotate_hours: int = 24  # Hours before persistent context is rotated (0 = never)
     context_rotate_at: str = ""  # Time of day to rotate (e.g. "04:00"); overrides hours-based rotation
@@ -118,6 +121,7 @@ class CronJob:
             prompt_file=d.get("prompt_file", ""),
             description=d.get("description", ""),
             model=d.get("model", ""),
+            cache_ttl=d.get("cache_ttl", ""),
             session_mode=d.get("session_mode", "isolated"),
             context_rotate_hours=int(d.get("context_rotate_hours", 24)),
             context_rotate_at=d.get("context_rotate_at", ""),
@@ -179,6 +183,7 @@ def save_jobs(jobs: list[CronJob], jobs_file: Path) -> None:
             "prompt_file": job.prompt_file,
             "description": job.description,
             "model": job.model,
+            "cache_ttl": job.cache_ttl,
             "session_mode": job.session_mode,
             "context_rotate_hours": job.context_rotate_hours,
             "context_rotate_at": job.context_rotate_at,
