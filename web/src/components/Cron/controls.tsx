@@ -97,7 +97,7 @@ export function RotateButton({ jobId }: { jobId: string }) {
     <button onClick={handleClick} disabled={isRotating}
       className={`flex items-center gap-1 rounded transition-colors cursor-pointer px-2 py-1.5 text-[12px]
         ${isRotating ? 'text-text-faint cursor-not-allowed' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}
-      title="Rotate session context">
+      title="Start a fresh chat (current chat is kept)">
       {isRotating ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}
       {!isRotating && <span>Rotate</span>}
     </button>

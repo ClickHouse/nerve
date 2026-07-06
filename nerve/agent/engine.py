@@ -3484,11 +3484,12 @@ class AgentEngine:
         skips live-background-task sessions for the same reason).
 
         ``keepalive_if_bg`` MUST be False for runs whose ``session_id`` is
-        reused across runs (``run_persistent_cron``'s stable ``cron:{job_id}``):
-        parking such a client would let the NEXT scheduled run reuse the same
-        client/conversation while the prior run's background task is still in
-        flight, interleaving the two. Keep-alive is only safe for the
-        unique-per-run isolated paths (``run_cron`` / ``run_hook``).
+        reused across runs (``run_persistent_cron``'s generation session,
+        reused until context rotation): parking such a client would let the
+        NEXT scheduled run reuse the same client/conversation while the
+        prior run's background task is still in flight, interleaving the
+        two. Keep-alive is only safe for the unique-per-run isolated paths
+        (``run_cron`` / ``run_hook``).
         """
         # Optimistic check: a task that settles between the watcher's last drain
         # and here still reads as live, parking a client whose work is actually
@@ -3540,19 +3541,24 @@ class AgentEngine:
         job_id: str,
         prompt: str,
         model: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """Run a persistent cron job that maintains context across runs.
 
-        Uses a stable session_id (cron:{job_id}) so the SDK resumes
-        conversation context on subsequent triggers.  The client is discarded
-        after each run to free the subprocess (sdk_session_id is preserved for
-        the next resume). Unlike the isolated one-shot paths it does NOT keep
-        the client alive for a live background task: the stable session is
-        reused by the next run, which would collide with the parked task — so a
-        persistent-cron background task that outlives its run is not resumed
-        (use an isolated cron for long background work).
+        The caller (CronService) resolves which generation chat session the
+        job currently owns and passes it as ``session_id`` — reusing it run
+        after run so the SDK resumes conversation context, and minting a
+        fresh session on context rotation (the old chat is preserved). When
+        no ``session_id`` is given, falls back to the legacy stable id
+        ``cron:{job_id}``. The client is discarded after each run to free
+        the subprocess (sdk_session_id is preserved for the next resume).
+        Unlike the isolated one-shot paths it does NOT keep the client alive
+        for a live background task: the session is reused by the next run,
+        which would collide with the parked task — so a persistent-cron
+        background task that outlives its run is not resumed (use an
+        isolated cron for long background work).
         """
-        session_id = f"cron:{job_id}"
+        session_id = session_id or f"cron:{job_id}"
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
         )
@@ -3564,9 +3570,9 @@ class AgentEngine:
                 model=model or self.config.agent.cron_model,
             )
         finally:
-            # Stable session_id is reused by the next run, which would collide
-            # with a parked background task — so persistent crons always discard
-            # (no keep-alive). See _teardown_oneshot_client.
+            # The session is reused by the next run (until rotation), which
+            # would collide with a parked background task — so persistent
+            # crons always discard (no keep-alive). See _teardown_oneshot_client.
             await self._teardown_oneshot_client(session_id, keepalive_if_bg=False)
 
     async def run_hook(

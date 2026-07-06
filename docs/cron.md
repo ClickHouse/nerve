@@ -84,7 +84,8 @@ prompt definition.
 | `model` | string | no | Override model (default: `agent.cron_model`) |
 | `target` | string | no | Delivery channel (default: `telegram`) |
 | `session_mode` | string | no | `isolated` (new session per run), `persistent` (reuse context), or `main` |
-| `context_rotate_hours` | int | no | Hours before persistent context resets (default: 24, 0 = never) |
+| `context_rotate_hours` | int | no | Hours before a persistent job rotates to a fresh chat (default: 24, 0 = never). The old chat is preserved |
+| `context_rotate_at` | string | no | Time of day to rotate (e.g. `"04:00"`, in the configured timezone). Overrides the hours-based rotation |
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once on startup if the job missed a run while the server was down (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
@@ -250,11 +251,16 @@ Each run creates a fresh session (`cron:{job_id}:{timestamp}`). The agent has no
 
 ### Persistent
 
-Jobs with `session_mode: persistent` maintain SDK conversation context across runs:
+Jobs with `session_mode: persistent` maintain SDK conversation context across runs. Each job owns a **generation chat** — one session that is reused run after run until rotation:
 
-- **First trigger**: Creates a fresh session (`cron:{job_id}`) and runs the prompt.
-- **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs in-context.
-- **Context rotation**: Every `context_rotate_hours` (default: 24), the context is reset. Old messages remain in the database and are searchable via memU, but the agent starts with a clean slate.
+- **First trigger**: Creates a fresh generation session (`cron:{job_id}:{timestamp}`) and runs the prompt.
+- **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs of this generation in-context.
+- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memU, cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
+
+> **Upgrade note.** Installs that predate generation chats used the stable id
+> `cron:{job_id}`. That session is adopted as the current generation on the
+> first run after upgrading — its SDK context carries over seamlessly — and
+> moves to the generation scheme on its next rotation.
 
 This is useful for jobs that benefit from accumulated context:
 - Monitoring jobs that track changes over time
@@ -262,6 +268,10 @@ This is useful for jobs that benefit from accumulated context:
 - Multi-step workflows that build on previous results
 
 Between runs, the SDK client subprocess is freed (no resource leak). On the next trigger, the SDK resumes the session from its stored state.
+
+Rotation can also be forced from the Cron page ("Rotate") or via
+`POST /api/cron/jobs/{job_id}/rotate` — same behavior: the current chat is
+preserved and the next run starts in a fresh one.
 
 #### Reminder Mode
 
