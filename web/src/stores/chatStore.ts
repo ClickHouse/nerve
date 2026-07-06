@@ -9,10 +9,10 @@ import { randomUUID } from '../utils/uuid';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn } from './handlers/streamingHandlers';
+import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
+import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -64,8 +64,9 @@ let _quoteId = 0;
 // stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'done', 'stopped', 'error',
-  'wakeup', 'auto_turn', 'session_status', 'plan_update', 'subagent_start',
-  'subagent_complete', 'hoa_progress', 'interaction', 'file_changed',
+  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
+  'subagent_start', 'subagent_complete', 'hoa_progress', 'interaction',
+  'file_changed',
 ]);
 
 interface ChatState {
@@ -106,6 +107,12 @@ interface ChatState {
   activePanelId: string | null;
   panelVisible: boolean;
   panelWidth: number;
+  // Conversation reading-column width in px (drag-resizable, persisted to
+  // localStorage 'nerve_chat_width'). Default 768 = the previous fixed cap.
+  chatWidth: number;
+  // Session list (left sidebar) width in px (drag-resizable, persisted to
+  // localStorage 'nerve_sidebar_width'). Default 240 = the previous w-60.
+  sidebarWidth: number;
 
   // Pending interactive tool (AskUserQuestion, ExitPlanMode, etc.)
   pendingInteraction: {
@@ -175,6 +182,8 @@ interface ChatState {
   updatePanelTab: (tabId: string, updates: Partial<PanelTab>) => void;
   togglePanel: () => void;
   setPanelWidth: (width: number) => void;
+  setChatWidth: (width: number) => void;
+  setSidebarWidth: (width: number) => void;
   pruneCompletedTabs: () => void;
   // Interactions
   answerInteraction: (result: Record<string, string> | null) => void;
@@ -203,6 +212,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activePanelId: null,
   panelVisible: false,
   panelWidth: parseFloat(localStorage.getItem('nerve_panel_width') || '45'),
+  chatWidth: parseFloat(localStorage.getItem('nerve_chat_width') || '768'),
+  sidebarWidth: parseFloat(localStorage.getItem('nerve_sidebar_width') || '240'),
   pendingInteraction: null,
   sidebarCollapsed: localStorage.getItem('nerve_sidebar_collapsed') === 'true',
   modifiedFiles: [],
@@ -283,6 +294,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const clamped = Math.max(20, Math.min(65, width));
     localStorage.setItem('nerve_panel_width', String(clamped));
     set({ panelWidth: clamped });
+  },
+
+  setChatWidth: (width: number) => {
+    // Clamp to a readable band (~60 chars min, very wide max). Mirrors the
+    // setPanelWidth persistence pattern above.
+    const clamped = Math.max(480, Math.min(2000, width));
+    localStorage.setItem('nerve_chat_width', String(clamped));
+    set({ chatWidth: clamped });
+  },
+
+  setSidebarWidth: (width: number) => {
+    const clamped = Math.max(180, Math.min(480, width));
+    localStorage.setItem('nerve_sidebar_width', String(clamped));
+    set({ sidebarWidth: clamped });
   },
 
   pruneCompletedTabs: () => {
@@ -695,6 +720,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'done':         return handleDone(msg, get, set);
       case 'wakeup':       return handleWakeup(msg, get, set);
       case 'auto_turn':    return handleAutoTurn(msg, get, set);
+      case 'model_changed': return handleModelChanged(msg, get, set);
       case 'stopped':      return handleStopped(msg, get, set);
       case 'error':        return handleError(msg, get, set);
       // Sessions
@@ -719,6 +745,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'file_changed':             return handleFileChanged(msg, get, set);
       case 'notification':             return handleNotification(msg, get, set);
       case 'notification_answered':    return handleNotificationAnswered(msg, get, set);
+      case 'notification_expired':     return handleNotificationExpired(msg, get, set);
       case 'background_tasks_update':  return handleBackgroundTasksUpdate(msg, get, set);
     }
   },

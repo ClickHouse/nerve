@@ -138,6 +138,12 @@ class AgentConfig:
     max_concurrent: int = 4
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
+    # Effort for cron- and hook-sourced turns (sensing / triage work). These
+    # fire far more often than interactive sessions and rarely need Opus-tier
+    # deliberation, so they default lower than `effort` above to cut token
+    # spend. Applied in engine._build_options when source is "cron" or "hook";
+    # interactive sources (web, telegram, wakeup) keep the full `effort`.
+    cron_effort: str = "medium"  # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
     # Substrings of model names for which the context-1m beta header must NOT
     # be sent (some subscriptions reject the beta for specific models — e.g.
@@ -174,6 +180,7 @@ class AgentConfig:
             max_concurrent=d.get("max_concurrent", 4),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
+            cron_effort=str(d.get("cron_effort", "medium")),
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=list(
                 d.get("context_1m_excluded_models", []) or []
@@ -666,6 +673,7 @@ class NotificationsConfig:
     channels: list[str] = field(default_factory=lambda: ["web", "telegram"])
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     default_expiry_hours: int = 48            # Auto-expire unanswered questions
+    max_redeliveries: int = 3                 # Per-row cap on snooze/re-delivery cycles
     priority_prefixes: dict[str, str] = field(default_factory=lambda: {
         "high": "⚠️ ",
         "urgent": "🚨 ",
@@ -677,6 +685,7 @@ class NotificationsConfig:
             channels=d.get("channels", ["web", "telegram"]),
             telegram_chat_id=d.get("telegram_chat_id"),
             default_expiry_hours=d.get("default_expiry_hours", 48),
+            max_redeliveries=d.get("max_redeliveries", 3),
             priority_prefixes=d.get("priority_prefixes", {
                 "high": "⚠️ ",
                 "urgent": "🚨 ",

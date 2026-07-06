@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, lazy, Suspense } from 'react';
-import { ArrowLeft, FilePlus, FileEdit, FileX, Loader2, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Eye, FilePlus, FileEdit, FileX, Loader2, RefreshCw, WrapText } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { SelectionToolbar } from './SelectionToolbar';
+import { MarkdownContent } from './MarkdownContent';
+import { MAX_DIFF_LINES } from '../../types/chat';
 import type { FileDiff, ModifiedFileSummary } from '../../types/chat';
 
 // The diff renderer pulls in @pierre/diffs + Shiki — only loaded when a file
@@ -79,23 +81,39 @@ function FileCard({ file, onClick }: { file: ModifiedFileSummary; onClick: () =>
 //  Detail view (loads diff on demand)                                  //
 // ------------------------------------------------------------------ //
 
+// Persisted line-wrap preference for diff inspection (shared across sessions).
+const WRAP_STORAGE_KEY = 'nerve_diff_wrap';
+
 function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: () => void }) {
   const activeSession = useChatStore(s => s.activeSession);
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [wrap, setWrap] = useState(() => localStorage.getItem(WRAP_STORAGE_KEY) === 'true');
+  // Markdown files only: toggle between the raw diff and a rendered preview.
+  const [preview, setPreview] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const toggleWrap = () => {
+    const next = !wrap;
+    setWrap(next);
+    localStorage.setItem(WRAP_STORAGE_KEY, String(next));
+  };
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setPreview(false);
     api.getFileDiff(activeSession, file.path)
       .then(data => { if (!cancelled) setDiff(data); })
       .catch(e => { if (!cancelled) setError(String(e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [activeSession, file.path]);
+
+  // Empty string is a valid (empty) markdown doc — check against null/undefined.
+  const canPreview = diff?.markdown_content != null;
 
   const { fileName } = splitPath(file.short_path);
   const color = STATUS_COLOR[file.status] || 'text-text-muted';
@@ -119,6 +137,30 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
             <span className="text-diff-del">&minus;{diff.stats.deletions}</span>
           )}
         </div>
+        <div className="ml-auto flex items-center gap-1">
+          {canPreview && (
+            <button
+              onClick={() => setPreview(p => !p)}
+              aria-pressed={preview}
+              className={`w-5 h-5 flex items-center justify-center cursor-pointer transition-colors ${
+                preview ? 'text-accent' : 'text-text-faint hover:text-text-muted'
+              }`}
+              title={preview ? 'Show raw diff' : 'Show rendered markdown'}
+            >
+              <Eye size={13} />
+            </button>
+          )}
+          <button
+            onClick={toggleWrap}
+            aria-pressed={wrap}
+            className={`w-5 h-5 flex items-center justify-center cursor-pointer transition-colors ${
+              wrap ? 'text-accent' : 'text-text-faint hover:text-text-muted'
+            }`}
+            title={wrap ? 'Disable line wrapping' : 'Enable line wrapping'}
+          >
+            <WrapText size={13} />
+          </button>
+        </div>
       </div>
       <div className="text-[11px] text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised">
         {file.short_path}
@@ -136,15 +178,26 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
           <div className="px-4 py-4 text-[13px] text-hue-red">Failed to load diff: {error}</div>
         )}
         {diff && !loading && (
-          <Suspense
-            fallback={
-              <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint">
-                <Loader2 size={14} className="animate-spin" /> Loading diff…
-              </div>
-            }
-          >
-            <DiffView diff={diff} />
-          </Suspense>
+          preview && diff.markdown_content != null ? (
+            <div className="px-4 py-3 text-[13px]">
+              <MarkdownContent content={diff.markdown_content} />
+              {diff.markdown_truncated && (
+                <div className="text-center py-3 mt-3 text-[11px] text-text-faint border-t border-border-subtle">
+                  Preview truncated at {MAX_DIFF_LINES} lines
+                </div>
+              )}
+            </div>
+          ) : (
+            <Suspense
+              fallback={
+                <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint">
+                  <Loader2 size={14} className="animate-spin" /> Loading diff…
+                </div>
+              }
+            >
+              <DiffView diff={diff} wrap={wrap} />
+            </Suspense>
+          )
         )}
       </div>
     </div>

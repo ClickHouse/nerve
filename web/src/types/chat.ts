@@ -80,7 +80,17 @@ export interface AutoTurnBlockData {
   type: 'auto';
 }
 
-export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData | AutoTurnBlockData;
+/** Marker emitted when the API switched the model serving this session —
+ *  e.g. a silent capacity downgrade away from the configured model
+ *  (downgrade: true), or the later recovery back to it. */
+export interface ModelChangeBlockData {
+  type: 'model_change';
+  from?: string;
+  to: string;
+  downgrade?: boolean;
+}
+
+export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData | ImageBlockData | FileBlockData | WakeupBlockData | AutoTurnBlockData | ModelChangeBlockData;
 
 export interface ChatMessage {
   id?: number;
@@ -172,6 +182,11 @@ export interface FileDiff {
   /** Raw git-style unified-diff string for the @pierre/diffs renderer. */
   patch: string;
   truncated: boolean;
+  /** Markdown files only: post-change file content (original for deleted
+   *  files) for the rendered-preview toggle. Null for non-markdown files. */
+  markdown_content?: string | null;
+  /** True when markdown_content was cut at MAX_DIFF_LINES. */
+  markdown_truncated?: boolean;
 }
 
 export interface ModifiedFileSummary {

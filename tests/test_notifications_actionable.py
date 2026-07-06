@@ -234,7 +234,7 @@ class TestSchemaAndStore:
         assert notif["target_id"] == "20260519T143906Z-d2e62e"
         assert notif["type"] == "approval"
 
-    async def test_snooze_notification_advances_expiry(self, db: Database):
+    async def test_snooze_notification_queues_redelivery(self, db: Database):
         await db.create_session("s1")
         future = (
             datetime.now(timezone.utc) + timedelta(hours=1)
@@ -244,12 +244,16 @@ class TestSchemaAndStore:
             type="approval", title="t",
             expires_at=future,
         )
-        new_expiry = (
+        redeliver_at = (
             datetime.now(timezone.utc) + timedelta(hours=24)
         ).isoformat()
-        ok = await db.snooze_notification("n1", new_expiry)
+        new_expiry = (
+            datetime.now(timezone.utc) + timedelta(hours=72)
+        ).isoformat()
+        ok = await db.snooze_notification("n1", redeliver_at, new_expiry)
         assert ok is True
         notif = await db.get_notification("n1")
+        assert notif["redeliver_at"] == redeliver_at
         assert notif["expires_at"] == new_expiry
         assert notif["status"] == "pending"
 
@@ -259,10 +263,15 @@ class TestSchemaAndStore:
             notification_id="n1", session_id="s1", type="approval", title="t",
         )
         await db.answer_notification("n1", "approve", "web")
-        new_expiry = (
+        redeliver_at = (
             datetime.now(timezone.utc) + timedelta(hours=24)
         ).isoformat()
-        assert await db.snooze_notification("n1", new_expiry) is False
+        new_expiry = (
+            datetime.now(timezone.utc) + timedelta(hours=72)
+        ).isoformat()
+        assert await db.snooze_notification(
+            "n1", redeliver_at, new_expiry,
+        ) is False
 
 
 # ----------------------------------------------------------------------
@@ -443,6 +452,10 @@ class TestHandleAnswerApproval:
         assert after["expires_at"] is not None
         # Expiry advanced forward; sanity check it is not the original.
         assert after["expires_at"] != prior_expiry
+        # Queued for re-delivery by the maintenance tick, with the
+        # expiry pushed past the re-delivery time.
+        assert after["redeliver_at"] is not None
+        assert after["expires_at"] > after["redeliver_at"]
         # And no answer recorded (snooze is not a final answer).
         assert after["answer"] is None
 

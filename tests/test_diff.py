@@ -117,3 +117,39 @@ def test_large_created_file_truncated_flag():
     d = compute_file_diff(None, content, "/ws/big.txt", workspace="/ws")
     assert d["truncated"] is True
     assert d["patch"]  # still produced
+
+
+# ------------------------------------------------------------------ #
+#  Markdown preview content (rendered-view toggle in the diff panel)   #
+# ------------------------------------------------------------------ #
+
+def test_markdown_file_carries_preview_content():
+    curr = "# Title\n\nSome **bold** text.\n"
+    d = compute_file_diff("# Old title\n", curr, "/ws/notes.md", workspace="/ws")
+    assert d["markdown_content"] == curr
+    assert d["markdown_truncated"] is False
+
+
+def test_markdown_suffix_is_case_insensitive():
+    d = compute_file_diff(None, "# New\n", "/ws/README.MD", workspace="/ws")
+    assert d["markdown_content"] == "# New\n"
+
+
+def test_deleted_markdown_previews_original_content():
+    d = compute_file_diff("# Gone\n\nbye\n", None, "/ws/gone.md", workspace="/ws")
+    assert d["status"] == "deleted"
+    assert d["markdown_content"] == "# Gone\n\nbye\n"
+
+
+def test_non_markdown_file_has_no_preview_content():
+    d = compute_file_diff("a\n", "b\n", "/ws/app.py", workspace="/ws")
+    assert d["markdown_content"] is None
+    assert d["markdown_truncated"] is False
+
+
+def test_markdown_preview_truncated_at_max_lines():
+    curr = "\n".join(f"line {i}" for i in range(MAX_DIFF_LINES + 100))
+    d = compute_file_diff("old\n", curr, "/ws/big.md", workspace="/ws")
+    assert d["markdown_truncated"] is True
+    expected = "\n".join(f"line {i}" for i in range(MAX_DIFF_LINES))
+    assert d["markdown_content"] == expected

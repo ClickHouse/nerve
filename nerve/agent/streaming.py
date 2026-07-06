@@ -211,6 +211,25 @@ class StreamBroadcaster:
         """Mark the start of a turn fired by a self-scheduled ScheduleWakeup."""
         await self.broadcast(session_id, {"type": "wakeup", "session_id": session_id})
 
+    async def broadcast_model_changed(
+        self,
+        session_id: str,
+        from_model: str,
+        to_model: str,
+        downgrade: bool = False,
+    ) -> None:
+        """The model serving this session changed (e.g. a silent API
+        downgrade to a fallback tier, or the later recovery back to the
+        configured model). ``downgrade`` is True when the new model moved
+        *away* from the session's configured model."""
+        await self.broadcast(session_id, {
+            "type": "model_changed",
+            "session_id": session_id,
+            "from_model": from_model,
+            "to_model": to_model,
+            "downgrade": downgrade,
+        })
+
     async def broadcast_interaction(self, session_id: str, interaction_type: str, interaction_id: str, tool_name: str, tool_input: dict) -> None:
         await self.broadcast(session_id, {
             "type": "interaction",
