@@ -70,6 +70,15 @@ def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     db.log_cron_start = AsyncMock(return_value=1)
     db.log_cron_finish = AsyncMock()
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
+    # Persistent-session generation lookups: default to "no current session"
+    # (AsyncMock's auto-returns are truthy MagicMocks, which would otherwise
+    # read as a live mapping/session).
+    db.get_channel_session = AsyncMock(return_value=None)
+    db.get_session = AsyncMock(return_value=None)
+    db.set_channel_session = AsyncMock()
+    db.cancel_wakeups_for_session = AsyncMock(return_value=0)
+    db.update_session_metadata = AsyncMock()
+    db.update_session_title = AsyncMock()
 
     return CronService(config, engine, db)
 
@@ -590,20 +599,63 @@ class TestJobLock:
 
 
 # ---------------------------------------------------------------------------
-# Context rotation — memorization must not block the run lifecycle
+# Context rotation — retiring the current chat and starting a fresh one
 # ---------------------------------------------------------------------------
 
-class TestRotationMemorize:
+def _pers_job(**kwargs) -> CronJob:
+    kwargs.setdefault("id", "pers")
+    kwargs.setdefault("session_mode", "persistent")
+    return _make_job(**kwargs)
+
+
+def _map_current(svc: CronService, session_id: str, session: dict) -> None:
+    """Point the job's channel mapping at *session_id* with *session* data."""
+    svc.db.get_channel_session = AsyncMock(
+        return_value={"session_id": session_id},
+    )
+    svc.db.get_session = AsyncMock(return_value=session)
+
+
+class TestRotation:
+    @pytest.mark.asyncio
+    async def test_rotation_starts_new_chat_and_preserves_old(self, cron_service):
+        """Rotation retires the old chat untouched and mints a new session."""
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(30),
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
+        })
+        job = _pers_job(context_rotate_hours=24)
+
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
+
+        assert rotated is True
+        assert session_id != "cron:pers"
+        assert session_id.startswith("cron:pers:")
+        # Old chat is preserved: its SDK context is never cleared and the
+        # session row is not deleted/archived by rotation.
+        cron_service.engine.sessions.mark_idle.assert_not_called()
+        # New chat is created and becomes the job's current session.
+        cron_service.engine.sessions.get_or_create.assert_awaited_once_with(
+            session_id, title="Cron: pers", source="cron",
+        )
+        cron_service.db.set_channel_session.assert_awaited_once_with(
+            "cron:pers", session_id,
+        )
+
     @pytest.mark.asyncio
     async def test_rotation_schedules_background_memorize(self, cron_service):
         """Rotation schedules memorization instead of awaiting it inline."""
-        cron_service.db.get_session = AsyncMock(return_value={
+        _map_current(cron_service, "cron:pers", {
             "connected_at": _hours_ago(30),
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
         })
+        job = _pers_job(context_rotate_hours=24)
 
-        rotated = await cron_service._maybe_rotate_context(
-            "cron:pers", rotate_hours=24,
-        )
+        _, rotated = await cron_service._resolve_persistent_session(job)
 
         assert rotated is True
         cron_service.engine.schedule_memorize.assert_awaited_once_with(
@@ -612,26 +664,55 @@ class TestRotationMemorize:
         cron_service.engine._memorize_session.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_no_rotation_no_memorize(self, cron_service):
-        """A session younger than the rotation window is left alone."""
-        cron_service.db.get_session = AsyncMock(return_value={
-            "connected_at": _hours_ago(1),
+    async def test_rotation_stamps_and_cancels_wakeups(self, cron_service):
+        """The retired chat is stamped rotated_at, retitled, wakeups cancelled."""
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(30),
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
         })
+        job = _pers_job(context_rotate_hours=24)
 
-        rotated = await cron_service._maybe_rotate_context(
-            "cron:pers", rotate_hours=24,
+        await cron_service._resolve_persistent_session(job)
+
+        cron_service.db.cancel_wakeups_for_session.assert_awaited_once_with(
+            "cron:pers",
         )
+        meta_args = cron_service.db.update_session_metadata.call_args.args
+        assert meta_args[0] == "cron:pers"
+        assert "rotated_at" in meta_args[1]
+        title_args = cron_service.db.update_session_title.call_args.args
+        assert title_args[0] == "cron:pers"
+        assert title_args[1].startswith("Cron: pers (until ")
+
+    @pytest.mark.asyncio
+    async def test_no_rotation_keeps_current_chat(self, cron_service):
+        """A session younger than the rotation window is left alone."""
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(1),
+            "status": "idle",
+        })
+        job = _pers_job(context_rotate_hours=24)
+
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
 
         assert rotated is False
+        assert session_id == "cron:pers"
         cron_service.engine.schedule_memorize.assert_not_awaited()
+        cron_service.db.set_channel_session.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_rotate_at_uses_configured_timezone(self):
         """Daily rotate_at uses config timezone, not the server timezone."""
         svc = _make_cron_service("America/New_York")
-        svc.db.get_session = AsyncMock(return_value={
+        _map_current(svc, "cron:pers", {
             "connected_at": "2026-01-01T13:59:00+00:00",
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
         })
+        job = _pers_job(context_rotate_hours=0, context_rotate_at="09:00")
 
         class FixedDateTime(datetime):
             @classmethod
@@ -642,39 +723,153 @@ class TestRotationMemorize:
                 return fixed.astimezone(tz)
 
         with patch("nerve.cron.service.datetime", FixedDateTime):
-            rotated = await svc._maybe_rotate_context(
-                "cron:pers", rotate_hours=0, rotate_at="09:00",
-            )
+            session_id, rotated = await svc._resolve_persistent_session(job)
 
         assert rotated is True
+        assert session_id == "cron:pers:20260101-150000"
         svc.engine.schedule_memorize.assert_awaited_once_with("cron:pers")
-        svc.engine.sessions.mark_idle.assert_awaited_once_with(
-            "cron:pers", preserve_sdk_id=False,
+        svc.engine.sessions.mark_idle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_first_run_mints_generation_session(self, cron_service):
+        """With no mapping and no legacy session, a fresh chat is minted."""
+        job = _pers_job(context_rotate_hours=24)
+
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
+
+        assert rotated is False
+        assert session_id.startswith("cron:pers:")
+        cron_service.db.set_channel_session.assert_awaited_once_with(
+            "cron:pers", session_id,
         )
 
     @pytest.mark.asyncio
-    async def test_manual_rotation_forces_disabled_rotation_window(self, cron_service):
-        """Manual rotation clears context even when scheduled rotation is disabled."""
-        cron_service._jobs = [
-            _make_job(
-                id="pers", session_mode="persistent", context_rotate_hours=0,
-            ),
-        ]
+    async def test_legacy_stable_session_adopted(self, cron_service):
+        """Pre-generation installs keep their cron:{job_id} session context."""
         cron_service.db.get_session = AsyncMock(return_value={
             "connected_at": _hours_ago(1),
+            "status": "idle",
+            "metadata": "{}",
+        })
+        job = _pers_job(context_rotate_hours=24)
+
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
+
+        assert rotated is False
+        assert session_id == "cron:pers"
+        cron_service.db.set_channel_session.assert_awaited_once_with(
+            "cron:pers", "cron:pers",
+        )
+
+    @pytest.mark.asyncio
+    async def test_rotated_legacy_session_not_readopted(self, cron_service):
+        """A legacy session already rotated out must not be resurrected."""
+        cron_service.db.get_session = AsyncMock(return_value={
+            "connected_at": _hours_ago(1),
+            "status": "idle",
+            "metadata": '{"rotated_at": "2026-01-01T00:00:00+00:00"}',
+        })
+        job = _pers_job(context_rotate_hours=24)
+
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
+
+        assert rotated is False
+        assert session_id.startswith("cron:pers:")
+
+    @pytest.mark.asyncio
+    async def test_archived_mapped_session_starts_new_chat(self, cron_service):
+        """An archived current chat is never resumed — a new one is minted."""
+        _map_current(cron_service, "cron:pers:20250101-000000", {
+            "connected_at": _hours_ago(1),
+            "status": "archived",
+            "metadata": "{}",
+        })
+        job = _pers_job(context_rotate_hours=24)
+
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
+
+        assert rotated is False
+        assert session_id.startswith("cron:pers:")
+        assert session_id != "cron:pers:20250101-000000"
+
+    @pytest.mark.asyncio
+    async def test_manual_rotation_forces_disabled_rotation_window(self, cron_service):
+        """Manual rotation starts a new chat even when auto-rotation is off."""
+        cron_service._jobs = [_pers_job(context_rotate_hours=0)]
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(1),
             "sdk_session_id": "sdk-123",
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
         })
 
         result = await cron_service.rotate_session("pers")
 
         assert result["rotated"] is True
         assert result["session_age_hours"] is not None
+        assert result["old_session_id"] == "cron:pers"
+        assert result["new_session_id"].startswith("cron:pers:")
         cron_service.engine.schedule_memorize.assert_awaited_once_with(
             "cron:pers",
         )
-        cron_service.engine.sessions.mark_idle.assert_awaited_once_with(
-            "cron:pers", preserve_sdk_id=False,
+        # Old chat preserved — rotation never wipes its SDK context.
+        cron_service.engine.sessions.mark_idle.assert_not_called()
+        cron_service.db.set_channel_session.assert_awaited_once_with(
+            "cron:pers", result["new_session_id"],
         )
+
+    @pytest.mark.asyncio
+    async def test_manual_rotation_without_session_is_noop(self, cron_service):
+        """Rotating a job that never ran reports rotated=False."""
+        cron_service._jobs = [_pers_job(context_rotate_hours=0)]
+
+        result = await cron_service.rotate_session("pers")
+
+        assert result["rotated"] is False
+        assert result["new_session_id"] is None
+        cron_service.engine.schedule_memorize.assert_not_awaited()
+
+
+class TestReminderModeAcrossRotation:
+    @pytest.mark.asyncio
+    async def test_short_reminder_when_resuming(self, cron_service):
+        """An established chat gets the short reminder, not the full prompt."""
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(1),
+            "sdk_session_id": "sdk-123",
+            "status": "idle",
+        })
+        job = _pers_job(context_rotate_hours=24, reminder_mode=True)
+
+        await cron_service._run_job_inner(job)
+
+        kwargs = cron_service.engine.run_persistent_cron.call_args.kwargs
+        assert kwargs["prompt"].startswith("Scheduled run — continue")
+        assert kwargs["session_id"] == "cron:pers"
+
+    @pytest.mark.asyncio
+    async def test_full_prompt_after_rotation(self, cron_service):
+        """The first run in a freshly-rotated chat resends the full prompt."""
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(30),
+            "sdk_session_id": "sdk-123",
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
+        })
+        job = _pers_job(context_rotate_hours=24, reminder_mode=True)
+
+        await cron_service._run_job_inner(job)
+
+        kwargs = cron_service.engine.run_persistent_cron.call_args.kwargs
+        assert kwargs["prompt"].startswith("do stuff")
+        assert "persistent cron with reminder" in kwargs["prompt"]
+        assert kwargs["session_id"].startswith("cron:pers:")
+        # The run log links the NEW chat, and the output is flagged rotated.
+        log_kwargs = cron_service.db.log_cron_finish.call_args.kwargs
+        assert log_kwargs["session_id"] == kwargs["session_id"]
+        assert log_kwargs["output"].startswith("[context rotated] ")
 
 
 # ---------------------------------------------------------------------------
@@ -918,13 +1113,16 @@ class TestRunLogOutput:
 
     @pytest.mark.asyncio
     async def test_persistent_run_links_session_id(self, cron_service):
-        cron_service.db.get_session = AsyncMock(return_value=None)
         job = _make_job(id="pers-job", session_mode="persistent", context_rotate_hours=0)
 
         await cron_service._run_job_inner(job)
 
         kwargs = cron_service.db.log_cron_finish.call_args.kwargs
-        assert kwargs["session_id"] == "cron:pers-job"
+        # First run mints a generation chat: cron:{job_id}:{timestamp}
+        assert kwargs["session_id"].startswith("cron:pers-job:")
+        # The same session is handed to the engine run.
+        run_kwargs = cron_service.engine.run_persistent_cron.call_args.kwargs
+        assert run_kwargs["session_id"] == kwargs["session_id"]
 
     @pytest.mark.asyncio
     async def test_error_run_still_links_session_id(self, cron_service):
@@ -971,16 +1169,16 @@ class TestLiveSessionLink:
 
     @pytest.mark.asyncio
     async def test_persistent_links_session_before_run(self, cron_service):
-        cron_service.db.get_session = AsyncMock(return_value=None)
         job = _make_job(
             id="pers-live", session_mode="persistent", context_rotate_hours=0,
         )
 
         await cron_service._run_job_inner(job)
 
-        cron_service.db.set_cron_log_session.assert_awaited_once_with(
-            1, "cron:pers-live",
-        )
+        cron_service.db.set_cron_log_session.assert_awaited_once()
+        log_id, session_id = cron_service.db.set_cron_log_session.call_args.args
+        assert log_id == 1
+        assert session_id.startswith("cron:pers-live:")
 
     @pytest.mark.asyncio
     async def test_no_link_when_prompt_unresolvable(self, cron_service, tmp_path):

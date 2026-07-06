@@ -6,6 +6,7 @@ Runs cron jobs and source runners on schedule.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone, tzinfo
 from typing import TYPE_CHECKING
@@ -333,57 +334,167 @@ class CronService:
 
     # -- End persistent timers ---------------------------------------------
 
-    async def _maybe_rotate_context(
-        self, session_id: str, rotate_hours: int,
-        rotate_at: str = "",
-        *,
-        force: bool = False,
-    ) -> bool:
-        """Check if a persistent cron session's context should be rotated.
+    # -- Persistent session generations --------------------------------------
+    #
+    # A persistent cron runs in a "generation" chat session. Instead of
+    # resetting the SDK context in place (which piles every context epoch
+    # into one endless chat), rotation RETIRES the current chat — keeping it
+    # and its full history as a normal browsable session — and mints a fresh
+    # chat for subsequent runs. The current generation for a job is tracked
+    # in channel_sessions under the key ``cron:{job_id}``.
 
-        Rotation clears the sdk_session_id so the next run starts a fresh
-        SDK client.  Old messages remain in the DB for memU search.
+    def _channel_key(self, job_id: str) -> str:
+        return f"cron:{job_id}"
+
+    async def _current_persistent_session_id(self, job_id: str) -> str | None:
+        """Resolve the current generation session for a persistent job.
+
+        Returns None when there is no usable current session (never ran,
+        chat deleted, or mapped session archived) — the caller mints a new
+        generation. Pre-generation installs used the stable id
+        ``cron:{job_id}`` directly; such a legacy session is adopted as the
+        current generation once, unless it was already rotated out (its
+        metadata carries ``rotated_at``).
+        """
+        key = self._channel_key(job_id)
+        row = await self.db.get_channel_session(key)
+        if row and row.get("session_id"):
+            session = await self.db.get_session(row["session_id"])
+            if session and session.get("status") != "archived":
+                return row["session_id"]
+            # Mapped chat was deleted or archived → start a new generation.
+            return None
+
+        # Legacy fallback: adopt the stable-id session from installs that
+        # predate generation chats, so their SDK context carries over.
+        legacy = await self.db.get_session(key)
+        if legacy and legacy.get("status") != "archived":
+            try:
+                meta = json.loads(legacy.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                meta = {}
+            if not meta.get("rotated_at"):
+                await self.db.set_channel_session(key, key)
+                logger.info(
+                    "Adopted legacy persistent cron session %s as current "
+                    "generation", key,
+                )
+                return key
+        return None
+
+    async def _start_new_generation(self, job_id: str) -> str:
+        """Create a fresh chat session for a persistent job and map it."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        session_id = f"cron:{job_id}:{ts}"
+        await self.engine.sessions.get_or_create(
+            session_id, title=f"Cron: {job_id}", source="cron",
+        )
+        await self.db.set_channel_session(self._channel_key(job_id), session_id)
+        logger.info(
+            "Started new chat for persistent cron %s: %s", job_id, session_id,
+        )
+        return session_id
+
+    async def _retire_session(
+        self, job_id: str, session_id: str, reason: str,
+    ) -> None:
+        """Retire a persistent cron generation, preserving its chat history.
+
+        The session row, its messages, usage, and events are left untouched —
+        the chat stays browsable (and even resumable) in the UI and ages out
+        via the normal session-archival cleanup. This only:
+
+        - schedules memU indexing of the retiring context (safety net),
+        - cancels the session's pending wakeups (a retired thread must not
+          resurrect itself alongside the new generation),
+        - stamps ``rotated_at`` in the session metadata (prevents legacy
+          re-adoption) and retitles the chat with its end date.
+        """
+        # Scheduled, not awaited: memorization queues on a global lock and
+        # awaiting it would delay the run start by the whole queue wait.
+        # The lower bound is frozen at scheduling time.
+        try:
+            await self.engine.schedule_memorize(session_id)
+        except Exception as e:
+            logger.warning(
+                "Pre-rotation memorize failed for %s: %s", session_id, e,
+            )
+
+        try:
+            cancelled = await self.db.cancel_wakeups_for_session(session_id)
+            if cancelled:
+                logger.info(
+                    "Cancelled %d pending wakeup(s) for retired cron "
+                    "session %s", cancelled, session_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to cancel wakeups for %s: %s", session_id, e,
+            )
+
+        try:
+            session = await self.db.get_session(session_id) or {}
+            try:
+                meta = json.loads(session.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                meta = {}
+            meta["rotated_at"] = datetime.now(timezone.utc).isoformat()
+            await self.db.update_session_metadata(session_id, meta)
+
+            date_str = datetime.now(self.timezone).strftime("%Y-%m-%d")
+            title = session.get("title") or f"Cron: {job_id}"
+            await self.db.update_session_title(
+                session_id, f"{title} (until {date_str})",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to stamp retired session %s: %s", session_id, e,
+            )
+
+        logger.info(
+            "Retired persistent cron session %s (%s) — history preserved",
+            session_id, reason,
+        )
+
+    def _rotation_reason(
+        self, session: dict, rotate_hours: int, rotate_at: str,
+    ) -> str | None:
+        """Decide whether a generation is due for rotation.
+
+        Returns a human-readable reason string, or None when the session
+        should keep running. ``connected_at`` marks the start of the current
+        SDK context (it is preserved across resumes), so it doubles as the
+        generation's epoch.
 
         If rotate_at is set (e.g. "04:00"), rotation happens once per day
         at that local time instead of using the hours-based approach.
-
-        Returns True if rotation was performed.
         """
-        session = await self.db.get_session(session_id)
-        if not session:
-            return False
-
         now = datetime.now(timezone.utc)
-        should_rotate = force
-        reason = "manual" if force else ""
 
-        connected_at = None
         connected_at_str = session.get("connected_at")
-        if connected_at_str:
-            try:
-                ts = connected_at_str
-                if "T" not in ts:
-                    ts = ts.replace(" ", "T")
-                if not ts.endswith(("Z", "+00:00")):
-                    ts += "+00:00"
-                connected_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid connected_at for %s: %s", session_id, connected_at_str,
-                )
-                if not force:
-                    return False
-        elif not force:
-            return False
+        if not connected_at_str:
+            return None
+        try:
+            ts = connected_at_str
+            if "T" not in ts:
+                ts = ts.replace(" ", "T")
+            if not ts.endswith(("Z", "+00:00")):
+                ts += "+00:00"
+            connected_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid connected_at for cron session: %s", connected_at_str,
+            )
+            return None
 
-        if not should_rotate and rotate_at:
+        if rotate_at:
             # Time-of-day rotation: rotate if session started before today's
             # rotate_at and current time is past it.
             try:
                 hour, minute = (int(x) for x in rotate_at.split(":"))
             except (ValueError, TypeError):
                 logger.warning("Invalid context_rotate_at: %s", rotate_at)
-                return False
+                return None
 
             today_rotate = now.astimezone(self.timezone).replace(
                 hour=hour, minute=minute, second=0, microsecond=0,
@@ -391,34 +502,39 @@ class CronService:
             today_rotate_utc = today_rotate.astimezone(timezone.utc)
 
             if now >= today_rotate_utc and connected_at < today_rotate_utc:
-                should_rotate = True
-                reason = f"rotate_at={rotate_at}"
-        elif not should_rotate and rotate_hours > 0:
+                return f"rotate_at={rotate_at}"
+        elif rotate_hours > 0:
             age_hours = (now - connected_at).total_seconds() / 3600
             if age_hours >= rotate_hours:
-                should_rotate = True
-                reason = f"age {age_hours:.1f}h >= {rotate_hours}h"
+                return f"age {age_hours:.1f}h >= {rotate_hours}h"
+        return None
 
-        if not should_rotate:
-            return False
+    async def _resolve_persistent_session(self, job: CronJob) -> tuple[str, bool]:
+        """Pick the chat session for a persistent run, rotating if due.
 
-        # Schedule memorization of the pre-rotation context (safety net).
-        # Scheduled, not awaited: memorization queues on a global lock and
-        # awaiting it would delay the run start by the whole queue wait.
-        # The lower bound is frozen at scheduling time, so clearing
-        # connected_at below cannot shrink the covered window.
-        try:
-            await self.engine.schedule_memorize(session_id)
-        except Exception as e:
-            logger.warning("Pre-rotation memorize failed for %s: %s", session_id, e)
+        Returns ``(session_id, rotated)``. When rotation is due, the current
+        generation is retired (chat + history preserved as its own session)
+        and a brand-new chat is minted for this and subsequent runs.
+        """
+        current = await self._current_persistent_session_id(job.id)
+        rotated = False
 
-        # Clear sdk_session_id + connected_at → next run starts fresh
-        await self.engine.sessions.mark_idle(session_id, preserve_sdk_id=False)
-        logger.info(
-            "Rotated context for persistent cron %s (%s)",
-            session_id, reason,
-        )
-        return True
+        if current and (job.context_rotate_at or job.context_rotate_hours > 0):
+            session = await self.db.get_session(current)
+            if session:
+                reason = self._rotation_reason(
+                    session, job.context_rotate_hours, job.context_rotate_at,
+                )
+                if reason:
+                    await self._retire_session(job.id, current, reason)
+                    current = None
+                    rotated = True
+
+        if current is None:
+            current = await self._start_new_generation(job.id)
+        return current, rotated
+
+    # -- End persistent session generations ----------------------------------
 
     def _load_merged_jobs(self) -> list[CronJob]:
         """Load and merge jobs from system.yaml and jobs.yaml.
@@ -501,7 +617,9 @@ class CronService:
             # instead of waiting for the run to finish.
             run_id: str | None = None
             if job.session_mode == "persistent":
-                session_id = f"cron:{job.id}"
+                # Resolve the current generation chat, rotating to a fresh
+                # one first when due (the old chat is preserved).
+                session_id, rotated = await self._resolve_persistent_session(job)
             else:
                 # Isolated mode: per-run session. The run_id is generated
                 # here (the engine would otherwise generate an identical
@@ -518,13 +636,6 @@ class CronService:
                 )
 
             if job.session_mode == "persistent":
-                # Persistent mode: reuse SDK context across runs
-                if job.context_rotate_at or job.context_rotate_hours > 0:
-                    rotated = await self._maybe_rotate_context(
-                        session_id, job.context_rotate_hours,
-                        rotate_at=job.context_rotate_at,
-                    )
-
                 # Determine prompt: full on first run, short reminder on subsequent
                 prompt = base_prompt
                 if job.reminder_mode:
@@ -552,6 +663,7 @@ class CronService:
                     job_id=job.id,
                     prompt=prompt,
                     model=model,
+                    session_id=session_id,
                 )
             else:
                 response = await self.engine.run_cron(
@@ -694,10 +806,11 @@ class CronService:
         await self._run_job_wrapper(job)
 
     async def rotate_session(self, job_id: str) -> dict:
-        """Force-rotate a persistent cron session's context.
+        """Force-rotate a persistent cron to a fresh chat session.
 
-        Runs pre-rotation memorization, then clears the sdk_session_id
-        so the next run starts a fresh SDK client.
+        Retires the current generation chat (its history is preserved as a
+        normal session) and starts a new empty chat that the next run — and
+        the CronPage chat link — picks up immediately.
 
         Returns a dict with rotation details.
         Raises ValueError if job not found or not persistent.
@@ -714,8 +827,8 @@ class CronService:
                 f"Job {job_id!r} is not persistent (mode={job.session_mode!r})"
             )
 
-        session_id = f"cron:{job_id}"
-        session = await self.db.get_session(session_id)
+        session_id = await self._current_persistent_session_id(job_id)
+        session = await self.db.get_session(session_id) if session_id else None
 
         # Calculate current age for the response
         session_age_hours: float | None = None
@@ -733,19 +846,25 @@ class CronService:
             except (ValueError, TypeError):
                 pass
 
-        rotated = await self._maybe_rotate_context(
-            session_id, rotate_hours=0, force=True,
-        )
+        rotated = False
+        new_session_id: str | None = None
+        if session_id and session:
+            await self._retire_session(job_id, session_id, "manual")
+            new_session_id = await self._start_new_generation(job_id)
+            rotated = True
 
         logger.info(
-            "Manual rotation for %s: rotated=%s age=%.1fh",
+            "Manual rotation for %s: rotated=%s age=%.1fh new=%s",
             job_id, rotated,
             session_age_hours if session_age_hours is not None else -1,
+            new_session_id,
         )
         return {
             "job_id": job_id,
             "rotated": rotated,
             "session_age_hours": session_age_hours,
+            "old_session_id": session_id if rotated else None,
+            "new_session_id": new_session_id,
         }
 
     async def list_jobs(self) -> list[dict]:
