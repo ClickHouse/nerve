@@ -117,7 +117,7 @@ Response: {
 ```
 
 #### `GET /api/sessions/{id}/file-diff?path=...&context=4`
-Compute a unified diff for a single file against its session baseline snapshot. Returns structured hunks with line numbers for GitHub PR-style rendering.
+Compute a unified diff for a single file against its session baseline snapshot. Returns structured hunks with line numbers for GitHub PR-style rendering. For markdown files (`.md`, `.markdown`) the response also carries `markdown_content` — the post-change file content (original content for deleted files) used by the UI's rendered-preview toggle — plus `markdown_truncated` when it was cut at the diff line limit. Both are `null`/`false` for other file types.
 
 ```json
 Response: {
@@ -136,7 +136,9 @@ Response: {
       ]
     }
   ],
-  "truncated": false
+  "truncated": false,
+  "markdown_content": null,
+  "markdown_truncated": false
 }
 ```
 
