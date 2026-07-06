@@ -12,7 +12,7 @@ import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
+import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -66,7 +66,7 @@ const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'done', 'stopped', 'error',
   'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
   'subagent_start', 'subagent_complete', 'hoa_progress', 'interaction',
-  'file_changed',
+  'interaction_resolved', 'file_changed',
 ]);
 
 interface ChatState {
@@ -742,6 +742,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'workflow_progress':  return handleWorkflowProgress(msg, get, set);
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
+      case 'interaction_resolved':     return handleInteractionResolved(msg, get, set);
       case 'file_changed':             return handleFileChanged(msg, get, set);
       case 'notification':             return handleNotification(msg, get, set);
       case 'notification_answered':    return handleNotificationAnswered(msg, get, set);

@@ -43,12 +43,20 @@ export function handleSessionStatus(
     // Rebuild panel tabs from buffered events
     const restored = rebuildPanelTabsFromBuffer(bufferedEvents, blocks);
 
-    // Restore pending interaction from buffer (last interaction event wins)
+    // Restore pending interaction from buffer (last interaction event wins),
+    // but treat any interaction the buffer later marks resolved as settled so a
+    // mid-turn reconnect doesn't re-prompt for an already-answered poll/plan.
+    const resolvedInteractionIds = new Set<string>();
+    for (const event of bufferedEvents) {
+      if (event.type === 'interaction_resolved') {
+        resolvedInteractionIds.add((event as Extract<WSMessage, { type: 'interaction_resolved' }>).interaction_id);
+      }
+    }
     let restoredInteraction: ReturnType<Get>['pendingInteraction'] = null;
     for (const event of bufferedEvents) {
       if (event.type === 'interaction') {
         const ie = event as Extract<WSMessage, { type: 'interaction' }>;
-        restoredInteraction = {
+        restoredInteraction = resolvedInteractionIds.has(ie.interaction_id) ? null : {
           interactionId: ie.interaction_id,
           interactionType: ie.interaction_type,
           toolName: ie.tool_name,
