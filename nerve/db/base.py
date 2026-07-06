@@ -11,7 +11,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, NamedTuple
 
 import aiosqlite
 
@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 # SCHEMA_VERSION is derived from the highest migration file number.
 # This keeps a single source of truth (the migration files themselves).
 SCHEMA_VERSION = max(v for v, _ in discover_migrations()) if discover_migrations() else 0
+
+
+class WriteResult(NamedTuple):
+    """Outcome of a single-statement write executed via :meth:`Database._write`.
+
+    Mirrors the two cursor attributes writer call sites actually use. The
+    live cursor is closed before the commit, so callers can never fetch from
+    a cursor whose transaction has already ended.
+    """
+
+    lastrowid: int | None
+    rowcount: int
 
 
 # Connection pragmas applied on every ``connect()``. These mirror the tuning
@@ -141,16 +153,98 @@ class Database(
             raise RuntimeError("Database not connected. Call connect() first.")
         return self._db
 
+    # -- Write path ---------------------------------------------------------
+    #
+    # All writes on the single shared connection MUST go through ``_atomic()``
+    # (multi-statement transactions) or ``_write()`` (single statements).
+    # Both serialize under ``_write_lock`` and guarantee the connection is
+    # never left inside an open transaction — on success they COMMIT, on any
+    # error (including ``asyncio.CancelledError``) they ROLLBACK.
+    #
+    # Why this is load-bearing (production outage, 2026-07-06): a write task
+    # was abandoned mid-transaction, leaving the shared connection inside an
+    # open transaction pinned to a WAL read snapshot. A second process then
+    # committed to the same DB file, making that snapshot stale. From that
+    # moment every write on the shared connection failed *instantly* with
+    # "database is locked" (SQLITE_BUSY_SNAPSHOT — the busy handler is
+    # deliberately not invoked for snapshot conflicts, so ``busy_timeout``
+    # does not apply), reads silently served the frozen snapshot, and nothing
+    # ever called ROLLBACK — wedging the daemon for 10 hours until a restart.
+    # ``_heal_leaked_txn()`` is the belt-and-suspenders guard that recovers
+    # from that state even if some future code path leaks a transaction.
+
     @asynccontextmanager
     async def _atomic(self) -> AsyncIterator[None]:
-        """Acquire write lock for multi-statement transactions.
+        """Serialize a multi-statement write and make it a real transaction.
 
-        Ensures that once a coroutine begins a multi-statement write,
-        no other coroutine can interleave writes before the commit.
+        Once a coroutine begins a multi-statement write, no other coroutine
+        can interleave writes before the commit. The body's statements are
+        committed on success and rolled back on any exception — including
+        task cancellation — so a failed body neither half-commits nor leaves
+        the shared connection inside an open (poisoned) transaction.
+
+        Statements inside the body must use ``self.db.execute(...)`` directly
+        (never ``_write()``, which would deadlock on the non-reentrant lock).
         """
         async with self._write_lock:
-            yield
-            await self.db.commit()
+            await self._heal_leaked_txn()
+            try:
+                yield
+                # Shield so a cancellation arriving mid-commit cannot abandon
+                # a half-finished transaction: the inner task runs to
+                # completion on aiosqlite's worker thread regardless.
+                await asyncio.shield(self.db.commit())
+            except BaseException:
+                await self._rollback_quietly()
+                raise
+
+    async def _write(self, sql: str, params: tuple | list = ()) -> WriteResult:
+        """Execute one write statement and commit, under the write lock.
+
+        The single-statement counterpart of :meth:`_atomic` with the same
+        guarantees: serialized against all other writers (so its commit can
+        never flush someone else's in-flight transaction) and commit-or-
+        rollback semantics (so an error or cancellation can never leave the
+        connection mid-transaction).
+        """
+        async with self._write_lock:
+            await self._heal_leaked_txn()
+            try:
+                cursor = await self.db.execute(sql, params)
+                result = WriteResult(cursor.lastrowid, cursor.rowcount)
+                await cursor.close()
+                await asyncio.shield(self.db.commit())
+                return result
+            except BaseException:
+                await self._rollback_quietly()
+                raise
+
+    async def _heal_leaked_txn(self) -> None:
+        """Roll back a leaked open transaction on the shared connection.
+
+        Called under ``_write_lock``. Every legitimate transaction commits or
+        rolls back before releasing the lock, so ``in_transaction`` being true
+        here means some code path abandoned a transaction (see the write-path
+        comment above for the outage this causes). Recover loudly.
+        """
+        if self.db.in_transaction:
+            logger.error(
+                "Leaked open transaction detected on the shared connection — "
+                "rolling back to prevent a wedged write path "
+                "(SQLITE_BUSY_SNAPSHOT poisoning)",
+            )
+            await self._rollback_quietly()
+
+    async def _rollback_quietly(self) -> None:
+        """Best-effort ROLLBACK that never raises and survives cancellation."""
+        try:
+            await asyncio.shield(self.db.rollback())
+        except asyncio.CancelledError:
+            # The shielded rollback still runs to completion on the worker
+            # thread; re-raise so the caller's cancellation proceeds.
+            raise
+        except Exception:
+            logger.exception("Rollback failed on the shared connection")
 
     async def _check_fts_integrity(self) -> None:
         """FTS integrity check — runs every startup.
@@ -167,27 +261,29 @@ class Database(
                 "FTS index mismatch: %d tasks vs %d FTS entries — reseeding",
                 task_count, fts_count,
             )
-            await self.db.execute("DELETE FROM tasks_fts")
             # Read content from disk files (source of truth) instead of seeding
             # empty. Task file_path values are relative to the workspace root,
             # which is NOT the DB directory (~/.nerve) — fall back to it only
             # when no workspace was provided.
             workspace = (self.workspace or self.db_path.parent).expanduser()
-            async with self.db.execute("SELECT id, title, file_path FROM tasks") as cur:
-                rows = await cur.fetchall()
-            for row in rows:
-                content = ""
-                try:
-                    fp = workspace / row["file_path"]
-                    if fp.exists():
-                        content = await asyncio.to_thread(
-                            fp.read_text, encoding="utf-8",
-                        )
-                except Exception as e:
-                    logger.warning("Failed to read %s for FTS reseed: %s", row["file_path"], e)
-                await self.db.execute(
-                    "INSERT INTO tasks_fts (task_id, title, content) VALUES (?, ?, ?)",
-                    (row["id"], row["title"], content),
-                )
-            await self.db.commit()
+            async with self._atomic():
+                await self.db.execute("DELETE FROM tasks_fts")
+                async with self.db.execute(
+                    "SELECT id, title, file_path FROM tasks",
+                ) as cur:
+                    rows = await cur.fetchall()
+                for row in rows:
+                    content = ""
+                    try:
+                        fp = workspace / row["file_path"]
+                        if fp.exists():
+                            content = await asyncio.to_thread(
+                                fp.read_text, encoding="utf-8",
+                            )
+                    except Exception as e:
+                        logger.warning("Failed to read %s for FTS reseed: %s", row["file_path"], e)
+                    await self.db.execute(
+                        "INSERT INTO tasks_fts (task_id, title, content) VALUES (?, ?, ?)",
+                        (row["id"], row["title"], content),
+                    )
             logger.info("FTS reseeded with %d tasks (content from disk)", task_count)

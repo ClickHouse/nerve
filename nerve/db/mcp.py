@@ -17,7 +17,7 @@ class McpStore:
     ) -> None:
         """Register or update an MCP server entry."""
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO mcp_servers (name, type, enabled, tool_count, first_seen_at, last_seen_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
@@ -29,7 +29,6 @@ class McpStore:
                    last_seen_at = excluded.last_seen_at""",
             (name, server_type, enabled, tool_count, now, now),
         )
-        await self.db.commit()
 
     async def record_mcp_tool_usage(
         self,
@@ -41,13 +40,12 @@ class McpStore:
         error: str | None = None,
     ) -> None:
         """Log an MCP tool invocation."""
-        await self.db.execute(
+        await self._write(
             """INSERT INTO mcp_tool_usage
                (server_name, tool_name, session_id, duration_ms, success, error)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (server_name, tool_name, session_id, duration_ms, success, error),
         )
-        await self.db.commit()
 
     async def get_mcp_server_stats(self) -> list[dict]:
         """List all MCP servers with aggregated usage stats."""

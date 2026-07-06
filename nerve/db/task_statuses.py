@@ -133,16 +133,14 @@ class TaskStatusStore:
         if not sets:
             return
         params.append(name)
-        await self.db.execute(
+        await self._write(
             f"UPDATE task_statuses SET {', '.join(sets)} WHERE name = ?",
             tuple(params),
         )
-        await self.db.commit()
 
     async def delete_task_status_def(self, name: str) -> None:
         """Delete a status definition. Caller enforces protection rules."""
-        await self.db.execute("DELETE FROM task_statuses WHERE name = ?", (name,))
-        await self.db.commit()
+        await self._write("DELETE FROM task_statuses WHERE name = ?", (name,))
 
     async def count_tasks_with_status(self, name: str) -> int:
         """Count tasks currently set to the given status."""

@@ -1420,6 +1420,10 @@ class TestCronLogSessionBackfill:
             "UPDATE cron_logs SET started_at = '2026-01-10 12:00:01' WHERE id = ?",
             (iso_log,),
         )
+        # Raw fixture writes on the shared connection must commit themselves:
+        # leaving the txn open would (correctly) be rolled back by the next
+        # store method's leaked-transaction guard.
+        await db.db.commit()
 
         # Persistent session + a log row with no per-run candidate.
         await db.create_session("cron:pers-job", source="cron")
@@ -1432,6 +1436,7 @@ class TestCronLogSessionBackfill:
             "UPDATE cron_logs SET started_at = '2026-01-05 00:00:00' WHERE id = ?",
             (far_log,),
         )
+        await db.db.commit()
 
         # Source-runner log — no sessions at all.
         src_log = await db.log_cron_start("source:gmail")

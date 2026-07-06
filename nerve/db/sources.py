@@ -20,11 +20,10 @@ class SourceStore:
 
     async def set_sync_cursor(self, source: str, cursor_value: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "INSERT OR REPLACE INTO sync_cursors (source, cursor, updated_at) VALUES (?, ?, ?)",
             (source, cursor_value, now),
         )
-        await self.db.commit()
 
     # --- Source run log operations ---
 
@@ -38,14 +37,12 @@ class SourceStore:
     ) -> int:
         """Log a source run with stats."""
         now = datetime.now(timezone.utc).isoformat()
-        async with self.db.execute(
+        result = await self._write(
             "INSERT INTO source_run_log (source, ran_at, records_fetched, records_processed, error, session_id) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (source, now, records_fetched, records_processed, error, session_id),
-        ) as cursor:
-            log_id = cursor.lastrowid
-        await self.db.commit()
-        return log_id
+        )
+        return result.lastrowid
 
     async def get_last_source_run(self, source: str) -> dict | None:
         """Get the most recent source run entry."""
@@ -222,11 +219,10 @@ class SourceStore:
         if not ids:
             return
         placeholders = ",".join("?" for _ in ids)
-        await self.db.execute(
+        await self._write(
             f"UPDATE source_messages SET run_session_id = ? WHERE source = ? AND id IN ({placeholders})",
             (session_id, source, *ids),
         )
-        await self.db.commit()
 
     # Normalize ISO 8601 timestamps for consistent sorting across sources.
     # Different sources use different suffixes: "+00:00", "Z", or none.
@@ -307,31 +303,20 @@ class SourceStore:
     async def delete_source_messages(self, source: str | None = None) -> int:
         """Purge source messages. If source is None, purge all. Returns count deleted."""
         if source:
-            async with self.db.execute(
-                "SELECT COUNT(*) FROM source_messages WHERE source = ?", (source,)
-            ) as cursor:
-                count = (await cursor.fetchone())[0]
-            await self.db.execute("DELETE FROM source_messages WHERE source = ?", (source,))
+            result = await self._write(
+                "DELETE FROM source_messages WHERE source = ?", (source,),
+            )
         else:
-            async with self.db.execute("SELECT COUNT(*) FROM source_messages") as cursor:
-                count = (await cursor.fetchone())[0]
-            await self.db.execute("DELETE FROM source_messages")
-        await self.db.commit()
-        return count
+            result = await self._write("DELETE FROM source_messages")
+        return result.rowcount or 0
 
     async def cleanup_expired_messages(self) -> int:
         """Delete source messages past their TTL. Returns count deleted."""
         now = datetime.now(timezone.utc).isoformat()
-        async with self.db.execute(
-            "SELECT COUNT(*) FROM source_messages WHERE expires_at < ?", (now,)
-        ) as cursor:
-            count = (await cursor.fetchone())[0]
-        if count > 0:
-            await self.db.execute(
-                "DELETE FROM source_messages WHERE expires_at < ?", (now,)
-            )
-            await self.db.commit()
-        return count
+        result = await self._write(
+            "DELETE FROM source_messages WHERE expires_at < ?", (now,)
+        )
+        return result.rowcount or 0
 
     # --- Consumer cursors ---
 
@@ -379,7 +364,7 @@ class SourceStore:
         """Advance cursor and refresh TTL. Links to session_id for UI tracking."""
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(days=ttl_days)).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO consumer_cursors (consumer, source, cursor_seq, session_id, updated_at, expires_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(consumer, source) DO UPDATE SET
@@ -387,7 +372,6 @@ class SourceStore:
                    updated_at=excluded.updated_at, expires_at=excluded.expires_at""",
             (consumer, source, cursor_seq, session_id, now.isoformat(), expires),
         )
-        await self.db.commit()
 
     async def list_consumer_cursors(self, consumer: str | None = None) -> list[dict]:
         """List active (non-expired) consumer cursors with unread counts."""

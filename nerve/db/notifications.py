@@ -38,7 +38,7 @@ class NotificationStore:
         is persisted for audit but never fanned out to channels.
         """
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO notifications
                (id, session_id, type, title, body, priority, status, options,
                 expires_at, metadata, created_at, target_kind, target_id)
@@ -49,7 +49,6 @@ class NotificationStore:
              expires_at, json.dumps(metadata or {}), now,
              target_kind, target_id),
         )
-        await self.db.commit()
         return {"id": notification_id, "session_id": session_id, "type": type}
 
     async def get_notification(self, notification_id: str) -> dict | None:
@@ -131,11 +130,10 @@ class NotificationStore:
 
     async def dismiss_all_notifications(self) -> int:
         """Dismiss all pending non-question notifications. Returns count dismissed."""
-        cursor = await self.db.execute(
+        result = await self._write(
             "UPDATE notifications SET status = 'dismissed' WHERE status = 'pending' AND type = 'notify'",
         )
-        await self.db.commit()
-        return cursor.rowcount
+        return result.rowcount
 
     async def expire_due_notifications(self) -> list[dict]:
         """Flip pending rows past their expiry to ``expired``.
@@ -287,10 +285,9 @@ class NotificationStore:
         sets = ", ".join(f"{k} = ?" for k in fields)
         vals = list(fields.values())
         vals.append(notification_id)
-        await self.db.execute(
+        await self._write(
             f"UPDATE notifications SET {sets} WHERE id = ?", tuple(vals),
         )
-        await self.db.commit()
 
     # ------------------------------------------------------------------ #
     #  Notification silences (deterministic suppression rules)             #
@@ -312,13 +309,12 @@ class NotificationStore:
         permanent. Returns the freshly-inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO notification_silences
                (id, pattern, action, reason, created_by, created_at, expires_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (silence_id, pattern, action, reason, created_by, now, expires_at),
         )
-        await self.db.commit()
         row = await self.get_silence(silence_id)
         return row or {"id": silence_id, "pattern": pattern}
 

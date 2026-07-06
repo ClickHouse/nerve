@@ -20,7 +20,7 @@ class SessionStore:
         forked_from_message: str | None = None,
     ) -> dict:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT OR IGNORE INTO sessions
                (id, title, source, metadata, status, parent_session_id,
                 forked_from_message, created_at, updated_at)
@@ -29,7 +29,6 @@ class SessionStore:
              json.dumps(metadata or {}), status,
              parent_session_id, forked_from_message, now, now),
         )
-        await self.db.commit()
         return {
             "id": session_id, "title": title or session_id,
             "source": source, "status": status,
@@ -77,16 +76,14 @@ class SessionStore:
 
     async def touch_session(self, session_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id)
         )
-        await self.db.commit()
 
     async def update_session_title(self, session_id: str, title: str) -> None:
-        await self.db.execute(
+        await self._write(
             "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
         )
-        await self.db.commit()
 
     async def delete_session(self, session_id: str) -> None:
         async with self._atomic():
@@ -102,23 +99,33 @@ class SessionStore:
 
         Also syncs dedicated columns (sdk_session_id, connected_at) for
         backward compatibility with callers that still use the metadata blob.
+        Both updates run in one transaction (the column sync is inlined —
+        calling :meth:`update_session_fields` here would deadlock on the
+        non-reentrant write lock).
         """
-        await self.db.execute(
-            "UPDATE sessions SET metadata = ? WHERE id = ?",
-            (json.dumps(metadata), session_id),
-        )
-        # Sync dedicated columns from metadata
         col_sync: dict[str, str | None] = {}
         if "sdk_session_id" in metadata:
             col_sync["sdk_session_id"] = metadata["sdk_session_id"]
         if "connected_at" in metadata:
             col_sync["connected_at"] = metadata["connected_at"]
-        if col_sync:
-            await self.update_session_fields(session_id, col_sync)
-        await self.db.commit()
+        built = self._build_session_fields_update(session_id, col_sync)
+        async with self._atomic():
+            await self.db.execute(
+                "UPDATE sessions SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), session_id),
+            )
+            if built is not None:
+                await self.db.execute(*built)
 
-    async def update_session_fields(self, session_id: str, fields: dict) -> None:
-        """Update specific session columns atomically. Merges, doesn't replace."""
+    @staticmethod
+    def _build_session_fields_update(
+        session_id: str, fields: dict,
+    ) -> tuple[str, tuple] | None:
+        """Build the (sql, params) for a whitelisted session-columns UPDATE.
+
+        Returns ``None`` when no allowed field is present. Shared by
+        :meth:`update_session_fields` and :meth:`update_session_metadata`.
+        """
         allowed = {
             "status", "sdk_session_id", "connected_at", "last_activity_at",
             "archived_at", "title", "message_count", "total_cost_usd",
@@ -132,15 +139,21 @@ class SessionStore:
                 set_clauses.append(f"{key} = ?")
                 params.append(value)
         if not set_clauses:
-            return
+            return None
         set_clauses.append("updated_at = ?")
         params.append(datetime.now(timezone.utc).isoformat())
         params.append(session_id)
-        await self.db.execute(
+        return (
             f"UPDATE sessions SET {', '.join(set_clauses)} WHERE id = ?",
             tuple(params),
         )
-        await self.db.commit()
+
+    async def update_session_fields(self, session_id: str, fields: dict) -> None:
+        """Update specific session columns atomically. Merges, doesn't replace."""
+        built = self._build_session_fields_update(session_id, fields)
+        if built is None:
+            return
+        await self._write(*built)
 
     async def get_sessions_with_metadata_key(self, key: str) -> list[dict]:
         """Find sessions whose metadata JSON contains a specific key.
@@ -171,13 +184,11 @@ class SessionStore:
     ) -> int:
         """Log a session lifecycle event."""
         now = datetime.now(timezone.utc).isoformat()
-        async with self.db.execute(
+        result = await self._write(
             "INSERT INTO session_events (session_id, event_type, details, created_at) VALUES (?, ?, ?, ?)",
             (session_id, event_type, json.dumps(details) if details else None, now),
-        ) as cursor:
-            event_id = cursor.lastrowid
-        await self.db.commit()
-        return event_id
+        )
+        return result.lastrowid
 
     async def get_session_events(
         self, session_id: str, limit: int = 50,
@@ -209,11 +220,10 @@ class SessionStore:
     async def set_channel_session(self, channel_key: str, session_id: str) -> None:
         """Persist a channel-to-session mapping."""
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "INSERT OR REPLACE INTO channel_sessions (channel_key, session_id, updated_at) VALUES (?, ?, ?)",
             (channel_key, session_id, now),
         )
-        await self.db.commit()
 
     # --- Session cleanup queries (V3) ---
 
@@ -284,11 +294,10 @@ class SessionStore:
 
     async def increment_message_count(self, session_id: str) -> None:
         """Atomically increment the message counter for a session."""
-        await self.db.execute(
+        await self._write(
             "UPDATE sessions SET message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
             (session_id,),
         )
-        await self.db.commit()
 
     async def get_sessions_needing_memorization(self) -> list[dict]:
         """Find non-archived sessions that have un-memorized messages.

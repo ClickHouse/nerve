@@ -19,14 +19,12 @@ class AuditStore:
     ) -> int:
         """Write an entry to the memU audit log."""
         now = datetime.now(timezone.utc).isoformat()
-        async with self.db.execute(
+        result = await self._write(
             "INSERT INTO memu_audit_log (timestamp, action, target_type, target_id, source, details) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (now, action, target_type, target_id, source, json.dumps(details) if details else None),
-        ) as cursor:
-            log_id = cursor.lastrowid
-        await self.db.commit()
-        return log_id
+        )
+        return result.lastrowid
 
     async def get_audit_logs(
         self,

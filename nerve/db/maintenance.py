@@ -165,20 +165,24 @@ class MaintenanceStore:
         """Truncate the WAL after a prune pass (best-effort).
 
         Frees the WAL file; does not shrink the main DB (see :meth:`vacuum`).
+        Runs under the write lock: an unlocked bare ``commit()`` here could
+        prematurely flush another coroutine's in-flight transaction.
         """
-        await self.db.commit()
-        await self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        async with self._write_lock:
+            await self._heal_leaked_txn()
+            await self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     async def vacuum(self) -> None:
         """Rewrite the DB file to reclaim freelist pages (shrinks the file).
 
-        Takes a write lock and cannot run inside a transaction, so it is an
-        explicit operator step, never on the background loop. Run with the
-        daemon stopped to avoid lock contention.
+        Cannot run inside a transaction (``_heal_leaked_txn`` guarantees the
+        connection is clean) and autocommits on completion. Serialized under
+        the write lock; still an explicit operator step, never on the
+        background loop. Run with the daemon stopped to avoid lock contention.
         """
-        await self.db.commit()
-        await self.db.execute("VACUUM")
-        await self.db.commit()
+        async with self._write_lock:
+            await self._heal_leaked_txn()
+            await self.db.execute("VACUUM")
 
     async def run_retention(
         self,

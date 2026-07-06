@@ -23,7 +23,7 @@ class SkillStore:
     ) -> None:
         """Insert or update a skill in the registry."""
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             """INSERT INTO skills (id, name, description, version, enabled,
                user_invocable, model_invocable, allowed_tools, metadata, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -38,7 +38,6 @@ class SkillStore:
              json.dumps(allowed_tools) if allowed_tools else None,
              json.dumps(metadata or {}), now, now),
         )
-        await self.db.commit()
 
     async def get_skill_row(self, skill_id: str) -> dict | None:
         """Get a single skill record."""
@@ -57,18 +56,17 @@ class SkillStore:
 
     async def delete_skill_row(self, skill_id: str) -> None:
         """Remove a skill and its usage records."""
-        await self.db.execute("DELETE FROM skill_usage WHERE skill_id = ?", (skill_id,))
-        await self.db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
-        await self.db.commit()
+        async with self._atomic():
+            await self.db.execute("DELETE FROM skill_usage WHERE skill_id = ?", (skill_id,))
+            await self.db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
 
     async def update_skill_enabled(self, skill_id: str, enabled: bool) -> None:
         """Toggle a skill's enabled state."""
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.execute(
+        await self._write(
             "UPDATE skills SET enabled = ?, updated_at = ? WHERE id = ?",
             (enabled, now, skill_id),
         )
-        await self.db.commit()
 
     async def record_skill_usage(
         self,
@@ -80,12 +78,11 @@ class SkillStore:
         error: str | None = None,
     ) -> None:
         """Log a skill invocation."""
-        await self.db.execute(
+        await self._write(
             """INSERT INTO skill_usage (skill_id, session_id, invoked_by, duration_ms, success, error)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (skill_id, session_id, invoked_by, duration_ms, success, error),
         )
-        await self.db.commit()
 
     async def get_skill_usage(self, skill_id: str, limit: int = 50) -> list[dict]:
         """Get usage history for a skill."""

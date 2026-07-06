@@ -9,12 +9,10 @@ class CronStore:
     """Mixin providing cron job logging operations."""
 
     async def log_cron_start(self, job_id: str) -> int:
-        async with self.db.execute(
+        result = await self._write(
             "INSERT INTO cron_logs (job_id) VALUES (?)", (job_id,)
-        ) as cursor:
-            log_id = cursor.lastrowid
-        await self.db.commit()
-        return log_id
+        )
+        return result.lastrowid
 
     async def set_cron_log_session(self, log_id: int, session_id: str) -> None:
         """Link a run log to its session while the run is still in flight.
@@ -22,11 +20,10 @@ class CronStore:
         Written at run start so the UI can open the chat of a running cron;
         log_cron_finish keeps it as a fallback for older code paths.
         """
-        await self.db.execute(
+        await self._write(
             "UPDATE cron_logs SET session_id = ? WHERE id = ?",
             (session_id, log_id),
         )
-        await self.db.commit()
 
     async def log_cron_finish(
         self,
@@ -37,12 +34,11 @@ class CronStore:
         session_id: str | None = None,
     ) -> None:
         now = utc_now_iso()
-        await self.db.execute(
+        await self._write(
             "UPDATE cron_logs SET finished_at = ?, status = ?, output = ?, error = ?, "
             "session_id = COALESCE(?, session_id) WHERE id = ?",
             (now, status, output, error, session_id, log_id),
         )
-        await self.db.commit()
 
     async def get_cron_logs(
         self, job_id: str | None = None, limit: int = 50, offset: int = 0,
@@ -122,11 +118,8 @@ class CronStore:
         thousands of rows and the unfiltered "latest N" query (used by the
         diagnostics endpoint) degrades to a full-table scan + memory sort.
         """
-        cursor = await self.db.execute(
+        result = await self._write(
             "DELETE FROM cron_logs WHERE started_at < datetime('now', ? || ' days')",
             (f"-{days}",),
         )
-        deleted = cursor.rowcount or 0
-        await cursor.close()
-        await self.db.commit()
-        return deleted
+        return result.rowcount or 0
