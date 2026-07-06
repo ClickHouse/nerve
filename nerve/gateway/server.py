@@ -617,6 +617,17 @@ def create_app() -> FastAPI:
                             _engine.db, file_ids,
                         )
 
+                    # Echo the message to every *other* client of this session so
+                    # parallel tabs render the user bubble live (the sender already
+                    # showed it optimistically). engine.run persists it, so reloads
+                    # get it from history regardless.
+                    await broadcaster.broadcast(session_id, {
+                        "type": "user_message",
+                        "session_id": session_id,
+                        "content": user_text,
+                        "blocks": image_refs or None,
+                    }, exclude=client_id)
+
                     # Run agent in background, store task for stop support
                     task = asyncio.create_task(
                         _engine.run(

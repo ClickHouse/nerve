@@ -1,6 +1,7 @@
 import type { WSMessage } from '../../api/websocket';
 import type { PanelTab } from '../../types/chat';
 import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
+import { hydrateMessage } from '../../utils/hydrateMessage';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
@@ -261,4 +262,17 @@ export function handleAnswerInjected(
       }],
     }));
   }
+}
+
+export function handleUserMessage(
+  msg: Extract<WSMessage, { type: 'user_message' }>,
+  get: Get,
+  set: Set,
+): void {
+  // A message sent from another client of this session — render the user
+  // bubble live. The sender is excluded server-side, so this never duplicates
+  // its own optimistic message. hydrateMessage rebuilds any image/file blocks.
+  if (msg.session_id !== get().activeSession) return;
+  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined });
+  set(s => ({ messages: [...s.messages, hydrated] }));
 }

@@ -82,8 +82,13 @@ class StreamBroadcaster:
                 if not self._listeners[session_id]:
                     del self._listeners[session_id]
 
-    async def broadcast(self, session_id: str, message: dict[str, Any]) -> None:
-        """Send a message to all listeners of a session. Also buffers if active."""
+    async def broadcast(self, session_id: str, message: dict[str, Any], exclude: str | None = None) -> None:
+        """Send a message to all listeners of a session. Also buffers if active.
+
+        ``exclude`` skips the listener with that callback id — used to echo an
+        event to every client except the one that originated it (and already
+        rendered it optimistically).
+        """
         # Terminal events close the open-turn flag so the engine's
         # backstop in run() knows no synthetic "done" is needed.
         if message.get("type") in ("done", "stopped", "error"):
@@ -101,6 +106,8 @@ class StreamBroadcaster:
             listeners = list(self._listeners.get(session_id, []))
 
         for callback_id, callback in listeners:
+            if callback_id == exclude:
+                continue
             try:
                 await callback(session_id, message)
             except Exception as e:
