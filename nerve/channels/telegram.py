@@ -332,7 +332,15 @@ class TelegramChannel(BaseChannel):
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(
-            drop_pending_updates=True,
+            # Do NOT drop updates that queued while we were offline.
+            # `nerve restart` (and any daemon respawn) goes through this
+            # startup path; with drop_pending_updates=True, every message
+            # the user sent during the restart window was silently discarded
+            # by Telegram and never redelivered — a real "lost message" bug.
+            # Telegram retains updates ~24h and only advances the offset once
+            # we fetch them, so False makes a restart pick up the backlog.
+            # The watchdog _rebuild() path already uses False; keep parity.
+            drop_pending_updates=False,
             # Retry initial connection indefinitely — don't give up on
             # transient network errors during startup
             bootstrap_retries=-1,
