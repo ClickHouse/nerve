@@ -563,9 +563,13 @@ class TelegramChannel(BaseChannel):
             self._cache_message(sent.message_id, chat_id, chunk)
 
     def format_response(self, text: str) -> str:
-        """Truncate for Telegram if needed."""
-        if len(text) > MAX_MSG_LEN:
-            return text[:MAX_MSG_LEN - 20] + "\n\n... (truncated)"
+        """Return text unchanged.
+
+        Long messages must NOT be truncated here: send() already splits text into
+        MAX_MSG_LEN-sized chunks and delivers them as sequential messages. Truncating
+        first (the old behaviour) defeated that chunking and dropped the tail of long
+        replies with a "... (truncated)" marker.
+        """
         return text
 
     # ------------------------------------------------------------------ #
