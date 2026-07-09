@@ -560,6 +560,103 @@ class TestHandleAnswerApproval:
 
 
 # ----------------------------------------------------------------------
+#  Busy-session answer injection
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBusySessionAnswerInjection:
+    """Answers must be injected even when the target session is mid-turn.
+
+    Regression tests for the stale ``is_running`` skip: an answer that
+    arrived while the session was busy was marked answered in the DB
+    but never dispatched into the session — silently lost. Dispatch is
+    now unconditional; ``engine.run``'s per-session lock queues the
+    injection behind the in-flight turn (FIFO).
+    """
+
+    async def test_busy_session_still_dispatches_answer(
+        self,
+        db: Database,
+        fake_config: NerveConfig,
+        fake_engine: MagicMock,
+        patch_broadcaster: list,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(
+            session_id="s1",
+            title="busy question",
+            body="pick one",
+            options=["yes", "no"],
+        )
+        nid = result["notification_id"]
+
+        # Session is mid-turn — the old code skipped injection here
+        # and the answer never reached the agent.
+        fake_engine.sessions.is_running.return_value = True
+
+        ok = await svc.handle_answer(nid, "yes", "web")
+        assert ok is True
+
+        notif = await db.get_notification(nid)
+        assert notif["status"] == "answered"
+
+        # The injected run was dispatched despite the busy session.
+        await asyncio.sleep(0)  # let the fire-and-forget task settle
+        fake_engine.run.assert_called_once()
+        kwargs = fake_engine.run.call_args.kwargs
+        assert kwargs["session_id"] == "s1"
+        assert kwargs["source"] == "notification:web"
+        assert kwargs["channel"] == "web"
+        assert "busy question" in kwargs["user_message"]
+        assert "yes" in kwargs["user_message"]
+
+        # The chat UI still sees the answer immediately, even though
+        # the injected turn is queued behind the in-flight one.
+        injected = [
+            m for _, m in patch_broadcaster
+            if m.get("type") == "answer_injected"
+            and m.get("notification_id") == nid
+        ]
+        assert injected
+
+    async def test_answers_during_busy_turn_dispatch_in_arrival_order(
+        self,
+        db: Database,
+        fake_config: NerveConfig,
+        fake_engine: MagicMock,
+        patch_broadcaster: list,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        first = await svc.ask_question(
+            session_id="s1", title="first question", options=["a", "b"],
+        )
+        second = await svc.ask_question(
+            session_id="s1", title="second question", options=["a", "b"],
+        )
+
+        fake_engine.sessions.is_running.return_value = True
+
+        assert await svc.handle_answer(
+            first["notification_id"], "a", "web",
+        )
+        assert await svc.handle_answer(
+            second["notification_id"], "b", "web",
+        )
+
+        await asyncio.sleep(0)
+        assert fake_engine.run.call_count == 2
+        messages = [
+            c.kwargs["user_message"]
+            for c in fake_engine.run.call_args_list
+        ]
+        assert "first question" in messages[0]
+        assert "second question" in messages[1]
+
+
+# ----------------------------------------------------------------------
 #  Handler registry sanity
 # ----------------------------------------------------------------------
 
