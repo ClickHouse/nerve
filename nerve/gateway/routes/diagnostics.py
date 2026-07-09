@@ -66,6 +66,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
         daily_usage_res,
         source_usage_res,
         model_usage_res,
+        cache_ttl_rows_res,
     ) = await asyncio.gather(
         deps.db.get_cron_logs(limit=10),
         deps.db.get_known_source_names(),
@@ -77,6 +78,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
         deps.db.get_usage_by_period(days=7),
         deps.db.get_usage_by_source(days=7),
         deps.db.get_usage_by_model(days=7),
+        deps.db.get_cache_ttl_turn_rows(days=7),
         return_exceptions=True,
     )
 
@@ -105,6 +107,24 @@ async def diagnostics(user: dict = Depends(require_auth)):
             "by_source": source_usage_res,
             "by_model": model_usage_res,
         }
+        # Cache-TTL policy block: 1h write share + estimated savings vs a
+        # pure-5m baseline (guardrail — see cache_policy.build_ttl_report).
+        try:
+            if not isinstance(cache_ttl_rows_res, BaseException):
+                from nerve.agent.cache_policy import build_ttl_report
+
+                report = build_ttl_report(cache_ttl_rows_res)
+                creation = usage_summary_res.get("total_cache_creation") or 0
+                creation_1h = (
+                    usage_summary_res.get("total_cache_creation_1h") or 0
+                )
+                report["cache_creation_1h_share"] = round(
+                    creation_1h / creation, 4,
+                ) if creation else 0.0
+                report["policy"] = config.agent.cache_ttl
+                usage_data["cache_ttl"] = report
+        except Exception:
+            logger.exception("Failed to build cache TTL diagnostics")
 
     # Augment known sources with registered runners (includes sources that
     # haven't logged a run yet).

@@ -59,6 +59,15 @@ def _format_tool_list() -> str:
 PROMPT_FILES = ["SOUL.md", "TASK.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 
 
+def current_time_str(timezone_name: str = "America/New_York") -> str:
+    """Minute-resolution local time, for the per-turn message reminder."""
+    try:
+        tz = ZoneInfo(timezone_name)
+        return datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
 def _read_if_exists(path: Path) -> str | None:
     """Read file content if it exists, otherwise return None."""
     try:
@@ -117,17 +126,22 @@ def build_system_prompt(
         else:
             parts.append(memory_content)
 
-    # Session context
+    # Session context. Deliberately date-resolution only: a minute-level
+    # timestamp here changes the system-prompt bytes on every client
+    # rebuild, invalidating the prompt cache for the entire conversation
+    # replay (prefix match — see nerve/agent/cache_policy.py). Precise
+    # wall-clock time is injected per turn as a trailing message reminder
+    # by the engine instead, which is fresher and costs nothing cache-wise.
     try:
         tz = ZoneInfo(timezone_name)
-        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+        today = datetime.now(tz).strftime("%Y-%m-%d %Z")
     except Exception:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        today = datetime.now().strftime("%Y-%m-%d")
 
     context = f"""# Session Context
 - **Session ID:** {session_id}
 - **Source:** {source}
-- **Current time:** {now}
+- **Current date:** {today}
 - **Workspace:** {workspace}
 
 You have access to the following custom tools:

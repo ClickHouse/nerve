@@ -664,6 +664,7 @@ class CronService:
                     prompt=prompt,
                     model=model,
                     session_id=session_id,
+                    cache_ttl=job.cache_ttl,
                 )
             else:
                 response = await self.engine.run_cron(
@@ -671,6 +672,7 @@ class CronService:
                     prompt=base_prompt,
                     model=model,
                     run_id=run_id,
+                    cache_ttl=job.cache_ttl,
                 )
 
             # Keep the tail of the response — for multi-message runs the

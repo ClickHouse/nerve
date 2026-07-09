@@ -281,6 +281,36 @@ class UsageStore:
                 d["total_cost_usd"] = round(d["total_cost_usd"], 4)
             return d
 
+    async def get_cache_ttl_turn_rows(self, days: int = 7) -> list[tuple]:
+        """Per-turn rows for the cache-TTL savings estimate.
+
+        Returns ``(session_id, source, ts_epoch, model, input_tokens,
+        cache_read, write_5m, write_1h)`` ordered by session and time.
+        Legacy rows that predate the TTL split report their aggregate
+        ``cache_creation_input_tokens`` as 5m writes (the historical
+        default).
+        """
+        async with self.db.execute(
+            """
+            SELECT u.session_id, COALESCE(s.source, 'unknown'),
+                   CAST(strftime('%s', u.created_at) AS REAL),
+                   u.model, u.input_tokens, u.cache_read_input_tokens,
+                   CASE
+                       WHEN u.cache_creation_5m_input_tokens
+                            + u.cache_creation_1h_input_tokens > 0
+                       THEN u.cache_creation_5m_input_tokens
+                       ELSE u.cache_creation_input_tokens
+                   END,
+                   u.cache_creation_1h_input_tokens
+            FROM session_usage u
+            LEFT JOIN sessions s ON s.id = u.session_id
+            WHERE u.created_at >= DATETIME('now', ?)
+            ORDER BY u.session_id, u.created_at, u.id
+            """,
+            (f"-{days} days",),
+        ) as cursor:
+            return [tuple(row) async for row in cursor]
+
     async def delete_session_usage(self, session_id: str) -> None:
         """Delete all usage records for a session (cascade on delete)."""
         await self._write(

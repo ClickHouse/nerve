@@ -151,6 +151,16 @@ class AgentConfig:
     # this subscription"). Match is case-insensitive substring on the resolved
     # model name. Empty list = send beta for all models when context_1m=True.
     context_1m_excluded_models: list[str] = field(default_factory=list)
+    # Prompt-cache write TTL policy: "5m" (status quo — every write uses the
+    # default 5-minute TTL), "1h" (always request the 1-hour TTL: writes cost
+    # 2x base input instead of 1.25x but survive sparse turn cadences), or
+    # "auto" (per session at client-build time — sparse-cadence sessions such
+    # as persistent crons, wakeup loops and spaced conversations get 1h;
+    # dense sessions stay on 5m). See nerve/agent/cache_policy.py.
+    cache_ttl: str = "5m"
+    # Substrings of model names that must never request the 1h cache TTL
+    # (same matching semantics as context_1m_excluded_models).
+    cache_ttl_excluded_models: list[str] = field(default_factory=list)
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
@@ -184,6 +194,10 @@ class AgentConfig:
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=list(
                 d.get("context_1m_excluded_models", []) or []
+            ),
+            cache_ttl=str(d.get("cache_ttl", "5m")),
+            cache_ttl_excluded_models=list(
+                d.get("cache_ttl_excluded_models", []) or []
             ),
             cli_idle_timeout_seconds=int(d.get("cli_idle_timeout_seconds", 900)),
             background_agent_permissions=bool(

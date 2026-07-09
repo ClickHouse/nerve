@@ -34,13 +34,18 @@ from claude_agent_sdk import (
 from claude_agent_sdk._errors import CLIConnectionError
 from claude_agent_sdk.types import HookMatcher, HookJSONOutput, HookContext
 
+from nerve.agent.cache_policy import cache_ttl_env, resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
     register_handler,
     unregister_handler,
     get_handler,
 )
-from nerve.agent.prompts import build_system_prompt, set_skill_manager
+from nerve.agent.prompts import (
+    build_system_prompt,
+    current_time_str,
+    set_skill_manager,
+)
 from nerve.agent.sessions import SessionManager, SessionStatus
 from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import (
@@ -959,6 +964,7 @@ class AgentEngine:
         resume: str | None = None,
         fork_session: bool = False,
         can_use_tool=None,
+        cache_ttl: str = "5m",
     ) -> ClaudeAgentOptions:
         """Build SDK client options for a session."""
         # Get skill summaries for system prompt injection
@@ -972,8 +978,12 @@ class AgentEngine:
                 if loop.is_running():
                     # We're in an async context — schedule and await later
                     # For now, use cached data from the manager
+                    # Sorted for deterministic system-prompt bytes — scan
+                    # order varies across restarts, and a reordered skill
+                    # list would silently invalidate every session's prompt
+                    # cache after a restart.
                     skill_summaries = []
-                    for sid, meta in self._skill_manager._cache.items():
+                    for sid, meta in sorted(self._skill_manager._cache.items()):
                         if meta.enabled and meta.model_invocable:
                             skill_summaries.append({
                                 "id": meta.id,
@@ -1106,7 +1116,7 @@ class AgentEngine:
             # CLI's own autonomous firing is suppressed via the
             # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
             disallowed_tools=["CronCreate", "CronList", "CronDelete"],
-            env=self._build_env(),
+            env=self._build_env(cache_ttl=cache_ttl),
             cwd=str(self.config.workspace),
             mcp_servers=self._build_mcp_servers(session_id),
             # Claude Code plugins — loaded via --plugin-dir so the CLI
@@ -1156,9 +1166,14 @@ class AgentEngine:
         path.write_text(content, encoding="utf-8")
         return str(path)
 
-    def _build_env(self) -> dict[str, str]:
+    def _build_env(self, cache_ttl: str = "5m") -> dict[str, str]:
         """Build environment variables for the SDK subprocess."""
         env: dict[str, str] = {}
+        # Prompt-cache TTL: the CLI natively supports the 1-hour TTL via
+        # this env var (it adds the extended-cache-ttl beta header and the
+        # cache_control ttl itself). Resolved per client build by
+        # nerve.agent.cache_policy — see that module for the policy.
+        env.update(cache_ttl_env(cache_ttl, self.config.provider.is_bedrock))
         # Disable the CLI's built-in cron/wakeup scheduler. It fires
         # autonomously inside the subprocess, but Nerve only reads the SDK
         # stream during an active run() — so a fired turn lands in an unread
@@ -1622,17 +1637,19 @@ class AgentEngine:
             # Check for stored SDK session ID for resume
             session = await self.db.get_session(session_id)
             sdk_resume_id = session.get("sdk_session_id") if session else None
+            try:
+                session_meta = json.loads(
+                    (session.get("metadata") if session else None) or "{}",
+                )
+            except (TypeError, ValueError):
+                session_meta = {}
 
             # Seed the serving-model baseline from the last persisted
             # observation so downgrade detection survives restarts without
             # re-firing an event on every resumed session.
             if session and session_id not in self._observed_models:
-                try:
-                    _meta = json.loads(session.get("metadata") or "{}")
-                except (TypeError, ValueError):
-                    _meta = {}
-                if _meta.get("observed_model"):
-                    self._observed_models[session_id] = _meta["observed_model"]
+                if session_meta.get("observed_model"):
+                    self._observed_models[session_id] = session_meta["observed_model"]
 
             # For forks, use the source session's SDK ID
             if fork_from and not sdk_resume_id:
@@ -1671,17 +1688,54 @@ class AgentEngine:
                     session_id, sdk_resume_id[:12],
                 )
 
-            # Pre-recall memories for new session context
+            # Pre-recall memories for new session context. The first
+            # successful recall is frozen in session metadata and reused on
+            # every rebuild of the same session: byte-identical system
+            # prompts across rebuilds are what let a resumed conversation
+            # hit the prompt cache (see nerve/agent/cache_policy.py), and a
+            # session keeping its original priors is more consistent anyway
+            # — live recall stays available via the memory_recall tool.
             recalled_memories: list[str] = []
-            if self._memory_bridge and self._memory_bridge.available:
+            meta_updates: dict[str, Any] = {}
+            frozen_recall = session_meta.get("recalled_memories")
+            if isinstance(frozen_recall, list):
+                recalled_memories = [str(m) for m in frozen_recall]
+            elif self._memory_bridge and self._memory_bridge.available:
                 try:
                     raw = await self._memory_bridge.recall(
                         f"context for {source} session",
                         limit=8,
                     )
                     recalled_memories = [m["summary"] for m in raw]
+                    meta_updates["recalled_memories"] = recalled_memories
                 except Exception as e:
                     logger.warning("Pre-recall failed: %s", e)
+
+            # Resolve the prompt-cache TTL for this client build (cadence-
+            # aware; see nerve/agent/cache_policy.py). Recomputed on every
+            # client (re)build — client recycling at the idle sweep makes
+            # the policy naturally track cadence changes.
+            requested = model or self.config.agent.model
+            is_claude = not (
+                self.config.ollama.enabled
+                and "claude" not in requested.lower()
+            )
+            cache_ttl = await resolve_cache_ttl(
+                self.config.agent, self.db, session_id, source, requested,
+                session_meta=session_meta, is_claude_model=is_claude,
+            )
+            logger.info(
+                "Session %s: prompt-cache TTL %s (source=%s, mode=%s)",
+                session_id, cache_ttl, source,
+                session_meta.get("cache_ttl_override")
+                or self.config.agent.cache_ttl,
+            )
+            if session_meta.get("cache_ttl") != cache_ttl:
+                meta_updates["cache_ttl"] = cache_ttl
+
+            if meta_updates and session:
+                session_meta.update(meta_updates)
+                await self.db.update_session_metadata(session_id, session_meta)
 
             # Determine if this is a fork
             is_fork = fork_from is not None
@@ -1704,6 +1758,7 @@ class AgentEngine:
                 resume=sdk_resume_id,
                 fork_session=is_fork,
                 can_use_tool=handler.can_use_tool,
+                cache_ttl=cache_ttl,
             )
             client = ClaudeSDKClient(options=options)
             await client.connect()
@@ -2842,6 +2897,24 @@ class AgentEngine:
             if query_text and query_text.startswith("/"):
                 query_text = "\u200b" + query_text
 
+            # Trailing wall-clock reminder. Precise time deliberately does
+            # NOT live in the system prompt (only the date does): a
+            # per-build timestamp there changes the prompt bytes on every
+            # client rebuild, invalidating the prompt cache for the entire
+            # conversation replay (see nerve/agent/cache_policy.py). As a
+            # message-tail reminder it is fresher \u2014 per turn instead of per
+            # client build \u2014 and costs nothing cache-wise. Not persisted to
+            # the DB message (db_text above), so the UI stays clean.
+            if query_text or images:
+                _time_note = (
+                    "<system-reminder>Current time: "
+                    f"{current_time_str(self.config.timezone)}"
+                    "</system-reminder>"
+                )
+                query_text = (
+                    f"{query_text}\n\n{_time_note}" if query_text else _time_note
+                )
+
             # Build multi-modal content blocks once (reused on retry)
             if images:
                 content_blocks: list[dict[str, Any]] = []
@@ -3531,12 +3604,37 @@ class AgentEngine:
         # lock and must not gate the run lifecycle.
         await self._discard_client(session_id, background_memorize=True)
 
+    async def _stamp_cron_session_meta(
+        self, session_id: str, mode: str, cache_ttl: str = "",
+    ) -> None:
+        """Stamp cron-session hints consumed by the cache-TTL policy.
+
+        ``mode`` ("persistent" | "isolated") is the no-history prior for
+        auto TTL resolution; ``cache_ttl`` is the per-job override from
+        jobs.yaml (empty = no override).
+        """
+        session = await self.db.get_session(session_id)
+        if not isinstance(session, dict):
+            return
+        try:
+            meta = json.loads(session.get("metadata") or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        updates: dict[str, Any] = {"cron_session_mode": mode}
+        if cache_ttl:
+            updates["cache_ttl_override"] = cache_ttl
+        if all(meta.get(k) == v for k, v in updates.items()):
+            return
+        meta.update(updates)
+        await self.db.update_session_metadata(session_id, meta)
+
     async def run_cron(
         self,
         job_id: str,
         prompt: str,
         model: str | None = None,
         run_id: str | None = None,
+        cache_ttl: str = "",
     ) -> str:
         """Run an agent turn for a cron job in an isolated session.
 
@@ -3550,6 +3648,7 @@ class AgentEngine:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         session = await self.sessions.create_cron_session(job_id, run_id=run_id)
         session_id = session["id"]
+        await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
         try:
             return await self.run(
                 session_id=session_id,
@@ -3566,6 +3665,7 @@ class AgentEngine:
         prompt: str,
         model: str | None = None,
         session_id: str | None = None,
+        cache_ttl: str = "",
     ) -> str:
         """Run a persistent cron job that maintains context across runs.
 
@@ -3586,6 +3686,7 @@ class AgentEngine:
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
         )
+        await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:
             return await self.run(
                 session_id=session_id,
