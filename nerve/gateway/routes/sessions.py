@@ -57,6 +57,10 @@ class MessageResponse(BaseModel):
 class SessionCreateRequest(BaseModel):
     title: str | None = None
     source: str = "web"
+    # Agent backend for this session ("claude" | "codex"). Stored as
+    # metadata backend_override; the engine stamps the sticky
+    # sessions.backend column at first client build (docs plan §3).
+    backend: str | None = None
 
 
 class ForkRequest(BaseModel):
@@ -97,9 +101,19 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
 @router.post("/api/sessions")
 async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
     deps = get_deps()
+    metadata = None
+    if req.backend:
+        backend = req.backend.strip().lower()
+        if backend not in deps.engine._backends:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown backend {backend!r} "
+                       f"(known: {sorted(deps.engine._backends)})",
+            )
+        metadata = {"backend_override": backend}
     session_id = str(uuid.uuid4())[:8]
     session = await deps.engine.sessions.get_or_create(
-        session_id, title=req.title, source=req.source
+        session_id, title=req.title, source=req.source, metadata=metadata,
     )
     return session
 

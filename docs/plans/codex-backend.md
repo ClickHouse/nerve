@@ -653,6 +653,20 @@ code where the fallback goes).
 4. Watch: usage rows (`raw`), cost attribution, audit trail, approval UX.
 5. Full flip (`agent.backend: codex`) = config edit + `nerve restart` — Artem's call.
 
+## 15b. New-chat backend selector (UI, added on request)
+
+The composer shows a segmented **Claude / Codex** control on new (virtual)
+chats: Claude in the brand-orange tint, Codex in teal, tooltips carrying
+each backend's default model. The choice binds at server-side session
+creation (`POST /api/sessions {backend}` → metadata `backend_override`,
+validated against the engine's backend registry) and the control
+disappears once the conversation starts — the header's existing model
+badge then shows what the session runs on. Codex-selected chats hide the
+Ollama model picker (its entries can't be served by codex). `GET
+/api/models` now advertises `backends: {default, options:[{id,label,
+model}]}` for the selector. Visually verified against a scratch gateway
+(screenshots: codex-selector-3/4.png in the workspace).
+
 ## 16. Review log
 
 - v1 → v2 (2026-07-10): adversarial subagent review (agent a4093b396028e149b) found 4

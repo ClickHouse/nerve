@@ -250,3 +250,48 @@ class TestResumeDroppedEnginePath:
             "sdk_session_id",
         )
         assert session.get("backend") == "codex"
+
+
+class TestCreateSessionRoute:
+    """POST /api/sessions with the new-chat backend selector's param."""
+
+    @pytest.mark.asyncio
+    async def test_backend_param_binds_override(self, tmp_path, db, monkeypatch):
+        import json
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+
+        from nerve.gateway.routes import sessions as routes
+
+        engine = _engine(tmp_path, db)
+        monkeypatch.setattr(
+            routes, "get_deps",
+            lambda: SimpleNamespace(engine=engine, db=db),
+        )
+
+        created = await routes.create_session(
+            routes.SessionCreateRequest(backend="codex"), user={"sub": "user"},
+        )
+        row = await db.get_session(created["id"])
+        meta = json.loads(row.get("metadata") or "{}")
+        assert meta["backend_override"] == "codex"
+        # ...and the engine's sticky resolution honors it for the new session.
+        assert engine._backend_for(row, "web").name == "codex"
+
+        # Omitted backend → no override, config default applies.
+        plain = await routes.create_session(
+            routes.SessionCreateRequest(), user={"sub": "user"},
+        )
+        plain_row = await db.get_session(plain["id"])
+        plain_meta = json.loads(plain_row.get("metadata") or "{}")
+        assert "backend_override" not in plain_meta
+        assert engine._backend_for(plain_row, "web").name == "claude"
+
+        # Unknown backend → 400, nothing created.
+        with pytest.raises(HTTPException) as excinfo:
+            await routes.create_session(
+                routes.SessionCreateRequest(backend="geminy"),
+                user={"sub": "user"},
+            )
+        assert excinfo.value.status_code == 400

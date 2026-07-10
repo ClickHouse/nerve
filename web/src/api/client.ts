@@ -68,6 +68,10 @@ export const api = {
   getModels: () =>
     request<{
       default: string;
+      backends?: {
+        default: string;
+        options: { id: string; label: string; model: string }[];
+      };
       models: { id: string; provider: string }[];
       ollama: { enabled: boolean; routable: boolean; available: boolean };
     }>('/models'),
@@ -77,10 +81,10 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string) =>
+  createSession: (title?: string, backend?: string | null) =>
     request<any>('/sessions', {
       method: 'POST',
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, ...(backend ? { backend } : {}) }),
     }),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),

@@ -143,6 +143,12 @@ interface ChatState {
   // current pick (null = use the server default).
   availableModels: { id: string; provider: string }[];
   modelsDefault: string | null;
+  // Agent backends for the new-chat selector (claude / codex).
+  backendOptions: { id: string; label: string; model: string }[];
+  backendDefault: string | null;
+  // Backend picked for the CURRENT virtual (unsent) chat; null = default.
+  // Bound at session materialization (ensureRealSession) and reset after.
+  newChatBackend: string | null;
   selectedModel: string | null;
 
   loadSessions: () => Promise<void>;
@@ -167,6 +173,7 @@ interface ChatState {
   sendMessage: (content: string) => void;
   /** Fetch selectable models for the composer picker (GET /api/models). */
   loadModels: () => Promise<void>;
+  setNewChatBackend: (backend: string | null) => void;
   /** Set the model for the next message (null → server default). */
   setSelectedModel: (model: string | null) => void;
   stopSession: () => void;
@@ -225,6 +232,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   searchFocusNonce: 0,
   availableModels: [],
   modelsDefault: null,
+  backendOptions: [],
+  backendDefault: null,
+  newChatBackend: null,
   selectedModel: localStorage.getItem('nerve_selected_model') || null,
 
   addQuote: (text: string, action: QuoteAction) => {
@@ -499,7 +509,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // server-minted id, so anything needing a persisted session — the first
     // message OR a file upload before it — targets a real row, not the
     // client-only temp id (which the backend has never seen → 404).
-    const real: Session = await api.createSession();
+    const real: Session = await api.createSession(
+      undefined, get().newChatBackend,
+    );
     set((state) => {
       const drafts = { ...state.drafts };
       // Carry any unsent draft text across to the real id so the composer,
@@ -511,6 +523,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Don't yank the view if the user navigated away during the POST.
         ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
         virtualSession: null,
+        newChatBackend: null,  // bound into the created session; reset for the next chat
         drafts,
         // POST /api/sessions returns a partial row (no updated_at); fill the
         // fields the sidebar needs so date-grouping doesn't choke.
@@ -526,6 +539,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
+    set({ newChatBackend: null });
     set((s) => {
       const drafts = { ...s.drafts };
       delete drafts[vs.id];
@@ -625,12 +639,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const keep = state.selectedModel && ids.has(state.selectedModel)
           ? state.selectedModel : null;
         if (keep !== state.selectedModel) localStorage.removeItem('nerve_selected_model');
-        return { availableModels: res.models, modelsDefault: res.default, selectedModel: keep };
+        return {
+          availableModels: res.models,
+          modelsDefault: res.default,
+          backendOptions: res.backends?.options ?? [],
+          backendDefault: res.backends?.default ?? null,
+          selectedModel: keep,
+        };
       });
     } catch (e) {
       console.error('Failed to load models:', e);
     }
   },
+
+  setNewChatBackend: (backend: string | null) => set({ newChatBackend: backend }),
 
   setSelectedModel: (model: string | null) => {
     if (model) localStorage.setItem('nerve_selected_model', model);

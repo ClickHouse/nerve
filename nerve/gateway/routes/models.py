@@ -43,6 +43,17 @@ async def list_models(user: dict = Depends(require_auth)):
     config = get_config()
     default_model = config.agent.model
 
+    # Agent backends for the new-chat selector. Both are always offered —
+    # construction is unconditional server-side; a codex pick without
+    # auth configured surfaces a clear, actionable error on first message.
+    backends = {
+        "default": config.agent.backend,
+        "options": [
+            {"id": "claude", "label": "Claude", "model": config.agent.model},
+            {"id": "codex", "label": "Codex", "model": config.codex.model},
+        ],
+    }
+
     models: list[dict[str, str]] = [
         {"id": default_model, "provider": "anthropic"},
     ]
@@ -56,6 +67,7 @@ async def list_models(user: dict = Depends(require_auth)):
 
     return {
         "default": default_model,
+        "backends": backends,
         "models": models,
         "ollama": {
             "enabled": config.ollama.enabled,

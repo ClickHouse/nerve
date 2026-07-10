@@ -5,6 +5,7 @@ import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
 import { PromptRewriteCard } from './PromptRewriteCard';
+import { BackendSelector } from './BackendSelector';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
   add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)', placeholder: 'Instructions...' },
@@ -60,6 +61,14 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const activeSession = useChatStore(s => s.activeSession);
   const ensureRealSession = useChatStore(s => s.ensureRealSession);
   const isNewChat = useChatStore(s => s.messages.length === 0);
+  // Backend selector renders only while the chat is virtual (unsent):
+  // the choice binds at server-side session creation and is sticky.
+  const isVirtualChat = useChatStore(
+    s => s.virtualSession !== null && s.virtualSession.id === s.activeSession,
+  );
+  const newChatBackend = useChatStore(s => s.newChatBackend);
+  const backendDefault = useChatStore(s => s.backendDefault);
+  const chosenBackend = newChatBackend ?? backendDefault;
 
   // ── Model picker ──
   const availableModels = useChatStore(s => s.availableModels);
@@ -455,10 +464,18 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               <Sparkles size={18} />
             </button>
           )}
+          {/* Agent backend selector — Claude vs Codex, new chats only.
+              Binds at session creation; sticky afterwards (the header's
+              model badge shows what a running session uses). */}
+          {isVirtualChat && (
+            <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
+          )}
           {/* Model picker — only when more than one model is offered (local
               Ollama models configured + available). Hidden otherwise so the
-              composer is unchanged for the default single-model setup. */}
-          {availableModels.length > 1 && (
+              composer is unchanged for the default single-model setup.
+              Codex chats hide it: its entries are Anthropic/Ollama models,
+              which the codex backend cannot serve (codex.model applies). */}
+          {availableModels.length > 1 && !(isVirtualChat && chosenBackend === 'codex') && (
             <select
               value={selectedModel ?? modelsDefault ?? ''}
               onChange={(e) => setSelectedModel(e.target.value === modelsDefault ? null : e.target.value)}
