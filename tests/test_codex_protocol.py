@@ -78,7 +78,7 @@ async def test_command_exit_code_marks_error(tmp_path):
     await client._map_notification("item/started", {"item": {
         "id": "c9", "type": "commandExecution", "command": ["false"],
     }})
-    events = client._map_item_completed({
+    events = await client._map_item_completed({
         "id": "c9", "type": "commandExecution",
         "command": ["false"], "aggregatedOutput": "", "exitCode": 3,
     })

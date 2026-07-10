@@ -39,6 +39,7 @@ from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
     CodexRpcError,
 )
+from nerve.agent.backends.codex.diffs import reverse_apply_unified_diff
 from nerve.agent.backends.codex.pricing import compute_cost
 from nerve.agent.backends.images import validate_image_data
 
@@ -515,7 +516,7 @@ class CodexClient(AgentClient):
             out.extend(await self._map_item_started(params.get("item") or {}))
 
         elif method == "item/completed":
-            out.extend(self._map_item_completed(params.get("item") or {}))
+            out.extend(await self._map_item_completed(params.get("item") or {}))
 
         elif method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage") or {}
@@ -605,25 +606,16 @@ class CodexClient(AgentClient):
         elif item_type == "fileChange":
             for n, change in enumerate(self._changes(item)):
                 path = str(change.get("path") or "")
-                # Best-effort pre-apply snapshot for the diff panel. If
-                # item/started turns out to fire post-apply in some codex
-                # version, the fallback is reconstructing the pre-image
-                # from the unified diff we receive at item/completed
-                # (docs plan §13) — the smoke script probes this ordering.
-                if path and self._spec.snapshot:
-                    from nerve.agent.interactive import _read_file_safe
-                    hub = self._spec.interactive
-                    fresh = hub.mark_snapshotted(path) if hub else True
-                    if fresh:
-                        try:
-                            await self._spec.snapshot(
-                                self._spec.session_id, path,
-                                _read_file_safe(path),
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Snapshot failed for %s: %s", path, e,
-                            )
+                # Pre-image snapshot for the diff panel. The live probe
+                # showed item/started fires POST-apply on the real
+                # app-server, so the disk already holds the new content —
+                # reconstruct the before-text by reverse-applying the
+                # change's unified diff (verification-first: a pre-apply
+                # timing simply fails the reverse and the disk content IS
+                # the pre-image). No diff on this event yet → defer to
+                # item/completed, which carries the full changes[].
+                if change.get("diff"):
+                    await self._snapshot_pre_image(path, change)
                 out.append(ev.ToolUse(
                     tool_use_id=self._change_id(item_id, n),
                     name="Edit",
@@ -650,7 +642,7 @@ class CodexClient(AgentClient):
         # notifications; nothing to emit at start.
         return out
 
-    def _map_item_completed(self, item: dict) -> list[ev.AgentEvent]:
+    async def _map_item_completed(self, item: dict) -> list[ev.AgentEvent]:
         item_id = str(item.get("id") or "")
         item_type = str(item.get("type") or "")
         started = self._items.pop(item_id, None)
@@ -673,6 +665,11 @@ class CodexClient(AgentClient):
             failed = str(item.get("status") or "").lower() == "failed"
             changes = self._changes(item) or self._changes(started or {})
             for n, change in enumerate(changes):
+                # Deferred snapshot: item/started carried no diff for this
+                # path (mark_snapshotted dedupes when it did).
+                await self._snapshot_pre_image(
+                    str(change.get("path") or ""), change,
+                )
                 diff = str(change.get("diff") or "")
                 out.append(ev.ToolResult(
                     tool_use_id=self._change_id(item_id, n),
@@ -701,6 +698,40 @@ class CodexClient(AgentClient):
             ))
         # agentMessage completion: text was already streamed via deltas.
         return out
+
+    async def _snapshot_pre_image(self, path: str, change: dict) -> None:
+        """Capture the BEFORE-content of a changed file (once per path).
+
+        Timing-agnostic (live-verified 2026-07-10, plan §17): the real
+        app-server applies patches before ``item/started``, so the
+        pre-image is reconstructed by reverse-applying the change's
+        unified diff to the disk content; when the event beats the write
+        (approval flows), the reverse fails verification and the disk
+        content — which IS the pre-image — is used directly.
+        """
+        if not path or self._spec.snapshot is None:
+            return
+        hub = self._spec.interactive
+        if hub is not None and not hub.mark_snapshotted(path):
+            return  # already captured this session
+        from nerve.agent.interactive import _read_file_safe
+
+        kind = str(change.get("kind") or "").lower()
+        content: str | None
+        if kind == "add":
+            content = None  # new file — no pre-image
+        else:
+            disk = _read_file_safe(path)
+            content = disk
+            diff = str(change.get("diff") or "")
+            if disk is not None and diff:
+                reconstructed = reverse_apply_unified_diff(diff, disk)
+                if reconstructed is not None:
+                    content = reconstructed
+        try:
+            await self._spec.snapshot(self._spec.session_id, path, content)
+        except Exception as e:
+            logger.warning("Snapshot failed for %s: %s", path, e)
 
     def _map_turn_completed(self, params: dict) -> ev.TurnCompleted:
         turn = params.get("turn") or {}

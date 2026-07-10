@@ -914,7 +914,6 @@ _CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 # $/1M tokens; cached input bills at the discounted rate. Config values
 # under codex.pricing REPLACE entries per model key (dict deep-merge).
 _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
-    "gpt-5.6-codex":  {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
     "gpt-5.6-sol":    {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
     "gpt-5.6-terra":  {"input": 2.5,  "cached_input": 0.25, "output": 15.0},
     "gpt-5.6-luna":   {"input": 1.0,  "cached_input": 0.1,  "output": 6.0},
@@ -932,7 +931,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     home_dir: str = "~/.nerve/codex"        # isolated CODEX_HOME (auth/config/sessions)
-    model: str = "gpt-5.6-codex"
+    model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
@@ -974,7 +973,7 @@ class CodexConfig:
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             home_dir=str(d.get("home_dir", "~/.nerve/codex")),
-            model=str(d.get("model", "gpt-5.6-codex")),
+            model=str(d.get("model", "gpt-5.6-sol")),
             cron_model=str(d.get("cron_model") or ""),
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),

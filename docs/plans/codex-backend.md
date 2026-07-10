@@ -472,7 +472,7 @@ agent:
 codex:
   bin_path: codex                    # PATH-resolved; min version check (>= 0.144)
   home_dir: ~/.nerve/codex           # isolated CODEX_HOME (auth + config + sessions)
-  model: gpt-5.6-codex
+  model: gpt-5.6-sol            # verified live via model/list (see §17)
   cron_model: null                   # null → codex.model
   auth: chatgpt                      # chatgpt | api_key
   api_key: null                      # or api_key_env: OPENAI_API_KEY
@@ -484,8 +484,7 @@ codex:
   turn_idle_timeout_seconds: null    # null → agent.cli_idle_timeout_seconds; engine
                                      # resolves into SessionSpec.idle_timeout
   pricing:                           # $/1M tokens; cached input billed at cached rate
-    gpt-5.6-codex:  {input: 5.0,  cached_input: 0.5,  output: 30.0}   # default model MUST have an entry
-    gpt-5.6-sol:    {input: 5.0,  cached_input: 0.5,  output: 30.0}
+    gpt-5.6-sol:    {input: 5.0,  cached_input: 0.5,  output: 30.0}   # default — MUST have an entry
     gpt-5.6-terra:  {input: 2.5,  cached_input: 0.25, output: 15.0}
     gpt-5.6-luna:   {input: 1.0,  cached_input: 0.1,  output: 6.0}
 ```
@@ -693,9 +692,31 @@ findings vs the plan:
 - Full pytest suite green (see PR); frontend `tsc --noEmit` + `npm run
   build` clean with the new ApprovalCard.
 
-**Pending live verification (needs Artem: `CODEX_HOME=~/.nerve/codex codex
-login`, then `scripts/codex_smoke.py`):** real-handshake auth, app-server
-RSS per session, fileChange `item/started` pre/post-apply ordering probe
-(smoke prints the verdict + the reverse-diff fallback instruction), live
-per-turn usage/cost sanity, `mcp_servers.nerve` override effectiveness
-against the real binary.
+**Live verification (2026-07-10, `scripts/codex_smoke.py --auth api_key`,
+real app-server + OpenAI API key):**
+
+- ✅ API-key auth: `account/login/start {type: apiKey}` → threads + turns
+  work end-to-end. Auth state persisted in `~/.nerve/codex/auth.json`.
+- ✅ Real turn on **gpt-5.6-sol**: `SMOKE-OK`, status=completed,
+  usage in=11013 / out=8, reported context window **353,400 tokens**,
+  computed cost $0.055 (pricing table math verified against live usage).
+- ⚠️→fixed **`gpt-5.6-codex` does not exist.** Live `model/list`:
+  `gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4,
+  gpt-5.4-mini, gpt-5.2`. Default `codex.model` corrected to
+  `gpt-5.6-sol`; the failed-turn path incidentally got a live test and
+  behaved as designed (status=failed surfaced, transport healthy).
+- ✅ **RSS: ~48 MB per app-server process** (connect and after turns) —
+  cheaper than a Claude CLI subprocess; the idle sweep bounds count as
+  before. No per-session memory concern.
+- ⚠️→fixed **fileChange `item/started` fires POST-apply** on the real
+  binary (the §13 risk, confirmed live). Implemented the reverse-diff
+  fallback: `backends/codex/diffs.py::reverse_apply_unified_diff`
+  reconstructs the pre-image from the change's unified diff
+  (verification-first — a pre-apply timing fails the reverse and the
+  disk content is used, so both timings are correct; snapshots defer to
+  `item/completed` when `item/started` carries no diff yet). Re-probe:
+  `final='CHANGED' snapshot-time='ORIGINAL'` ✅ — the diff panel gets a
+  true before/after pair.
+- Not exercised live: `mcp_servers.nerve` override effectiveness (smoke
+  runs without a gateway; asserted against the fake's argv mirror — the
+  first real nerve-session turn will confirm tool calls land).

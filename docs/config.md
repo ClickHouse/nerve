@@ -67,7 +67,7 @@ agent:
 codex:                     # active when a codex backend is selected
   bin_path: codex          # codex-cli >= 0.144 on PATH
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
-  model: gpt-5.6-codex
+  model: gpt-5.6-sol
   cron_model: null         # null → model
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
@@ -77,7 +77,7 @@ codex:                     # active when a codex backend is selected
   tool_timeout_sec: 3600        # nerve MCP calls may block on ask_user
   turn_idle_timeout_seconds: null  # null → agent.cli_idle_timeout_seconds
   pricing:                      # $/1M tokens — cost is None for unlisted models
-    gpt-5.6-codex: {input: 5.0, cached_input: 0.5, output: 30.0}
+    gpt-5.6-sol: {input: 5.0, cached_input: 0.5, output: 30.0}
   extra_config: {}              # arbitrary codex -c key=value passthrough
 ```
 

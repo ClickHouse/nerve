@@ -35,7 +35,7 @@ def _config(tmp_path: Path, **codex_overrides) -> NerveConfig:
         "codex": {
             "bin_path": FAKE_BIN,
             "home_dir": str(tmp_path / "codex-home"),
-            "model": "gpt-5.6-codex",
+            "model": "gpt-5.6-sol",
             **codex_overrides,
         },
     })
@@ -105,7 +105,7 @@ async def test_basic_turn_streams_and_completes(tmp_path, monkeypatch):
         assert "".join(texts) == "Hello "
         assert any(isinstance(e, ev.ThinkingDelta) for e in events)
         assert isinstance(events[0], ev.ModelObserved)
-        assert events[0].model == "gpt-5.6-codex"
+        assert events[0].model == "gpt-5.6-sol"
 
         done = events[-1]
         assert isinstance(done, ev.TurnCompleted)
