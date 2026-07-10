@@ -184,3 +184,69 @@ class TestScheduleWakeupTool:
         # missing prompt → error, nothing scheduled
         bad = await schedule_wakeup_handler(ctx, {"delaySeconds": 60, "prompt": " "})
         assert bad.is_error
+
+
+class TestResumeDroppedEnginePath:
+    @pytest.mark.asyncio
+    async def test_stale_native_id_is_cleared_not_repersisted(self, tmp_path, db):
+        """When the backend reports resume_dropped, the engine must clear
+        sessions.sdk_session_id AND not let mark_active re-persist the
+        stale id (review finding: the local variable also has to be
+        dropped)."""
+        from types import SimpleNamespace
+
+        from nerve.agent.backends.base import BackendCapabilities
+
+        engine = _engine(tmp_path, db)
+        await db.create_session("s-drop", source="web")
+        await db.update_session_fields("s-drop", {
+            "sdk_session_id": "stale-thread-1", "backend": "codex",
+        })
+
+        class StubClient:
+            resume_dropped = True
+            native_session_id = "fresh-thread-9"
+            model = "gpt-5.6-sol"
+
+            def is_alive(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+        class StubBackend:
+            name = "codex"
+            capabilities = BackendCapabilities(
+                cost_is_cumulative=False,
+                supports_idle_stream=False,
+                supports_cache_ttl=False,
+                interactive_builtins=False,
+                reports_context_window=True,
+            )
+
+            def default_model(self, source):
+                return "gpt-5.6-sol"
+
+            def excluded_tools(self):
+                return set()
+
+            def validate_resume_target(self, native_id, cwd):
+                return True
+
+            async def create_client(self, spec):
+                # The backend already recovered with a fresh thread —
+                # spec still carried the stale id.
+                assert spec.resume_native_id == "stale-thread-1"
+                return StubClient()
+
+        engine._backends["codex"] = StubBackend()
+        client = await engine._get_or_create_client("s-drop", "web", None)
+        assert client.resume_dropped is True
+
+        session = await db.get_session("s-drop")
+        # The stale id must be GONE (mark_active must not re-persist it);
+        # the fresh id lands at turn end via TurnCompleted.
+        assert session.get("sdk_session_id") in (None, ""), session.get(
+            "sdk_session_id",
+        )
+        assert session.get("backend") == "codex"

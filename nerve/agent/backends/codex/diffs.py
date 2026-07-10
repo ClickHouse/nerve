@@ -39,8 +39,10 @@ def reverse_apply_unified_diff(diff: str, after_text: str) -> str | None:
         return None
 
     keepends = after_text.splitlines(keepends=True)
-    # Track whether the after-text ends without a newline so the
-    # reconstruction can preserve the analogous property.
+    # Removed lines are re-inserted with the file's dominant terminator so
+    # CRLF files round-trip (diff.splitlines() strips the \r from hunk
+    # body lines; comparisons go through _line(), which strips both).
+    eol = "\r\n" if "\r\n" in after_text else "\n"
     before_parts: list[str] = []
     pos = 0  # cursor into keepends (0-based line index of after_text)
 
@@ -96,8 +98,9 @@ def reverse_apply_unified_diff(diff: str, after_text: str) -> str | None:
                     return None
                 pos += 1
             elif tag == "-":
-                # Absent in after, present in before — re-insert.
-                before_parts.append(content + "\n")
+                # Absent in after, present in before — re-insert with the
+                # file's dominant line terminator.
+                before_parts.append(content.rstrip("\r") + eol)
             else:
                 # Not a hunk body line (e.g. the next file's header in a
                 # concatenated diff) — end of this hunk.

@@ -154,9 +154,12 @@ def run_turn(thread_id: str, turn_id: str) -> None:
                      "aggregatedOutput": "hi\n", "exitCode": 0,
                      "status": "completed"},
         })
+        # kind is a TAGGED OBJECT in the v2 schema (PatchChangeKind).
         changes = [
-            {"path": "/tmp/fake_a.txt", "kind": "update", "diff": "-a\n+b\n"},
-            {"path": "/tmp/fake_b.txt", "kind": "add", "diff": "+new\n"},
+            {"path": "/tmp/fake_a.txt", "kind": {"type": "update"},
+             "diff": "-a\n+b\n"},
+            {"path": "/tmp/fake_b.txt", "kind": {"type": "add"},
+             "diff": "+new\n"},
         ]
         notify("item/started", {
             "threadId": thread_id, "turnId": turn_id,
@@ -177,7 +180,9 @@ def run_turn(thread_id: str, turn_id: str) -> None:
         notify("item/completed", {
             "threadId": thread_id, "turnId": turn_id,
             "item": {"id": "t1", "type": "mcpToolCall", "server": "nerve",
-                     "tool": "memorize", "result": "Memorized: x",
+                     "tool": "memorize",
+                     "result": {"content": [{"type": "text",
+                                             "text": "Memorized: x"}]},
                      "status": "completed"},
         })
 

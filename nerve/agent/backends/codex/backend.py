@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -189,9 +190,15 @@ class CodexBackend:
                 overrides.append(f"{key}={value}")
         return overrides
 
-    @staticmethod
-    def _translate_mcp_server(srv: Any) -> list[str]:
+    _TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    @classmethod
+    def _translate_mcp_server(cls, srv: Any) -> list[str]:
         """Translate one nerve ``McpServerConfig`` into codex overrides."""
+        if not cls._TOML_KEY_RE.match(str(srv.name)):
+            raise ValueError(
+                f"server name {srv.name!r} is not a bare TOML key segment"
+            )
         base = f"mcp_servers.{srv.name}"
         out: list[str] = []
         command = getattr(srv, "command", None)
@@ -204,6 +211,8 @@ class CodexBackend:
                 out.append(f"{base}.args=[{arr}]")
             env = getattr(srv, "env", None) or {}
             for k, v in env.items():
+                if not cls._TOML_KEY_RE.match(str(k)):
+                    raise ValueError(f"env key {k!r} is not a bare TOML key")
                 out.append(f"{base}.env.{k}={_toml_str(str(v))}")
         elif url:
             out.append(f"{base}.url={_toml_str(url)}")
@@ -367,6 +376,7 @@ class CodexClient(AgentClient):
         if not self._thread_id:
             raise BackendError("codex client has no thread")
         self._turn_usage = None
+        self._last_error = None
         self._items.clear()
         # Drain notifications that straggled in after the previous turn
         # (late tokenUsage updates etc.) so they can't bleed into this one.
@@ -449,7 +459,10 @@ class CodexClient(AgentClient):
         regardless of status (completed / interrupted / failed) so the
         /stop flow's graceful wait works.
         """
-        idle_timeout = self._spec.idle_timeout
+        idle_timeout = (
+            float(self._backend.codex.turn_idle_timeout_seconds)
+            or self._spec.idle_timeout
+        )
         # The thread model is serving this turn — surface it for
         # serving-model tracking (parity with AssistantMessage.model).
         yield ev.ModelObserved(model=self.model)
@@ -527,10 +540,7 @@ class CodexClient(AgentClient):
                     self._context_window = window
 
         elif method == "model/rerouted":
-            new_model = (
-                params.get("model") or params.get("toModel")
-                or params.get("to")
-            )
+            new_model = params.get("toModel") or params.get("model")
             if new_model:
                 self.model = str(new_model)
                 out.append(ev.ModelObserved(model=self.model))
@@ -539,7 +549,13 @@ class CodexClient(AgentClient):
             out.append(ev.SystemEvent(subtype="codex_plan", data=params))
 
         elif method == "turn/completed":
-            out.append(self._map_turn_completed(params))
+            turn_id = ((params.get("turn") or {}).get("id"))
+            if turn_id and self._turn_id and str(turn_id) != self._turn_id:
+                logger.debug(
+                    "codex: dropping stale turn/completed for %s", turn_id,
+                )
+            else:
+                out.append(self._map_turn_completed(params))
 
         elif method == "error":
             message = self._error_message(params)
@@ -621,7 +637,7 @@ class CodexClient(AgentClient):
                     name="Edit",
                     input={
                         "file_path": path,
-                        "kind": change.get("kind"),
+                        "kind": self._change_kind(change) or None,
                     },
                 ))
         elif item_type == "mcpToolCall":
@@ -636,7 +652,7 @@ class CodexClient(AgentClient):
                 name="WebSearch",
                 input={"query": item.get("query", "")},
             ))
-        elif item_type in ("plan", "planUpdate", "todoList"):
+        elif "plan" in item_type.lower() or "todo" in item_type.lower():
             out.append(ev.SystemEvent(subtype="codex_plan", data=item))
         # agentMessage/reasoning items stream via their delta
         # notifications; nothing to emit at start.
@@ -673,7 +689,7 @@ class CodexClient(AgentClient):
                 diff = str(change.get("diff") or "")
                 out.append(ev.ToolResult(
                     tool_use_id=self._change_id(item_id, n),
-                    content=diff or f"({change.get('kind') or 'change'} applied)",
+                    content=diff or f"({self._change_kind(change) or 'change'} applied)",
                     is_error=failed,
                 ))
         elif item_type == "mcpToolCall":
@@ -716,7 +732,7 @@ class CodexClient(AgentClient):
             return  # already captured this session
         from nerve.agent.interactive import _read_file_safe
 
-        kind = str(change.get("kind") or "").lower()
+        kind = self._change_kind(change).lower()
         content: str | None
         if kind == "add":
             content = None  # new file — no pre-image
@@ -797,6 +813,16 @@ class CodexClient(AgentClient):
         return str(command or "")
 
     @staticmethod
+    def _change_kind(change: dict) -> str:
+        """``FileUpdateChange.kind`` is a tagged object ``{"type": "add" |
+        "delete" | "update"}`` in the v2 schema — normalize to the string
+        (tolerating legacy/plain-string shapes)."""
+        kind = change.get("kind")
+        if isinstance(kind, dict):
+            kind = kind.get("type")
+        return str(kind or "")
+
+    @staticmethod
     def _changes(item: dict) -> list[dict]:
         changes = item.get("changes")
         if isinstance(changes, list):
@@ -831,32 +857,37 @@ class CodexClient(AgentClient):
     # -- approvals (server-initiated requests) ---------------------------- #
 
     async def _handle_server_request(self, method: str, params: dict) -> dict:
-        if method in (
-            "item/commandExecution/requestApproval",
-            "execCommandApproval",
-        ):
+        if method == "item/commandExecution/requestApproval":
             return await self._approval(
                 "command_approval", self._approval_payload(params),
             )
-        if method in ("item/fileChange/requestApproval", "applyPatchApproval"):
+        if method == "item/fileChange/requestApproval":
             return await self._approval(
                 "file_approval", self._approval_payload(params),
             )
         if method == "item/permissions/requestApproval":
-            return await self._approval(
-                "permission_approval", self._approval_payload(params),
-            )
-        if method == "item/tool/requestUserInput":
-            # v1: nerve's ask_user covers interactive questions; decline
-            # tool-level input requests explicitly (docs plan §7).
+            # The response type requires a constructed GrantedPermissionProfile
+            # — there is no decline variant to express. Unsupported in v1
+            # (docs plan §14): raising here makes the transport answer with
+            # a JSON-RPC error, which codex treats as not-granted and
+            # continues sandboxed. Surfaced to the log so the operator
+            # knows a grant was requested.
             logger.warning(
-                "codex requested tool user input — declining (unsupported): %s",
-                str(params)[:200],
+                "codex requested a permission grant — unsupported (v1), "
+                "denied via JSON-RPC error: %s", str(params)[:200],
             )
-            return {}
+            raise BackendError("permission grants are not supported by nerve v1")
+        if method == "item/tool/requestUserInput":
+            # v1: nerve's ask_user covers interactive questions; answer
+            # the (experimental) request with an empty answer set.
+            logger.warning(
+                "codex requested tool user input — returning no answers "
+                "(unsupported): %s", str(params)[:200],
+            )
+            return {"answers": {}}
         if method == "mcpServer/elicitation/request":
             logger.warning("codex MCP elicitation declined (unsupported)")
-            return {}
+            return {"action": "decline"}
 
         if method.endswith("requestApproval") or method.endswith("Approval"):
             logger.warning(

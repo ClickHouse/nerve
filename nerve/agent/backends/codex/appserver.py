@@ -41,8 +41,8 @@ _OPT_OUT_NOTIFICATIONS = [
     "thread/realtime/itemAdded",
     "thread/realtime/outputAudio/delta",
     "thread/realtime/sdp",
-    "thread/realtime/transcriptDelta",
-    "thread/realtime/transcriptDone",
+    "thread/realtime/transcript/delta",
+    "thread/realtime/transcript/done",
     "fuzzyFileSearch/sessionUpdated",
     "fuzzyFileSearch/sessionCompleted",
 ]

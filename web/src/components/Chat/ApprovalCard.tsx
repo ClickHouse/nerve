@@ -16,7 +16,13 @@ const APPROVAL_TYPES = new Set(['command_approval', 'file_approval', 'permission
 
 interface ChangeEntry {
   path?: string;
-  kind?: string;
+  // PatchChangeKind: tagged object in the v2 protocol; legacy strings tolerated.
+  kind?: string | { type?: string };
+}
+
+function kindLabel(kind: ChangeEntry['kind']): string {
+  if (kind && typeof kind === 'object') return kind.type || 'edit';
+  return kind || 'edit';
 }
 
 export function ApprovalCard() {
@@ -71,7 +77,7 @@ export function ApprovalCard() {
           <ul className="text-[12px] font-mono space-y-0.5">
             {changes.map((c, i) => (
               <li key={i} className="text-text-secondary">
-                <span className="text-hue-orange mr-1.5">{c.kind || 'edit'}</span>
+                <span className="text-hue-orange mr-1.5">{kindLabel(c.kind)}</span>
                 {c.path}
               </li>
             ))}

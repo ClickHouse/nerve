@@ -150,7 +150,7 @@ class AgentConfig:
     # Effort for cron- and hook-sourced turns (sensing / triage work). These
     # fire far more often than interactive sessions and rarely need Opus-tier
     # deliberation, so they default lower than `effort` above to cut token
-    # spend. Applied in engine._build_options when source is "cron" or "hook";
+    # spend. Applied by the claude backend when source is "cron" or "hook";
     # interactive sources (web, telegram, wakeup) keep the full `effort`.
     cron_effort: str = "medium"  # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
@@ -908,6 +908,16 @@ class ExternalAgentsConfig:
         )
 
 
+def _lenient_int(value: Any, default: int) -> int:
+    """Best-effort int coercion — malformed inactive config must not
+    brick startup (validate() reports problems when the section is live)."""
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-integer config value %r", value)
+        return default
+
+
 _CODEX_APPROVAL_POLICIES = ("never", "on-request", "untrusted")
 _CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
@@ -959,10 +969,19 @@ class CodexConfig:
         raw_pricing = d.get("pricing") or {}
         if isinstance(raw_pricing, dict):
             for model_key, prices in raw_pricing.items():
-                if isinstance(prices, dict):
+                if not isinstance(prices, dict):
+                    continue
+                try:
                     pricing[str(model_key)] = {
                         str(k): float(v) for k, v in prices.items()
                     }
+                except (TypeError, ValueError):
+                    # Lenient here so a malformed INACTIVE codex section
+                    # can't brick startup; the entry is dropped (cost
+                    # records None) and flagged.
+                    logger.warning(
+                        "Ignoring malformed codex.pricing entry %r", model_key,
+                    )
         effort_map = {
             "max": "xhigh", "xhigh": "xhigh", "high": "high",
             "medium": "medium", "low": "low",
@@ -982,8 +1001,10 @@ class CodexConfig:
             approval_policy=str(d.get("approval_policy", "never")),
             effort_map=effort_map,
             web_search=bool(d.get("web_search", True)),
-            tool_timeout_sec=int(d.get("tool_timeout_sec", 3600)),
-            turn_idle_timeout_seconds=int(d.get("turn_idle_timeout_seconds", 0)),
+            tool_timeout_sec=_lenient_int(d.get("tool_timeout_sec"), 3600),
+            turn_idle_timeout_seconds=_lenient_int(
+                d.get("turn_idle_timeout_seconds"), 0,
+            ),
             pricing=pricing,
             extra_config=dict(d.get("extra_config") or {}),
         )

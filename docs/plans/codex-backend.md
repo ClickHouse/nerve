@@ -626,6 +626,15 @@ code where the fallback goes).
 ## 14. Out of scope (v1) — explicit non-parity list
 
 - Langfuse tracing for codex turns (usage rows + audit only).
+- **Permission grants** (`item/permissions/requestApproval`): the response
+  type requires a constructed `GrantedPermissionProfile` with no decline
+  variant — nerve answers with a JSON-RPC error, which codex treats as
+  not-granted and continues sandboxed (logged). Command and file-change
+  approvals ARE supported.
+- Concurrent approval cards: the web UI holds one pending interaction at
+  a time (pre-existing store design); a second simultaneous approval
+  (possible under `untrusted`) waits server-side until the first resolves
+  or times out.
 - Claude Code plugin MCPs on codex (plugin lifecycle is claude-CLI-owned).
 - PDF/document inputs on codex (inline note to the model instead of silent drop).
 - Dynamic client-registered tools over app-server; `turn/steer`; `thread/rollback`;
@@ -720,3 +729,37 @@ real app-server + OpenAI API key):**
 - Not exercised live: `mcp_servers.nerve` override effectiveness (smoke
   runs without a gateway; asserted against the fake's argv mirror — the
   first real nerve-session turn will confirm tool calls land).
+
+**Adversarial review round 2 (2026-07-10, post-implementation subagent
+review of the full branch — 3 MAJOR / 9 MINOR / 4 NIT, all addressed or
+descoped explicitly):**
+
+- MAJOR: the Claude generic-error path lost the early-captured resume id
+  (crashed turns restarted conversations). Fixed: the exception handler
+  now pulls `client.native_session_id` (like the cancel path) — EXCEPT
+  for poisoned contexts, which must start fresh (the pre-refactor code
+  re-persisted the poisoned id there; deliberately not preserved).
+- MAJOR: `FileUpdateChange.kind` is a tagged object (`{"type": "add"}`)
+  in the v2 schema, not a string. Fixed via `_change_kind` normalization;
+  the fake app-server + tests now emit the schema shape; ApprovalCard
+  renders both shapes.
+- MAJOR: `item/permissions/requestApproval` reply shape was invalid —
+  descoped to a JSON-RPC-error denial (see §14).
+- MINOR fixes: `resume_dropped` no longer un-done by `mark_active`
+  (stale local id dropped; engine-level regression test added);
+  elicitation → `{"action": "decline"}` and requestUserInput →
+  `{"answers": {}}` (schema-correct); legacy execCommandApproval/
+  applyPatchApproval aliases removed (nerve never opts into the legacy
+  API); late `turn/completed` now scoped by turn id; CRLF files
+  round-trip through the reverse-diff; malformed INACTIVE codex config
+  can no longer brick startup (lenient coercion + warnings);
+  `codex.turn_idle_timeout_seconds` actually wired; `model/rerouted`
+  reads `toModel` (the real field); realtime opt-out method names
+  corrected; `_last_error` reset per turn; MCP server names validated as
+  TOML key segments.
+- Plan corrections (was overclaiming): ollama+codex is a load-time
+  WARNING, not an error (the hazard is per-model, guarded by the claude
+  path's ollama routing); `codex/protocol.py` was folded into
+  `backend.py`; `tests/test_backend_events.py` coverage lives in
+  test_engine.py/test_autonomous_turns.py; v038 has no dedicated
+  migration test (covered by the schema-version suite).

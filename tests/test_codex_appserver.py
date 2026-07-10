@@ -184,6 +184,8 @@ async def test_tools_map_to_claude_vocabulary(tmp_path, monkeypatch):
         assert {u.input["file_path"] for u in edits} == {
             "/tmp/fake_a.txt", "/tmp/fake_b.txt",
         }
+        # PatchChangeKind objects normalize to plain strings.
+        assert {u.input["kind"] for u in edits} == {"update", "add"}
         edit_ids = {u.tool_use_id for u in edits}
         edit_results = [r for r in results if r.tool_use_id in edit_ids]
         assert len(edit_results) == 2

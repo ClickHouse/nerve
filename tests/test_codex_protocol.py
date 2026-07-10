@@ -66,7 +66,11 @@ async def test_stale_turn_usage_is_scoped(tmp_path):
 @pytest.mark.asyncio
 async def test_model_rerouted_updates_serving_model(tmp_path):
     client = _client(tmp_path)
-    events = await client._map_notification("model/rerouted", {"model": "gpt-5.6-terra"})
+    # Schema shape: {fromModel, toModel, reason, threadId, turnId}
+    events = await client._map_notification("model/rerouted", {
+        "fromModel": "gpt-5.6-sol", "toModel": "gpt-5.6-terra",
+        "threadId": "t", "turnId": "x", "reason": "capacity",
+    })
     assert events == [ev.ModelObserved(model="gpt-5.6-terra")]
     done = client._map_turn_completed({"turn": {"id": "x", "status": "completed"}})
     assert done.model == "gpt-5.6-terra"

@@ -53,3 +53,10 @@ def test_git_style_headers_are_tolerated():
         + _diff(before, after)
     )
     assert reverse_apply_unified_diff(diff, after) == before
+
+
+def test_crlf_files_round_trip_with_correct_terminators():
+    before = "aaa\r\nbbb\r\nccc\r\n"
+    after = "aaa\r\nBBB\r\nccc\r\n"
+    diff = _diff(before, after)
+    assert reverse_apply_unified_diff(diff, after) == before

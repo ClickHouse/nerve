@@ -36,20 +36,6 @@ class TransportDiedError(BackendError):
     """The backend subprocess/stream died mid-operation."""
 
 
-class ResumeDroppedError(BackendError):
-    """The stored native session id could not be resumed.
-
-    Raised (or reported) by ``create_client`` after it has already
-    recovered by starting a fresh native session — the engine must clear
-    the persisted ``sdk_session_id``. Carries the live client so no work
-    is lost.
-    """
-
-    def __init__(self, message: str, client: "AgentClient | None" = None):
-        super().__init__(message)
-        self.client = client
-
-
 @dataclass
 class TurnInput:
     """One user turn, engine-normalized.
@@ -133,12 +119,21 @@ class AgentClient(Protocol):
 
     # -- autonomous/idle stream (only when supports_idle_stream) ------- #
 
-    def try_receive_idle_event(self) -> AgentEvent | None:
-        """Non-parking probe of the between-turns stream (None = empty)."""
+    def try_receive_idle_events(self) -> "list[AgentEvent] | None":
+        """Non-parking probe of the between-turns stream.
+
+        One native message's translated events, ``[]`` for skip-and-
+        continue payloads, ``None`` when nothing is buffered or the
+        stream is closed.
+        """
         ...
 
-    async def receive_idle_event(self, timeout: float) -> AgentEvent | None:
-        """Park up to ``timeout`` seconds for a between-turns event."""
+    async def receive_idle_events(
+        self, timeout: "float | None",
+    ) -> "list[AgentEvent] | None":
+        """Park up to ``timeout`` seconds for the next between-turns
+        message; raises ``asyncio.TimeoutError`` on expiry, returns
+        ``None`` when the stream ended."""
         ...
 
     def buffer_used(self) -> int:
@@ -157,9 +152,13 @@ class AgentBackend(Protocol):
         ...
 
     async def create_client(self, spec: SessionSpec) -> AgentClient:
-        """Build and connect a client. May raise :class:`ResumeDroppedError`
-        (carrying the recovered client) when a stale resume target had to
-        be discarded."""
+        """Build and connect a client.
+
+        When a stale resume target had to be discarded (the backend
+        recovered by starting a fresh native session), the returned
+        client exposes ``resume_dropped == True`` and the engine clears
+        the persisted ``sdk_session_id``.
+        """
         ...
 
     def validate_resume_target(self, native_id: str, cwd: str) -> bool:

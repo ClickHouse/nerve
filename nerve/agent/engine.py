@@ -1145,11 +1145,13 @@ class AgentEngine:
             client = await backend.create_client(spec)
             if getattr(client, "resume_dropped", False):
                 # The backend had to discard the stale native id (codex
-                # resume-miss recovery) — clear the persisted column; the
-                # fresh id is re-persisted at turn end.
+                # resume-miss recovery) — clear the persisted column AND
+                # the local variable (mark_active below would otherwise
+                # re-persist the stale id); the fresh id lands at turn end.
                 await self.db.update_session_fields(
                     session_id, {"sdk_session_id": None},
                 )
+                sdk_resume_id = None
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
 
@@ -2385,6 +2387,18 @@ class AgentEngine:
                 "Could not process image" in err_str
                 or "Could not process document" in err_str
             )
+            # Preserve resumability on crashed turns (parity with the old
+            # any-message early capture): the terminal event never arrived,
+            # so pull the native id off the live client. _finalize_turn's
+            # mark_active then restores it after mark_error's clear.
+            # Poisoned contexts are the exception — they MUST start fresh
+            # (the old code re-persisted the poisoned id here; fixed).
+            if not is_poisoned and not st.sdk_session_id:
+                _live = self.sessions.get_client(session_id)
+                if _live is not None:
+                    with contextlib.suppress(Exception):
+                        st.sdk_session_id = _live.native_session_id
+
             if is_poisoned:
                 logger.warning(
                     "Poisoned context detected for session %s: %s — "
