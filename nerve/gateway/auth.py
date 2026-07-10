@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
+# Audience claim on session-bound MCP tokens (see create_mcp_session_token).
+MCP_AUDIENCE = "nerve-mcp"
+# Claim carrying the bound nerve session id on MCP tokens.
+MCP_SESSION_CLAIM = "nerve_session_id"
+
 
 def verify_password(plain: str, hashed: str) -> bool:
     """Verify a plaintext password against a bcrypt hash."""
@@ -35,10 +40,41 @@ def create_token(jwt_secret: str) -> str:
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
 
 
-def decode_token(token: str, jwt_secret: str) -> dict:
-    """Decode and validate a JWT token."""
+def create_mcp_session_token(jwt_secret: str, session_id: str) -> str:
+    """Mint a session-bound MCP token for a backend-managed agent process.
+
+    Carries ``aud=nerve-mcp`` + the bound session id so the external MCP
+    endpoint attributes every tool call to the real engine session
+    (instead of a satellite). Deliberately **no ``exp``**: the token
+    lives only in the spawned agent subprocess's environment, the bound
+    session under steady traffic is never idle-swept (a 24h expiry would
+    401 mid-conversation), and revocation is the same as for every other
+    nerve token — rotate ``auth.jwt_secret``.
+    """
+    payload = {
+        "iat": datetime.now(timezone.utc),
+        "sub": "backend-agent",
+        "aud": MCP_AUDIENCE,
+        MCP_SESSION_CLAIM: session_id,
+    }
+    return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def decode_token(
+    token: str, jwt_secret: str, audience: str | None = None,
+) -> dict:
+    """Decode and validate a JWT token.
+
+    ``audience=None`` (the default) accepts only aud-less tokens — PyJWT
+    rejects any token carrying an ``aud`` claim unless the caller
+    verifies it, so audience-scoped tokens (MCP session tokens) never
+    pass ordinary web-UI auth by accident. Callers that accept scoped
+    tokens pass the expected ``audience`` explicitly.
+    """
     try:
-        return jwt.decode(token, jwt_secret, algorithms=[JWT_ALGORITHM])
+        return jwt.decode(
+            token, jwt_secret, algorithms=[JWT_ALGORITHM], audience=audience,
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:

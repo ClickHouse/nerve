@@ -4,6 +4,7 @@ import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
 import { ChatInput } from '../components/Chat/ChatInput';
+import { ApprovalCard } from '../components/Chat/ApprovalCard';
 import { ContextBar } from '../components/Chat/ContextBar';
 import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
@@ -270,6 +271,8 @@ export function ChatPage() {
           </div>
 
           <TodoPanel todos={currentTodos} ccTasks={currentCCTasks} />
+
+          <ApprovalCard />
 
           <ChatInput
             onSend={sendMessage}

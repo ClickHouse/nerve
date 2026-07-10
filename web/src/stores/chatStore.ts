@@ -117,7 +117,7 @@ interface ChatState {
   // Pending interactive tool (AskUserQuestion, ExitPlanMode, etc.)
   pendingInteraction: {
     interactionId: string;
-    interactionType: 'question' | 'plan_exit' | 'plan_enter';
+    interactionType: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval';
     toolName: string;
     toolInput: Record<string, unknown>;
   } | null;

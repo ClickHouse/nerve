@@ -1,8 +1,12 @@
-"""Agent engine — Claude Agent SDK wrapper.
+"""Agent engine — backend-agnostic agent orchestration.
 
-Orchestrates SDK clients and delegates all session state to SessionManager.
-The SDK handles context management and compaction internally.
-Sessions are resumable across server restarts via SDK's --resume flag.
+Orchestrates per-session agent clients (Claude Agent SDK, OpenAI Codex
+app-server — see :mod:`nerve.agent.backends`) and delegates all session
+state to SessionManager. The engine consumes only normalized
+:mod:`nerve.agent.backends.events`; every runtime-specific type stays
+inside its backend module. Sessions are resumable across server restarts
+via each backend's native resume mechanism, routed by the sticky
+``sessions.backend`` column (docs/plans/codex-backend.md §3).
 """
 
 from __future__ import annotations
@@ -13,28 +17,28 @@ import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import anyio
-
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    SystemMessage,
-    UserMessage,
-    TextBlock,
-    ToolUseBlock,
-    ToolResultBlock,
+from nerve.agent.backends import (
+    AgentBackend,
+    AgentClient,
+    BackendDeps,
+    ModelObserved,
+    SessionSpec,
+    SubagentStarted,
+    SystemEvent,
+    TextDelta,
+    ThinkingDelta,
+    ToolResult,
+    ToolUse,
+    TransportDiedError,
+    TurnCompleted,
+    TurnInput,
+    build_backends,
 )
-from claude_agent_sdk._errors import CLIConnectionError
-from claude_agent_sdk.types import HookMatcher, HookJSONOutput, HookContext
-
-from nerve.agent.cache_policy import cache_ttl_env, resolve_cache_ttl
+from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
     register_handler,
@@ -52,7 +56,6 @@ from nerve.agent.tools import (
     ToolContext,
     ToolRegistry,
     build_default_registry,
-    build_session_mcp_server,
 )
 # Legacy back-compat: ``init_tools`` populates ``nerve.agent.tools``'s
 # module globals so test fixtures that patch them and the shared
@@ -67,152 +70,8 @@ from nerve.skills.manager import SkillManager
 
 logger = logging.getLogger(__name__)
 
-try:
-    from claude_agent_sdk import ThinkingBlock
-except ImportError:
-    ThinkingBlock = None
-
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
-
-# Anthropic API image limits
-_MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
-# Linux execve() limits a single argv element to MAX_ARG_STRLEN = PAGE_SIZE * 32
-# = 131,072 bytes on common configurations. The Claude Agent SDK passes the
-# system prompt inline as `--system-prompt <STRING>`, which makes the string a
-# single argv element. When SOUL.md + TASK.md + AGENTS.md + TOOLS.md +
-# MEMORY.md + recalled memU summaries cross that boundary, execve() returns
-# E2BIG ("Argument list too long") and Claude Code fails to start.
-#
-# We sidestep the limit by writing the prompt to a file and passing
-# `SystemPromptFile = {"type": "file", "path": ...}` (which the SDK converts
-# to `--system-prompt-file <PATH>` — the path string is short).
-#
-# Threshold below which we keep passing inline (preserves prompt-cache hit
-# behavior for small, stable prompts). Set conservatively well under the
-# kernel limit to leave room for env/argv overhead.
-_SYSTEM_PROMPT_INLINE_MAX = 100_000  # bytes
-
-# Magic byte signatures for supported image formats.
-# Each format maps to a list of valid signatures.  A signature is a list
-# of (magic_bytes, offset) pairs that must ALL match (AND logic).
-_IMAGE_MAGIC: dict[str, list[list[tuple[bytes, int]]]] = {
-    ".png":  [[(b"\x89PNG\r\n\x1a\n", 0)]],
-    ".jpg":  [[(b"\xff\xd8\xff", 0)]],
-    ".jpeg": [[(b"\xff\xd8\xff", 0)]],
-    ".gif":  [[(b"GIF87a", 0)], [(b"GIF89a", 0)]],
-    # WebP is RIFF container: must have RIFF at 0 AND WEBP at 8
-    ".webp": [[(b"RIFF", 0), (b"WEBP", 8)]],
-}
-
-
-def _validate_image_file(file_path: str) -> str | None:
-    """Validate that a file with an image extension contains actual image data.
-
-    Returns None if valid, or an error string describing the problem.
-    This prevents the CLI from base64-encoding non-image files (e.g. HTML
-    redirect pages saved with a .png extension) and poisoning the
-    conversation context with an unprocessable image block.
-    """
-    from pathlib import Path
-
-    ext = Path(file_path).suffix.lower()
-    if ext not in _IMAGE_EXTENSIONS:
-        return None  # Not an image — nothing to validate
-
-    try:
-        size = os.path.getsize(file_path)
-    except OSError:
-        return None  # Let the Read tool handle missing files
-
-    if size == 0:
-        return f"Image file is empty (0 bytes): {file_path}"
-
-    if size > _MAX_IMAGE_BYTES:
-        size_mb = size / (1024 * 1024)
-        return (
-            f"Image file too large ({size_mb:.1f} MB > 5 MB API limit): {file_path}. "
-            f"The Anthropic API rejects images larger than 5 MB."
-        )
-
-    # Check magic bytes
-    magic_specs = _IMAGE_MAGIC.get(ext, [])
-    if not magic_specs:
-        return None  # No magic spec — let it through
-
-    try:
-        with open(file_path, "rb") as f:
-            header = f.read(16)
-    except OSError:
-        return None  # Let the Read tool handle I/O errors
-
-    # Each signature is a list of (bytes, offset) pairs — ALL must match.
-    # Multiple signatures per format are OR'd (e.g. GIF87a vs GIF89a).
-    for signature in magic_specs:
-        if all(
-            header[off: off + len(magic)] == magic
-            for magic, off in signature
-        ):
-            return None  # Valid magic — good to go
-
-    # None of the magic signatures matched
-    # Check if it's actually HTML (common when auth fails on image URLs)
-    is_html = header.lstrip()[:5].lower() in (b"<!doc", b"<html", b"<?xml")
-    hint = (
-        " The file appears to contain HTML — it may be a redirect or error page "
-        "downloaded instead of the actual image."
-        if is_html
-        else " The file header does not match any supported image format "
-        "(JPEG, PNG, GIF, WebP)."
-    )
-    return (
-        f"File {file_path} has {ext} extension but does not contain valid image data.{hint} "
-        f"Reading this file would poison the conversation with an unprocessable image block."
-    )
-
-
-def _validate_image_data(data_b64: str, media_type: str) -> str | None:
-    """Validate base64-encoded image data before sending to the API.
-
-    Returns None if valid, or an error string describing the problem.
-    Used for images entering through Nerve's own pipeline (Telegram, etc).
-    """
-    import base64
-
-    try:
-        raw = base64.b64decode(data_b64[:64])  # Only need first bytes
-    except Exception:
-        return f"Invalid base64 encoding for {media_type} image"
-
-    if len(raw) < 4:
-        return f"Image data too small ({len(raw)} bytes) for {media_type}"
-
-    # Map media_type to extension for magic check
-    type_to_ext = {
-        "image/png": ".png",
-        "image/jpeg": ".jpg",
-        "image/gif": ".gif",
-        "image/webp": ".webp",
-    }
-    ext = type_to_ext.get(media_type)
-    if not ext:
-        return None  # Unknown type — let the API decide
-
-    magic_specs = _IMAGE_MAGIC.get(ext, [])
-    for signature in magic_specs:
-        if all(
-            raw[off: off + len(magic)] == magic
-            for magic, off in signature
-        ):
-            return None  # Valid
-
-    return (
-        f"Image data does not match declared type {media_type}. "
-        f"The file header bytes do not contain a valid {ext.upper().strip('.')} signature."
-    )
-
 
 def _sanitize_surrogates(s: str) -> str:
     """Remove orphaned UTF-16 surrogates that break JSON serialization.
@@ -390,6 +249,24 @@ class AgentEngine:
         # up the reference from here.
         self.notification_service: Any = None
 
+        # Agent backends (claude / codex). Constructed once; resolved per
+        # session by the STICKY rule (stored sessions.backend first, then
+        # config) — see _backend_for. ``_session_backends`` mirrors the
+        # live client's backend for hot paths (finalize, idle watcher).
+        self._backends: dict[str, AgentBackend] = build_backends(
+            BackendDeps(
+                config=self.config,
+                db=self.db,
+                registry=self.registry,
+                tool_ctx_factory=self._build_tool_context,
+                external_mcp_servers=lambda: self._mcp_servers_cache,
+                claude_plugins=lambda: self._claude_code_plugins,
+                gateway_port=self._gateway_port,
+                mint_session_token=self._mint_mcp_session_token,
+            )
+        )
+        self._session_backends: dict[str, str] = {}
+
     def set_notification_service(self, service: Any) -> None:
         """Install the notification service used by per-session ``ToolContext``.
 
@@ -401,6 +278,106 @@ class AgentEngine:
     def get_active_channel(self, session_id: str) -> str | None:
         """Return the channel name currently driving ``session_id`` (or None)."""
         return self._active_channel.get(session_id)
+
+    # ------------------------------------------------------------------ #
+    #  Backend resolution (sticky per session)                            #
+    # ------------------------------------------------------------------ #
+
+    def _build_tool_context(self, session_id: str) -> ToolContext:
+        """Fresh per-session ToolContext for backend MCP servers."""
+        return ToolContext(
+            session_id=session_id,
+            workspace=self.config.workspace,
+            db=self.db,
+            memory_bridge=self._memory_bridge,
+            xmemory_bridge=self._xmemory_bridge,
+            config=self.config,
+            skill_manager=self._skill_manager,
+            engine=self,
+            notification_service=self.notification_service,
+        )
+
+    def _gateway_port(self) -> int | None:
+        """Gateway port for the loopback MCP bridge (codex tool access)."""
+        if not self.config.mcp_endpoint.enabled:
+            return None
+        return int(self.config.gateway.port)
+
+    def _mint_mcp_session_token(self, session_id: str) -> str:
+        """Session-bound bearer token for a backend-managed agent process."""
+        from nerve.gateway.auth import create_mcp_session_token
+
+        if not self.config.auth.jwt_secret:
+            return ""  # dev mode — endpoint accepts unauthenticated calls
+        return create_mcp_session_token(self.config.auth.jwt_secret, session_id)
+
+    def _backend_for(self, session: dict | None, source: str) -> AgentBackend:
+        """Resolve the backend for a session — STICKY on the stored column.
+
+        1. ``sessions.backend`` set → that backend, always. Wakeup /
+           internal / cron-fired turns on an existing session can never
+           cross backends, no matter what the config says now (a stored
+           native session id is meaningless on another runtime).
+        2. New sessions: metadata ``backend_override`` (per-session A/B
+           hook) → config (``agent.cron_backend`` for cron/hook sources,
+           ``agent.backend`` otherwise).
+        """
+        stored = (session or {}).get("backend")
+        name = str(stored) if stored else ""
+        if not name:
+            try:
+                meta = json.loads((session or {}).get("metadata") or "{}")
+            except (TypeError, ValueError):
+                meta = {}
+            override = meta.get("backend_override")
+            if override:
+                name = str(override).strip().lower()
+        if not name:
+            if source in self._CRON_EFFORT_SOURCES:
+                name = self.config.agent.resolved_cron_backend
+            else:
+                name = self.config.agent.backend
+        backend = self._backends.get(name)
+        if backend is None:
+            raise RuntimeError(
+                f"Session requires backend {name!r} which is not available "
+                f"(known: {sorted(self._backends)}). Restore the backend "
+                "config or start a new session."
+            )
+        return backend
+
+    def _backend_for_live_session(self, session_id: str) -> AgentBackend:
+        """Backend of the session's live client (defaults to claude)."""
+        name = self._session_backends.get(session_id, "claude")
+        return self._backends.get(name) or self._backends["claude"]
+
+    def _collect_skill_summaries(self) -> list[dict] | None:
+        """Skill summaries for the system prompt (moved from _build_options).
+
+        Sorted for deterministic system-prompt bytes — scan order varies
+        across restarts, and a reordered skill list would silently
+        invalidate every session's prompt cache after a restart.
+        """
+        if not self._skill_manager:
+            return None
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                summaries = []
+                for sid, meta in sorted(self._skill_manager._cache.items()):
+                    if meta.enabled and meta.model_invocable:
+                        summaries.append({
+                            "id": meta.id,
+                            "name": meta.name,
+                            "description": meta.description,
+                        })
+                return summaries
+            return loop.run_until_complete(
+                self._skill_manager.get_enabled_summaries()
+            )
+        except Exception as e:
+            logger.warning("Failed to get skill summaries: %s", e)
+            return None
 
     async def initialize(self) -> None:
         """Initialize the agent engine — set up tools and main session."""
@@ -590,74 +567,17 @@ class AgentEngine:
 
     @staticmethod
     async def _safe_disconnect(client: Any, timeout: float = 5.0) -> None:
-        """Disconnect an SDK client without risking an event-loop spin.
+        """Tear a client down without letting teardown errors propagate.
 
-        The SDK's Query.close() cancels its anyio task group before closing
-        the transport.  If any task inside that group cannot exit promptly
-        (e.g. _read_messages stuck on process.wait(), _handle_control_request
-        writing to a dead pipe, or _message_send buffer full), the anyio
-        _deliver_cancellation callback spins at 100% CPU forever.
-
-        Strategy:
-        1. Kill the subprocess immediately (SIGKILL) so every I/O wait
-           inside the task group unblocks.
-        2. Attempt a clean disconnect() with a short timeout.
-        3. If that times out, forcibly disarm the anyio task group so
-           _deliver_cancellation has nothing left to spin on.
+        The hardened teardown logic (subprocess kill, anyio task-group
+        disarm for the Claude SDK) lives in each backend's
+        ``AgentClient.disconnect`` — this wrapper only guarantees the
+        call can't take forever or raise into engine control flow.
         """
-        # --- 1. Kill subprocess immediately ---
-        transport = getattr(
-            getattr(client, "_query", None), "transport", None,
-        )
-        proc = getattr(transport, "_process", None)
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-        # --- 2. Try a clean disconnect with a timeout ---
         try:
-            await asyncio.wait_for(client.disconnect(), timeout=timeout)
-            return
-        except asyncio.TimeoutError:
-            logger.warning(
-                "SDK client disconnect timed out after %.1fs — "
-                "force-clearing task group to stop _deliver_cancellation spin",
-                timeout,
-            )
-        except Exception:
-            pass
-
-        # --- 3. Forcibly disarm the stuck task group ---
-        query = getattr(client, "_query", None)
-        if query is None:
-            return
-        tg = getattr(query, "_tg", None)
-        if tg is None:
-            return
-
-        # Cancel the pending _deliver_cancellation handle so it stops
-        # rescheduling itself via call_soon().
-        cs = getattr(tg, "cancel_scope", None)
-        handle = getattr(cs, "_cancel_handle", None)
-        if handle is not None:
-            handle.cancel()
-            cs._cancel_handle = None
-
-        # Clear task sets so a stray _deliver_cancellation finds nothing.
-        if cs is not None:
-            cs._tasks.clear()
-        tg._tasks.clear()
-
-        # Close the transport directly (kills process, closes pipes).
-        try:
-            await asyncio.wait_for(query.transport.close(), timeout=2.0)
-        except Exception:
-            pass
-
-        client._query = None
-        client._transport = None
+            await asyncio.wait_for(client.disconnect(), timeout=timeout + 5.0)
+        except Exception as e:
+            logger.warning("Client disconnect failed: %s", e)
 
     async def shutdown(self) -> None:
         """Disconnect all persistent clients and mark sessions as idle.
@@ -951,440 +871,6 @@ class AgentEngine:
                 logger.info("Memorization sweep: %s", stats)
             return stats
 
-    # ------------------------------------------------------------------ #
-    #  SDK options                                                         #
-    # ------------------------------------------------------------------ #
-
-    def _build_options(
-        self,
-        session_id: str,
-        source: str = "web",
-        model: str | None = None,
-        recalled_memories: list[str] | None = None,
-        resume: str | None = None,
-        fork_session: bool = False,
-        can_use_tool=None,
-        cache_ttl: str = "5m",
-    ) -> ClaudeAgentOptions:
-        """Build SDK client options for a session."""
-        # Get skill summaries for system prompt injection
-        skill_summaries = None
-        if self._skill_manager:
-            try:
-                import asyncio
-                # get_enabled_summaries is a coroutine but _build_options is sync
-                # Use the running loop if available
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're in an async context — schedule and await later
-                    # For now, use cached data from the manager
-                    # Sorted for deterministic system-prompt bytes — scan
-                    # order varies across restarts, and a reordered skill
-                    # list would silently invalidate every session's prompt
-                    # cache after a restart.
-                    skill_summaries = []
-                    for sid, meta in sorted(self._skill_manager._cache.items()):
-                        if meta.enabled and meta.model_invocable:
-                            skill_summaries.append({
-                                "id": meta.id,
-                                "name": meta.name,
-                                "description": meta.description,
-                            })
-                else:
-                    skill_summaries = loop.run_until_complete(
-                        self._skill_manager.get_enabled_summaries()
-                    )
-            except Exception as e:
-                logger.warning("Failed to get skill summaries: %s", e)
-
-        system_prompt_str = build_system_prompt(
-            workspace=self.config.workspace,
-            session_id=session_id,
-            source=source,
-            timezone_name=self.config.timezone,
-            recalled_memories=recalled_memories,
-            skill_summaries=skill_summaries,
-        )
-
-        # Pass the system prompt as a file when it's large enough to risk
-        # hitting Linux's MAX_ARG_STRLEN argv-element limit. See the comment
-        # near _SYSTEM_PROMPT_INLINE_MAX at module scope. The SDK accepts
-        # `SystemPromptFile` ({"type": "file", "path": ...}) and converts it
-        # to `--system-prompt-file <PATH>` on the CLI.
-        system_prompt: str | dict[str, Any]
-        if len(system_prompt_str) > _SYSTEM_PROMPT_INLINE_MAX:
-            sp_path = self._write_system_prompt_file(session_id, system_prompt_str)
-            system_prompt = {"type": "file", "path": sp_path}
-            logger.info(
-                "Session %s: system prompt %d bytes (> %d), passing via file %s",
-                session_id[:8],
-                len(system_prompt_str),
-                _SYSTEM_PROMPT_INLINE_MAX,
-                sp_path,
-            )
-        else:
-            system_prompt = system_prompt_str
-
-        # Local Ollama models are reached through the proxy and speak the
-        # OpenAI-translated API — Anthropic-only knobs (extended thinking,
-        # effort, the context-1m beta) don't apply and may break translation,
-        # so suppress them for non-Claude models.
-        selected_model = model or self.config.agent.model
-        is_ollama_model = (
-            self.config.ollama.enabled and "claude" not in selected_model.lower()
-        )
-
-        thinking_config = (
-            None if is_ollama_model
-            else self._parse_thinking_config(self.config.agent.thinking, selected_model)
-        )
-        # Cron- and hook-sourced turns are sensing / triage work that fires
-        # far more often than interactive sessions; run them at the lower
-        # cron_effort to cut token spend. Interactive sources (web, telegram,
-        # wakeup) keep the full agent.effort.
-        base_effort = self._base_effort_for_source(
-            source, self.config.agent.effort, self.config.agent.cron_effort
-        )
-        effort = (
-            None if is_ollama_model
-            else self._effective_effort(base_effort, selected_model)
-        )
-        # Some subscriptions reject the context-1m beta for specific models
-        # (e.g. claude-sonnet-4-6) — skip the beta header for those.
-        betas = (
-            ["context-1m-2025-08-07"]
-            if not is_ollama_model and self.config.agent.context_1m_enabled_for(model)
-            else []
-        )
-
-        # Build PreToolUse (file snapshots, image validation) +
-        # PostToolUse (ScheduleWakeup capture) hooks.
-        hooks = self._build_hooks(session_id)
-
-        def _cli_stderr(line: str) -> None:
-            stripped = line.rstrip()
-            if not stripped:
-                return
-            # Filter debug-to-stderr output by severity
-            if "[ERROR]" in stripped or "[FATAL]" in stripped:
-                logger.error("CLI stderr [%s]: %s", session_id[:8], stripped)
-            elif "[WARN]" in stripped:
-                logger.warning("CLI stderr [%s]: %s", session_id[:8], stripped)
-            elif "[DEBUG]" in stripped or "[INFO]" in stripped:
-                logger.debug("CLI stderr [%s]: %s", session_id[:8], stripped)
-            else:
-                # Non-debug lines (e.g. raw warnings from the CLI)
-                logger.warning("CLI stderr [%s]: %s", session_id[:8], stripped)
-
-        extra_args: dict[str, str | None] = {"debug-to-stderr": None}
-        # Opus 4.7 defaults thinking.display to "omitted", returning empty
-        # thinking blocks with only a signature (for multi-turn continuity).
-        # Force "summarized" so the UI actually has thinking text to render.
-        # The CLI ignores this flag when thinking is disabled.
-        # NOTE: --thinking-display hangs on Bedrock (multi-turn after ToolSearch
-        # never returns). Disabled for Bedrock until the provider bug is fixed.
-        if (
-            thinking_config
-            and thinking_config.get("type") != "disabled"
-            and not self.config.provider.is_bedrock
-        ):
-            extra_args["thinking-display"] = "summarized"
-
-        return ClaudeAgentOptions(
-            model=model or self.config.agent.model,
-            system_prompt=system_prompt,
-            max_turns=self.config.agent.max_turns,
-            # No permission_mode — can_use_tool callback handles all permissions.
-            # Interactive tools pause for user input; everything else auto-approves.
-            can_use_tool=can_use_tool,
-            thinking=thinking_config,
-            effort=effort,
-            betas=betas,
-            resume=resume,
-            fork_session=fork_session,
-            hooks=hooks,
-            stderr=_cli_stderr,
-            extra_args=extra_args,
-            # No allowed_tools — can_use_tool callback handles permissions.
-            # External MCP server tools are discovered at connection time,
-            # so we can't enumerate them upfront.
-            #
-            # Remove the CLI's cron tools — Nerve has its own cron system,
-            # so exposing CronCreate/CronList/CronDelete is redundant and
-            # confusing. ``ScheduleWakeup`` stays available and is handled by
-            # Nerve's wakeup harness (capture hook + cron-service sweep); the
-            # CLI's own autonomous firing is suppressed via the
-            # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
-            disallowed_tools=["CronCreate", "CronList", "CronDelete"],
-            env=self._build_env(cache_ttl=cache_ttl),
-            cwd=str(self.config.workspace),
-            mcp_servers=self._build_mcp_servers(session_id),
-            # Claude Code plugins — loaded via --plugin-dir so the CLI
-            # handles OAuth, credentials, and plugin lifecycle natively.
-            plugins=self._claude_code_plugins,
-        )
-
-
-    def _system_prompt_dir(self) -> "os.PathLike[str]":
-        """Directory where oversized system prompts are spilled to disk.
-
-        Lives under the workspace's `.nerve/cache/system_prompts/` so it's
-        per-workspace and easy to inspect / clean.
-        """
-        from pathlib import Path
-        d = Path(self.config.workspace) / ".nerve" / "cache" / "system_prompts"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
-    def _write_system_prompt_file(self, session_id: str, content: str) -> str:
-        """Write the system prompt to disk and return its absolute path.
-
-        Uses a deterministic filename so a session that reconnects (resume)
-        gets the same prompt without re-writing. Best-effort cleanup of stale
-        files happens lazily on each write — anything older than 7 days is
-        removed.
-        """
-        import time
-        from pathlib import Path
-
-        dir_path = Path(self._system_prompt_dir())
-
-        # Lazy GC: drop files older than 7 days
-        cutoff = time.time() - 7 * 24 * 3600
-        try:
-            for old in dir_path.iterdir():
-                try:
-                    if old.is_file() and old.stat().st_mtime < cutoff:
-                        old.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
-
-        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120]
-        path = dir_path / f"{safe_id}.md"
-        path.write_text(content, encoding="utf-8")
-        return str(path)
-
-    def _build_env(self, cache_ttl: str = "5m") -> dict[str, str]:
-        """Build environment variables for the SDK subprocess."""
-        env: dict[str, str] = {}
-        # Prompt-cache TTL: the CLI natively supports the 1-hour TTL via
-        # this env var (it adds the extended-cache-ttl beta header and the
-        # cache_control ttl itself). Resolved per client build by
-        # nerve.agent.cache_policy — see that module for the policy.
-        env.update(cache_ttl_env(cache_ttl, self.config.provider.is_bedrock))
-        # Disable the CLI's built-in cron/wakeup scheduler. It fires
-        # autonomously inside the subprocess, but Nerve only reads the SDK
-        # stream during an active run() — so a fired turn lands in an unread
-        # buffer and then desyncs the next real turn. Nerve owns wakeup
-        # timing instead: a PostToolUse hook records each ScheduleWakeup and
-        # the cron service fires it via run(..., source="wakeup"). The tool
-        # itself stays available (this flag only gates the firing hook).
-        env["CLAUDE_CODE_DISABLE_CRON"] = "1"
-        if self.config.provider.is_bedrock:
-            env["CLAUDE_CODE_USE_BEDROCK"] = "1"
-            if self.config.provider.aws_region:
-                env["AWS_REGION"] = self.config.provider.aws_region
-            if self.config.provider.aws_profile:
-                env["AWS_PROFILE"] = self.config.provider.aws_profile
-            if self.config.provider.aws_access_key_id:
-                env["AWS_ACCESS_KEY_ID"] = self.config.provider.aws_access_key_id
-                env["AWS_SECRET_ACCESS_KEY"] = self.config.provider.aws_secret_access_key
-        else:
-            api_key = self.config.effective_api_key
-            if api_key:
-                env["ANTHROPIC_API_KEY"] = api_key
-            if self.config.proxy.enabled:
-                env["ANTHROPIC_BASE_URL"] = (
-                    f"http://{self.config.proxy.host}:{self.config.proxy.port}"
-                )
-        return env
-
-    def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
-        """Build the mcp_servers dict: built-in nerve + external servers from config.
-
-        Claude Code plugin MCPs are handled separately via the SDK ``plugins``
-        field which lets the CLI manage OAuth and plugin lifecycle natively.
-        """
-        # Construct a fresh ``ToolContext`` per session so every tool
-        # handler sees the correct session_id and the live collaborator
-        # references. The notification_service may still be ``None``
-        # here if a session starts before gateway startup wires it; the
-        # tools themselves degrade gracefully in that case.
-        tool_ctx = ToolContext(
-            session_id=session_id,
-            workspace=self.config.workspace,
-            db=self.db,
-            memory_bridge=self._memory_bridge,
-            xmemory_bridge=self._xmemory_bridge,
-            config=self.config,
-            skill_manager=self._skill_manager,
-            engine=self,
-            notification_service=self.notification_service,
-        )
-        include_hoa = bool(self.config.houseofagents.enabled)
-        servers: dict[str, Any] = {
-            "nerve": build_session_mcp_server(
-                self.registry, tool_ctx, include_hoa=include_hoa,
-            ),
-        }
-        for srv in self._mcp_servers_cache:
-            if srv.enabled and srv.name != "nerve":
-                try:
-                    servers[srv.name] = srv.to_sdk_config()
-                except ValueError as e:
-                    logger.warning("Skipping MCP server %r: %s", srv.name, e)
-        if len(servers) > 1:
-            logger.debug(
-                "Session %s: %d MCP servers (%s)",
-                session_id[:8], len(servers),
-                ", ".join(servers.keys()),
-            )
-        return servers
-
-    def _build_hooks(self, session_id: str) -> dict:
-        """Build SDK hooks for this session.
-
-        PreToolUse: file snapshots (Edit/Write/NotebookEdit) and image
-        validation (Read). PostToolUse: ScheduleWakeup capture, which
-        records the requested wakeup so the cron-service sweep can fire it
-        through ``engine.run(..., source="wakeup")`` (the CLI's own
-        autonomous firing is suppressed — see ``_build_env``).
-        """
-        from nerve.agent.interactive import INTERACTIVE_TOOLS, _read_file_safe
-
-        captured_files: set[str] = set()
-
-        async def _snapshot_hook(hook_input, tool_use_id, context):
-            """PreToolUse hook: capture file content before Edit/Write/NotebookEdit."""
-            tool_input = hook_input.get("tool_input", {})
-            file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
-
-            if file_path and file_path not in captured_files:
-                captured_files.add(file_path)
-                content = _read_file_safe(file_path)
-                try:
-                    await self._save_file_snapshot(session_id, file_path, content)
-                    logger.info("Captured file snapshot for %s", file_path)
-                except Exception as e:
-                    logger.warning("Failed to save file snapshot for %s: %s", file_path, e)
-
-            # Allow the tool to proceed
-            return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
-
-        async def _validate_image_hook(hook_input, tool_use_id, context):
-            """PreToolUse hook: validate image files before Read to prevent
-            poisoning the conversation with unprocessable image data.
-
-            The CLI's Read tool detects images by file extension and base64-
-            encodes them into image content blocks.  If the file isn't a valid
-            image (e.g. an HTML redirect saved as .png), the API rejects it
-            with 400 "Could not process image".  Worse, the bad block persists
-            in the CLI's conversation history, causing *every* subsequent turn
-            to fail — an unrecoverable poison loop.
-
-            This hook checks magic bytes and size *before* Read executes,
-            blocking invalid files with a clear error message so the agent
-            can adjust.
-            """
-            tool_input = hook_input.get("tool_input", {})
-            file_path = tool_input.get("file_path", "")
-
-            error = _validate_image_file(file_path)
-            if error:
-                logger.warning(
-                    "Blocked Read of invalid image for session %s: %s",
-                    session_id[:8], error,
-                )
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": error,
-                    },
-                }
-
-            return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
-
-        async def _capture_wakeup_hook(hook_input, tool_use_id, context):
-            """PostToolUse hook: record a ScheduleWakeup so Nerve can fire it.
-
-            The CLI's own scheduler is disabled (CLAUDE_CODE_DISABLE_CRON),
-            so the tool just records the request and returns. We persist it
-            here and the cron-service sweep re-injects the prompt at the
-            scheduled time via ``engine.run(..., source="wakeup")``.
-            """
-            try:
-                await self._record_wakeup(
-                    self.db, session_id, hook_input.get("tool_input", {}) or {},
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to record wakeup for session %s: %s", session_id, e,
-                )
-            return {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
-
-        async def _grant_permission_hook(hook_input, tool_use_id, context):
-            """PreToolUse hook: pre-approve non-interactive tools.
-
-            Background sub-agents (the Agent tool with run_in_background) run
-            detached and non-blocking, so the CLI never surfaces an approval
-            prompt for their nested tool calls — the ``can_use_tool`` callback
-            is never invoked for them and the CLI denies their Write/Edit/Bash
-            by default. A PreToolUse hook, however, DOES fire for those nested
-            calls (it is a programmatic callback, not a user-facing prompt), so
-            returning ``permissionDecision: "allow"`` here grants the same
-            auto-approval foreground agents already get via ``can_use_tool``.
-
-            Interactive tools and Read are left untouched: interactive tools
-            defer to ``can_use_tool`` (pause / inject answers / deny), and Read
-            defers to the image validator above plus the CLI's read-only
-            auto-allow. This keeps the web pause-for-input flow intact while
-            giving background sub-agents permission parity with the foreground.
-            """
-            tool_name = hook_input.get("tool_name", "")
-            if tool_name in INTERACTIVE_TOOLS or tool_name == "Read":
-                return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": (
-                        "nerve: auto-approved (background-agent permission parity)"
-                    ),
-                }
-            }
-
-        pre_tool_use = [
-            HookMatcher(
-                matcher="Edit|Write|NotebookEdit",
-                hooks=[_snapshot_hook],
-            ),
-            HookMatcher(
-                matcher="Read",
-                hooks=[_validate_image_hook],
-            ),
-        ]
-        # Catch-all permission grant so background sub-agents (whose nested
-        # tool calls never reach can_use_tool) inherit foreground's tool
-        # permissions. Registered last so the snapshot/validator hooks still
-        # run for their tools; a deny from the validator wins over this allow.
-        if self.config.agent.background_agent_permissions:
-            pre_tool_use.append(
-                HookMatcher(matcher=None, hooks=[_grant_permission_hook])
-            )
-
-        return {
-            "PreToolUse": pre_tool_use,
-            "PostToolUse": [
-                HookMatcher(
-                    matcher="ScheduleWakeup",
-                    hooks=[_capture_wakeup_hook],
-                ),
-            ],
-        }
-
     # Min/max delay the CLI's ScheduleWakeup enforces (clamped to [60, 3600]).
     _WAKEUP_MIN_DELAY = 60
     _WAKEUP_MAX_DELAY = 3600
@@ -1433,53 +919,6 @@ class AgentEngine:
         )
         return wakeup_id
 
-    @staticmethod
-    def _model_supports_legacy_enabled_thinking(model: str | None) -> bool:
-        # Claude 4.5 / 4.6 accept thinking.type="enabled" with budget_tokens.
-        # Newer models (4.7+) require thinking.type="adaptive" with effort.
-        if not model:
-            return False
-        m = model.lower()
-        return "4-5" in m or "4-6" in m
-
-    @staticmethod
-    def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
-        """Parse thinking config string into SDK ThinkingConfig dict."""
-        v = value.strip().lower()
-        if v == "disabled":
-            return {"type": "disabled"}
-        if v == "adaptive":
-            return {"type": "adaptive"}
-        if not AgentEngine._model_supports_legacy_enabled_thinking(model):
-            return {"type": "adaptive"}
-        budget_map = {
-            "max": 128_000,
-            "high": 64_000,
-            "medium": 32_000,
-            "low": 8_000,
-        }
-        if v in budget_map:
-            return {"type": "enabled", "budget_tokens": budget_map[v]}
-        try:
-            tokens = int(v)
-            return {"type": "enabled", "budget_tokens": tokens}
-        except ValueError:
-            logger.warning("Unknown thinking config '%s', using adaptive", value)
-            return {"type": "adaptive"}
-
-    # Effort levels accepted per Claude model — substring-matched against the
-    # full model name so dated aliases (e.g. "claude-opus-4-8-20260528") resolve.
-    # Ordered most-specific to least-specific; first match wins. Mirrors the
-    # pattern used by MODEL_PRICING in nerve/db/usage.py.
-    _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
-        "fable-5":    ("low", "medium", "high", "xhigh", "max"),
-        "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
-        "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
-        "opus-4-6":   ("low", "medium", "high", "max"),
-        "sonnet-4-6": ("low", "medium", "high"),
-    }
-    _EFFORT_RANK: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
-
     # Sources whose turns are sensing / triage work and use ``cron_effort``
     # instead of the interactive ``effort``. Everything else (web, telegram,
     # wakeup, ...) is treated as interactive.
@@ -1497,113 +936,35 @@ class AgentEngine:
             return cron_effort
         return effort
 
-    @staticmethod
-    def _effective_effort(value: str, model: str | None = None) -> str | None:
-        """Return ``value`` capped to the highest effort level ``model`` supports."""
-        if value not in AgentEngine._EFFORT_RANK:
-            return None
-        allowed: tuple[str, ...] | None = None
-        if model:
-            m = model.lower()
-            for key, levels in AgentEngine._MODEL_EFFORT_LEVELS.items():
-                if key in m:
-                    allowed = levels
-                    break
-        if not allowed or value in allowed:
-            return value
-        requested_rank = AgentEngine._EFFORT_RANK.index(value)
-        for level in reversed(AgentEngine._EFFORT_RANK[: requested_rank + 1]):
-            if level in allowed:
-                logger.debug(
-                    "Capped effort %r to %r for model %r (model caps at %r)",
-                    value, level, model, allowed[-1],
-                )
-                return level
-        return None
-
     # ------------------------------------------------------------------ #
     #  SDK client lifecycle                                                #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _is_client_dead(client: ClaudeSDKClient) -> bool:
-        """Check if the client's underlying CLI process has terminated."""
-        transport = getattr(client, "_transport", None)
-        if not transport:
-            return True
-        process = getattr(transport, "_process", None)
-        if process is None:
-            return True
-        return process.returncode is not None
-
-    def _sdk_resume_file_exists(self, sdk_session_id: str) -> bool:
-        """Check whether Claude Code still has the conversation .jsonl
-        for the given SDK session ID on this filesystem.
-
-        The CLI stores history at::
-
-            ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
-
-        where <encoded-cwd> is the absolute cwd path with every '/'
-        replaced by '-'.  The CLI resolves the cwd symlink before
-        encoding, so when the workspace is itself a symlink (e.g. the
-        Docker deployment's /root/nerve-workspace -> /Users/.../
-        nerve-workspace) the history lives under the *realpath*-encoded
-        directory, not the symlink-encoded one.  Check the realpath
-        first and fall back to the unresolved path for non-symlinked
-        layouts.
-
-        If the file is gone (typically because the container's
-        /root/.claude was not bind-mounted and got wiped on restart),
-        passing --resume to the CLI fails with exit 1.
-
-        Best-effort check: any unexpected error returns True so we still
-        attempt the resume and let the CLI surface the real error,
-        rather than masking unrelated bugs.
-        """
-        try:
-            projects = os.path.expanduser("~/.claude/projects")
-            workspace = str(self.config.workspace)
-            bases = [os.path.realpath(workspace)]
-            if workspace not in bases:
-                bases.append(workspace)
-            for base in bases:
-                encoded = base.replace("/", "-")
-                jsonl = (
-                    projects + "/" + encoded
-                    + "/" + sdk_session_id + ".jsonl"
-                )
-                if os.path.isfile(jsonl):
-                    return True
-            return False
-        except Exception as e:
-            logger.debug(
-                "Could not stat resume jsonl for %s: %s, assuming present",
-                sdk_session_id[:12], e,
-            )
-            return True
-
     async def _get_or_create_client(
         self, session_id: str, source: str, model: str | None,
         fork_from: str | None = None,
-    ) -> ClaudeSDKClient:
+    ) -> AgentClient:
         """Get an existing persistent client or create a new one.
 
-        If the session has a stored sdk_session_id, the new client is created
-        with resume=sdk_session_id so the CLI restores full conversation
-        context.
-
-        If fork_from is set, creates the client with fork_session=True to
-        branch from the given SDK session.
+        Backend-agnostic orchestration: resolves the session's (sticky)
+        backend, validates/clears stale resume targets, freezes the
+        recall priors, renders the system prompt, and hands a
+        :class:`SessionSpec` to the backend. The backend owns everything
+        runtime-specific (options, hooks, subprocess).
         """
         lock = self.sessions.get_lock(session_id)
         async with lock:
             client = self.sessions.get_client(session_id)
-            requested_model = model or self.config.agent.model
+
+            # Session row first — backend resolution is sticky on it.
+            session = await self.db.get_session(session_id)
+            backend = self._backend_for(session, source)
+            requested_model = model or backend.default_model(source)
+
             if client is not None:
                 bound_model = self._session_models.get(session_id)
-                # Health check: verify the underlying CLI process is still alive
-                if self._is_client_dead(client):
+                # Health check: verify the underlying subprocess is alive
+                if not client.is_alive():
                     logger.warning(
                         "Client process for session %s is dead, recreating",
                         session_id,
@@ -1615,9 +976,8 @@ class AgentEngine:
                     client = None
                 elif bound_model is not None and bound_model != requested_model:
                     # Model switched mid-session (e.g. the composer's picker
-                    # moved from the Anthropic default to a local Ollama
-                    # model). The CLI binds its model at connect time, so
-                    # tear the client down and recreate it below.
+                    # moved to a different model). Clients bind their model
+                    # at connect time, so tear down and recreate below.
                     logger.info(
                         "Session %s model changed (%s → %s), recreating client",
                         session_id, bound_model, requested_model,
@@ -1634,8 +994,7 @@ class AgentEngine:
                 else:
                     return client
 
-            # Check for stored SDK session ID for resume
-            session = await self.db.get_session(session_id)
+            # Check for stored native session ID for resume
             sdk_resume_id = session.get("sdk_session_id") if session else None
             try:
                 session_meta = json.loads(
@@ -1651,31 +1010,24 @@ class AgentEngine:
                 if session_meta.get("observed_model"):
                     self._observed_models[session_id] = session_meta["observed_model"]
 
-            # For forks, use the source session's SDK ID
+            # For forks, use the source session's native ID
             if fork_from and not sdk_resume_id:
                 sdk_resume_id = fork_from
 
-            # Defensive: verify the resume target's conversation .jsonl
-            # actually exists before passing it to the CLI.  Claude Code
-            # stores conversation history in /root/.claude/projects/
-            # <encoded-cwd>/<sdk_session_id>.jsonl.  If that directory is
-            # not bind-mounted from the host, a container restart wipes
-            # the .jsonl files but the Nerve DB still holds the stale
-            # sdk_session_id; the CLI dies with "No conversation
-            # found with session ID" exit 1.
-            #
-            # When the file is missing, clear the stale id and start a
-            # fresh conversation rather than crashing the turn.  Forks
-            # are exempt: the source session's context lives in the
-            # source's row, and a fresh fork has nothing to recover to.
+            # Defensive: let the backend verify the resume target is still
+            # materialized (claude: the conversation .jsonl under
+            # ~/.claude/projects; codex: no cheap check — create_client
+            # falls back and reports resume_dropped instead).  Forks are
+            # exempt: the source session's context lives in the source's
+            # row, and a fresh fork has nothing to recover to.
             if sdk_resume_id and not fork_from:
-                if not self._sdk_resume_file_exists(sdk_resume_id):
+                if not backend.validate_resume_target(
+                    sdk_resume_id, str(self.config.workspace),
+                ):
                     logger.warning(
-                        "Session %s resume target %s.jsonl is missing; "
-                        "starting a fresh CLI conversation.  This usually "
-                        "means /root/.claude was not persisted across a "
-                        "container restart.",
-                        session_id, sdk_resume_id[:12],
+                        "Session %s resume target %s is missing on the %s "
+                        "backend; starting a fresh conversation.",
+                        session_id, sdk_resume_id[:12], backend.name,
                     )
                     await self.db.update_session_fields(
                         session_id, {"sdk_session_id": None},
@@ -1684,7 +1036,7 @@ class AgentEngine:
 
             if sdk_resume_id:
                 logger.info(
-                    "Resuming session %s with SDK session %s",
+                    "Resuming session %s with native session %s",
                     session_id, sdk_resume_id[:12],
                 )
 
@@ -1712,26 +1064,27 @@ class AgentEngine:
                     logger.warning("Pre-recall failed: %s", e)
 
             # Resolve the prompt-cache TTL for this client build (cadence-
-            # aware; see nerve/agent/cache_policy.py). Recomputed on every
-            # client (re)build — client recycling at the idle sweep makes
-            # the policy naturally track cadence changes.
-            requested = model or self.config.agent.model
-            is_claude = not (
-                self.config.ollama.enabled
-                and "claude" not in requested.lower()
-            )
-            cache_ttl = await resolve_cache_ttl(
-                self.config.agent, self.db, session_id, source, requested,
-                session_meta=session_meta, is_claude_model=is_claude,
-            )
-            logger.info(
-                "Session %s: prompt-cache TTL %s (source=%s, mode=%s)",
-                session_id, cache_ttl, source,
-                session_meta.get("cache_ttl_override")
-                or self.config.agent.cache_ttl,
-            )
-            if session_meta.get("cache_ttl") != cache_ttl:
-                meta_updates["cache_ttl"] = cache_ttl
+            # aware; see nerve/agent/cache_policy.py). Claude-only — other
+            # backends manage caching natively (capability-gated).
+            cache_ttl = "5m"
+            if backend.capabilities.supports_cache_ttl:
+                is_claude = not (
+                    self.config.ollama.enabled
+                    and "claude" not in requested_model.lower()
+                )
+                cache_ttl = await resolve_cache_ttl(
+                    self.config.agent, self.db, session_id, source,
+                    requested_model,
+                    session_meta=session_meta, is_claude_model=is_claude,
+                )
+                logger.info(
+                    "Session %s: prompt-cache TTL %s (source=%s, mode=%s)",
+                    session_id, cache_ttl, source,
+                    session_meta.get("cache_ttl_override")
+                    or self.config.agent.cache_ttl,
+                )
+                if session_meta.get("cache_ttl") != cache_ttl:
+                    meta_updates["cache_ttl"] = cache_ttl
 
             if meta_updates and session:
                 session_meta.update(meta_updates)
@@ -1740,9 +1093,9 @@ class AgentEngine:
             # Determine if this is a fork
             is_fork = fork_from is not None
 
-            # Create interactive tool handler for this session.
-            # Non-web sessions (telegram, cron, hook) cannot handle interactive
-            # tools — auto-deny them to prevent deadlocks.
+            # Create interactive hub for this session.
+            # Non-web sessions (telegram, cron, hook) cannot handle
+            # interactive pauses — auto-deny them to prevent deadlocks.
             is_interactive = source in ("web",)
             handler = InteractiveToolHandler(
                 session_id=session_id,
@@ -1752,24 +1105,68 @@ class AgentEngine:
             )
             register_handler(session_id, handler)
 
-            options = self._build_options(
-                session_id, source=source, model=model,
+            # Render the system prompt (engine-owned: identity files,
+            # frozen recall, skills; the tool list respects the backend's
+            # exclusions so the prompt never advertises a tool this
+            # session's MCP server doesn't serve).
+            system_prompt = build_system_prompt(
+                workspace=self.config.workspace,
+                session_id=session_id,
+                source=source,
+                timezone_name=self.config.timezone,
                 recalled_memories=recalled_memories or None,
-                resume=sdk_resume_id,
-                fork_session=is_fork,
-                can_use_tool=handler.can_use_tool,
-                cache_ttl=cache_ttl,
+                skill_summaries=self._collect_skill_summaries(),
+                excluded_tools=backend.excluded_tools(),
             )
-            client = ClaudeSDKClient(options=options)
-            await client.connect()
+
+            async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
+                return await self._record_wakeup(self.db, sid, tool_input)
+
+            spec = SessionSpec(
+                session_id=session_id,
+                source=source,
+                model=requested_model,
+                effort=self._base_effort_for_source(
+                    source, self.config.agent.effort,
+                    self.config.agent.cron_effort,
+                ),
+                system_prompt=system_prompt,
+                cwd=str(self.config.workspace),
+                resume_native_id=sdk_resume_id,
+                fork=is_fork,
+                interactive=handler,
+                snapshot=self._save_file_snapshot,
+                record_wakeup=_record_wakeup_cb,
+                cache_ttl=cache_ttl,
+                max_turns=self.config.agent.max_turns,
+                idle_timeout=float(self.config.agent.cli_idle_timeout_seconds),
+            )
+
+            client = await backend.create_client(spec)
+            if getattr(client, "resume_dropped", False):
+                # The backend had to discard the stale native id (codex
+                # resume-miss recovery) — clear the persisted column; the
+                # fresh id is re-persisted at turn end.
+                await self.db.update_session_fields(
+                    session_id, {"sdk_session_id": None},
+                )
             self.sessions.set_client(session_id, client)
-            # Watch the SDK stream between runs so autonomous CLI turns
+            self._session_backends[session_id] = backend.name
+
+            # Stamp the sticky backend on first client build.
+            if not (session or {}).get("backend"):
+                await self.db.update_session_fields(
+                    session_id, {"backend": backend.name},
+                )
+
+            # Watch the stream between runs so autonomous runtime turns
             # (background task completions, Monitor events) stream to the
-            # UI instead of buffering invisibly.
-            self._start_idle_watcher(session_id, client, source)
+            # UI instead of buffering invisibly. Claude-only capability.
+            if backend.capabilities.supports_idle_stream:
+                self._start_idle_watcher(session_id, client, source)
 
             # Record connected_at and the resolved model
-            resolved_model = options.model
+            resolved_model = getattr(client, "model", "") or requested_model
             self._session_models[session_id] = resolved_model
             now = datetime.now(timezone.utc).isoformat()
             connected_at = session.get("connected_at") if session and sdk_resume_id else now
@@ -1780,16 +1177,15 @@ class AgentEngine:
             )
             await self.db.update_session_fields(session_id, {"model": resolved_model})
 
-            # A brand-new CLI process starts its cumulative cost counter at
-            # zero — zero the persisted baseline so the first turn's delta
-            # is exact.  The reset inference in compute_turn_cost remains
-            # as a backstop for any recycle path that bypasses this (e.g.
-            # a `nerve restart` racing an in-flight turn).
-            await self._reset_cost_baseline(session_id)
+            # A brand-new runtime process starts its cumulative cost counter
+            # at zero — zero the persisted baseline so the first turn's
+            # delta is exact (claude-only; codex reports per-turn cost).
+            if backend.capabilities.cost_is_cumulative:
+                await self._reset_cost_baseline(session_id)
 
             logger.info(
-                "Created persistent client for session %s%s",
-                session_id,
+                "Created persistent %s client for session %s%s",
+                backend.name, session_id,
                 " (resumed)" if sdk_resume_id and not is_fork else
                 " (forked)" if is_fork else "",
             )
@@ -1919,24 +1315,24 @@ class AgentEngine:
 
     async def _process_tool_result(
         self,
-        block: ToolResultBlock,
+        event: ToolResult,
         session_id: str,
-        parent_tool_use_id: str | None,
         tool_results_map: dict[str, dict],
         ordered_blocks: list[dict],
         tool_calls_log: list[dict],
         active_subagents: dict[str, float],
     ) -> None:
-        """Process a single ToolResultBlock (shared by AssistantMessage and UserMessage paths)."""
+        """Process a normalized ToolResult event (shared by user runs and
+        autonomous-turn drains)."""
         result_content = (
-            block.content
-            if isinstance(block.content, str)
-            else json.dumps(block.content, default=str)
+            event.content
+            if isinstance(event.content, str)
+            else json.dumps(event.content, default=str)
         )
-        # Sanitize orphaned surrogates — CLI may truncate output mid-emoji
+        # Sanitize orphaned surrogates — runtimes may truncate output mid-emoji
         result_content = _sanitize_surrogates(result_content)
-        tool_use_id = getattr(block, "tool_use_id", None)
-        is_error = getattr(block, "is_error", False)
+        tool_use_id = event.tool_use_id
+        is_error = event.is_error
 
         tool_results_map[tool_use_id] = {
             "result": result_content,
@@ -1955,7 +1351,7 @@ class AgentEngine:
             session_id, result_content,
             tool_use_id=tool_use_id,
             is_error=is_error or False,
-            parent_tool_use_id=parent_tool_use_id,
+            parent_tool_use_id=event.parent_tool_use_id,
         )
 
         # Sub-agent lifecycle: emit complete event
@@ -1983,10 +1379,6 @@ class AgentEngine:
                         srv_name, mcp_tool = parsed
                         try:
                             duration = None
-                            if tool_use_id in active_subagents:
-                                # Sub-agent already popped above, but for
-                                # regular MCP tools we don't track start time
-                                pass
                             # Auto-register unknown MCP servers on first use
                             # (e.g. Claude Code plugins: "plugin_Notion_notion").
                             # Skip servers already registered at startup to avoid
@@ -2075,157 +1467,127 @@ class AgentEngine:
             downgrade=downgrade,
         )
 
-    async def _process_sdk_message(
-        self, session_id: str, message: Any, st: _TurnState,
+    async def _process_agent_event(
+        self, session_id: str, event: Any, st: _TurnState,
     ) -> bool:
-        """Process one SDK stream message: broadcast to the UI and
+        """Process one normalized agent event: broadcast to the UI and
         accumulate into ``st`` for DB persistence.
 
         Shared by ``_run_inner`` (user-initiated turns) and
-        ``_drain_pending_messages`` (autonomous CLI turns) so both paths
-        produce identical events and records.
+        ``_drain_pending_messages`` (autonomous runtime turns) so both
+        paths produce identical events and records. Backends translate
+        their native stream into these events (see
+        nerve/agent/backends/events.py).
 
-        Returns True when the message is a ResultMessage (turn complete).
+        Returns True when the event is a TurnCompleted (turn over).
         """
-        # Early-capture sdk_session_id from the first message that carries
-        # it so it survives /stop cancellation (ResultMessage — the normal
-        # source — never arrives when the turn is interrupted).
-        if not st.sdk_session_id:
-            msg_sid = getattr(message, "session_id", None)
-            if msg_sid:
-                st.sdk_session_id = msg_sid
-
-        if isinstance(message, AssistantMessage):
+        if isinstance(event, TextDelta):
             st.got_content = True
-            # Extract parent_tool_use_id — set when this message comes from
-            # a sub-agent (Task/Agent) rather than the main agent
-            parent_id = getattr(message, "parent_tool_use_id", None)
-            # Capture model from assistant message (more reliable than
-            # config). Main-agent messages only: sub-agents legitimately
-            # run different models (Agent tool `model` opt, built-in agent
-            # defaults), which must not pollute turn cost attribution or
-            # fire serving-model change events.
-            msg_model = getattr(message, "model", None)
-            if msg_model and parent_id is None:
-                st.last_model = msg_model
-                await self._track_serving_model(session_id, msg_model, st)
+            st.full_response_text += event.text
+            if st.ordered_blocks and st.ordered_blocks[-1].get("type") == "text":
+                st.ordered_blocks[-1]["content"] += event.text
+            else:
+                st.ordered_blocks.append({"type": "text", "content": event.text})
+            await broadcaster.broadcast_token(
+                session_id, event.text,
+                parent_tool_use_id=event.parent_tool_use_id,
+            )
 
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    st.full_response_text += block.text
-                    # Track ordered blocks for DB persistence
-                    if st.ordered_blocks and st.ordered_blocks[-1].get("type") == "text":
-                        st.ordered_blocks[-1]["content"] += block.text
-                    else:
-                        st.ordered_blocks.append({"type": "text", "content": block.text})
-                    await broadcaster.broadcast_token(
-                        session_id, block.text,
-                        parent_tool_use_id=parent_id,
-                    )
+        elif isinstance(event, ThinkingDelta):
+            st.got_content = True
+            st.thinking_text += event.text
+            if st.ordered_blocks and st.ordered_blocks[-1].get("type") == "thinking":
+                st.ordered_blocks[-1]["content"] += event.text
+            else:
+                st.ordered_blocks.append({"type": "thinking", "content": event.text})
+            await broadcaster.broadcast_thinking(
+                session_id, event.text,
+                parent_tool_use_id=event.parent_tool_use_id,
+            )
 
-                elif ThinkingBlock is not None and isinstance(
-                    block, ThinkingBlock,
-                ):
-                    thinking = getattr(block, "thinking", "") or ""
-                    if not thinking:
-                        # Empty thinking block (e.g. Opus 4.7 with
-                        # display="omitted", or simple queries on low
-                        # effort). Nothing visible to render — never fall
-                        # back to str(block) as that leaks the
-                        # ThinkingBlock(...) repr into the UI.
-                        continue
-                    st.thinking_text += thinking
-                    # Track ordered blocks for DB persistence
-                    if st.ordered_blocks and st.ordered_blocks[-1].get("type") == "thinking":
-                        st.ordered_blocks[-1]["content"] += thinking
-                    else:
-                        st.ordered_blocks.append({"type": "thinking", "content": thinking})
-                    await broadcaster.broadcast_thinking(
-                        session_id, thinking,
-                        parent_tool_use_id=parent_id,
-                    )
+        elif isinstance(event, ToolUse):
+            st.got_content = True
+            await broadcaster.broadcast_tool_use(
+                session_id, event.name, event.input,
+                tool_use_id=event.tool_use_id,
+                parent_tool_use_id=event.parent_tool_use_id,
+            )
+            # Track dynamic workflows.  A ``Workflow`` tool call spawns
+            # a background runtime; later task_* system events carry
+            # its progress tree keyed by this tool_use_id.  Register it
+            # now so _handle_system_event can recognize those events
+            # even before the first ``workflow_progress`` payload.
+            if event.name == "Workflow" and event.tool_use_id:
+                self._workflows.setdefault(session_id, {})[event.tool_use_id] = {
+                    "name": self._derive_workflow_name(event.input),
+                    "snapshot": None,
+                }
+            st.tool_calls_log.append({
+                "tool": event.name,
+                "input": event.input,
+                "tool_use_id": event.tool_use_id,
+            })
+            st.ordered_blocks.append({
+                "type": "tool_call",
+                "tool": event.name,
+                "input": event.input,
+                "tool_use_id": event.tool_use_id,
+            })
 
-                elif isinstance(block, ToolUseBlock):
-                    tool_input = getattr(block, "input", {})
-                    tool_name = getattr(block, "name", None) or str(block)
-                    tool_use_id = getattr(block, "id", None)
-                    await broadcaster.broadcast_tool_use(
-                        session_id, tool_name, tool_input,
-                        tool_use_id=tool_use_id,
-                        parent_tool_use_id=parent_id,
-                    )
-                    # Track sub-agent lifecycle.  Claude Code 2.1.x renamed
-                    # the subagent-spawning tool from ``Task`` → ``Agent``
-                    # (and introduced separate ``TaskCreate``/``TaskUpdate``
-                    # /etc. tools for in-session todo tracking).  Match both
-                    # names so old session history still opens panels on
-                    # replay.
-                    if tool_name in ("Task", "Agent") and tool_use_id:
-                        st.active_subagents[tool_use_id] = asyncio.get_event_loop().time()
-                        await broadcaster.broadcast_subagent_start(
-                            session_id,
-                            tool_use_id=tool_use_id,
-                            subagent_type=str(tool_input.get("subagent_type", tool_input.get("model", "agent"))),
-                            description=str(tool_input.get("description", "")),
-                            model=str(tool_input.get("model", "")) or None,
-                        )
-                    # Track dynamic workflows.  A ``Workflow`` tool call spawns
-                    # a background runtime; later task_* system messages carry
-                    # its progress tree keyed by this tool_use_id.  Register it
-                    # now so _handle_system_message can recognize those events
-                    # even before the first ``workflow_progress`` payload.
-                    if tool_name == "Workflow" and tool_use_id:
-                        self._workflows.setdefault(session_id, {})[tool_use_id] = {
-                            "name": self._derive_workflow_name(tool_input),
-                            "snapshot": None,
-                        }
-                    st.tool_calls_log.append({
-                        "tool": tool_name,
-                        "input": tool_input,
-                        "tool_use_id": tool_use_id,
-                    })
-                    st.ordered_blocks.append({
-                        "type": "tool_call",
-                        "tool": tool_name,
-                        "input": tool_input,
-                        "tool_use_id": tool_use_id,
-                    })
+        elif isinstance(event, SubagentStarted):
+            st.active_subagents[event.tool_use_id] = asyncio.get_event_loop().time()
+            await broadcaster.broadcast_subagent_start(
+                session_id,
+                tool_use_id=event.tool_use_id,
+                subagent_type=event.subagent_type,
+                description=event.description,
+                model=event.model,
+            )
 
-                elif isinstance(block, ToolResultBlock):
-                    await self._process_tool_result(
-                        block, session_id, parent_id,
-                        st.tool_results_map, st.ordered_blocks,
-                        st.tool_calls_log, st.active_subagents,
-                    )
+        elif isinstance(event, ToolResult):
+            await self._process_tool_result(
+                event, session_id,
+                st.tool_results_map, st.ordered_blocks,
+                st.tool_calls_log, st.active_subagents,
+            )
 
-        elif isinstance(message, UserMessage):
-            parent_id = getattr(message, "parent_tool_use_id", None)
-            content = getattr(message, "content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        await self._process_tool_result(
-                            block, session_id, parent_id,
-                            st.tool_results_map, st.ordered_blocks,
-                            st.tool_calls_log, st.active_subagents,
-                        )
+        elif isinstance(event, ModelObserved):
+            # Main-agent serving-model observation (backends already gate
+            # out sub-agent models). More reliable than config.
+            st.last_model = event.model
+            await self._track_serving_model(session_id, event.model, st)
 
-        elif isinstance(message, SystemMessage):
+        elif isinstance(event, SystemEvent):
             # Task lifecycle events (task_started/task_updated/
             # task_notification) drive the background-task chips in the UI.
-            # Other subtypes (init, status, ...) are informational only.
-            await self._handle_system_message(session_id, message)
+            # Other subtypes (init, codex_plan, ...) are informational only.
+            await self._handle_system_event(session_id, event)
 
-        elif isinstance(message, ResultMessage):
-            if message.usage:
-                st.last_usage = message.usage
-            st.sdk_session_id = message.session_id
+        elif isinstance(event, TurnCompleted):
+            if event.usage is not None:
+                st.last_usage = event.usage.to_anthropic_shape()
+            if event.native_session_id:
+                st.sdk_session_id = event.native_session_id
+            if event.model and not st.last_model:
+                st.last_model = event.model
             st.result_meta = {
-                "total_cost_usd": getattr(message, "total_cost_usd", None),
-                "duration_ms": getattr(message, "duration_ms", None),
-                "duration_api_ms": getattr(message, "duration_api_ms", None),
-                "num_turns": getattr(message, "num_turns", None),
+                "total_cost_usd": event.total_cost_usd,
+                "duration_ms": event.duration_ms,
+                "duration_api_ms": event.duration_api_ms,
+                "num_turns": event.num_turns,
+                "context_window": event.context_window,
+                "status": event.status,
             }
+            if event.status == "failed" and event.error:
+                # Failed turns still complete: surface the error inline so
+                # the conversation shows what happened (the runtime's
+                # transport stays healthy — this is a model/API failure).
+                note = f"⚠️ Turn failed: {event.error}"
+                st.full_response_text += (
+                    ("\n\n" + note) if st.full_response_text else note
+                )
+                st.ordered_blocks.append({"type": "text", "content": note})
+                await broadcaster.broadcast_token(session_id, note)
             return True
 
         return False
@@ -2233,30 +1595,30 @@ class AgentEngine:
     # CLI task statuses that mean "no longer running".
     _BG_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 
-    async def _handle_system_message(
-        self, session_id: str, message: Any,
+    async def _handle_system_event(
+        self, session_id: str, event: SystemEvent,
     ) -> None:
-        """Track CLI background-task lifecycle events and update the UI.
+        """Track runtime background-task lifecycle events and update the UI.
 
-        The CLI emits ``system`` messages for background work (Bash/Agent
-        ``run_in_background``, Monitor watches):
+        The Claude CLI emits ``system`` messages for background work
+        (Bash/Agent ``run_in_background``, Monitor watches):
 
         - ``task_started``  — task spawned (description, task_type)
         - ``task_progress`` — periodic usage updates
         - ``task_updated``  — status patches
         - ``task_notification`` — task settled (completed/failed/stopped)
 
-        These replace the old regex-based output-file watcher: the chips in
-        the UI now reflect what the CLI actually tracks.
+        Backends merge any legacy top-level fields into ``event.data`` so
+        this handler reads one dict.
         """
-        subtype = getattr(message, "subtype", "") or ""
+        subtype = event.subtype
         if subtype not in (
             "task_started", "task_progress", "task_updated", "task_notification",
         ):
             return
 
-        data = getattr(message, "data", None) or {}
-        task_id = data.get("task_id") or getattr(message, "task_id", None)
+        data = event.data or {}
+        task_id = data.get("task_id")
         if not task_id:
             return
 
@@ -2272,16 +1634,14 @@ class AgentEngine:
         changed = True
         if subtype == "task_started":
             entry["label"] = (
-                data.get("description")
-                or getattr(message, "description", "")
-                or entry["label"] or task_id
+                data.get("description") or entry["label"] or task_id
             )
             task_type = str(data.get("task_type") or "")
             entry["tool"] = "Agent" if "agent" in task_type else "Bash"
             entry["status"] = "running"
         elif subtype == "task_progress":
             # Only useful for backfilling a label if task_started was missed.
-            desc = data.get("description") or getattr(message, "description", "")
+            desc = data.get("description")
             if desc and not entry["label"]:
                 entry["label"] = desc
             else:
@@ -2294,7 +1654,7 @@ class AgentEngine:
             else:
                 changed = False
         elif subtype == "task_notification":
-            status = str(data.get("status") or getattr(message, "status", "") or "")
+            status = str(data.get("status") or "")
             entry["status"] = (
                 "done" if status in ("completed", "stopped", "") else "failed"
             )
@@ -2303,10 +1663,10 @@ class AgentEngine:
 
         # Dynamic-workflow progress. A workflow task is recognized either by
         # its tool_use_id (captured when the ``Workflow`` tool streamed) or by
-        # the presence of a ``workflow_progress`` tree on the message. We emit
+        # the presence of a ``workflow_progress`` tree on the event. We emit
         # a dedicated event so the UI can render a live phase/agent panel —
         # independent of the coarse background-task chip above.
-        tool_use_id = data.get("tool_use_id") or getattr(message, "tool_use_id", None)
+        tool_use_id = data.get("tool_use_id")
         wf_reg = self._workflows.get(session_id) or {}
         wp = data.get("workflow_progress")
         task_type = str(data.get("task_type") or "")
@@ -2325,7 +1685,7 @@ class AgentEngine:
                     tool_use_id, {"name": "Workflow", "snapshot": None},
                 )["name"] = str(wf_name)
             await self._emit_workflow_progress(
-                session_id, tool_use_id, subtype, data, message, wp,
+                session_id, tool_use_id, subtype, data, wp,
             )
 
         if changed:
@@ -2341,7 +1701,6 @@ class AgentEngine:
         tool_use_id: str,
         subtype: str,
         data: dict,
-        message: Any,
         wp: Any,
     ) -> None:
         """Build, cache, broadcast (and on terminal, persist) a workflow
@@ -2363,15 +1722,10 @@ class AgentEngine:
                 "agentCount": prev.get("agentCount", 0),
             }
 
-        status = self._workflow_status(subtype, data, message)
+        status = self._workflow_status(subtype, data)
         snapshot["name"] = cached.get("name") or "Workflow"
         snapshot["status"] = status
-        summary = (
-            data.get("summary")
-            or data.get("description")
-            or getattr(message, "summary", "")
-            or getattr(message, "description", "")
-        )
+        summary = data.get("summary") or data.get("description")
         if summary:
             snapshot["summary"] = str(summary)[:2000]
 
@@ -2385,7 +1739,7 @@ class AgentEngine:
                 logger.debug("merge_workflow_into_call failed for %s: %s", tool_use_id, e)
 
     @staticmethod
-    def _workflow_status(subtype: str, data: dict, message: Any) -> str:
+    def _workflow_status(subtype: str, data: dict) -> str:
         """Map a task_* system message to a workflow status string
         (running / completed / failed / stopped)."""
         if subtype in ("task_started", "task_progress"):
@@ -2397,9 +1751,7 @@ class AgentEngine:
                 return "stopped"
             return s or "running"
         if subtype == "task_notification":
-            return str(
-                data.get("status") or getattr(message, "status", "") or "completed"
-            )
+            return str(data.get("status") or "completed")
         return "running"
 
     @staticmethod
@@ -2531,12 +1883,18 @@ class AgentEngine:
                 connected_at=await self.get_client_connected_at_async(session_id),
             )
 
-        # Persist usage for context bar on session switch
-        max_context = (
-            1_048_576
-            if self.config.agent.context_1m_enabled_for(st.last_model)
-            else 200_000
-        )
+        # Persist usage for context bar on session switch. Backends that
+        # report the serving model's context window (codex, via
+        # thread/tokenUsage/updated) override the Anthropic-derived value.
+        reported_window = (st.result_meta or {}).get("context_window")
+        if reported_window:
+            max_context = int(reported_window)
+        else:
+            max_context = (
+                1_048_576
+                if self.config.agent.context_1m_enabled_for(st.last_model)
+                else 200_000
+            )
         num_turns = (st.result_meta or {}).get("num_turns") or 1
         if st.last_usage:
             usage_data = {
@@ -2557,39 +1915,51 @@ class AgentEngine:
             web_search = server_tool.get("web_search_requests", 0)
             web_fetch = server_tool.get("web_fetch_requests", 0)
 
-            # Calculate per-turn cost.
-            # NOTE: The SDK's total_cost_usd is *cumulative* per CLI client
-            # process, NOT per-invocation.  We track the last known
-            # cumulative value in session metadata and compute the delta
-            # for this turn.  The counter resets whenever the client is
-            # recycled (idle sweep, oneshot cron teardown, restart, model
-            # switch) — compute_turn_cost detects the reset and attributes
-            # the new cumulative to this turn instead of recording $0.
+            # Calculate per-turn cost. Semantics depend on the backend
+            # (cost_is_cumulative capability):
+            #
+            # * Claude: the SDK's total_cost_usd is *cumulative* per CLI
+            #   client process, NOT per-invocation.  We track the last
+            #   known cumulative value in session metadata and compute the
+            #   delta for this turn.  The counter resets whenever the
+            #   client is recycled — compute_turn_cost detects the reset
+            #   and attributes the new cumulative to this turn.
+            # * Codex: the backend pre-computes THIS turn's cost from its
+            #   pricing table (None when the model has no entry — recorded
+            #   as $0 with tokens intact, never estimated) and the
+            #   cumulative bookkeeping must stay untouched.
             from nerve.db.usage import compute_turn_cost, extract_cache_ttl_split
             sdk_cost = (st.result_meta or {}).get("total_cost_usd")
             current_session_cost = (
                 session_record.get("total_cost_usd", 0) if session_record else 0
             ) or 0
 
-            prev_cumulative = meta.get("_sdk_cumulative_cost", 0) or 0
-            turn_cost, cost_source = compute_turn_cost(
-                sdk_cost, prev_cumulative, st.last_usage, model=st.last_model,
-            )
-            if cost_source == "sdk_reset":
-                logger.info(
-                    "SDK cost counter reset for %s (%.4f < %.4f) — client "
-                    "recycle; attributing new cumulative to this turn",
-                    session_id, sdk_cost, prev_cumulative,
+            cost_is_cumulative = self._backend_for_live_session(
+                session_id,
+            ).capabilities.cost_is_cumulative
+            if cost_is_cumulative:
+                prev_cumulative = meta.get("_sdk_cumulative_cost", 0) or 0
+                turn_cost, cost_source = compute_turn_cost(
+                    sdk_cost, prev_cumulative, st.last_usage, model=st.last_model,
                 )
-            elif cost_source == "estimate_backstop":
-                logger.warning(
-                    "SDK reported no turn cost (cumulative %.4f, prev %.4f) "
-                    "despite token traffic for %s — using token-based "
-                    "estimate $%.4f",
-                    sdk_cost, prev_cumulative, session_id, turn_cost,
-                )
-            if sdk_cost is not None:
-                meta["_sdk_cumulative_cost"] = sdk_cost
+                if cost_source == "sdk_reset":
+                    logger.info(
+                        "SDK cost counter reset for %s (%.4f < %.4f) — client "
+                        "recycle; attributing new cumulative to this turn",
+                        session_id, sdk_cost, prev_cumulative,
+                    )
+                elif cost_source == "estimate_backstop":
+                    logger.warning(
+                        "SDK reported no turn cost (cumulative %.4f, prev %.4f) "
+                        "despite token traffic for %s — using token-based "
+                        "estimate $%.4f",
+                        sdk_cost, prev_cumulative, session_id, turn_cost,
+                    )
+                if sdk_cost is not None:
+                    meta["_sdk_cumulative_cost"] = sdk_cost
+            else:
+                turn_cost = float(sdk_cost) if sdk_cost is not None else 0.0
+                cost_source = "backend"
 
             # Save metadata (includes _sdk_cumulative_cost update)
             await self.db.update_session_metadata(session_id, meta)
@@ -2725,60 +2095,6 @@ class AgentEngine:
                         "is_running": False,
                     })
 
-    @staticmethod
-    async def _iter_response_with_timeout(
-        client: Any,
-        session_id: str,
-        idle_timeout: float,
-    ):
-        """Iterate ``client.receive_response()`` with a per-message idle timeout.
-
-        The Claude Agent SDK's ``receive_response()`` async generator can
-        block indefinitely if the underlying CLI subprocess hangs (stuck
-        Anthropic API request, broken stdio pipe, etc.).  Without a timeout
-        the engine has no way to notice — ``is_running`` stays True, the
-        per-session lock stays held, queued user messages back up forever.
-
-        Wrapping each ``__anext__()`` await in ``asyncio.wait_for`` detects
-        a hung CLI when no SDK message of any kind (assistant chunk, tool
-        call, tool result, ResultMessage) arrives within ``idle_timeout``
-        seconds.  The iterator is closed and ``asyncio.TimeoutError`` is
-        raised so the existing CLI-crash retry path in ``_run_inner`` can
-        take over.
-
-        The timeout is per-message, not per-turn, so legitimate long tool
-        calls (e.g. a Bash command with ``timeout=600000`` ms) don't trip
-        it as long as they emit ``tool_use``/``tool_result`` chunks
-        between waits.
-
-        ``idle_timeout <= 0`` disables the timeout entirely (kept for
-        belt-and-suspenders ops who want the old behaviour back).
-        """
-        response_iter = client.receive_response()
-        try:
-            while True:
-                try:
-                    if idle_timeout and idle_timeout > 0:
-                        message = await asyncio.wait_for(
-                            response_iter.__anext__(),
-                            timeout=idle_timeout,
-                        )
-                    else:
-                        message = await response_iter.__anext__()
-                except StopAsyncIteration:
-                    return
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "CLI idle timeout (%ds) for session %s — no SDK "
-                        "message received; treating CLI as hung",
-                        idle_timeout, session_id,
-                    )
-                    raise
-                yield message
-        finally:
-            with contextlib.suppress(Exception):
-                await response_iter.aclose()
-
     async def _run_inner(
         self,
         session_id: str,
@@ -2888,23 +2204,17 @@ class AgentEngine:
             # New user turn: settled background-task chips are stale now.
             self._prune_bg_tasks(session_id)
 
-            # Send message — the client preserves conversation history internally
-            # Escape slash-prefixed messages so Claude Code CLI doesn't
-            # intercept them as built-in slash commands.  Registered bot
-            # commands (/stop, /new, etc.) are handled upstream — anything
-            # that reaches here should go straight to the LLM.
-            query_text = user_message
-            if query_text and query_text.startswith("/"):
-                query_text = "\u200b" + query_text
-
+            # New user turn: settled background-task chips are stale now.
+            # (moved below drain in original flow — kept semantically here)
             # Trailing wall-clock reminder. Precise time deliberately does
             # NOT live in the system prompt (only the date does): a
             # per-build timestamp there changes the prompt bytes on every
             # client rebuild, invalidating the prompt cache for the entire
             # conversation replay (see nerve/agent/cache_policy.py). As a
-            # message-tail reminder it is fresher \u2014 per turn instead of per
-            # client build \u2014 and costs nothing cache-wise. Not persisted to
+            # message-tail reminder it is fresher — per turn instead of per
+            # client build — and costs nothing cache-wise. Not persisted to
             # the DB message (db_text above), so the UI stays clean.
+            query_text = user_message
             if query_text or images:
                 _time_note = (
                     "<system-reminder>Current time: "
@@ -2915,62 +2225,25 @@ class AgentEngine:
                     f"{query_text}\n\n{_time_note}" if query_text else _time_note
                 )
 
-            # Build multi-modal content blocks once (reused on retry)
-            if images:
-                content_blocks: list[dict[str, Any]] = []
-                if query_text:
-                    content_blocks.append({"type": "text", "text": query_text})
-                for img in images:
-                    # Text files are inlined as text context blocks
-                    if img.get("type") == "text_file":
-                        fname = img.get("filename", "file")
-                        content = img.get("content", "")
-                        content_blocks.append({
-                            "type": "text",
-                            "text": f"--- Attached: {fname} ---\n{content}",
-                        })
-                        continue
+            # Backend-neutral turn input: attachments pass through raw;
+            # each backend converts to its native shape (Anthropic content
+            # blocks / codex UserInput items) and applies its own escaping
+            # rules (e.g. the Claude CLI's slash-command interception).
+            turn_input = TurnInput(text=query_text, images=images)
 
-                    # PDFs use "document" content block; images use "image"
-                    block_type = "document" if img["media_type"] == "application/pdf" else "image"
-
-                    # Validate image data before sending — prevent poisoning
-                    # the CLI's conversation with unprocessable images.
-                    if block_type == "image":
-                        img_error = _validate_image_data(
-                            img["data"], img["media_type"],
-                        )
-                        if img_error:
-                            logger.warning(
-                                "Skipping invalid image for session %s: %s",
-                                session_id[:8], img_error,
-                            )
-                            # Inject as text so the agent knows what happened
-                            content_blocks.append({
-                                "type": "text",
-                                "text": f"[Image skipped: {img_error}]",
-                            })
-                            continue
-
-                    content_blocks.append({
-                        "type": block_type,
-                        "source": {
-                            "type": img["type"],
-                            "media_type": img["media_type"],
-                            "data": img["data"],
-                        },
-                    })
-
-            # Send query + read response, with auto-retry on CLI crash.
-            # The CLI may crash during query (CLIConnectionError) or during
-            # response reading (generic Exception from the SDK reader task).
+            # Send query + read response, with auto-retry on runtime crash.
+            # The runtime may die during start_turn (TransportDiedError) or
+            # during response reading (generic Exception from the stream).
             # Retry once with a fresh client if no content was received yet.
             #
-            # The whole turn (query + every streamed message including tool
+            # The whole turn (query + every streamed event including tool
             # calls) is wrapped in ``lf_attrs`` so all OTEL spans emitted by
-            # the SDK carry our session_id / tags. The wrap is a no-op when
-            # Langfuse is disabled.
-            _effective_model = model or self.config.agent.model
+            # the Claude SDK carry our session_id / tags. The wrap is a
+            # no-op when Langfuse is disabled (and for codex turns, which
+            # are not instrumented — known v1 gap).
+            _effective_model = (
+                self._session_models.get(session_id) or model or ""
+            )
             _lf_tags = [f"source:{source}", f"model:{_effective_model}"]
             if channel:
                 _lf_tags.append(f"channel:{channel}")
@@ -2989,22 +2262,12 @@ class AgentEngine:
             ):
                 for _attempt in range(2):
                     try:
-                        if images:
-                            async def _image_prompt():
-                                yield {
-                                    "type": "user",
-                                    "message": {"role": "user", "content": content_blocks},
-                                    "parent_tool_use_id": None,
-                                }
-
-                            await client.query(_image_prompt())
-                        else:
-                            await client.query(query_text)
-                    except CLIConnectionError as _qerr:
+                        await client.start_turn(turn_input)
+                    except TransportDiedError as _qerr:
                         if _attempt > 0:
                             raise
                         logger.warning(
-                            "CLI dead for session %s (query phase): %s — retrying",
+                            "Agent runtime dead for session %s (query phase): %s — retrying",
                             session_id, _qerr,
                         )
                         self._stop_idle_watcher(session_id)
@@ -3016,33 +2279,30 @@ class AgentEngine:
                         )
                         continue  # retry the query
 
-                    # Read response — may raise if CLI crashes mid-stream
-                    # or hangs idle for longer than cli_idle_timeout_seconds
-                    # (see _iter_response_with_timeout).
+                    # Read response — may raise if the runtime crashes
+                    # mid-stream or hangs idle beyond the per-message idle
+                    # timeout (enforced inside the client's receive_turn).
                     try:
-                        async for message in AgentEngine._iter_response_with_timeout(
-                            client, session_id,
-                            self.config.agent.cli_idle_timeout_seconds,
-                        ):
-                            done = await self._process_sdk_message(
-                                session_id, message, st,
+                        async for event in client.receive_turn():
+                            done = await self._process_agent_event(
+                                session_id, event, st,
                             )
                             if done:
-                                # receive_response() also stops after the
-                                # ResultMessage; the explicit break keeps
-                                # the invariant local.
+                                # receive_turn also stops after the terminal
+                                # event; the explicit break keeps the
+                                # invariant local.
                                 break
 
                     except asyncio.CancelledError:
                         raise  # propagate to outer handler
                     except Exception as _recv_err:
-                        # CLI crashed during response reading.
+                        # Runtime crashed during response reading.
                         # Retry only if we haven't received any content yet
                         # (otherwise we'd produce duplicate/garbled output).
                         if st.got_content or _attempt > 0:
                             raise
                         logger.warning(
-                            "CLI crashed for session %s during response "
+                            "Agent runtime crashed for session %s during response "
                             "(no content yet): %s — retrying with fresh client",
                             session_id, _recv_err,
                         )
@@ -3065,9 +2325,17 @@ class AgentEngine:
             )
 
             # --- Critical cleanup first (must succeed for resume) ----------
-            # Persist sdk_session_id so the session can be resumed later.
-            # For new sessions the DB still has NULL because mark_active()
-            # was called before the SDK emitted any messages.
+            # Persist the native session id so the session can be resumed
+            # later. For new sessions the DB still has NULL because
+            # mark_active() ran before the runtime emitted anything; the
+            # normal source (TurnCompleted) never arrives on an
+            # interrupted turn, so fall back to the live client's early-
+            # captured id.
+            if not st.sdk_session_id:
+                _live = self.sessions.get_client(session_id)
+                if _live is not None:
+                    with contextlib.suppress(Exception):
+                        st.sdk_session_id = _live.native_session_id
             if st.sdk_session_id:
                 await self.db.update_session_fields(
                     session_id, {"sdk_session_id": st.sdk_session_id},
@@ -3181,27 +2449,6 @@ class AgentEngine:
     # How often the idle watcher probes the SDK buffer (seconds).
     _IDLE_STREAM_POLL_SECONDS = 0.5
 
-    @staticmethod
-    def _sdk_message_stream(client: Any) -> Any | None:
-        """Return the SDK client's internal message receive stream.
-
-        Private-API access (``client._query._message_receive``), pinned to
-        the bundled SDK version. Callers degrade gracefully (drain and
-        watcher become no-ops) when the attribute shape changes.
-        """
-        return getattr(getattr(client, "_query", None), "_message_receive", None)
-
-    @classmethod
-    def _sdk_buffer_used(cls, client: Any) -> int:
-        """Number of unread messages in the SDK client's buffer (0 on error)."""
-        stream = cls._sdk_message_stream(client)
-        if stream is None:
-            return 0
-        try:
-            return int(stream.statistics().current_buffer_used)
-        except Exception:
-            return 0
-
     async def _drain_pending_messages(
         self,
         session_id: str,
@@ -3211,27 +2458,29 @@ class AgentEngine:
         manage_framing: bool = False,
         first_content_timeout: float = 30.0,
     ) -> int:
-        """Drain SDK messages that arrived outside an active ``run()``.
+        """Drain agent events that arrived outside an active ``run()``.
 
-        Autonomous CLI turns are routed through the same pipeline as user
+        Autonomous runtime turns (Claude CLI background-task
+        continuations) are routed through the same pipeline as user
         turns: blocks broadcast live, assistant message persisted with a
         leading ``{"type": "auto"}`` marker, usage recorded, ``done``
         emitted.  Standalone task lifecycle events update the background-
         task chips without opening a turn.
 
         Never parks while no turn is open (only consumes what's already
-        buffered), so the pre-query call inside ``run()`` cannot hang on
-        an idle CLI.  The CLI emits a ``system/init`` message when it
-        starts processing a turn, so an ``init`` in the buffer means
-        content IS coming (the model call is in flight) — the drain opens
+        buffered via ``try_receive_idle_events``), so the pre-query call
+        inside ``run()`` cannot hang on an idle runtime.  A buffered
+        ``init`` system event means content IS coming — the drain opens
         the turn and waits up to ``first_content_timeout`` for the first
-        content message (model latency can be several seconds).  If
-        nothing arrives the empty turn is dropped without persisting and
+        content event.  If nothing arrives the empty turn is dropped and
         the watcher's next poll picks the content up instead.  Once
         content flows, the wait uses the same idle timeout as a normal
         run; on that timeout the partial turn is persisted and
         ``asyncio.TimeoutError`` propagates so the caller can apply
-        hung-CLI treatment.
+        hung-runtime treatment.
+
+        Backends without an idle stream (codex) return ``None`` from the
+        probe immediately — the drain is a no-op for them.
 
         Caller must hold the per-session run lock.  ``manage_framing``
         controls session-level run framing (mark_running/session_running/
@@ -3240,13 +2489,6 @@ class AgentEngine:
 
         Returns the number of completed autonomous turns processed.
         """
-        stream = self._sdk_message_stream(client)
-        if stream is None:
-            return 0
-
-        from claude_agent_sdk._errors import MessageParseError
-        from claude_agent_sdk._internal.message_parser import parse_message
-
         idle_timeout = self.config.agent.cli_idle_timeout_seconds
         turns = 0
         st: _TurnState | None = None
@@ -3298,22 +2540,15 @@ class AgentEngine:
             while True:
                 if st is None:
                     # No turn open — only consume what's already buffered.
-                    try:
-                        data = stream.receive_nowait()
-                    except anyio.WouldBlock:
-                        break
-                    except (anyio.EndOfStream, anyio.ClosedResourceError):
-                        break
+                    batch = client.try_receive_idle_events()
+                    if batch is None:
+                        break  # nothing buffered / stream closed
                 else:
-                    # Turn in flight — the CLI is producing; park for the
-                    # next message.  Before the first content message the
+                    # Turn in flight — the runtime is producing; park for
+                    # the next event batch.  Before the first content the
                     # wait is capped by first_content_timeout (init arrives
                     # seconds before the model's first output); after that
-                    # it matches a normal run's idle timeout.  NOTE: a
-                    # timeout cancels the parked receive, which can in
-                    # theory drop one in-flight message — acceptable on
-                    # both timeout paths (empty turn → watcher re-drains;
-                    # hung CLI → client discarded).
+                    # it matches a normal run's idle timeout.
                     waiting_first_content = not st.got_content
                     if waiting_first_content:
                         park_timeout: float | None = first_content_timeout
@@ -3324,9 +2559,7 @@ class AgentEngine:
                             else None
                         )
                     try:
-                        data = await asyncio.wait_for(
-                            stream.receive(), timeout=park_timeout,
-                        )
+                        batch = await client.receive_idle_events(park_timeout)
                     except asyncio.TimeoutError:
                         if waiting_first_content:
                             logger.info(
@@ -3339,77 +2572,80 @@ class AgentEngine:
                             break
                         logger.warning(
                             "Autonomous turn idle timeout (%ss) for session %s "
-                            "— persisting partial turn and flagging CLI as hung",
+                            "— persisting partial turn and flagging runtime as hung",
                             idle_timeout, session_id,
                         )
                         st.full_response_text += (
-                            "\n\n[Background turn interrupted: CLI went silent]"
+                            "\n\n[Background turn interrupted: runtime went silent]"
                             if st.full_response_text
-                            else "[Background turn interrupted: CLI went silent]"
+                            else "[Background turn interrupted: runtime went silent]"
                         )
                         await _close_turn()
                         raise
-                    except (anyio.EndOfStream, anyio.ClosedResourceError):
+                    if batch is None:
                         logger.warning(
-                            "SDK stream ended mid-autonomous-turn for session %s",
+                            "Agent stream ended mid-autonomous-turn for session %s",
                             session_id,
                         )
                         await _close_turn()
                         break
 
-                mtype = data.get("type") if isinstance(data, dict) else None
-                if mtype == "end":
-                    # Reader sentinel — stream is closed.
-                    await _close_turn()
-                    break
-                if mtype == "error":
-                    logger.error(
-                        "SDK stream error during autonomous drain for %s: %s",
-                        session_id, data.get("error"),
-                    )
-                    await _close_turn()
-                    break
+                if not batch:
+                    continue  # unparseable / skip-and-continue payload
 
-                try:
-                    message = parse_message(data)
-                except MessageParseError as pe:
-                    logger.warning(
-                        "Unparseable SDK message during drain for %s: %s",
-                        session_id, pe,
-                    )
-                    continue
-                if message is None:
-                    continue
+                # A ModelObserved that precedes content in the same batch
+                # (autonomous AssistantMessage without init framing) must
+                # not be lost — hold it and replay once the turn opens.
+                pending_model: ModelObserved | None = None
 
-                if isinstance(message, SystemMessage) and st is None:
-                    if getattr(message, "subtype", "") == "init":
-                        # The CLI emits ``init`` when it starts processing
-                        # a turn — an autonomous continuation is underway;
-                        # open the turn and park for its content.
+                for event in batch:
+                    if isinstance(event, SystemEvent) and st is None:
+                        if event.subtype == "init":
+                            # The runtime emits ``init`` when it starts
+                            # processing a turn — an autonomous continuation
+                            # is underway; open the turn and park for content.
+                            await _open_turn()
+                        else:
+                            # Task lifecycle events between turns — chips only.
+                            await self._handle_system_event(session_id, event)
+                        continue
+
+                    if isinstance(event, TurnCompleted) and st is None:
+                        # Stray terminal event with no preceding content
+                        # (e.g. a prior drain timed out mid-turn).  Consume
+                        # it so it can't desync the next turn; nothing to
+                        # render.
+                        logger.info(
+                            "Consumed stray TurnCompleted during drain for %s",
+                            session_id,
+                        )
+                        continue
+
+                    if st is None and isinstance(event, ModelObserved):
+                        pending_model = event
+                        continue
+
+                    if st is None and isinstance(
+                        event,
+                        (TextDelta, ThinkingDelta, ToolUse, ToolResult,
+                         SubagentStarted),
+                    ):
                         await _open_turn()
-                    else:
-                        # Task lifecycle events between turns — chips only.
-                        await self._handle_system_message(session_id, message)
-                    continue
+                        if pending_model is not None:
+                            await self._process_agent_event(
+                                session_id, pending_model, st,
+                            )
+                            pending_model = None
 
-                if isinstance(message, (AssistantMessage, UserMessage)):
-                    await _open_turn()
-                elif isinstance(message, ResultMessage) and st is None:
-                    # Stray result with no preceding content (e.g. a prior
-                    # drain timed out mid-turn).  Consume it so it can't
-                    # desync the next receive_response(); nothing to render.
-                    logger.info(
-                        "Consumed stray ResultMessage during drain for %s",
-                        session_id,
-                    )
-                    continue
-
-                if st is not None:
-                    turn_done = await self._process_sdk_message(
-                        session_id, message, st,
-                    )
-                    if turn_done:
-                        await _close_turn()
+                    if st is not None:
+                        turn_done = await self._process_agent_event(
+                            session_id, event, st,
+                        )
+                        if turn_done:
+                            await _close_turn()
+                    # A ModelObserved whose batch never produced content is
+                    # dropped with it — an empty assistant message carries
+                    # nothing worth persisting.
 
         except asyncio.CancelledError:
             # /stop (or teardown) cancelled the drain mid-turn — persist
@@ -3454,7 +2690,14 @@ class AgentEngine:
     def _start_idle_watcher(
         self, session_id: str, client: Any, source: str,
     ) -> None:
-        """Spawn the idle stream watcher for a freshly connected client."""
+        """Spawn the idle stream watcher for a freshly connected client.
+
+        No-op for backends without an idle stream (codex has no
+        autonomous turns — the watcher would only burn a poll loop).
+        """
+        backend = self._backend_for_live_session(session_id)
+        if not backend.capabilities.supports_idle_stream:
+            return
         self._stop_idle_watcher(session_id)
         channel = self._active_channel.get(session_id)
         self._idle_watchers[session_id] = asyncio.create_task(
@@ -3496,8 +2739,8 @@ class AgentEngine:
                     return  # replaced/discarded — new client gets a new watcher
                 if self.sessions.is_running(session_id):
                     continue  # run() owns the stream right now
-                if self._sdk_buffer_used(client) <= 0:
-                    if self._is_client_dead(client):
+                if client.buffer_used() <= 0:
+                    if not client.is_alive():
                         return
                     continue
 
@@ -3654,7 +2897,7 @@ class AgentEngine:
                 session_id=session_id,
                 user_message=prompt,
                 source="cron",
-                model=model or self.config.agent.cron_model,
+                model=model,  # backend default_model(source) fills cron defaults
             )
         finally:
             await self._teardown_oneshot_client(session_id)
@@ -3692,7 +2935,7 @@ class AgentEngine:
                 session_id=session_id,
                 user_message=prompt,
                 source="cron",
-                model=model or self.config.agent.cron_model,
+                model=model,  # backend default_model(source) fills cron defaults
             )
         finally:
             # The session is reused by the next run (until rotation), which
@@ -3721,7 +2964,7 @@ class AgentEngine:
                 session_id=session_id,
                 user_message=prompt,
                 source="hook",
-                model=model or self.config.agent.cron_model,
+                model=model,  # backend default_model(source) fills cron defaults
             )
         finally:
             await self._teardown_oneshot_client(session_id)

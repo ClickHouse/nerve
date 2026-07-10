@@ -7,13 +7,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from nerve.agent.backends.claude import ClaudeBackend
 from nerve.agent.cache_policy import (
     build_ttl_report,
     cache_ttl_env,
     estimate_live_ttl_delta,
     resolve_cache_ttl,
 )
-from nerve.agent.engine import AgentEngine
 from nerve.config import AgentConfig
 
 # ---------------------------------------------------------------------------
@@ -162,12 +162,11 @@ class TestResolveAutoCadence:
 
 
 # ---------------------------------------------------------------------------
-# Engine env wiring — the switch reaches the CLI subprocess iff resolved 1h
+# Backend env wiring — the switch reaches the CLI subprocess iff resolved 1h
 # ---------------------------------------------------------------------------
 
-def _make_env_engine(is_bedrock: bool = False) -> AgentEngine:
-    engine = AgentEngine.__new__(AgentEngine)
-    engine.config = SimpleNamespace(
+def _make_env_backend(is_bedrock: bool = False) -> ClaudeBackend:
+    config = SimpleNamespace(
         provider=SimpleNamespace(
             is_bedrock=is_bedrock, aws_region="", aws_profile="",
             aws_access_key_id="", aws_secret_access_key="",
@@ -175,28 +174,28 @@ def _make_env_engine(is_bedrock: bool = False) -> AgentEngine:
         proxy=SimpleNamespace(enabled=False, host="", port=0),
         effective_api_key="",
     )
-    return engine
+    return ClaudeBackend(SimpleNamespace(config=config))
 
 
 def test_build_env_5m_has_no_cache_flag():
-    env = _make_env_engine()._build_env(cache_ttl="5m")
+    env = _make_env_backend()._build_env(cache_ttl="5m")
     assert "ENABLE_PROMPT_CACHING_1H" not in env
     assert "FORCE_PROMPT_CACHING_5M" not in env  # never force upstream off
 
 
 def test_build_env_1h_sets_cache_flag():
-    env = _make_env_engine()._build_env(cache_ttl="1h")
+    env = _make_env_backend()._build_env(cache_ttl="1h")
     assert env["ENABLE_PROMPT_CACHING_1H"] == "1"
 
 
 def test_build_env_1h_bedrock_sets_bedrock_flag():
-    env = _make_env_engine(is_bedrock=True)._build_env(cache_ttl="1h")
+    env = _make_env_backend(is_bedrock=True)._build_env(cache_ttl="1h")
     assert env["ENABLE_PROMPT_CACHING_1H"] == "1"
     assert env["ENABLE_PROMPT_CACHING_1H_BEDROCK"] == "1"
 
 
 def test_build_env_default_is_5m():
-    env = _make_env_engine()._build_env()
+    env = _make_env_backend()._build_env()
     assert "ENABLE_PROMPT_CACHING_1H" not in env
 
 

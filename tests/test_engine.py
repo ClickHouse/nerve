@@ -1,14 +1,16 @@
-"""Tests for nerve.agent.engine — pure helpers (no SDK state)."""
+"""Tests for nerve.agent.engine and nerve.agent.backends.claude — pure
+helpers (no SDK subprocess)."""
 
 import asyncio
 import os
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage
+from claude_agent_sdk import AssistantMessage, TextBlock
 
+from nerve.agent.backends.base import SessionSpec
+from nerve.agent.backends.claude import ClaudeBackend, ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
 from nerve.config import AgentConfig
 
@@ -53,12 +55,12 @@ from nerve.config import AgentConfig
     ],
 )
 def test_effective_effort(value, model, expected):
-    assert AgentEngine._effective_effort(value, model) == expected
+    assert ClaudeBackend._effective_effort(value, model) == expected
 
 
 def test_effective_effort_model_default_none():
     # Signature symmetry with _parse_thinking_config
-    assert AgentEngine._effective_effort("max") == "max"
+    assert ClaudeBackend._effective_effort("max") == "max"
 
 
 @pytest.mark.parametrize(
@@ -82,15 +84,15 @@ def test_base_effort_for_source_then_capped():
     # A cron turn at the default cron_effort stays "medium" after the model-cap
     # pass on Sonnet 4.6 (which tops out at "high", so medium is unaffected).
     base = AgentEngine._base_effort_for_source("cron", "max", "medium")
-    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "medium"
+    assert ClaudeBackend._effective_effort(base, "claude-sonnet-4-6") == "medium"
     # Sonnet 5 is not in the cap table, so cron_effort passes through unchanged.
-    assert AgentEngine._effective_effort(base, "claude-sonnet-5") == "medium"
+    assert ClaudeBackend._effective_effort(base, "claude-sonnet-5") == "medium"
     # An interactive turn keeps "max", which caps to "high" on Sonnet 4.6.
     base = AgentEngine._base_effort_for_source("web", "max", "medium")
-    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "high"
+    assert ClaudeBackend._effective_effort(base, "claude-sonnet-4-6") == "high"
     # A cron turn whose cron_effort is left at "max" still caps to the model max.
     base = AgentEngine._base_effort_for_source("cron", "max", "max")
-    assert AgentEngine._effective_effort(base, "claude-sonnet-4-6") == "high"
+    assert ClaudeBackend._effective_effort(base, "claude-sonnet-4-6") == "high"
 
 
 def test_agent_config_cron_effort_default_and_override():
@@ -103,7 +105,7 @@ def test_agent_config_cron_effort_default_and_override():
 
 
 # ---------------------------------------------------------------------------
-# _iter_response_with_timeout — hung-CLI detection
+# ClaudeClient.receive_turn — per-message idle timeout (hung-CLI detection)
 # ---------------------------------------------------------------------------
 
 
@@ -139,97 +141,129 @@ class _StubClient:
         return _gen()
 
 
+def _turn_client(sdk: _StubClient, session_id: str, idle_timeout: float) -> ClaudeClient:
+    """A ClaudeClient wired to a stub SDK (no subprocess)."""
+    client = ClaudeClient.__new__(ClaudeClient)
+    client._sdk = sdk
+    client._spec = SessionSpec(
+        session_id=session_id, source="web", model="m", effort="high",
+        system_prompt="", cwd="/tmp", idle_timeout=idle_timeout,
+    )
+    client._native_session_id = None
+    return client
+
+
+def _text_msg(text: str) -> AssistantMessage:
+    return AssistantMessage(content=[TextBlock(text=text)], model="claude-test")
+
+
+def _translated(messages: list) -> list:
+    """The normalized events the given SDK messages translate into."""
+    return [event for m in messages for event in translate_message(m)]
+
+
 @pytest.mark.asyncio
-async def test_iter_response_yields_messages_normally():
+async def test_receive_turn_yields_events_normally():
     """Fast SDK stream completes without timing out."""
-    client = _StubClient(["a", "b", "c"])
+    messages = [_text_msg("a"), _text_msg("b"), _text_msg("c")]
+    sdk = _StubClient(messages)
+    client = _turn_client(sdk, "sess-1", idle_timeout=5.0)
     seen = []
-    async for msg in AgentEngine._iter_response_with_timeout(
-        client, "sess-1", idle_timeout=5.0,
-    ):
-        seen.append(msg)
-    assert seen == ["a", "b", "c"]
+    async for event in client.receive_turn():
+        seen.append(event)
+    assert seen == _translated(messages)
     # Generator was closed cleanly when it ran to completion.
-    assert client.aclose_calls == 1
+    assert sdk.aclose_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_iter_response_raises_on_idle_timeout():
+async def test_receive_turn_raises_on_idle_timeout():
     """If the SDK goes silent past idle_timeout, raise TimeoutError."""
     # Yields one message, then hangs long enough to trip a 50ms timeout.
-    client = _StubClient(["a"], hang=True, hang_seconds=2.0)
+    messages = [_text_msg("a")]
+    sdk = _StubClient(messages, hang=True, hang_seconds=2.0)
+    client = _turn_client(sdk, "sess-2", idle_timeout=0.05)
     seen = []
     with pytest.raises(asyncio.TimeoutError):
-        async for msg in AgentEngine._iter_response_with_timeout(
-            client, "sess-2", idle_timeout=0.05,
-        ):
-            seen.append(msg)
-    # The first message arrived before the hang.
-    assert seen == ["a"]
+        async for event in client.receive_turn():
+            seen.append(event)
+    # The first message's events arrived before the hang.
+    assert seen == _translated(messages)
     # The underlying iterator was closed before the exception propagated.
-    assert client.aclose_calls == 1
+    assert sdk.aclose_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_iter_response_disabled_when_timeout_zero():
+async def test_receive_turn_disabled_when_timeout_zero():
     """idle_timeout <= 0 disables the timeout (legacy behaviour)."""
     # Hangs forever after 1 message.  Without a timeout we'd wait forever;
     # to verify "disabled" we wrap the whole call in our own short outer
     # timeout and assert that's what fired (not the inner one).
-    client = _StubClient(["a"], hang=True, hang_seconds=10.0)
+    messages = [_text_msg("a")]
+    sdk = _StubClient(messages, hang=True, hang_seconds=10.0)
+    client = _turn_client(sdk, "sess-3", idle_timeout=0)
     seen = []
     with pytest.raises(asyncio.TimeoutError):
         async with asyncio.timeout(0.1):
-            async for msg in AgentEngine._iter_response_with_timeout(
-                client, "sess-3", idle_timeout=0,
-            ):
-                seen.append(msg)
-    assert seen == ["a"]
+            async for event in client.receive_turn():
+                seen.append(event)
+    assert seen == _translated(messages)
     # Outer-cancel still triggers the finally block → aclose() runs.
-    assert client.aclose_calls == 1
+    assert sdk.aclose_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_iter_response_handles_empty_stream():
+async def test_receive_turn_handles_empty_stream():
     """Empty receive_response (e.g. CLI exits immediately) returns cleanly."""
-    client = _StubClient([])
+    sdk = _StubClient([])
+    client = _turn_client(sdk, "sess-4", idle_timeout=5.0)
     seen = []
-    async for msg in AgentEngine._iter_response_with_timeout(
-        client, "sess-4", idle_timeout=5.0,
-    ):
-        seen.append(msg)
+    async for event in client.receive_turn():
+        seen.append(event)
     assert seen == []
-    assert client.aclose_calls == 1
-# _sdk_resume_file_exists
+    assert sdk.aclose_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# ClaudeBackend.validate_resume_target
 # ---------------------------------------------------------------------------
 
-def _make_engine(workspace: str = "/root/nerve-workspace") -> AgentEngine:
-    """Minimal AgentEngine stub (only config.workspace is needed)."""
-    engine = AgentEngine.__new__(AgentEngine)
-    engine.config = SimpleNamespace(workspace=Path(workspace))
-    return engine
+def _make_backend() -> ClaudeBackend:
+    """Minimal ClaudeBackend (validate_resume_target reads no config)."""
+    return ClaudeBackend(SimpleNamespace(config=SimpleNamespace()))
 
 
-class TestSdkResumeFileExists:
+class TestValidateResumeTarget:
+    WORKSPACE = "/root/nerve-workspace"
+
     def test_returns_true_when_file_present(self):
-        engine = _make_engine()
-        with patch("nerve.agent.engine.os.path.isfile", return_value=True):
-            assert engine._sdk_resume_file_exists("some-session-id") is True
+        backend = _make_backend()
+        with patch("nerve.agent.backends.claude.os.path.isfile", return_value=True):
+            assert backend.validate_resume_target(
+                "some-session-id", self.WORKSPACE,
+            ) is True
 
     def test_returns_false_when_file_missing(self):
-        engine = _make_engine()
-        with patch("nerve.agent.engine.os.path.isfile", return_value=False):
-            assert engine._sdk_resume_file_exists("some-session-id") is False
+        backend = _make_backend()
+        with patch("nerve.agent.backends.claude.os.path.isfile", return_value=False):
+            assert backend.validate_resume_target(
+                "some-session-id", self.WORKSPACE,
+            ) is False
 
     def test_fail_open_on_exception(self):
         """Any unexpected error returns True rather than crashing the turn."""
-        engine = _make_engine()
-        with patch("nerve.agent.engine.os.path.isfile", side_effect=OSError("denied")):
-            assert engine._sdk_resume_file_exists("some-session-id") is True
+        backend = _make_backend()
+        with patch(
+            "nerve.agent.backends.claude.os.path.isfile",
+            side_effect=OSError("denied"),
+        ):
+            assert backend.validate_resume_target(
+                "some-session-id", self.WORKSPACE,
+            ) is True
 
     def test_path_encodes_workspace_slashes(self):
         """'/' in the workspace path are replaced with '-' in the projects subdir."""
-        engine = _make_engine("/root/nerve-workspace")
+        backend = _make_backend()
         captured: dict = {}
 
         def _capture(path: str) -> bool:
@@ -239,24 +273,27 @@ class TestSdkResumeFileExists:
         # Pin realpath to identity so this test exercises only the
         # slash-encoding, independent of any host symlinks.  Symlink
         # resolution itself is covered by the symlinked-workspace tests.
-        with patch("nerve.agent.engine.os.path.realpath", side_effect=lambda p: p), \
-             patch("nerve.agent.engine.os.path.isfile", side_effect=_capture):
-            engine._sdk_resume_file_exists("sid-abc")
+        with patch("nerve.agent.backends.claude.os.path.realpath",
+                   side_effect=lambda p: p), \
+             patch("nerve.agent.backends.claude.os.path.isfile",
+                   side_effect=_capture):
+            backend.validate_resume_target("sid-abc", "/root/nerve-workspace")
 
         assert "-root-nerve-workspace" in captured["path"]
         assert "sid-abc.jsonl" in captured["path"]
 
     def test_path_ends_with_jsonl(self):
         """The constructed path always ends with <session_id>.jsonl."""
-        engine = _make_engine("/workspace")
+        backend = _make_backend()
         captured: dict = {}
 
         def _capture(path: str) -> bool:
             captured["path"] = path
             return True
 
-        with patch("nerve.agent.engine.os.path.isfile", side_effect=_capture):
-            engine._sdk_resume_file_exists("myid")
+        with patch("nerve.agent.backends.claude.os.path.isfile",
+                   side_effect=_capture):
+            backend.validate_resume_target("myid", "/workspace")
 
         assert captured["path"].endswith("myid.jsonl")
 
@@ -283,8 +320,8 @@ class TestSdkResumeFileExists:
         proj_dir.mkdir(parents=True)
         (proj_dir / f"{sid}.jsonl").write_text("{}")
 
-        engine = _make_engine(str(link_ws))
-        assert engine._sdk_resume_file_exists(sid) is True
+        backend = _make_backend()
+        assert backend.validate_resume_target(sid, str(link_ws)) is True
 
     def test_symlinked_workspace_missing_returns_false(self, tmp_path, monkeypatch):
         """Symlinked workspace, but the .jsonl genuinely does not exist:
@@ -300,8 +337,8 @@ class TestSdkResumeFileExists:
         encoded = os.path.realpath(str(link_ws)).replace("/", "-")
         (fake_home / ".claude" / "projects" / encoded).mkdir(parents=True)
 
-        engine = _make_engine(str(link_ws))
-        assert engine._sdk_resume_file_exists("does-not-exist") is False
+        backend = _make_backend()
+        assert backend.validate_resume_target("does-not-exist", str(link_ws)) is False
 
     def test_falls_back_to_unresolved_path(self, tmp_path, monkeypatch):
         """If history lives under the unresolved (symlink) encoding, the
@@ -321,23 +358,29 @@ class TestSdkResumeFileExists:
         proj_dir.mkdir(parents=True)
         (proj_dir / f"{sid}.jsonl").write_text("{}")
 
-        engine = _make_engine(str(link_ws))
-        assert engine._sdk_resume_file_exists(sid) is True
+        backend = _make_backend()
+        assert backend.validate_resume_target(sid, str(link_ws)) is True
 
 
 # ---------------------------------------------------------------------------
-# _build_hooks — background-agent permission parity
+# ClaudeBackend._build_hooks — background-agent permission parity
 # ---------------------------------------------------------------------------
 
-def _make_hook_engine(background_agent_permissions: bool) -> AgentEngine:
-    """Minimal engine stub for exercising _build_hooks's PreToolUse wiring."""
-    engine = AgentEngine.__new__(AgentEngine)
-    engine.config = SimpleNamespace(
+def _make_hook_backend(background_agent_permissions: bool) -> ClaudeBackend:
+    """Minimal backend stub for exercising _build_hooks's PreToolUse wiring."""
+    config = SimpleNamespace(
         agent=SimpleNamespace(
             background_agent_permissions=background_agent_permissions,
         ),
     )
-    return engine
+    return ClaudeBackend(SimpleNamespace(config=config))
+
+
+def _hook_spec(session_id: str) -> SessionSpec:
+    return SessionSpec(
+        session_id=session_id, source="web", model="m", effort="high",
+        system_prompt="", cwd="/tmp",
+    )
 
 
 def _catch_all_grant_hook(hooks: dict):
@@ -354,8 +397,8 @@ class TestBuildHooksBackgroundPermissions:
 
     @pytest.mark.asyncio
     async def test_grants_non_interactive_tools_when_enabled(self):
-        engine = _make_hook_engine(True)
-        hooks = engine._build_hooks("sess-x")
+        backend = _make_hook_backend(True)
+        hooks = backend._build_hooks(_hook_spec("sess-x"))
         grant = _catch_all_grant_hook(hooks)
         assert grant is not None, "permission-grant hook should be registered"
 
@@ -369,8 +412,8 @@ class TestBuildHooksBackgroundPermissions:
 
     @pytest.mark.asyncio
     async def test_defers_interactive_and_read_when_enabled(self):
-        engine = _make_hook_engine(True)
-        grant = _catch_all_grant_hook(engine._build_hooks("sess-x"))
+        backend = _make_hook_backend(True)
+        grant = _catch_all_grant_hook(backend._build_hooks(_hook_spec("sess-x")))
 
         # Interactive tools defer to can_use_tool (pause / inject / deny):
         # the hook must NOT pre-decide them, or the web pause-for-input breaks.
@@ -385,8 +428,8 @@ class TestBuildHooksBackgroundPermissions:
 
     @pytest.mark.asyncio
     async def test_no_grant_hook_when_disabled(self):
-        engine = _make_hook_engine(False)
-        hooks = engine._build_hooks("sess-y")
+        backend = _make_hook_backend(False)
+        hooks = backend._build_hooks(_hook_spec("sess-y"))
         assert _catch_all_grant_hook(hooks) is None
         # Snapshot + image-validator hooks stay registered regardless.
         matchers = {m.matcher for m in hooks["PreToolUse"]}
@@ -436,7 +479,8 @@ def test_model_family_distinguishes_real_changes():
 
 # ---------------------------------------------------------------------------
 # _track_serving_model — downgrade / recovery detection via
-# _process_sdk_message (the shared user-run + autonomous-turn path)
+# translate_message + _process_agent_event (the shared user-run +
+# autonomous-turn path)
 # ---------------------------------------------------------------------------
 
 
@@ -455,6 +499,16 @@ def _assistant(model: str, parent_tool_use_id: str | None = None) -> AssistantMe
     )
 
 
+async def _process_sdk_message(engine: AgentEngine, session_id, message, st) -> bool:
+    """Feed one SDK message through the live pipeline: translate it into
+    normalized events, dispatch each to the engine. Returns True when the
+    message completed the turn (TurnCompleted event)."""
+    done = False
+    for event in translate_message(message):
+        done = await engine._process_agent_event(session_id, event, st)
+    return done
+
+
 class TestServingModelTracking:
     @pytest.mark.asyncio
     async def test_first_message_downgrade_fires_event(self):
@@ -462,8 +516,8 @@ class TestServingModelTracking:
         st = _TurnState()
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast_model_changed = AsyncMock()
-            await engine._process_sdk_message(
-                "s1", _assistant("claude-opus-4-8-20260115"), st,
+            await _process_sdk_message(
+                engine, "s1", _assistant("claude-opus-4-8-20260115"), st,
             )
         assert st.last_model == "claude-opus-4-8-20260115"
         assert st.ordered_blocks == [{
@@ -485,8 +539,8 @@ class TestServingModelTracking:
         st = _TurnState()
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast_model_changed = AsyncMock()
-            await engine._process_sdk_message(
-                "s1", _assistant("claude-fable-5-20260601"), st,
+            await _process_sdk_message(
+                engine, "s1", _assistant("claude-fable-5-20260601"), st,
             )
         assert st.ordered_blocks == []
         bc.broadcast_model_changed.assert_not_awaited()
@@ -500,8 +554,8 @@ class TestServingModelTracking:
         st = _TurnState()
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast_model_changed = AsyncMock()
-            await engine._process_sdk_message(
-                "s1", _assistant("claude-fable-5-20260601"), st,
+            await _process_sdk_message(
+                engine, "s1", _assistant("claude-fable-5-20260601"), st,
             )
         assert st.ordered_blocks == [{
             "type": "model_change",
@@ -516,11 +570,11 @@ class TestServingModelTracking:
         st = _TurnState()
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast_model_changed = AsyncMock()
-            await engine._process_sdk_message(
-                "s1", _assistant("claude-fable-5-20260601"), st,
+            await _process_sdk_message(
+                engine, "s1", _assistant("claude-fable-5-20260601"), st,
             )
-            await engine._process_sdk_message(
-                "s1", _assistant("claude-opus-4-8-20260115"), st,
+            await _process_sdk_message(
+                engine, "s1", _assistant("claude-opus-4-8-20260115"), st,
             )
         # Only the second message fires; "from" is the observed dated id,
         # not the configured alias.
@@ -534,8 +588,8 @@ class TestServingModelTracking:
         st = _TurnState()
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast_model_changed = AsyncMock()
-            await engine._process_sdk_message(
-                "s1",
+            await _process_sdk_message(
+                engine, "s1",
                 _assistant("claude-haiku-4-5", parent_tool_use_id="tu_1"),
                 st,
             )
@@ -552,8 +606,8 @@ class TestServingModelTracking:
         st = _TurnState()
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast_model_changed = AsyncMock()
-            await engine._process_sdk_message(
-                "s1", _assistant("claude-opus-4-8-20260115"), st,
+            await _process_sdk_message(
+                engine, "s1", _assistant("claude-opus-4-8-20260115"), st,
             )
         # Nothing to compare against — record the baseline silently.
         assert st.ordered_blocks == []

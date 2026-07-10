@@ -22,7 +22,7 @@ from fastapi import HTTPException
 from starlette.types import Scope
 
 from nerve.config import NerveConfig
-from nerve.gateway.auth import decode_token
+from nerve.gateway.auth import MCP_AUDIENCE, MCP_SESSION_CLAIM, decode_token
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,31 @@ def _extract_token_from_scope(scope: Scope) -> str:
     return ""
 
 
+def decode_mcp_token(token: str, jwt_secret: str) -> dict:
+    """Decode a token for the MCP endpoint.
+
+    Two token shapes are accepted:
+
+    * ordinary gateway tokens (no ``aud``) — external clients (Codex CLI,
+      Claude Code) that logged in via the web-UI flow; their tool calls
+      attribute to satellite sessions.
+    * session-bound tokens (``aud=nerve-mcp`` + ``nerve_session_id``) —
+      minted by :func:`nerve.gateway.auth.create_mcp_session_token` for
+      backend-managed agent subprocesses; their tool calls bind to the
+      real engine session.
+
+    PyJWT rejects an ``aud``-carrying token unless the audience is
+    requested, and rejects an aud-less token when one is — hence the
+    two-step decode.
+    """
+    try:
+        return decode_token(token, jwt_secret)
+    except HTTPException:
+        pass
+    # Not a plain token — try the MCP-audience shape (raises on failure).
+    return decode_token(token, jwt_secret, audience=MCP_AUDIENCE)
+
+
 def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict | None:
     """Validate the JWT on an incoming MCP request.
 
@@ -72,8 +97,22 @@ def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict | None:
         raise McpAuthError("Missing token")
 
     try:
-        return decode_token(token, config.auth.jwt_secret)
+        return decode_mcp_token(token, config.auth.jwt_secret)
     except HTTPException as e:
         # decode_token raises FastAPI HTTPException; translate so the
         # caller doesn't need to import fastapi.
         raise McpAuthError(e.detail or "Invalid token")
+
+
+def bound_session_id(payload: dict | None) -> str | None:
+    """The engine session a decoded MCP token is bound to (or ``None``).
+
+    Only ``aud=nerve-mcp`` tokens carry the claim; ordinary tokens (and
+    dev mode's ``None`` payload) return ``None`` → satellite attribution.
+    """
+    if not payload:
+        return None
+    if payload.get("aud") != MCP_AUDIENCE:
+        return None
+    session_id = payload.get(MCP_SESSION_CLAIM)
+    return str(session_id) if session_id else None

@@ -4,9 +4,10 @@ The CLI continues sessions on its own (background task settles →
 task_notification → full agent turn inside the subprocess).  These tests
 cover the engine pieces that surface that activity:
 
-- ``_handle_system_message`` — task lifecycle → background-task chips
+- ``_handle_system_event`` — task lifecycle → background-task chips
 - ``_drain_pending_messages`` — buffered autonomous turns → UI + DB
-- ``_sdk_buffer_used`` — non-destructive buffer probe
+  (consumed through the client's idle-event API)
+- ``ClaudeClient.buffer_used`` — non-destructive buffer probe
 """
 
 import asyncio
@@ -19,6 +20,8 @@ import pytest
 
 from claude_agent_sdk import ResultMessage, SystemMessage
 
+from nerve.agent.backends.base import SessionSpec
+from nerve.agent.backends.claude import ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState
 
 
@@ -69,8 +72,31 @@ class _FakeStream:
         self._send.send_nowait(item)
 
 
-def _fake_client(stream: _FakeStream):
-    return SimpleNamespace(_query=SimpleNamespace(_message_receive=stream))
+def _fake_client(stream: _FakeStream) -> ClaudeClient:
+    """A real ClaudeClient wired to a fake SDK whose receive stream is the
+    given _FakeStream — the drain/watcher consume the client's idle-event
+    API (try_receive_idle_events / receive_idle_events / buffer_used /
+    is_alive) exactly as in production, fed by the same raw SDK payloads
+    as before the backend split."""
+    client = ClaudeClient.__new__(ClaudeClient)
+    client._spec = SessionSpec(
+        session_id="s1", source="web", model="m", effort="high",
+        system_prompt="", cwd="/tmp",
+    )
+    client._sdk = SimpleNamespace(
+        _query=SimpleNamespace(_message_receive=stream),
+        # A live subprocess (returncode None) so is_alive() reports True.
+        _transport=SimpleNamespace(_process=SimpleNamespace(returncode=None)),
+    )
+    client._native_session_id = None
+    return client
+
+
+async def _handle_system_message(engine: AgentEngine, session_id, message) -> None:
+    """Route an SDK SystemMessage the way the live pipeline does: translate
+    it into a normalized SystemEvent, then hand it to the engine."""
+    for event in translate_message(message):
+        await engine._handle_system_event(session_id, event)
 
 
 def _sys_msg(subtype: str, **data) -> dict:
@@ -104,25 +130,29 @@ def _result_msg() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# _sdk_buffer_used
+# ClaudeClient.buffer_used
 # ---------------------------------------------------------------------------
 
 
-def test_sdk_buffer_used_counts_pending():
+def test_buffer_used_counts_pending():
     stream = _FakeStream([_sys_msg("task_updated", task_id="t1", patch={})])
     client = _fake_client(stream)
-    assert AgentEngine._sdk_buffer_used(client) == 1
+    assert client.buffer_used() == 1
     stream.receive_nowait()
-    assert AgentEngine._sdk_buffer_used(client) == 0
+    assert client.buffer_used() == 0
 
 
-def test_sdk_buffer_used_handles_missing_internals():
-    assert AgentEngine._sdk_buffer_used(SimpleNamespace()) == 0
-    assert AgentEngine._sdk_buffer_used(SimpleNamespace(_query=None)) == 0
+def test_buffer_used_handles_missing_internals():
+    client = _fake_client(_FakeStream([]))
+    client._sdk = SimpleNamespace()
+    assert client.buffer_used() == 0
+    client._sdk = SimpleNamespace(_query=None)
+    assert client.buffer_used() == 0
 
 
 # ---------------------------------------------------------------------------
-# _handle_system_message → background-task chips
+# _handle_system_event → background-task chips (SystemMessage fixtures fed
+# through translate_message, as in the live pipeline)
 # ---------------------------------------------------------------------------
 
 
@@ -143,7 +173,7 @@ async def test_task_lifecycle_updates_registry_and_broadcasts():
                 description="run tests", task_type="local_bash",
             ),
         )
-        await engine._handle_system_message("s1", started)
+        await _handle_system_message(engine, "s1", started)
 
         reg = engine._bg_task_registry["s1"]
         assert reg["t1"]["status"] == "running"
@@ -156,7 +186,7 @@ async def test_task_lifecycle_updates_registry_and_broadcasts():
                 "task_notification", task_id="t1", status="completed",
             ),
         )
-        await engine._handle_system_message("s1", notified)
+        await _handle_system_message(engine, "s1", notified)
         assert reg["t1"]["status"] == "done"
 
     assert len(events) == 2
@@ -173,7 +203,7 @@ async def test_task_failed_maps_to_failed_status():
             subtype="task_notification",
             data=_sys_msg("task_notification", task_id="t9", status="failed"),
         )
-        await engine._handle_system_message("s1", msg)
+        await _handle_system_message(engine, "s1", msg)
     assert engine._bg_task_registry["s1"]["t9"]["status"] == "failed"
 
 
@@ -189,7 +219,7 @@ async def test_agent_task_type_uses_agent_tool():
                 description="explore repo", task_type="local_agent",
             ),
         )
-        await engine._handle_system_message("s1", msg)
+        await _handle_system_message(engine, "s1", msg)
     assert engine._bg_task_registry["s1"]["t2"]["tool"] == "Agent"
 
 
@@ -198,8 +228,8 @@ async def test_non_task_subtypes_ignored():
     engine = _make_engine()
     with patch("nerve.agent.engine.broadcaster") as bc:
         bc.broadcast = AsyncMock()
-        await engine._handle_system_message(
-            "s1", SystemMessage(subtype="init", data={"type": "system"}),
+        await _handle_system_message(
+            engine, "s1", SystemMessage(subtype="init", data={"type": "system"}),
         )
         bc.broadcast.assert_not_called()
     assert "s1" not in engine._bg_task_registry
@@ -221,7 +251,7 @@ async def test_workflow_task_emits_progress_and_persists():
         bc.broadcast_workflow_progress = AsyncMock(
             side_effect=lambda sid, tid, snap: wf_events.append((tid, snap)),
         )
-        await engine._handle_system_message("s1", SystemMessage(
+        await _handle_system_message(engine, "s1", SystemMessage(
             subtype="task_started",
             data=_sys_msg(
                 "task_started", task_id="wt", tool_use_id="wf-tool",
@@ -229,7 +259,7 @@ async def test_workflow_task_emits_progress_and_persists():
                 description="tiny workflow",
             ),
         ))
-        await engine._handle_system_message("s1", SystemMessage(
+        await _handle_system_message(engine, "s1", SystemMessage(
             subtype="task_progress",
             data=_sys_msg(
                 "task_progress", task_id="wt", tool_use_id="wf-tool",
@@ -241,7 +271,7 @@ async def test_workflow_task_emits_progress_and_persists():
                 ],
             ),
         ))
-        await engine._handle_system_message("s1", SystemMessage(
+        await _handle_system_message(engine, "s1", SystemMessage(
             subtype="task_updated",
             data=_sys_msg(
                 "task_updated", task_id="wt", tool_use_id="wf-tool",
@@ -357,7 +387,7 @@ async def test_drain_processes_full_autonomous_turn():
     assert {"type": "session_running", "session_id": "s1",
             "is_running": False} in events
     # Buffer fully consumed — nothing left to desync the next turn
-    assert AgentEngine._sdk_buffer_used(client) == 0
+    assert client.buffer_used() == 0
 
 
 @pytest.mark.asyncio
@@ -398,7 +428,7 @@ async def test_drain_consumes_stray_result_without_turn():
 
     assert turns == 0
     assert finalized == []
-    assert AgentEngine._sdk_buffer_used(client) == 0
+    assert client.buffer_used() == 0
 
 
 @pytest.mark.asyncio
@@ -530,12 +560,13 @@ async def test_drain_multiple_turns_in_one_call():
 
 
 # ---------------------------------------------------------------------------
-# _process_sdk_message — ResultMessage handling via shared path
+# _process_agent_event — ResultMessage (translated to TurnCompleted) via the
+# shared path
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_process_sdk_message_returns_true_on_result():
+async def test_process_agent_event_returns_true_on_result():
     engine = _make_engine()
     st = _TurnState()
     result = ResultMessage(
@@ -543,7 +574,9 @@ async def test_process_sdk_message_returns_true_on_result():
         is_error=False, num_turns=1, session_id="sdk-9",
         total_cost_usd=0.5, usage={"input_tokens": 1},
     )
-    done = await engine._process_sdk_message("s1", result, st)
+    done = False
+    for event in translate_message(result):
+        done = await engine._process_agent_event("s1", event, st)
     assert done is True
     assert st.sdk_session_id == "sdk-9"
     assert st.last_usage == {"input_tokens": 1}
@@ -648,7 +681,7 @@ async def test_idle_watcher_resumes_parked_session_on_background_completion():
                "tool": "Bash", "status": "running"},
     }
     assert engine._has_live_background_tasks("s1") is True
-    engine._is_client_dead = lambda _c: False
+    # (the fake client's subprocess reports alive — see _fake_client)
     engine.sessions = SimpleNamespace(
         get_client=lambda _sid: client,
         is_running=lambda _sid: False,

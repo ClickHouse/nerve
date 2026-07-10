@@ -107,6 +107,7 @@ def build_session_mcp_server(
     ctx: ToolContext,
     *,
     include_hoa: bool = False,
+    exclude: "set[str] | None" = None,
 ) -> dict:
     """Build the per-session in-process MCP server.
 
@@ -114,13 +115,22 @@ def build_session_mcp_server(
     ask_user/react/etc. always reference the correct session — no shared
     global, no race under concurrent sessions.
 
+    ``exclude`` drops tools by name — used by agent backends to hide
+    tools that duplicate a runtime built-in (e.g. the Claude backend
+    excludes ``schedule_wakeup``; the CLI's ScheduleWakeup covers it).
+
     The returned dict matches the SDK's ``McpSdkServerConfig`` shape;
     ``alwaysLoad`` is set to ``True`` so the Claude Code CLI skips tool-
     search deferral on first turn (requires CLI >= 2.1.121; silently
     ignored on older versions). The nerve MCP's tools are used on almost
     every turn — deferring them adds a ToolSearch round-trip for no benefit.
     """
-    sdk_tools = [_wrap_for_sdk(spec, ctx) for spec in registry.list(include_hoa=include_hoa)]
+    excluded = exclude or set()
+    sdk_tools = [
+        _wrap_for_sdk(spec, ctx)
+        for spec in registry.list(include_hoa=include_hoa)
+        if spec.name not in excluded
+    ]
     config = create_sdk_mcp_server(name="nerve", version="1.0.0", tools=sdk_tools)
     config["alwaysLoad"] = True  # type: ignore[typeddict-unknown-key]
     return config

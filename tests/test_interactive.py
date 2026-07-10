@@ -1,4 +1,9 @@
-"""Tests for the interactive tool handler: timeout, waiting-input indicator."""
+"""Tests for the interactive tool handler: timeout, waiting-input indicator.
+
+The hub itself is backend-neutral; the SDK ``can_use_tool`` surface lives in
+``ClaudeToolPermissions``, which translates the hub's ``InteractionOutcome``
+into ``PermissionResultAllow``/``PermissionResultDeny``.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import asyncio
 import pytest
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
+from nerve.agent.backends.claude import ClaudeToolPermissions
 from nerve.agent.interactive import (
     INTERACTION_TIMEOUT,
     InteractiveToolHandler,
@@ -59,7 +65,9 @@ async def test_awaiting_input_broadcast_and_registry():
     register_handler("sess-await", handler)
     try:
         task = asyncio.create_task(
-            handler._handle_interactive("AskUserQuestion", {"questions": []})
+            ClaudeToolPermissions(handler).can_use_tool(
+                "AskUserQuestion", {"questions": []}, None,
+            )
         )
         await _wait_until_pending(handler)
 
@@ -101,7 +109,9 @@ async def test_resolve_broadcasts_interaction_resolved():
     register_handler("sess-resolved", handler)
     try:
         task = asyncio.create_task(
-            handler._handle_interactive("AskUserQuestion", {"questions": []})
+            ClaudeToolPermissions(handler).can_use_tool(
+                "AskUserQuestion", {"questions": []}, None,
+            )
         )
         await _wait_until_pending(handler)
         interaction = next(m for (_c, m) in messages if m["type"] == "interaction")
@@ -130,7 +140,9 @@ async def test_cancel_all_clears_awaiting():
     handler = InteractiveToolHandler("sess-cancel", broadcast, interactive_capable=True)
     register_handler("sess-cancel", handler)
     try:
-        task = asyncio.create_task(handler._handle_interactive("EnterPlanMode", {}))
+        task = asyncio.create_task(
+            ClaudeToolPermissions(handler).can_use_tool("EnterPlanMode", {}, None)
+        )
         await _wait_until_pending(handler)
         assert "sess-cancel" in get_awaiting_ids()
 

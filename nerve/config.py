@@ -131,6 +131,15 @@ class PromptRewriteConfig:
 
 @dataclass
 class AgentConfig:
+    # Agent backend for NEW sessions: "claude" (Claude Agent SDK) or
+    # "codex" (OpenAI Codex app-server; see CodexConfig). Existing
+    # sessions are sticky — the backend they were created with is stored
+    # in sessions.backend and always wins over this setting.
+    backend: str = "claude"
+    # Backend for NEW cron/hook sessions; empty → same as `backend`.
+    # Wakeup turns fire on existing sessions and inherit their stored
+    # backend — this only affects freshly minted cron/hook sessions.
+    cron_backend: str = ""
     model: str = "claude-opus-4-8"
     cron_model: str = "claude-sonnet-4-6"
     title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
@@ -180,9 +189,16 @@ class AgentConfig:
     background_agent_permissions: bool = True
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
+    @property
+    def resolved_cron_backend(self) -> str:
+        """Backend used for new cron/hook sessions."""
+        return self.cron_backend or self.backend
+
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
         return cls(
+            backend=str(d.get("backend", "claude")).strip().lower(),
+            cron_backend=str(d.get("cron_backend") or "").strip().lower(),
             model=d.get("model", "claude-opus-4-8"),
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
             title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
@@ -892,6 +908,108 @@ class ExternalAgentsConfig:
         )
 
 
+_CODEX_APPROVAL_POLICIES = ("never", "on-request", "untrusted")
+_CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+
+# $/1M tokens; cached input bills at the discounted rate. Config values
+# under codex.pricing REPLACE entries per model key (dict deep-merge).
+_DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
+    "gpt-5.6-codex":  {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
+    "gpt-5.6-sol":    {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
+    "gpt-5.6-terra":  {"input": 2.5,  "cached_input": 0.25, "output": 15.0},
+    "gpt-5.6-luna":   {"input": 1.0,  "cached_input": 0.1,  "output": 6.0},
+}
+
+
+@dataclass
+class CodexConfig:
+    """OpenAI Codex backend (``codex app-server``) settings.
+
+    Active only when ``agent.backend`` / ``agent.cron_backend`` is
+    "codex" (or a session was created on it). See
+    docs/plans/codex-backend.md.
+    """
+
+    bin_path: str = "codex"                 # PATH-resolved codex binary
+    home_dir: str = "~/.nerve/codex"        # isolated CODEX_HOME (auth/config/sessions)
+    model: str = "gpt-5.6-codex"
+    cron_model: str = ""                    # empty → model
+    auth: str = "chatgpt"                   # chatgpt | api_key
+    api_key: str = ""                       # literal key (config.local.yaml)
+    api_key_env: str = "OPENAI_API_KEY"     # env fallback when auth=api_key
+    sandbox: str = "danger-full-access"     # read-only | workspace-write | danger-full-access
+    approval_policy: str = "never"          # never | on-request | untrusted
+    # nerve effort vocabulary -> codex reasoning effort string
+    effort_map: dict[str, str] = field(default_factory=lambda: {
+        "max": "xhigh", "xhigh": "xhigh", "high": "high",
+        "medium": "medium", "low": "low",
+    })
+    web_search: bool = True
+    tool_timeout_sec: int = 3600            # nerve MCP calls may block on ask_user
+    # Per-notification hang detection; 0/empty → agent.cli_idle_timeout_seconds
+    turn_idle_timeout_seconds: int = 0
+    pricing: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {k: dict(v) for k, v in _DEFAULT_CODEX_PRICING.items()},
+    )
+    # Arbitrary codex config-override passthrough (-c key=value at spawn)
+    extra_config: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CodexConfig":
+        pricing = {k: dict(v) for k, v in _DEFAULT_CODEX_PRICING.items()}
+        raw_pricing = d.get("pricing") or {}
+        if isinstance(raw_pricing, dict):
+            for model_key, prices in raw_pricing.items():
+                if isinstance(prices, dict):
+                    pricing[str(model_key)] = {
+                        str(k): float(v) for k, v in prices.items()
+                    }
+        effort_map = {
+            "max": "xhigh", "xhigh": "xhigh", "high": "high",
+            "medium": "medium", "low": "low",
+        }
+        raw_effort = d.get("effort_map") or {}
+        if isinstance(raw_effort, dict):
+            effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
+        return cls(
+            bin_path=str(d.get("bin_path", "codex")),
+            home_dir=str(d.get("home_dir", "~/.nerve/codex")),
+            model=str(d.get("model", "gpt-5.6-codex")),
+            cron_model=str(d.get("cron_model") or ""),
+            auth=str(d.get("auth", "chatgpt")).strip().lower(),
+            api_key=str(d.get("api_key") or ""),
+            api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
+            sandbox=str(d.get("sandbox", "danger-full-access")),
+            approval_policy=str(d.get("approval_policy", "never")),
+            effort_map=effort_map,
+            web_search=bool(d.get("web_search", True)),
+            tool_timeout_sec=int(d.get("tool_timeout_sec", 3600)),
+            turn_idle_timeout_seconds=int(d.get("turn_idle_timeout_seconds", 0)),
+            pricing=pricing,
+            extra_config=dict(d.get("extra_config") or {}),
+        )
+
+    def validate(self) -> list[str]:
+        """Config-load-time validation; returns human-readable problems."""
+        problems: list[str] = []
+        if self.auth not in ("chatgpt", "api_key"):
+            problems.append(
+                f"codex.auth must be 'chatgpt' or 'api_key', got {self.auth!r}"
+            )
+        if self.approval_policy not in _CODEX_APPROVAL_POLICIES:
+            problems.append(
+                f"codex.approval_policy must be one of "
+                f"{_CODEX_APPROVAL_POLICIES}, got {self.approval_policy!r} "
+                "(note: 'on-failure' is not accepted by the app-server v2 API)"
+            )
+        if self.sandbox not in _CODEX_SANDBOX_MODES:
+            problems.append(
+                f"codex.sandbox must be one of {_CODEX_SANDBOX_MODES}, "
+                f"got {self.sandbox!r}"
+            )
+        return problems
+
+
 @dataclass
 class McpServerConfig:
     """External MCP server configuration.
@@ -1143,6 +1261,7 @@ class NerveConfig:
     docker: DockerConfig = field(default_factory=DockerConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    codex: CodexConfig = field(default_factory=CodexConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
@@ -1246,8 +1365,60 @@ class NerveConfig:
             timeout=timeout,
         )
 
+    _KNOWN_BACKENDS = ("claude", "codex")
+
+    def _validate_backend_config(self) -> None:
+        """Fail fast on unusable backend settings (called from from_dict).
+
+        Unknown backend names are hard errors — a typo here would
+        otherwise surface as a confusing per-session failure. Codex
+        sub-config problems are hard errors only when a codex backend is
+        actually selected; otherwise the section is inert.
+        """
+        for label, name in (
+            ("agent.backend", self.agent.backend),
+            ("agent.cron_backend", self.agent.resolved_cron_backend),
+        ):
+            if name not in self._KNOWN_BACKENDS:
+                raise ValueError(
+                    f"{label} must be one of {self._KNOWN_BACKENDS}, got {name!r}"
+                )
+        codex_selected = "codex" in (
+            self.agent.backend, self.agent.resolved_cron_backend,
+        )
+        problems = self.codex.validate()
+        if problems:
+            if codex_selected:
+                raise ValueError("; ".join(problems))
+            for p in problems:
+                logger.warning("Inactive codex config problem: %s", p)
+        if codex_selected:
+            if self.codex.model not in {
+                k for k in self.codex.pricing
+            } and not any(
+                key.lower() in self.codex.model.lower()
+                for key in self.codex.pricing
+            ):
+                logger.warning(
+                    "codex.model %r has no codex.pricing entry — turn costs "
+                    "will be recorded as unknown (tokens still tracked)",
+                    self.codex.model,
+                )
+            if self.ollama.enabled:
+                logger.warning(
+                    "agent.backend=codex with ollama.enabled: Ollama models "
+                    "cannot be served by the codex backend; sessions "
+                    "explicitly selecting an Ollama model will fail",
+                )
+
     @classmethod
     def from_dict(cls, d: dict) -> NerveConfig:
+        config = cls._build_from_dict(d)
+        config._validate_backend_config()
+        return config
+
+    @classmethod
+    def _build_from_dict(cls, d: dict) -> NerveConfig:
         return cls(
             workspace=_expand_path(d.get("workspace", "~/nerve-workspace")) or Path("~/nerve-workspace"),
             timezone=d.get("timezone", "America/New_York"),
@@ -1270,6 +1441,7 @@ class NerveConfig:
             docker=DockerConfig.from_dict(d.get("docker", {})),
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             ollama=OllamaConfig.from_dict(d.get("ollama", {})),
+            codex=CodexConfig.from_dict(d.get("codex", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),

@@ -1,0 +1,7 @@
+{
+  "codex_cli_version": "0.144.1",
+  "generated_with": "codex app-server generate-json-schema",
+  "verified_date": "2026-07-10",
+  "v2_schema_sha256": "eb10053ceba382660c8c5023d2b74ce80776e1997c0a606b5153b467e186a30a",
+  "notes": "Shapes nerve/agent/backends/codex/ was verified against. Regenerate and diff when bumping the codex-cli min version."
+}

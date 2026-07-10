@@ -51,6 +51,48 @@ from any working directory:
 
 **Note:** The engine uses a `can_use_tool` callback (not `bypassPermissions`) so that interactive tools (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`) can pause mid-turn for user input. All other tools are auto-approved. See [sdk-sessions.md](sdk-sessions.md#permissions--interactive-tools) for details.
 
+## Agent Backends (claude / codex)
+
+Nerve can run sessions on two agent runtimes. The backend is selected per
+NEW session and is **sticky**: it's stamped into `sessions.backend` at first
+client build and always wins over config afterwards, so flipping the
+defaults never crosses an existing conversation (or its wakeups) onto a
+runtime that can't resume it. See `docs/plans/codex-backend.md`.
+
+```yaml
+agent:
+  backend: claude          # claude | codex — new interactive sessions
+  cron_backend: null       # null → backend; new cron/hook sessions only
+
+codex:                     # active when a codex backend is selected
+  bin_path: codex          # codex-cli >= 0.144 on PATH
+  home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
+  model: gpt-5.6-codex
+  cron_model: null         # null → model
+  auth: chatgpt            # chatgpt | api_key
+  api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
+  sandbox: danger-full-access   # read-only | workspace-write | danger-full-access
+  approval_policy: never        # never | on-request | untrusted
+  web_search: true
+  tool_timeout_sec: 3600        # nerve MCP calls may block on ask_user
+  turn_idle_timeout_seconds: null  # null → agent.cli_idle_timeout_seconds
+  pricing:                      # $/1M tokens — cost is None for unlisted models
+    gpt-5.6-codex: {input: 5.0, cached_input: 0.5, output: 30.0}
+  extra_config: {}              # arbitrary codex -c key=value passthrough
+```
+
+Setup for `auth: chatgpt`: run `CODEX_HOME=~/.nerve/codex codex login` once,
+then `scripts/codex_smoke.py` to verify end-to-end before flipping any
+backend default. Codex sessions reach nerve tools through the gateway's
+`/mcp/v1` endpoint with a session-bound token (minted automatically);
+`mcp_endpoint.enabled` must stay on.
+
+Notes: prompt-cache TTL policy, Claude Code plugins, Langfuse tracing and
+PDF inputs are claude-only (see the plan's §14 non-parity list). With the
+default `approval_policy: never` + full-access sandbox, codex sessions
+behave like claude's auto-approved tools; tightening the policy surfaces
+Approve/Decline cards in the web UI.
+
 ## Gateway
 
 | Key | Type | Default | Description |
