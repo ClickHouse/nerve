@@ -22,11 +22,11 @@ parser  → translator  → CodexIngester  ──▶  Nerve `messages` + `sessio
                                        broadcaster (live UI)
 ```
 
-Each Codex thread lands in a satellite session id'd
-`codex:<thread_uuid>`. The external MCP server (see
-[external-mcp.md](./external-mcp.md)) converges on the same id when
-Codex provides its thread UUID at MCP `initialize` time, so a tool call
-and the conversation it lives inside share one session row.
+Migration v039 maintains a `session_native_threads` mapping. A thread created
+by Nerve is ingested back into that same Nerve session; only otherwise-unknown
+threads fall back to a satellite session id'd `codex:<thread_uuid>`. Tool calls
+and transcript messages therefore share one row without relying on optional
+client metadata.
 
 ## Enabling
 
@@ -134,16 +134,11 @@ the newline is flushed.
 
 ## Convergence with the external MCP server
 
-When Codex calls a Nerve tool over MCP it normally creates a satellite
-session id'd `external:codex:<mcp_session_id>`. If the same Codex CLI
-exposes its thread UUID as `clientInfo.client_session_id` (or the
-SDK's equivalent), the satellite is created under `codex:<thread_id>`
-instead — exactly the id the rollout sync uses. The two ingestion
-paths then write into the same session row, and the
-`(session_id, external_id)` dedup ensures each tool call is recorded
-exactly once even when both paths see it.
-
-Without the thread UUID hint, both rows still exist for the same
-underlying conversation. Future work: have the external MCP server
-inspect Codex's `initialize` params for the thread UUID and adopt the
-convergent id automatically.
+Backend-managed Codex gets a session-bound MCP token, so its tool calls are
+attributed directly to the real Nerve session. Once app-server returns the
+thread ID, Nerve binds `(codex, thread_id)` to that session. Rollout ingestion
+looks up this mapping before creating anything, and external threads bind their
+fallback satellite on first sight. The `(session_id, external_id)` unique index
+then deduplicates the two ingestion paths. Archiving an external rollout only
+archives satellite sessions; it never changes the lifecycle of a Nerve-owned
+chat.

@@ -33,6 +33,7 @@ from nerve.gateway.routes import (
     external_agents,
     prompt_rewrite,
     models,
+    codex,
 )
 
 __all__ = [
@@ -63,4 +64,5 @@ def register_all_routes() -> APIRouter:
     router.include_router(external_agents.router)
     router.include_router(prompt_rewrite.router)
     router.include_router(models.router)
+    router.include_router(codex.router)
     return router

@@ -29,6 +29,7 @@ from nerve.agent.backends.events import (
     TextDelta,
     ThinkingDelta,
     ToolResult,
+    ToolOutputDelta,
     ToolUse,
     TurnCompleted,
 )
@@ -90,6 +91,7 @@ __all__ = [
     "TextDelta",
     "ThinkingDelta",
     "ToolResult",
+    "ToolOutputDelta",
     "ToolUse",
     "TransportDiedError",
     "TurnCompleted",

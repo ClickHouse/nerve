@@ -69,13 +69,20 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const newChatBackend = useChatStore(s => s.newChatBackend);
   const backendDefault = useChatStore(s => s.backendDefault);
   const chosenBackend = newChatBackend ?? backendDefault;
+  const sessions = useChatStore(s => s.sessions);
+  const activeBackend = isVirtualChat
+    ? (chosenBackend ?? 'claude')
+    : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
 
   // ── Model picker ──
   const availableModels = useChatStore(s => s.availableModels);
-  const selectedModel = useChatStore(s => s.selectedModel);
-  const modelsDefault = useChatStore(s => s.modelsDefault);
+  const selectedModels = useChatStore(s => s.selectedModels);
+  const modelDefaults = useChatStore(s => s.modelDefaults);
   const setSelectedModel = useChatStore(s => s.setSelectedModel);
   const loadModels = useChatStore(s => s.loadModels);
+  const scopedModels = availableModels.filter(m => m.backend === activeBackend);
+  const selectedModel = selectedModels[activeBackend] ?? null;
+  const modelsDefault = modelDefaults[activeBackend] ?? null;
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -470,29 +477,33 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           {isVirtualChat && (
             <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
           )}
-          {/* Model picker — only when more than one model is offered (local
-              Ollama models configured + available). Hidden otherwise so the
-              composer is unchanged for the default single-model setup.
-              Codex chats hide it: its entries are Anthropic/Ollama models,
-              which the codex backend cannot serve (codex.model applies). */}
-          {availableModels.length > 1 && !(isVirtualChat && chosenBackend === 'codex') && (
+          {/* Backend-scoped model picker. A Claude/Ollama selection can never
+              leak into Codex (or vice versa) when the backend changes. */}
+          {scopedModels.length > 1 && (
             <select
               value={selectedModel ?? modelsDefault ?? ''}
-              onChange={(e) => setSelectedModel(e.target.value === modelsDefault ? null : e.target.value)}
+              onChange={(e) => setSelectedModel(activeBackend, e.target.value === modelsDefault ? null : e.target.value)}
               disabled={disabled || isStreaming || rewriteActive}
               title="Model for your next message"
               className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
             >
-              {availableModels.some(m => m.provider === 'anthropic') && (
+              {scopedModels.some(m => m.provider === 'anthropic') && (
                 <optgroup label="Anthropic">
-                  {availableModels.filter(m => m.provider === 'anthropic').map(m => (
+                  {scopedModels.filter(m => m.provider === 'anthropic').map(m => (
                     <option key={m.id} value={m.id}>{m.id}</option>
                   ))}
                 </optgroup>
               )}
-              {availableModels.some(m => m.provider === 'ollama') && (
+              {scopedModels.some(m => m.provider === 'ollama') && (
                 <optgroup label="Ollama (local)">
-                  {availableModels.filter(m => m.provider === 'ollama').map(m => (
+                  {scopedModels.filter(m => m.provider === 'ollama').map(m => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
+                  ))}
+                </optgroup>
+              )}
+              {scopedModels.some(m => m.provider === 'openai') && (
+                <optgroup label="OpenAI Codex">
+                  {scopedModels.filter(m => m.provider === 'openai').map(m => (
                     <option key={m.id} value={m.id}>{m.id}</option>
                   ))}
                 </optgroup>

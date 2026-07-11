@@ -6,6 +6,7 @@ export type WSMessage =
   | { type: 'thinking'; session_id: string; content: string; parent_tool_use_id?: string }
   | { type: 'tool_use'; session_id: string; tool: string; input: Record<string, unknown>; tool_use_id?: string; parent_tool_use_id?: string }
   | { type: 'tool_result'; session_id: string; tool_use_id?: string; result: string; is_error?: boolean; parent_tool_use_id?: string }
+  | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
   | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; max_context_tokens?: number; num_turns?: number }
   | { type: 'stopped'; session_id: string }
   | { type: 'error'; session_id: string; error: string }
@@ -16,6 +17,7 @@ export type WSMessage =
   | { type: 'session_resumed'; session_id: string }
   | { type: 'session_archived'; session_id: string }
   | { type: 'plan_update'; session_id: string; content: string }
+  | { type: 'backend_status'; session_id: string; subtype: string; data: Record<string, unknown> }
   | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown> }
   | { type: 'interaction_resolved'; session_id: string; interaction_id: string }
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }

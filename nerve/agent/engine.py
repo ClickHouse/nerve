@@ -32,6 +32,7 @@ from nerve.agent.backends import (
     TextDelta,
     ThinkingDelta,
     ToolResult,
+    ToolOutputDelta,
     ToolUse,
     TransportDiedError,
     TurnCompleted,
@@ -161,6 +162,7 @@ class _TurnState:
     ordered_blocks: list[dict] = field(default_factory=list)
     last_usage: dict | None = None
     sdk_session_id: str | None = None
+    native_turn_id: str | None = None
     # tool_use_id -> monotonic start time of an in-flight sub-agent
     active_subagents: dict[str, float] = field(default_factory=dict)
     result_meta: dict | None = None
@@ -184,7 +186,15 @@ class AgentEngine:
         self.config = config
         self.db = db
         self.sessions = SessionManager(
-            db, sticky_period_minutes=config.sessions.sticky_period_minutes,
+            db,
+            sticky_period_minutes=config.sessions.sticky_period_minutes,
+            default_backend=config.agent.backend,
+            cron_backend=config.agent.resolved_cron_backend,
+            backend_models={
+                "claude": config.agent.model,
+                "codex": config.codex.model,
+            },
+            default_cwd=str(config.workspace),
         )
         self._semaphore = asyncio.Semaphore(config.agent.max_concurrent)
         self._memory_bridge = None
@@ -234,6 +244,10 @@ class AgentEngine:
         # survives restarts without re-firing on every resume.
         self._observed_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
+        # Gateways expose an ephemeral plaintext MCP listener on loopback for
+        # co-located Codex processes. The gateway fills this after the listener
+        # starts; the callable passed to CodexBackend reads it lazily.
+        self._mcp_loopback_port: int | None = None
         self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
@@ -298,10 +312,14 @@ class AgentEngine:
         )
 
     def _gateway_port(self) -> int | None:
-        """Gateway port for the loopback MCP bridge (codex tool access)."""
+        """Port for the loopback MCP listener (Codex tool access)."""
         if not self.config.mcp_endpoint.enabled:
             return None
-        return int(self.config.gateway.port)
+        return self._mcp_loopback_port
+
+    def set_mcp_loopback_port(self, port: int | None) -> None:
+        """Publish the local MCP listener port to backends."""
+        self._mcp_loopback_port = port
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
@@ -323,7 +341,12 @@ class AgentEngine:
            ``agent.backend`` otherwise).
         """
         stored = (session or {}).get("backend")
-        name = str(stored) if stored else ""
+        # A NULL backend can only come from a database that has not applied
+        # v039 yet.  Legacy sessions are Claude by definition; never let the
+        # mutable global default reinterpret them as Codex.
+        name = str(stored) if stored else (
+            "claude" if (session or {}).get("id") else ""
+        )
         if not name:
             try:
                 meta = json.loads((session or {}).get("metadata") or "{}")
@@ -943,6 +966,7 @@ class AgentEngine:
     async def _get_or_create_client(
         self, session_id: str, source: str, model: str | None,
         fork_from: str | None = None,
+        fork_last_turn_id: str | None = None,
     ) -> AgentClient:
         """Get an existing persistent client or create a new one.
 
@@ -959,7 +983,13 @@ class AgentEngine:
             # Session row first — backend resolution is sticky on it.
             session = await self.db.get_session(session_id)
             backend = self._backend_for(session, source)
-            requested_model = model or backend.default_model(source)
+            requested_model = (
+                model or (session or {}).get("model")
+                or backend.default_model(source)
+            )
+            validate_model = getattr(backend, "validate_model", None)
+            if validate_model is not None:
+                await validate_model(requested_model)
 
             if client is not None:
                 bound_model = self._session_models.get(session_id)
@@ -971,6 +1001,8 @@ class AgentEngine:
                     )
                     self._stop_idle_watcher(session_id)
                     self.sessions.remove_client(session_id)
+                    self._session_backends.pop(session_id, None)
+                    self._session_models.pop(session_id, None)
                     unregister_handler(session_id)
                     await self._safe_disconnect(client)
                     client = None
@@ -984,6 +1016,8 @@ class AgentEngine:
                     )
                     self._stop_idle_watcher(session_id)
                     self.sessions.remove_client(session_id)
+                    self._session_backends.pop(session_id, None)
+                    self._session_models.pop(session_id, None)
                     unregister_handler(session_id)
                     await self._safe_disconnect(client)
                     client = None
@@ -1002,6 +1036,11 @@ class AgentEngine:
                 )
             except (TypeError, ValueError):
                 session_meta = {}
+            session_cwd = str(
+                (session or {}).get("cwd")
+                or session_meta.get("codex_cwd")
+                or self.config.workspace
+            )
 
             # Seed the serving-model baseline from the last persisted
             # observation so downgrade detection survives restarts without
@@ -1022,7 +1061,7 @@ class AgentEngine:
             # row, and a fresh fork has nothing to recover to.
             if sdk_resume_id and not fork_from:
                 if not backend.validate_resume_target(
-                    sdk_resume_id, str(self.config.workspace),
+                    sdk_resume_id, session_cwd,
                 ):
                     logger.warning(
                         "Session %s resume target %s is missing on the %s "
@@ -1131,9 +1170,10 @@ class AgentEngine:
                     self.config.agent.cron_effort,
                 ),
                 system_prompt=system_prompt,
-                cwd=str(self.config.workspace),
+                cwd=session_cwd,
                 resume_native_id=sdk_resume_id,
                 fork=is_fork,
+                fork_last_turn_id=fork_last_turn_id,
                 interactive=handler,
                 snapshot=self._save_file_snapshot,
                 record_wakeup=_record_wakeup_cb,
@@ -1240,6 +1280,9 @@ class AgentEngine:
         else:
             await self._memorize_session(session_id)
         client = self.sessions.remove_client(session_id)
+        self._session_backends.pop(session_id, None)
+        self._session_models.pop(session_id, None)
+        unregister_handler(session_id)
 
         if clear_resume:
             await self.sessions.mark_error(session_id, "client_discarded")
@@ -1553,6 +1596,21 @@ class AgentEngine:
                 st.tool_calls_log, st.active_subagents,
             )
 
+        elif isinstance(event, ToolOutputDelta):
+            st.got_content = True
+            for block in reversed(st.ordered_blocks):
+                if (
+                    block.get("type") == "tool_call"
+                    and block.get("tool_use_id") == event.tool_use_id
+                ):
+                    block["result"] = str(block.get("result") or "") + event.content
+                    break
+            await broadcaster.broadcast_tool_output(
+                session_id, event.content,
+                tool_use_id=event.tool_use_id,
+                parent_tool_use_id=event.parent_tool_use_id,
+            )
+
         elif isinstance(event, ModelObserved):
             # Main-agent serving-model observation (backends already gate
             # out sub-agent models). More reliable than config.
@@ -1570,10 +1628,14 @@ class AgentEngine:
                 st.last_usage = event.usage.to_anthropic_shape()
             if event.native_session_id:
                 st.sdk_session_id = event.native_session_id
+            if event.native_turn_id:
+                st.native_turn_id = event.native_turn_id
             if event.model and not st.last_model:
                 st.last_model = event.model
             st.result_meta = {
                 "total_cost_usd": event.total_cost_usd,
+                "cost_basis": event.cost_basis,
+                "estimated_cost_usd": event.estimated_cost_usd,
                 "duration_ms": event.duration_ms,
                 "duration_api_ms": event.duration_api_ms,
                 "num_turns": event.num_turns,
@@ -1614,6 +1676,21 @@ class AgentEngine:
         this handler reads one dict.
         """
         subtype = event.subtype
+        if subtype == "codex_plan":
+            data = event.data or {}
+            content = data.get("delta") or data.get("text")
+            if not content:
+                content = json.dumps(data, ensure_ascii=False, default=str)
+            await broadcaster.broadcast_plan_update(session_id, str(content))
+            return
+        if subtype in ("codex_rate_limits", "codex_status", "codex_error"):
+            await self.db.log_session_event(
+                session_id, subtype, event.data or {},
+            )
+            await broadcaster.broadcast_backend_status(
+                session_id, subtype, event.data or {},
+            )
+            return
         if subtype not in (
             "task_started", "task_progress", "task_updated", "task_notification",
         ):
@@ -1875,6 +1952,7 @@ class AgentEngine:
             channel=channel,
             thinking=st.thinking_text if st.thinking_text else None,
             blocks=st.ordered_blocks if st.ordered_blocks else None,
+            native_turn_id=st.native_turn_id,
         )
 
         # Persist SDK session ID and update status
@@ -1883,6 +1961,10 @@ class AgentEngine:
                 session_id,
                 sdk_session_id=st.sdk_session_id,
                 connected_at=await self.get_client_connected_at_async(session_id),
+            )
+            backend = self._backend_for_live_session(session_id)
+            await self.db.bind_native_thread(
+                backend.name, st.sdk_session_id, session_id,
             )
 
         # Persist usage for context bar on session switch. Backends that
@@ -1926,10 +2008,9 @@ class AgentEngine:
             #   delta for this turn.  The counter resets whenever the
             #   client is recycled — compute_turn_cost detects the reset
             #   and attributes the new cumulative to this turn.
-            # * Codex: the backend pre-computes THIS turn's cost from its
-            #   pricing table (None when the model has no entry — recorded
-            #   as $0 with tokens intact, never estimated) and the
-            #   cumulative bookkeeping must stay untouched.
+            # * Codex: the backend returns THIS turn's nullable billed cost,
+            #   explicit cost basis, and (for ChatGPT auth) a separate
+            #   API-equivalent estimate. Cumulative bookkeeping stays untouched.
             from nerve.db.usage import compute_turn_cost, extract_cache_ttl_split
             sdk_cost = (st.result_meta or {}).get("total_cost_usd")
             current_session_cost = (
@@ -1959,9 +2040,13 @@ class AgentEngine:
                     )
                 if sdk_cost is not None:
                     meta["_sdk_cumulative_cost"] = sdk_cost
+                cost_basis = "api_billed"
+                estimated_cost = None
             else:
-                turn_cost = float(sdk_cost) if sdk_cost is not None else 0.0
-                cost_source = "backend"
+                turn_cost = float(sdk_cost) if sdk_cost is not None else None
+                cost_source = (st.result_meta or {}).get("cost_basis") or "unknown"
+                cost_basis = cost_source
+                estimated_cost = (st.result_meta or {}).get("estimated_cost_usd")
 
             # Save metadata (includes _sdk_cumulative_cost update)
             await self.db.update_session_metadata(session_id, meta)
@@ -1985,6 +2070,8 @@ class AgentEngine:
                 max_context=max_context,
                 model=st.last_model,
                 cost_usd=turn_cost,
+                cost_basis=cost_basis,
+                estimated_cost_usd=estimated_cost,
                 duration_ms=(st.result_meta or {}).get("duration_ms"),
                 duration_api_ms=(st.result_meta or {}).get("duration_api_ms"),
                 num_turns=num_turns,
@@ -1994,7 +2081,7 @@ class AgentEngine:
 
             # Update total_cost_usd on the session
             await self.db.update_session_fields(session_id, {
-                "total_cost_usd": current_session_cost + turn_cost,
+                "total_cost_usd": current_session_cost + (turn_cost or 0.0),
             })
 
         await broadcaster.broadcast_done(
@@ -2159,16 +2246,31 @@ class AgentEngine:
             # Get or create persistent client for this session
             # Check if we need to fork from a parent
             fork_from = None
+            fork_last_turn_id = None
             if session:
                 parent_id = session.get("parent_session_id")
                 fork_msg = session.get("forked_from_message")
                 if parent_id and session.get("status") == SessionStatus.CREATED.value:
                     parent = await self.db.get_session(parent_id)
                     if parent and parent.get("sdk_session_id"):
+                        if parent.get("backend") != session.get("backend"):
+                            raise ValueError(
+                                "Cannot fork a native session across agent backends"
+                            )
                         fork_from = parent["sdk_session_id"]
+                        if fork_msg:
+                            fork_last_turn_id = await self.db.get_native_turn_at_message(
+                                parent_id, fork_msg,
+                            )
+                            if parent.get("backend") == "codex" and not fork_last_turn_id:
+                                raise ValueError(
+                                    "Cannot fork this Codex session at the selected "
+                                    "message: no native turn mapping is available."
+                                )
 
             client = await self._get_or_create_client(
                 session_id, source, model, fork_from=fork_from,
+                fork_last_turn_id=fork_last_turn_id,
             )
 
             # Check for deferred /stop that arrived while we were setting up

@@ -36,6 +36,8 @@ export interface WorkflowAgent {
   /** queued | running | done | failed (CLI vocabulary) */
   state?: string;
   model?: string;
+  backend?: string;
+  cwd?: string;
   tokens?: number;
   toolCalls?: number;
   lastToolName?: string;
@@ -113,6 +115,8 @@ export interface Session {
   message_count?: number;
   total_cost_usd?: number;
   model?: string;
+  backend?: string;
+  cwd?: string;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
   // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).

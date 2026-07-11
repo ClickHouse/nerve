@@ -23,6 +23,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import signal
 from typing import Any, Awaitable, Callable
 
 from nerve.agent.backends.base import TransportDiedError
@@ -55,10 +57,11 @@ _STDERR_TAIL_LINE_CHARS = 500
 # granularity (bigger limit = fewer accumulation round-trips per line).
 _STREAM_LIMIT = 1024 * 1024
 
-# Absolute per-line ceiling. A line past this is drained to its newline
-# but returned truncated (the JSON parse fails and the message is
-# dropped, framing intact). Purely an OOM guard against a runaway peer.
+# Absolute per-line ceiling. A line past this is drained to its newline and
+# then fails the transport explicitly. Purely an OOM guard against a runaway
+# peer; silently dropping a terminal/accounting notification is unsafe.
 _MAX_LINE_BYTES = 64 * 1024 * 1024
+_MAX_NOTIFICATION_BACKLOG = 4_096
 
 
 async def _read_jsonl_line(reader: asyncio.StreamReader, label: str) -> bytes:
@@ -75,8 +78,8 @@ async def _read_jsonl_line(reader: asyncio.StreamReader, label: str) -> bytes:
 
     Mirrors ``readline()`` semantics otherwise: returns the line
     including its newline, the partial line at EOF, ``b""`` at clean EOF.
-    Lines beyond ``_MAX_LINE_BYTES`` are consumed fully but returned
-    truncated to the cap.
+    Lines beyond ``_MAX_LINE_BYTES`` are consumed fully and then raise a
+    controlled :class:`TransportDiedError`.
     """
     chunks: list[bytes] = []
     kept = 0
@@ -90,8 +93,8 @@ async def _read_jsonl_line(reader: asyncio.StreamReader, label: str) -> bytes:
         if len(chunk) > room:
             truncated = True
             logger.error(
-                "codex app-server %s line exceeds %d bytes — truncating "
-                "(message will be dropped, stream stays framed)",
+                "codex app-server %s line exceeds %d bytes — draining and "
+                "failing the transport",
                 label, _MAX_LINE_BYTES,
             )
             chunk = chunk[:room]
@@ -103,6 +106,11 @@ async def _read_jsonl_line(reader: asyncio.StreamReader, label: str) -> bytes:
             chunk = await reader.readuntil(b"\n")
         except asyncio.IncompleteReadError as e:  # EOF before newline
             _keep(e.partial)
+            if truncated:
+                raise TransportDiedError(
+                    f"codex app-server {label} line exceeded "
+                    f"{_MAX_LINE_BYTES} bytes"
+                )
             return b"".join(chunks)
         except asyncio.LimitOverrunError as e:
             # Buffer holds e.consumed separator-less bytes: drain them
@@ -110,6 +118,10 @@ async def _read_jsonl_line(reader: asyncio.StreamReader, label: str) -> bytes:
             _keep(await reader.readexactly(e.consumed))
             continue
         _keep(chunk)
+        if truncated:
+            raise TransportDiedError(
+                f"codex app-server {label} line exceeded {_MAX_LINE_BYTES} bytes"
+            )
         return b"".join(chunks)
 
 
@@ -144,9 +156,13 @@ class CodexAppServerClient:
         self._write_lock = asyncio.Lock()
         self._next_id = 0
         self._pending: dict[Any, asyncio.Future] = {}
-        # Bounded so a notification storm while nobody is consuming can't
-        # grow without limit; the consumer is always attached during turns.
-        self.notifications: asyncio.Queue[dict] = asyncio.Queue(maxsize=4096)
+        # Lifecycle/control notifications must never be silently evicted.
+        # A pathological producer fails visibly at the bound instead of
+        # dropping turn/completed or tokenUsage and hanging/corrupting
+        # accounting.
+        self.notifications: asyncio.Queue[dict] = asyncio.Queue(
+            maxsize=_MAX_NOTIFICATION_BACKLOG,
+        )
         self._stderr_tail: list[str] = []
         self._closed = False
 
@@ -171,6 +187,7 @@ class CodexAppServerClient:
                 cwd=self._cwd,
                 env=self._env,
                 limit=_STREAM_LIMIT,
+                start_new_session=True,
             )
         except (OSError, ValueError) as e:
             raise TransportDiedError(
@@ -184,18 +201,24 @@ class CodexAppServerClient:
             self._stderr_loop(), name=f"codex-stderr:{self._proc.pid}",
         )
 
-        response = await self.request("initialize", {
-            "clientInfo": {
-                "name": self._client_name,
-                "title": "Nerve",
-                "version": self._client_version,
-            },
-            "capabilities": {
-                "optOutNotificationMethods": _OPT_OUT_NOTIFICATIONS,
-            },
-        })
-        await self.notify("initialized", None)
-        return response
+        try:
+            response = await self.request("initialize", {
+                "clientInfo": {
+                    "name": self._client_name,
+                    "title": "Nerve",
+                    "version": self._client_version,
+                },
+                "capabilities": {
+                    "optOutNotificationMethods": _OPT_OUT_NOTIFICATIONS,
+                    "experimentalApi": True,
+                    "mcpServerOpenaiFormElicitation": True,
+                },
+            })
+            await self.notify("initialized", None)
+            return response
+        except BaseException:
+            await self.close()
+            raise
 
     def is_alive(self) -> bool:
         return (
@@ -207,25 +230,49 @@ class CodexAppServerClient:
     async def close(self) -> None:
         """Terminate the subprocess and fail everything pending."""
         self._closed = True
-        for task in (self._reader_task, self._stderr_task):
+        tasks = [
+            task for task in (self._reader_task, self._stderr_task)
+            if task is not None and task is not asyncio.current_task()
+        ]
+        for task in tasks:
             if task is not None and not task.done():
                 task.cancel()
-        for task in list(self._server_request_tasks):
+        request_tasks = [
+            task for task in self._server_request_tasks
+            if task is not asyncio.current_task()
+        ]
+        for task in request_tasks:
             task.cancel()
 
         proc, self._proc = self._proc, None
         if proc is not None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
+            self._signal_process_tree(proc, signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except (asyncio.TimeoutError, ProcessLookupError):
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
+                self._signal_process_tree(proc, signal.SIGKILL)
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
 
         self._fail_pending(TransportDiedError("codex app-server closed"))
+        if tasks or request_tasks:
+            await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+        self._reader_task = None
+        self._stderr_task = None
+        self._server_request_tasks.clear()
+
+    @staticmethod
+    def _signal_process_tree(
+        proc: asyncio.subprocess.Process, sig: signal.Signals,
+    ) -> None:
+        """Signal the app-server process group, including plugin workers."""
+        if proc.pid is None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            with contextlib.suppress(ProcessLookupError):
+                proc.send_signal(sig)
 
     # -- JSON-RPC ------------------------------------------------------- #
 
@@ -346,14 +393,24 @@ class CodexAppServerClient:
                 "method": method if isinstance(method, str) else "",
                 "params": params if isinstance(params, dict) else {},
             }
-            try:
-                self.notifications.put_nowait(note)
-            except asyncio.QueueFull:
-                # Keep the newest — drop the oldest buffered notification.
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    self.notifications.get_nowait()
-                with contextlib.suppress(asyncio.QueueFull):
-                    self.notifications.put_nowait(note)
+            if self.notifications.qsize() >= _MAX_NOTIFICATION_BACKLOG:
+                logger.error(
+                    "codex notification backlog exceeded %d; failing "
+                    "transport rather than dropping lifecycle events",
+                    _MAX_NOTIFICATION_BACKLOG,
+                )
+                self._closed = True
+                proc = self._proc
+                if proc is not None:
+                    self._signal_process_tree(proc, signal.SIGTERM)
+                while not self.notifications.empty():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        self.notifications.get_nowait()
+                self._fail_pending(TransportDiedError(
+                    "codex notification backlog exhausted",
+                ))
+                return
+            self.notifications.put_nowait(note)
             return
 
         # Response to one of our requests.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -848,26 +849,25 @@ class ExternalAgentTargetConfig:
     every interval to keep the agent's memory files in sync with the
     workspace identity files.
 
-    ``token`` is the bearer JWT the agent uses to authenticate against
-    the local MCP endpoint. It's written into the agent's config once
-    at bootstrap (e.g. into ``~/.codex/config.toml``); the sync service
-    does NOT rewrite the config file, only the memory bundle.
+    Bearer credentials are deliberately not persisted here. A legacy
+    ``token`` field is accepted on read for compatibility, discarded, and
+    omitted from every subsequent write.
     """
 
     name: str                                  # registry key: "codex" | "claude-code" | ...
     enabled: bool = True
-    token: str = ""                            # bearer JWT for MCP auth (informational only)
+    token: str = ""                            # deprecated; never persisted
 
     @classmethod
     def from_dict(cls, d: dict) -> ExternalAgentTargetConfig:
         return cls(
             name=str(d.get("name", "")),
             enabled=bool(d.get("enabled", True)),
-            token=str(d.get("token", "")),
+            token="",
         )
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "enabled": self.enabled, "token": self.token}
+        return {"name": self.name, "enabled": self.enabled}
 
 
 @dataclass
@@ -931,6 +931,63 @@ _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
 
 
 @dataclass
+class UltracodeConfig:
+    """Managed Ultracode plugin inside Nerve's isolated Codex home."""
+
+    enabled: bool = False
+    auto_install: bool = True
+    repository: str = "https://github.com/just-every/plugin-ultracode.git"
+    # Reviewed upstream revision. Upgrades are explicit config/code changes;
+    # the plugin's own daily marketplace refresh is always disabled.
+    revision: str = "9dde0086e983413016bf62ab96ba6bb17b599fae"
+    version: str = "0.3.0+codex.20260601143116"
+    # Expose completed and in-flight journals through Nerve's authenticated,
+    # read-only dashboard.  This is deliberately separate from ``ui`` below:
+    # upstream's detached Node server has unauthenticated mutation endpoints.
+    dashboard: bool = False
+    ui: bool = False
+    default_transport: str = "exec"
+    max_concurrency: int = 2
+    default_token_budget: int = 250_000
+    max_agents: int = 8
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> "UltracodeConfig":
+        d = raw or {}
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            auto_install=bool(d.get("auto_install", True)),
+            repository=str(d.get("repository") or cls.repository),
+            revision=str(d.get("revision") or cls.revision),
+            version=str(d.get("version") or cls.version),
+            dashboard=bool(d.get("dashboard", False)),
+            ui=bool(d.get("ui", False)),
+            default_transport=str(d.get("default_transport") or "exec"),
+            max_concurrency=_lenient_int(d.get("max_concurrency"), 2),
+            default_token_budget=_lenient_int(
+                d.get("default_token_budget"), 250_000,
+            ),
+            max_agents=_lenient_int(d.get("max_agents"), 8),
+        )
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if not re.fullmatch(r"[0-9a-f]{40}", self.revision):
+            problems.append("codex.ultracode.revision must be a pinned 40-char git SHA")
+        if self.default_transport not in ("exec", "app-server"):
+            problems.append(
+                "codex.ultracode.default_transport must be 'exec' or 'app-server'"
+            )
+        if not 1 <= self.max_concurrency <= 16:
+            problems.append("codex.ultracode.max_concurrency must be in [1, 16]")
+        if self.default_token_budget < 1:
+            problems.append("codex.ultracode.default_token_budget must be positive")
+        if not 1 <= self.max_agents <= 1000:
+            problems.append("codex.ultracode.max_agents must be in [1, 1000]")
+        return problems
+
+
+@dataclass
 class CodexConfig:
     """OpenAI Codex backend (``codex app-server``) settings.
 
@@ -940,6 +997,8 @@ class CodexConfig:
     """
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
+    min_version: str = "0.144.1"            # inclusive tested protocol range
+    max_version: str = "0.145.0"            # exclusive
     home_dir: str = "~/.nerve/codex"        # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -950,7 +1009,7 @@ class CodexConfig:
     approval_policy: str = "never"          # never | on-request | untrusted
     # nerve effort vocabulary -> codex reasoning effort string
     effort_map: dict[str, str] = field(default_factory=lambda: {
-        "max": "xhigh", "xhigh": "xhigh", "high": "high",
+        "max": "ultra", "ultra": "ultra", "xhigh": "xhigh", "high": "high",
         "medium": "medium", "low": "low",
     })
     web_search: bool = True
@@ -962,6 +1021,7 @@ class CodexConfig:
     )
     # Arbitrary codex config-override passthrough (-c key=value at spawn)
     extra_config: dict[str, Any] = field(default_factory=dict)
+    ultracode: UltracodeConfig = field(default_factory=UltracodeConfig)
 
     @classmethod
     def from_dict(cls, d: dict) -> "CodexConfig":
@@ -983,7 +1043,7 @@ class CodexConfig:
                         "Ignoring malformed codex.pricing entry %r", model_key,
                     )
         effort_map = {
-            "max": "xhigh", "xhigh": "xhigh", "high": "high",
+            "max": "ultra", "ultra": "ultra", "xhigh": "xhigh", "high": "high",
             "medium": "medium", "low": "low",
         }
         raw_effort = d.get("effort_map") or {}
@@ -991,6 +1051,8 @@ class CodexConfig:
             effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
+            min_version=str(d.get("min_version", "0.144.1")),
+            max_version=str(d.get("max_version", "0.145.0")),
             home_dir=str(d.get("home_dir", "~/.nerve/codex")),
             model=str(d.get("model", "gpt-5.6-sol")),
             cron_model=str(d.get("cron_model") or ""),
@@ -1007,6 +1069,7 @@ class CodexConfig:
             ),
             pricing=pricing,
             extra_config=dict(d.get("extra_config") or {}),
+            ultracode=UltracodeConfig.from_dict(d.get("ultracode")),
         )
 
     def validate(self) -> list[str]:
@@ -1027,6 +1090,7 @@ class CodexConfig:
                 f"codex.sandbox must be one of {_CODEX_SANDBOX_MODES}, "
                 f"got {self.sandbox!r}"
             )
+        problems.extend(self.ultracode.validate())
         return problems
 
 

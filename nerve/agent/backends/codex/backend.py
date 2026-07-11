@@ -20,10 +20,14 @@ attribute to the real session exactly like the in-process Claude MCP.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -41,7 +45,14 @@ from nerve.agent.backends.codex.appserver import (
     CodexRpcError,
 )
 from nerve.agent.backends.codex.diffs import reverse_apply_unified_diff
+from nerve.agent.backends.codex.mcp_stdio_wrapper import EXTERNAL_MCP_ENV_PREFIX
 from nerve.agent.backends.codex.pricing import compute_cost
+from nerve.agent.backends.codex.ultracode import (
+    ensure_installed as ensure_ultracode_installed,
+    installation_status as ultracode_installation_status,
+    materialize_worker_wrapper,
+    read_verified_run_journal,
+)
 from nerve.agent.backends.images import validate_image_data
 
 logger = logging.getLogger(__name__)
@@ -57,14 +68,56 @@ You are running on Nerve's Codex backend.
   `mcp__nerve__<name>` / however your harness names MCP tools.
 - To schedule a future wakeup of this session, use the `schedule_wakeup` nerve
   tool (there is no ScheduleWakeup built-in here).
-- AskUserQuestion and plan mode do not exist in this runtime. To ask the user
-  something, use the nerve `ask_user` tool.
+- Native structured questions and plan updates are bridged into Nerve's UI.
+  The persistent/asynchronous question tool is `mcp__nerve__ask_user`.
 </backend-notes>
 """
 
 
 class CodexTurnError(BackendError):
     """A codex turn failed with a non-retryable error."""
+
+
+_MISSING_THREAD_RE = re.compile(
+    r"(?:no rollout found for thread(?: id)?|rollout (?:was )?not found|"
+    r"thread(?: id)? .{0,80}(?:not found|does not exist|expired)|unknown thread)",
+    re.IGNORECASE,
+)
+
+# Ultracode workers are non-interactive and therefore cannot safely inherit
+# every mutating Nerve tool under an unconditional MCP approval. Keep the
+# child surface useful for context/research while making future tools fail
+# closed until explicitly reviewed.
+_ULTRACODE_CHILD_NERVE_TOOLS = (
+    "session_context",
+    "memory_recall",
+    "memory_expand_category",
+    "conversation_history",
+    "memory_records_by_date",
+    "task_search",
+    "task_list",
+    "task_read",
+    "task_status_list",
+    "plan_list",
+    "plan_read",
+    "skill_list",
+    "skill_get",
+    "skill_read_reference",
+    "sync_status",
+    "list_sources",
+    "read_source",
+)
+
+
+def _is_missing_thread_error(error: CodexRpcError) -> bool:
+    """Return True only for a positively identified missing thread.
+
+    Authentication, validation, permission, transport, and protocol errors
+    must remain visible.  Treating every JSON-RPC error as a cache miss loses
+    conversation context silently.
+    """
+    detail = f"{error.message}\n{json.dumps(error.data, default=str)}"
+    return bool(_MISSING_THREAD_RE.search(detail))
 
 
 def _toml_str(value: str) -> str:
@@ -80,7 +133,7 @@ class CodexBackend:
         cost_is_cumulative=False,
         supports_idle_stream=False,
         supports_cache_ttl=False,
-        interactive_builtins=False,
+        interactive_builtins=True,
         reports_context_window=True,
     )
 
@@ -89,6 +142,10 @@ class CodexBackend:
         self.config = deps.config
         self.codex = deps.config.codex
         Path(self._home_dir()).mkdir(parents=True, exist_ok=True)
+        self._preflight_cache: tuple[float, dict[str, Any]] | None = None
+        self._preflight_lock = asyncio.Lock()
+        self._live_models: set[str] = set()
+        self._rate_limits: dict[str, Any] | None = None
 
     # -- policy ---------------------------------------------------------- #
 
@@ -99,6 +156,32 @@ class CodexBackend:
 
     def excluded_tools(self) -> set[str]:
         return set()
+
+    async def validate_model(self, model: str) -> None:
+        """Reject obvious cross-backend model leakage before spawning Codex.
+
+        The live app-server model list is checked again after authentication;
+        this fast guard catches the frontend's historical Anthropic/Ollama
+        carry-over without starting a subprocess for a doomed turn.
+        """
+        allowed = {
+            self.codex.model,
+            self.codex.cron_model or self.codex.model,
+            *(self.codex.pricing or {}).keys(),
+            *self._live_models,
+        }
+        if model in allowed:
+            return
+        preflight = await self.preflight()
+        live = set(preflight.get("models") or []) if preflight.get("available") else set()
+        if model in live:
+            return
+        detail = preflight.get("reason") if not preflight.get("available") else None
+        suffix = f"; preflight failed: {detail}" if detail else ""
+        raise BackendError(
+            f"Model {model!r} is not available for the Codex backend "
+            f"(available: {sorted(allowed | live)}){suffix}"
+        )
 
     def validate_resume_target(self, native_id: str, cwd: str) -> bool:
         # No cheap filesystem check for codex threads; create_client
@@ -111,9 +194,143 @@ class CodexBackend:
     # -- client construction --------------------------------------------- #
 
     async def create_client(self, spec: SessionSpec) -> "CodexClient":
+        await self._check_cli_version()
+        if self.codex.ultracode.enabled:
+            await ensure_ultracode_installed(self.config)
         client = CodexClient(self, spec)
-        await client.connect()
-        return client
+        try:
+            await client.connect()
+            return client
+        except BaseException:
+            await client.disconnect()
+            raise
+
+    @staticmethod
+    def _version_tuple(value: str) -> tuple[int, ...]:
+        match = re.search(r"(\d+(?:\.\d+){1,3})", value)
+        if not match:
+            raise BackendError(f"Could not parse Codex CLI version from {value!r}")
+        return tuple(int(part) for part in match.group(1).split("."))
+
+    async def _check_cli_version(self) -> str:
+        def _read() -> str:
+            try:
+                completed = subprocess.run(
+                    [self.codex.bin_path, "--version"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as e:
+                raise BackendError(
+                    f"Codex CLI is unavailable at {self.codex.bin_path!r}: {e}"
+                ) from e
+            return (completed.stdout or completed.stderr).strip()
+
+        output = await asyncio.to_thread(_read)
+        current = self._version_tuple(output)
+        minimum = self._version_tuple(self.codex.min_version)
+        maximum = self._version_tuple(self.codex.max_version)
+        if current < minimum or current >= maximum:
+            raise BackendError(
+                f"Unsupported {output}; Nerve tested Codex versions "
+                f">={self.codex.min_version}, <{self.codex.max_version}"
+            )
+        return output
+
+    async def preflight(self, *, force: bool = False) -> dict[str, Any]:
+        """Check binary/version, auth, protocol, models, MCP, and plugin state."""
+        now = time.monotonic()
+        if (
+            not force and self._preflight_cache is not None
+            and now - self._preflight_cache[0] < 60
+        ):
+            return dict(self._preflight_cache[1])
+        async with self._preflight_lock:
+            try:
+                version = await self._check_cli_version()
+                async def _decline(method: str, params: dict) -> dict:
+                    if method.endswith("requestApproval"):
+                        return {"decision": "decline"}
+                    if method == "mcpServer/elicitation/request":
+                        return {"action": "decline"}
+                    return {}
+
+                transport = CodexAppServerClient(
+                    bin_path=self.codex.bin_path,
+                    cwd=str(self.config.workspace),
+                    env={**os.environ, "CODEX_HOME": self._home_dir()},
+                    server_request_handler=_decline,
+                    request_timeout=10,
+                )
+                try:
+                    await transport.start()
+                    account = await transport.request("account/read", {}, timeout=10)
+                    if not account.get("account"):
+                        raise BackendError(
+                            "Codex is not authenticated. To fix: " + self.auth_hint()
+                        )
+                    model_result = await transport.request("model/list", {}, timeout=10)
+                    try:
+                        rate_result = await transport.request(
+                            "account/rateLimits/read", {}, timeout=10,
+                        )
+                    except CodexRpcError:
+                        rate_result = {}
+                finally:
+                    await transport.close()
+                models = model_result.get("data") or model_result.get("models") or []
+                model_ids = sorted({
+                    str(item.get("id") or item.get("model") or item.get("slug"))
+                    for item in models if isinstance(item, dict)
+                    and (item.get("id") or item.get("model") or item.get("slug"))
+                })
+                if model_ids and self.codex.model not in model_ids:
+                    raise BackendError(
+                        f"Configured Codex model {self.codex.model!r} is unavailable"
+                    )
+                self._live_models = set(model_ids)
+                rate_limits = rate_result.get("rateLimits")
+                if isinstance(rate_limits, dict):
+                    self._rate_limits = rate_limits
+                account_obj = account.get("account") or {}
+                account_type = (
+                    account_obj.get("type") if isinstance(account_obj, dict) else None
+                )
+                effective_auth = self._normalize_auth_mode(account_type)
+                plugin = None
+                if self.codex.ultracode.enabled:
+                    # Diagnostics must be observational. Installation/repair
+                    # occurs only when a real Codex client is created.
+                    plugin = ultracode_installation_status(self.config)
+                result = {
+                    "available": True,
+                    "version": version,
+                    "auth": effective_auth,
+                    "configured_auth": self.codex.auth,
+                    "auth_mismatch": (
+                        effective_auth not in ("unknown", self.codex.auth)
+                    ),
+                    "account_type": account_type,
+                    "models": model_ids or [self.codex.model],
+                    "default_model": self.codex.model,
+                    "rate_limits": self._rate_limits,
+                    "ultracode": plugin,
+                }
+            except Exception as e:
+                result = {"available": False, "reason": str(e)}
+            self._preflight_cache = (time.monotonic(), result)
+            return dict(result)
+
+    @staticmethod
+    def _normalize_auth_mode(value: Any) -> str:
+        normalized = str(value or "").replace("_", "").replace("-", "").lower()
+        if normalized in {"apikey", "api"}:
+            return "api_key"
+        if normalized in {"chatgpt", "chatgptauth", "oauth"}:
+            return "chatgpt"
+        return "unknown"
 
     # -- config assembly (used by CodexClient) --------------------------- #
 
@@ -133,6 +350,43 @@ class CodexBackend:
                     "Could not mint MCP session token for %s: %s",
                     spec.session_id, e,
                 )
+        # Keep external MCP credentials out of process argv. Stdio values are
+        # inherited by name through ``env_vars``; HTTP headers use synthetic
+        # environment names referenced by ``env_http_headers``.
+        for srv in self._deps.external_mcp_servers():
+            if not srv.enabled or srv.name == "nerve":
+                continue
+            if getattr(srv, "command", None):
+                for key, value in (getattr(srv, "env", None) or {}).items():
+                    if not self._TOML_KEY_RE.fullmatch(str(key)):
+                        continue
+                    secret_name = self._mcp_secret_env_name(
+                        str(srv.name), str(key), "STDIO",
+                    )
+                    env[secret_name] = str(value)
+            elif getattr(srv, "url", None):
+                for header, value in (getattr(srv, "headers", None) or {}).items():
+                    secret_name = self._mcp_secret_env_name(
+                        str(srv.name), str(header), "HTTP",
+                    )
+                    env[secret_name] = str(value)
+        if self.codex.ultracode.enabled:
+            wrapper = materialize_worker_wrapper(self._home_dir())
+            env["CODEX_CLI_PATH"] = str(wrapper)
+            env["NERVE_CODEX_REAL_BIN"] = self.codex.bin_path
+            env["ULTRACODE_NO_AUTO_UPDATE"] = "1"
+            env["ULTRACODE_UI"] = "1" if self.codex.ultracode.ui else "0"
+            env["ULTRACODE_TRANSPORT"] = self.codex.ultracode.default_transport
+            env["ULTRACODE_MAX_CONCURRENCY"] = str(
+                self.codex.ultracode.max_concurrency,
+            )
+            env["ULTRACODE_DEFAULT_TOKEN_BUDGET"] = str(
+                self.codex.ultracode.default_token_budget,
+            )
+            env["ULTRACODE_MAX_AGENTS"] = str(
+                self.codex.ultracode.max_agents,
+            )
+            env["NERVE_MCP_PARENT_SESSION_ID"] = spec.session_id
         return env
 
     def build_config_overrides(self, spec: SessionSpec) -> list[str]:
@@ -142,21 +396,31 @@ class CodexBackend:
         config. This is the same mechanism the official SDKs use and is
         honored for every thread the process hosts.
         """
-        overrides: list[str] = [
-            # The workspace AGENTS.md is Nerve's identity bundle and is
-            # already injected via developerInstructions — suppress
-            # project-doc discovery so it isn't duplicated.
-            "project_doc_max_bytes=0",
-        ]
+        overrides: list[str] = []
+        # At the Nerve workspace root, AGENTS.md is the same identity bundle
+        # already rendered into developerInstructions. For an explicit nested
+        # project cwd, retain normal discovery so repository-local AGENTS.md
+        # instructions are not lost.
+        try:
+            if Path(spec.cwd).resolve() == Path(self.config.workspace).resolve():
+                overrides.append("project_doc_max_bytes=0")
+        except OSError:
+            pass
 
         # Nerve tools over the gateway's Streamable HTTP MCP endpoint.
         port = self._deps.gateway_port()
         if port and self._deps.mint_session_token is not None:
             base = "mcp_servers.nerve"
-            url = f"http://127.0.0.1:{port}/mcp/v1"
+            # Requests to the mounted app's root must retain the trailing
+            # slash.  Respect a customized endpoint path instead of silently
+            # hard-coding the default /mcp/v1 mount.
+            endpoint = "/" + self.config.mcp_endpoint.path.strip("/") + "/"
+            url = f"http://127.0.0.1:{port}{endpoint}"
             overrides += [
                 f"{base}.url={_toml_str(url)}",
                 f"{base}.bearer_token_env_var={_toml_str('NERVE_MCP_TOKEN')}",
+                f"{base}.required=true",
+                f"{base}.startup_timeout_sec=30",
                 f"{base}.tool_timeout_sec={int(self.codex.tool_timeout_sec)}",
             ]
         else:
@@ -192,6 +456,13 @@ class CodexBackend:
 
     _TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+    @staticmethod
+    def _mcp_secret_env_name(server: str, key: str, kind: str) -> str:
+        digest = hashlib.sha256(
+            f"{kind}\0{server}\0{key}".encode("utf-8"),
+        ).hexdigest()[:20].upper()
+        return f"{EXTERNAL_MCP_ENV_PREFIX}{kind}_{digest}"
+
     @classmethod
     def _translate_mcp_server(cls, srv: Any) -> list[str]:
         """Translate one nerve ``McpServerConfig`` into codex overrides."""
@@ -204,21 +475,46 @@ class CodexBackend:
         command = getattr(srv, "command", None)
         url = getattr(srv, "url", None)
         if command:
-            out.append(f"{base}.command={_toml_str(command)}")
             args = getattr(srv, "args", None) or []
-            if args:
-                arr = ", ".join(_toml_str(str(a)) for a in args)
-                out.append(f"{base}.args=[{arr}]")
             env = getattr(srv, "env", None) or {}
-            for k, v in env.items():
+            wrapper_args: list[str] = [
+                "-m", "nerve.agent.backends.codex.mcp_stdio_wrapper",
+            ]
+            env_names: list[str] = []
+            for k in env:
                 if not cls._TOML_KEY_RE.match(str(k)):
                     raise ValueError(f"env key {k!r} is not a bare TOML key")
-                out.append(f"{base}.env.{k}={_toml_str(str(v))}")
+                secret_name = cls._mcp_secret_env_name(
+                    str(srv.name), str(k), "STDIO",
+                )
+                env_names.append(secret_name)
+                wrapper_args.extend(["--env", str(k), secret_name])
+            if env_names:
+                wrapper_args.extend(["--", str(command), *(str(a) for a in args)])
+                out.append(f"{base}.command={_toml_str(sys.executable)}")
+                arr = ", ".join(_toml_str(value) for value in wrapper_args)
+                out.append(f"{base}.args=[{arr}]")
+            else:
+                out.append(f"{base}.command={_toml_str(command)}")
+                if args:
+                    arr = ", ".join(_toml_str(str(a)) for a in args)
+                    out.append(f"{base}.args=[{arr}]")
+            if env_names:
+                out.append(
+                    f"{base}.env_vars="
+                    + json.dumps(env_names, ensure_ascii=False)
+                )
         elif url:
             out.append(f"{base}.url={_toml_str(url)}")
             headers = getattr(srv, "headers", None) or {}
-            for k, v in headers.items():
-                out.append(f'{base}.http_headers.{_toml_str(k)}={_toml_str(str(v))}')
+            for k in headers:
+                env_name = cls._mcp_secret_env_name(
+                    str(srv.name), str(k), "HTTP",
+                )
+                out.append(
+                    f'{base}.env_http_headers.{_toml_str(str(k))}='
+                    f'{_toml_str(env_name)}'
+                )
         else:
             raise ValueError("no command or url")
         return out
@@ -261,12 +557,39 @@ class CodexClient(AgentClient):
     def __init__(self, backend: CodexBackend, spec: SessionSpec):
         self._backend = backend
         self._spec = spec
+        config_overrides = backend.build_config_overrides(spec)
+        env = backend.build_env(spec)
+        if backend.codex.ultracode.enabled:
+            # Child workers need Nerve's MCP bridge, but not the parent's
+            # external MCP servers.  Besides reducing startup overhead, this
+            # prevents third-party credentials from being copied into
+            # NERVE_CODEX_CHILD_CONFIG and then exposed in worker argv.
+            child_overrides = [
+                value for value in config_overrides
+                if value.startswith("mcp_servers.nerve.")
+            ]
+            # Ultracode is non-interactive (approval_policy=never). Explicitly
+            # approve the trusted, session-scoped Nerve server or Codex marks
+            # every child MCP call as "user cancelled".
+            child_overrides.append(
+                'mcp_servers.nerve.default_tools_approval_mode="approve"'
+            )
+            child_overrides.append(
+                "mcp_servers.nerve.enabled_tools="
+                + json.dumps(_ULTRACODE_CHILD_NERVE_TOOLS)
+            )
+            env["NERVE_CODEX_CHILD_CONFIG"] = json.dumps(child_overrides)
+            port = backend._deps.gateway_port()
+            if port:
+                env["NERVE_MCP_WORKER_TOKEN_URL"] = (
+                    f"http://127.0.0.1:{port}/api/codex/worker-token"
+                )
         self._transport = CodexAppServerClient(
             bin_path=backend.codex.bin_path,
             cwd=spec.cwd,
-            env=backend.build_env(spec),
+            env=env,
             server_request_handler=self._handle_server_request,
-            config_overrides=backend.build_config_overrides(spec),
+            config_overrides=config_overrides,
         )
         self._thread_id: str | None = None
         self._turn_id: str | None = None
@@ -280,6 +603,12 @@ class CodexClient(AgentClient):
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
         self._context_window: int | None = None
+        self._ultracode_usage: dict[str, int] | None = None
+        self._ultracode_estimated_cost: float = 0.0
+        self._ultracode_worker_count = 0
+        self._ultracode_priced_worker_count = 0
+        self._ultracode_runs: set[str] = set()
+        self._effective_auth = "unknown"
 
     # -- protocol --------------------------------------------------------- #
 
@@ -297,16 +626,44 @@ class CodexClient(AgentClient):
     async def connect(self) -> None:
         await self._transport.start()
         await self._ensure_auth()
+        await self._validate_live_model()
 
         spec = self._spec
         backend = self._backend
         params = backend.thread_params(spec)
 
+        response: dict | None = None
+        if spec.resume_native_id:
+            try:
+                await self._transport.request(
+                    "thread/read",
+                    {"threadId": spec.resume_native_id, "includeTurns": False},
+                )
+            except CodexRpcError as e:
+                if not _is_missing_thread_error(e):
+                    raise
+                if spec.fork:
+                    raise BackendError(
+                        f"Cannot fork missing Codex thread {spec.resume_native_id!r}"
+                    ) from e
+                logger.warning(
+                    "Codex resume target %s is confirmed missing for session %s; "
+                    "starting a fresh thread",
+                    spec.resume_native_id[:12], spec.session_id,
+                )
+                self._resume_dropped = True
+                response = await self._transport.request("thread/start", params)
+
         try:
-            if spec.resume_native_id and spec.fork:
+            if response is not None:
+                pass
+            elif spec.resume_native_id and spec.fork:
+                fork_params = {**params, "threadId": spec.resume_native_id}
+                if spec.fork_last_turn_id:
+                    fork_params["lastTurnId"] = spec.fork_last_turn_id
                 response = await self._transport.request(
                     "thread/fork",
-                    {**params, "threadId": spec.resume_native_id},
+                    fork_params,
                 )
             elif spec.resume_native_id:
                 response = await self._transport.request(
@@ -320,7 +677,7 @@ class CodexClient(AgentClient):
             # rollout the app-server refuses) must never brick the
             # session — fall back to a fresh thread and tell the engine
             # the old id was dropped.
-            if not spec.resume_native_id:
+            if not spec.resume_native_id or spec.fork or not _is_missing_thread_error(e):
                 raise
             logger.warning(
                 "Codex %s of %s failed for session %s (%s) — starting a "
@@ -339,6 +696,27 @@ class CodexClient(AgentClient):
             )
         self._thread_id = str(thread_id)
 
+    async def _validate_live_model(self) -> None:
+        """Confirm the selected model against the authenticated app-server."""
+        try:
+            response = await self._transport.request("model/list", {})
+        except CodexRpcError as e:
+            raise BackendError(
+                f"Codex model discovery failed; the app-server protocol is "
+                f"not compatible: {e}"
+            ) from e
+        models = response.get("data") or response.get("models") or []
+        ids = {
+            str(item.get("id") or item.get("model") or item.get("slug"))
+            for item in models if isinstance(item, dict)
+        }
+        ids.discard("")
+        if ids and self.model not in ids:
+            raise BackendError(
+                f"Codex model {self.model!r} is unavailable for the current "
+                f"account (available: {sorted(ids)})"
+            )
+
     async def _ensure_auth(self) -> None:
         """Best-effort auth check with a clear operator hint.
 
@@ -349,9 +727,19 @@ class CodexClient(AgentClient):
         try:
             account = await self._transport.request("account/read", {})
         except CodexRpcError as e:
-            logger.debug("codex account/read failed (%s) — proceeding", e)
-            return
+            raise BackendError(f"Codex authentication check failed: {e}") from e
         if isinstance(account, dict) and account.get("account"):
+            account_obj = account.get("account") or {}
+            account_type = (
+                account_obj.get("type") if isinstance(account_obj, dict) else None
+            )
+            self._effective_auth = backend._normalize_auth_mode(account_type)
+            if self._effective_auth not in ("unknown", backend.codex.auth):
+                logger.warning(
+                    "Codex configured auth=%s but isolated home is logged in "
+                    "with %s; billing follows the effective account",
+                    backend.codex.auth, self._effective_auth,
+                )
             return
 
         if backend.codex.auth == "api_key":
@@ -363,6 +751,7 @@ class CodexClient(AgentClient):
                         {"type": "apiKey", "apiKey": api_key},
                     )
                     logger.info("Codex: logged in with API key")
+                    self._effective_auth = "api_key"
                     return
                 except CodexRpcError as e:
                     raise BackendError(
@@ -378,6 +767,11 @@ class CodexClient(AgentClient):
         self._turn_usage = None
         self._last_error = None
         self._items.clear()
+        self._ultracode_usage = None
+        self._ultracode_estimated_cost = 0.0
+        self._ultracode_worker_count = 0
+        self._ultracode_priced_worker_count = 0
+        self._ultracode_runs.clear()
         # Drain notifications that straggled in after the previous turn
         # (late tokenUsage updates etc.) so they can't bleed into this one.
         while not self._transport.notifications.empty():
@@ -415,13 +809,19 @@ class CodexClient(AgentClient):
                 continue
             media_type = att.get("media_type") or ""
             if media_type == "application/pdf":
-                # No document input type in the codex protocol — surface
-                # the degradation instead of silently dropping (plan §14).
-                notes.append(
-                    "[A PDF attachment could not be delivered: the Codex "
-                    "backend does not support document inputs. Ask the "
-                    "user for the content as text if needed.]"
-                )
+                local_path = att.get("path")
+                if local_path:
+                    notes.append(
+                        "[PDF attachment preserved locally at "
+                        f"{local_path}. Read or convert that file with local "
+                        "tools; the app-server has no native PDF input type.]"
+                    )
+                else:
+                    notes.append(
+                        "[A PDF attachment could not be delivered: the Codex "
+                        "backend does not support document inputs. Ask the "
+                        "user for the content as text if needed.]"
+                    )
                 continue
             if att.get("path"):
                 items.append({"type": "localImage", "path": str(att["path"])})
@@ -468,6 +868,8 @@ class CodexClient(AgentClient):
         yield ev.ModelObserved(model=self.model)
 
         while True:
+            if self._transport.notifications.empty() and not self._transport.is_alive():
+                raise TransportDiedError("codex app-server died mid-turn")
             try:
                 if idle_timeout and idle_timeout > 0:
                     note = await asyncio.wait_for(
@@ -548,6 +950,24 @@ class CodexClient(AgentClient):
         elif method == "item/plan/delta":
             out.append(ev.SystemEvent(subtype="codex_plan", data=params))
 
+        elif method == "item/commandExecution/outputDelta":
+            delta = params.get("delta") or params.get("text") or ""
+            if delta:
+                out.append(ev.ToolOutputDelta(
+                    tool_use_id=str(params.get("itemId") or "") or None,
+                    content=str(delta),
+                ))
+
+        elif method == "account/rateLimits/updated":
+            if isinstance(params.get("rateLimits"), dict):
+                self._backend._rate_limits = params["rateLimits"]
+            out.append(ev.SystemEvent(subtype="codex_rate_limits", data=params))
+
+        elif method in ("thread/compacted", "mcpServer/startupProgress"):
+            out.append(ev.SystemEvent(subtype="codex_status", data={
+                "method": method, **params,
+            }))
+
         elif method == "turn/completed":
             turn_id = ((params.get("turn") or {}).get("id"))
             if turn_id and self._turn_id and str(turn_id) != self._turn_id:
@@ -579,12 +999,9 @@ class CodexClient(AgentClient):
         elif method in (
             "turn/started",
             "thread/started",
-            "item/commandExecution/outputDelta",   # final output arrives on item/completed
             "item/fileChange/outputDelta",
             "item/fileChange/patchUpdated",
             "item/mcpToolCall/progress",
-            "account/rateLimits/updated",
-            "thread/compacted",
             "serverRequest/resolved",
         ):
             pass  # consumed elsewhere / intentionally ignored
@@ -652,6 +1069,19 @@ class CodexClient(AgentClient):
                 name="WebSearch",
                 input={"query": item.get("query", "")},
             ))
+        elif item_type == "collabAgentToolCall":
+            out.append(ev.SubagentStarted(
+                tool_use_id=item_id or "codex-subagent",
+                subagent_type=str(item.get("tool") or "Agent"),
+                description=str(item.get("prompt") or "Codex subagent"),
+                model=str(item.get("model")) if item.get("model") else None,
+            ))
+        elif item_type == "dynamicToolCall":
+            out.append(ev.ToolUse(
+                tool_use_id=item_id or None,
+                name=str(item.get("tool") or "DynamicTool"),
+                input=item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+            ))
         elif "plan" in item_type.lower() or "todo" in item_type.lower():
             out.append(ev.SystemEvent(subtype="codex_plan", data=item))
         # agentMessage/reasoning items stream via their delta
@@ -668,6 +1098,7 @@ class CodexClient(AgentClient):
             exit_code = item.get("exitCode")
             is_error = isinstance(exit_code, int) and exit_code != 0
             output = str(item.get("aggregatedOutput") or "")
+            self._capture_ultracode_accounting(output)
             if isinstance(exit_code, int):
                 output = output or ""
                 output += ("" if not output or output.endswith("\n") else "\n")
@@ -711,6 +1142,32 @@ class CodexClient(AgentClient):
                     item.get("results", item.get("result", "")), default=str,
                 )[:4000],
                 is_error=False,
+            ))
+        elif item_type == "collabAgentToolCall":
+            status = str(item.get("status") or "").lower()
+            out.append(ev.ToolResult(
+                tool_use_id=item_id or None,
+                content=json.dumps({
+                    "receivers": item.get("receiverThreadIds") or [],
+                    "agents": item.get("agentsStates") or {},
+                }, default=str),
+                is_error=status in {"failed", "cancelled"},
+            ))
+        elif item_type == "dynamicToolCall":
+            status = str(item.get("status") or "").lower()
+            output = self._dynamic_tool_output(item)
+            if (
+                str(item.get("tool") or "") == "exec"
+                # Codex code-mode dynamic tools are intentionally
+                # un-namespaced.  A namespaced lookalike must not be able to
+                # import usage into the parent turn.
+                and item.get("namespace") in (None, "")
+            ):
+                self._capture_ultracode_accounting(output)
+            out.append(ev.ToolResult(
+                tool_use_id=item_id or None,
+                content=output or "(no output)",
+                is_error=status == "failed" or item.get("success") is False,
             ))
         # agentMessage completion: text was already streamed via deltas.
         return out
@@ -765,12 +1222,64 @@ class CodexClient(AgentClient):
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
         usage = self._normalize_usage(self._turn_usage)
-        cost = compute_cost(self.model, usage, self._backend.codex.pricing)
+        if usage is None and self._ultracode_usage:
+            # A turn can complete before app-server emits a parent tokenUsage
+            # notification. Child usage is still authoritative and must not
+            # disappear merely because the parent count is absent.
+            usage = ev.NormalizedUsage()
+        if usage is not None and self._ultracode_usage:
+            child = self._ultracode_usage
+            usage.input_tokens += max(
+                0,
+                child.get("input_tokens", 0)
+                - child.get("cached_input_tokens", 0),
+            )
+            usage.cache_read_tokens += child.get("cached_input_tokens", 0)
+            # Codex output_tokens already includes the reasoning subset (the
+            # separate field is diagnostic detail, not additional billing).
+            usage.output_tokens += child.get("output_tokens", 0)
+            usage.raw["ultracode"] = dict(child)
+        estimate = compute_cost(self.model, usage, self._backend.codex.pricing)
+        if (
+            estimate is not None
+            and self._ultracode_worker_count > 0
+            and self._ultracode_priced_worker_count == self._ultracode_worker_count
+        ):
+            # compute_cost above priced every child token at the parent model;
+            # per-worker journal pricing is more precise, so replace that
+            # approximate child component when worker model data was present.
+            parent_usage = self._normalize_usage(self._turn_usage)
+            parent_cost = compute_cost(
+                self.model, parent_usage, self._backend.codex.pricing,
+            )
+            if parent_cost is not None:
+                estimate = parent_cost + self._ultracode_estimated_cost
+        if self._effective_auth == "api_key":
+            cost = estimate
+            cost_basis = "api_billed" if estimate is not None else "unknown"
+            estimated_cost = None
+        elif self._effective_auth == "chatgpt":
+            # ChatGPT authentication consumes subscription credits/rate limits;
+            # it is not an API USD charge.  Keep the optional API-equivalent
+            # estimate separate so dashboards cannot present it as a bill.
+            cost = None
+            cost_basis = (
+                "api_equivalent_estimate" if estimate is not None
+                else "chatgpt_credit"
+            )
+            estimated_cost = estimate
+        else:
+            cost = None
+            cost_basis = "unknown"
+            estimated_cost = estimate
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
+            native_turn_id=self._turn_id,
             model=self.model,
             usage=usage,
             total_cost_usd=cost,           # per-turn (cost_is_cumulative=False)
+            cost_basis=cost_basis,
+            estimated_cost_usd=estimated_cost,
             duration_ms=turn.get("durationMs"),
             duration_api_ms=None,
             num_turns=1,
@@ -802,6 +1311,105 @@ class CodexClient(AgentClient):
             cache_creation_tokens=0,
             raw={"last": last, "total": usage.get("total")},
         )
+
+    @staticmethod
+    def _dynamic_tool_output(item: dict[str, Any]) -> str:
+        """Flatten app-server ``DynamicToolCall.contentItems`` text blocks."""
+        parts: list[str] = []
+        content_items = item.get("contentItems")
+        if isinstance(content_items, list):
+            for content in content_items:
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") == "inputText" and isinstance(content.get("text"), str):
+                    parts.append(content["text"])
+                elif content.get("type") == "inputImage" and content.get("imageUrl"):
+                    parts.append("[image output]")
+        if parts:
+            return "\n".join(parts)
+        fallback = item.get("content") or item.get("result") or ""
+        return fallback if isinstance(fallback, str) else json.dumps(fallback, default=str)
+
+    def _capture_ultracode_accounting(self, output: str) -> None:
+        """Import verified child usage from an Ultracode journal once per run.
+
+        Dynamic tool outputs can wrap or truncate the CLI's final JSON.  Treat
+        the output only as a run-id hint, then load the authoritative journal
+        from Nerve's isolated Codex home.  This avoids trusting a worker-emitted
+        lookalike aggregate and keeps malformed counters out of turn handling.
+        """
+        run_ids = re.findall(r'ultra-[A-Za-z0-9][A-Za-z0-9_-]{0,191}', output)
+        if not run_ids:
+            return
+        for run_id in reversed(list(dict.fromkeys(run_ids))):
+            if run_id in self._ultracode_runs:
+                continue
+            record = read_verified_run_journal(self._backend.config, run_id)
+            if record is None:
+                continue
+            if str(record.get("status") or "").lower() not in {
+                "completed", "failed", "cancelled", "partial", "refuted",
+            }:
+                continue
+            aggregate = record.get("aggregate_usage")
+            if not isinstance(aggregate, dict):
+                continue
+
+            keys = (
+                "input_tokens", "cached_input_tokens",
+                "output_tokens", "reasoning_output_tokens",
+            )
+            counts: dict[str, int] = {}
+            valid = True
+            for key in keys:
+                value = aggregate.get(key, 0)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    valid = False
+                    break
+                counts[key] = value
+            if not valid:
+                logger.warning("Ignoring malformed Ultracode usage in %s", run_id)
+                continue
+
+            self._ultracode_runs.add(run_id)
+            if self._ultracode_usage is None:
+                self._ultracode_usage = {key: 0 for key in keys}
+            for key, value in counts.items():
+                self._ultracode_usage[key] += value
+
+            # Journals carry per-worker model + usage. Price those separately
+            # when possible; ChatGPT auth still stores this only as an estimate.
+            for worker in record.get("workers") or []:
+                if not isinstance(worker, dict) or not isinstance(worker.get("usage"), dict):
+                    continue
+                raw = worker["usage"]
+                worker_counts: dict[str, int] = {}
+                for key in ("input_tokens", "cached_input_tokens", "output_tokens"):
+                    value = raw.get(key, 0)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        worker_counts = {}
+                        break
+                    worker_counts[key] = value
+                if not worker_counts:
+                    continue
+                self._ultracode_worker_count += 1
+                normalized = ev.NormalizedUsage(
+                    input_tokens=max(
+                        0,
+                        worker_counts["input_tokens"]
+                        - worker_counts["cached_input_tokens"],
+                    ),
+                    output_tokens=worker_counts["output_tokens"],
+                    cache_read_tokens=worker_counts["cached_input_tokens"],
+                )
+                worker_cost = compute_cost(
+                    str(worker.get("model") or self.model),
+                    normalized,
+                    self._backend.codex.pricing,
+                )
+                if worker_cost is not None:
+                    self._ultracode_estimated_cost += worker_cost
+                    self._ultracode_priced_worker_count += 1
 
     # -- item helpers ----------------------------------------------------- #
 
@@ -878,16 +1486,9 @@ class CodexClient(AgentClient):
             )
             raise BackendError("permission grants are not supported by nerve v1")
         if method == "item/tool/requestUserInput":
-            # v1: nerve's ask_user covers interactive questions; answer
-            # the (experimental) request with an empty answer set.
-            logger.warning(
-                "codex requested tool user input — returning no answers "
-                "(unsupported): %s", str(params)[:200],
-            )
-            return {"answers": {}}
+            return await self._request_user_input(params)
         if method == "mcpServer/elicitation/request":
-            logger.warning("codex MCP elicitation declined (unsupported)")
-            return {"action": "decline"}
+            return await self._request_mcp_elicitation(params)
 
         if method.endswith("requestApproval") or method.endswith("Approval"):
             logger.warning(
@@ -913,6 +1514,173 @@ class CodexClient(AgentClient):
             return {"decision": "accept"}
         outcome = await hub.request_approval(kind, payload)
         return {"decision": "accept" if outcome.approved else "decline"}
+
+    async def _request_user_input(self, params: dict) -> dict:
+        hub = self._spec.interactive
+        if hub is None:
+            return {"answers": {}}
+        raw_questions = [
+            q for q in (params.get("questions") or []) if isinstance(q, dict)
+        ]
+        questions = []
+        for question in raw_questions:
+            options = question.get("options") or []
+            questions.append({
+                "id": str(question.get("id") or question.get("question") or ""),
+                "question": str(question.get("question") or ""),
+                "header": str(question.get("header") or "Question")[:12],
+                "options": [
+                    {
+                        "label": str(option.get("label") or ""),
+                        "description": str(option.get("description") or ""),
+                    }
+                    for option in options if isinstance(option, dict)
+                ],
+                "multiSelect": False,
+                "freeText": not options or bool(question.get("isOther")),
+                "allowOther": bool(question.get("isOther")),
+                "isSecret": bool(question.get("isSecret")),
+                "required": True,
+            })
+        if not questions:
+            return {"answers": {}}
+        auto_ms = params.get("autoResolutionMs")
+        timeout = float(auto_ms) / 1000.0 if isinstance(auto_ms, int) and auto_ms > 0 else None
+        outcome = await hub.request_interaction(
+            "AskUserQuestion", {
+                "questions": questions,
+                "outOfBand": True,
+                "message": "Codex needs your input",
+            }, timeout=timeout,
+        )
+        if not outcome.approved or not outcome.result:
+            return {"answers": {}}
+        answers: dict[str, dict[str, list[str]]] = {}
+        for raw, rendered in zip(raw_questions, questions, strict=False):
+            value = (
+                outcome.result.get(rendered["question"])
+                or outcome.result.get(str(raw.get("id") or ""))
+            )
+            if value is None:
+                continue
+            labels = [part.strip() for part in str(value).split(",") if part.strip()]
+            answers[str(raw.get("id") or rendered["question"])] = {"answers": labels}
+        return {"answers": answers}
+
+    async def _request_mcp_elicitation(self, params: dict) -> dict:
+        """Bridge typed MCP form and URL elicitation into Nerve's UI."""
+        hub = self._spec.interactive
+        if hub is None:
+            return {"action": "decline"}
+        mode = params.get("mode")
+        if mode == "url":
+            url = str(params.get("url") or "")
+            if not url.startswith(("https://", "http://")):
+                return {"action": "decline"}
+            outcome = await hub.request_interaction(
+                "AskUserQuestion",
+                {
+                    "outOfBand": True,
+                    "message": str(params.get("message") or "Complete this request"),
+                    "url": url,
+                    "questions": [{
+                        "id": "completed",
+                        "question": "Open the link, complete the flow, then continue.",
+                        "header": "External",
+                        "options": [{"label": "Completed", "value": "true"}],
+                        "required": True,
+                    }],
+                },
+            )
+            return {"action": "accept"} if outcome.approved else {"action": "decline"}
+        if mode not in ("form", "openai/form"):
+            return {"action": "decline"}
+        schema = params.get("requestedSchema") or {}
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(properties, dict) or not properties:
+            return {"action": "decline"}
+        required = set(schema.get("required") or [])
+        questions: list[dict[str, Any]] = []
+        property_types: dict[str, str] = {}
+        for key, prop in properties.items():
+            if not isinstance(prop, dict):
+                return {"action": "decline"}
+            prop_type = str(prop.get("type") or "string")
+            enum = prop.get("enum")
+            one_of = prop.get("oneOf")
+            multi = prop_type == "array"
+            enum_source = prop.get("items") if multi and isinstance(prop.get("items"), dict) else prop
+            if multi:
+                enum = enum_source.get("enum")
+                one_of = enum_source.get("oneOf")
+            options: list[dict[str, str]] = []
+            if isinstance(one_of, list) and one_of:
+                options = [
+                    {
+                        "label": str(option.get("title") or option.get("const")),
+                        "value": str(option.get("const")),
+                    }
+                    for option in one_of
+                    if isinstance(option, dict) and option.get("const") is not None
+                ]
+            elif isinstance(enum, list) and enum:
+                names = enum_source.get("enumNames") or []
+                options = [
+                    {
+                        "label": str(names[index]) if index < len(names) else str(value),
+                        "value": str(value),
+                    }
+                    for index, value in enumerate(enum)
+                ]
+            elif prop_type == "boolean":
+                options = [
+                    {"label": "Yes", "value": "true"},
+                    {"label": "No", "value": "false"},
+                ]
+            elif prop_type not in ("string", "number", "integer"):
+                return {"action": "decline"}
+            property_types[str(key)] = prop_type
+            questions.append({
+                "id": str(key),
+                "question": str(prop.get("description") or prop.get("title") or key),
+                "header": str(prop.get("title") or key)[:12],
+                "options": options,
+                "multiSelect": multi,
+                "freeText": not options,
+                "isSecret": bool(prop.get("writeOnly")) or prop.get("format") == "password",
+                "required": str(key) in required,
+            })
+        outcome = await hub.request_interaction(
+            "AskUserQuestion", {
+                "questions": questions,
+                "outOfBand": True,
+                "message": str(params.get("message") or "An MCP server needs input"),
+            },
+        )
+        if not outcome.approved or not outcome.result:
+            return {"action": "decline"}
+        content: dict[str, Any] = {}
+        for key, prop_type in property_types.items():
+            value = outcome.result.get(key)
+            if value is None:
+                continue
+            if prop_type == "boolean":
+                content[key] = str(value).lower() == "true"
+            elif prop_type == "integer":
+                try:
+                    content[key] = int(str(value))
+                except ValueError:
+                    return {"action": "decline"}
+            elif prop_type == "number":
+                try:
+                    content[key] = float(str(value))
+                except ValueError:
+                    return {"action": "decline"}
+            elif prop_type == "array":
+                content[key] = [part.strip() for part in str(value).split(",") if part.strip()]
+            else:
+                content[key] = value
+        return {"action": "accept", "content": content}
 
     # -- lifecycle -------------------------------------------------------- #
 

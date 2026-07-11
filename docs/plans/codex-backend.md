@@ -1,12 +1,18 @@
 # Codex Backend — Multi-Backend Agent Engine
 
-**Status:** implementation plan v2 (2026-07-10; v1 revised after adversarial review — all
-blockers/majors incorporated, see §16)
+**Status:** implemented; 2026-07-11 integration-audit remediation complete
 **Branch:** `pufit/codex-backend`
 **Goal:** run Nerve sessions on OpenAI Codex (GPT‑5.6 family) with **full parity** to the
 Claude path — interactive web sessions, Telegram, cron, wakeups, forks, resume — behind a
 clean backend abstraction. Claude remains the default; the backend is selected by config
 and **sticky per session**.
+
+The 2026-07-11 hardening pass added migration v039 (legacy backend backfill,
+native thread/turn mapping, persisted cwd, cost basis), backend-scoped model
+preflight, exact-point Codex forks, narrow resume-miss recovery, dedicated
+loopback MCP ASGI serving, expiring credentials, canonical protocol checks,
+non-dropping terminal transport behavior, structured user-input/plan/output
+bridges, external-thread convergence, and the pinned managed Ultracode layer.
 
 ---
 
@@ -362,7 +368,7 @@ Asyncio-native JSON-RPC client; the only transport-aware code:
   spec.system_prompt + backend notes` (see §9-prompt), `sandbox` + `approvalPolicy`
   from config (defaults `danger-full-access` + `never` = parity with claude
   auto-approve), `config` override dict: `mcp_servers` (nerve + translated external
-  servers, §8), `project_doc_max_bytes: 0`, web-search toggle.
+  servers, §8), root-workspace-only `project_doc_max_bytes: 0`, web-search toggle.
 - `native_session_id` = thread id (known at `thread/start` — available to the engine's
   cancel-persistence path immediately).
 
@@ -378,16 +384,16 @@ Asyncio-native JSON-RPC client; the only transport-aware code:
 | `item/agentMessage/delta` | `TextDelta` |
 | `item/reasoning/textDelta` / `summaryTextDelta` | `ThinkingDelta` |
 | `item/started {commandExecution}` | `ToolUse(id, "Bash", {command, cwd})` |
-| `item/commandExecution/outputDelta` | buffered → flushed on `item/completed` as `ToolResult(aggregatedOutput, is_error = exitCode != 0)` |
+| `item/commandExecution/outputDelta` | `ToolOutputDelta` for the live Bash block; completion still emits the final `ToolResult` |
 | `item/started {fileChange}` | per `changes[]` entry: best-effort pre-apply `spec.snapshot(path)` then `ToolUse(f"{itemId}:{n}", "Edit", {file_path: path})` |
 | `item/fileChange/patchUpdated` / `item/completed {fileChange}` | per entry: `ToolResult(f"{itemId}:{n}", diff)` — multi-file changes produce N pairs, so the diff panel gets every file |
 | `item/started {mcpToolCall}` | `ToolUse(id, "mcp__<server>__<tool>", input)` |
 | `item/mcpToolCall/progress` / `item/completed {mcpToolCall}` | `ToolResult` |
 | `item/started|completed {webSearch}` | `ToolUse`/`ToolResult("WebSearch")` |
-| `item/plan/delta` + plan items | `SystemEvent("codex_plan", ...)` (logged v1; UI chip later) |
+| `item/plan/delta` + plan items | `SystemEvent("plan_update", ...)` broadcast to the live UI |
 | `thread/tokenUsage/updated` (matching turnId) | retained: `last` breakdown + `modelContextWindow` |
 | `model/rerouted` | `ModelObserved(new_model)` |
-| `turn/completed` | `TurnCompleted(thread_id, model, usage=retained tokenUsage → NormalizedUsage (cachedInputTokens→cache_read_tokens), total_cost_usd=pricing.compute(model, usage) — None when the model has no table entry, duration_ms=turn.durationMs, context_window, status=turn.status, error=turn.error)` — `interrupted` terminates the iterator cleanly so /stop's graceful-wait works |
+| `turn/completed` | `TurnCompleted(thread_id, turn_id, model, usage=retained tokenUsage → NormalizedUsage, nullable billed cost, explicit cost basis/API-equivalent estimate, duration/context/status/error)` — `interrupted` terminates cleanly |
 | generic `error {willRetry}` | `willRetry=true` → `SystemEvent`; else raise `CodexTurnError` into the engine's existing error path |
 | unknown | debug log |
 
@@ -401,10 +407,12 @@ existing UI (tool chips, `_maybe_broadcast_file_changed` diff panel keyed on
 - Default config: `approval_policy: never` + full-access sandbox → no approval
   requests, parity with today. Tightened configs route
   `item/commandExecution/requestApproval` / `item/fileChange/requestApproval` /
-  `item/permissions/requestApproval` → `InteractionHub.request_approval(...)`
+  command/file requests → `InteractionHub.request_approval(...)`
   (auto-decline on non-interactive sources, same rule as today) → decision
-  `{decision: accept|decline}`. `item/tool/requestUserInput` and
-  `mcpServer/elicitation/request`: v1 auto-decline + log.
+  `{decision: accept|decline}`. `item/tool/requestUserInput` is bridged for
+  structured options, including auto-resolution timeouts; MCP enum/boolean
+  forms are bridged while free-form, URL, and secret elicitation is declined.
+  Permission-profile grants remain explicitly unsupported.
 - `interrupt()` → `turn/interrupt {threadId, turnId}`.
 - ScheduleWakeup: new nerve-registry tool `schedule_wakeup` (same clamping/semantics,
   handler calls `spec.record_wakeup` → identical wakeup rows; the sweep fires the
@@ -419,11 +427,15 @@ existing UI (tool chips, `_maybe_broadcast_file_changed` diff panel keyed on
 
 Reuse the production Streamable HTTP endpoint:
 
-- Per-thread `config.mcp_servers.nerve = {url: "http://127.0.0.1:<gateway_port>/mcp/v1",
-  bearer_token_env_var: "NERVE_MCP_TOKEN", tool_timeout_sec: 3600}`.
+- Per-thread `config.mcp_servers.nerve = {url: "http://127.0.0.1:<loopback_port>/mcp/v1/",
+  bearer_token_env_var: "NERVE_MCP_TOKEN", required: true, startup_timeout_sec: 30,
+  tool_timeout_sec: 3600}`.
+  The gateway serves the authenticated MCP ASGI app directly on an ephemeral
+  plaintext listener bound only to `127.0.0.1`. No upstream HTTP client, TLS
+  bypass, or public-listener proxy is involved.
   `bearer_token_env_var` confirmed supported in 0.144.1 (the existing external-agents
-  writer uses `http_headers = {Authorization = "Bearer …"}` — also fine as fallback;
-  final choice at implementation, env-var preferred to keep the token out of any TOML).
+  external-agent writer also uses `bearer_token_env_var`; raw credentials never
+  land in generated Codex TOML.
   If per-thread `config.mcp_servers` proves inert in practice (schema allows it), the
   fallback is writing `~/.nerve/codex/config.toml` at spawn — same content, still
   per-session because the process is per-session (verified by the fake-server test
@@ -433,10 +445,9 @@ Reuse the production Streamable HTTP endpoint:
   `http_headers`/`bearer_token_env_var`). Untranslatable entries (claude-plugin MCPs —
   those ride `options.plugins` on claude) are skipped with a warning. Claude Code
   plugins are claude-only by nature; documented in §14.
-- **Session binding:** mint a per-session JWT with claims `{nerve_session_id,
-  aud: "nerve-mcp", exp: none}` (revocation = gateway secret rotation, exactly the
-  trust model of the existing external tokens; no 24h expiry — a busy session never
-  gets swept, so a 24h token would 401 mid-conversation). Auth changes:
+- **Session binding:** mint an eight-hour per-session JWT with claims
+  `{nerve_session_id, aud: "nerve-mcp", exp, jti}`; Ultracode children exchange
+  it for a two-hour worker-scoped token. Auth changes:
   `gateway.auth.decode_token` gains an `audience=` passthrough and — because PyJWT
   rejects any token carrying `aud` when the caller doesn't request one —
   `authenticate_mcp` tries aud-less first, then `aud="nerve-mcp"`; the decoded payload
@@ -456,9 +467,11 @@ Reuse the production Streamable HTTP endpoint:
   `baseInstructions` (codex harness behavior) untouched.
 - Backend appends a `<backend-notes>` block (not in prompts.py — it stays neutral):
   nerve tools live on the `nerve` MCP server; use `schedule_wakeup` (not
-  ScheduleWakeup); AskUserQuestion/plan-mode don't exist — use `ask_user`.
-- Workspace AGENTS.md would duplicate the identity bundle → thread config
-  `project_doc_max_bytes: 0`.
+  ScheduleWakeup); structured questions and plan updates are bridged, while the
+  persistent async question primitive remains `mcp__nerve__ask_user`.
+- At Nerve's workspace root, AGENTS.md duplicates the rendered identity bundle,
+  so `project_doc_max_bytes: 0`; explicit nested project cwd keeps ordinary
+  repository-local AGENTS.md discovery.
 - Prompt caching: OpenAI caches automatically (no TTL knob) → `supports_cache_ttl=False`
   skips cache_policy for codex sessions; `cachedInputTokens` maps to
   `cache_read_input_tokens` in the usage contract so diagnostics stay meaningful.
@@ -490,7 +503,7 @@ codex:
 ```
 
 - **Auth:** isolated `CODEX_HOME` keeps nerve's auth/config/session state away from
-  Artem's `~/.codex` (which external-agents manages and points back at nerve).
+  the operator's `~/.codex` (which external-agents manages and points back at nerve).
   `api_key` → backend runs `account/login/start {type: apiKey}` once per home when
   `account/read` says logged-out. `chatgpt` → one-time manual
   `CODEX_HOME=~/.nerve/codex codex login`; unauthenticated state surfaces that exact
@@ -503,9 +516,10 @@ codex:
 - **Cost accounting:**
   - claude (cost_is_cumulative=True): unchanged — `_sdk_cumulative_cost` high-water
     mark + `compute_turn_cost` diff + estimate backstop.
-  - codex: `TurnCompleted.total_cost_usd` is already per-turn (backend-priced;
-    **None when the model isn't in the pricing table — never estimated**). Engine
-    passes it directly to `record_turn_usage` and **skips** `compute_turn_cost`,
+  - codex API-key auth: `TurnCompleted.total_cost_usd` is per-turn and marked
+    `api_billed` when the model has a known price. ChatGPT auth records billed
+    cost as NULL and keeps an explicitly labeled `api_equivalent_estimate`.
+    The engine passes billed cost directly to `record_turn_usage` and **skips** `compute_turn_cost`,
     the `_sdk_cumulative_cost` write, and `_reset_cost_baseline` (all gated on the
     capability flag).
   - Usage dict: `NormalizedUsage.to_anthropic_shape()` is what lands in
@@ -616,12 +630,12 @@ code where the fallback goes).
 | Per-thread `config.mcp_servers` override ignored | fake-server asserts what we send; smoke verifies effect; fallback: config.toml in isolated CODEX_HOME (still per-session) |
 | Beta Python SDK temptation | rejected with verified reason (reader-thread approval dispatch); documented |
 | Cross-backend resume corruption | sticky backend column + guard; wakeups inherit |
-| Per-session JWT | aud-scoped, session-claimed, env-only, no exp (revocation = secret rotation — same trust model as existing external tokens) |
-| Cost table drift | config-driven; unknown model → cost None, never estimated (codex path bypasses the estimate backstop by design) |
+| Per-session JWT | aud-scoped, session-claimed, env-only, eight-hour expiry + unique jti; worker tokens expire in two hours |
+| Cost table drift | config-driven; unknown model → cost None; ChatGPT estimates are separate from billed cost |
 | App-server RSS per session | measured in smoke before flip; idle sweep already bounds live client count |
 | `turn/steer` unused → messages queue during turns | same as today (per-session serialization); steering out of scope v1 |
-| Plan mode / AskUserQuestion absent on codex | ask_user covers; approvals UI ships for tightened sandboxes |
-| Live instance safety | worktree only; default config unchanged; no restart without Artem |
+| Structured input/plan protocol drift | schema contract + focused request/plan/output tests; unknown secret/freeform elicitation declines safely |
+| Live instance safety | worktree only; default config unchanged; no restart without operator approval |
 
 ## 14. Out of scope (v1) — explicit non-parity list
 
@@ -646,22 +660,22 @@ code where the fallback goes).
 ## 15. Rollout
 
 1. Merge with `backend: claude` default → zero behavior change; suite green.
-2. Artem: `CODEX_HOME=~/.nerve/codex codex login` (or api_key config); run
+2. Operator: `CODEX_HOME=~/.nerve/codex codex login` (or api_key config); run
    `scripts/codex_smoke.py`; record RSS + snapshot-ordering results in §17.
 3. A/B: `backend_override` on a fresh session, or `agent.cron_backend: codex` (safe
    now — sticky resolution keeps existing sessions and their wakeups on claude).
 4. Watch: usage rows (`raw`), cost attribution, audit trail, approval UX.
-5. Full flip (`agent.backend: codex`) = config edit + `nerve restart` — Artem's call.
+5. Full flip (`agent.backend: codex`) = config edit + `nerve restart` — the operator's call.
 
 ## 15b. New-chat backend selector (UI, added on request)
 
 The composer shows a segmented **Claude / Codex** control on new (virtual)
 chats: Claude in the brand-orange tint, Codex in teal, tooltips carrying
 each backend's default model. The choice binds at server-side session
-creation (`POST /api/sessions {backend}` → metadata `backend_override`,
+creation (`POST /api/sessions {backend, model, cwd}` → persisted columns,
 validated against the engine's backend registry) and the control
-disappears once the conversation starts — the header's existing model
-badge then shows what the session runs on. Codex-selected chats hide the
+disappears once the conversation starts — persistent backend and model
+badges then show what the session runs on. Codex-selected chats hide the
 Ollama model picker (its entries can't be served by codex). `GET
 /api/models` now advertises `backends: {default, options:[{id,label,
 model}]}` for the selector. Visually verified against a scratch gateway
@@ -740,9 +754,9 @@ real app-server + OpenAI API key):**
   `item/completed` when `item/started` carries no diff yet). Re-probe:
   `final='CHANGED' snapshot-time='ORIGINAL'` ✅ — the diff panel gets a
   true before/after pair.
-- Not exercised live: `mcp_servers.nerve` override effectiveness (smoke
-  runs without a gateway; asserted against the fake's argv mirror — the
-  first real nerve-session turn will confirm tool calls land).
+- ✅ **`mcp_servers.nerve` exercised live end-to-end:** a real Codex
+  subprocess connected to the dedicated loopback MCP ASGI listener and
+  completed `session_context` with session-bound auth.
 
 **Adversarial review round 2 (2026-07-10, post-implementation subagent
 review of the full branch — 3 MAJOR / 9 MINOR / 4 NIT, all addressed or
@@ -777,3 +791,43 @@ descoped explicitly):**
   `backend.py`; `tests/test_backend_events.py` coverage lives in
   test_engine.py/test_autonomous_turns.py; v038 has no dedicated
   migration test (covered by the schema-version suite).
+
+## 18. Integration-audit remediation and Ultracode (2026-07-11)
+
+- Migration v039 backfills every legacy NULL backend to `claude`; new sessions
+  persist backend, model, and cwd immediately. Forks inherit all three, reject
+  mixed backends, and pass the selected message's native `lastTurnId` to
+  `thread/fork`.
+- Resume fallback is limited to positively identified missing-thread errors.
+  Authentication, validation, permission, transport, and protocol failures are
+  surfaced without silently discarding context.
+- `GET /api/models` is driven by an authenticated `account/read` + `model/list`
+  preflight. The UI stores model choice per backend, shows a persistent backend
+  badge, and never sends an Anthropic/Ollama model to Codex.
+- Version support is pinned to `>=0.144.1,<0.145.0`; the canonical generated v2
+  schema hash and required RPC methods are checked by
+  `scripts/check_codex_schema.py`.
+- Transport startup failure owns full process/task cleanup. App-server and its
+  Ultracode descendants share a process group. Notification backlog exhaustion
+  and >64 MiB JSONL records are explicit terminal transport failures, never
+  drop-oldest/truncate-and-continue behavior.
+- Native thread IDs have a one-to-one mapping to Nerve sessions. Assistant
+  messages retain native turn IDs so a message-point fork is reproducible;
+  rollout sync reuses that mapping and cannot archive a Nerve-owned session.
+- Optional Ultracode support is managed under the isolated Codex home. Nerve
+  installs version `0.3.0+codex.20260601143116` at exact commit
+  `9dde0086e983413016bf62ab96ba6bb17b599fae`, verifies both on preflight, and
+  forces `ULTRACODE_NO_AUTO_UPDATE=1`.
+- A deterministic, hash-verified overlay fails closed on upstream source drift
+  and hard-caps pilot workflows at concurrency 2, 250k tokens, and eight total
+  workers by default. It also prevents the upstream skill from overriding
+  Nerve's dashboard-off policy.
+- `CODEX_CLI_PATH` points workers at an owner-only Nerve wrapper. The wrapper
+  forwards the parent's stable MCP overrides, exchanges the parent session token
+  for a two-hour `nerve_worker_id` token, and preserves the same parent-session
+  attribution in tool audit metadata. Worker aggregate usage is imported once
+  per workflow ID; ChatGPT/API billing semantics remain distinct.
+- Interrupt/disconnect terminates the app-server process group, including child
+  workers. Non-terminal journals under `$CODEX_HOME/ultracode/runs` are listed by
+  `/api/codex/status` and `nerve codex doctor` for operator recovery. Workers are
+  read-only by default; writable workflows remain an explicit user choice.

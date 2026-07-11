@@ -996,6 +996,88 @@ def doctor(ctx: click.Context) -> None:
         ctx.exit(1)
 
 
+@main.group()
+def codex() -> None:
+    """Inspect and authenticate the Codex integration."""
+
+
+@codex.command("token")
+@click.option(
+    "--hours", type=click.IntRange(1, 24), default=8, show_default=True,
+    help="Token lifetime.",
+)
+@click.pass_context
+def codex_token(ctx: click.Context, hours: int) -> None:
+    """Print a fresh MCP-only token for NERVE_MCP_TOKEN.
+
+    Example: export NERVE_MCP_TOKEN="$(nerve codex token)"
+    """
+    from nerve.gateway.auth import create_external_mcp_token
+
+    secret = ctx.obj["config"].auth.jwt_secret
+    if not secret:
+        # Development mode bypasses MCP auth. An empty value is intentional.
+        return
+    click.echo(create_external_mcp_token(secret, ttl_seconds=hours * 60 * 60))
+
+
+@codex.command("doctor")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON.")
+@click.pass_context
+def codex_doctor(ctx: click.Context, json_output: bool) -> None:
+    """Check CLI version, auth, model protocol, and Ultracode state."""
+    import json
+    from types import SimpleNamespace
+
+    from nerve.agent.backends.codex.backend import CodexBackend
+    from nerve.agent.backends.codex.ultracode import (
+        installation_status,
+        recoverable_runs,
+    )
+
+    config = ctx.obj["config"]
+    backend = CodexBackend(SimpleNamespace(config=config))
+    status = asyncio.run(backend.preflight(force=True))
+    report = {
+        "preflight": status,
+        "ultracode": installation_status(config),
+        "recoverable_runs": recoverable_runs(config),
+        "external_token_env": bool(os.environ.get("NERVE_MCP_TOKEN")),
+    }
+    if json_output:
+        click.echo(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        if status.get("available"):
+            click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
+            click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
+            if status.get("auth_mismatch"):
+                click.echo(
+                    "[ERR] Codex auth mismatch: configured "
+                    f"{status.get('configured_auth')}, effective "
+                    f"{status.get('auth')}"
+                )
+        else:
+            click.echo(f"[ERR] Codex preflight: {status.get('reason', 'failed')}")
+        plugin = report["ultracode"]
+        marker = "OK" if plugin.get("installed") else "--"
+        click.echo(
+            f"[{marker}] Ultracode: "
+            f"{plugin.get('version') or 'not installed'} "
+            f"({plugin.get('revision') or 'no revision'})"
+        )
+        click.echo(
+            f"[{'OK' if report['external_token_env'] else '--'}] "
+            "NERVE_MCP_TOKEN environment"
+        )
+        if report["recoverable_runs"]:
+            click.echo(
+                f"[WARN] {len(report['recoverable_runs'])} recoverable "
+                "Ultracode run(s)"
+            )
+    if not status.get("available") or status.get("auth_mismatch"):
+        ctx.exit(1)
+
+
 @main.command()
 @click.pass_context
 def pair(ctx: click.Context) -> None:

@@ -228,6 +228,14 @@ class ConfigWriter:
                 os.chmod(tmp, mode)
             except OSError as e:
                 logger.debug("chmod on %s failed: %s", tmp, e)
+        else:
+            # Agent configs can contain credentials or references to private
+            # workspace state. Do not let the user's umask make a fresh file
+            # group/world-readable.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError as e:
+                logger.debug("chmod on new %s failed: %s", tmp, e)
         os.replace(tmp, path)
 
     def _sidecar_path(self, path: Path) -> Path:

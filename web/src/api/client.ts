@@ -10,6 +10,74 @@ export interface TaskStatusDef {
   created_at?: string;
 }
 
+export interface UltracodeUsage {
+  input_tokens?: number;
+  cached_input_tokens?: number;
+  output_tokens?: number;
+  reasoning_output_tokens?: number;
+  total_tokens?: number;
+}
+
+export interface UltracodeRunStep {
+  id?: string;
+  step_id?: string;
+  index?: number;
+  kind?: string;
+  title?: string;
+  label?: string;
+  phase?: string | null;
+  status?: string;
+  model?: string;
+  reasoning_effort?: string;
+  depends_on?: string[];
+  duration_ms?: number;
+  usage?: UltracodeUsage;
+  result?: unknown;
+  value?: unknown;
+  error?: string | null;
+  spec?: Record<string, unknown>;
+}
+
+export interface UltracodeRunEvent {
+  at?: string;
+  type?: string;
+  label?: string;
+  phase?: string | null;
+  status?: string;
+  message?: string;
+  worker_id?: string;
+  worker_index?: number;
+  schema_valid?: boolean;
+  data?: Record<string, unknown>;
+}
+
+export interface UltracodeRun {
+  id: string;
+  name?: string | null;
+  display_name?: string | null;
+  slug?: string | null;
+  kind?: string | null;
+  status?: string;
+  task?: string | null;
+  cwd?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at?: string | null;
+  duration_ms?: number | null;
+  workers?: UltracodeRunStep[] | number;
+  steps?: UltracodeRunStep[];
+  events?: UltracodeRunEvent[];
+  aggregate_usage?: UltracodeUsage;
+  options?: Record<string, unknown>;
+  result?: unknown;
+  error?: string | null;
+  running?: number;
+  pending?: number;
+  completed?: number;
+  failed?: number;
+  cancelled?: number;
+}
+
 let authToken: string | null = localStorage.getItem('nerve_token');
 
 export function setToken(token: string) {
@@ -68,11 +136,13 @@ export const api = {
   getModels: () =>
     request<{
       default: string;
+      defaults?: Record<string, string>;
       backends?: {
         default: string;
-        options: { id: string; label: string; model: string }[];
+        options: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string }[];
+        diagnostics?: Record<string, { available: boolean; reason?: string }>;
       };
-      models: { id: string; provider: string }[];
+      models: { id: string; provider: string; backend: string }[];
       ollama: { enabled: boolean; routable: boolean; available: boolean };
     }>('/models'),
 
@@ -81,10 +151,10 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string, backend?: string | null) =>
+  createSession: (title?: string, backend?: string | null, cwd?: string | null) =>
     request<any>('/sessions', {
       method: 'POST',
-      body: JSON.stringify({ title, ...(backend ? { backend } : {}) }),
+      body: JSON.stringify({ title, ...(backend ? { backend } : {}), ...(cwd ? { cwd } : {}) }),
     }),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
@@ -382,6 +452,14 @@ export const api = {
     request<{ deleted: boolean }>(`/houseofagents/pipelines/${id}`, { method: 'DELETE' }),
   installHoaBinary: () =>
     request<{ installed: boolean; path: string; version: string }>('/houseofagents/install', { method: 'POST' }),
+
+  // Ultracode read-only dashboard
+  getUltracodeDashboardStatus: () =>
+    request<{ enabled: boolean }>('/codex/ultracode/dashboard'),
+  listUltracodeRuns: (limit = 40) =>
+    request<{ runs: UltracodeRun[] }>(`/codex/ultracode/runs?limit=${encodeURIComponent(String(limit))}`),
+  getUltracodeRun: (id: string) =>
+    request<{ run: UltracodeRun }>(`/codex/ultracode/runs/${encodeURIComponent(id)}`),
 
   // Files
   uploadFiles: async (files: File[], sessionId: string): Promise<{ files: Array<{ id: string; filename: string; media_type: string; file_type: string; size: number }> }> => {

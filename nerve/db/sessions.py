@@ -18,21 +18,26 @@ class SessionStore:
         status: str = "created",
         parent_session_id: str | None = None,
         forked_from_message: str | None = None,
+        backend: str = "claude",
+        model: str | None = None,
+        cwd: str | None = None,
     ) -> dict:
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
             """INSERT OR IGNORE INTO sessions
                (id, title, source, metadata, status, parent_session_id,
-                forked_from_message, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                forked_from_message, backend, model, cwd, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session_id, title or session_id, source,
              json.dumps(metadata or {}), status,
-             parent_session_id, forked_from_message, now, now),
+             parent_session_id, forked_from_message, backend, model, cwd,
+             now, now),
         )
         return {
             "id": session_id, "title": title or session_id,
             "source": source, "status": status,
             "parent_session_id": parent_session_id,
+            "backend": backend, "model": model, "cwd": cwd,
         }
 
     async def get_session(self, session_id: str) -> dict | None:
@@ -130,7 +135,7 @@ class SessionStore:
             "status", "sdk_session_id", "connected_at", "last_activity_at",
             "archived_at", "title", "message_count", "total_cost_usd",
             "parent_session_id", "forked_from_message", "last_memorized_at",
-            "starred", "model", "backend",
+            "starred", "model", "backend", "cwd",
         }
         set_clauses: list[str] = []
         params: list = []
@@ -154,6 +159,44 @@ class SessionStore:
         if built is None:
             return
         await self._write(*built)
+
+    async def bind_native_thread(
+        self, backend: str, native_thread_id: str, session_id: str,
+    ) -> None:
+        """Bind one backend-native thread to exactly one Nerve session.
+
+        The unique backend/session constraint prevents a session from silently
+        switching native threads while the primary key prevents rollout/MCP
+        ingestion from creating a duplicate satellite for a Nerve-owned thread.
+        """
+        if not backend or not native_thread_id or not session_id:
+            raise ValueError("backend, native_thread_id, and session_id are required")
+        async with self._atomic():
+            await self.db.execute(
+                "DELETE FROM session_native_threads "
+                "WHERE backend = ? AND session_id = ? AND native_thread_id != ?",
+                (backend, session_id, native_thread_id),
+            )
+            await self.db.execute(
+                """INSERT INTO session_native_threads
+                       (backend, native_thread_id, session_id, updated_at)
+                   VALUES (?, ?, ?, datetime('now'))
+                   ON CONFLICT(backend, native_thread_id) DO UPDATE SET
+                       session_id = excluded.session_id,
+                       updated_at = excluded.updated_at""",
+                (backend, native_thread_id, session_id),
+            )
+
+    async def get_session_for_native_thread(
+        self, backend: str, native_thread_id: str,
+    ) -> str | None:
+        async with self.db.execute(
+            "SELECT session_id FROM session_native_threads "
+            "WHERE backend = ? AND native_thread_id = ?",
+            (backend, native_thread_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row[0]) if row else None
 
     async def get_sessions_with_metadata_key(self, key: str) -> list[dict]:
         """Find sessions whose metadata JSON contains a specific key.

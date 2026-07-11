@@ -5,6 +5,7 @@ import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
 import { ChatInput } from '../components/Chat/ChatInput';
 import { ApprovalCard } from '../components/Chat/ApprovalCard';
+import { InteractiveQuestionCard } from '../components/Chat/InteractiveQuestionCard';
 import { ContextBar } from '../components/Chat/ContextBar';
 import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
@@ -39,9 +40,10 @@ export function ChatPage() {
   const {
     sessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
-    agentStatus, contextUsage, currentTodos, currentCCTasks,
+    agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, panels,
     modifiedFiles, modifiedFilesCount,
+    backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSidebar, openFilesPanel,
   } = useChatStore();
@@ -204,6 +206,23 @@ export function ChatPage() {
                   : (sessions.find(s => s.id === activeSession)?.title || activeSession)}
               </span>
               {(() => {
+                const backend = virtualSession?.id === activeSession
+                  ? (newChatBackend ?? backendDefault ?? 'claude')
+                  : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
+                return (
+                  <span
+                    title={`Agent backend: ${backend}`}
+                    className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border ${
+                      backend === 'codex'
+                        ? 'text-hue-teal border-teal-400/25 bg-teal-400/10'
+                        : 'text-hue-orange border-orange-400/25 bg-orange-400/10'
+                    }`}
+                  >
+                    {backend}
+                  </span>
+                );
+              })()}
+              {(() => {
                 const model = sessions.find(s => s.id === activeSession)?.model;
                 return model ? (
                   <span className="text-[11px] text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
@@ -217,6 +236,20 @@ export function ChatPage() {
                   <span>{statusLabel}</span>
                 </div>
               )}
+              {backendStatus?.subtype === 'codex_rate_limits' && (() => {
+                const rateLimits = backendStatus.data.rateLimits as
+                  | { primary?: { usedPercent?: number } }
+                  | undefined;
+                const used = rateLimits?.primary?.usedPercent;
+                return (
+                  <span
+                    className="text-[11px] text-text-faint"
+                    title={JSON.stringify(backendStatus.data)}
+                  >
+                    Codex limit{typeof used === 'number' ? ` ${used}% used` : ' updated'}
+                  </span>
+                );
+              })()}
             </div>
             <div className="flex items-center gap-2">
               <BackgroundJobs
@@ -272,6 +305,7 @@ export function ChatPage() {
 
           <TodoPanel todos={currentTodos} ccTasks={currentCCTasks} />
 
+          <InteractiveQuestionCard />
           <ApprovalCard />
 
           <ChatInput

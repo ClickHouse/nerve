@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from nerve.gateway.auth import (
     MCP_AUDIENCE,
     MCP_SESSION_CLAIM,
+    MCP_WORKER_CLAIM,
     create_mcp_session_token,
     create_token,
     decode_token,
@@ -37,12 +38,13 @@ def _scope(token: str | None) -> dict:
 
 
 class TestTokenShapes:
-    def test_session_token_carries_claims_and_no_expiry(self):
+    def test_session_token_carries_claims_and_short_expiry(self):
         token = create_mcp_session_token(SECRET, "sess-42")
         payload = decode_mcp_token(token, SECRET)
         assert payload["aud"] == MCP_AUDIENCE
         assert payload[MCP_SESSION_CLAIM] == "sess-42"
-        assert "exp" not in payload  # process-env token; see auth.py rationale
+        assert payload["exp"] - payload["iat"] == 8 * 60 * 60
+        assert payload["jti"]
 
     def test_plain_gateway_token_still_decodes(self):
         token = create_token(SECRET)
@@ -137,6 +139,40 @@ class TestCtxBinding:
 
         # No request context set → no binding.
         assert mcp_http._bound_session_from_request(cfg) is None
+
+    @pytest.mark.asyncio
+    async def test_worker_token_adds_runtime_attribution(self, tmp_path):
+        from types import SimpleNamespace
+
+        from nerve.config import NerveConfig
+        from nerve.mcp_server import http as mcp_http
+
+        cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
+        cfg.auth.jwt_secret = SECRET
+        worker_id = "ultracode-0123456789abcdef"
+        token = create_mcp_session_token(
+            SECRET, "engine-sess-8", worker_id=worker_id,
+        )
+
+        class _Headers(dict):
+            def get(self, key, default=None):
+                return super().get(key.lower(), default)
+
+        fake_request = SimpleNamespace(
+            headers=_Headers({"authorization": f"Bearer {token}"}),
+            query_params={},
+        )
+        cv_token = mcp_http.request_ctx.set(
+            SimpleNamespace(request=fake_request, session=None),
+        )
+        try:
+            session_id, runtime = mcp_http._bound_identity_from_request(cfg)
+        finally:
+            mcp_http.request_ctx.reset(cv_token)
+        assert session_id == "engine-sess-8"
+        assert runtime == {"worker_id": worker_id, "runtime": "ultracode"}
+        payload = decode_mcp_token(token, SECRET)
+        assert payload[MCP_WORKER_CLAIM] == worker_id
 
     @pytest.mark.asyncio
     async def test_dev_mode_never_binds(self, tmp_path):

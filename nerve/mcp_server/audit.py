@@ -54,7 +54,7 @@ def build_audit_writer(db: "Database"):
     """
 
     async def _write(
-        session_id: str,
+        session_id,
         tool_name: str,
         args: dict,
         result: ToolResult,
@@ -72,6 +72,10 @@ def build_audit_writer(db: "Database"):
             "duration_ms": round(duration_ms, 2),
             "is_error": is_error,
         }
+        runtime_metadata = getattr(session_id, "runtime_metadata", None) or {}
+        if runtime_metadata:
+            details["runtime"] = runtime_metadata
+        session_id = getattr(session_id, "session_id", session_id)
         try:
             await db.log_session_event(
                 session_id=session_id,
@@ -84,4 +88,5 @@ def build_audit_writer(db: "Database"):
                 session_id, tool_name,
             )
 
+    _write._accepts_tool_context = True  # type: ignore[attr-defined]
     return _write

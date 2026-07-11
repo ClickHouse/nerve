@@ -57,10 +57,10 @@ class MessageResponse(BaseModel):
 class SessionCreateRequest(BaseModel):
     title: str | None = None
     source: str = "web"
-    # Agent backend for this session ("claude" | "codex"). Stored as
-    # metadata backend_override; the engine stamps the sticky
-    # sessions.backend column at first client build (docs plan §3).
+    # Agent backend for this session ("claude" | "codex"). Persisted
+    # immediately; metadata keeps the override only for old readers.
     backend: str | None = None
+    cwd: str | None = None
 
 
 class ForkRequest(BaseModel):
@@ -111,9 +111,27 @@ async def create_session(req: SessionCreateRequest, user: dict = Depends(require
                        f"(known: {sorted(deps.engine._backends)})",
             )
         metadata = {"backend_override": backend}
+    else:
+        backend = deps.engine.config.agent.backend
+    if backend == "codex":
+        preflight = await deps.engine._backends["codex"].preflight()
+        if not preflight.get("available"):
+            raise HTTPException(
+                status_code=503,
+                detail=f"Codex is unavailable: {preflight.get('reason', 'preflight failed')}",
+            )
+    cwd = str(deps.engine.config.workspace)
+    if req.cwd:
+        path = Path(req.cwd).expanduser().resolve()
+        if not path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Working directory not found: {path}")
+        cwd = str(path)
+    selected_backend = deps.engine._backends[backend]
+    model = selected_backend.default_model(req.source)
     session_id = str(uuid.uuid4())[:8]
     session = await deps.engine.sessions.get_or_create(
         session_id, title=req.title, source=req.source, metadata=metadata,
+        backend=backend, model=model, cwd=cwd,
     )
     return session
 

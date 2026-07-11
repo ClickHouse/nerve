@@ -135,7 +135,10 @@ class InteractiveToolHandler:
     # -- pause requests -------------------------------------------------- #
 
     async def request_interaction(
-        self, tool_name: str, tool_input: dict[str, Any],
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        timeout: float | None = None,
     ) -> InteractionOutcome:
         """Pause for an interactive built-in (question / plan approval)."""
         if not self.interactive_capable:
@@ -148,7 +151,7 @@ class InteractiveToolHandler:
                 message=f"{tool_name} is not available in this channel.",
             )
         return await self._pause(
-            tool_name, tool_input, _interaction_type(tool_name),
+            tool_name, tool_input, _interaction_type(tool_name), timeout=timeout,
         )
 
     async def request_approval(
@@ -176,6 +179,7 @@ class InteractiveToolHandler:
         tool_name: str,
         tool_input: dict[str, Any],
         interaction_type: str,
+        timeout: float | None = None,
     ) -> InteractionOutcome:
         """Broadcast to the UI, wait for the user's response."""
         interaction_id = str(uuid4())
@@ -206,17 +210,18 @@ class InteractiveToolHandler:
 
         try:
             try:
-                await asyncio.wait_for(pending.event.wait(), timeout=INTERACTION_TIMEOUT)
+                wait_timeout = INTERACTION_TIMEOUT if timeout is None else max(0.1, timeout)
+                await asyncio.wait_for(pending.event.wait(), timeout=wait_timeout)
             except asyncio.TimeoutError:
                 logger.warning(
                     "Session %s: interaction %s timed out after %ds",
-                    self.session_id, interaction_id[:8], INTERACTION_TIMEOUT,
+                    self.session_id, interaction_id[:8], wait_timeout,
                 )
                 return InteractionOutcome(
                     denied=True,
                     message=(
                         f"No response received after "
-                        f"{_humanize_seconds(INTERACTION_TIMEOUT)} — timed out."
+                        f"{_humanize_seconds(wait_timeout)} — timed out."
                     ),
                 )
             except asyncio.CancelledError:

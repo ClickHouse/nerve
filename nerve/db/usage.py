@@ -64,6 +64,8 @@ class UsageStore:
         cache_creation_1h: int = 0,
         model: str | None = None,
         cost_usd: float | None = None,
+        cost_basis: str = "unknown",
+        estimated_cost_usd: float | None = None,
         duration_ms: int | None = None,
         duration_api_ms: int | None = None,
         num_turns: int = 1,
@@ -83,15 +85,15 @@ class UsageStore:
             "(session_id, input_tokens, output_tokens, "
             "cache_creation_input_tokens, cache_read_input_tokens, "
             "cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, "
-            "max_context_tokens, model, cost_usd, duration_ms, "
+            "max_context_tokens, model, cost_usd, cost_basis, estimated_cost_usd, duration_ms, "
             "duration_api_ms, num_turns, web_search_requests, web_fetch_requests) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id, input_tokens, output_tokens,
                 cache_creation, cache_read,
                 cache_creation_5m, cache_creation_1h,
                 max_context,
-                model, cost_usd, duration_ms,
+                model, cost_usd, cost_basis, estimated_cost_usd, duration_ms,
                 duration_api_ms, num_turns,
                 web_search_requests, web_fetch_requests,
             ),
@@ -111,6 +113,7 @@ class UsageStore:
                 COALESCE(SUM(cache_read_input_tokens), 0) as total_cache_read,
                 MAX(max_context_tokens) as max_context,
                 COALESCE(SUM(cost_usd), 0) as total_cost_usd,
+                COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost_usd,
                 COALESCE(SUM(web_search_requests), 0) as total_web_searches,
                 COALESCE(SUM(web_fetch_requests), 0) as total_web_fetches
             FROM session_usage WHERE session_id = ?
@@ -125,6 +128,7 @@ class UsageStore:
                         "total_cache_creation_1h": 0,
                         "total_cache_read": 0,
                         "max_context": 0, "total_cost_usd": 0,
+                        "total_estimated_cost_usd": 0,
                         "total_web_searches": 0, "total_web_fetches": 0}
             return dict(row)
 
@@ -142,6 +146,7 @@ class UsageStore:
                 SUM(cache_creation_1h_input_tokens) as cache_creation_1h,
                 SUM(cache_read_input_tokens) as cache_read,
                 COALESCE(SUM(cost_usd), 0) as cost_usd,
+                COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost_usd,
                 COALESCE(SUM(web_search_requests), 0) as web_searches
             FROM session_usage
             WHERE created_at >= DATE('now', ?)
@@ -167,6 +172,7 @@ class UsageStore:
                 SUM(u.cache_creation_1h_input_tokens) as cache_creation_1h,
                 SUM(u.cache_read_input_tokens) as cache_read,
                 COALESCE(SUM(u.cost_usd), 0) as cost_usd,
+                COALESCE(SUM(u.estimated_cost_usd), 0) as estimated_cost_usd,
                 COALESCE(SUM(u.web_search_requests), 0) as web_searches
             FROM session_usage u
             JOIN sessions s ON s.id = u.session_id
@@ -192,6 +198,7 @@ class UsageStore:
                 SUM(cache_creation_1h_input_tokens) as cache_creation_1h,
                 SUM(cache_read_input_tokens) as cache_read,
                 COALESCE(SUM(cost_usd), 0) as cost_usd,
+                COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost_usd,
                 COALESCE(SUM(web_search_requests), 0) as web_searches
             FROM session_usage
             WHERE created_at >= DATE('now', ?)
@@ -243,8 +250,9 @@ class UsageStore:
     async def get_usage_summary(self, days: int = 7) -> dict:
         """High-level usage summary for the past N days.
 
-        Uses SDK-provided cost_usd when available; falls back to estimation
-        for legacy rows that predate v021 (cost_usd is NULL).
+        Billed cost and explicitly labeled estimates stay separate. A token
+        estimate is used only when every row predates cost-basis tracking;
+        ChatGPT-credit turns must never be presented as API spend.
         """
         async with self.db.execute(
             """
@@ -258,6 +266,9 @@ class UsageStore:
                 COALESCE(SUM(cache_creation_5m_input_tokens), 0) as total_cache_creation_5m,
                 COALESCE(SUM(cache_creation_1h_input_tokens), 0) as total_cache_creation_1h,
                 COALESCE(SUM(cost_usd), 0) as total_cost_usd,
+                COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost_usd,
+                COALESCE(SUM(CASE WHEN cost_basis != 'unknown' THEN 1 ELSE 0 END), 0)
+                    as classified_turns,
                 COALESCE(SUM(web_search_requests), 0) as total_web_searches
             FROM session_usage
             WHERE created_at >= DATE('now', ?)
@@ -272,13 +283,19 @@ class UsageStore:
                         "total_cache_creation_5m": 0,
                         "total_cache_creation_1h": 0,
                         "total_cost_usd": 0,
+                        "total_estimated_cost_usd": 0,
                         "total_web_searches": 0}
             d = dict(row)
-            # If SDK cost is available, use it; otherwise fall back to estimate
-            if not d["total_cost_usd"]:
+            # Legacy-only databases predate cost_basis and need the historical
+            # estimate fallback. Classified ChatGPT rows deliberately remain
+            # billed at $0 with their estimate in the separate field.
+            if not d["total_cost_usd"] and not d.pop("classified_turns", 0):
                 d["total_cost_usd"] = round(estimate_cost_from_totals(d), 4)
             else:
                 d["total_cost_usd"] = round(d["total_cost_usd"], 4)
+            d["total_estimated_cost_usd"] = round(
+                d["total_estimated_cost_usd"], 4,
+            )
             return d
 
     async def get_cache_ttl_turn_rows(self, days: int = 7) -> list[tuple]:

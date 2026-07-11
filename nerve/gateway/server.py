@@ -32,6 +32,7 @@ from nerve.gateway.routes import (
     set_notification_service,
 )
 from nerve.mcp_server import build_manager as _build_mcp_manager, mount_deferred as _mount_mcp_deferred
+from nerve.mcp_server.loopback import McpLoopbackServer
 from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
@@ -166,6 +167,43 @@ async def lifespan(app: FastAPI):
     _engine.set_notification_service(notification_service)
     agent_tools._notification_service = notification_service
     set_notification_service(notification_service)
+
+    # Start the external MCP manager and its Codex-facing loopback listener
+    # before cron scheduling. The loopback listener serves the ASGI app
+    # directly and is independent of the public gateway socket/TLS setup.
+    mcp_run_ctx = None
+    mcp_loopback_server = None
+    if config.mcp_endpoint.enabled:
+        try:
+            _mcp_manager = _build_mcp_manager(_engine, _engine.registry, config)
+            mcp_run_ctx = _mcp_manager.run()
+            await mcp_run_ctx.__aenter__()
+            logger.info(
+                "MCP endpoint live at %s (include_hoa=%s)",
+                config.mcp_endpoint.path, config.mcp_endpoint.include_hoa,
+            )
+        except Exception as e:
+            logger.error("Failed to start MCP endpoint: %s", e)
+            mcp_run_ctx = None
+            _mcp_manager = None
+
+        if _mcp_manager is not None:
+            try:
+                from nerve.gateway.routes.codex import router as codex_router
+
+                loopback_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+                _mount_mcp_deferred(
+                    loopback_app, config, lambda: _mcp_manager,
+                )
+                loopback_app.include_router(codex_router)
+                mcp_loopback_server = await McpLoopbackServer.start(loopback_app)
+                _engine.set_mcp_loopback_port(mcp_loopback_server.port)
+                logger.info(
+                    "Codex MCP loopback listener live on 127.0.0.1:%d",
+                    mcp_loopback_server.port,
+                )
+            except Exception as e:
+                logger.error("Failed to start Codex MCP loopback listener: %s", e)
 
     # Start Telegram bot if enabled
     telegram_channel = None
@@ -412,26 +450,6 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to start Codex thread sync: %s", e, exc_info=True)
         _codex_thread_sync = None
 
-    # Start the external MCP manager if enabled — its run() context
-    # owns the task group for in-flight connections. The deferred mount
-    # added in create_app() reads the manager from _mcp_manager once
-    # it's set, so the /mcp/v1 path is wired BEFORE the SPA catch-all
-    # but only becomes reachable after we enter run() below.
-    mcp_run_ctx = None
-    if config.mcp_endpoint.enabled:
-        try:
-            _mcp_manager = _build_mcp_manager(_engine, _engine.registry, config)
-            mcp_run_ctx = _mcp_manager.run()
-            await mcp_run_ctx.__aenter__()
-            logger.info(
-                "MCP endpoint live at %s (include_hoa=%s)",
-                config.mcp_endpoint.path, config.mcp_endpoint.include_hoa,
-            )
-        except Exception as e:
-            logger.error("Failed to start MCP endpoint: %s", e)
-            mcp_run_ctx = None
-            _mcp_manager = None
-
     logger.info("Nerve started on %s:%d", config.gateway.host, config.gateway.port)
 
     # Send startup notification to the user (Telegram only, silent)
@@ -448,8 +466,17 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: stop MCP manager first so in-flight requests finish
-    # before we tear down the engine they depend on.
+    # Stop the loopback listener before the manager so no new requests
+    # arrive while the MCP task group is shutting down.
+    if mcp_loopback_server is not None:
+        try:
+            await mcp_loopback_server.close()
+        except Exception as e:
+            logger.warning("MCP loopback listener shutdown raised: %s", e)
+        if _engine is not None:
+            _engine.set_mcp_loopback_port(None)
+
+    # Shutdown: stop MCP manager before the engine it depends on.
     if mcp_run_ctx is not None:
         try:
             await mcp_run_ctx.__aexit__(None, None, None)

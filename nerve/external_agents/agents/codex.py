@@ -1,7 +1,7 @@
 """Codex external agent — writes ``~/.codex/config.toml`` + ``AGENTS.md``.
 
 The ``config.toml`` portion is one-shot: we write it once during
-bootstrap with the user's MCP token and the workspace path, then
+bootstrap with an MCP token environment-variable reference and the workspace path, then
 never touch it again. Users routinely edit Codex config to swap
 models, tweak sandbox modes, add other MCP servers — clobbering those
 edits every sync run would be hostile.
@@ -13,6 +13,7 @@ bundle string).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from nerve.external_agents.registry import (
@@ -43,10 +44,11 @@ trust_level = "trusted"
 
 # Nerve MCP server — exposes the full Nerve tool registry (tasks,
 # memory, plans, skills, notifications, ...) to Codex. Authentication
-# reuses Nerve's gateway JWT.
+# uses a gateway JWT supplied at process launch. Never persist bearer
+# credentials in this generated TOML file.
 [mcp_servers.nerve]
 url = "{nerve_url}"
-http_headers = {{ Authorization = "Bearer {mcp_token}" }}
+bearer_token_env_var = "NERVE_MCP_TOKEN"
 startup_timeout_sec = 30
 tool_timeout_sec = 60
 default_tools_approval_mode = "auto"
@@ -100,7 +102,6 @@ class CodexAgent(ExternalAgent):
             sandbox_mode=self.DEFAULT_SANDBOX_MODE,
             workspace=str(workspace),
             nerve_url=nerve_url,
-            mcp_token=mcp_token,
         )
         backups: list[Path] = []
         warnings: list[str] = []
@@ -121,6 +122,11 @@ class CodexAgent(ExternalAgent):
             warnings.append(
                 "`codex` CLI not found on PATH — install with "
                 "`npm i -g @openai/codex` to actually use this config."
+            )
+        if not os.environ.get("NERVE_MCP_TOKEN"):
+            warnings.append(
+                "Set NERVE_MCP_TOKEN in the environment that launches `codex`; "
+                "the bearer token is intentionally not stored in config.toml."
             )
 
         return AgentSetupResult(

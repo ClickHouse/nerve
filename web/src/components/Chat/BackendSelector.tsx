@@ -54,9 +54,11 @@ export function BackendSelector({ disabled }: { disabled?: boolean }) {
             key={opt.id}
             role="radio"
             aria-checked={isActive}
-            disabled={disabled}
+            disabled={disabled || opt.available === false}
             onClick={() => setNewChatBackend(opt.id === backendDefault ? null : opt.id)}
-            title={`${opt.label} — ${opt.model}${opt.id === backendDefault ? ' (default)' : ''}. Applies to this new chat; the choice is fixed once the conversation starts.`}
+            title={opt.available === false
+              ? `${opt.label} unavailable — ${opt.reason ?? 'preflight failed'}`
+              : `${opt.label} — ${opt.model}${opt.id === backendDefault ? ' (default)' : ''}. Applies to this new chat; the choice is fixed once the conversation starts.`}
             className={`h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-all cursor-pointer disabled:opacity-30 disabled:cursor-default ${
               isActive
                 ? style.active

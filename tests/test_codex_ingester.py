@@ -175,6 +175,38 @@ async def test_thread_archived_marks_session(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_native_thread_reuses_nerve_session_and_does_not_archive_it(
+    db, tmp_path,
+):
+    tid = "native-thread-1"
+    await db.create_session(
+        "nerve-chat", source="web", backend="codex", status="active",
+    )
+    await db.bind_native_thread("codex", tid, "nerve-chat")
+    ing = CodexIngester(
+        db, origin_id="local",
+        workspace_filter=_filter(tmp_path),
+        broadcaster=_NullBroadcaster(),
+    )
+    await ing.ingest(_evt(
+        "thread_in_scope", thread_id=tid,
+        payload=_session_meta_payload(tid, str(tmp_path)),
+    ))
+    await ing.ingest(_evt(
+        "user_message", thread_id=tid,
+        payload={"message": "same row", "event_id": "native-1"}, seq=2,
+    ))
+    assert await db.get_session(codex_session_id(tid)) is None
+    messages = await db.get_messages("nerve-chat")
+    assert messages[0]["content"] == "same row"
+
+    await ing.ingest(_evt("thread_archived", thread_id=tid, payload={}))
+    session = await db.get_session("nerve-chat")
+    assert session["status"] == "active"
+    assert ing.stats["threads_archived"] == 0
+
+
+@pytest.mark.asyncio
 async def test_message_before_session_meta_is_dropped(db, tmp_path):
     ing = CodexIngester(
         db, origin_id="o1",

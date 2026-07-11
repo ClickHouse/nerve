@@ -15,6 +15,8 @@ FAKE_CODEX_MODE env var:
                  only after the client answers
   resume_fail  — thread/resume|fork answer with a JSON-RPC error;
                  thread/start succeeds (resume-miss recovery path)
+  resume_auth_fail — thread/read fails with a non-missing auth error;
+                 the client must surface it and never start fresh
   interrupt    — turn runs "forever" until turn/interrupt, then emits
                  turn/completed with status=interrupted
   die_mid_turn — emits one delta then exits(1) mid-turn
@@ -41,6 +43,10 @@ import os
 import sys
 import threading
 import time
+
+if "--version" in sys.argv:
+    print("codex-cli 0.144.1")
+    raise SystemExit(0)
 
 MODE = os.environ.get("FAKE_CODEX_MODE", "basic")
 
@@ -308,15 +314,29 @@ def main() -> None:
         elif method == "initialized":
             pass  # notification, no response
         elif method == "account/read":
-            respond(req_id, {"account": {"type": "chatgpt", "email": "fake@example.com"}})
+            account_type = "apiKey" if MODE == "account_api_key" else "chatgpt"
+            respond(req_id, {"account": {"type": account_type, "email": "fake@example.com"}})
         elif method == "account/login/start":
             respond(req_id, {"loginId": "fake-login"})
+        elif method == "model/list":
+            respond(req_id, {"data": [{"id": "gpt-5.6-sol"}]})
+        elif method == "thread/read":
+            if MODE == "resume_auth_fail":
+                respond_error(req_id, 401, "authentication expired")
+            elif MODE == "resume_fail":
+                respond_error(req_id, -32600, "no rollout found for thread")
+            else:
+                respond(req_id, {"thread": {"id": msg["params"]["threadId"]}})
         elif method == "thread/start":
             threads_started += 1
             respond(req_id, {"thread": {"id": f"th_fake_{threads_started}"}})
         elif method in ("thread/resume", "thread/fork"):
             if MODE == "resume_fail":
                 respond_error(req_id, -32600, "no rollout found for thread")
+            elif MODE == "resume_auth_fail":
+                respond_error(req_id, 401, "authentication expired")
+            elif method == "thread/fork" and msg["params"].get("lastTurnId"):
+                respond(req_id, {"thread": {"id": "fork:" + msg["params"]["lastTurnId"]}})
             else:
                 respond(req_id, {"thread": {"id": msg["params"]["threadId"]}})
         elif method == "turn/start":

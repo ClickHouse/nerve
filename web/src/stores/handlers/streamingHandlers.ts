@@ -383,6 +383,29 @@ export function handleToolResult(
   }
 }
 
+export function handleToolOutput(
+  msg: Extract<WSMessage, { type: 'tool_output' }>,
+  _get: Get,
+  set: Set,
+): void {
+  const parentId = msg.parent_tool_use_id;
+  if (parentId) {
+    // Child-command live output remains visible in the parent panel once the
+    // final tool_result arrives; avoid manufacturing a completed result here.
+    return;
+  }
+  set(state => ({
+    streamingBlocks: state.streamingBlocks.map(block => {
+      if (block.type !== 'tool_call' || block.toolUseId !== msg.tool_use_id) return block;
+      return {
+        ...block,
+        result: `${block.result ?? ''}${msg.content}`,
+        status: 'running' as const,
+      };
+    }),
+  }));
+}
+
 // ------------------------------------------------------------------ //
 //  Turn lifecycle: done, stopped, error                               //
 // ------------------------------------------------------------------ //

@@ -34,6 +34,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
 from nerve.agent.tools import ToolContext, ToolRegistry
+from nerve.gateway.auth import MCP_WORKER_CLAIM
 from nerve.mcp_server.audit import build_audit_writer
 from nerve.mcp_server.auth import (
     McpAuthError,
@@ -102,7 +103,9 @@ def _resolve_client_info() -> tuple[str | None, str | None, str | None]:
     return client_name, mcp_session_id, path
 
 
-def _bound_session_from_request(config: "NerveConfig") -> str | None:
+def _bound_identity_from_request(
+    config: "NerveConfig",
+) -> tuple[str | None, dict[str, str]]:
     """Session id bound into the request's bearer token, if any.
 
     Backend-managed agent subprocesses (the Codex backend) authenticate
@@ -116,14 +119,14 @@ def _bound_session_from_request(config: "NerveConfig") -> str | None:
     only extracts the (signed) claim — cheap HS256, per tool call.
     """
     if not config.auth.jwt_secret:
-        return None
+        return None, {}
     try:
         rctx = request_ctx.get()
     except LookupError:
-        return None
+        return None, {}
     request = getattr(rctx, "request", None)
     if request is None:
-        return None
+        return None, {}
     token = ""
     try:
         auth_header = request.headers.get("authorization") or ""
@@ -132,14 +135,24 @@ def _bound_session_from_request(config: "NerveConfig") -> str | None:
         if not token:
             token = request.query_params.get("token") or ""
     except AttributeError:
-        return None
+        return None, {}
     if not token:
-        return None
+        return None, {}
     try:
         payload = decode_mcp_token(token, config.auth.jwt_secret)
     except Exception:
-        return None
-    return bound_session_id(payload)
+        return None, {}
+    runtime: dict[str, str] = {}
+    worker_id = payload.get(MCP_WORKER_CLAIM)
+    if worker_id:
+        runtime["worker_id"] = str(worker_id)
+        runtime["runtime"] = "ultracode"
+    return bound_session_id(payload), runtime
+
+
+def _bound_session_from_request(config: "NerveConfig") -> str | None:
+    """Backward-compatible session-only view used by tests/callers."""
+    return _bound_identity_from_request(config)[0]
 
 
 def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver):
@@ -155,7 +168,7 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
     """
 
     async def _resolve() -> ToolContext:
-        session_id = _bound_session_from_request(engine.config)
+        session_id, runtime_metadata = _bound_identity_from_request(engine.config)
 
         if session_id is None:
             client_name, mcp_session_id, _ = _resolve_client_info()
@@ -169,6 +182,10 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
                 client_name=client_name,
                 mcp_session_id=mcp_session_id,
             )
+            runtime_metadata = {
+                "runtime": client_name or "external",
+                "mcp_session_id": mcp_session_id,
+            }
 
         return ToolContext(
             session_id=session_id,
@@ -180,6 +197,7 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
             skill_manager=engine._skill_manager,
             engine=engine,
             notification_service=engine.notification_service,
+            runtime_metadata=runtime_metadata,
         )
 
     return _resolve

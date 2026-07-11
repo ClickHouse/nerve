@@ -63,6 +63,7 @@ class SessionSpec:
     cwd: str
     resume_native_id: str | None = None
     fork: bool = False
+    fork_last_turn_id: str | None = None
     interactive: Any = None          # InteractionHub (typed Any to avoid cycles)
     snapshot: SnapshotFn | None = None
     record_wakeup: WakeupFn | None = None
@@ -171,4 +172,8 @@ class AgentBackend(Protocol):
 
     def excluded_tools(self) -> set[str]:
         """Nerve-registry tool names NOT to expose for this backend."""
+        ...
+
+    async def validate_model(self, model: str) -> None:
+        """Raise :class:`BackendError` when *model* cannot be served."""
         ...

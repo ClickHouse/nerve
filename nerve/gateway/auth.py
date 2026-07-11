@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import bcrypt
 import jwt
@@ -23,6 +24,7 @@ JWT_EXPIRY_HOURS = 24
 MCP_AUDIENCE = "nerve-mcp"
 # Claim carrying the bound nerve session id on MCP tokens.
 MCP_SESSION_CLAIM = "nerve_session_id"
+MCP_WORKER_CLAIM = "nerve_worker_id"
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -40,22 +42,56 @@ def create_token(jwt_secret: str) -> str:
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
 
 
-def create_mcp_session_token(jwt_secret: str, session_id: str) -> str:
+def create_mcp_session_token(
+    jwt_secret: str,
+    session_id: str,
+    *,
+    ttl_seconds: int = 8 * 60 * 60,
+    worker_id: str | None = None,
+) -> str:
     """Mint a session-bound MCP token for a backend-managed agent process.
 
     Carries ``aud=nerve-mcp`` + the bound session id so the external MCP
     endpoint attributes every tool call to the real engine session
-    (instead of a satellite). Deliberately **no ``exp``**: the token
-    lives only in the spawned agent subprocess's environment, the bound
-    session under steady traffic is never idle-swept (a 24h expiry would
-    401 mid-conversation), and revocation is the same as for every other
-    nerve token — rotate ``auth.jwt_secret``.
+    (instead of a satellite). The token is deliberately short-lived.
+    Backend clients are normally
+    idle-swept within an hour and receive a fresh token when recreated;
+    Ultracode children exchange the parent token for still-shorter worker
+    tokens so calls can be attributed without persisting secrets.
     """
+    now = datetime.now(timezone.utc)
     payload = {
-        "iat": datetime.now(timezone.utc),
+        "iat": now,
+        "exp": now + timedelta(seconds=max(60, int(ttl_seconds))),
+        "jti": uuid4().hex,
         "sub": "backend-agent",
         "aud": MCP_AUDIENCE,
         MCP_SESSION_CLAIM: session_id,
+    }
+    if worker_id:
+        payload[MCP_WORKER_CLAIM] = worker_id
+    return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def create_external_mcp_token(
+    jwt_secret: str,
+    *,
+    ttl_seconds: int = 8 * 60 * 60,
+) -> str:
+    """Mint a short-lived MCP-only token for a user-launched client.
+
+    Unlike backend session tokens this intentionally has no bound Nerve
+    session; the MCP resolver creates/reuses a satellite session. The MCP
+    audience prevents this credential from authenticating to ordinary web
+    routes.
+    """
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iat": now,
+        "exp": now + timedelta(seconds=max(60, int(ttl_seconds))),
+        "jti": uuid4().hex,
+        "sub": "external-agent-mcp",
+        "aud": MCP_AUDIENCE,
     }
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
 

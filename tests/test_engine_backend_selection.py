@@ -259,12 +259,17 @@ class TestCreateSessionRoute:
     async def test_backend_param_binds_override(self, tmp_path, db, monkeypatch):
         import json
         from types import SimpleNamespace
+        from unittest.mock import AsyncMock
 
         from fastapi import HTTPException
 
         from nerve.gateway.routes import sessions as routes
 
         engine = _engine(tmp_path, db)
+        engine._backends["codex"].preflight = AsyncMock(return_value={
+            "available": True,
+            "models": [engine.config.codex.model],
+        })
         monkeypatch.setattr(
             routes, "get_deps",
             lambda: SimpleNamespace(engine=engine, db=db),

@@ -109,8 +109,17 @@ class ToolResult:
 
 
 @dataclass
+class ToolOutputDelta:
+    """Live output from a long-running command/tool before completion."""
+
+    tool_use_id: str | None
+    content: str
+    parent_tool_use_id: str | None = None
+
+
+@dataclass
 class SubagentStarted:
-    """A sub-agent (Claude ``Task``/``Agent`` tool) began. Claude-only."""
+    """A backend-native sub-agent began (Claude Task or Codex collab item)."""
 
     tool_use_id: str
     subagent_type: str
@@ -153,15 +162,17 @@ class TurnCompleted:
 
     ``total_cost_usd`` semantics depend on the backend's
     ``cost_is_cumulative`` capability: Claude reports a process-cumulative
-    figure (the engine diffs it); Codex reports THIS turn's cost,
-    pre-computed from the pricing table (``None`` when the model has no
-    table entry — never estimated).
+    figure (the engine diffs it); Codex reports THIS turn's nullable billed
+    cost plus a separate basis/API-equivalent estimate when applicable.
     """
 
     native_session_id: str | None = None
+    native_turn_id: str | None = None
     model: str | None = None
     usage: NormalizedUsage | None = None
     total_cost_usd: float | None = None
+    cost_basis: str = "unknown"
+    estimated_cost_usd: float | None = None
     duration_ms: int | None = None
     duration_api_ms: int | None = None
     num_turns: int | None = None
@@ -175,6 +186,7 @@ AgentEvent = (
     | ThinkingDelta
     | ToolUse
     | ToolResult
+    | ToolOutputDelta
     | SubagentStarted
     | ModelObserved
     | SystemEvent

@@ -24,6 +24,7 @@ from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
 from nerve.agent.backends.base import TurnInput
 from nerve.agent.interactive import InteractiveToolHandler
+from nerve.agent.interactive import InteractionOutcome
 from nerve.config import NerveConfig
 
 FAKE_BIN = str(Path(__file__).parent / "fixtures" / "fake_codex_appserver.py")
@@ -43,14 +44,14 @@ def _config(tmp_path: Path, **codex_overrides) -> NerveConfig:
     return cfg
 
 
-def _deps(cfg: NerveConfig) -> BackendDeps:
+def _deps(cfg: NerveConfig, *, gateway_port: int = 8900) -> BackendDeps:
     return BackendDeps(
         config=cfg,
         db=None,
         registry=None,
         tool_ctx_factory=lambda sid: None,
         external_mcp_servers=lambda: [],
-        gateway_port=lambda: 8900,
+        gateway_port=lambda: gateway_port,
         mint_session_token=lambda sid: f"tok-{sid}",
     )
 
@@ -117,14 +118,34 @@ async def test_basic_turn_streams_and_completes(tmp_path, monkeypatch):
         assert done.usage.input_tokens == 200
         assert done.usage.cache_read_tokens == 1000
         assert done.usage.output_tokens == 50
-        # cost from the default pricing table:
+        # ChatGPT auth is subscription/credit based, not API-billed USD.
+        # Keep the token-price equivalent separate and explicitly labelled.
         # 200*5 + 1000*0.5 + 50*30 = 1000+500+1500 = 3000 per 1M → $0.003
-        assert done.total_cost_usd == pytest.approx(0.003)
+        assert done.total_cost_usd is None
+        assert done.estimated_cost_usd == pytest.approx(0.003)
+        assert done.cost_basis == "api_equivalent_estimate"
         # per-turn usage lands anthropic-shaped for the engine
         shaped = done.usage.to_anthropic_shape()
         assert shaped["input_tokens"] == 200
         assert shaped["cache_read_input_tokens"] == 1000
         assert shaped["cache_creation_input_tokens"] == 0
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_effective_api_key_auth_controls_billing(tmp_path, monkeypatch):
+    _mode(monkeypatch, "account_api_key")
+    cfg = _config(tmp_path, auth="chatgpt")  # deliberately mismatched config
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="hello"))
+        done = (await _collect_turn(client))[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.total_cost_usd == pytest.approx(0.003)
+        assert done.estimated_cost_usd is None
+        assert done.cost_basis == "api_billed"
     finally:
         await client.disconnect()
 
@@ -136,8 +157,10 @@ async def test_config_overrides_carry_mcp_bridge(tmp_path, monkeypatch):
     backend = CodexBackend(_deps(cfg))
     overrides = backend.build_config_overrides(_spec(cfg))
     joined = "\n".join(overrides)
-    assert 'mcp_servers.nerve.url="http://127.0.0.1:8900/mcp/v1"' in joined
+    assert 'mcp_servers.nerve.url="http://127.0.0.1:8900/mcp/v1/"' in joined
     assert 'mcp_servers.nerve.bearer_token_env_var="NERVE_MCP_TOKEN"' in joined
+    assert "mcp_servers.nerve.required=true" in joined
+    assert "mcp_servers.nerve.startup_timeout_sec=30" in joined
     assert "project_doc_max_bytes=0" in joined
 
     client = await backend.create_client(_spec(cfg))
@@ -149,6 +172,38 @@ async def test_config_overrides_carry_mcp_bridge(tmp_path, monkeypatch):
         assert env["CODEX_HOME"] == str(tmp_path / "codex-home")
     finally:
         await client.disconnect()
+
+
+def test_config_overrides_use_runtime_loopback_port(tmp_path):
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg, gateway_port=49152))
+    overrides = backend.build_config_overrides(_spec(cfg))
+    assert (
+        'mcp_servers.nerve.url="http://127.0.0.1:49152/mcp/v1/"'
+        in overrides
+    )
+
+
+def test_notification_backlog_fails_transport_instead_of_dropping(monkeypatch):
+    from types import SimpleNamespace
+
+    from nerve.agent.backends.codex import appserver as appserver_mod
+
+    async def handler(method, params):
+        return {}
+
+    client = appserver_mod.CodexAppServerClient(
+        bin_path="codex", cwd="/tmp", env={}, server_request_handler=handler,
+    )
+    client.notifications = asyncio.Queue(maxsize=2)
+    client._proc = SimpleNamespace(pid=None)
+    monkeypatch.setattr(appserver_mod, "_MAX_NOTIFICATION_BACKLOG", 2)
+    client._dispatch({"jsonrpc": "2.0", "method": "one", "params": {}})
+    client._dispatch({"jsonrpc": "2.0", "method": "two", "params": {}})
+    client._dispatch({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+    assert client._closed is True
+    assert client.notifications.qsize() == 1
+    assert client.notifications.get_nowait()["method"] == "__transport_died__"
 
 
 @pytest.mark.asyncio
@@ -261,6 +316,82 @@ async def test_approval_declined_on_noninteractive_source(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_structured_and_freeform_user_input_bridge(tmp_path):
+    cfg = _config(tmp_path)
+    captured = {}
+
+    class Hub:
+        async def request_interaction(self, tool, payload, timeout=None):
+            captured.update(tool=tool, payload=payload, timeout=timeout)
+            return InteractionOutcome(result={"name": "Ada", "mode": "Fast"})
+
+    spec = _spec(cfg)
+    spec.interactive = Hub()
+    from nerve.agent.backends.codex.backend import CodexClient
+    client = CodexClient(CodexBackend(_deps(cfg)), spec)
+    response = await client._request_user_input({
+        "autoResolutionMs": 5000,
+        "questions": [
+            {
+                "id": "name", "header": "Name", "question": "Your name?",
+                "isOther": True, "isSecret": False, "options": None,
+            },
+            {
+                "id": "mode", "header": "Mode", "question": "Choose mode",
+                "options": [{"label": "Fast", "description": "quick"}],
+            },
+        ],
+    })
+    assert captured["payload"]["outOfBand"] is True
+    assert captured["payload"]["questions"][0]["freeText"] is True
+    assert captured["timeout"] == 5
+    assert response == {
+        "answers": {
+            "name": {"answers": ["Ada"]},
+            "mode": {"answers": ["Fast"]},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_form_elicitation_preserves_types(tmp_path):
+    cfg = _config(tmp_path)
+
+    class Hub:
+        async def request_interaction(self, tool, payload, timeout=None):
+            assert payload["outOfBand"] is True
+            assert payload["questions"][3]["multiSelect"] is True
+            return InteractionOutcome(result={
+                "enabled": "true", "count": "3", "ratio": "1.5",
+                "tags": "a, b", "note": "hello",
+            })
+
+    spec = _spec(cfg)
+    spec.interactive = Hub()
+    from nerve.agent.backends.codex.backend import CodexClient
+    client = CodexClient(CodexBackend(_deps(cfg)), spec)
+    response = await client._request_mcp_elicitation({
+        "mode": "form",
+        "message": "Configure",
+        "requestedSchema": {
+            "type": "object",
+            "required": ["enabled", "count"],
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "count": {"type": "integer"},
+                "ratio": {"type": "number"},
+                "tags": {"type": "array", "items": {"type": "string", "enum": ["a", "b"]}},
+                "note": {"type": "string"},
+            },
+        },
+    })
+    assert response == {"action": "accept", "content": {
+        "enabled": True, "count": 3, "ratio": 1.5,
+        "tags": ["a", "b"], "note": "hello",
+    }}
+
+
+@pytest.mark.asyncio
 async def test_resume_miss_falls_back_to_fresh_thread(tmp_path, monkeypatch):
     _mode(monkeypatch, "resume_fail")
     cfg = _config(tmp_path)
@@ -271,6 +402,32 @@ async def test_resume_miss_falls_back_to_fresh_thread(tmp_path, monkeypatch):
     try:
         assert client.resume_dropped is True
         assert client.native_session_id == "th_fake_1"  # fresh thread
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_resume_auth_error_never_starts_fresh_thread(tmp_path, monkeypatch):
+    _mode(monkeypatch, "resume_auth_fail")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    with pytest.raises(Exception, match="authentication expired"):
+        await backend.create_client(_spec(cfg, resume_native_id="th_existing"))
+
+
+@pytest.mark.asyncio
+async def test_fork_uses_selected_native_turn(tmp_path, monkeypatch):
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(
+        cfg,
+        resume_native_id="th_parent",
+        fork=True,
+        fork_last_turn_id="turn_selected",
+    ))
+    try:
+        assert client.native_session_id == "fork:turn_selected"
     finally:
         await client.disconnect()
 
@@ -406,8 +563,11 @@ async def test_read_jsonl_line_tolerates_lines_beyond_limit():
 
 @pytest.mark.asyncio
 async def test_read_jsonl_line_caps_runaway_lines(monkeypatch):
-    """Past _MAX_LINE_BYTES the line is drained but returned truncated —
-    the message drops, the NEXT message stays intact (framing kept)."""
+    """Past _MAX_LINE_BYTES the line is drained and fails explicitly.
+
+    Framing remains intact for diagnostics/recovery, but callers cannot
+    mistake a silently dropped lifecycle message for a healthy transport.
+    """
     from nerve.agent.backends.codex import appserver as appserver_mod
 
     monkeypatch.setattr(appserver_mod, "_MAX_LINE_BYTES", 256)
@@ -415,8 +575,8 @@ async def test_read_jsonl_line_caps_runaway_lines(monkeypatch):
     reader.feed_data(b"y" * 5000 + b"\n" + b'{"ok":1}\n')
     reader.feed_eof()
 
-    line = await appserver_mod._read_jsonl_line(reader, "stdout")
-    assert line == b"y" * 256  # truncated to the cap, not b"" (EOF signal)
+    with pytest.raises(TransportDiedError, match="exceeded 256 bytes"):
+        await appserver_mod._read_jsonl_line(reader, "stdout")
     assert await appserver_mod._read_jsonl_line(reader, "stdout") == b'{"ok":1}\n'
 
 

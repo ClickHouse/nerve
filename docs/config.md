@@ -65,7 +65,9 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # codex-cli >= 0.144 on PATH
+  bin_path: codex          # tested: >= 0.144.1 and < 0.145.0
+  min_version: 0.144.1
+  max_version: 0.145.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
@@ -79,16 +81,60 @@ codex:                     # active when a codex backend is selected
   pricing:                      # $/1M tokens — cost is None for unlisted models
     gpt-5.6-sol: {input: 5.0, cached_input: 0.5, output: 30.0}
   extra_config: {}              # arbitrary codex -c key=value passthrough
+  ultracode:                    # optional managed third-party orchestrator
+    enabled: false
+    auto_install: true
+    repository: https://github.com/just-every/plugin-ultracode.git
+    revision: 9dde0086e983413016bf62ab96ba6bb17b599fae
+    version: 0.3.0+codex.20260601143116
+    dashboard: false            # authenticated read-only Nerve UI
+    ui: false                   # detached upstream server; keep disabled
+    default_transport: exec
+    max_concurrency: 2          # hard cap, even if a workflow asks for more
+    default_token_budget: 250000 # default and maximum per workflow
+    max_agents: 8               # lifetime worker cap per workflow
 ```
 
-Setup for `auth: chatgpt`: run `CODEX_HOME=~/.nerve/codex codex login` once,
-then `scripts/codex_smoke.py` to verify end-to-end before flipping any
-backend default. Codex sessions reach nerve tools through the gateway's
-`/mcp/v1` endpoint with a session-bound token (minted automatically);
-`mcp_endpoint.enabled` must stay on.
+`codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
+It does not start Ultracode's detached dashboard process. Keep
+`codex.ultracode.ui: false`: the upstream process serves unauthenticated
+mutation and execution endpoints and is not safe to expose through Nerve.
 
-Notes: prompt-cache TTL policy, Claude Code plugins, Langfuse tracing and
-PDF inputs are claude-only (see the plan's §14 non-parity list). With the
+Setup for `auth: chatgpt`: run `CODEX_HOME=~/.nerve/codex codex login` once,
+then `nerve codex doctor` to verify CLI version, authentication, the live
+model list, protocol, and managed plugin state before flipping any backend
+default. Codex sessions reach Nerve tools through a dedicated plaintext ASGI
+listener bound to an ephemeral `127.0.0.1` port. Its bearer token is scoped to
+the owning session, expires after eight hours, and exists only in the spawned
+process environment. `mcp_endpoint.enabled` must stay on; the public gateway
+mount and the loopback listener share the same authenticated MCP manager.
+
+External/user-launched Codex uses `bearer_token_env_var = "NERVE_MCP_TOKEN"`
+instead of storing a credential in TOML. Refresh it with:
+
+```bash
+export NERVE_MCP_TOKEN="$(nerve codex token)"
+```
+
+Billing follows the effective account reported by `account/read` (and preflight
+flags a mismatch with `codex.auth`). With ChatGPT authentication, token counts and rate/credit events are retained,
+but `cost_usd` is null: any API-price calculation is stored separately as an
+`api_equivalent_estimate`. API-key sessions use `cost_basis: api_billed` when a
+known price is available.
+
+Ultracode is installed only into the isolated Nerve Codex home at the exact
+configured revision. A hash-verified Nerve policy overlay hard-enforces the
+configured concurrency, token, lifetime-agent, and dashboard caps even when a
+workflow requests looser values. Autonomous marketplace updates and its
+dashboard are off by default. Workers inherit stable MCP definitions through a Nerve wrapper,
+exchange the parent credential for two-hour worker-scoped tokens, report usage
+back into the parent turn, and run read-only unless a workflow explicitly asks
+for a writable sandbox. `GET /api/codex/status` exposes preflight state and
+non-terminal journals available for recovery.
+
+Notes: prompt-cache TTL policy, Claude Code plugins, and Langfuse tracing are
+claude-only. PDF attachments are surfaced to Codex as explicit path/context
+notes rather than silently dropped. With the
 default `approval_policy: never` + full-access sandbox, codex sessions
 behave like claude's auto-approved tools; tightening the policy surfaces
 Approve/Decline cards in the web UI.
