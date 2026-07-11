@@ -381,3 +381,113 @@ async def test_idle_stream_is_absent(tmp_path, monkeypatch):
         assert client.buffer_used() == 0
     finally:
         await client.disconnect()
+
+
+# -- 64 KiB StreamReader line-limit regression (large MCP responses) ----- #
+
+
+@pytest.mark.asyncio
+async def test_read_jsonl_line_tolerates_lines_beyond_limit():
+    """The tolerant reader accumulates across LimitOverrunError and
+    mirrors readline() semantics (newline kept, partial at EOF, b"" at
+    clean EOF) — plain readline() raises ValueError past the limit."""
+    from nerve.agent.backends.codex.appserver import _read_jsonl_line
+
+    reader = asyncio.StreamReader(limit=64)
+    big = b"x" * 100_000
+    reader.feed_data(big + b"\n" + b'{"ok":1}\n' + b"tail-no-newline")
+    reader.feed_eof()
+
+    assert await _read_jsonl_line(reader, "stdout") == big + b"\n"
+    assert await _read_jsonl_line(reader, "stdout") == b'{"ok":1}\n'
+    assert await _read_jsonl_line(reader, "stdout") == b"tail-no-newline"
+    assert await _read_jsonl_line(reader, "stdout") == b""
+
+
+@pytest.mark.asyncio
+async def test_read_jsonl_line_caps_runaway_lines(monkeypatch):
+    """Past _MAX_LINE_BYTES the line is drained but returned truncated —
+    the message drops, the NEXT message stays intact (framing kept)."""
+    from nerve.agent.backends.codex import appserver as appserver_mod
+
+    monkeypatch.setattr(appserver_mod, "_MAX_LINE_BYTES", 256)
+    reader = asyncio.StreamReader(limit=64)
+    reader.feed_data(b"y" * 5000 + b"\n" + b'{"ok":1}\n')
+    reader.feed_eof()
+
+    line = await appserver_mod._read_jsonl_line(reader, "stdout")
+    assert line == b"y" * 256  # truncated to the cap, not b"" (EOF signal)
+    assert await appserver_mod._read_jsonl_line(reader, "stdout") == b'{"ok":1}\n'
+
+
+@pytest.mark.asyncio
+async def test_large_mcp_result_survives_transport(tmp_path, monkeypatch):
+    """A ~2 MiB MCP tool result on one JSONL line used to raise
+    ValueError in the reader loop (asyncio default 64 KiB line limit)
+    and fail the whole turn with TransportDiedError."""
+    _mode(monkeypatch, "big_line")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="fetch big"))
+        events = await asyncio.wait_for(_collect_turn(client), timeout=20)
+
+        results = [e for e in events if isinstance(e, ev.ToolResult)]
+        assert any(len(r.content or "") >= 2_000_000 for r in results)
+        done = events[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.status == "completed"
+        assert client.is_alive()
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_oversized_stderr_line_keeps_draining(tmp_path, monkeypatch):
+    """A >limit stderr line used to kill the stderr loop silently —
+    stderr then filled and the subprocess could wedge on its next
+    write. The loop must survive and keep the (clamped) tail."""
+    _mode(monkeypatch, "big_stderr")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="log a lot"))
+        events = await asyncio.wait_for(_collect_turn(client), timeout=20)
+
+        done = events[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.status == "completed"
+        assert client.is_alive()
+
+        # The huge line landed in the tail, clamped per line.
+        for _ in range(60):  # stderr drains concurrently — poll briefly
+            tail = client._transport._stderr_tail
+            if any(t.startswith("EEEE") for t in tail):
+                break
+            await asyncio.sleep(0.05)
+        assert any(t.startswith("EEEE") for t in tail)
+        assert all(len(t) <= 500 for t in tail)
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_reader_death_marks_client_dead(tmp_path, monkeypatch):
+    """stdout EOF while the process is still running: is_alive() used to
+    stay True (deaf zombie — every request written fine, then timed out
+    at request_timeout). The engine health check must see it dead."""
+    _mode(monkeypatch, "close_stdout_mid_turn")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="go deaf"))
+        with pytest.raises(TransportDiedError):
+            await asyncio.wait_for(_collect_turn(client), timeout=10)
+
+        assert client._transport._proc.returncode is None  # process lives
+        assert client.is_alive() is False                  # client is dead
+    finally:
+        await client.disconnect()

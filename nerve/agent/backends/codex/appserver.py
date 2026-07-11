@@ -48,6 +48,69 @@ _OPT_OUT_NOTIFICATIONS = [
 ]
 
 _STDERR_TAIL_LINES = 40
+_STDERR_TAIL_LINE_CHARS = 500
+
+# StreamReader buffer limit for the subprocess pipes. Not a message-size
+# cap — ``_read_jsonl_line`` accumulates past it — just the flow-control
+# granularity (bigger limit = fewer accumulation round-trips per line).
+_STREAM_LIMIT = 1024 * 1024
+
+# Absolute per-line ceiling. A line past this is drained to its newline
+# but returned truncated (the JSON parse fails and the message is
+# dropped, framing intact). Purely an OOM guard against a runaway peer.
+_MAX_LINE_BYTES = 64 * 1024 * 1024
+
+
+async def _read_jsonl_line(reader: asyncio.StreamReader, label: str) -> bytes:
+    """``readline()`` without the StreamReader line-length ceiling.
+
+    ``readline()`` raises ``ValueError`` on any line longer than the
+    stream limit (asyncio default: 64 KiB) and — once the buffer holds
+    more than the limit without a separator — *clears the buffer*,
+    losing JSONL framing. codex app-server ships whole MCP tool results
+    inside single ``item/completed`` lines, so one large tool response
+    would kill the transport. Instead, accumulate ``readuntil()`` chunks
+    across ``LimitOverrunError`` (``e.consumed`` bytes are already
+    buffered, so ``readexactly`` never blocks).
+
+    Mirrors ``readline()`` semantics otherwise: returns the line
+    including its newline, the partial line at EOF, ``b""`` at clean EOF.
+    Lines beyond ``_MAX_LINE_BYTES`` are consumed fully but returned
+    truncated to the cap.
+    """
+    chunks: list[bytes] = []
+    kept = 0
+    truncated = False
+
+    def _keep(chunk: bytes) -> None:
+        nonlocal kept, truncated
+        if truncated or not chunk:
+            return
+        room = _MAX_LINE_BYTES - kept
+        if len(chunk) > room:
+            truncated = True
+            logger.error(
+                "codex app-server %s line exceeds %d bytes — truncating "
+                "(message will be dropped, stream stays framed)",
+                label, _MAX_LINE_BYTES,
+            )
+            chunk = chunk[:room]
+        chunks.append(chunk)
+        kept += len(chunk)
+
+    while True:
+        try:
+            chunk = await reader.readuntil(b"\n")
+        except asyncio.IncompleteReadError as e:  # EOF before newline
+            _keep(e.partial)
+            return b"".join(chunks)
+        except asyncio.LimitOverrunError as e:
+            # Buffer holds e.consumed separator-less bytes: drain them
+            # and keep looking for the newline.
+            _keep(await reader.readexactly(e.consumed))
+            continue
+        _keep(chunk)
+        return b"".join(chunks)
 
 
 class CodexAppServerClient:
@@ -107,6 +170,7 @@ class CodexAppServerClient:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd,
                 env=self._env,
+                limit=_STREAM_LIMIT,
             )
         except (OSError, ValueError) as e:
             raise TransportDiedError(
@@ -226,7 +290,7 @@ class CodexAppServerClient:
             return
         try:
             while True:
-                line = await proc.stdout.readline()
+                line = await _read_jsonl_line(proc.stdout, "stdout")
                 if not line:
                     break  # EOF — process died or closed stdout
                 line = line.strip()
@@ -247,6 +311,12 @@ class CodexAppServerClient:
         except Exception as e:  # pragma: no cover - defensive
             logger.error("codex app-server reader crashed: %s", e, exc_info=True)
         finally:
+            # Once the reader is gone the transport is deaf: writes would
+            # still succeed and then time out one by one (a zombie —
+            # ``is_alive()`` used to stay True while the process lived).
+            # Mark the client dead so the engine health check recreates
+            # it immediately.
+            self._closed = True
             self._fail_pending(TransportDiedError(
                 f"codex app-server stream ended{self._stderr_hint()}"
             ))
@@ -336,24 +406,30 @@ class CodexAppServerClient:
             return
         try:
             while True:
-                line = await proc.stderr.readline()
+                # Same tolerant reader as stdout: a >limit stderr line
+                # used to raise ValueError, silently kill this loop, and
+                # leave stderr undrained — the subprocess then blocks on
+                # its next stderr write and wedges.
+                line = await _read_jsonl_line(proc.stderr, "stderr")
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if not text:
                     continue
-                self._stderr_tail.append(text)
+                # Clamp stored lines — the tail rides in exception
+                # messages and lines can now be arbitrarily long.
+                self._stderr_tail.append(text[:_STDERR_TAIL_LINE_CHARS])
                 if len(self._stderr_tail) > _STDERR_TAIL_LINES:
                     del self._stderr_tail[0]
                 lowered = text.lower()
                 if "error" in lowered or "panic" in lowered:
-                    logger.warning("codex stderr: %s", text)
+                    logger.warning("codex stderr: %.2000s", text)
                 else:
-                    logger.debug("codex stderr: %s", text)
+                    logger.debug("codex stderr: %.2000s", text)
         except asyncio.CancelledError:
             raise
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("codex app-server stderr loop crashed: %s", e)
 
     # -- helpers -------------------------------------------------------- #
 

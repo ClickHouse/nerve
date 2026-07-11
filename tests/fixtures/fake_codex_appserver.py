@@ -19,6 +19,15 @@ FAKE_CODEX_MODE env var:
                  turn/completed with status=interrupted
   die_mid_turn — emits one delta then exits(1) mid-turn
   failed_turn  — emits an error notification then turn/completed(failed)
+  big_line     — mcpToolCall item/completed whose result is ~2 MiB on a
+                 single JSONL line (asyncio 64 KiB StreamReader-limit
+                 regression: one large MCP response must not kill the
+                 transport)
+  big_stderr   — writes one ~2.5 MiB stderr line mid-turn, then
+                 completes normally (stderr loop must keep draining)
+  close_stdout_mid_turn — closes stdout mid-turn but KEEPS RUNNING
+                 (reader-death liveness: is_alive() must flip False even
+                 though the process is still up)
 
 The process also mirrors received config overrides (argv --config k=v)
 back in the initialize response under _fake.configOverrides so tests can
@@ -31,6 +40,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 MODE = os.environ.get("FAKE_CODEX_MODE", "basic")
 
@@ -185,6 +195,52 @@ def run_turn(thread_id: str, turn_id: str) -> None:
                                              "text": "Memorized: x"}]},
                      "status": "completed"},
         })
+
+    if MODE == "big_line":
+        notify("turn/started", {"threadId": thread_id,
+                                "turn": {"id": turn_id, "status": "inProgress", "items": []}})
+        notify("item/started", {
+            "threadId": thread_id, "turnId": turn_id,
+            "item": {"id": "t1", "type": "mcpToolCall", "server": "nerve",
+                     "tool": "task_read", "arguments": {"task_id": "big"},
+                     "status": "inProgress"},
+        })
+        # The whole result rides ONE JSONL line — far past asyncio's
+        # default 64 KiB StreamReader limit and past nerve's 1 MiB
+        # stream limit, forcing the accumulation path.
+        notify("item/completed", {
+            "threadId": thread_id, "turnId": turn_id,
+            "item": {"id": "t1", "type": "mcpToolCall", "server": "nerve",
+                     "tool": "task_read", "result": "B" * 2_000_000,
+                     "status": "completed"},
+        })
+        _usage(turn_id, thread_id)
+        _completed(turn_id, thread_id)
+        return
+
+    if MODE == "big_stderr":
+        notify("turn/started", {"threadId": thread_id,
+                                "turn": {"id": turn_id, "status": "inProgress", "items": []}})
+        sys.stderr.write("E" * 2_500_000 + "\n")
+        sys.stderr.flush()
+        notify("item/agentMessage/delta",
+               {"threadId": thread_id, "turnId": turn_id, "itemId": "m1",
+                "delta": "still here"})
+        _usage(turn_id, thread_id)
+        _completed(turn_id, thread_id)
+        return
+
+    if MODE == "close_stdout_mid_turn":
+        notify("turn/started", {"threadId": thread_id,
+                                "turn": {"id": turn_id, "status": "inProgress", "items": []}})
+        notify("item/agentMessage/delta",
+               {"threadId": thread_id, "turnId": turn_id, "itemId": "m1",
+                "delta": "going deaf"})
+        with _out_lock:
+            sys.stdout.flush()
+            os.close(1)
+        time.sleep(30)  # stay alive — this is the zombie window
+        return
 
     if MODE == "die_mid_turn":
         notify("turn/started", {"threadId": thread_id,
