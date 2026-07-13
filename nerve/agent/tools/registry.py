@@ -50,6 +50,7 @@ class ToolContext:
     skill_manager: "SkillManager | None" = None
     engine: "AgentEngine | None" = None
     notification_service: "NotificationService | None" = None
+    runtime_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

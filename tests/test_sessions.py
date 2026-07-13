@@ -346,6 +346,27 @@ class TestMessages:
         assert history[0]["role"] == "user"
         assert history[1]["role"] == "assistant"
 
+    async def test_add_message_preserves_native_turn_id(
+        self, sm: SessionManager,
+    ):
+        """Completed backend turns survive the SessionManager boundary."""
+        await sm.get_or_create("msg-native-turn")
+        await sm.add_message(
+            "msg-native-turn",
+            "assistant",
+            "persisted output",
+            blocks=[{"type": "text", "content": "persisted output"}],
+            native_turn_id="turn-1",
+        )
+
+        history = await sm.get_conversation_history("msg-native-turn")
+        assert len(history) == 1
+        assert history[0]["content"] == "persisted output"
+        assert history[0]["native_turn_id"] == "turn-1"
+        assert history[0]["blocks"] == [
+            {"type": "text", "content": "persisted output"},
+        ]
+
 
 @pytest.mark.asyncio
 class TestArchiveAndCleanup:

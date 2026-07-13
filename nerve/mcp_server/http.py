@@ -34,8 +34,14 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
 from nerve.agent.tools import ToolContext, ToolRegistry
+from nerve.gateway.auth import MCP_WORKER_CLAIM
 from nerve.mcp_server.audit import build_audit_writer
-from nerve.mcp_server.auth import McpAuthError, authenticate_mcp
+from nerve.mcp_server.auth import (
+    McpAuthError,
+    authenticate_mcp,
+    bound_session_id,
+    decode_mcp_token,
+)
 from nerve.mcp_server.server import build_mcp_server
 from nerve.mcp_server.session import SatelliteSessionResolver
 
@@ -97,28 +103,89 @@ def _resolve_client_info() -> tuple[str | None, str | None, str | None]:
     return client_name, mcp_session_id, path
 
 
+def _bound_identity_from_request(
+    config: "NerveConfig",
+) -> tuple[str | None, dict[str, str]]:
+    """Session id bound into the request's bearer token, if any.
+
+    Backend-managed agent subprocesses (the Codex backend) authenticate
+    with a session-bound token (``aud=nerve-mcp`` +
+    ``nerve_session_id`` — see gateway.auth.create_mcp_session_token);
+    their tool calls must attribute to the REAL engine session so
+    notify/ask_user/memorize/task_* behave exactly like the in-process
+    Claude MCP. Ordinary tokens return ``None`` → satellite attribution.
+
+    The signature was already verified at the ASGI mount; this re-decode
+    only extracts the (signed) claim — cheap HS256, per tool call.
+    """
+    if not config.auth.jwt_secret:
+        return None, {}
+    try:
+        rctx = request_ctx.get()
+    except LookupError:
+        return None, {}
+    request = getattr(rctx, "request", None)
+    if request is None:
+        return None, {}
+    token = ""
+    try:
+        auth_header = request.headers.get("authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = request.query_params.get("token") or ""
+    except AttributeError:
+        return None, {}
+    if not token:
+        return None, {}
+    try:
+        payload = decode_mcp_token(token, config.auth.jwt_secret)
+    except Exception:
+        return None, {}
+    runtime: dict[str, str] = {}
+    worker_id = payload.get(MCP_WORKER_CLAIM)
+    if worker_id:
+        runtime["worker_id"] = str(worker_id)
+        runtime["runtime"] = "ultracode"
+    return bound_session_id(payload), runtime
+
+
+def _bound_session_from_request(config: "NerveConfig") -> str | None:
+    """Backward-compatible session-only view used by tests/callers."""
+    return _bound_identity_from_request(config)[0]
+
+
 def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver):
     """Build the per-call_tool ``ToolContext`` resolver closure.
 
     The Server's ``call_tool`` handler invokes this for every tool call
-    to attribute the call to the correct satellite session. Per-call
+    to attribute the call to the correct session: a session-bound token
+    (backend-managed agents) binds directly to its engine session;
+    everything else goes through satellite attribution. Per-call
     resolution is cheap (the satellite session id is deterministic and
     the underlying ``get_session`` / ``create_session`` check is O(1)
     on the indexed primary key).
     """
 
     async def _resolve() -> ToolContext:
-        client_name, mcp_session_id, _ = _resolve_client_info()
+        session_id, runtime_metadata = _bound_identity_from_request(engine.config)
 
-        if mcp_session_id is None:
-            # Stateless requests / pre-initialize calls can land here.
-            # Fall back to a synthetic id so we still get a session row.
-            mcp_session_id = "stateless"
+        if session_id is None:
+            client_name, mcp_session_id, _ = _resolve_client_info()
 
-        session_id = await resolver.resolve(
-            client_name=client_name,
-            mcp_session_id=mcp_session_id,
-        )
+            if mcp_session_id is None:
+                # Stateless requests / pre-initialize calls can land here.
+                # Fall back to a synthetic id so we still get a session row.
+                mcp_session_id = "stateless"
+
+            session_id = await resolver.resolve(
+                client_name=client_name,
+                mcp_session_id=mcp_session_id,
+            )
+            runtime_metadata = {
+                "runtime": client_name or "external",
+                "mcp_session_id": mcp_session_id,
+            }
 
         return ToolContext(
             session_id=session_id,
@@ -130,6 +197,7 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
             skill_manager=engine._skill_manager,
             engine=engine,
             notification_service=engine.notification_service,
+            runtime_metadata=runtime_metadata,
         )
 
     return _resolve

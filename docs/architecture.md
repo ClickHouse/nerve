@@ -151,6 +151,21 @@ Markdown + SQLite task system:
 - SQLite index for queries
 - Escalation reminders (soft → medium → urgent)
 
+### Agent Backends
+
+The engine is backend-agnostic: per-session clients implement the
+`AgentBackend`/`AgentClient` protocols (`nerve/agent/backends/`) and
+translate their native streams into normalized events
+(`backends/events.py`) — the only vocabulary the engine consumes.
+`backends/claude.py` wraps the Claude Agent SDK (options, hooks,
+`can_use_tool`, idle-stream drains, hardened disconnect);
+`backends/codex/` speaks JSON-RPC to a per-session `codex app-server`
+subprocess (threads/turns, approval server-requests routed to the
+interaction hub, per-turn pricing). Backend choice is sticky per session
+(`sessions.backend`); capabilities (cumulative vs per-turn cost,
+idle-stream support, cache-TTL policy) gate engine behavior — never
+`isinstance`. Details: `docs/plans/codex-backend.md`.
+
 ## Data Flow
 
 ### User Message (Telegram)

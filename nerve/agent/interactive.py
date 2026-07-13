@@ -1,14 +1,16 @@
 """Interactive tool handler — pauses agent execution for user input.
 
-Implements the `can_use_tool` callback for the Claude Agent SDK.
-Interactive tools (AskUserQuestion, ExitPlanMode, EnterPlanMode) pause
-the agent mid-turn, broadcast to the UI via WebSocket, and resume once
-the user responds.
+Backend-neutral pause/approve machinery. A backend adapter (e.g.
+:class:`nerve.agent.backends.claude.ClaudeToolPermissions` for the SDK's
+``can_use_tool`` callback, or the Codex approval-request handlers)
+translates its runtime's permission surface into
+:meth:`InteractiveToolHandler.request_interaction` /
+:meth:`InteractiveToolHandler.request_approval` calls; the hub broadcasts
+to the UI via WebSocket ``interaction`` events and resumes once the user
+responds.
 
-File-modifying tools (Edit, Write, NotebookEdit) trigger a pre-execution
-file snapshot to capture original content for diff computation.
-
-All other tools are auto-approved with zero overhead.
+No agent-runtime types (``claude_agent_sdk`` / Codex protocol) may be
+imported here — this module sits on the engine side of the backend seam.
 """
 
 from __future__ import annotations
@@ -20,23 +22,25 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine
 from uuid import uuid4
 
-from claude_agent_sdk.types import (
-    PermissionResult,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    ToolPermissionContext,
-)
-
 logger = logging.getLogger(__name__)
 
 # Default timeout for interactive tool waits (1 hour)
 INTERACTION_TIMEOUT = 3600
 
-# Tools that require user interaction before execution
+# Claude CLI built-ins that require user interaction before execution.
+# Defined here (not in the claude backend) so the neutral registry and
+# tests can reference the set without importing backend modules.
 INTERACTIVE_TOOLS = frozenset({
     "AskUserQuestion",
     "ExitPlanMode",
     "EnterPlanMode",
+})
+
+# Approval kinds surfaced by sandboxed backends (Codex approval requests).
+APPROVAL_KINDS = frozenset({
+    "command_approval",
+    "file_approval",
+    "permission_approval",
 })
 
 # Tools that modify files — trigger pre-execution snapshot
@@ -65,15 +69,33 @@ class PendingInteraction:
     deny_message: str = ""
 
 
+@dataclass
+class InteractionOutcome:
+    """How a pause resolved — the backend adapter maps this onto its
+    runtime's permission vocabulary."""
+
+    denied: bool = False
+    cancelled: bool = False          # session stopped while waiting
+    message: str = ""
+    result: dict[str, Any] | None = None
+
+    @property
+    def approved(self) -> bool:
+        return not self.denied and not self.cancelled
+
+
 class InteractiveToolHandler:
-    """Per-session handler that intercepts interactive tool calls.
+    """Per-session hub that pauses turns for user input.
 
-    Created for each session and registered with the SDK via can_use_tool.
-    The WebSocket server routes user answers to the correct handler via
-    the global registry.
+    Created for each session and registered in the global registry; the
+    WebSocket server routes user answers to the correct hub. Backend
+    adapters call :meth:`request_interaction` (interactive built-ins) or
+    :meth:`request_approval` (sandbox approval requests) and translate
+    the :class:`InteractionOutcome`.
 
-    Also captures file content snapshots before file-modifying tools execute,
-    enabling session-scoped diff computation.
+    Also tracks which files were already snapshotted this session so
+    permission adapters can capture pre-modification content exactly once
+    (see :meth:`mark_snapshotted`).
     """
 
     def __init__(
@@ -85,79 +107,81 @@ class InteractiveToolHandler:
     ):
         """
         Args:
-            session_id: The Nerve session this handler belongs to.
+            session_id: The Nerve session this hub belongs to.
             broadcast_fn: async fn(session_id, message_dict) — the broadcaster.
-            snapshot_fn: Optional async fn(session_id, file_path, content) — persists
-                         original file content before modification for diff view.
-            interactive_capable: Whether the session channel supports interactive
-                                 tools (WebSocket UI). Non-interactive channels
-                                 (Telegram, cron) auto-deny to prevent deadlocks.
+            snapshot_fn: Optional async fn(session_id, file_path, content) —
+                         persists original file content before modification.
+            interactive_capable: Whether the session channel supports
+                                 interactive pauses (WebSocket UI).
+                                 Non-interactive channels (Telegram, cron)
+                                 auto-deny to prevent deadlocks.
         """
         self.session_id = session_id
         self._broadcast = broadcast_fn
-        self._snapshot_fn = snapshot_fn
-        self._interactive_capable = interactive_capable
+        self.snapshot_fn = snapshot_fn
+        self.interactive_capable = interactive_capable
         self._pending: dict[str, PendingInteraction] = {}
-        self._captured_files: set[str] = set()  # paths already snapshotted this session
+        self._captured_files: set[str] = set()  # paths snapshotted this session
 
-    async def can_use_tool(
+    # -- snapshot bookkeeping ------------------------------------------- #
+
+    def mark_snapshotted(self, file_path: str) -> bool:
+        """Record *file_path* as snapshotted; True when newly recorded."""
+        if file_path in self._captured_files:
+            return False
+        self._captured_files.add(file_path)
+        return True
+
+    # -- pause requests -------------------------------------------------- #
+
+    async def request_interaction(
         self,
         tool_name: str,
         tool_input: dict[str, Any],
-        context: ToolPermissionContext,
-    ) -> PermissionResult:
-        """SDK permission callback.
-
-        Captures file snapshots before file-modifying tools, then
-        auto-approves non-interactive tools.
-        """
-        # Capture pre-execution file snapshot for diff tracking
-        # (Also done via PreToolUse hook in engine.py as primary mechanism)
-        if self._snapshot_fn and tool_name in FILE_MODIFY_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
-            if file_path and file_path not in self._captured_files:
-                self._captured_files.add(file_path)
-                content = _read_file_safe(file_path)
-                try:
-                    await self._snapshot_fn(self.session_id, file_path, content)
-                except Exception as e:
-                    logger.warning("Failed to save file snapshot for %s: %s", file_path, e)
-
-        if tool_name not in INTERACTIVE_TOOLS:
-            return PermissionResultAllow()
-
-        # Non-interactive channels: deny immediately to prevent deadlocks
-        if not self._interactive_capable:
-            deny_messages = {
-                "AskUserQuestion": (
-                    "AskUserQuestion is not available in this channel. "
-                    "Use the Nerve `ask_user` tool to ask the user questions asynchronously."
-                ),
-                "EnterPlanMode": (
-                    "Plan mode is not available in non-web sessions. "
-                    "Proceed with implementation directly."
-                ),
-                "ExitPlanMode": (
-                    "Plan mode is not available in non-web sessions."
-                ),
-            }
+        timeout: float | None = None,
+    ) -> InteractionOutcome:
+        """Pause for an interactive built-in (question / plan approval)."""
+        if not self.interactive_capable:
             logger.info(
                 "Session %s: auto-denying %s (non-interactive channel)",
                 self.session_id, tool_name,
             )
-            return PermissionResultDeny(
-                message=deny_messages.get(
-                    tool_name,
-                    f"{tool_name} is not available in this channel.",
-                )
+            return InteractionOutcome(
+                denied=True,
+                message=f"{tool_name} is not available in this channel.",
             )
+        return await self._pause(
+            tool_name, tool_input, _interaction_type(tool_name), timeout=timeout,
+        )
 
-        return await self._handle_interactive(tool_name, tool_input)
+    async def request_approval(
+        self, kind: str, payload: dict[str, Any],
+    ) -> InteractionOutcome:
+        """Pause for a backend approval request (command / file change).
 
-    async def _handle_interactive(
-        self, tool_name: str, tool_input: dict[str, Any],
-    ) -> PermissionResult:
-        """Pause execution, broadcast to UI, wait for user response."""
+        ``kind`` must be one of :data:`APPROVAL_KINDS`; ``payload`` is the
+        backend's request context (command, cwd, file changes, reason...)
+        rendered by the UI's approval card.
+        """
+        if not self.interactive_capable:
+            logger.info(
+                "Session %s: auto-declining %s (non-interactive channel)",
+                self.session_id, kind,
+            )
+            return InteractionOutcome(
+                denied=True,
+                message="Approval requests are not available in this channel.",
+            )
+        return await self._pause(kind, payload, kind)
+
+    async def _pause(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        interaction_type: str,
+        timeout: float | None = None,
+    ) -> InteractionOutcome:
+        """Broadcast to the UI, wait for the user's response."""
         interaction_id = str(uuid4())
         pending = PendingInteraction(
             interaction_id=interaction_id,
@@ -171,7 +195,7 @@ class InteractiveToolHandler:
             "type": "interaction",
             "session_id": self.session_id,
             "interaction_id": interaction_id,
-            "interaction_type": _interaction_type(tool_name),
+            "interaction_type": interaction_type,
             "tool_name": tool_name,
             "tool_input": tool_input,
         })
@@ -186,33 +210,40 @@ class InteractiveToolHandler:
 
         try:
             try:
-                await asyncio.wait_for(pending.event.wait(), timeout=INTERACTION_TIMEOUT)
+                wait_timeout = INTERACTION_TIMEOUT if timeout is None else max(0.1, timeout)
+                await asyncio.wait_for(pending.event.wait(), timeout=wait_timeout)
             except asyncio.TimeoutError:
                 logger.warning(
                     "Session %s: interaction %s timed out after %ds",
-                    self.session_id, interaction_id[:8], INTERACTION_TIMEOUT,
+                    self.session_id, interaction_id[:8], wait_timeout,
                 )
-                return PermissionResultDeny(
-                    message=f"No response received after {_humanize_seconds(INTERACTION_TIMEOUT)} — timed out.",
+                return InteractionOutcome(
+                    denied=True,
+                    message=(
+                        f"No response received after "
+                        f"{_humanize_seconds(wait_timeout)} — timed out."
+                    ),
                 )
             except asyncio.CancelledError:
-                logger.info("Session %s: interaction %s cancelled", self.session_id, interaction_id[:8])
-                return PermissionResultDeny(
+                logger.info(
+                    "Session %s: interaction %s cancelled",
+                    self.session_id, interaction_id[:8],
+                )
+                return InteractionOutcome(
+                    denied=True, cancelled=True,
                     message="Session stopped by user.",
-                    interrupt=True,
                 )
 
             if pending.denied:
-                logger.info("Session %s: %s denied by user", self.session_id, tool_name)
-                return PermissionResultDeny(message=pending.deny_message or "Declined by user.")
+                logger.info(
+                    "Session %s: %s denied by user", self.session_id, tool_name,
+                )
+                return InteractionOutcome(
+                    denied=True,
+                    message=pending.deny_message or "Declined by user.",
+                )
 
-            # For AskUserQuestion: inject answers into the tool input
-            if tool_name == "AskUserQuestion" and pending.result:
-                updated = {**tool_input, "answers": pending.result}
-                return PermissionResultAllow(updated_input=updated)
-
-            # For ExitPlanMode/EnterPlanMode: just allow
-            return PermissionResultAllow()
+            return InteractionOutcome(result=pending.result)
         finally:
             # Always drop the pending entry and refresh the waiting indicator,
             # regardless of how the wait resolved (answered, denied, timeout,

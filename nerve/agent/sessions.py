@@ -49,9 +49,22 @@ class SessionManager:
     - Orphan recovery on startup
     """
 
-    def __init__(self, db: Database, sticky_period_minutes: int = 120):
+    def __init__(
+        self,
+        db: Database,
+        sticky_period_minutes: int = 120,
+        *,
+        default_backend: str = "claude",
+        cron_backend: str | None = None,
+        backend_models: dict[str, str] | None = None,
+        default_cwd: str | None = None,
+    ):
         self.db = db
         self.sticky_period_minutes = sticky_period_minutes
+        self.default_backend = default_backend
+        self.cron_backend = cron_backend or default_backend
+        self.backend_models = dict(backend_models or {})
+        self.default_cwd = default_cwd
         # In-memory SDK client registry (rebuilt on demand from DB)
         self._clients: dict[str, Any] = {}
         self._client_locks: dict[str, asyncio.Lock] = {}
@@ -79,12 +92,16 @@ class SessionManager:
         title: str | None = None,
         source: str = "web",
         metadata: dict | None = None,
+        backend: str | None = None,
+        model: str | None = None,
+        cwd: str | None = None,
     ) -> dict:
         """Get an existing session or create a new one."""
         session = await self.db.get_session(session_id)
         if not session:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
+                backend=backend, model=model, cwd=cwd,
             )
         return session
 
@@ -96,13 +113,32 @@ class SessionManager:
         metadata: dict | None = None,
         parent_session_id: str | None = None,
         forked_from_message: str | None = None,
+        backend: str | None = None,
+        model: str | None = None,
+        cwd: str | None = None,
     ) -> dict:
         """Create a new session with status=created and log the event."""
+        if backend is None:
+            try:
+                override = (metadata or {}).get("backend_override")
+            except AttributeError:
+                override = None
+            backend = str(override or (
+                self.cron_backend if source in ("cron", "hook")
+                else self.default_backend
+            )).strip().lower()
+        if model is None:
+            model = self.backend_models.get(backend)
+        if cwd is None:
+            cwd = self.default_cwd
         session = await self.db.create_session(
             session_id, title=title, source=source, metadata=metadata,
             status=SessionStatus.CREATED,
             parent_session_id=parent_session_id,
             forked_from_message=forked_from_message,
+            backend=backend,
+            model=model,
+            cwd=cwd,
         )
         await self.db.log_session_event(session_id, "created", {
             "source": source,
@@ -460,6 +496,9 @@ class SessionManager:
             source=source or parent.get("source", "web"),
             parent_session_id=source_session_id,
             forked_from_message=at_message_id,
+            backend=parent.get("backend") or "claude",
+            model=parent.get("model"),
+            cwd=parent.get("cwd"),
         )
         return session
 
@@ -516,11 +555,13 @@ class SessionManager:
         channel: str | None = None,
         thinking: str | None = None,
         blocks: list | None = None,
+        native_turn_id: str | None = None,
     ) -> int:
         """Add a message to a session's history."""
         return await self.db.add_message(
             session_id, role, content, channel=channel,
             thinking=thinking, blocks=blocks,
+            native_turn_id=native_turn_id,
         )
 
     async def get_conversation_history(

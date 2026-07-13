@@ -1,0 +1,18 @@
+{
+  "codex_cli_version": "0.144.1",
+  "generated_with": "codex app-server generate-json-schema",
+  "verified_date": "2026-07-11",
+  "canonical_v2_schema_sha256": "5d8251e1e2f713a3c567c927386f84f2f94692d4721b90d8ff36d0ff92877621",
+  "required_methods": [
+    "initialize",
+    "account/read",
+    "model/list",
+    "thread/read",
+    "thread/start",
+    "thread/resume",
+    "thread/fork",
+    "turn/start",
+    "turn/interrupt"
+  ],
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range."
+}

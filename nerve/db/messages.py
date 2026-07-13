@@ -18,6 +18,7 @@ class MessageStore:
         thinking: str | None = None,
         blocks: list | None = None,
         external_id: str | None = None,
+        native_turn_id: str | None = None,
         created_at: str | None = None,
     ) -> int:
         """Insert a message row. ``external_id`` enables idempotent ingest
@@ -31,21 +32,22 @@ class MessageStore:
                 async with self.db.execute(
                     """INSERT INTO messages
                          (session_id, role, content, thinking, blocks, channel,
-                          external_id, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                          external_id, native_turn_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (session_id, role, content, thinking,
                      json.dumps(blocks) if blocks else None,
-                     channel, external_id, created_at),
+                     channel, external_id, native_turn_id, created_at),
                 ) as cursor:
                     msg_id = cursor.lastrowid
             else:
                 async with self.db.execute(
                     """INSERT INTO messages
-                         (session_id, role, content, thinking, blocks, channel, external_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                         (session_id, role, content, thinking, blocks, channel,
+                          external_id, native_turn_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (session_id, role, content, thinking,
                      json.dumps(blocks) if blocks else None,
-                     channel, external_id),
+                     channel, external_id, native_turn_id),
                 ) as cursor:
                     msg_id = cursor.lastrowid
             # Update session timestamp and message counter
@@ -55,6 +57,41 @@ class MessageStore:
                 (now, session_id),
             )
         return msg_id
+
+    async def get_native_turn_at_message(
+        self, session_id: str, message_id: str | int,
+    ) -> str | None:
+        """Return the native turn at or immediately before a Nerve message.
+
+        Fork controls may point at the user message that began a turn or the
+        assistant message that completed it. Only completed assistant rows
+        carry ``native_turn_id``: prefer the first mapped completion at/after
+        the selection (the selected user turn), then fall back to the prior
+        completion for older/non-turn message shapes.
+        """
+        try:
+            numeric_id = int(message_id)
+        except (TypeError, ValueError):
+            return None
+        async with self.db.execute(
+            """SELECT native_turn_id FROM messages
+               WHERE session_id = ? AND id >= ?
+                 AND native_turn_id IS NOT NULL
+               ORDER BY id ASC LIMIT 1""",
+            (session_id, numeric_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            return str(row[0])
+        async with self.db.execute(
+            """SELECT native_turn_id FROM messages
+               WHERE session_id = ? AND id <= ?
+                 AND native_turn_id IS NOT NULL
+               ORDER BY id DESC LIMIT 1""",
+            (session_id, numeric_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row[0]) if row else None
 
     async def add_message_idempotent(
         self,

@@ -63,25 +63,25 @@ class TestBuildSnapshot:
 
 class TestWorkflowStatus:
     def test_started_and_progress_are_running(self):
-        assert AgentEngine._workflow_status("task_started", {}, object()) == "running"
-        assert AgentEngine._workflow_status("task_progress", {}, object()) == "running"
+        assert AgentEngine._workflow_status("task_started", {}) == "running"
+        assert AgentEngine._workflow_status("task_progress", {}) == "running"
 
     def test_notification_status_passes_through(self):
         assert AgentEngine._workflow_status(
-            "task_notification", {"status": "completed"}, object()
+            "task_notification", {"status": "completed"}
         ) == "completed"
         assert AgentEngine._workflow_status(
-            "task_notification", {"status": "failed"}, object()
+            "task_notification", {"status": "failed"}
         ) == "failed"
 
     def test_updated_killed_maps_to_stopped(self):
         assert AgentEngine._workflow_status(
-            "task_updated", {"patch": {"status": "killed"}}, object()
+            "task_updated", {"patch": {"status": "killed"}}
         ) == "stopped"
 
     def test_updated_without_status_stays_running(self):
         assert AgentEngine._workflow_status(
-            "task_updated", {"patch": {"end_time": 1}}, object()
+            "task_updated", {"patch": {"end_time": 1}}
         ) == "running"
 
 

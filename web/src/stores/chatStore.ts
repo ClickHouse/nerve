@@ -9,7 +9,7 @@ import { randomUUID } from '../utils/uuid';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
+import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
@@ -63,8 +63,9 @@ let _quoteId = 0;
 // disabled composer. Sidebar/list events (session_running, session_updated, …)
 // stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
-  'thinking', 'token', 'tool_use', 'tool_result', 'done', 'stopped', 'error',
+  'thinking', 'token', 'tool_use', 'tool_result', 'tool_output', 'done', 'stopped', 'error',
   'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
+  'backend_status',
   'subagent_start', 'subagent_complete', 'hoa_progress', 'interaction',
   'interaction_resolved', 'file_changed',
 ]);
@@ -95,6 +96,7 @@ interface ChatState {
     max_context_tokens: number;
     num_turns: number;
   } | null;
+  backendStatus: { subtype: string; data: Record<string, unknown> } | null;
   // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
   // Claude Code 2.1+ task panel state (TaskCreate / TaskUpdate / TaskList)
@@ -117,7 +119,7 @@ interface ChatState {
   // Pending interactive tool (AskUserQuestion, ExitPlanMode, etc.)
   pendingInteraction: {
     interactionId: string;
-    interactionType: 'question' | 'plan_exit' | 'plan_enter';
+    interactionType: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval';
     toolName: string;
     toolInput: Record<string, unknown>;
   } | null;
@@ -141,9 +143,15 @@ interface ChatState {
   // Composer model picker: options from GET /api/models (Anthropic default +
   // locally-installed Ollama models), the server's default id, and the user's
   // current pick (null = use the server default).
-  availableModels: { id: string; provider: string }[];
-  modelsDefault: string | null;
-  selectedModel: string | null;
+  availableModels: { id: string; provider: string; backend: string }[];
+  modelDefaults: Record<string, string>;
+  // Agent backends for the new-chat selector (claude / codex).
+  backendOptions: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string }[];
+  backendDefault: string | null;
+  // Backend picked for the CURRENT virtual (unsent) chat; null = default.
+  // Bound at session materialization (ensureRealSession) and reset after.
+  newChatBackend: string | null;
+  selectedModels: Record<string, string | null>;
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
@@ -167,8 +175,9 @@ interface ChatState {
   sendMessage: (content: string) => void;
   /** Fetch selectable models for the composer picker (GET /api/models). */
   loadModels: () => Promise<void>;
+  setNewChatBackend: (backend: string | null) => void;
   /** Set the model for the next message (null → server default). */
-  setSelectedModel: (model: string | null) => void;
+  setSelectedModel: (backend: string, model: string | null) => void;
   stopSession: () => void;
   handleWSMessage: (msg: WSMessage) => void;
   addQuote: (text: string, action: QuoteAction) => void;
@@ -205,6 +214,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loading: false,
   agentStatus: { state: 'idle' },
   contextUsage: null,
+  backendStatus: null,
   currentTodos: [],
   currentCCTasks: [],
   quotes: [],
@@ -224,8 +234,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
   searchLoading: false,
   searchFocusNonce: 0,
   availableModels: [],
-  modelsDefault: null,
-  selectedModel: localStorage.getItem('nerve_selected_model') || null,
+  modelDefaults: {},
+  backendOptions: [],
+  backendDefault: null,
+  newChatBackend: null,
+  selectedModels: {
+    claude: localStorage.getItem('nerve_selected_model_claude')
+      || localStorage.getItem('nerve_selected_model') || null,
+    codex: localStorage.getItem('nerve_selected_model_codex') || null,
+  },
 
   addQuote: (text: string, action: QuoteAction) => {
     const id = `q${++_quoteId}`;
@@ -421,6 +438,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeSession: id, messages: [], loading: true, streamingBlocks: [],
       isStreaming: false, agentStatus: { state: 'idle' }, contextUsage: null,
+      backendStatus: null,
       currentTodos: [], currentCCTasks: [], pendingInteraction: null,
       panels: [], activePanelId: null, panelVisible: false,
       modifiedFiles: [], modifiedFilesCount: 0, backgroundTasks: [],
@@ -499,7 +517,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // server-minted id, so anything needing a persisted session — the first
     // message OR a file upload before it — targets a real row, not the
     // client-only temp id (which the backend has never seen → 404).
-    const real: Session = await api.createSession();
+    const real: Session = await api.createSession(
+      undefined, get().newChatBackend,
+    );
     set((state) => {
       const drafts = { ...state.drafts };
       // Carry any unsent draft text across to the real id so the composer,
@@ -511,6 +531,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Don't yank the view if the user navigated away during the POST.
         ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
         virtualSession: null,
+        newChatBackend: null,  // bound into the created session; reset for the next chat
         drafts,
         // POST /api/sessions returns a partial row (no updated_at); fill the
         // fields the sidebar needs so date-grouping doesn't choke.
@@ -526,6 +547,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
+    set({ newChatBackend: null });
     set((s) => {
       const drafts = { ...s.drafts };
       delete drafts[vs.id];
@@ -621,21 +643,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((state) => {
         // Drop a stale pick (e.g. an Ollama model no longer installed) so we
         // never send a model the server can't route.
-        const ids = new Set(res.models.map(m => m.id));
-        const keep = state.selectedModel && ids.has(state.selectedModel)
-          ? state.selectedModel : null;
-        if (keep !== state.selectedModel) localStorage.removeItem('nerve_selected_model');
-        return { availableModels: res.models, modelsDefault: res.default, selectedModel: keep };
+        const selectedModels = { ...state.selectedModels };
+        for (const backend of ['claude', 'codex']) {
+          const ids = new Set(res.models.filter(m => m.backend === backend).map(m => m.id));
+          const selected = selectedModels[backend];
+          if (selected && !ids.has(selected)) {
+            selectedModels[backend] = null;
+            localStorage.removeItem(`nerve_selected_model_${backend}`);
+          }
+        }
+        localStorage.removeItem('nerve_selected_model');
+        return {
+          availableModels: res.models,
+          modelDefaults: res.defaults ?? { claude: res.default },
+          backendOptions: res.backends?.options ?? [],
+          backendDefault: res.backends?.default ?? null,
+          selectedModels,
+        };
       });
     } catch (e) {
       console.error('Failed to load models:', e);
     }
   },
 
-  setSelectedModel: (model: string | null) => {
-    if (model) localStorage.setItem('nerve_selected_model', model);
-    else localStorage.removeItem('nerve_selected_model');
-    set({ selectedModel: model });
+  setNewChatBackend: (backend: string | null) => set({ newChatBackend: backend }),
+
+  setSelectedModel: (backend: string, model: string | null) => {
+    const key = `nerve_selected_model_${backend}`;
+    if (model) localStorage.setItem(key, model);
+    else localStorage.removeItem(key);
+    set((state) => ({
+      selectedModels: { ...state.selectedModels, [backend]: model },
+    }));
   },
 
   sendMessage: async (content: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => {
@@ -677,7 +716,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
     }
-    const status = ws.sendMessage(content, session, fileIds, get().selectedModel ?? undefined);
+    const state = get();
+    const backend = state.sessions.find(s => s.id === session)?.backend
+      ?? state.backendDefault ?? 'claude';
+    const status = ws.sendMessage(
+      content, session, fileIds, state.selectedModels[backend] ?? undefined,
+    );
     if (status === 'dropped') {
       // The message could not reach the server. Revert the optimistic
       // state and surface the failure inline so the user knows to retry.
@@ -717,6 +761,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'token':        return handleToken(msg, get, set);
       case 'tool_use':     return handleToolUse(msg, get, set);
       case 'tool_result':  return handleToolResult(msg, get, set);
+      case 'tool_output':  return handleToolOutput(msg, get, set);
       case 'done':         return handleDone(msg, get, set);
       case 'wakeup':       return handleWakeup(msg, get, set);
       case 'auto_turn':    return handleAutoTurn(msg, get, set);
@@ -736,6 +781,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'user_message':     return handleUserMessage(msg, get, set);
       // Panels
       case 'plan_update':        return handlePlanUpdate(msg, get, set);
+      case 'backend_status':
+        set({ backendStatus: { subtype: msg.subtype, data: msg.data } });
+        return;
       case 'subagent_start':     return handleSubagentStart(msg, get, set);
       case 'subagent_complete':  return handleSubagentComplete(msg, get, set);
       case 'hoa_progress':       return handleHoaProgress(msg, get, set);

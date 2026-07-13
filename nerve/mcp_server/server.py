@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 CtxResolver = Callable[[], Awaitable[ToolContext]]
-AuditWriter = Callable[[str, str, dict, ToolResult, float, bool], Awaitable[None]]
+AuditWriter = Callable[[ToolContext, str, dict, ToolResult, float, bool], Awaitable[None]]
 
 
 def build_mcp_server(
@@ -51,7 +51,7 @@ def build_mcp_server(
             the current request. The resolver is responsible for
             attributing the call to a satellite session.
         audit_writer: Optional async callable receiving
-            ``(session_id, tool_name, args, result, duration_ms, is_error)``
+            ``(tool_context, tool_name, args, result, duration_ms, is_error)``
             after every call. Used to record ``external_tool_call``
             session_events. Failures are logged but never propagate.
         include_hoa: If ``True``, expose HoA tools (``hoa_*``) to the
@@ -116,8 +116,12 @@ def build_mcp_server(
             err_result = ToolResult.text(f"Tool error: {e}", is_error=True)
             if audit_writer is not None:
                 try:
+                    audit_subject = (
+                        ctx if getattr(audit_writer, "_accepts_tool_context", False) is True
+                        else ctx.session_id
+                    )
                     await audit_writer(
-                        ctx.session_id, name, arguments, err_result,
+                        audit_subject, name, arguments, err_result,
                         duration_ms, True,
                     )
                 except Exception:
@@ -130,8 +134,12 @@ def build_mcp_server(
         duration_ms = (time.monotonic() - start) * 1000.0
         if audit_writer is not None:
             try:
+                audit_subject = (
+                    ctx if getattr(audit_writer, "_accepts_tool_context", False) is True
+                    else ctx.session_id
+                )
                 await audit_writer(
-                    ctx.session_id, name, arguments, result,
+                    audit_subject, name, arguments, result,
                     duration_ms, result.is_error,
                 )
             except Exception:

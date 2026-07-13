@@ -1,5 +1,15 @@
 # SDK Session Management
 
+> **Multi-backend note (2026-07):** everything below applies to the Claude
+> backend specifically; the same *concepts* (native session id in
+> `sessions.sdk_session_id`, resume, fork) are implemented per backend
+> behind `nerve/agent/backends/`. The `sessions.backend` column records
+> which runtime owns a session — resolution is sticky (stored backend
+> beats config) and cross-backend resume is refused (the native id is
+> cleared and the conversation restarts). Codex threads resume via
+> `thread/resume` and fork via `thread/fork`; a stale codex thread id is
+> recovered by falling back to a fresh thread (`resume_dropped`).
+
 ## Core Principle
 
 The Claude Agent SDK manages conversation context internally. **Never load messages into prompts manually.** Use `resume` and `fork_session` to give the agent context.

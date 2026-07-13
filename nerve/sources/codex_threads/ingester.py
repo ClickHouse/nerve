@@ -1,11 +1,8 @@
 """Idempotent ingestion of Codex thread events into Nerve.
 
-Maps :class:`ThreadEvent`s to satellite-session lifecycle operations
-plus message inserts. The session ID convention is
-``codex:<thread_id>`` (NOT ``codex:<origin_id>:<thread_id>``) so the
-same Codex thread always lands in the same satellite session no matter
-how many origins watch it, and so the external MCP server can converge
-on the same ID when Codex provides its thread UUID at initialize-time.
+Maps :class:`ThreadEvent`s to session lifecycle operations plus message
+inserts. A native-thread mapping reuses the owning Nerve session when one
+exists; otherwise the fallback satellite ID is ``codex:<thread_id>``.
 
 All inserts go through ``add_message_idempotent`` keyed on
 ``(session_id, external_id)``: the partial unique index added in v028
@@ -143,7 +140,7 @@ class CodexIngester:
         if not messages:
             return
 
-        session_id = codex_session_id(event.thread_id)
+        session_id = await self._session_id_for(event.thread_id)
         for msg in messages:
             await self._insert_message(session_id, msg)
 
@@ -170,7 +167,7 @@ class CodexIngester:
         self.mark_in_scope(event.thread_id)
         self.stats["threads_in_scope"] += 1
 
-        session_id = codex_session_id(event.thread_id)
+        session_id = await self._session_id_for(event.thread_id)
         existing = await self.db.get_session(session_id)
         if existing is not None:
             # Already created — MCP server may have got there first.
@@ -197,7 +194,10 @@ class CodexIngester:
             source="external",
             metadata=metadata,
             status="active",
+            backend="codex",
+            cwd=meta.cwd,
         )
+        await self.db.bind_native_thread("codex", meta.thread_id, session_id)
         logger.info(
             "Codex thread %s: synced (cwd=%s, origin=%s) → %s",
             meta.thread_id[:8], meta.cwd, self.origin_id, session_id,
@@ -246,23 +246,30 @@ class CodexIngester:
         await self.db.update_session_metadata(session_id, meta)
         # Bring stopped sessions back to active when their rollout is
         # still alive. Archived stays archived.
-        if existing.get("status") == "stopped":
+        if existing.get("source") == "external" and existing.get("status") == "stopped":
             try:
                 await self.db.update_session_fields(session_id, {"status": "active"})
             except Exception:
                 logger.exception("Failed to reactivate session %s", session_id)
 
     async def _archive_session(self, thread_id: str) -> None:
-        session_id = codex_session_id(thread_id)
+        session_id = await self._session_id_for(thread_id)
         existing = await self.db.get_session(session_id)
         if existing is None:
             return
         try:
-            await self.db.update_session_fields(session_id, {"status": "archived"})
-            self.stats["threads_archived"] += 1
-            logger.info("Codex thread %s: archived", thread_id[:8])
+            # Native Nerve sessions own their own lifecycle.  A rollout being
+            # archived must not hide the corresponding live chat.
+            if existing.get("source") == "external":
+                await self.db.update_session_fields(session_id, {"status": "archived"})
+                self.stats["threads_archived"] += 1
+                logger.info("Codex thread %s: archived", thread_id[:8])
         except Exception:
             logger.exception("Failed to archive Codex session %s", session_id)
+
+    async def _session_id_for(self, thread_id: str) -> str:
+        mapped = await self.db.get_session_for_native_thread("codex", thread_id)
+        return mapped or codex_session_id(thread_id)
 
     async def _insert_message(
         self, session_id: str, msg: StoredMessage,

@@ -1740,16 +1740,15 @@ class SetupWizard:
     # ---- External agents apply step --------------------------------
 
     def _apply_external_agents(self, workspace: Path) -> None:
-        """Issue an MCP token, write each selected agent's config, and
+        """Issue an ephemeral MCP token, write each selected agent's config, and
         record them in config.yaml so the sync service can keep their
         memory bundles fresh.
 
         Token strategy: per the user's decision in plan-3bc42e5f we
         reuse the existing single gateway JWT mechanism (no per-agent
-        token table). The wizard issues one long-lived token via
-        :func:`_issue_mcp_token` and embeds it into every selected
-        agent's config. The token's only use is bearer auth against
-        /mcp/v1; revocation = rotating the gateway JWT secret.
+        token table). Generated clients reference ``NERVE_MCP_TOKEN`` rather
+        than storing the credential; users refresh it with
+        ``nerve codex token``. The token is scoped to MCP and expires.
         """
         import asyncio
 
@@ -1787,35 +1786,20 @@ class SetupWizard:
         self._record_external_agents_in_config_yaml(results)
 
     def _issue_mcp_token(self) -> str:
-        """Issue a long-lived JWT for external agent MCP auth.
-
-        We reuse :func:`nerve.gateway.auth.create_token`'s payload but
-        with a 10-year expiry so users don't see the token break a
-        month later. The token isn't stored anywhere — once embedded
-        in the agent config file the wizard's job is done.
+        """Issue an eight-hour, MCP-audience JWT for external agents.
 
         If no jwt_secret is configured yet (dev mode), returns a
         placeholder string that the user can replace later. The MCP
         endpoint's auth bypass covers dev mode so this still works
         end-to-end on a fresh install.
         """
-        from datetime import datetime, timedelta, timezone
-
-        import jwt
-
-        from nerve.gateway.auth import JWT_ALGORITHM
+        from nerve.gateway.auth import create_external_mcp_token
 
         secret = self._resolve_jwt_secret()
         if not secret:
             return "dev-mode-no-auth"
 
-        payload = {
-            "sub": "external-agent-mcp",
-            "iat": datetime.now(timezone.utc),
-            "exp": datetime.now(timezone.utc) + timedelta(days=3650),
-            "kind": "mcp",
-        }
-        return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
+        return create_external_mcp_token(secret)
 
     def _resolve_jwt_secret(self) -> str:
         """Return the JWT secret we're about to write to config.local.yaml.
@@ -1849,15 +1833,26 @@ class SetupWizard:
     def _compute_nerve_mcp_url(self) -> str:
         """Return the MCP endpoint URL external agents should hit.
 
-        Defaults to ``https://localhost:<gateway-port>/mcp/v1/`` for a
-        local install. The trailing slash matters — Codex's MCP client
-        appends paths to it.
+        Uses the gateway scheme/host/port and MCP path from the configuration
+        just written by the wizard. The trailing slash matters.
         """
-        # Default port mirrors GatewayConfig.port (8900). The bootstrap
-        # wizard doesn't currently expose a port-override step but
-        # plumbing it here keeps the door open.
-        port = 8900
-        return f"https://localhost:{port}/mcp/v1/"
+        raw: dict = {}
+        path = self.config_dir / "config.yaml"
+        if path.exists():
+            try:
+                raw = yaml.safe_load(path.read_text()) or {}
+            except Exception:
+                raw = {}
+        gateway = raw.get("gateway") or {}
+        ssl = gateway.get("ssl") or {}
+        scheme = "https" if ssl.get("cert") and ssl.get("key") else "http"
+        host = str(gateway.get("host") or "127.0.0.1")
+        if host in {"0.0.0.0", "::", "[::]"}:
+            host = "localhost"
+        port = int(gateway.get("port") or 8900)
+        endpoint = raw.get("mcp_endpoint") or {}
+        mcp_path = "/" + str(endpoint.get("path") or "/mcp/v1").strip("/")
+        return f"{scheme}://{host}:{port}{mcp_path}/"
 
     def _record_external_agents_in_config_yaml(self, results) -> None:
         """Append the external_agents block to the freshly-written config.yaml.
@@ -1882,7 +1877,6 @@ class SetupWizard:
             targets.append({
                 "name": r.agent,
                 "enabled": True,
-                "token": r.token,
             })
 
         data["external_agents"] = {
@@ -1891,6 +1885,10 @@ class SetupWizard:
             "conflict_policy": self.choices.external_agents_conflict_policy,
             "targets": targets,
         }
+        endpoint = data.setdefault("mcp_endpoint", {})
+        endpoint["enabled"] = True
+        endpoint.setdefault("path", "/mcp/v1")
+        endpoint.setdefault("include_hoa", False)
         path.write_text(yaml.safe_dump(data, sort_keys=False))
 
     def _build_web_ui(self) -> None:

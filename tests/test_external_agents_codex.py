@@ -42,7 +42,9 @@ def writer(fake_home: Path) -> ConfigWriter:
 @pytest.mark.asyncio
 async def test_codex_writes_config_and_agents_md(
     fake_home: Path, workspace: Path, writer: ConfigWriter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("NERVE_MCP_TOKEN", raising=False)
     agent = CodexAgent()
     result = await agent.write_config(
         nerve_url="https://localhost:8900/mcp/v1/",
@@ -60,14 +62,17 @@ async def test_codex_writes_config_and_agents_md(
     assert agents_md_path in result.config_files_written
 
     toml_text = config_path.read_text()
-    # URL + token landed
+    # URL landed, but the credential itself must never be persisted.
     assert "https://localhost:8900/mcp/v1/" in toml_text
-    assert "Bearer test-jwt" in toml_text
+    assert 'bearer_token_env_var = "NERVE_MCP_TOKEN"' in toml_text
+    assert "test-jwt" not in toml_text
+    assert config_path.stat().st_mode & 0o777 == 0o600
     # Workspace path is in the [projects.*] header
     assert f'[projects."{workspace}"]' in toml_text
     # Default trust posture
     assert 'approval_policy = "never"' in toml_text
     assert 'sandbox_mode = "danger-full-access"' in toml_text
+    assert any("NERVE_MCP_TOKEN" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio

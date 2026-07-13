@@ -5,6 +5,7 @@ import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
 import { PromptRewriteCard } from './PromptRewriteCard';
+import { BackendSelector } from './BackendSelector';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
   add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)', placeholder: 'Instructions...' },
@@ -60,13 +61,28 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const activeSession = useChatStore(s => s.activeSession);
   const ensureRealSession = useChatStore(s => s.ensureRealSession);
   const isNewChat = useChatStore(s => s.messages.length === 0);
+  // Backend selector renders only while the chat is virtual (unsent):
+  // the choice binds at server-side session creation and is sticky.
+  const isVirtualChat = useChatStore(
+    s => s.virtualSession !== null && s.virtualSession.id === s.activeSession,
+  );
+  const newChatBackend = useChatStore(s => s.newChatBackend);
+  const backendDefault = useChatStore(s => s.backendDefault);
+  const chosenBackend = newChatBackend ?? backendDefault;
+  const sessions = useChatStore(s => s.sessions);
+  const activeBackend = isVirtualChat
+    ? (chosenBackend ?? 'claude')
+    : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
 
   // ── Model picker ──
   const availableModels = useChatStore(s => s.availableModels);
-  const selectedModel = useChatStore(s => s.selectedModel);
-  const modelsDefault = useChatStore(s => s.modelsDefault);
+  const selectedModels = useChatStore(s => s.selectedModels);
+  const modelDefaults = useChatStore(s => s.modelDefaults);
   const setSelectedModel = useChatStore(s => s.setSelectedModel);
   const loadModels = useChatStore(s => s.loadModels);
+  const scopedModels = availableModels.filter(m => m.backend === activeBackend);
+  const selectedModel = selectedModels[activeBackend] ?? null;
+  const modelsDefault = modelDefaults[activeBackend] ?? null;
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -455,27 +471,39 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               <Sparkles size={18} />
             </button>
           )}
-          {/* Model picker — only when more than one model is offered (local
-              Ollama models configured + available). Hidden otherwise so the
-              composer is unchanged for the default single-model setup. */}
-          {availableModels.length > 1 && (
+          {/* Agent backend selector — Claude vs Codex, new chats only.
+              Binds at session creation; sticky afterwards (the header's
+              model badge shows what a running session uses). */}
+          {isVirtualChat && (
+            <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
+          )}
+          {/* Backend-scoped model picker. A Claude/Ollama selection can never
+              leak into Codex (or vice versa) when the backend changes. */}
+          {scopedModels.length > 1 && (
             <select
               value={selectedModel ?? modelsDefault ?? ''}
-              onChange={(e) => setSelectedModel(e.target.value === modelsDefault ? null : e.target.value)}
+              onChange={(e) => setSelectedModel(activeBackend, e.target.value === modelsDefault ? null : e.target.value)}
               disabled={disabled || isStreaming || rewriteActive}
               title="Model for your next message"
               className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
             >
-              {availableModels.some(m => m.provider === 'anthropic') && (
+              {scopedModels.some(m => m.provider === 'anthropic') && (
                 <optgroup label="Anthropic">
-                  {availableModels.filter(m => m.provider === 'anthropic').map(m => (
+                  {scopedModels.filter(m => m.provider === 'anthropic').map(m => (
                     <option key={m.id} value={m.id}>{m.id}</option>
                   ))}
                 </optgroup>
               )}
-              {availableModels.some(m => m.provider === 'ollama') && (
+              {scopedModels.some(m => m.provider === 'ollama') && (
                 <optgroup label="Ollama (local)">
-                  {availableModels.filter(m => m.provider === 'ollama').map(m => (
+                  {scopedModels.filter(m => m.provider === 'ollama').map(m => (
+                    <option key={m.id} value={m.id}>{m.id}</option>
+                  ))}
+                </optgroup>
+              )}
+              {scopedModels.some(m => m.provider === 'openai') && (
+                <optgroup label="OpenAI Codex">
+                  {scopedModels.filter(m => m.provider === 'openai').map(m => (
                     <option key={m.id} value={m.id}>{m.id}</option>
                   ))}
                 </optgroup>

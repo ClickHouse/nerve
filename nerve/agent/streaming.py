@@ -188,6 +188,21 @@ class StreamBroadcaster:
             msg["parent_tool_use_id"] = parent_tool_use_id
         await self.broadcast(session_id, msg)
 
+    async def broadcast_tool_output(
+        self, session_id: str, content: str,
+        tool_use_id: str | None = None,
+        parent_tool_use_id: str | None = None,
+    ) -> None:
+        msg: dict[str, Any] = {
+            "type": "tool_output",
+            "session_id": session_id,
+            "tool_use_id": tool_use_id,
+            "content": content,
+        }
+        if parent_tool_use_id:
+            msg["parent_tool_use_id"] = parent_tool_use_id
+        await self.broadcast(session_id, msg)
+
     async def broadcast_done(
         self,
         session_id: str,
@@ -206,6 +221,16 @@ class StreamBroadcaster:
 
     async def broadcast_plan_update(self, session_id: str, content: str) -> None:
         await self.broadcast(session_id, {"type": "plan_update", "session_id": session_id, "content": content})
+
+    async def broadcast_backend_status(
+        self, session_id: str, subtype: str, data: dict[str, Any],
+    ) -> None:
+        await self.broadcast(session_id, {
+            "type": "backend_status",
+            "session_id": session_id,
+            "subtype": subtype,
+            "data": data,
+        })
 
     async def broadcast_wakeup(self, session_id: str) -> None:
         """Mark the start of a turn fired by a self-scheduled ScheduleWakeup."""

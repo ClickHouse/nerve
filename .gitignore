@@ -57,3 +57,6 @@ docker-entrypoint.sh
 # OS
 .DS_Store
 Thumbs.db
+
+# Local planning docs — not for PRs
+docs/plans/

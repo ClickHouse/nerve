@@ -34,21 +34,29 @@ def set_skill_manager(manager: Any) -> None:
     _skill_manager = manager
 
 
-def _format_tool_list() -> str:
+def _format_tool_list(excluded_tools: "set[str] | None" = None) -> str:
     """Generate tool list for system prompt from the default registry.
 
-    Tool names are prefixed with ``mcp__nerve__`` because that's how the
-    Claude Agent SDK exposes them: the in-process MCP server is named
-    "nerve", and the CLI namespaces every MCP tool as ``mcp__<server>__<name>``.
-    Calling the bare ``spec.name`` fails with "No such tool available".
+    Tool names are prefixed with ``mcp__nerve__`` because that's how both
+    runtimes expose them: the MCP server is named "nerve", and MCP tools
+    are namespaced as ``mcp__<server>__<name>`` (Claude CLI and Codex use
+    the same convention). Calling the bare ``spec.name`` fails.
 
     HoA tools are excluded — they don't usefully appear in the prompt
     when houseofagents is disabled, and including them when enabled
     bloats the prompt with rarely-used surface. The model still
     discovers them via the MCP tools/list call on first turn.
+
+    ``excluded_tools`` mirrors the active backend's tool exclusions so
+    the prompt never advertises a tool the session's MCP server doesn't
+    serve (e.g. ``schedule_wakeup`` on the Claude backend, which has the
+    ScheduleWakeup built-in instead).
     """
+    excluded = excluded_tools or set()
     lines = []
     for spec in _get_prompt_tool_registry().list(include_hoa=False):
+        if spec.name in excluded:
+            continue
         # Take the first sentence of the description as the summary
         desc = spec.description.split("\n")[0].rstrip(".")
         lines.append(f"- `mcp__nerve__{spec.name}` — {desc}")
@@ -102,6 +110,7 @@ def build_system_prompt(
     recalled_memories: list[str] | None = None,
     timezone_name: str = "America/New_York",
     skill_summaries: list[dict] | None = None,
+    excluded_tools: "set[str] | None" = None,
 ) -> str:
     """Build the full system prompt for the agent.
 
@@ -145,7 +154,7 @@ def build_system_prompt(
 - **Workspace:** {workspace}
 
 You have access to the following custom tools:
-{_format_tool_list()}"""
+{_format_tool_list(excluded_tools)}"""
     parts.append(context)
 
     # Skills summary (progressive disclosure level 1: name + description only)
