@@ -472,22 +472,18 @@ class NotificationService:
             "content": injected_message,
         })
 
+        # Dispatch unconditionally — ``engine.run`` serializes per
+        # session, so a mid-turn session picks the answer up when its
+        # current turn finishes (FIFO), same pattern as the wakeup
+        # dispatcher. The old ``is_running`` skip here silently dropped
+        # answers that arrived while the session was busy.
         try:
-            if not self.engine.sessions.is_running(session_id):
-                task = asyncio.create_task(
-                    self.engine.run(
-                        session_id=session_id,
-                        user_message=injected_message,
-                        source=f"notification:{answered_by}",
-                        channel=answered_by,
-                    )
-                )
-                task.add_done_callback(self._on_answer_task_done)
-            else:
-                logger.info(
-                    "Session %s running — answer stored, not injected",
-                    session_id,
-                )
+            self._dispatch_into_session(
+                session_id,
+                injected_message,
+                source=f"notification:{answered_by}",
+                channel=answered_by,
+            )
         except Exception as e:
             logger.error(
                 "Failed to inject answer for %s into session %s: %s",
@@ -661,6 +657,34 @@ class NotificationService:
                 "approval audit append failed: %s (event=%s)",
                 exc, event.get("event"),
             )
+
+    def _dispatch_into_session(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        source: str,
+        channel: str | None = None,
+        internal: bool = False,
+    ) -> None:
+        """Fire-and-forget ``engine.run()`` into a session.
+
+        Safe to call while the session is mid-turn: ``engine.run``
+        holds a per-session lock, so the injected message waits behind
+        any in-flight turn and runs when it finishes (FIFO) — the
+        wakeup-dispatcher pattern. Never skip-on-busy here; that drops
+        the message.
+        """
+        task = asyncio.create_task(
+            self.engine.run(
+                session_id=session_id,
+                user_message=message,
+                source=source,
+                channel=channel,
+                internal=internal,
+            )
+        )
+        task.add_done_callback(self._on_answer_task_done)
 
     def _on_answer_task_done(self, task: asyncio.Task) -> None:
         """Log errors from answer injection tasks.
@@ -1182,11 +1206,11 @@ class NotificationService:
 
         Dispatched unconditionally — ``engine.run`` serializes per
         session, so a mid-turn session just processes the note when its
-        current turn finishes (same pattern as the wakeup dispatcher;
-        deliberately NOT the stale ``is_running`` skip that drops
-        answers). Skipped for external (satellite) sessions, whose
-        conversation loop Nerve doesn't own, and archived/missing
-        sessions — those got the web broadcast and nothing more.
+        current turn finishes (same pattern as the wakeup dispatcher
+        and ``handle_answer``). Skipped for external (satellite)
+        sessions, whose conversation loop Nerve doesn't own, and
+        archived/missing sessions — those got the web broadcast and
+        nothing more.
         """
         try:
             session = await self.db.get_session(session_id)
@@ -1225,15 +1249,12 @@ class NotificationService:
             )
             message = f"[Questions expired unanswered]\n{titles}"
 
-        task = asyncio.create_task(
-            self.engine.run(
-                session_id=session_id,
-                user_message=message,
-                source="notification:expiry",
-                internal=True,
-            )
+        self._dispatch_into_session(
+            session_id,
+            message,
+            source="notification:expiry",
+            internal=True,
         )
-        task.add_done_callback(self._on_answer_task_done)
 
     async def _edit_telegram_expired(self, notif: dict[str, Any]) -> None:
         """Best-effort edit of the Telegram card to show it expired.
