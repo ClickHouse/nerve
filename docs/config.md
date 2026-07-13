@@ -240,7 +240,7 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 
 When active:
 - The `memorize` tool **dual-writes**: memU (as always) plus an async `write_async` to xmemory. Failures on the xmemory side never fail the tool.
-- `memory_recall` appends xmemory's single synthesized answer (its `SINGLE_ANSWER` read mode) to memU's N items, run concurrently so the dual lookup is one round-trip.
+- `memory_recall` appends xmemory's read result to memU's N items, run concurrently so the dual lookup is one round-trip. Read behavior is controlled via `xmemory.read_mode` (defaults to `single-answer`).
 - The memorization **sweep** (session-close / cron) stays memU-only — it does not go through the `memorize` tool handler.
 
 | Key | Type | Default | Description |
@@ -249,6 +249,7 @@ When active:
 | `xmemory.instance_id` | string | *(empty)* | The xmemory instance to bind. Both this and `api_key` are required to activate. |
 | `xmemory.api_url` | string | `https://api.xmemory.ai` | API base URL. |
 | `xmemory.extraction_logic` | string | `deep` | Write extraction mode: `deep` (accurate) or `fast` (high-volume). |
+| `xmemory.read_mode` | string | `single-answer` | Read mode for recall: `single-answer` (synthesized natural-language answer), `raw-tables` (structured rows, JSON-rendered), or `xresponse`. |
 | `xmemory.timeout` | float | `60.0` | Per-request timeout in seconds. |
 
 ## Docker

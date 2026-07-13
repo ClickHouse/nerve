@@ -1304,6 +1304,7 @@ class XmemoryConfig:
     instance_id: str = ""
     api_url: str = "https://api.xmemory.ai"
     extraction_logic: str = "deep"  # "deep" (default) or "fast"
+    read_mode: str = "single-answer"  # "single-answer" | "raw-tables" | "xresponse"
     timeout: float = 60.0
 
     @property
@@ -1318,6 +1319,7 @@ class XmemoryConfig:
             instance_id=d.get("instance_id", ""),
             api_url=d.get("api_url", "https://api.xmemory.ai"),
             extraction_logic=d.get("extraction_logic", "deep"),
+            read_mode=d.get("read_mode", "single-answer"),
             timeout=float(d.get("timeout", 60.0)),
         )
 
