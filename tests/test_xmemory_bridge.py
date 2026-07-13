@@ -81,6 +81,61 @@ def test_extract_answer_shapes() -> None:
     assert _extract_answer(SimpleNamespace(reader_result=SimpleNamespace(answer="x"))) == "x"
 
 
+def test_extract_answer_labels_each_sub_query() -> None:
+    """Decomposed answers keep the sub-question they answer — otherwise the
+    agent cannot tell which answer belongs to which part of the query."""
+    assert _extract_answer(
+        SimpleNamespace(
+            reader_result="Who leads sales? -> Ann\nWhere is HQ? -> Berlin",
+            reader_results=[
+                SimpleNamespace(
+                    sub_query="Who leads sales?",
+                    reader_result={"answer": "Ann"},
+                    error=None,
+                ),
+                SimpleNamespace(
+                    sub_query="Where is HQ?",
+                    reader_result={"answer": "Berlin"},
+                    error=None,
+                ),
+            ],
+        )
+    ) == "Who leads sales?: Ann\nWhere is HQ?: Berlin"
+
+
+def test_extract_answer_surfaces_sub_query_error() -> None:
+    """A sub-query the server could not answer is reported, not dropped."""
+    assert _extract_answer(
+        SimpleNamespace(
+            reader_result="Ann leads sales.",
+            reader_results=[
+                SimpleNamespace(
+                    sub_query="Who leads sales?",
+                    reader_result={"answer": "Ann"},
+                    error=None,
+                ),
+                SimpleNamespace(
+                    sub_query="What is churn?", reader_result="", error="no data",
+                ),
+            ],
+        )
+    ) == "Who leads sales?: Ann\nWhat is churn?: (unavailable: no data)"
+
+
+def test_extract_answer_falls_back_when_no_sub_query_answers() -> None:
+    """Every sub-query empty and error-free → fall back to the combined
+    ``reader_result`` rather than discarding a real answer."""
+    assert _extract_answer(
+        SimpleNamespace(
+            reader_result="Partial: HQ is Berlin.",
+            reader_results=[
+                SimpleNamespace(sub_query="q1", reader_result="", error=None),
+                SimpleNamespace(sub_query="q2", reader_result=None, error=None),
+            ],
+        )
+    ) == "Partial: HQ is Berlin."
+
+
 def test_extract_answer_does_not_mine_answer_keys_from_table_rows() -> None:
     """Under raw-tables the payload is data rows. A row with an ``answer``
     column must not be mistaken for the synthesized answer."""

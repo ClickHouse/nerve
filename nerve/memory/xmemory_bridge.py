@@ -196,7 +196,33 @@ class XmemoryBridge:
 
 
 def _extract_answer(result: Any, *, single_answer: bool = True) -> str | None:
-    """Render an SDK ReadResult as text, per the read mode it was fetched in."""
+    """Render an SDK ReadResult as text.
+
+    Prefers ``reader_results`` — the per-sub-query answers the server returns
+    when it decomposes a composite query (xmemory-ai 0.10.0+) — so each answer
+    stays labelled with the sub-question it answers. Falls back to the combined
+    ``reader_result`` when the query was not decomposed, when the server
+    predates decomposition, or when no sub-query yielded anything usable.
+    """
+    parts: list[str] = []
+    for tagged in getattr(result, "reader_results", None) or ():
+        body = _render_payload(
+            getattr(tagged, "reader_result", None), single_answer=single_answer,
+        )
+        if body is None:
+            # ``error`` is set only when this one sub-query could not be
+            # answered while the others still were. Surface it: an explicit
+            # "not known" beats dropping the sub-query silently.
+            error = _as_text(getattr(tagged, "error", None))
+            body = f"(unavailable: {error})" if error else None
+        if body is None:
+            continue
+        sub_query = _as_text(getattr(tagged, "sub_query", None))
+        parts.append(f"{sub_query}: {body}" if sub_query else body)
+
+    if parts:
+        return "\n".join(parts)
+
     return _render_payload(
         getattr(result, "reader_result", result), single_answer=single_answer,
     )
