@@ -12,7 +12,7 @@ from claude_agent_sdk import AssistantMessage, TextBlock
 from nerve.agent.backends.base import SessionSpec
 from nerve.agent.backends.claude import ClaudeBackend, ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
-from nerve.config import AgentConfig
+from nerve.config import AgentConfig, NerveConfig
 
 
 @pytest.mark.parametrize(
@@ -102,6 +102,32 @@ def test_agent_config_cron_effort_default_and_override():
     cfg = AgentConfig.from_dict({"cron_effort": "low"})
     assert cfg.cron_effort == "low"
     assert cfg.effort == "max"
+
+
+def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
+    """Codex-only runbook semantics must never alter Claude's prompt."""
+    cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    backend = ClaudeBackend(SimpleNamespace(
+        config=cfg,
+        claude_plugins=lambda: [],
+    ))
+    marker = "exact claude system prompt"
+    spec = SessionSpec(
+        session_id="claude-prompt-isolation",
+        source="web",
+        model=cfg.agent.model,
+        effort="high",
+        system_prompt=marker,
+        cwd=str(tmp_path),
+    )
+
+    with patch.object(backend, "_build_mcp_servers", return_value={}), \
+         patch.object(backend, "_build_hooks", return_value={}):
+        options = backend._build_options(spec)
+
+    assert options.system_prompt == marker
+    assert "Nerve runbooks" not in str(options.system_prompt)
+    assert "Codex-native skills" not in str(options.system_prompt)
 
 
 # ---------------------------------------------------------------------------

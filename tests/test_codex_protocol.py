@@ -163,8 +163,17 @@ def test_effort_mapping_and_defaults(tmp_path):
 
 def test_backend_notes_appended_to_developer_instructions(tmp_path):
     client = _client(tmp_path)
+    client._spec.system_prompt = "base system prompt"
     params = client._backend.thread_params(client._spec)
-    assert params["developerInstructions"].startswith("")
-    assert "schedule_wakeup" in params["developerInstructions"]
+    instructions = params["developerInstructions"]
+    flat_instructions = " ".join(instructions.split())
+    assert instructions.startswith("base system prompt")
+    assert "schedule_wakeup" in instructions
+    assert "Nerve runbooks, not Codex-native skills" in flat_instructions
+    assert "later user turns without calling `skill_get` again" in flat_instructions
+    assert "resume of the same native thread" in flat_instructions
+    assert "independent child must load its own copy once" in flat_instructions
+    assert "context compaction" in flat_instructions
+    assert "Native Codex skills keep their normal" in flat_instructions
     assert params["approvalPolicy"] == "never"
     assert params["sandbox"] == "danger-full-access"
