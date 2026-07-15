@@ -2,7 +2,7 @@
 
 xmemory runs *alongside* memU, never replacing it:
 * ``memorize`` dual-writes (memU + xmemory async), and
-* ``memory_recall`` appends xmemory's synthesized answer to memU's hits.
+* ``memory_recall`` appends xmemory's read output to memU's hits.
 
 These tests lock in three contracts: (1) the bridge is inert unless both a
 token and an instance_id are configured, (2) every xmemory failure is
@@ -45,6 +45,7 @@ def test_config_from_dict_defaults_and_overrides() -> None:
     assert c.api_key == "" and c.instance_id == ""
     assert c.api_url == "https://api.xmemory.ai"
     assert c.extraction_logic == "deep"
+    assert c.read_mode == "single-answer"
     assert c.timeout == 60.0
 
     c2 = XmemoryConfig.from_dict({
@@ -52,10 +53,12 @@ def test_config_from_dict_defaults_and_overrides() -> None:
         "instance_id": "inst_1",
         "api_url": "https://example.test",
         "extraction_logic": "fast",
+        "read_mode": "raw-tables",
         "timeout": 30,
     })
     assert c2.enabled and c2.api_url == "https://example.test"
-    assert c2.extraction_logic == "fast" and c2.timeout == 30.0
+    assert c2.extraction_logic == "fast" and c2.read_mode == "raw-tables"
+    assert c2.timeout == 30.0
 
 
 def test_nerveconfig_wires_xmemory_block() -> None:
@@ -76,6 +79,85 @@ def test_extract_answer_shapes() -> None:
     assert _extract_answer(SimpleNamespace(reader_result={})) is None
     assert _extract_answer(SimpleNamespace(reader_result="plain")) == "plain"
     assert _extract_answer(SimpleNamespace(reader_result=SimpleNamespace(answer="x"))) == "x"
+
+
+def test_extract_answer_labels_each_sub_query() -> None:
+    """Decomposed answers keep the sub-question they answer — otherwise the
+    agent cannot tell which answer belongs to which part of the query."""
+    assert _extract_answer(
+        SimpleNamespace(
+            reader_result="Who leads sales? -> Ann\nWhere is HQ? -> Berlin",
+            reader_results=[
+                SimpleNamespace(
+                    sub_query="Who leads sales?",
+                    reader_result={"answer": "Ann"},
+                    error=None,
+                ),
+                SimpleNamespace(
+                    sub_query="Where is HQ?",
+                    reader_result={"answer": "Berlin"},
+                    error=None,
+                ),
+            ],
+        )
+    ) == "Who leads sales?: Ann\nWhere is HQ?: Berlin"
+
+
+def test_extract_answer_surfaces_sub_query_error() -> None:
+    """A sub-query the server could not answer is reported, not dropped."""
+    assert _extract_answer(
+        SimpleNamespace(
+            reader_result="Ann leads sales.",
+            reader_results=[
+                SimpleNamespace(
+                    sub_query="Who leads sales?",
+                    reader_result={"answer": "Ann"},
+                    error=None,
+                ),
+                SimpleNamespace(
+                    sub_query="What is churn?", reader_result="", error="no data",
+                ),
+            ],
+        )
+    ) == "Who leads sales?: Ann\nWhat is churn?: (unavailable: no data)"
+
+
+def test_extract_answer_falls_back_when_no_sub_query_answers() -> None:
+    """Every sub-query empty and error-free → fall back to the combined
+    ``reader_result`` rather than discarding a real answer."""
+    assert _extract_answer(
+        SimpleNamespace(
+            reader_result="Partial: HQ is Berlin.",
+            reader_results=[
+                SimpleNamespace(sub_query="q1", reader_result="", error=None),
+                SimpleNamespace(sub_query="q2", reader_result=None, error=None),
+            ],
+        )
+    ) == "Partial: HQ is Berlin."
+
+
+def test_extract_answer_does_not_mine_answer_keys_from_table_rows() -> None:
+    """Under raw-tables the payload is data rows. A row with an ``answer``
+    column must not be mistaken for the synthesized answer."""
+    rows = [
+        {"question": "What is our refund window?", "answer": "30 days"},
+        {"question": "What is our SLA?", "answer": "99.9%"},
+    ]
+    text = _extract_answer(
+        SimpleNamespace(reader_result=rows, reader_results=[]), single_answer=False,
+    )
+    assert text is not None
+    # Whole rows survive — questions included, not just the 'answer' cells.
+    assert "refund window" in text and "30 days" in text
+
+
+def test_extract_answer_preserves_non_ascii() -> None:
+    """JSON rendering must not escape non-ASCII into \\uXXXX noise."""
+    text = _extract_answer(
+        SimpleNamespace(reader_result=[{"city": "Zürich"}], reader_results=[]),
+        single_answer=False,
+    )
+    assert text is not None and "Zürich" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -107,10 +189,18 @@ async def test_bridge_disabled_when_package_missing(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def _enabled_bridge(extraction_logic: str = "deep") -> XmemoryBridge:
+async def _enabled_bridge(
+    extraction_logic: str = "deep",
+    read_mode: str = "single-answer",  # mirrors the production default
+) -> XmemoryBridge:
     """Build a bridge bound to a (fake-token) real client, then mock the
     instance handle so reads/writes never hit the network."""
-    cfg = XmemoryConfig(api_key="tok", instance_id="inst_1", extraction_logic=extraction_logic)
+    cfg = XmemoryConfig(
+        api_key="tok",
+        instance_id="inst_1",
+        extraction_logic=extraction_logic,
+        read_mode=read_mode,
+    )
     bridge = XmemoryBridge(cfg)
     await bridge.initialize()  # client + .instance() are network-free
     assert bridge.available
@@ -120,7 +210,7 @@ async def _enabled_bridge(extraction_logic: str = "deep") -> XmemoryBridge:
 
 @pytest.mark.asyncio
 async def test_recall_answer_returns_single_answer() -> None:
-    bridge = await _enabled_bridge()
+    bridge = await _enabled_bridge(read_mode="single-answer")
     bridge._instance.read = AsyncMock(
         return_value=SimpleNamespace(reader_result={"answer": "alice@acme.com"})
     )
@@ -129,6 +219,52 @@ async def test_recall_answer_returns_single_answer() -> None:
     # Uses SINGLE_ANSWER read mode.
     _, kwargs = bridge._instance.read.call_args
     assert kwargs["read_mode"] == bridge._ReadMode.SINGLE_ANSWER
+    await bridge.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recall_defaults_to_single_answer() -> None:
+    """An unconfigured ``read_mode`` synthesizes an answer, not raw rows."""
+    bridge = XmemoryBridge(XmemoryConfig(api_key="tok", instance_id="inst_1"))
+    await bridge.initialize()
+    bridge._instance = AsyncMock()
+    bridge._instance.read = AsyncMock(
+        return_value=SimpleNamespace(reader_result={"answer": "HQ is in Berlin."})
+    )
+    assert await bridge.recall_answer("Where is HQ?") == "HQ is in Berlin."
+    _, kwargs = bridge._instance.read.call_args
+    assert kwargs["read_mode"] == bridge._ReadMode.SINGLE_ANSWER
+    await bridge.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recall_answer_honors_raw_tables_read_mode() -> None:
+    bridge = await _enabled_bridge(read_mode="raw-tables")
+    bridge._instance.read = AsyncMock(
+        return_value=SimpleNamespace(reader_result={"rows": [{"k": "v"}]})
+    )
+    ans = await bridge.recall_answer("Show rows")
+    assert ans is not None
+    assert '"rows"' in ans
+    _, kwargs = bridge._instance.read.call_args
+    assert kwargs["read_mode"] == bridge._ReadMode.RAW_TABLES
+    await bridge.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "expected_attr"),
+    [
+        ("raw_tables", "RAW_TABLES"),   # underscore alias still accepted
+        ("RAW-TABLES", "RAW_TABLES"),   # case-insensitive
+        ("  xresponse ", "XRESPONSE"),  # surrounding whitespace tolerated
+        ("nonsense", "SINGLE_ANSWER"),  # unknown → default
+        ("", "SINGLE_ANSWER"),          # empty → default
+    ],
+)
+async def test_read_mode_resolution(configured: str, expected_attr: str) -> None:
+    bridge = await _enabled_bridge(read_mode=configured)
+    assert bridge._read_mode() == getattr(bridge._ReadMode, expected_attr)
     await bridge.aclose()
 
 
@@ -206,7 +342,7 @@ async def test_recall_handler_combines_memu_and_xmemory() -> None:
 
     assert "[memU]" in text
     assert "Alice lives in Metropolis" in text
-    assert "[xmemory] synthesized answer" in text
+    assert "[xmemory]" in text
     assert "alice@acme.com" in text
     xmem.recall_answer.assert_awaited_once_with("alice")
 

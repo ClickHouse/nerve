@@ -11,7 +11,10 @@ In Nerve, xmemory runs *next to* memU, never replacing it:
 * ``memorize`` tool  → dual-writes: memU (as today) **and** xmemory
   (async ``write_async``, fire-and-forget).
 * ``memory_recall`` tool → memU returns its N items/breadcrumbs **and**
-  this bridge appends xmemory's single synthesized answer to the query.
+  this bridge appends xmemory's read output for the query. The read mode
+  is configurable (``xmemory.read_mode``): a synthesized natural-language
+  answer by default (``single-answer``), or the structured ``raw-tables`` /
+  ``xresponse`` payloads.
 * The memorization *sweep* (session-close, cron) stays memU-only — it
   never goes through the ``memorize`` tool handler, so it's untouched.
 
@@ -22,6 +25,7 @@ or failing xmemory can never break memU recall or the memorize tool.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -131,6 +135,25 @@ class XmemoryBridge:
         fast = (self._config.extraction_logic or "deep").strip().lower() == "fast"
         return self._ExtractionLogic.FAST if fast else self._ExtractionLogic.DEEP
 
+    def _read_mode(self) -> Any:
+        """Map the configured ``read_mode`` to the SDK enum.
+
+        Config values mirror the SDK's own wire values (``single-answer``,
+        ``raw-tables``, ``xresponse``), so the enum resolves them directly and
+        any mode the SDK adds later needs no change here. Underscores are
+        accepted as an alias; unknown values fall back to ``single-answer``,
+        the configured default.
+        """
+        mode = (self._config.read_mode or "").strip().lower().replace("_", "-")
+        try:
+            return self._ReadMode(mode)
+        except ValueError:
+            logger.warning(
+                "xmemory: unknown read_mode=%r, falling back to single-answer",
+                self._config.read_mode,
+            )
+            return self._ReadMode.SINGLE_ANSWER
+
     async def memorize(self, text: str) -> bool:
         """Async-write ``text`` to xmemory (fire-and-forget).
 
@@ -149,40 +172,107 @@ class XmemoryBridge:
             return False
 
     async def recall_answer(self, query: str) -> str | None:
-        """Query xmemory and return its single synthesized answer.
+        """Query xmemory and return its read output as text.
 
-        Uses ``SINGLE_ANSWER`` read mode — xmemory translates the question
-        to SQL over its knowledge graph and returns a natural-language
-        answer. Returns the answer string, or ``None`` when unavailable,
-        empty, or on any error (so recall always falls back to memU alone).
+        The read mode comes from ``xmemory.read_mode``: ``single-answer`` (the
+        default) yields the synthesized natural-language answer, while
+        ``raw-tables`` and ``xresponse`` yield structured payloads, rendered
+        as JSON.
+
+        Returns ``None`` when unavailable, empty, or on any error (so recall
+        always falls back to memU alone).
         """
         if not self.available or not query:
             return None
         try:
-            result = await self._instance.read(
-                query, read_mode=self._ReadMode.SINGLE_ANSWER,
-            )
-            return _extract_answer(result)
+            read_mode = self._read_mode()
+            result = await self._instance.read(query, read_mode=read_mode)
         except Exception as e:
             logger.warning("xmemory read failed: %s", e)
             return None
+        return _extract_answer(
+            result, single_answer=read_mode == self._ReadMode.SINGLE_ANSWER,
+        )
 
 
-def _extract_answer(result: Any) -> str | None:
-    """Pull the natural-language answer out of an SDK ReadResult.
+def _extract_answer(result: Any, *, single_answer: bool = True) -> str | None:
+    """Render an SDK ReadResult as text.
 
-    SINGLE_ANSWER mode yields ``reader_result == {"answer": "..."}``; we
-    stay defensive about shape (dict, object, or bare string).
+    Prefers ``reader_results`` — the per-sub-query answers the server returns
+    when it decomposes a composite query (xmemory-ai 0.10.0+) — so each answer
+    stays labelled with the sub-question it answers. Falls back to the combined
+    ``reader_result`` when the query was not decomposed, when the server
+    predates decomposition, or when no sub-query yielded anything usable.
     """
-    reader = getattr(result, "reader_result", result)
-    answer: Any = None
-    if isinstance(reader, dict):
-        answer = reader.get("answer")
-    elif hasattr(reader, "answer"):
-        answer = reader.answer
-    elif isinstance(reader, str):
-        answer = reader
-    if answer is None:
+    parts: list[str] = []
+    for tagged in getattr(result, "reader_results", None) or ():
+        body = _render_payload(
+            getattr(tagged, "reader_result", None), single_answer=single_answer,
+        )
+        if body is None:
+            # ``error`` is set only when this one sub-query could not be
+            # answered while the others still were. Surface it: an explicit
+            # "not known" beats dropping the sub-query silently.
+            error = _as_text(getattr(tagged, "error", None))
+            body = f"(unavailable: {error})" if error else None
+        if body is None:
+            continue
+        sub_query = _as_text(getattr(tagged, "sub_query", None))
+        parts.append(f"{sub_query}: {body}" if sub_query else body)
+
+    if parts:
+        return "\n".join(parts)
+
+    return _render_payload(
+        getattr(result, "reader_result", result), single_answer=single_answer,
+    )
+
+
+def _render_payload(payload: Any, *, single_answer: bool) -> str | None:
+    """Render one reader payload — a whole read's, or one sub-query's — as text.
+
+    Only ``single-answer`` payloads carry an ``answer`` envelope. The other
+    modes return tables, which must not be searched for an ``answer`` key: a
+    data row with an ``answer`` column would otherwise be mistaken for the
+    synthesized answer and the rest of the row dropped.
+    """
+    if single_answer:
+        payload = _unwrap_answer(payload)
+    return _as_text(payload)
+
+
+def _unwrap_answer(payload: Any) -> Any:
+    """Pull the answer out of a ``single-answer`` payload.
+
+    Arrives as ``{"answer": ...}``, an object with ``.answer``, or a bare
+    string, depending on server/SDK version.
+    """
+    if isinstance(payload, dict):
+        return payload.get("answer")
+    if isinstance(payload, str):
+        return payload
+    return getattr(payload, "answer", None)
+
+
+def _as_text(value: Any) -> str | None:
+    """Render a value as text — JSON for structured (non-string) payloads."""
+    if value is None:
         return None
-    text = str(answer).strip()
-    return text or None
+    if not isinstance(value, str):
+        try:
+            value = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, default=_json_default,
+            )
+        except Exception:
+            value = str(value)
+    return value.strip() or None
+
+
+def _json_default(value: Any) -> Any:
+    for attr in ("model_dump", "dict"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            return method()
+    if hasattr(value, "__dict__"):
+        return value.__dict__
+    return str(value)

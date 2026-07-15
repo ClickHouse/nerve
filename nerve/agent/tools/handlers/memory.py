@@ -106,7 +106,7 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
         logger.error("Memory recall failed: %s", e)
         memu_block = f"Memory recall error: {e}"
 
-    # Collect xmemory's synthesized answer (None when disabled/empty/error).
+    # Collect xmemory's read output (None when disabled/empty/error).
     xmem_answer: str | None = None
     if xmem_task is not None:
         try:
@@ -121,10 +121,12 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(memu_block)
 
     # Both stores in play → label each source so the two are distinguishable.
+    # The label stays mode-agnostic: under raw-tables/xresponse the payload is
+    # structured rows, not a synthesized answer.
     memu_part = memu_block if memu_block is not None else "No relevant memories found."
     xmem_part = _clip_to_budget(xmem_answer, _MAX_XMEM_ANSWER_BYTES)
     return ToolResult.text(
-        f"[memU] {memu_part}\n\n---\n\n[xmemory] synthesized answer:\n\n{xmem_part}"
+        f"[memU] {memu_part}\n\n---\n\n[xmemory]\n\n{xmem_part}"
     )
 
 

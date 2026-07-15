@@ -28,7 +28,7 @@ dependencies = [
     "html2text>=2024.2.26",
     # Optional xmemory.ai structured-memory layer — only active when an
     # xmemory api_key + instance_id are configured (see XmemoryConfig).
-    "xmemory-ai>=0.5.3",
+    "xmemory-ai>=0.10.0",
     # Optional observability stack — only active when langfuse keys are
     # configured. All three are pure-Python wheels.
     "langfuse>=3.0.0",
