@@ -94,6 +94,72 @@ class TestWeekdayArithmetic:
         assert f"({expected_weekday})" in result, f"{iso}: expected ({expected_weekday}) in {result!r}"
 
 
+class TestWeekdayNamePlaceholder:
+    """`<dow:Weekday>` resolves a bare weekday name to the nearest upcoming date.
+
+    This is the fix for the 2026-07-16 Zip Pendants bug: the dispatch email
+    said "Arriving Tuesday" (no calendar date), and the model kept the stale
+    "22 July" from the order confirmation instead of computing that Tuesday
+    meant 21 July. Now the model copies "Tuesday" into a placeholder and the
+    renderer does the arithmetic. Anchored to Wed 2026-06-24 (_NOW).
+    """
+
+    def test_today_weekday_resolves_to_today(self):
+        # _NOW is a Wednesday.
+        assert render_iso_dates("<dow:Wednesday>", now=_NOW) == "сегодня, 24 июня (ср)"
+
+    def test_tomorrow_weekday(self):
+        assert render_iso_dates("<dow:Thursday>", now=_NOW) == "завтра, 25 июня (чт)"
+
+    def test_next_tuesday_from_wednesday(self):
+        # From Wed 24 June, the next Tuesday is 30 June (6 days ahead), no label.
+        assert render_iso_dates("<dow:Tuesday>", now=_NOW) == "30 июня (вт)"
+
+    def test_next_monday_from_wednesday(self):
+        assert render_iso_dates("<dow:Monday>", now=_NOW) == "29 июня (пн)"
+
+    def test_real_bug_scenario_arriving_tuesday(self):
+        # The actual failure: email arrived Thu 16 July 2026, "Arriving Tuesday".
+        now = datetime(2026, 7, 16, 5, 30)  # Thursday
+        assert render_iso_dates("<dow:Tuesday>", now=now) == "21 июля (вт)"
+
+    @pytest.mark.parametrize("name", ["Tuesday", "tuesday", "TUESDAY", "Tue", "tues"])
+    def test_english_forms_case_insensitive(self, name):
+        assert render_iso_dates(f"<dow:{name}>", now=_NOW) == "30 июня (вт)"
+
+    @pytest.mark.parametrize("name", ["вторник", "вт", "Вторник", "ВТ"])
+    def test_russian_forms(self, name):
+        assert render_iso_dates(f"<dow:{name}>", now=_NOW) == "30 июня (вт)"
+
+    @pytest.mark.parametrize("name", ["Dienstag", "dienstag", "Di"])
+    def test_german_forms(self, name):
+        assert render_iso_dates(f"<dow:{name}>", now=_NOW) == "30 июня (вт)"
+
+    def test_whitespace_tolerated(self):
+        assert render_iso_dates("<dow: Tuesday >", now=_NOW) == "30 июня (вт)"
+
+    def test_unrecognized_name_kept_as_placeholder(self):
+        text = "Прибывает <dow:someday>"
+        assert render_iso_dates(text, now=_NOW) == text
+
+    def test_inside_delivery_notification(self):
+        body = (
+            "🍁 Zip Pendants отправлены\n"
+            "🌿 Прибывают <dow:Tuesday> в Packstation 536\n"
+            "🌿 [Отследить](https://example.com)"
+        )
+        now = datetime(2026, 7, 16, 5, 30)  # Thursday
+        result = render_iso_dates(body, now=now)
+        assert "Прибывают 21 июля (вт) в Packstation 536" in result
+        assert "🍁" in result and "[Отследить]" in result
+
+    def test_iso_and_dow_placeholders_coexist(self):
+        text = "Заказ <2026-06-25>, доставка <dow:Tuesday>"
+        result = render_iso_dates(text, now=_NOW)
+        assert "завтра, 25 июня (чт)" in result
+        assert "30 июня (вт)" in result
+
+
 class TestMonthNames:
     @pytest.mark.parametrize("month_num,month_name", [
         (1, "января"), (2, "февраля"), (3, "марта"), (4, "апреля"),

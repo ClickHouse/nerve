@@ -26,6 +26,26 @@ The relative-label arithmetic is done in Python from a known ``now``, so
 the failure mode that originally motivated this module — the model
 miscounting day deltas — cannot recur here.
 
+Weekday-name placeholder
+------------------------
+
+Delivery emails frequently state the estimate as a bare weekday name with
+no calendar date — Amazon's "Dispatched — Arriving Tuesday", DHL's
+"Zustellung am Dienstag". Resolving "Tuesday" to an absolute date is the
+same day-delta arithmetic the model gets wrong (it once kept a stale
+"22 July" from the order-confirmation instead of computing that the
+dispatch email's "Tuesday" meant 21 July). So the model may instead copy
+the weekday name verbatim into a placeholder and let the code resolve it:
+
+    <dow:Tuesday>          → nearest upcoming Tuesday, e.g. "21 июля (вт)"
+
+Resolution is deterministic: the nearest date whose weekday matches,
+counting forward from ``now`` (today itself counts if it matches). English,
+Russian, and German weekday names (full or common short forms) are
+accepted, since the source email may be in any of them. Combines with the
+relative label exactly like an absolute date, so a "Tuesday" that lands on
+tomorrow renders "завтра, 21 июля (вт)". Unrecognized names are left as-is.
+
 Malformed placeholders (impossible dates like ``<2026-02-31>``,
 out-of-range hours, wrong digits) are left untouched so the model sees
 its own broken output rather than a silent miscarriage.
@@ -34,7 +54,7 @@ its own broken output rather than a silent miscarriage.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 
@@ -46,11 +66,49 @@ _MONTHS_RU_GENITIVE = (
 
 _WEEKDAYS_RU_SHORT = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 
+# Weekday name → Python weekday index (Mon=0 .. Sun=6). English, Russian, and
+# German, full and common short forms, since the source email may be in any of
+# them. All keys are lowercase; lookup lowercases its input.
+_WEEKDAY_NAMES = {
+    # Monday
+    "monday": 0, "mon": 0,
+    "понедельник": 0, "пн": 0,
+    "montag": 0, "mo": 0,
+    # Tuesday
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "вторник": 1, "вт": 1,
+    "dienstag": 1, "di": 1,
+    # Wednesday
+    "wednesday": 2, "wed": 2,
+    "среда": 2, "ср": 2,
+    "mittwoch": 2, "mi": 2,
+    # Thursday
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "четверг": 3, "чт": 3,
+    "donnerstag": 3, "do": 3,
+    # Friday
+    "friday": 4, "fri": 4,
+    "пятница": 4, "пт": 4,
+    "freitag": 4, "fr": 4,
+    # Saturday
+    "saturday": 5, "sat": 5,
+    "суббота": 5, "сб": 5,
+    "samstag": 5, "sonnabend": 5, "sa": 5,
+    # Sunday
+    "sunday": 6, "sun": 6,
+    "воскресенье": 6, "вс": 6,
+    "sonntag": 6, "so": 6,
+}
+
 # Strict: 4-digit year, 2-digit month, 2-digit day, optional HH:MM time.
 # Wrapped in angle brackets so it never collides with markdown / HTML.
 _ISO_DATE_RE = re.compile(
     r"<(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?>"
 )
+
+# Weekday-name placeholder: <dow:Tuesday>. The name is captured loosely and
+# validated against _WEEKDAY_NAMES so unrecognized text is left untouched.
+_DOW_RE = re.compile(r"<dow:\s*([^\s>]+)\s*>", re.IGNORECASE)
 
 
 def render_iso_dates(text: str, now: Optional[datetime] = None) -> str:
@@ -71,7 +129,24 @@ def render_iso_dates(text: str, now: Optional[datetime] = None) -> str:
 
     today = (now or datetime.now()).date()
 
-    def _replace(match: re.Match) -> str:
+    def _format(event: date, time_part: str = "") -> str:
+        """Localized 'сегодня, 21 июля (вт), 19:00' for an absolute date."""
+        month_name = _MONTHS_RU_GENITIVE[event.month - 1]
+        weekday_short = _WEEKDAYS_RU_SHORT[event.weekday()]
+        absolute = f"{event.day} {month_name} ({weekday_short})"
+
+        delta_days = (event - today).days
+        relative = ""
+        if delta_days == 0:
+            relative = "сегодня, "
+        elif delta_days == 1:
+            relative = "завтра, "
+        elif delta_days == -1:
+            relative = "вчера, "
+
+        return f"{relative}{absolute}{time_part}"
+
+    def _replace_iso(match: re.Match) -> str:
         year_s, month_s, day_s, hour_s, minute_s = match.groups()
         try:
             event = date(int(year_s), int(month_s), int(day_s))
@@ -90,19 +165,18 @@ def render_iso_dates(text: str, now: Optional[datetime] = None) -> str:
             except ValueError:
                 return match.group(0)
 
-        month_name = _MONTHS_RU_GENITIVE[event.month - 1]
-        weekday_short = _WEEKDAYS_RU_SHORT[event.weekday()]
-        absolute = f"{event.day} {month_name} ({weekday_short})"
+        return _format(event, time_part)
 
-        delta_days = (event - today).days
-        relative = ""
-        if delta_days == 0:
-            relative = "сегодня, "
-        elif delta_days == 1:
-            relative = "завтра, "
-        elif delta_days == -1:
-            relative = "вчера, "
+    def _replace_dow(match: re.Match) -> str:
+        target = _WEEKDAY_NAMES.get(match.group(1).strip().lower())
+        if target is None:
+            # Unrecognized weekday name — leave it visible.
+            return match.group(0)
+        # Nearest date whose weekday matches, counting forward from today
+        # (today itself counts if it already is that weekday).
+        days_ahead = (target - today.weekday()) % 7
+        return _format(today + timedelta(days=days_ahead))
 
-        return f"{relative}{absolute}{time_part}"
-
-    return _ISO_DATE_RE.sub(_replace, text)
+    text = _ISO_DATE_RE.sub(_replace_iso, text)
+    text = _DOW_RE.sub(_replace_dow, text)
+    return text
