@@ -383,15 +383,61 @@ def restart(ctx: click.Context) -> None:
         ctx.exit(rc)
         return
 
-    # Systemd mode (Restart=always): just kill the process — systemd
-    # will bring it back automatically.
+    # Systemd mode (Restart=always): kill the old process and let systemd
+    # respawn it. A bare SIGTERM is NOT enough: uvicorn's graceful shutdown
+    # waits for in-flight connections to drain, and when the restart is
+    # triggered from *inside* a live session (Telegram bot / agent), that
+    # session's own stream keeps a connection open — so the drain never
+    # completes. systemd's TimeoutStopSec→SIGKILL only fires for a
+    # systemd-initiated stop (`systemctl stop/restart`), not for a process
+    # that received a signal and is shutting itself down, so nothing
+    # escalates and the service hangs down indefinitely.
+    #
+    # Fix: spawn a detached helper (own session, survives the caller's death)
+    # that sends SIGTERM, waits a bounded grace period, then SIGKILLs. Once
+    # the old PID is gone, systemd's Restart=always brings up a fresh
+    # instance. No privileges / systemctl needed, and shutdown is bounded.
     if _is_systemd_managed():
         running, old_pid = _get_daemon_status()
-        if running:
-            click.echo(f"Restarting Nerve (PID {old_pid})... systemd will respawn.")
-            os.kill(old_pid, signal.SIGTERM)
-        else:
+        if not running:
             click.echo("Nerve is not running — systemd will start it shortly.")
+            return
+
+        kill_helper = (
+            "import os, signal, time\n"
+            f"old_pid = {old_pid}\n"
+            "try:\n"
+            "    os.kill(old_pid, signal.SIGTERM)\n"
+            "except ProcessLookupError:\n"
+            "    raise SystemExit(0)\n"
+            # Up to 15s for a clean drain, then force it. This can't hang:
+            # the helper only sleeps and signals, independent of nerve's
+            # (possibly blocked) event loop.
+            "for _ in range(30):\n"
+            "    time.sleep(0.5)\n"
+            "    try:\n"
+            "        os.kill(old_pid, 0)\n"
+            "    except ProcessLookupError:\n"
+            "        break\n"
+            "else:\n"
+            "    try:\n"
+            "        os.kill(old_pid, signal.SIGKILL)\n"
+            "    except ProcessLookupError:\n"
+            "        pass\n"
+        )
+        log_fd = open(LOG_FILE, "a")
+        subprocess.Popen(
+            [sys.executable, "-c", kill_helper],
+            stdout=log_fd,
+            stderr=log_fd,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log_fd.close()
+        click.echo(
+            f"Restarting Nerve (PID {old_pid})... systemd will respawn "
+            "(bounded shutdown, SIGKILL after 15s if drain stalls)."
+        )
         return
 
     # Build the command that `start` would use to launch the daemon.
