@@ -12,6 +12,7 @@ both sources without regressing the memU-only output shape.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +26,7 @@ from nerve.agent.tools.handlers.memory import (
 )
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import NerveConfig, XmemoryConfig
-from nerve.memory.xmemory_bridge import XmemoryBridge, _extract_answer
+from nerve.memory.xmemory_bridge import XmemoryBridge, _serialize_read_payload
 
 
 # --------------------------------------------------------------------------- #
@@ -69,95 +70,69 @@ def test_nerveconfig_wires_xmemory_block() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Pure helper: answer extraction
+# Pure helper: read-payload serialization
 # --------------------------------------------------------------------------- #
 
 
-def test_extract_answer_shapes() -> None:
-    assert _extract_answer(SimpleNamespace(reader_result={"answer": "  hi "})) == "hi"
-    assert _extract_answer(SimpleNamespace(reader_result={"answer": ""})) is None
-    assert _extract_answer(SimpleNamespace(reader_result={})) is None
-    assert _extract_answer(SimpleNamespace(reader_result="plain")) == "plain"
-    assert _extract_answer(SimpleNamespace(reader_result=SimpleNamespace(answer="x"))) == "x"
+def test_serialize_prefers_reader_results() -> None:
+    """When the server decomposes the query, the per-sub-query results win, and
+    the SDK's Pydantic models are unwrapped to plain dicts for JSON."""
+    from xmemory import ReadResult, TaggedReaderResult
 
-
-def test_extract_answer_labels_each_sub_query() -> None:
-    """Decomposed answers keep the sub-question they answer — otherwise the
-    agent cannot tell which answer belongs to which part of the query."""
-    assert _extract_answer(
-        SimpleNamespace(
-            reader_result="Who leads sales? -> Ann\nWhere is HQ? -> Berlin",
-            reader_results=[
-                SimpleNamespace(
-                    sub_query="Who leads sales?",
-                    reader_result={"answer": "Ann"},
-                    error=None,
-                ),
-                SimpleNamespace(
-                    sub_query="Where is HQ?",
-                    reader_result={"answer": "Berlin"},
-                    error=None,
-                ),
-            ],
-        )
-    ) == "Who leads sales?: Ann\nWhere is HQ?: Berlin"
-
-
-def test_extract_answer_surfaces_sub_query_error() -> None:
-    """A sub-query the server could not answer is reported, not dropped."""
-    assert _extract_answer(
-        SimpleNamespace(
-            reader_result="Ann leads sales.",
-            reader_results=[
-                SimpleNamespace(
-                    sub_query="Who leads sales?",
-                    reader_result={"answer": "Ann"},
-                    error=None,
-                ),
-                SimpleNamespace(
-                    sub_query="What is churn?", reader_result="", error="no data",
-                ),
-            ],
-        )
-    ) == "Who leads sales?: Ann\nWhat is churn?: (unavailable: no data)"
-
-
-def test_extract_answer_falls_back_when_no_sub_query_answers() -> None:
-    """Every sub-query empty and error-free → fall back to the combined
-    ``reader_result`` rather than discarding a real answer."""
-    assert _extract_answer(
-        SimpleNamespace(
-            reader_result="Partial: HQ is Berlin.",
-            reader_results=[
-                SimpleNamespace(sub_query="q1", reader_result="", error=None),
-                SimpleNamespace(sub_query="q2", reader_result=None, error=None),
-            ],
-        )
-    ) == "Partial: HQ is Berlin."
-
-
-def test_extract_answer_does_not_mine_answer_keys_from_table_rows() -> None:
-    """Under raw-tables the payload is data rows. A row with an ``answer``
-    column must not be mistaken for the synthesized answer."""
-    rows = [
-        {"question": "What is our refund window?", "answer": "30 days"},
-        {"question": "What is our SLA?", "answer": "99.9%"},
-    ]
-    text = _extract_answer(
-        SimpleNamespace(reader_result=rows, reader_results=[]), single_answer=False,
+    result = ReadResult(
+        trace_id="t",
+        reader_result="combined back-compat answer",
+        reader_results=[
+            TaggedReaderResult(sub_query="Who leads sales?", reader_result={"answer": "Ann"}),
+            TaggedReaderResult(sub_query="What is churn?", reader_result="", error="no data"),
+        ],
     )
-    assert text is not None
-    # Whole rows survive — questions included, not just the 'answer' cells.
-    assert "refund window" in text and "30 days" in text
+    parsed = json.loads(_serialize_read_payload(result))
+    assert [p["sub_query"] for p in parsed] == ["Who leads sales?", "What is churn?"]
+    assert parsed[0]["reader_result"] == {"answer": "Ann"}
+    assert parsed[1]["error"] == "no data"
 
 
-def test_extract_answer_preserves_non_ascii() -> None:
+def test_serialize_falls_back_to_reader_result() -> None:
+    """No decomposition (empty ``reader_results``) → serialize the combined
+    ``reader_result``, intact. The bridge never reaches for an ``answer`` key:
+    raw-tables is columns+rows, xresponse is objects+relations, and both are
+    passed through whole."""
+    raw_tables = {
+        "columns": ["question", "answer"],
+        "rows": [["refund window?", "30 days"], ["SLA?", "99.9%"]],
+    }
+    assert json.loads(
+        _serialize_read_payload(SimpleNamespace(reader_result=raw_tables, reader_results=[]))
+    ) == raw_tables
+
+    xresponse = {"objects": [{"type": "Person", "name": "Ann"}], "relations": []}
+    assert json.loads(
+        _serialize_read_payload(SimpleNamespace(reader_result=xresponse, reader_results=[]))
+    ) == xresponse
+
+
+def test_serialize_string_payload_passes_through_unquoted() -> None:
+    assert _serialize_read_payload(
+        SimpleNamespace(reader_result="  a plain answer  ", reader_results=[])
+    ) == "a plain answer"
+
+
+def test_serialize_empty_payload_is_none() -> None:
+    assert _serialize_read_payload(
+        SimpleNamespace(reader_result=None, reader_results=[])
+    ) is None
+    assert _serialize_read_payload(
+        SimpleNamespace(reader_result="", reader_results=[])
+    ) is None
+
+
+def test_serialize_preserves_non_ascii() -> None:
     """JSON rendering must not escape non-ASCII into \\uXXXX noise."""
-    text = _extract_answer(
-        SimpleNamespace(reader_result=[{"city": "Zürich"}], reader_results=[]),
-        single_answer=False,
+    out = _serialize_read_payload(
+        SimpleNamespace(reader_result={"city": "Zürich"}, reader_results=[])
     )
-    assert text is not None and "Zürich" in text
+    assert "Zürich" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -209,13 +184,13 @@ async def _enabled_bridge(
 
 
 @pytest.mark.asyncio
-async def test_recall_answer_returns_single_answer() -> None:
+async def test_recall_answer_serializes_single_answer() -> None:
     bridge = await _enabled_bridge(read_mode="single-answer")
     bridge._instance.read = AsyncMock(
         return_value=SimpleNamespace(reader_result={"answer": "alice@acme.com"})
     )
     ans = await bridge.recall_answer("What is Alice's email?")
-    assert ans == "alice@acme.com"
+    assert json.loads(ans) == {"answer": "alice@acme.com"}
     # Uses SINGLE_ANSWER read mode.
     _, kwargs = bridge._instance.read.call_args
     assert kwargs["read_mode"] == bridge._ReadMode.SINGLE_ANSWER
@@ -223,15 +198,17 @@ async def test_recall_answer_returns_single_answer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recall_defaults_to_single_answer() -> None:
-    """An unconfigured ``read_mode`` synthesizes an answer, not raw rows."""
+async def test_recall_defaults_to_single_answer_read_mode() -> None:
+    """An unconfigured ``read_mode`` reads in single-answer mode."""
     bridge = XmemoryBridge(XmemoryConfig(api_key="tok", instance_id="inst_1"))
     await bridge.initialize()
     bridge._instance = AsyncMock()
     bridge._instance.read = AsyncMock(
         return_value=SimpleNamespace(reader_result={"answer": "HQ is in Berlin."})
     )
-    assert await bridge.recall_answer("Where is HQ?") == "HQ is in Berlin."
+    assert json.loads(await bridge.recall_answer("Where is HQ?")) == {
+        "answer": "HQ is in Berlin.",
+    }
     _, kwargs = bridge._instance.read.call_args
     assert kwargs["read_mode"] == bridge._ReadMode.SINGLE_ANSWER
     await bridge.aclose()
@@ -240,12 +217,12 @@ async def test_recall_defaults_to_single_answer() -> None:
 @pytest.mark.asyncio
 async def test_recall_answer_honors_raw_tables_read_mode() -> None:
     bridge = await _enabled_bridge(read_mode="raw-tables")
+    table = {"columns": ["k"], "rows": [["v"]]}
     bridge._instance.read = AsyncMock(
-        return_value=SimpleNamespace(reader_result={"rows": [{"k": "v"}]})
+        return_value=SimpleNamespace(reader_result=table)
     )
     ans = await bridge.recall_answer("Show rows")
-    assert ans is not None
-    assert '"rows"' in ans
+    assert json.loads(ans) == table  # columns and rows both survive
     _, kwargs = bridge._instance.read.call_args
     assert kwargs["read_mode"] == bridge._ReadMode.RAW_TABLES
     await bridge.aclose()
