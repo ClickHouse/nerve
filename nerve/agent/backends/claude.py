@@ -476,6 +476,19 @@ class ClaudeBackend:
             disallowed_tools=["CronCreate", "CronList", "CronDelete"],
             env=self._build_env(cache_ttl=spec.cache_ttl),
             cwd=spec.cwd,
+            # Load no filesystem settings/memory: Nerve owns the entire
+            # prompt. It injects the full identity/memory bundle
+            # (SOUL/IDENTITY/USER/AGENTS/TOOLS/MEMORY) via ``system_prompt``
+            # and passes permissions (``can_use_tool``), MCP (``mcp_servers``),
+            # hooks and env explicitly. Left at the default, the CLI would also
+            # auto-load ~/.claude/CLAUDE.md — the same bundle the Claude Code
+            # renderer writes for external claude-code use — duplicating tens
+            # of thousands of tokens every turn. ["project"] is NOT enough: the
+            # workspace lives under $HOME, so project-root detection climbs to
+            # $HOME and loads the user-level CLAUDE.md under both the "user" and
+            # "project" sources. Native skills/plugins are unaffected — they
+            # load via ``plugins`` (--plugin-dir), independent of this setting.
+            setting_sources=[],
             mcp_servers=self._build_mcp_servers(spec.session_id),
             # Claude Code plugins — loaded via --plugin-dir so the CLI
             # handles OAuth, credentials, and plugin lifecycle natively.
