@@ -635,7 +635,7 @@ class BackupConfig:
 @dataclass
 class SessionsConfig:
     archive_after_days: int = 30
-    archive_after_hours: int = 0  # Interactive (web/telegram/…) sessions auto-close after this many idle hours (0 = disabled; opt in via config)
+    interactive_archive_after_hours: int = 0  # Interactive (web/telegram/…) sessions auto-close after this many idle hours (0 = disabled; opt in via config)
     max_sessions: int = 500
     cron_session_mode: str = "per_run"  # "per_run" or "reuse"
     memorize_interval_minutes: int = 30  # Background memorization sweep interval
@@ -646,7 +646,7 @@ class SessionsConfig:
     def from_dict(cls, d: dict) -> SessionsConfig:
         return cls(
             archive_after_days=d.get("archive_after_days", 30),
-            archive_after_hours=d.get("archive_after_hours", 0),
+            interactive_archive_after_hours=d.get("interactive_archive_after_hours", 0),
             max_sessions=d.get("max_sessions", 500),
             cron_session_mode=d.get("cron_session_mode", "per_run"),
             memorize_interval_minutes=d.get("memorize_interval_minutes", 30),

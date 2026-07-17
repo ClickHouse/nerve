@@ -618,11 +618,11 @@ class SessionManager:
         self,
         archive_after_days: int = DEFAULT_ARCHIVE_AFTER_DAYS,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
-        archive_after_hours: int = 0,
+        interactive_archive_after_hours: int = 0,
     ) -> dict:
         """Auto-archive stale sessions and enforce limits.
 
-        When ``archive_after_hours`` > 0 (opt-in; 0 disables and leaves the
+        When ``interactive_archive_after_hours`` > 0 (opt-in; 0 disables and leaves the
         default behavior unchanged), interactive sessions (web/telegram/…)
         idle longer than that are archived and memorized promptly — including
         ones parked on an unanswered ``ask_user`` question, whose pending
@@ -633,10 +633,10 @@ class SessionManager:
         now = datetime.now(timezone.utc)
 
         # Opt-in short idle cutoff for interactive sessions. Skipped entirely
-        # when archive_after_hours == 0, so default behavior is unchanged.
+        # when interactive_archive_after_hours == 0, so default behavior is unchanged.
         archived_interactive = 0
-        if archive_after_hours and archive_after_hours > 0:
-            icutoff = (now - timedelta(hours=archive_after_hours)).isoformat()
+        if interactive_archive_after_hours and interactive_archive_after_hours > 0:
+            icutoff = (now - timedelta(hours=interactive_archive_after_hours)).isoformat()
             interactive = await self.db.get_stale_interactive_sessions(
                 icutoff, INTERACTIVE_SOURCES,
             )

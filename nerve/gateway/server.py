@@ -239,11 +239,11 @@ async def lifespan(app: FastAPI):
 
     # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
     # it tightens to hourly only when the opt-in interactive idle auto-close
-    # (sessions.archive_after_hours > 0) is enabled and needs finer resolution.
+    # (sessions.interactive_archive_after_hours > 0) is enabled and needs finer resolution.
     async def _periodic_cleanup():
         while True:
             interval = (
-                3600 if config.sessions.archive_after_hours > 0 else 6 * 3600
+                3600 if config.sessions.interactive_archive_after_hours > 0 else 6 * 3600
             )
             await asyncio.sleep(interval)
             try:
@@ -251,7 +251,7 @@ async def lifespan(app: FastAPI):
                     stats = await _engine.sessions.run_cleanup(
                         archive_after_days=config.sessions.archive_after_days,
                         max_sessions=config.sessions.max_sessions,
-                        archive_after_hours=config.sessions.archive_after_hours,
+                        interactive_archive_after_hours=config.sessions.interactive_archive_after_hours,
                     )
                     if (
                         stats.get("archived_stale")
