@@ -609,6 +609,7 @@ class CronService:
 
         try:
             model = job.model or self.config.agent.cron_model
+            effort = job.effort or None  # per-job effort override; None = source default (cron_effort)
             rotated = False
             base_prompt = job.resolve_prompt()
 
@@ -665,6 +666,7 @@ class CronService:
                     model=model,
                     session_id=session_id,
                     cache_ttl=job.cache_ttl,
+                    effort=effort,
                 )
             else:
                 response = await self.engine.run_cron(
@@ -673,6 +675,7 @@ class CronService:
                     model=model,
                     run_id=run_id,
                     cache_ttl=job.cache_ttl,
+                    effort=effort,
                 )
 
             # Keep the tail of the response — for multi-message runs the
