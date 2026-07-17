@@ -26,6 +26,7 @@ from nerve.agent.tools.schemas import (
     MEMORY_UPDATE_SCHEMA,
     SESSION_CONTEXT_SCHEMA,
 )
+from nerve.memory.memu_bridge import MemoryBackendUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,13 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
             if cats:
                 header += f" + {len(cats)} related topics"
             memu_block = f"{header}:\n\n{body}"
+    except MemoryBackendUnavailable as e:
+        logger.warning("Memory recall: backend unavailable: %s", e)
+        memu_block = (
+            "⚠️ MEMORY BACKEND DOWN (transient proxy/auth error) — recall is UNAVAILABLE right now, "
+            "NOT empty. Do NOT conclude 'no relevant memories'. Reconstruct context from other "
+            "sources (git history, your own notes) and alert the operator that memory is down."
+        )
     except Exception as e:
         logger.error("Memory recall failed: %s", e)
         memu_block = f"Memory recall error: {e}"
@@ -394,6 +402,7 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     # Primary write: memU (file + extraction pipeline).
     memu_ok = False
     memu_err: str | None = None
+    memu_down = False  # transient backend outage (distinct from a genuine failure)
     try:
         mem_dir = Path("~/.nerve/memu-manual").expanduser()
         mem_path = mem_dir / f"memorize-{int(time.time())}.txt"
@@ -405,6 +414,10 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
         await asyncio.to_thread(_write_memorize_file)
 
         memu_ok = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
+    except MemoryBackendUnavailable as e:
+        logger.warning("Memorize (memU): backend unavailable: %s", e)
+        memu_err = str(e)
+        memu_down = True
     except Exception as e:
         logger.error("Memorize (memU) failed: %s", e)
         memu_err = str(e)
@@ -420,6 +433,12 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if memu_ok:
         suffix = " (+ xmemory)" if xmem_written else ""
         return ToolResult.text(f"Memorized: {content}{suffix}")
+    if memu_down:
+        return ToolResult.text(
+            "⚠️ NOT saved — MEMORY BACKEND DOWN (transient proxy/auth error). "
+            "The fact was NOT stored; retry shortly. If it persists, `nerve restart` "
+            f"clears a stuck proxy cooldown. ({memu_err})"
+        )
     if memu_err is not None:
         return ToolResult.text(f"Error: {memu_err}")
     return ToolResult.text("Failed to memorize.")

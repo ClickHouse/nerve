@@ -33,6 +33,43 @@ from nerve.observability.langfuse import attributes as lf_attrs
 
 logger = logging.getLogger(__name__)
 
+
+class MemoryBackendUnavailable(RuntimeError):
+    """Raised when a memU operation fails because the LLM backend (the shared
+    proxy route) is transiently unavailable — HTTP 429/5xx or an auth blip
+    (``auth_unavailable`` / revoked OAuth) — rather than because the query
+    genuinely had no results. The tool layer surfaces this LOUDLY so a session
+    never mistakes "memory is DOWN" for "no relevant memories"."""
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a transient proxy/auth failure — worth
+    retrying, and worth surfacing as backend-down — vs a permanent/logic error.
+
+    Detects the OpenAI-SDK ``APIStatusError`` family by HTTP status (429 / 5xx)
+    plus the proxy's ``auth_unavailable`` / revoked-OAuth signatures on 401/403.
+    Status is read from ``status_code`` (or ``response.status_code``), falling
+    back to parsing ``"Error code: NNN"`` from the message so this stays
+    decoupled from the ``openai`` import."""
+    msg = str(exc)
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None and "Error code: " in msg:
+        try:
+            status = int(msg.split("Error code: ", 1)[1].strip()[:3])
+        except (ValueError, IndexError):
+            status = None
+    if status in (429, 500, 502, 503, 504):
+        return True
+    low = msg.lower()
+    if status in (401, 403) and ("auth_unavailable" in low or "revoked" in low):
+        return True
+    # Belt-and-suspenders: the proxy's stuck-cooldown signature regardless of
+    # how the status surfaced.
+    return "auth_unavailable" in low
+
+
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
 
@@ -1916,38 +1953,60 @@ class MemUBridge:
                     # omits it.  Default to 4096 to prevent 400 errors.
                     if max_tokens is None:
                         max_tokens = 4096
-                    t0 = time.monotonic()
-                    try:
-                        return await asyncio.wait_for(
-                            _orig(
-                                prompt,
-                                max_tokens=max_tokens,
-                                system_prompt=system_prompt,
-                                temperature=temperature,
-                            ),
-                            timeout=self._LLM_CALL_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        elapsed = time.monotonic() - t0
-                        in_flight = len(self._metrics.in_flight)
-                        # Dump httpx connection pool state for diagnosis
-                        pool_info = "unknown"
+                    # memU otherwise fails fast with SDK retries disabled
+                    # (see max_retries=0 above), so a transient proxy/auth blip
+                    # (503/429/auth_unavailable) that the agent SDK rides out via
+                    # its own retries takes memory down instead. Retry a few
+                    # times with short backoff on transient errors only; keep the
+                    # per-attempt wait_for so genuine hangs still fail fast.
+                    _RETRY_BACKOFFS = (0.5, 1.5, 3.0)
+                    for _attempt in range(len(_RETRY_BACKOFFS) + 1):
+                        t0 = time.monotonic()
                         try:
-                            base = self._service._llm_clients.get(_prof)
-                            sdk = getattr(base, "client", None)
-                            transport = getattr(sdk, "_client", None)
-                            pool = getattr(transport, "_pool", None) or getattr(transport, "_transport", None)
-                            if pool:
-                                pool_info = repr(pool)
-                        except Exception:
-                            pass
-                        logger.error(
-                            "memU LLM HUNG [%s]: no response after %.0fs "
-                            "(prompt=%d chars, in_flight=%d, pool=%s)",
-                            _prof, elapsed, len(prompt),
-                            in_flight, pool_info,
-                        )
-                        raise
+                            return await asyncio.wait_for(
+                                _orig(
+                                    prompt,
+                                    max_tokens=max_tokens,
+                                    system_prompt=system_prompt,
+                                    temperature=temperature,
+                                ),
+                                timeout=self._LLM_CALL_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            elapsed = time.monotonic() - t0
+                            in_flight = len(self._metrics.in_flight)
+                            # Dump httpx connection pool state for diagnosis
+                            pool_info = "unknown"
+                            try:
+                                base = self._service._llm_clients.get(_prof)
+                                sdk = getattr(base, "client", None)
+                                transport = getattr(sdk, "_client", None)
+                                pool = getattr(transport, "_pool", None) or getattr(transport, "_transport", None)
+                                if pool:
+                                    pool_info = repr(pool)
+                            except Exception:
+                                pass
+                            logger.error(
+                                "memU LLM HUNG [%s]: no response after %.0fs "
+                                "(prompt=%d chars, in_flight=%d, pool=%s)",
+                                _prof, elapsed, len(prompt),
+                                in_flight, pool_info,
+                            )
+                            raise
+                        except Exception as _e:
+                            # Transient proxy/auth blip → retry with backoff.
+                            # Anything else (or the final transient failure) is
+                            # re-raised so the recall/memorize layer can surface
+                            # it loudly as MemoryBackendUnavailable.
+                            if _is_transient_llm_error(_e) and _attempt < len(_RETRY_BACKOFFS):
+                                _delay = _RETRY_BACKOFFS[_attempt]
+                                logger.warning(
+                                    "memU LLM transient error [%s] attempt %d/%d: %s — retrying in %.1fs",
+                                    _prof, _attempt + 1, len(_RETRY_BACKOFFS) + 1, _e, _delay,
+                                )
+                                await asyncio.sleep(_delay)
+                                continue
+                            raise
 
                 _timeout_chat._nerve_timeout_wrapped = True  # type: ignore[attr-defined]
                 client.chat = _timeout_chat  # type: ignore[method-assign]
@@ -2212,6 +2271,11 @@ class MemUBridge:
                     last_error = str(e)
                     logger.error("memU memorize_file failed %sfor %s: %s", label + " " if label else "", file_path, e)
                     self._metrics.end_op(op_id, success=False, error=last_error)
+                    # Distinguish a transient backend outage from a genuine
+                    # failure so the tool layer can tell the agent memory is
+                    # DOWN (not that the write silently "didn't happen").
+                    if _is_transient_llm_error(e):
+                        raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
                     return False
 
             attempt += 1
@@ -2651,6 +2715,11 @@ class MemUBridge:
         except Exception as e:
             logger.error("memU recall failed: %s", e)
             self._metrics.end_op(op_id, success=False, error=str(e))
+            # A transient backend outage must not masquerade as "no results" —
+            # surface it so the caller can flag amnesia instead of trusting the
+            # empty list.
+            if _is_transient_llm_error(e):
+                raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
             return []
 
     async def expand_category(
