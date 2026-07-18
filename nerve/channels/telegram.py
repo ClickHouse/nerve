@@ -22,7 +22,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
@@ -218,6 +218,61 @@ def _format_reply_context(message: Any) -> str:
             parts.append(f'[Quoted: "{quote_text}"]')
 
     return "\n".join(parts)
+
+
+# Inline-keyboard /sessions rendering ------------------------------------- #
+_SESSIONS_BUTTON_LIMIT = 8      # keep the keyboard thumb-friendly on mobile
+_SESSION_LABEL_MAX = 40         # Telegram wraps long button labels poorly
+
+
+def _session_label(session: dict, current_id: str | None) -> str:
+    """Button label for one session: title (or short id), current marked ✓."""
+    title = (session.get("title") or "").strip() or session.get("id", "?")
+    if len(title) > _SESSION_LABEL_MAX:
+        title = title[: _SESSION_LABEL_MAX - 1] + "…"
+    prefix = "✓ " if session.get("id") == current_id else ""
+    return f"{prefix}{title}"
+
+
+def build_sessions_view(
+    sessions: list[dict], current_id: str | None,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render the /sessions inline keyboard (pure, sync — unit-testable).
+
+    One tap-to-switch button per session (the current one marked ✓), with the
+    session id carried in ``callback_data`` as ``sess:<id>`` — so switching
+    routing takes a single tap and never requires copy-pasting an id on mobile.
+    A trailing ``➕ New session`` button (``sess:new``) starts a fresh one.
+    Returns ``(message_text, keyboard)``.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in sessions[:_SESSIONS_BUTTON_LIMIT]:
+        sid = s.get("id")
+        cb = f"sess:{sid}"
+        # callback_data is capped at 64 bytes by Telegram; interactive session
+        # ids are short, but guard defensively so a button always round-trips.
+        if sid is None or len(cb.encode("utf-8")) > 64:
+            continue
+        rows.append(
+            [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
+        )
+    rows.append([InlineKeyboardButton("➕ New session", callback_data="sess:new")])
+
+    if rows[:-1]:
+        current_title = next(
+            (
+                (s.get("title") or s.get("id"))
+                for s in sessions
+                if s.get("id") == current_id
+            ),
+            None,
+        )
+        text = "🗂 Sessions — tap to switch."
+        if current_title:
+            text += f"\nCurrent: {current_title}"
+    else:
+        text = "No sessions yet — start one:"
+    return text, InlineKeyboardMarkup(rows)
 
 
 class TelegramChannel(BaseChannel):
@@ -853,21 +908,32 @@ class TelegramChannel(BaseChannel):
         except ValueError as e:
             await update.message.reply_text(str(e))
 
+    async def _sessions_view_for(
+        self, channel_key: str,
+    ) -> "tuple[str, InlineKeyboardMarkup]":
+        """Build the inline-keyboard sessions view for a channel.
+
+        Shared by /sessions and the button-press handler so both render the
+        same thing. Only interactive (telegram/web) sessions are offered as
+        switch targets — cron/automation sessions are never listed.
+        """
+        current = await self.router.get_last_session(channel_key)
+        sessions = await self.router.list_sessions(limit=30)
+        sessions = [s for s in sessions if s.get("source") in ("telegram", "web")]
+        return build_sessions_view(sessions, current)
+
     async def _handle_sessions(self, update: Update, context: Any) -> None:
-        """Handle /sessions — list sessions."""
+        """Handle /sessions — native inline keyboard to switch session routing.
+
+        Each recent session is a tap-to-switch button (current marked ✓); the
+        id rides in the button's callback_data, so no id copy-paste is needed.
+        """
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-
-        sessions = await self.router.list_sessions(limit=20)
-        if not sessions:
-            await update.message.reply_text("No sessions.")
-            return
-
-        lines = []
-        for s in sessions:
-            lines.append(f"• `{s['id']}` — {s.get('title', 'untitled')}")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        channel_key = f"telegram:{update.effective_chat.id}"
+        text, markup = await self._sessions_view_for(channel_key)
+        await update.message.reply_text(text, reply_markup=markup)
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
         """Handle /new [title] — stop current session, create and switch to a new one."""
@@ -1496,6 +1562,35 @@ class TelegramChannel(BaseChannel):
     #  Notification callback handlers                                      #
     # ------------------------------------------------------------------ #
 
+    async def _handle_session_switch(self, query: Any) -> None:
+        """Handle a /sessions button press: switch routing (or start a new one).
+
+        ``callback_data`` is ``sess:<id>`` or ``sess:new``. After acting, the
+        message is re-rendered in place with the new current session marked ✓,
+        mirroring how notification cards update on answer.
+        """
+        if not query.message:
+            await query.answer()
+            return
+        channel_key = f"telegram:{query.message.chat.id}"
+        target = query.data.split(":", 1)[1]
+        try:
+            if target == "new":
+                await self.router.create_session(channel_key, source="telegram")
+                await query.answer("Started a new session")
+            else:
+                await self.router.switch_session(channel_key, target)
+                await query.answer("Switched")
+        except ValueError:
+            await query.answer(
+                "That session is no longer available", show_alert=True,
+            )
+        text, markup = await self._sessions_view_for(channel_key)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup)
+        except Exception:
+            pass
+
     async def _handle_callback_query(self, update: Update, context: Any) -> None:
         """Handle inline keyboard button presses for notification questions."""
         self._touch()
@@ -1505,6 +1600,11 @@ class TelegramChannel(BaseChannel):
 
         if not self._is_authorized(query.from_user.id):
             await query.answer("Unauthorized", show_alert=True)
+            return
+
+        # Session switch/create buttons from /sessions.
+        if query.data.startswith("sess:"):
+            await self._handle_session_switch(query)
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"
