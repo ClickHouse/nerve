@@ -12,10 +12,33 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 
+def _check_no_duplicate_versions(items: list[tuple[int, str]]) -> None:
+    """Raise ``RuntimeError`` if two migration files share a version.
+
+    ``run_migrations`` skips anything at or below the recorded schema
+    version, so when two files claim the same number one silently wins and
+    the other never runs — on every database, forever, with no error. The
+    symptom surfaces much later as a missing column or index, and which of
+    the two is missing depends on filesystem iteration order.
+
+    Failing loudly at import is the lesser evil: the collision is a
+    packaging mistake, and it is cheap to fix once you know it happened.
+    """
+    seen: dict[int, str] = {}
+    for version, name in items:
+        if version in seen:
+            raise RuntimeError(
+                f"Duplicate migration version {version}: "
+                f"{seen[version]!r} and {name!r}. Renumber one of them."
+            )
+        seen[version] = name
+
+
 def discover_migrations() -> list[tuple[int, str]]:
     """Scan the migrations package for vNNN_*.py files.
 
-    Returns sorted list of (version, module_name) tuples.
+    Returns sorted list of (version, module_name) tuples. Raises if two
+    files share a version number.
     """
     migrations_dir = Path(__file__).parent
     results: list[tuple[int, str]] = []
@@ -28,6 +51,7 @@ def discover_migrations() -> list[tuple[int, str]]:
             except ValueError:
                 continue
     results.sort(key=lambda x: x[0])
+    _check_no_duplicate_versions(results)
     return results
 
 
