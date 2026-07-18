@@ -118,9 +118,9 @@ def test_tail_load_more_button_when_more_history():
     msgs = [_msg("user", f"m{n}", "2026-07-18T09:00:00+00:00") for n in range(6)]
     text, markup = build_session_tail_view(_SESSION, msgs, total=20, window=6, tzname="UTC")
     cbs = _cbs(markup)
-    assert "sesstail:aaaa1111:12" in cbs   # next window = 6 + step(6)
+    assert "sesstail:aaaa1111:14" in cbs   # next window = 6 + step(8)
     assert "sess:list" in cbs              # back-to-list always present
-    assert "14 earlier" in text            # 20 - 6 shown
+    assert "14 earlier" in text            # 20 - 6 shown (short msgs, none dropped)
 
 
 def test_tail_no_load_more_when_all_shown():
@@ -129,11 +129,41 @@ def test_tail_no_load_more_when_all_shown():
     assert _cbs(markup) == ["sess:list"]   # no Load more
 
 
-def test_tail_capped_offers_no_more_but_hints_full_history():
-    msgs = [_msg("assistant", f"m{n}", "2026-07-18T09:00:00+00:00") for n in range(18)]
-    text, markup = build_session_tail_view(_SESSION, msgs, total=100, window=18, tzname="UTC")
+def test_tail_budget_bound_offers_no_more_but_hints_full_history():
+    # Long messages exhaust the char budget, so some fetched messages are dropped
+    # (budget-bound) — fetching more won't surface them; point to the session.
+    msgs = [_msg("assistant", "x" * 400, "2026-07-18T09:00:00+00:00") for _ in range(18)]
+    text, markup = build_session_tail_view(_SESSION, msgs, total=50, window=18, tzname="UTC")
     assert not any(c.startswith("sesstail:") for c in _cbs(markup))
     assert "open the session for the rest" in text
+
+
+def test_tail_newest_gets_the_most_budget():
+    import re
+    # Long messages so the budget binds; the newest must get the largest share.
+    msgs = [
+        _msg("user", "O" * 1500, "2026-07-18T09:00:00+00:00"),
+        _msg("assistant", "O" * 1500, "2026-07-18T09:01:00+00:00"),
+        _msg("user", "O" * 1500, "2026-07-18T09:02:00+00:00"),
+        _msg("assistant", "N" * 2000, "2026-07-18T09:03:00+00:00"),
+    ]
+    text, _m = build_session_tail_view(_SESSION, msgs, total=4, window=8, tzname="UTC")
+    bodies = re.findall(r"<blockquote expandable>(.*?)</blockquote>", text, re.S)
+    assert bodies[-1].count("N") >= 2000                       # newest shown in full
+    assert all(len(b) < len(bodies[-1]) for b in bodies[:-1])  # newest is the largest
+
+
+def test_tail_uses_expandable_blockquote_and_escapes_html():
+    msgs = [_msg("assistant", "<b>&danger</b>", "2026-07-18T09:00:00+00:00")]
+    text, _m = build_session_tail_view(_SESSION, msgs, total=1, window=6, tzname="UTC")
+    assert "<blockquote expandable>" in text     # native collapse/expand
+    assert "&lt;b&gt;&amp;danger&lt;/b&gt;" in text  # content HTML-escaped
+
+
+def test_tail_stays_within_telegram_message_limit():
+    msgs = [_msg("assistant", "y" * 1000, "2026-07-18T09:00:00+00:00") for _ in range(30)]
+    text, _m = build_session_tail_view(_SESSION, msgs, total=30, window=30, tzname="UTC")
+    assert len(text) <= 4096
 
 
 def test_tail_empty_session():
