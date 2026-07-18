@@ -1,10 +1,14 @@
 """Tests for the /sessions inline-keyboard builder (nerve.channels.telegram)."""
 
-from nerve.channels.telegram import build_sessions_view
+from nerve.channels.telegram import build_session_tail_view, build_sessions_view
 
 
 def _flat(markup):
     return [btn for row in markup.inline_keyboard for btn in row]
+
+
+def _cbs(markup):
+    return [b.callback_data for b in _flat(markup)]
 
 
 def test_current_session_marked_and_ids_ride_in_callback_data():
@@ -77,3 +81,64 @@ def test_oversized_callback_data_is_skipped():
     assert f"sess:{huge}" not in cbs
     assert "sess:eeee5555" in cbs
     assert "sess:new" in cbs
+
+
+# --- catch-up tail (build_session_tail_view) ------------------------------- #
+
+_SESSION = {"id": "aaaa1111", "title": "Work", "status": "idle"}
+
+
+def _msg(role, content, iso):
+    return {"role": role, "content": content, "created_at": iso}
+
+
+def test_tail_native_order_oldest_top_recent_bottom():
+    msgs = [
+        _msg("user", "FIRST question", "2026-07-18T09:00:00+00:00"),
+        _msg("assistant", "SECOND answer", "2026-07-18T09:05:00+00:00"),
+        _msg("user", "THIRD followup", "2026-07-18T09:10:00+00:00"),
+    ]
+    text, _markup = build_session_tail_view(_SESSION, msgs, total=3, window=6, tzname="UTC")
+    # Native chat order: earlier messages appear above later ones.
+    assert text.index("FIRST") < text.index("SECOND") < text.index("THIRD")
+    assert "🧑" in text and "🤖" in text
+
+
+def test_tail_timestamps_in_user_timezone():
+    # 09:00 UTC rendered for a UTC+3 zone must read 12:00 (matches the user's client).
+    msgs = [_msg("user", "hi", "2026-07-18T09:00:00+00:00")]
+    text, _m = build_session_tail_view(_SESSION, msgs, total=1, window=6, tzname="Europe/Moscow")
+    assert "[12:00]" in text
+    # And the same instant is 09:00 in UTC.
+    text_utc, _ = build_session_tail_view(_SESSION, msgs, total=1, window=6, tzname="UTC")
+    assert "[09:00]" in text_utc
+
+
+def test_tail_load_more_button_when_more_history():
+    msgs = [_msg("user", f"m{n}", "2026-07-18T09:00:00+00:00") for n in range(6)]
+    text, markup = build_session_tail_view(_SESSION, msgs, total=20, window=6, tzname="UTC")
+    cbs = _cbs(markup)
+    assert "sesstail:aaaa1111:12" in cbs   # next window = 6 + step(6)
+    assert "sess:list" in cbs              # back-to-list always present
+    assert "14 earlier" in text            # 20 - 6 shown
+
+
+def test_tail_no_load_more_when_all_shown():
+    msgs = [_msg("user", "only", "2026-07-18T09:00:00+00:00")]
+    _text, markup = build_session_tail_view(_SESSION, msgs, total=1, window=6, tzname="UTC")
+    assert _cbs(markup) == ["sess:list"]   # no Load more
+
+
+def test_tail_capped_offers_no_more_but_hints_full_history():
+    msgs = [_msg("assistant", f"m{n}", "2026-07-18T09:00:00+00:00") for n in range(18)]
+    text, markup = build_session_tail_view(_SESSION, msgs, total=100, window=18, tzname="UTC")
+    assert not any(c.startswith("sesstail:") for c in _cbs(markup))
+    assert "open the session for the rest" in text
+
+
+def test_tail_empty_session():
+    text, markup = build_session_tail_view(
+        {"id": "x", "status": "running"}, [], total=0, window=6, tzname="UTC",
+    )
+    assert "no messages yet" in text
+    assert _cbs(markup) == ["sess:list"]
