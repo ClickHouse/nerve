@@ -28,6 +28,16 @@ def test_new_session_button_always_present():
     assert "No sessions" in text
 
 
+def test_new_session_note_reassures_current_keeps_running():
+    # The New-session button must not read like /new (which stops the current);
+    # the view states the current session keeps running.
+    text, _markup = build_sessions_view(
+        [{"id": "aaaa1111", "title": "Work", "source": "telegram"}],
+        current_id="aaaa1111",
+    )
+    assert "keeps the current one running" in text
+
+
 def test_long_title_truncated():
     long = "x" * 100
     _text, markup = build_sessions_view(

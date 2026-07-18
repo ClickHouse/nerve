@@ -258,6 +258,10 @@ def build_sessions_view(
         )
     rows.append([InlineKeyboardButton("➕ New session", callback_data="sess:new")])
 
+    # The New-session button switches routing to a fresh session WITHOUT
+    # stopping the current one (unlike /new). A session switched away from
+    # keeps running any in-flight turn and still delivers its result to the
+    # chat (output is bound per-session, not to the channel's current map).
     if rows[:-1]:
         current_title = next(
             (
@@ -270,8 +274,9 @@ def build_sessions_view(
         text = "🗂 Sessions — tap to switch."
         if current_title:
             text += f"\nCurrent: {current_title}"
+        text += "\n➕ New session keeps the current one running."
     else:
-        text = "No sessions yet — start one:"
+        text = "No sessions yet — tap ➕ to start one."
     return text, InlineKeyboardMarkup(rows)
 
 
