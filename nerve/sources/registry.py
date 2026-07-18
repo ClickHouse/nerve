@@ -83,6 +83,65 @@ def build_source_runners(
             ))
             logger.info("Registered source: %s (batch=%d)", source.source_name, gmail.batch_size)
 
+    # IMAP — one source per mailbox, each with an independent cursor.
+    # Passwords come from sync.imap.passwords (config.local.yaml), keyed by
+    # username, so no credential ever sits in the tracked config.
+    imap = config.sync.imap
+    if imap.enabled and imap.accounts:
+        import dataclasses
+
+        from nerve.sources.imap import ImapSource
+
+        # The image pass needs a prompt to send; without one it would ask the
+        # model nothing and label every message unreadable, so treat a missing
+        # prompt as "not configured" and say so once.
+        vision = dataclasses.replace(
+            imap.vision, model=imap.vision.model or config.memory.fast_model,
+        )
+        if vision.enabled and not vision.prompt:
+            logger.warning(
+                "sync.imap.vision.enabled is set but vision.prompt is empty — "
+                "the image pass stays off",
+            )
+            vision = dataclasses.replace(vision, enabled=False)
+
+        for account in imap.accounts:
+            password = imap.passwords.get(account.username, "")
+            if not password:
+                logger.warning(
+                    "Skipping IMAP source %s: no password for %s in "
+                    "sync.imap.passwords",
+                    account.label, account.username,
+                )
+                continue
+            source = ImapSource(
+                host=account.host,
+                port=account.port,
+                username=account.username,
+                password=password,
+                mailbox=account.mailbox,
+                label=account.label,
+                initial_lookback_days=imap.initial_lookback_days,
+                match=imap.match,
+                vision=vision,
+                vision_client_factory=condense_factory,
+            )
+            runners.append(SourceRunner(
+                source=source,
+                db=db,
+                batch_size=imap.batch_size,
+                condense=imap.condense,
+                condense_model=condense_model,
+                condense_prompt=imap.condense_prompt or "",
+                condense_client_factory=condense_factory,
+                ttl_days=ttl_days,
+            ))
+            logger.info(
+                "Registered source: %s (batch=%d, only_matched=%s, vision=%s)",
+                source.source_name, imap.batch_size,
+                imap.match.only_matched, vision.enabled,
+            )
+
     # GitHub (notifications)
     gh = config.sync.github
     if gh.enabled:

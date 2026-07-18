@@ -329,6 +329,139 @@ class GmailSyncConfig:
 
 
 @dataclass
+class ImapMatchConfig:
+    """Which IMAP messages are singled out for the optional image pass.
+
+    Both lists are case-insensitive substrings and both default to empty, so
+    an unconfigured source never singles anything out and stays a plain
+    mailbox reader.
+    """
+
+    # Matched against the decoded From: header.
+    sender_contains: list[str] = field(default_factory=list)
+    # Matched against an inline image's Content-ID / filename. A hit also
+    # picks that image over the merely largest one.
+    attachment_contains: list[str] = field(default_factory=list)
+    # Drop everything that did not match, turning the mailbox into a
+    # single-purpose notifier instead of a second inbox.
+    only_matched: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapMatchConfig:
+        return cls(
+            sender_contains=[str(s) for s in d.get("sender_contains", [])],
+            attachment_contains=[str(s) for s in d.get("attachment_contains", [])],
+            only_matched=bool(d.get("only_matched", False)),
+        )
+
+
+@dataclass
+class ImapVisionConfig:
+    """Multimodal pass over an inline image in matched messages.
+
+    For mail whose payload is only legible in an image — a scan, a photo, a
+    rendered document — the model reads it at ingest time so downstream
+    consumers get plain text.
+
+    ``prompt`` and ``answer_key`` are a matched pair: the prompt tells the
+    model which label to emit, and the parser reads the line after exactly
+    that label. Changing one without the other silently yields
+    ``unknown_answer`` every time, so they live together here. Leave
+    ``answer_key`` empty to take the first non-empty line of the answer.
+
+    Wording templates accept ``{label} {answer} {vision} {subject} {sender}
+    {date} {body}``; ``{answer}`` is the parsed line and ``{vision}`` the full
+    model reply.
+    """
+
+    enabled: bool = False
+    # Defaults to memory.fast_model when left empty.
+    model: str = ""
+    prompt: str = ""
+    answer_key: str = ""
+    unknown_answer: str = "unreadable"
+    summary: str = "[{label}] {answer}"
+    summary_unknown: str = "[{label}] {subject}"
+    content: str = (
+        "{vision}\n\n"
+        "Subject: {subject}\n"
+        "From: {sender}\n"
+        "Date: {date}"
+    )
+    content_unknown: str = (
+        "The image could not be read (missing or unreadable).\n\n"
+        "Subject: {subject}\n"
+        "From: {sender}\n"
+        "Date: {date}"
+    )
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapVisionConfig:
+        base = cls()
+        return cls(
+            enabled=bool(d.get("enabled", base.enabled)),
+            model=str(d.get("model", base.model)),
+            prompt=str(d.get("prompt", base.prompt)),
+            answer_key=str(d.get("answer_key", base.answer_key)),
+            unknown_answer=str(d.get("unknown_answer", base.unknown_answer)),
+            summary=str(d.get("summary", base.summary)),
+            summary_unknown=str(d.get("summary_unknown", base.summary_unknown)),
+            content=str(d.get("content", base.content)),
+            content_unknown=str(d.get("content_unknown", base.content_unknown)),
+        )
+
+
+@dataclass
+class ImapAccountConfig:
+    """One IMAP mailbox. The password lives in config.local.yaml under
+    ``sync.imap.passwords[<username>]``, never here."""
+    host: str
+    username: str
+    label: str
+    port: int = 993
+    mailbox: str = "INBOX"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapAccountConfig:
+        return cls(
+            host=str(d["host"]),
+            username=str(d["username"]),
+            label=str(d.get("label") or d["username"].split("@")[0]),
+            port=int(d.get("port", 993)),
+            mailbox=str(d.get("mailbox", "INBOX")),
+        )
+
+
+@dataclass
+class ImapSyncConfig:
+    enabled: bool = False
+    accounts: list[ImapAccountConfig] = field(default_factory=list)
+    passwords: dict[str, str] = field(default_factory=dict)
+    schedule: str = "*/30 * * * *"
+    batch_size: int = 20
+    initial_lookback_days: int = 1
+    condense: bool = False
+    condense_prompt: str = ""
+    match: ImapMatchConfig = field(default_factory=ImapMatchConfig)
+    vision: ImapVisionConfig = field(default_factory=ImapVisionConfig)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapSyncConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            accounts=[ImapAccountConfig.from_dict(a) for a in d.get("accounts", [])],
+            passwords=dict(d.get("passwords", {})),
+            schedule=str(d.get("schedule", "*/30 * * * *")),
+            batch_size=int(d.get("batch_size", 20)),
+            initial_lookback_days=int(d.get("initial_lookback_days", 1)),
+            condense=bool(d.get("condense", False)),
+            condense_prompt=str(d.get("condense_prompt", "")),
+            match=ImapMatchConfig.from_dict(d.get("match", {})),
+            vision=ImapVisionConfig.from_dict(d.get("vision", {})),
+        )
+
+
+@dataclass
 class GitHubSyncConfig:
     enabled: bool = True
     schedule: str = "*/15 * * * *"
@@ -522,6 +655,7 @@ class CodexSyncConfig:
 class SyncConfig:
     telegram: TelegramSyncConfig = field(default_factory=TelegramSyncConfig)
     gmail: GmailSyncConfig = field(default_factory=GmailSyncConfig)
+    imap: ImapSyncConfig = field(default_factory=ImapSyncConfig)
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
     github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
@@ -534,6 +668,7 @@ class SyncConfig:
         return cls(
             telegram=TelegramSyncConfig.from_dict(d.get("telegram", {})),
             gmail=GmailSyncConfig.from_dict(d.get("gmail", {})),
+            imap=ImapSyncConfig.from_dict(d.get("imap", {})),
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
             github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
