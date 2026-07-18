@@ -1065,7 +1065,12 @@ class TelegramChannel(BaseChannel):
         current = await self.router.get_last_session(channel_key)
         sessions = await self.router.list_sessions(limit=30)
         sessions = [s for s in sessions if s.get("source") in ("telegram", "web")]
-        return build_sessions_view(sessions, current)
+        # Drop empty (0-message) sessions — nothing to switch to or catch up on.
+        non_empty = []
+        for s in sessions:
+            if await self.router.count_session_messages(s["id"]) > 0:
+                non_empty.append(s)
+        return build_sessions_view(non_empty, current)
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
         """Handle /sessions — native inline keyboard to switch session routing.
