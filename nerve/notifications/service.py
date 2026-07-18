@@ -231,10 +231,11 @@ class NotificationService:
         """
         notification_id = f"notif-{uuid.uuid4().hex[:8]}"
         # Render <YYYY-MM-DD[ HH:MM]> placeholders before silence matching
-        # so rules can target the human-readable form ("24 июня") and so
+        # so rules can target the human-readable form ("24 June") and so
         # persisted/delivered text matches what the user sees.
-        title = render_iso_dates(title)
-        body = render_iso_dates(body)
+        locale = self.config.notifications.date_locale
+        title = render_iso_dates(title, locale=locale)
+        body = render_iso_dates(body, locale=locale)
         match = await self._match_silence(title, body)
 
         if match and not force:

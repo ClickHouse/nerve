@@ -709,6 +709,11 @@ class NotificationsConfig:
         "high": "⚠️ ",
         "urgent": "🚨 ",
     })
+    # Output language for <YYYY-MM-DD> / <dow:> placeholders rendered into
+    # notification text: "en" (default), "ru", "de". Placeholder *parsing*
+    # stays multilingual regardless. The English default keeps the code free
+    # of any one user's language; set it in config instead.
+    date_locale: str = "en"
 
     @classmethod
     def from_dict(cls, d: dict) -> NotificationsConfig:
@@ -721,6 +726,7 @@ class NotificationsConfig:
                 "high": "⚠️ ",
                 "urgent": "🚨 ",
             }),
+            date_locale=str(d.get("date_locale", "en")),
         )
 
 

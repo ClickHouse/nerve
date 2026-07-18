@@ -13,13 +13,23 @@ from datetime import datetime
 
 import pytest
 
-from nerve.notifications.date_render import render_iso_dates
+from nerve.notifications.date_render import (
+    DEFAULT_LOCALE,
+    render_iso_dates as _render_raw,
+)
 
 
 # Fixed reference: 2026-06-24 was a Wednesday. The whole suite anchors
 # its "today/tomorrow/yesterday" assertions to this date so changes in
 # wall-clock time can't drift the expectations.
 _NOW = datetime(2026, 6, 24, 10, 0)
+
+
+def render_iso_dates(text, now=None, locale="ru"):
+    """Suite default is Russian: these cases were written against the
+    Russian month/weekday tables, and they still exercise the mechanism.
+    The module default is English — see TestLocaleSelection."""
+    return _render_raw(text, now=now, locale=locale)
 
 
 class TestBasicRendering:
@@ -252,3 +262,49 @@ class TestDefaultNowFallback:
         result = render_iso_dates("<2030-01-01>")
         # 2030-01-01 is a Tuesday.
         assert "1 января (вт)" in result
+
+
+# ---------------------------------------------------------------------------
+# Locale selection — the language is config, not a hardcode
+# ---------------------------------------------------------------------------
+
+
+class TestLocaleSelection:
+    """Output language comes from notifications.date_locale.
+
+    Placeholder *parsing* stays multilingual whatever the output locale is,
+    because the source email the model copied a weekday from may be in any
+    language.
+    """
+
+    def test_module_default_is_english(self):
+        assert DEFAULT_LOCALE == "en"
+        assert _render_raw("<2026-06-24>", now=_NOW) == "today, 24 June (Wed)"
+
+    def test_russian_is_opt_in(self):
+        assert _render_raw("<2026-06-24>", now=_NOW, locale="ru") == (
+            "сегодня, 24 июня (ср)"
+        )
+
+    def test_german(self):
+        assert _render_raw("<2026-06-24>", now=_NOW, locale="de") == (
+            "heute, 24 Juni (Mi)"
+        )
+
+    def test_unknown_locale_falls_back_to_english(self):
+        assert _render_raw("<2026-06-24>", now=_NOW, locale="klingon") == (
+            "today, 24 June (Wed)"
+        )
+
+    def test_none_locale_falls_back(self):
+        assert _render_raw("<2026-06-24>", now=_NOW, locale=None) == (
+            "today, 24 June (Wed)"
+        )
+
+    @pytest.mark.parametrize("locale", ["en", "ru", "de"])
+    def test_weekday_parsing_is_locale_independent(self, locale):
+        # A German weekday name resolves even when rendering in English.
+        out = _render_raw("<dow:Dienstag>", now=_NOW, locale=locale)
+        assert "<dow:" not in out
+        # 2026-06-24 is a Wednesday, so the next Tuesday is 30 June.
+        assert "30" in out

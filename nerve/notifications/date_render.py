@@ -1,8 +1,8 @@
 """Render ISO date placeholders in notification text.
 
 Models (especially in cron-driven sessions like inbox-processor) regularly
-miscompute weekdays for absolute dates — e.g. writing "24 июня (вт)" when
-24 June is a Wednesday. Asking the model to "be more careful" or
+miscompute weekdays for absolute dates — e.g. writing "24 June (Tue)"
+when 24 June is a Wednesday. Asking the model to "be more careful" or
 embedding a 14-day lookup table in the system prompt both fail: the first
 is unreliable, the second doesn't scale beyond two weeks.
 
@@ -12,15 +12,15 @@ and the code formats it deterministically.
 
 Syntax accepted in any notification ``title`` or ``body``:
 
-    <YYYY-MM-DD>           → "24 июня (ср)"
-    <YYYY-MM-DD HH:MM>     → "24 июня (ср), 19:00"
+    <YYYY-MM-DD>           → "24 June (Wed)"
+    <YYYY-MM-DD HH:MM>     → "24 June (Wed), 19:00"
 
 If the placeholder date matches today / tomorrow / yesterday relative
 to the rendering ``now``, a relative label is prepended:
 
-    <2026-06-24>           (today)     → "сегодня, 24 июня (ср)"
-    <2026-06-25 19:00>     (tomorrow)  → "завтра, 25 июня (чт), 19:00"
-    <2026-06-23>           (yesterday) → "вчера, 23 июня (вт)"
+    <2026-06-24>           (today)     → "today, 24 June (Wed)"
+    <2026-06-25 19:00>     (tomorrow)  → "tomorrow, 25 June (Thu), 19:00"
+    <2026-06-23>           (yesterday) → "yesterday, 23 June (Tue)"
 
 The relative-label arithmetic is done in Python from a known ``now``, so
 the failure mode that originally motivated this module — the model
@@ -37,14 +37,15 @@ same day-delta arithmetic the model gets wrong (it once kept a stale
 dispatch email's "Tuesday" meant 21 July). So the model may instead copy
 the weekday name verbatim into a placeholder and let the code resolve it:
 
-    <dow:Tuesday>          → nearest upcoming Tuesday, e.g. "21 июля (вт)"
+    <dow:Tuesday>          → nearest upcoming Tuesday, e.g. "21 July (Tue)"
 
 Resolution is deterministic: the nearest date whose weekday matches,
 counting forward from ``now`` (today itself counts if it matches). English,
 Russian, and German weekday names (full or common short forms) are
-accepted, since the source email may be in any of them. Combines with the
+accepted, since the source email may be in any of them, independent of
+the output locale. Combines with the
 relative label exactly like an absolute date, so a "Tuesday" that lands on
-tomorrow renders "завтра, 21 июля (вт)". Unrecognized names are left as-is.
+tomorrow renders "tomorrow, 21 July (Tue)". Unrecognized names are left as-is.
 
 Malformed placeholders (impossible dates like ``<2026-02-31>``,
 out-of-range hours, wrong digits) are left untouched so the model sees
@@ -58,13 +59,55 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 
-# Order matters: month index = position (1-based)
-_MONTHS_RU_GENITIVE = (
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-)
+# Output locales. Month order matters: index = month - 1. Weekday order is
+# Python's: Mon=0 .. Sun=6.
+#
+# Only the *rendered* side is localized. Placeholder parsing below
+# (``_WEEKDAY_NAMES``) stays multilingual regardless of this setting, because
+# the source email whose weekday the model copied may be in any language.
+#
+# Default is English so the module carries no personal preference; pick a
+# language with ``notifications.date_locale`` in config.
+_LOCALES: dict[str, dict[str, object]] = {
+    "en": {
+        "months": (
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ),
+        "weekdays": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"),
+        "today": "today, ",
+        "tomorrow": "tomorrow, ",
+        "yesterday": "yesterday, ",
+    },
+    "ru": {
+        # Genitive: the day number governs the month name ("24 июня").
+        "months": (
+            "января", "февраля", "марта", "апреля", "мая", "июня",
+            "июля", "августа", "сентября", "октября", "ноября", "декабря",
+        ),
+        "weekdays": ("пн", "вт", "ср", "чт", "пт", "сб", "вс"),
+        "today": "сегодня, ",
+        "tomorrow": "завтра, ",
+        "yesterday": "вчера, ",
+    },
+    "de": {
+        "months": (
+            "Januar", "Februar", "März", "April", "Mai", "Juni",
+            "Juli", "August", "September", "Oktober", "November", "Dezember",
+        ),
+        "weekdays": ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"),
+        "today": "heute, ",
+        "tomorrow": "morgen, ",
+        "yesterday": "gestern, ",
+    },
+}
 
-_WEEKDAYS_RU_SHORT = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+DEFAULT_LOCALE = "en"
+
+
+def _locale(name: str | None) -> dict[str, object]:
+    """Locale table for ``name``, falling back to English for anything unknown."""
+    return _LOCALES.get((name or DEFAULT_LOCALE).lower(), _LOCALES[DEFAULT_LOCALE])
 
 # Weekday name → Python weekday index (Mon=0 .. Sun=6). English, Russian, and
 # German, full and common short forms, since the source email may be in any of
@@ -111,14 +154,20 @@ _ISO_DATE_RE = re.compile(
 _DOW_RE = re.compile(r"<dow:\s*([^\s>]+)\s*>", re.IGNORECASE)
 
 
-def render_iso_dates(text: str, now: Optional[datetime] = None) -> str:
+def render_iso_dates(
+    text: str,
+    now: Optional[datetime] = None,
+    locale: str = DEFAULT_LOCALE,
+) -> str:
     """Replace ``<YYYY-MM-DD[ HH:MM]>`` placeholders with localized strings.
 
     Args:
         text: Notification title or body. Any string is safe — non-matching
             text passes through untouched.
-        now: Reference time for "сегодня/завтра/вчера" labels. Defaults to
-            the current local time. Tests inject a fixed value.
+        now: Reference time for the today/tomorrow/yesterday label. Defaults
+            to the current local time. Tests inject a fixed value.
+        locale: Output language for month names, weekday abbreviations and
+            the relative label. Unknown values fall back to English.
 
     Returns:
         Text with every well-formed placeholder rendered. Malformed
@@ -128,21 +177,24 @@ def render_iso_dates(text: str, now: Optional[datetime] = None) -> str:
         return text
 
     today = (now or datetime.now()).date()
+    loc = _locale(locale)
+    months: tuple = loc["months"]  # type: ignore[assignment]
+    weekdays: tuple = loc["weekdays"]  # type: ignore[assignment]
 
     def _format(event: date, time_part: str = "") -> str:
-        """Localized 'сегодня, 21 июля (вт), 19:00' for an absolute date."""
-        month_name = _MONTHS_RU_GENITIVE[event.month - 1]
-        weekday_short = _WEEKDAYS_RU_SHORT[event.weekday()]
-        absolute = f"{event.day} {month_name} ({weekday_short})"
+        """One absolute date, e.g. "today, 21 July (Tue), 19:00"."""
+        absolute = (
+            f"{event.day} {months[event.month - 1]} ({weekdays[event.weekday()]})"
+        )
 
         delta_days = (event - today).days
         relative = ""
         if delta_days == 0:
-            relative = "сегодня, "
+            relative = str(loc["today"])
         elif delta_days == 1:
-            relative = "завтра, "
+            relative = str(loc["tomorrow"])
         elif delta_days == -1:
-            relative = "вчера, "
+            relative = str(loc["yesterday"])
 
         return f"{relative}{absolute}{time_part}"
 
