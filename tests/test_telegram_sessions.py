@@ -142,3 +142,12 @@ def test_tail_empty_session():
     )
     assert "no messages yet" in text
     assert _cbs(markup) == ["sess:list"]
+
+
+def test_tail_active_status_shows_live_emoji():
+    # A live session's status value is "active" (not "running") — it must render
+    # the live marker, not the fallback bullet.
+    text, _m = build_session_tail_view(
+        {"id": "a", "title": "T", "status": "active"}, [], total=0, window=6, tzname="UTC",
+    )
+    assert "🟢" in text and "•" not in text
