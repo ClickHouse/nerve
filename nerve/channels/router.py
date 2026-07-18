@@ -430,6 +430,20 @@ class ChannelRouter:
         """List sessions, most recently updated first."""
         return await self.engine.sessions.list_sessions(limit=limit)
 
+    async def get_session(self, session_id: str) -> dict[str, Any] | None:
+        """Fetch a session row (title/status/…), or None if it is gone."""
+        return await self.engine.db.get_session(session_id)
+
+    async def get_session_messages(
+        self, session_id: str, limit: int,
+    ) -> list[dict[str, Any]]:
+        """Recent messages for a session, oldest→newest (native chat order)."""
+        return await self.engine.db.get_messages(session_id, limit=limit)
+
+    async def count_session_messages(self, session_id: str) -> int:
+        """Total message count for a session (to know if more history exists)."""
+        return await self.engine.db.count_messages(session_id)
+
     # ------------------------------------------------------------------ #
     #  Outbound: engine → channel (cron delivery, etc.)                    #
     # ------------------------------------------------------------------ #

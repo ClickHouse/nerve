@@ -19,8 +19,10 @@ import subprocess
 import sys
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
@@ -277,6 +279,96 @@ def build_sessions_view(
         text += "\n➕ New session keeps the current one running."
     else:
         text = "No sessions yet — tap ➕ to start one."
+    return text, InlineKeyboardMarkup(rows)
+
+
+# Catch-up tail shown after switching to a session -------------------------- #
+_TAIL_WINDOW = 6        # messages shown right after a switch
+_TAIL_STEP = 6          # extra messages added per "Load more"
+_TAIL_MAX = 18          # hard cap (keeps the card under Telegram's 4096 limit)
+_TAIL_MSG_MAX = 180     # per-message content truncation
+_STATUS_EMOJI = {"running": "🟢", "idle": "✅", "stopped": "⏹", "error": "⚠️"}
+
+
+def _safe_zone(tzname: str | None):
+    """ZoneInfo for the user's configured tz, or None → fall back to system local."""
+    if not tzname:
+        return None
+    try:
+        return ZoneInfo(tzname)
+    except Exception:
+        return None
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse whitespace and truncate to a compact one-line preview."""
+    flat = " ".join((text or "").split())
+    if len(flat) > limit:
+        flat = flat[: limit - 1].rstrip() + "…"
+    return flat or "(no text)"
+
+
+def _fmt_local(iso: str, tz) -> "tuple[str, str]":
+    """Return (day label, HH:MM) for an ISO timestamp in the user's timezone."""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(tz) if tz else dt.astimezone()
+        return local.strftime("%a %b %d"), local.strftime("%H:%M")
+    except Exception:
+        return "", "--:--"
+
+
+def build_session_tail_view(
+    session: dict,
+    messages: list[dict],
+    total: int,
+    window: int,
+    tzname: str | None,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render a session's recent history so the user can catch up after switching.
+
+    Native chat order — oldest at the top, most recent at the bottom — with a
+    per-message timestamp converted to the user's timezone (``tzname``) so it
+    matches what the Telegram client shows; the timestamp is often as useful as
+    the text. ``messages`` is the last ``window`` messages (oldest→newest, as
+    ``get_messages`` returns them). The "Load more" button widens the window
+    (older history appears above) and is purely informational — it does not
+    change routing. Returns ``(text, keyboard)``.
+    """
+    tz = _safe_zone(tzname)
+    sid = session.get("id", "?")
+    status = session.get("status") or "idle"
+    title = session.get("title") or sid
+    emoji = _STATUS_EMOJI.get(status, "•")
+    shown = len(messages)
+    can_load_more = total > window and window < _TAIL_MAX
+
+    lines = [f"🗂 {title}\n{emoji} {status} · {total} message" + ("" if total == 1 else "s")]
+    if not messages:
+        lines.append("\n(no messages yet — send one to begin)")
+    else:
+        if total > shown:
+            hint = "tap Load more" if can_load_more else "open the session for the rest"
+            lines.append(f"… {total - shown} earlier — {hint}")
+        last_day = None
+        for m in messages:
+            day, hm = _fmt_local(m.get("created_at", ""), tz)
+            if day and day != last_day:
+                lines.append(f"— {day} —")
+                last_day = day
+            who = "🧑" if m.get("role") == "user" else "🤖"
+            lines.append(f"[{hm}] {who} {_one_line(m.get('content', ''), _TAIL_MSG_MAX)}")
+    text = "\n".join(lines)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_load_more:
+        nxt = min(window + _TAIL_STEP, _TAIL_MAX)
+        rows.append(
+            [InlineKeyboardButton("⬆️ Load more", callback_data=f"sesstail:{sid}:{nxt}")]
+        )
+    rows.append([InlineKeyboardButton("🗂 Sessions", callback_data="sess:list")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -1567,21 +1659,76 @@ class TelegramChannel(BaseChannel):
     #  Notification callback handlers                                      #
     # ------------------------------------------------------------------ #
 
-    async def _handle_session_switch(self, query: Any) -> None:
-        """Handle a /sessions button press: switch routing (or start a new one).
+    async def _safe_edit(self, query: Any, text: str, markup: Any) -> None:
+        """edit_message_text, swallowing the benign 'not modified'/transient errors."""
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup)
+        except Exception:
+            pass
 
-        ``callback_data`` is ``sess:<id>`` or ``sess:new``. After acting, the
-        message is re-rendered in place with the new current session marked ✓,
-        mirroring how notification cards update on answer.
+    async def _edit_session_tail(
+        self, query: Any, session_id: str, window: int,
+    ) -> None:
+        """Render a session's recent history (catch-up view) into the card in place."""
+        window = max(1, min(window, _TAIL_MAX))
+        session = await self.router.get_session(session_id)
+        if not session:
+            channel_key = f"telegram:{query.message.chat.id}"
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+        messages = await self.router.get_session_messages(session_id, limit=window)
+        total = await self.router.count_session_messages(session_id)
+        text, markup = build_session_tail_view(
+            session, messages, total, window, self.config.timezone,
+        )
+        await self._safe_edit(query, text, markup)
+
+    async def _handle_session_button(self, query: Any) -> None:
+        """Handle /sessions inline-keyboard presses.
+
+        callback_data forms:
+          ``sess:list``           — (re)show the session switch list
+          ``sess:new``            — create a fresh session (current keeps running)
+          ``sess:<id>``           — switch routing to <id>, then show its history
+          ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
+
+        After a switch/create the card is replaced by that session's recent
+        history (native order, oldest→newest) so the user can catch up — which
+        matters most when switching into a background session they weren't
+        following.
         """
         if not query.message:
             await query.answer()
             return
         channel_key = f"telegram:{query.message.chat.id}"
-        target = query.data.split(":", 1)[1]
+        data = query.data
+
+        if data == "sess:list":
+            await query.answer()
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+
+        if data.startswith("sesstail:"):
+            parts = data.split(":")
+            sid = parts[1] if len(parts) > 1 else ""
+            try:
+                window = int(parts[2])
+            except (IndexError, ValueError):
+                window = _TAIL_WINDOW
+            await query.answer()
+            await self._edit_session_tail(query, sid, window)
+            return
+
+        # sess:new / sess:<id>
+        target = data.split(":", 1)[1]
+        sid = target
         try:
             if target == "new":
-                await self.router.create_session(channel_key, source="telegram")
+                sid = await self.router.create_session(
+                    channel_key, source="telegram",
+                )
                 await query.answer("Started a new session")
             else:
                 await self.router.switch_session(channel_key, target)
@@ -1590,11 +1737,10 @@ class TelegramChannel(BaseChannel):
             await query.answer(
                 "That session is no longer available", show_alert=True,
             )
-        text, markup = await self._sessions_view_for(channel_key)
-        try:
-            await query.edit_message_text(text=text, reply_markup=markup)
-        except Exception:
-            pass
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+        await self._edit_session_tail(query, sid, _TAIL_WINDOW)
 
     async def _handle_callback_query(self, update: Update, context: Any) -> None:
         """Handle inline keyboard button presses for notification questions."""
@@ -1607,9 +1753,9 @@ class TelegramChannel(BaseChannel):
             await query.answer("Unauthorized", show_alert=True)
             return
 
-        # Session switch/create buttons from /sessions.
-        if query.data.startswith("sess:"):
-            await self._handle_session_switch(query)
+        # /sessions inline keyboard: switch/create/list + history buttons.
+        if query.data.startswith("sess:") or query.data.startswith("sesstail:"):
+            await self._handle_session_button(query)
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"
