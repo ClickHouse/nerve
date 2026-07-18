@@ -287,7 +287,14 @@ _TAIL_WINDOW = 6        # messages shown right after a switch
 _TAIL_STEP = 6          # extra messages added per "Load more"
 _TAIL_MAX = 18          # hard cap (keeps the card under Telegram's 4096 limit)
 _TAIL_MSG_MAX = 180     # per-message content truncation
-_STATUS_EMOJI = {"running": "🟢", "idle": "✅", "stopped": "⏹", "error": "⚠️"}
+_STATUS_EMOJI = {
+    "active": "🟢",     # a client is connected (live / possibly mid-turn)
+    "running": "🟢",    # defensive alias
+    "idle": "💤",       # no client attached, resumable
+    "stopped": "⏹",
+    "error": "⚠️",
+    "archived": "🗄",
+}
 
 
 def _safe_zone(tzname: str | None):
