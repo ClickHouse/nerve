@@ -283,10 +283,17 @@ def build_sessions_view(
 
 
 # Catch-up tail shown after switching to a session -------------------------- #
-_TAIL_WINDOW = 6        # messages shown right after a switch
-_TAIL_STEP = 6          # extra messages added per "Load more"
-_TAIL_MAX = 18          # hard cap (keeps the card under Telegram's 4096 limit)
-_TAIL_MSG_MAX = 180     # per-message content truncation
+_TAIL_WINDOW = 8        # messages fetched for the catch-up view on switch
+_TAIL_STEP = 8          # extra messages fetched per "Load more"
+_TAIL_MAX = 30          # hard cap on how many messages to fetch
+# Rendered-card char budget. The newest message (usually the one you most want
+# to read) gets first claim up to _NEWEST_MAX; older messages get _OLDER_CAP
+# each from what remains. Bodies render as expandable blockquotes, so long
+# messages collapse to a few lines and expand in place — no hard truncation for
+# normal-sized messages, while the whole card stays under Telegram's 4096 limit.
+_TAIL_CARD_MAX = 3800   # max chars of the assembled HTML card (< Telegram's 4096)
+_NEWEST_MAX = 2000      # newest message body clip (raw) — it gets first/largest claim
+_OLDER_CAP = 700        # older message body clip (raw)
 _STATUS_EMOJI = {
     "active": "🟢",     # a client is connected (live / possibly mid-turn)
     "running": "🟢",    # defensive alias
@@ -307,12 +314,12 @@ def _safe_zone(tzname: str | None):
         return None
 
 
-def _one_line(text: str, limit: int) -> str:
-    """Collapse whitespace and truncate to a compact one-line preview."""
-    flat = " ".join((text or "").split())
-    if len(flat) > limit:
-        flat = flat[: limit - 1].rstrip() + "…"
-    return flat or "(no text)"
+def _clip(text: str, cap: int) -> str:
+    """Trim to `cap` visible chars and HTML-escape; '…' appended if truncated."""
+    t = (text or "").strip()
+    if len(t) > cap:
+        t = t[:cap].rstrip() + "…"
+    return _html.escape(t) if t else "(no text)"
 
 
 def _fmt_local(iso: str, tz) -> "tuple[str, str]":
@@ -334,39 +341,73 @@ def build_session_tail_view(
     window: int,
     tzname: str | None,
 ) -> "tuple[str, InlineKeyboardMarkup]":
-    """Render a session's recent history so the user can catch up after switching.
+    """Render a session's recent history (HTML) so the user can catch up.
 
     Native chat order — oldest at the top, most recent at the bottom — with a
     per-message timestamp converted to the user's timezone (``tzname``) so it
-    matches what the Telegram client shows; the timestamp is often as useful as
-    the text. ``messages`` is the last ``window`` messages (oldest→newest, as
-    ``get_messages`` returns them). The "Load more" button widens the window
-    (older history appears above) and is purely informational — it does not
-    change routing. Returns ``(text, keyboard)``.
+    matches the Telegram client (the timestamp is often as useful as the text).
+    Each body is an *expandable blockquote*: long messages collapse to a few
+    lines and expand in place on tap, so there is no hard truncation for normal
+    messages. The char budget is newest-first — the most recent message (usually
+    the important one) gets the largest share — while the whole card stays under
+    Telegram's 4096-char limit. ``messages`` is the last ``window`` messages
+    (oldest→newest). "Load more" fetches more older history; it does not change
+    routing. Returns ``(html_text, keyboard)`` — send/edit with ParseMode.HTML.
     """
     tz = _safe_zone(tzname)
     sid = session.get("id", "?")
     status = session.get("status") or "idle"
-    title = session.get("title") or sid
     emoji = _STATUS_EMOJI.get(status, "•")
-    shown = len(messages)
-    can_load_more = total > window and window < _TAIL_MAX
+    title = _html.escape(str(session.get("title") or sid))
+    header = (
+        f"🗂 <b>{title}</b>\n{emoji} {status} · "
+        f"{total} message" + ("" if total == 1 else "s")
+    )
 
-    lines = [f"🗂 {title}\n{emoji} {status} · {total} message" + ("" if total == 1 else "s")]
     if not messages:
-        lines.append("\n(no messages yet — send one to begin)")
-    else:
-        if total > shown:
-            hint = "tap Load more" if can_load_more else "open the session for the rest"
-            lines.append(f"… {total - shown} earlier — {hint}")
-        last_day = None
-        for m in messages:
-            day, hm = _fmt_local(m.get("created_at", ""), tz)
-            if day and day != last_day:
-                lines.append(f"— {day} —")
-                last_day = day
-            who = "🧑" if m.get("role") == "user" else "🤖"
-            lines.append(f"[{hm}] {who} {_one_line(m.get('content', ''), _TAIL_MSG_MAX)}")
+        rows = [[InlineKeyboardButton("🗂 Sessions", callback_data="sess:list")]]
+        return header + "\n\n<i>(no messages yet — send one to begin)</i>", InlineKeyboardMarkup(rows)
+
+    # Greedy newest-first: the newest message is added first with the largest
+    # clip (so it gets the most budget and is never starved); older messages are
+    # added while the assembled card stays within budget. The budget is measured
+    # on the *rendered, HTML-escaped* block length, so entity expansion (e.g. an
+    # apostrophe → "&#x27;") can never push the card past Telegram's 4096 limit.
+    included: list[tuple[str, str]] = []          # (day_label, block) newest-first
+    used = len(header) + 64                        # header + room for the "earlier" line
+    for idx, m in enumerate(reversed(messages)):   # newest → oldest
+        cap = _NEWEST_MAX if idx == 0 else _OLDER_CAP
+        day, hm = _fmt_local(m.get("created_at", ""), tz)
+        who = "🧑" if m.get("role") == "user" else "🤖"
+        block = (
+            f"[{hm}] {who}\n"
+            f"<blockquote expandable>{_clip(m.get('content', ''), cap)}</blockquote>"
+        )
+        cost = len(block) + len(day) + 6           # + possible day separator
+        if idx > 0 and used + cost > _TAIL_CARD_MAX:
+            break                                  # older message doesn't fit
+        included.append((day, block))
+        used += cost
+    included.reverse()                             # oldest→newest for display
+
+    earlier = total - len(included)
+    # "Load more" fetches more history; it only helps when everything fetched was
+    # shown and more exists (window-bound). If messages were dropped to fit the
+    # card (budget-bound), fetching more won't surface them — point to the session.
+    can_load_more = (
+        len(included) == len(messages) and total > window and window < _TAIL_MAX
+    )
+
+    lines = [header]
+    if earlier > 0:
+        hint = "tap Load more" if can_load_more else "open the session for the rest"
+        lines.append(f"<i>… {earlier} earlier — {hint}</i>")
+    last_day = None
+    for day, block in included:
+        if day and day != last_day:
+            lines.append(f"— {day} —")
+            last_day = day
+        lines.append(block)
     text = "\n".join(lines)
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -1666,10 +1707,14 @@ class TelegramChannel(BaseChannel):
     #  Notification callback handlers                                      #
     # ------------------------------------------------------------------ #
 
-    async def _safe_edit(self, query: Any, text: str, markup: Any) -> None:
+    async def _safe_edit(
+        self, query: Any, text: str, markup: Any, parse_mode: Any = None,
+    ) -> None:
         """edit_message_text, swallowing the benign 'not modified'/transient errors."""
         try:
-            await query.edit_message_text(text=text, reply_markup=markup)
+            await query.edit_message_text(
+                text=text, reply_markup=markup, parse_mode=parse_mode,
+            )
         except Exception:
             pass
 
@@ -1689,7 +1734,7 @@ class TelegramChannel(BaseChannel):
         text, markup = build_session_tail_view(
             session, messages, total, window, self.config.timezone,
         )
-        await self._safe_edit(query, text, markup)
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
 
     async def _handle_session_button(self, query: Any) -> None:
         """Handle /sessions inline-keyboard presses.
