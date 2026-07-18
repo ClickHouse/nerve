@@ -329,6 +329,120 @@ class GmailSyncConfig:
 
 
 @dataclass
+class ImapEnvelopeMessagesConfig:
+    """Wording for Deutsche Post envelope-scan enrichment.
+
+    ``vision_prompt`` and ``sender_key`` are a matched pair: the prompt tells
+    the model which label to emit, and the parser reads the line after exactly
+    that label. Translating one without the other silently yields
+    ``unknown_sender`` for every letter, so they live together here.
+    """
+
+    vision_prompt: str = (
+        "You are looking at a scan of the FRONT of a paper envelope "
+        "(Deutsche Post Briefankuendigung). Identify the SENDER — usually "
+        "printed in small type at the top of the envelope or in the sender "
+        "window. Answer with EXACTLY two lines:\n"
+        "Sender: <company or person, or \"unreadable\">\n"
+        "Type: <one or two words: bank / insurance / government / invoice / "
+        "advertising / personal / unclear>"
+    )
+    sender_key: str = "Sender:"
+    unknown_sender: str = "unreadable"
+    # {label} {sender}
+    summary: str = "[{label}] \U0001F4EC Physical letter: {sender}"
+    summary_unknown: str = "[{label}] \U0001F4EC A physical letter is on its way"
+    # {vision} {subject} {date}
+    content: str = (
+        "Deutsche Post Briefankuendigung — a paper letter is announced "
+        "(delivery in the next few days).\n"
+        "Sender per the envelope:\n{vision}\n\n"
+        "Subject: {subject}\n"
+        "Date: {date}"
+    )
+    # {subject} {date}
+    content_unknown: str = (
+        "Deutsche Post Briefankuendigung — a paper letter is announced "
+        "(delivery in the next few days).\n"
+        "The sender could not be read from the envelope "
+        "(image missing or unreadable).\n\n"
+        "Subject: {subject}\n"
+        "Date: {date}"
+    )
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapEnvelopeMessagesConfig:
+        base = cls()
+        return cls(
+            vision_prompt=str(d.get("vision_prompt", base.vision_prompt)),
+            sender_key=str(d.get("sender_key", base.sender_key)),
+            unknown_sender=str(d.get("unknown_sender", base.unknown_sender)),
+            summary=str(d.get("summary", base.summary)),
+            summary_unknown=str(d.get("summary_unknown", base.summary_unknown)),
+            content=str(d.get("content", base.content)),
+            content_unknown=str(d.get("content_unknown", base.content_unknown)),
+        )
+
+
+@dataclass
+class ImapAccountConfig:
+    """One IMAP mailbox. The password lives in config.local.yaml under
+    ``sync.imap.passwords[<username>]``, never here."""
+    host: str
+    username: str
+    label: str
+    port: int = 993
+    mailbox: str = "INBOX"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapAccountConfig:
+        return cls(
+            host=str(d["host"]),
+            username=str(d["username"]),
+            label=str(d.get("label") or d["username"].split("@")[0]),
+            port=int(d.get("port", 993)),
+            mailbox=str(d.get("mailbox", "INBOX")),
+        )
+
+
+@dataclass
+class ImapSyncConfig:
+    enabled: bool = False
+    accounts: list[ImapAccountConfig] = field(default_factory=list)
+    passwords: dict[str, str] = field(default_factory=dict)
+    schedule: str = "*/30 * * * *"
+    batch_size: int = 20
+    analyze_envelopes: bool = True
+    envelope_only: bool = False
+    initial_lookback_days: int = 1
+    vision_model: str = ""
+    condense: bool = False
+    condense_prompt: str = ""
+    envelope_messages: ImapEnvelopeMessagesConfig = field(
+        default_factory=ImapEnvelopeMessagesConfig
+    )
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ImapSyncConfig:
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            accounts=[ImapAccountConfig.from_dict(a) for a in d.get("accounts", [])],
+            passwords=dict(d.get("passwords", {})),
+            schedule=str(d.get("schedule", "*/30 * * * *")),
+            batch_size=int(d.get("batch_size", 20)),
+            analyze_envelopes=bool(d.get("analyze_envelopes", True)),
+            envelope_only=bool(d.get("envelope_only", False)),
+            initial_lookback_days=int(d.get("initial_lookback_days", 1)),
+            vision_model=str(d.get("vision_model", "")),
+            condense=bool(d.get("condense", False)),
+            condense_prompt=str(d.get("condense_prompt", "")),
+            envelope_messages=ImapEnvelopeMessagesConfig.from_dict(
+                d.get("envelope_messages", {})
+            ),
+        )
+
+
+@dataclass
 class GitHubSyncConfig:
     enabled: bool = True
     schedule: str = "*/15 * * * *"
@@ -522,6 +636,7 @@ class CodexSyncConfig:
 class SyncConfig:
     telegram: TelegramSyncConfig = field(default_factory=TelegramSyncConfig)
     gmail: GmailSyncConfig = field(default_factory=GmailSyncConfig)
+    imap: ImapSyncConfig = field(default_factory=ImapSyncConfig)
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
     github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
@@ -534,6 +649,7 @@ class SyncConfig:
         return cls(
             telegram=TelegramSyncConfig.from_dict(d.get("telegram", {})),
             gmail=GmailSyncConfig.from_dict(d.get("gmail", {})),
+            imap=ImapSyncConfig.from_dict(d.get("imap", {})),
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
             github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
