@@ -1,5 +1,7 @@
 """Tests for the /sessions inline-keyboard builder (nerve.channels.telegram)."""
 
+import pytest
+
 from nerve.channels.telegram import build_session_tail_view, build_sessions_view
 
 
@@ -164,6 +166,38 @@ def test_tail_stays_within_telegram_message_limit():
     msgs = [_msg("assistant", "y" * 1000, "2026-07-18T09:00:00+00:00") for _ in range(30)]
     text, _m = build_session_tail_view(_SESSION, msgs, total=30, window=30, tzname="UTC")
     assert len(text) <= 4096
+
+
+# --- /sessions list excludes empty sessions -------------------------------- #
+
+class _FakeRouter:
+    def __init__(self, sessions, counts, current):
+        self._s, self._c, self._cur = sessions, counts, current
+
+    async def get_last_session(self, _channel_key):
+        return self._cur
+
+    async def list_sessions(self, limit=20):
+        return self._s
+
+    async def count_session_messages(self, session_id):
+        return self._c.get(session_id, 0)
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_excludes_empty_sessions():
+    from nerve.channels.telegram import TelegramChannel
+    sessions = [
+        {"id": "has111", "title": "Has messages", "source": "telegram"},
+        {"id": "empty2", "title": "empty2", "source": "web"},       # 0 messages
+    ]
+    ch = TelegramChannel.__new__(TelegramChannel)   # bypass __init__; only .router needed
+    ch.router = _FakeRouter(sessions, {"has111": 4, "empty2": 0}, current="has111")
+    _text, markup = await ch._sessions_view_for("telegram:1")
+    cbs = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "sess:has111" in cbs        # non-empty shown
+    assert "sess:empty2" not in cbs    # empty hidden
+    assert "sess:new" in cbs           # New button still present
 
 
 def test_tail_empty_session():
