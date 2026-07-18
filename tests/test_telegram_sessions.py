@@ -173,6 +173,7 @@ def test_tail_stays_within_telegram_message_limit():
 class _FakeRouter:
     def __init__(self, sessions, counts, current):
         self._s, self._c, self._cur = sessions, counts, current
+        self.count_calls = 0
 
     async def get_last_session(self, _channel_key):
         return self._cur
@@ -181,6 +182,7 @@ class _FakeRouter:
         return self._s
 
     async def count_session_messages(self, session_id):
+        self.count_calls += 1
         return self._c.get(session_id, 0)
 
 
@@ -198,6 +200,24 @@ async def test_sessions_list_excludes_empty_sessions():
     assert "sess:has111" in cbs        # non-empty shown
     assert "sess:empty2" not in cbs    # empty hidden
     assert "sess:new" in cbs           # New button still present
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_caps_at_button_limit_and_stops_counting():
+    from nerve.channels.telegram import TelegramChannel, _SESSIONS_BUTTON_LIMIT
+    sessions = [
+        {"id": f"s{n:02d}", "title": f"S{n}", "source": "telegram"} for n in range(12)
+    ]
+    counts = {s["id"]: 5 for s in sessions}
+    ch = TelegramChannel.__new__(TelegramChannel)
+    ch.router = _FakeRouter(sessions, counts, current="s00")
+    _text, markup = await ch._sessions_view_for("telegram:1")
+    session_btns = [
+        b for row in markup.inline_keyboard for b in row
+        if b.callback_data.startswith("sess:") and b.callback_data != "sess:new"
+    ]
+    assert len(session_btns) == _SESSIONS_BUTTON_LIMIT       # keyboard capped
+    assert ch.router.count_calls == _SESSIONS_BUTTON_LIMIT   # stopped counting early
 
 
 def test_tail_empty_session():
