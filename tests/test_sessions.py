@@ -229,6 +229,31 @@ class TestChannelMapping:
         with pytest.raises(ValueError, match="not found"):
             await sm.set_active_session("telegram:123", "nonexistent")
 
+    async def test_explicit_switch_survives_sticky_period(
+        self, sm: SessionManager, db: Database,
+    ):
+        """An explicit switch routes the next message to the chosen session even
+        when it was idle far beyond the sticky period.
+
+        Channels without a per-message session id (e.g. Telegram) resolve the
+        target via get_active_session, whose sticky-period check would otherwise
+        reject a long-idle session and mint a fresh one — silently discarding the
+        user's switch. set_active_session marks the chosen session freshly active
+        so the choice is honoured.
+        """
+        await sm.get_or_create("old-sess", source="telegram")
+        await db.update_session_fields(
+            "old-sess", {"last_activity_at": "2020-01-01T00:00:00+00:00"},
+        )
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = ?",
+            ("old-sess",),
+        )
+        await db.db.commit()
+        await sm.set_active_session("telegram:777", "old-sess")   # explicit switch
+        sid = await sm.get_active_session("telegram:777", source="telegram")
+        assert sid == "old-sess"    # honoured, not rotated to a fresh session
+
 
 @pytest.mark.asyncio
 class TestRunningState:

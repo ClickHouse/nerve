@@ -315,6 +315,14 @@ class SessionManager:
         if not session:
             raise ValueError(f"Session not found: {session_id}")
         await self.db.set_channel_session(channel_key, session_id)
+        # An explicit switch is a deliberate choice: the next inbound message must
+        # route to this session regardless of how long it has been idle. Mark it
+        # freshly active (this also bumps updated_at) so get_active_session's
+        # sticky-period check honours the switch instead of minting a new session.
+        await self.db.update_session_fields(
+            session_id,
+            {"last_activity_at": datetime.now(timezone.utc).isoformat()},
+        )
         logger.info("Channel %s -> session %s", channel_key, session_id)
 
     # ------------------------------------------------------------------ #
