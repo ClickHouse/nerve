@@ -51,6 +51,24 @@ class TestLifecycleTransitions:
         assert session["sdk_session_id"] == "sdk-1"
         assert session["connected_at"] == "2024-01-01T00:00:00"
 
+    async def test_mark_active_advances_last_activity_despite_old_connected_at(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Resuming an SDK client passes the ORIGINAL connected_at; last_activity_at
+        must still advance to now, since it drives channel stickiness. Regression:
+        last_activity_at was pinned to connected_at, freezing it at session start."""
+        from datetime import datetime, timezone
+        await sm.get_or_create("trans-la")
+        old = "2020-01-01T00:00:00+00:00"
+        await sm.mark_active("trans-la", sdk_session_id="sdk-la", connected_at=old)
+        session = await db.get_session("trans-la")
+        # connected_at is preserved (the stable original connect time)...
+        assert session["connected_at"] == old
+        # ...but last_activity_at reflects real current activity, not the old connect.
+        assert session["last_activity_at"] != old
+        last = datetime.fromisoformat(session["last_activity_at"])
+        assert (datetime.now(timezone.utc) - last).total_seconds() < 60
+
     async def test_mark_idle_preserves_sdk_id(self, sm: SessionManager, db: Database):
         await sm.get_or_create("trans-2")
         await sm.mark_active("trans-2", sdk_session_id="sdk-2")
@@ -176,6 +194,26 @@ class TestChannelMapping:
         await db.db.commit()
         sid2 = await sm.get_active_session("telegram:444", source="telegram")
         assert sid1 != sid2
+
+    async def test_resumed_long_lived_session_stays_sticky_after_turn(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Regression: a long-lived session that just had a turn must not be rotated.
+
+        On resume the engine calls mark_active() with the session's ORIGINAL
+        connected_at. That used to pin last_activity_at to session start, so once
+        the session was older than sticky_period_minutes, the next inbound message
+        forked a fresh session even though a turn had just completed. last_activity_at
+        must track the turn, so the same session is reused.
+        """
+        sid1 = await sm.get_active_session("telegram:555", source="telegram")
+        # A turn resumes hours after the session first connected (original
+        # connected_at is far in the past), then the turn finishes and goes idle.
+        old_connect = "2020-01-01T00:00:00+00:00"
+        await sm.mark_active(sid1, sdk_session_id="sdk-r", connected_at=old_connect)
+        await sm.mark_idle(sid1)
+        sid2 = await sm.get_active_session("telegram:555", source="telegram")
+        assert sid1 == sid2
 
     async def test_set_and_get_active_session(self, sm: SessionManager, db: Database):
         await sm.get_or_create("ch-1")
