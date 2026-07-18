@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nerve.notifications import handlers as _handlers
+from nerve.notifications.date_render import render_iso_dates
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -229,6 +230,12 @@ class NotificationService:
                 stamped + counted as an override for audit.
         """
         notification_id = f"notif-{uuid.uuid4().hex[:8]}"
+        # Render <YYYY-MM-DD[ HH:MM]> placeholders before silence matching
+        # so rules can target the human-readable form ("24 June") and so
+        # persisted/delivered text matches what the user sees.
+        locale = self.config.notifications.date_locale
+        title = render_iso_dates(title, locale=locale)
+        body = render_iso_dates(body, locale=locale)
         match = await self._match_silence(title, body)
 
         if match and not force:
@@ -296,6 +303,8 @@ class NotificationService:
         the answer is injected as a user message into the originating session.
         """
         notification_id = f"ask-{uuid.uuid4().hex[:8]}"
+        title = render_iso_dates(title)
+        body = render_iso_dates(body)
         hours = expiry_hours or self.config.notifications.default_expiry_hours
         expires_at = (
             datetime.now(timezone.utc) + timedelta(hours=hours)
@@ -343,6 +352,8 @@ class NotificationService:
         Returns ``{"notification_id": <id>, "status": "sent"}``.
         """
         notification_id = f"approval-{uuid.uuid4().hex[:8]}"
+        title = render_iso_dates(title)
+        body = render_iso_dates(body)
 
         # Resolve options. Default to the registered dispatcher's
         # canonical set when none was passed. Falling back to the
