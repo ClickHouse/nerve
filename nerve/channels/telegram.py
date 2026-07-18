@@ -1064,12 +1064,18 @@ class TelegramChannel(BaseChannel):
         """
         current = await self.router.get_last_session(channel_key)
         sessions = await self.router.list_sessions(limit=30)
-        sessions = [s for s in sessions if s.get("source") in ("telegram", "web")]
-        # Drop empty (0-message) sessions — nothing to switch to or catch up on.
-        non_empty = []
+        # Keep the most-recent interactive sessions that have history: empty
+        # (0-message) sessions are useless to switch to, and cron/automation
+        # sessions are never switch targets. Stop once the keyboard is full so
+        # we don't count every session.
+        non_empty: list[dict] = []
         for s in sessions:
+            if s.get("source") not in ("telegram", "web"):
+                continue
             if await self.router.count_session_messages(s["id"]) > 0:
                 non_empty.append(s)
+                if len(non_empty) >= _SESSIONS_BUTTON_LIMIT:
+                    break
         return build_sessions_view(non_empty, current)
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
