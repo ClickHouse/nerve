@@ -661,8 +661,11 @@ class SessionManager:
         Cron/persistent sessions are excluded from the short cutoff and only
         hit the ``archive_after_days`` backstop. Starred sessions are exempt
         from every auto-archival path (short cutoff, backstop, and the
-        max-session overflow eviction) — a starred session is kept until it is
-        explicitly unstarred or deleted. Returns cleanup statistics.
+        max-session overflow eviction) and are off-budget for the
+        ``max_sessions`` cap — they are neither counted toward it nor evicted,
+        so the cap governs only cap-eligible (non-starred) sessions. A starred
+        session is kept until it is explicitly unstarred or deleted. Returns
+        cleanup statistics.
         """
         now = datetime.now(timezone.utc)
 
@@ -692,8 +695,10 @@ class SessionManager:
         for s in stale:
             await self.archive_session(s["id"])
 
-        # Enforce max session count (archive oldest beyond limit)
-        count = await self.db.count_active_sessions()
+        # Enforce max session count (archive oldest beyond limit). Starred
+        # sessions are off-budget: excluded from the count and never evicted,
+        # so the cap governs only cap-eligible (non-starred) sessions.
+        count = await self.db.count_active_sessions(exclude_starred=True)
         overflow = 0
         if count > max_sessions:
             excess = await self.db.get_oldest_sessions(

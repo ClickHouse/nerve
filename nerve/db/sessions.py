@@ -332,11 +332,17 @@ class SessionStore:
         async with self.db.execute(query, (*sources, before_iso)) as cursor:
             return [dict(row) async for row in cursor]
 
-    async def count_active_sessions(self) -> int:
-        """Count non-archived sessions."""
-        async with self.db.execute(
-            "SELECT COUNT(*) FROM sessions WHERE status != 'archived'"
-        ) as cursor:
+    async def count_active_sessions(self, exclude_starred: bool = False) -> int:
+        """Count non-archived sessions.
+
+        When ``exclude_starred`` is set, starred sessions are omitted: they are
+        off-budget for the ``max_sessions`` cap, so the overflow check counts
+        only cap-eligible sessions.
+        """
+        query = "SELECT COUNT(*) FROM sessions WHERE status != 'archived'"
+        if exclude_starred:
+            query += " AND starred = 0"
+        async with self.db.execute(query) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 

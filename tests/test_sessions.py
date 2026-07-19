@@ -489,23 +489,47 @@ class TestArchiveAndCleanup:
 
         assert (await db.get_session("stale-star"))["status"] == "idle"
 
-    async def test_starred_exempt_from_overflow_eviction(
+    async def test_starred_off_budget_no_eviction_when_only_starred(
         self, sm: SessionManager, db: Database,
     ):
-        """Starred sessions are never evicted to enforce the session-count cap."""
-        await sm.get_or_create("keep-star")
-        await db.update_session_fields(
-            "keep-star", {"status": "idle", "starred": 1},
-        )
+        """Starred sessions are off-budget: a population of only starred
+        sessions over the cap triggers no overflow eviction at all."""
         for i in range(3):
-            sid = f"evictable-{i}"
+            sid = f"star-{i}"
+            await sm.get_or_create(sid)
+            await db.update_session_fields(sid, {"status": "idle", "starred": 1})
+
+        stats = await sm.run_cleanup(archive_after_days=30, max_sessions=1)
+
+        assert stats["archived_overflow"] == 0
+        for i in range(3):
+            assert (await db.get_session(f"star-{i}"))["status"] == "idle"
+
+    async def test_overflow_bounds_unstarred_and_ignores_starred(
+        self, sm: SessionManager, db: Database,
+    ):
+        """The cap governs only non-starred sessions: starred are off-budget
+        and untouched, while unstarred are evicted down to the limit."""
+        for i in range(2):
+            sid = f"kept-star-{i}"
+            await sm.get_or_create(sid)
+            await db.update_session_fields(sid, {"status": "idle", "starred": 1})
+        for i in range(3):
+            sid = f"disposable-{i}"
             await sm.get_or_create(sid)
             await db.update_session_fields(sid, {"status": "idle"})
 
         await sm.run_cleanup(archive_after_days=30, max_sessions=1)
 
-        # The starred session survives even though it counts toward the cap.
-        assert (await db.get_session("keep-star"))["status"] == "idle"
+        # Both starred survive (off-budget, non-evictable).
+        for i in range(2):
+            assert (await db.get_session(f"kept-star-{i}"))["status"] == "idle"
+        # Unstarred are bounded to the cap regardless of the starred count.
+        live_unstarred = [
+            s for s in await db.list_sessions(include_archived=False)
+            if not s.get("starred")
+        ]
+        assert len(live_unstarred) == 1
 
     async def test_set_and_toggle_starred(self, sm: SessionManager, db: Database):
         await sm.get_or_create("star-me")
