@@ -368,6 +368,13 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 
+**Starred sessions are exempt from all auto-archival.** A session starred via
+the star toggle (web sidebar, or the Telegram `/sessions` list / `/star`) is
+never auto-closed: it is skipped by the idle cutoff and the
+`archive_after_days` backstop, and is off-budget for `max_sessions` — neither
+counted toward the cap nor evicted. It stays resumable until explicitly
+unstarred, archived, or deleted.
+
 ## Retention
 
 Opt-in `nerve.db` maintenance. Disabled by default. When enabled, a background
