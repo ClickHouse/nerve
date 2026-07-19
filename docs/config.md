@@ -365,6 +365,7 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `sessions.archive_after_days` | int | `30` | Auto-archive idle/stopped sessions older than this |
+| `sessions.interactive_archive_after_hours` | int | `0` | Auto-close interactive (web/telegram/…) sessions after this many idle hours (`0` = disabled; opt-in). Cron/persistent sessions are unaffected. |
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 
