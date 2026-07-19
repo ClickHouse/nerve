@@ -457,6 +457,67 @@ class TestArchiveAndCleanup:
 
         assert (await db.get_session("idle-cron"))["status"] == "idle"
 
+    async def test_starred_exempt_from_interactive_cutoff(
+        self, sm: SessionManager, db: Database,
+    ):
+        """A starred interactive session survives the short idle cutoff."""
+        await sm.get_or_create("idle-star", source="web")
+        await self._set_idle_hours_ago(db, "idle-star", hours=5)
+        await sm.set_starred("idle-star", True)
+
+        stats = await sm.run_cleanup(
+            archive_after_days=30, interactive_archive_after_hours=1,
+        )
+
+        assert stats["archived_interactive"] == 0
+        assert (await db.get_session("idle-star"))["status"] == "idle"
+
+    async def test_starred_exempt_from_stale_backstop(
+        self, sm: SessionManager, db: Database,
+    ):
+        """A starred session survives the long age backstop."""
+        await sm.get_or_create("stale-star")
+        await db.update_session_fields(
+            "stale-star", {"status": "idle", "starred": 1},
+        )
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = 'stale-star'"
+        )
+        await db.db.commit()
+
+        await sm.run_cleanup(archive_after_days=30, max_sessions=1000)
+
+        assert (await db.get_session("stale-star"))["status"] == "idle"
+
+    async def test_starred_exempt_from_overflow_eviction(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Starred sessions are never evicted to enforce the session-count cap."""
+        await sm.get_or_create("keep-star")
+        await db.update_session_fields(
+            "keep-star", {"status": "idle", "starred": 1},
+        )
+        for i in range(3):
+            sid = f"evictable-{i}"
+            await sm.get_or_create(sid)
+            await db.update_session_fields(sid, {"status": "idle"})
+
+        await sm.run_cleanup(archive_after_days=30, max_sessions=1)
+
+        # The starred session survives even though it counts toward the cap.
+        assert (await db.get_session("keep-star"))["status"] == "idle"
+
+    async def test_set_and_toggle_starred(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("star-me")
+        assert await sm.set_starred("star-me", True) is True
+        assert (await db.get_session("star-me"))["starred"] == 1
+        assert await sm.toggle_starred("star-me") is False
+        assert (await db.get_session("star-me"))["starred"] == 0
+
+    async def test_set_starred_not_found(self, sm: SessionManager):
+        with pytest.raises(ValueError):
+            await sm.set_starred("nonexistent", True)
+
 
 @pytest.mark.asyncio
 class TestOrphanRecovery:

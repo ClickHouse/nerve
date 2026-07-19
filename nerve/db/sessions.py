@@ -282,13 +282,18 @@ class SessionStore:
     async def get_stale_sessions(
         self, before_iso: str, exclude_ids: list[str] | None = None,
     ) -> list[dict]:
-        """Get idle/stopped/error sessions not updated since before_iso."""
+        """Get idle/stopped/error sessions not updated since before_iso.
+
+        Starred sessions are excluded: a starred session is never
+        auto-archived, regardless of how long it has been idle.
+        """
         excludes = exclude_ids or []
         if excludes:
             placeholders = ",".join("?" for _ in excludes)
             query = f"""
                 SELECT * FROM sessions
                 WHERE status IN ('idle', 'stopped', 'error')
+                AND starred = 0
                 AND updated_at < ?
                 AND id NOT IN ({placeholders})
             """
@@ -297,6 +302,7 @@ class SessionStore:
             query = """
                 SELECT * FROM sessions
                 WHERE status IN ('idle', 'stopped', 'error')
+                AND starred = 0
                 AND updated_at < ?
             """
             params = (before_iso,)
@@ -310,7 +316,8 @@ class SessionStore:
 
         Scoped by ``source`` (web/telegram/…) so cron and persistent sessions
         keep their own long rotation and are never archived at the short
-        interactive cutoff. Returns [] when ``sources`` is empty.
+        interactive cutoff. Starred sessions are also excluded — a starred
+        session is never auto-archived. Returns [] when ``sources`` is empty.
         """
         if not sources:
             return []
@@ -318,6 +325,7 @@ class SessionStore:
         query = f"""
             SELECT * FROM sessions
             WHERE status IN ('idle', 'stopped', 'error')
+              AND starred = 0
               AND source IN ({src})
               AND updated_at < ?
         """
@@ -335,13 +343,18 @@ class SessionStore:
     async def get_oldest_sessions(
         self, count: int, exclude_ids: list[str] | None = None,
     ) -> list[dict]:
-        """Get the oldest non-active, non-archived sessions for cleanup."""
+        """Get the oldest non-active, non-archived sessions for cleanup.
+
+        Starred sessions are excluded: they are never evicted to enforce the
+        session-count limit.
+        """
         excludes = exclude_ids or []
         if excludes:
             placeholders = ",".join("?" for _ in excludes)
             query = f"""
                 SELECT * FROM sessions
                 WHERE status NOT IN ('active', 'archived')
+                AND starred = 0
                 AND id NOT IN ({placeholders})
                 ORDER BY updated_at ASC LIMIT ?
             """
@@ -350,6 +363,7 @@ class SessionStore:
             query = """
                 SELECT * FROM sessions
                 WHERE status NOT IN ('active', 'archived')
+                AND starred = 0
                 ORDER BY updated_at ASC LIMIT ?
             """
             params = (count,)
