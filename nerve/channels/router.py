@@ -434,10 +434,6 @@ class ChannelRouter:
         """Star/unstar a session. Starred sessions are never auto-archived."""
         return await self.engine.sessions.set_starred(session_id, starred)
 
-    async def toggle_session_starred(self, session_id: str) -> bool:
-        """Toggle a session's starred flag. Returns the new state."""
-        return await self.engine.sessions.toggle_starred(session_id)
-
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""
         return await self.engine.db.get_session(session_id)

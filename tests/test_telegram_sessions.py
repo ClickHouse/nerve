@@ -239,67 +239,28 @@ def test_tail_active_status_shows_live_emoji():
 
 # --- star (kept-alive) toggle --------------------------------------------- #
 
-def test_starred_session_shows_marker_and_filled_toggle():
+def test_starred_session_shows_marker_in_label_without_toggle_button():
     sessions = [
         {"id": "aaaa1111", "title": "Kept", "source": "web", "starred": True},
         {"id": "bbbb2222", "title": "Normal", "source": "web"},
     ]
     _text, markup = build_sessions_view(sessions, current_id=None)
     by_cb = {b.callback_data: b for b in _flat(markup)}
-    # Starred: switch label carries ⭐; its toggle button is the filled star.
+    # Starred: the switch label carries the ⭐ marker (read-only indicator).
     assert by_cb["sess:aaaa1111"].text == "⭐ Kept"
-    assert by_cb["sessstar:aaaa1111"].text == "⭐"
-    # Normal: no marker; toggle button is the hollow star.
+    # Normal: no marker.
     assert by_cb["sess:bbbb2222"].text == "Normal"
-    assert by_cb["sessstar:bbbb2222"].text == "☆"
+    # No per-row star toggle buttons — starring is via /star and /unstar, so the
+    # switch list stays one tap-to-switch button per row (no cramped 2nd column
+    # that Telegram would render half a row wide).
+    assert not any(
+        (b.callback_data or "").startswith("sessstar:") for b in _flat(markup)
+    )
 
 
 def test_sessions_view_explains_star_keeps_alive():
     text, _markup = build_sessions_view(
         [{"id": "aaaa1111", "title": "Work", "source": "web"}], current_id=None,
     )
-    assert "keeps a session alive" in text
-
-
-@pytest.mark.asyncio
-async def test_sessstar_callback_toggles_and_rerenders():
-    from nerve.channels.telegram import TelegramChannel
-
-    sessions = [{"id": "keep01", "title": "Keep", "source": "web"}]
-    ch = TelegramChannel.__new__(TelegramChannel)
-    router = _FakeRouter(sessions, {"keep01": 3}, current="keep01")
-    toggled = {}
-
-    async def _toggle(sid):
-        toggled["sid"] = sid
-        return True
-
-    router.toggle_session_starred = _toggle
-    ch.router = router
-
-    edited = {}
-
-    async def _safe_edit(query, text, markup, **kw):
-        edited["text"] = text
-
-    ch._safe_edit = _safe_edit
-
-    answers = []
-
-    class _Chat:
-        id = 1
-
-    class _Msg:
-        chat = _Chat()
-
-    class _Query:
-        data = "sessstar:keep01"
-        message = _Msg()
-
-        async def answer(self, *a, **k):
-            answers.append(a[0] if a else "")
-
-    await ch._handle_session_button(_Query())
-    assert toggled["sid"] == "keep01"          # toggle routed with the id
-    assert edited                              # list re-rendered in place
-    assert answers and "Kept alive" in answers[0]
+    assert "kept alive" in text.lower()
+    assert "/star" in text
