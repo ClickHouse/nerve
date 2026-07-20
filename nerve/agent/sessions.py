@@ -175,11 +175,21 @@ class SessionManager:
         sdk_session_id: str | None = None,
         connected_at: str | None = None,
     ) -> None:
-        """Mark session as active with an SDK client."""
-        now = connected_at or datetime.now(timezone.utc).isoformat()
+        """Mark session as active with an SDK client.
+
+        ``connected_at`` is the (stable) time the SDK client connected; callers
+        pass the original value when resuming an existing client so it is
+        preserved across turns. ``last_activity_at`` must instead always advance
+        to the real current time, because it drives channel stickiness
+        (see :meth:`_is_within_sticky_period`). Pinning it to ``connected_at``
+        froze it at session start, so any session older than
+        ``sticky_period_minutes`` was wrongly rotated onto a fresh session on
+        the next inbound message even when a turn had just completed.
+        """
+        now = datetime.now(timezone.utc).isoformat()
         fields: dict[str, Any] = {
             "status": SessionStatus.ACTIVE.value,
-            "connected_at": now,
+            "connected_at": connected_at or now,
             "last_activity_at": now,
         }
         if sdk_session_id is not None:
@@ -308,6 +318,14 @@ class SessionManager:
         if not session:
             raise ValueError(f"Session not found: {session_id}")
         await self.db.set_channel_session(channel_key, session_id)
+        # An explicit switch is a deliberate choice: the next inbound message must
+        # route to this session regardless of how long it has been idle. Mark it
+        # freshly active (this also bumps updated_at) so get_active_session's
+        # sticky-period check honours the switch instead of minting a new session.
+        await self.db.update_session_fields(
+            session_id,
+            {"last_activity_at": datetime.now(timezone.utc).isoformat()},
+        )
         logger.info("Channel %s -> session %s", channel_key, session_id)
 
     # ------------------------------------------------------------------ #

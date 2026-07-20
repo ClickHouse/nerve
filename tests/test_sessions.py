@@ -52,6 +52,24 @@ class TestLifecycleTransitions:
         assert session["sdk_session_id"] == "sdk-1"
         assert session["connected_at"] == "2024-01-01T00:00:00"
 
+    async def test_mark_active_advances_last_activity_despite_old_connected_at(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Resuming an SDK client passes the ORIGINAL connected_at; last_activity_at
+        must still advance to now, since it drives channel stickiness. Regression:
+        last_activity_at was pinned to connected_at, freezing it at session start."""
+        from datetime import datetime, timezone
+        await sm.get_or_create("trans-la")
+        old = "2020-01-01T00:00:00+00:00"
+        await sm.mark_active("trans-la", sdk_session_id="sdk-la", connected_at=old)
+        session = await db.get_session("trans-la")
+        # connected_at is preserved (the stable original connect time)...
+        assert session["connected_at"] == old
+        # ...but last_activity_at reflects real current activity, not the old connect.
+        assert session["last_activity_at"] != old
+        last = datetime.fromisoformat(session["last_activity_at"])
+        assert (datetime.now(timezone.utc) - last).total_seconds() < 60
+
     async def test_mark_idle_preserves_sdk_id(self, sm: SessionManager, db: Database):
         await sm.get_or_create("trans-2")
         await sm.mark_active("trans-2", sdk_session_id="sdk-2")
@@ -178,6 +196,26 @@ class TestChannelMapping:
         sid2 = await sm.get_active_session("telegram:444", source="telegram")
         assert sid1 != sid2
 
+    async def test_resumed_long_lived_session_stays_sticky_after_turn(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Regression: a long-lived session that just had a turn must not be rotated.
+
+        On resume the engine calls mark_active() with the session's ORIGINAL
+        connected_at. That used to pin last_activity_at to session start, so once
+        the session was older than sticky_period_minutes, the next inbound message
+        forked a fresh session even though a turn had just completed. last_activity_at
+        must track the turn, so the same session is reused.
+        """
+        sid1 = await sm.get_active_session("telegram:555", source="telegram")
+        # A turn resumes hours after the session first connected (original
+        # connected_at is far in the past), then the turn finishes and goes idle.
+        old_connect = "2020-01-01T00:00:00+00:00"
+        await sm.mark_active(sid1, sdk_session_id="sdk-r", connected_at=old_connect)
+        await sm.mark_idle(sid1)
+        sid2 = await sm.get_active_session("telegram:555", source="telegram")
+        assert sid1 == sid2
+
     async def test_set_and_get_active_session(self, sm: SessionManager, db: Database):
         await sm.get_or_create("ch-1")
         await sm.set_active_session("telegram:123", "ch-1")
@@ -191,6 +229,31 @@ class TestChannelMapping:
     async def test_set_active_session_not_found(self, sm: SessionManager):
         with pytest.raises(ValueError, match="not found"):
             await sm.set_active_session("telegram:123", "nonexistent")
+
+    async def test_explicit_switch_survives_sticky_period(
+        self, sm: SessionManager, db: Database,
+    ):
+        """An explicit switch routes the next message to the chosen session even
+        when it was idle far beyond the sticky period.
+
+        Channels without a per-message session id (e.g. Telegram) resolve the
+        target via get_active_session, whose sticky-period check would otherwise
+        reject a long-idle session and mint a fresh one — silently discarding the
+        user's switch. set_active_session marks the chosen session freshly active
+        so the choice is honoured.
+        """
+        await sm.get_or_create("old-sess", source="telegram")
+        await db.update_session_fields(
+            "old-sess", {"last_activity_at": "2020-01-01T00:00:00+00:00"},
+        )
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = ?",
+            ("old-sess",),
+        )
+        await db.db.commit()
+        await sm.set_active_session("telegram:777", "old-sess")   # explicit switch
+        sid = await sm.get_active_session("telegram:777", source="telegram")
+        assert sid == "old-sess"    # honoured, not rotated to a fresh session
 
 
 @pytest.mark.asyncio
