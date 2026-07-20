@@ -48,13 +48,29 @@ class SessionStore:
     async def list_sessions(
         self, limit: int = 50, include_archived: bool = False,
     ) -> list[dict]:
+        """List sessions, most recently updated first.
+
+        Starred sessions are always included regardless of ``limit``;
+        the limit only bounds the non-starred ones.
+        """
         if include_archived:
-            query = "SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?"
-            params = (limit,)
+            query = (
+                "SELECT * FROM sessions"
+                " WHERE starred = 1"
+                "    OR id IN (SELECT id FROM sessions WHERE starred = 0"
+                "              ORDER BY updated_at DESC LIMIT ?)"
+                " ORDER BY updated_at DESC"
+            )
         else:
-            query = "SELECT * FROM sessions WHERE status != 'archived' ORDER BY updated_at DESC LIMIT ?"
-            params = (limit,)
-        async with self.db.execute(query, params) as cursor:
+            query = (
+                "SELECT * FROM sessions"
+                " WHERE (starred = 1 AND status != 'archived')"
+                "    OR id IN (SELECT id FROM sessions"
+                "              WHERE starred = 0 AND status != 'archived'"
+                "              ORDER BY updated_at DESC LIMIT ?)"
+                " ORDER BY updated_at DESC"
+            )
+        async with self.db.execute(query, (limit,)) as cursor:
             return [dict(row) async for row in cursor]
 
     async def count_sessions(self, include_archived: bool = False) -> int:

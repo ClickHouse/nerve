@@ -598,7 +598,11 @@ class SessionManager:
     async def list_sessions(
         self, limit: int = 50, include_archived: bool = False,
     ) -> list[dict]:
-        """List sessions, most recently updated first."""
+        """List sessions, most recently updated first.
+
+        Starred sessions are always included; ``limit`` only bounds the
+        non-starred ones.
+        """
         return await self.db.list_sessions(
             limit=limit, include_archived=include_archived,
         )
