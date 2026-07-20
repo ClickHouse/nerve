@@ -83,6 +83,51 @@ def build_source_runners(
             ))
             logger.info("Registered source: %s (batch=%d)", source.source_name, gmail.batch_size)
 
+    # IMAP — one source per mailbox, each with an independent cursor.
+    # Passwords come from sync.imap.passwords (config.local.yaml), keyed by
+    # username, so no credential ever sits in the tracked config.
+    imap = config.sync.imap
+    if imap.enabled and imap.accounts:
+        from nerve.sources.imap import ImapSource
+
+        for account in imap.accounts:
+            password = imap.passwords.get(account.username, "")
+            if not password:
+                logger.warning(
+                    "Skipping IMAP source %s: no password for %s in "
+                    "sync.imap.passwords",
+                    account.label, account.username,
+                )
+                continue
+            source = ImapSource(
+                host=account.host,
+                port=account.port,
+                username=account.username,
+                password=password,
+                mailbox=account.mailbox,
+                label=account.label,
+                analyze_envelopes=imap.analyze_envelopes,
+                envelope_only=imap.envelope_only,
+                initial_lookback_days=imap.initial_lookback_days,
+                vision_model=imap.vision_model or config.memory.fast_model,
+                vision_client_factory=condense_factory,
+                envelope_messages=imap.envelope_messages,
+            )
+            runners.append(SourceRunner(
+                source=source,
+                db=db,
+                batch_size=imap.batch_size,
+                condense=imap.condense,
+                condense_model=condense_model,
+                condense_prompt=imap.condense_prompt or "",
+                condense_client_factory=condense_factory,
+                ttl_days=ttl_days,
+            ))
+            logger.info(
+                "Registered source: %s (batch=%d, envelope_only=%s)",
+                source.source_name, imap.batch_size, imap.envelope_only,
+            )
+
     # GitHub (notifications)
     gh = config.sync.github
     if gh.enabled:
