@@ -526,6 +526,36 @@ class TestCronJobLock:
 
 
 # ---------------------------------------------------------------------------
+# CronJob.effort field (per-job reasoning-effort override)
+# ---------------------------------------------------------------------------
+
+class TestCronJobEffort:
+    def test_default_empty(self):
+        job = _make_job()
+        assert job.effort == ""
+
+    def test_from_dict_default(self):
+        job = CronJob.from_dict({"id": "x", "schedule": "1h", "prompt": "p"})
+        assert job.effort == ""
+
+    def test_from_dict_explicit(self):
+        job = CronJob.from_dict({
+            "id": "x", "schedule": "1h", "prompt": "p", "effort": "high",
+        })
+        assert job.effort == "high"
+
+    def test_round_trips_through_save_load(self, tmp_path):
+        from nerve.cron.jobs import load_jobs, save_jobs
+
+        job = CronJob.from_dict({
+            "id": "x", "schedule": "1h", "prompt": "p", "effort": "xhigh",
+        })
+        out = tmp_path / "out.yaml"
+        save_jobs([job], out)
+        assert load_jobs(out)[0].effort == "xhigh"
+
+
+# ---------------------------------------------------------------------------
 # Job lock (concurrent run serialization)
 # ---------------------------------------------------------------------------
 
