@@ -19,10 +19,12 @@ import subprocess
 import sys
 import time
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
@@ -218,6 +220,204 @@ def _format_reply_context(message: Any) -> str:
             parts.append(f'[Quoted: "{quote_text}"]')
 
     return "\n".join(parts)
+
+
+# Inline-keyboard /sessions rendering ------------------------------------- #
+_SESSIONS_BUTTON_LIMIT = 8      # keep the keyboard thumb-friendly on mobile
+_SESSION_LABEL_MAX = 40         # Telegram wraps long button labels poorly
+
+
+def _session_label(session: dict, current_id: str | None) -> str:
+    """Button label for one session: title (or short id), current marked ✓."""
+    title = (session.get("title") or "").strip() or session.get("id", "?")
+    if len(title) > _SESSION_LABEL_MAX:
+        title = title[: _SESSION_LABEL_MAX - 1] + "…"
+    prefix = "✓ " if session.get("id") == current_id else ""
+    return f"{prefix}{title}"
+
+
+def build_sessions_view(
+    sessions: list[dict], current_id: str | None,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render the /sessions inline keyboard (pure, sync — unit-testable).
+
+    One tap-to-switch button per session (the current one marked ✓), with the
+    session id carried in ``callback_data`` as ``sess:<id>`` — so switching
+    routing takes a single tap and never requires copy-pasting an id on mobile.
+    A trailing ``➕ New session`` button (``sess:new``) starts a fresh one.
+    Returns ``(message_text, keyboard)``.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in sessions[:_SESSIONS_BUTTON_LIMIT]:
+        sid = s.get("id")
+        cb = f"sess:{sid}"
+        # callback_data is capped at 64 bytes by Telegram; interactive session
+        # ids are short, but guard defensively so a button always round-trips.
+        if sid is None or len(cb.encode("utf-8")) > 64:
+            continue
+        rows.append(
+            [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
+        )
+    rows.append([InlineKeyboardButton("➕ New session", callback_data="sess:new")])
+
+    # The New-session button switches routing to a fresh session WITHOUT
+    # stopping the current one (unlike /new). A session switched away from
+    # keeps running any in-flight turn and still delivers its result to the
+    # chat (output is bound per-session, not to the channel's current map).
+    if rows[:-1]:
+        current_title = next(
+            (
+                (s.get("title") or s.get("id"))
+                for s in sessions
+                if s.get("id") == current_id
+            ),
+            None,
+        )
+        text = "🗂 Sessions — tap to switch."
+        if current_title:
+            text += f"\nCurrent: {current_title}"
+        text += "\n➕ New session keeps the current one running."
+    else:
+        text = "No sessions yet — tap ➕ to start one."
+    return text, InlineKeyboardMarkup(rows)
+
+
+# Catch-up tail shown after switching to a session -------------------------- #
+_TAIL_WINDOW = 8        # messages fetched for the catch-up view on switch
+_TAIL_STEP = 8          # extra messages fetched per "Load more"
+_TAIL_MAX = 30          # hard cap on how many messages to fetch
+# Rendered-card char budget. The newest message (usually the one you most want
+# to read) gets first claim up to _NEWEST_MAX; older messages get _OLDER_CAP
+# each from what remains. Bodies render as expandable blockquotes, so long
+# messages collapse to a few lines and expand in place — no hard truncation for
+# normal-sized messages, while the whole card stays under Telegram's 4096 limit.
+_TAIL_CARD_MAX = 3800   # max chars of the assembled HTML card (< Telegram's 4096)
+_NEWEST_MAX = 2000      # newest message body clip (raw) — it gets first/largest claim
+_OLDER_CAP = 700        # older message body clip (raw)
+_STATUS_EMOJI = {
+    "active": "🟢",     # a client is connected (live / possibly mid-turn)
+    "running": "🟢",    # defensive alias
+    "idle": "💤",       # no client attached, resumable
+    "stopped": "⏹",
+    "error": "⚠️",
+    "archived": "🗄",
+}
+
+
+def _safe_zone(tzname: str | None):
+    """ZoneInfo for the user's configured tz, or None → fall back to system local."""
+    if not tzname:
+        return None
+    try:
+        return ZoneInfo(tzname)
+    except Exception:
+        return None
+
+
+def _clip(text: str, cap: int) -> str:
+    """Trim to `cap` visible chars and HTML-escape; '…' appended if truncated."""
+    t = (text or "").strip()
+    if len(t) > cap:
+        t = t[:cap].rstrip() + "…"
+    return _html.escape(t) if t else "(no text)"
+
+
+def _fmt_local(iso: str, tz) -> "tuple[str, str]":
+    """Return (day label, HH:MM) for an ISO timestamp in the user's timezone."""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(tz) if tz else dt.astimezone()
+        return local.strftime("%a %b %d"), local.strftime("%H:%M")
+    except Exception:
+        return "", "--:--"
+
+
+def build_session_tail_view(
+    session: dict,
+    messages: list[dict],
+    total: int,
+    window: int,
+    tzname: str | None,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render a session's recent history (HTML) so the user can catch up.
+
+    Native chat order — oldest at the top, most recent at the bottom — with a
+    per-message timestamp converted to the user's timezone (``tzname``) so it
+    matches the Telegram client (the timestamp is often as useful as the text).
+    Each body is an *expandable blockquote*: long messages collapse to a few
+    lines and expand in place on tap, so there is no hard truncation for normal
+    messages. The char budget is newest-first — the most recent message (usually
+    the important one) gets the largest share — while the whole card stays under
+    Telegram's 4096-char limit. ``messages`` is the last ``window`` messages
+    (oldest→newest). "Load more" fetches more older history; it does not change
+    routing. Returns ``(html_text, keyboard)`` — send/edit with ParseMode.HTML.
+    """
+    tz = _safe_zone(tzname)
+    sid = session.get("id", "?")
+    status = session.get("status") or "idle"
+    emoji = _STATUS_EMOJI.get(status, "•")
+    title = _html.escape(str(session.get("title") or sid))
+    header = (
+        f"🗂 <b>{title}</b>\n{emoji} {status} · "
+        f"{total} message" + ("" if total == 1 else "s")
+    )
+
+    if not messages:
+        rows = [[InlineKeyboardButton("🗂 Sessions", callback_data="sess:list")]]
+        return header + "\n\n<i>(no messages yet — send one to begin)</i>", InlineKeyboardMarkup(rows)
+
+    # Greedy newest-first: the newest message is added first with the largest
+    # clip (so it gets the most budget and is never starved); older messages are
+    # added while the assembled card stays within budget. The budget is measured
+    # on the *rendered, HTML-escaped* block length, so entity expansion (e.g. an
+    # apostrophe → "&#x27;") can never push the card past Telegram's 4096 limit.
+    included: list[tuple[str, str]] = []          # (day_label, block) newest-first
+    used = len(header) + 64                        # header + room for the "earlier" line
+    for idx, m in enumerate(reversed(messages)):   # newest → oldest
+        cap = _NEWEST_MAX if idx == 0 else _OLDER_CAP
+        day, hm = _fmt_local(m.get("created_at", ""), tz)
+        who = "🧑" if m.get("role") == "user" else "🤖"
+        block = (
+            f"[{hm}] {who}\n"
+            f"<blockquote expandable>{_clip(m.get('content', ''), cap)}</blockquote>"
+        )
+        cost = len(block) + len(day) + 6           # + possible day separator
+        if idx > 0 and used + cost > _TAIL_CARD_MAX:
+            break                                  # older message doesn't fit
+        included.append((day, block))
+        used += cost
+    included.reverse()                             # oldest→newest for display
+
+    earlier = total - len(included)
+    # "Load more" fetches more history; it only helps when everything fetched was
+    # shown and more exists (window-bound). If messages were dropped to fit the
+    # card (budget-bound), fetching more won't surface them — point to the session.
+    can_load_more = (
+        len(included) == len(messages) and total > window and window < _TAIL_MAX
+    )
+
+    lines = [header]
+    if earlier > 0:
+        hint = "tap Load more" if can_load_more else "open the session for the rest"
+        lines.append(f"<i>… {earlier} earlier — {hint}</i>")
+    last_day = None
+    for day, block in included:
+        if day and day != last_day:
+            lines.append(f"— {day} —")
+            last_day = day
+        lines.append(block)
+    text = "\n".join(lines)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_load_more:
+        nxt = min(window + _TAIL_STEP, _TAIL_MAX)
+        rows.append(
+            [InlineKeyboardButton("⬆️ Load more", callback_data=f"sesstail:{sid}:{nxt}")]
+        )
+    rows.append([InlineKeyboardButton("🗂 Sessions", callback_data="sess:list")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 class TelegramChannel(BaseChannel):
@@ -853,21 +1053,43 @@ class TelegramChannel(BaseChannel):
         except ValueError as e:
             await update.message.reply_text(str(e))
 
+    async def _sessions_view_for(
+        self, channel_key: str,
+    ) -> "tuple[str, InlineKeyboardMarkup]":
+        """Build the inline-keyboard sessions view for a channel.
+
+        Shared by /sessions and the button-press handler so both render the
+        same thing. Only interactive (telegram/web) sessions are offered as
+        switch targets — cron/automation sessions are never listed.
+        """
+        current = await self.router.get_last_session(channel_key)
+        sessions = await self.router.list_sessions(limit=30)
+        # Keep the most-recent interactive sessions that have history: empty
+        # (0-message) sessions are useless to switch to, and cron/automation
+        # sessions are never switch targets. Stop once the keyboard is full so
+        # we don't count every session.
+        non_empty: list[dict] = []
+        for s in sessions:
+            if s.get("source") not in ("telegram", "web"):
+                continue
+            if await self.router.count_session_messages(s["id"]) > 0:
+                non_empty.append(s)
+                if len(non_empty) >= _SESSIONS_BUTTON_LIMIT:
+                    break
+        return build_sessions_view(non_empty, current)
+
     async def _handle_sessions(self, update: Update, context: Any) -> None:
-        """Handle /sessions — list sessions."""
+        """Handle /sessions — native inline keyboard to switch session routing.
+
+        Each recent session is a tap-to-switch button (current marked ✓); the
+        id rides in the button's callback_data, so no id copy-paste is needed.
+        """
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-
-        sessions = await self.router.list_sessions(limit=20)
-        if not sessions:
-            await update.message.reply_text("No sessions.")
-            return
-
-        lines = []
-        for s in sessions:
-            lines.append(f"• `{s['id']}` — {s.get('title', 'untitled')}")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        channel_key = f"telegram:{update.effective_chat.id}"
+        text, markup = await self._sessions_view_for(channel_key)
+        await update.message.reply_text(text, reply_markup=markup)
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
         """Handle /new [title] — stop current session, create and switch to a new one."""
@@ -1496,6 +1718,93 @@ class TelegramChannel(BaseChannel):
     #  Notification callback handlers                                      #
     # ------------------------------------------------------------------ #
 
+    async def _safe_edit(
+        self, query: Any, text: str, markup: Any, parse_mode: Any = None,
+    ) -> None:
+        """edit_message_text, swallowing the benign 'not modified'/transient errors."""
+        try:
+            await query.edit_message_text(
+                text=text, reply_markup=markup, parse_mode=parse_mode,
+            )
+        except Exception:
+            pass
+
+    async def _edit_session_tail(
+        self, query: Any, session_id: str, window: int,
+    ) -> None:
+        """Render a session's recent history (catch-up view) into the card in place."""
+        window = max(1, min(window, _TAIL_MAX))
+        session = await self.router.get_session(session_id)
+        if not session:
+            channel_key = f"telegram:{query.message.chat.id}"
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+        messages = await self.router.get_session_messages(session_id, limit=window)
+        total = await self.router.count_session_messages(session_id)
+        text, markup = build_session_tail_view(
+            session, messages, total, window, self.config.timezone,
+        )
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _handle_session_button(self, query: Any) -> None:
+        """Handle /sessions inline-keyboard presses.
+
+        callback_data forms:
+          ``sess:list``           — (re)show the session switch list
+          ``sess:new``            — create a fresh session (current keeps running)
+          ``sess:<id>``           — switch routing to <id>, then show its history
+          ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
+
+        After a switch/create the card is replaced by that session's recent
+        history (native order, oldest→newest) so the user can catch up — which
+        matters most when switching into a background session they weren't
+        following.
+        """
+        if not query.message:
+            await query.answer()
+            return
+        channel_key = f"telegram:{query.message.chat.id}"
+        data = query.data
+
+        if data == "sess:list":
+            await query.answer()
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+
+        if data.startswith("sesstail:"):
+            parts = data.split(":")
+            sid = parts[1] if len(parts) > 1 else ""
+            try:
+                window = int(parts[2])
+            except (IndexError, ValueError):
+                window = _TAIL_WINDOW
+            await query.answer()
+            await self._edit_session_tail(query, sid, window)
+            return
+
+        # sess:new / sess:<id>
+        target = data.split(":", 1)[1]
+        sid = target
+        try:
+            if target == "new":
+                sid = await self.router.create_session(
+                    channel_key, source="telegram",
+                )
+                await query.answer("Started a new session")
+            else:
+                await self.router.switch_session(channel_key, target)
+                await query.answer("Switched")
+        except ValueError:
+            await query.answer(
+                "That session is no longer available", show_alert=True,
+            )
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+        await self._edit_session_tail(query, sid, _TAIL_WINDOW)
+
     async def _handle_callback_query(self, update: Update, context: Any) -> None:
         """Handle inline keyboard button presses for notification questions."""
         self._touch()
@@ -1505,6 +1814,11 @@ class TelegramChannel(BaseChannel):
 
         if not self._is_authorized(query.from_user.id):
             await query.answer("Unauthorized", show_alert=True)
+            return
+
+        # /sessions inline keyboard: switch/create/list + history buttons.
+        if query.data.startswith("sess:") or query.data.startswith("sesstail:"):
+            await self._handle_session_button(query)
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"
