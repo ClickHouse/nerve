@@ -303,6 +303,27 @@ class SessionStore:
         async with self.db.execute(query, params) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def get_stale_interactive_sessions(
+        self, before_iso: str, sources: list[str],
+    ) -> list[dict]:
+        """Idle/stopped/error *interactive* sessions not updated since before_iso.
+
+        Scoped by ``source`` (web/telegram/…) so cron and persistent sessions
+        keep their own long rotation and are never archived at the short
+        interactive cutoff. Returns [] when ``sources`` is empty.
+        """
+        if not sources:
+            return []
+        src = ",".join("?" for _ in sources)
+        query = f"""
+            SELECT * FROM sessions
+            WHERE status IN ('idle', 'stopped', 'error')
+              AND source IN ({src})
+              AND updated_at < ?
+        """
+        async with self.db.execute(query, (*sources, before_iso)) as cursor:
+            return [dict(row) async for row in cursor]
+
     async def count_active_sessions(self) -> int:
         """Count non-archived sessions."""
         async with self.db.execute(

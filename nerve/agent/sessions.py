@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # Cleanup defaults
 DEFAULT_ARCHIVE_AFTER_DAYS = 30
 DEFAULT_MAX_SESSIONS = 500
+# Sources treated as interactive for the opt-in short idle auto-close. Cron and
+# source-runner sessions are excluded so their context continuity is preserved.
+INTERACTIVE_SOURCES = ["web", "telegram", "discord", "slack", "whatsapp"]
 
 
 class SessionStatus(StrEnum):
@@ -615,12 +618,39 @@ class SessionManager:
         self,
         archive_after_days: int = DEFAULT_ARCHIVE_AFTER_DAYS,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
+        interactive_archive_after_hours: int = 0,
     ) -> dict:
         """Auto-archive stale sessions and enforce limits.
 
-        Returns dict with cleanup statistics.
+        When ``interactive_archive_after_hours`` > 0 (opt-in; 0 disables and leaves the
+        default behavior unchanged), interactive sessions (web/telegram/…)
+        idle longer than that are archived and memorized promptly — including
+        ones parked on an unanswered ``ask_user`` question, whose pending
+        notification is expired so it doesn't dangle on a closed session.
+        Cron/persistent sessions are excluded from the short cutoff and only
+        hit the ``archive_after_days`` backstop. Returns cleanup statistics.
         """
         now = datetime.now(timezone.utc)
+
+        # Opt-in short idle cutoff for interactive sessions. Skipped entirely
+        # when interactive_archive_after_hours == 0, so default behavior is unchanged.
+        archived_interactive = 0
+        if interactive_archive_after_hours and interactive_archive_after_hours > 0:
+            icutoff = (now - timedelta(hours=interactive_archive_after_hours)).isoformat()
+            interactive = await self.db.get_stale_interactive_sessions(
+                icutoff, INTERACTIVE_SOURCES,
+            )
+            for s in interactive:
+                try:
+                    await self.db.expire_pending_questions_for_session(s["id"])
+                except Exception as e:
+                    logger.warning(
+                        "Expire pending questions failed for %s: %s", s["id"], e,
+                    )
+                await self.archive_session(s["id"])
+            archived_interactive = len(interactive)
+
+        # Long backstop cutoff for everything (incl. non-interactive).
         cutoff = (now - timedelta(days=archive_after_days)).isoformat()
 
         # Archive idle/stopped sessions older than cutoff
@@ -640,10 +670,11 @@ class SessionManager:
             overflow = len(excess)
 
         stats = {
+            "archived_interactive": archived_interactive,
             "archived_stale": len(stale),
             "archived_overflow": overflow,
         }
-        if stale or overflow:
+        if archived_interactive or stale or overflow:
             logger.info("Session cleanup: %s", stats)
         return stats
 

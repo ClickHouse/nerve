@@ -237,17 +237,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Cron service failed to start: %s", e)
 
-    # Periodic session cleanup (every 6 hours)
+    # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
+    # it tightens to hourly only when the opt-in interactive idle auto-close
+    # (sessions.interactive_archive_after_hours > 0) is enabled and needs finer resolution.
     async def _periodic_cleanup():
         while True:
-            await asyncio.sleep(6 * 3600)
+            interval = (
+                3600 if config.sessions.interactive_archive_after_hours > 0 else 6 * 3600
+            )
+            await asyncio.sleep(interval)
             try:
                 if _engine:
                     stats = await _engine.sessions.run_cleanup(
                         archive_after_days=config.sessions.archive_after_days,
                         max_sessions=config.sessions.max_sessions,
+                        interactive_archive_after_hours=config.sessions.interactive_archive_after_hours,
                     )
-                    if stats.get("archived_stale") or stats.get("archived_overflow"):
+                    if (
+                        stats.get("archived_stale")
+                        or stats.get("archived_overflow")
+                        or stats.get("archived_interactive")
+                    ):
                         logger.info("Session cleanup: %s", stats)
             except Exception as e:
                 logger.error("Session cleanup failed: %s", e)

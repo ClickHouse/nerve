@@ -187,6 +187,29 @@ class NotificationStore:
             )
         return True
 
+    async def expire_pending_questions_for_session(self, session_id: str) -> int:
+        """Expire a session's pending ``question`` notifications.
+
+        Called when an idle session is auto-archived so the user isn't left
+        with a phantom pending question on a closed session (and the periodic
+        expiry pass has nothing to inject into the now-archived session).
+        Returns the number of questions expired.
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                """SELECT id FROM notifications
+                   WHERE session_id = ? AND status = 'pending' AND type = 'question'""",
+                (session_id,),
+            ) as cursor:
+                ids = [row[0] async for row in cursor]
+            if ids:
+                ph = ",".join("?" for _ in ids)
+                await self.db.execute(
+                    f"UPDATE notifications SET status = 'expired' WHERE id IN ({ph})",
+                    tuple(ids),
+                )
+        return len(ids)
+
     async def snooze_notification(
         self, notification_id: str, redeliver_at: str, new_expires_at: str,
     ) -> bool:

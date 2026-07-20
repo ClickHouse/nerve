@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -413,6 +414,48 @@ class TestArchiveAndCleanup:
         await sm.run_cleanup(archive_after_days=30)
         session = await db.get_session("cleanup-any")
         assert session["status"] == "archived"
+
+    async def _set_idle_hours_ago(self, db: Database, sid: str, hours: int):
+        ts = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        await db.update_session_fields(sid, {"status": "idle"})
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?", (ts, sid),
+        )
+        await db.db.commit()
+
+    async def test_cleanup_hours_disabled_leaves_interactive_untouched(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Default (interactive_archive_after_hours=0) must NOT close idle interactive sessions."""
+        await sm.get_or_create("idle-web", source="web")
+        await self._set_idle_hours_ago(db, "idle-web", hours=5)
+
+        stats = await sm.run_cleanup(archive_after_days=30, interactive_archive_after_hours=0)
+
+        assert stats["archived_interactive"] == 0
+        assert (await db.get_session("idle-web"))["status"] == "idle"
+
+    async def test_cleanup_hours_enabled_archives_idle_interactive(
+        self, sm: SessionManager, db: Database,
+    ):
+        await sm.get_or_create("idle-web2", source="web")
+        await self._set_idle_hours_ago(db, "idle-web2", hours=5)
+
+        stats = await sm.run_cleanup(archive_after_days=30, interactive_archive_after_hours=1)
+
+        assert stats["archived_interactive"] >= 1
+        assert (await db.get_session("idle-web2"))["status"] == "archived"
+
+    async def test_cleanup_hours_excludes_cron_sessions(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Cron sessions are never subject to the short interactive cutoff."""
+        await sm.get_or_create("idle-cron", source="cron")
+        await self._set_idle_hours_ago(db, "idle-cron", hours=5)
+
+        await sm.run_cleanup(archive_after_days=30, interactive_archive_after_hours=1)
+
+        assert (await db.get_session("idle-cron"))["status"] == "idle"
 
 
 @pytest.mark.asyncio
