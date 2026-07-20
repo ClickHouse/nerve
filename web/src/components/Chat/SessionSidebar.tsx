@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } fr
 import { Link } from 'react-router-dom';
 import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2 } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
-import { groupByDate } from '../../utils/dateGroups';
+import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
@@ -184,18 +184,21 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   const activeIsRunning = agentStatus.state !== 'idle';
 
-  // Split running and starred conversations to pin them at the top
-  const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+  // Split running conversations to pin them at the top. Everything else —
+  // starred included — stays in one flat list ordered purely by updated_at
+  // (starring keeps a session in the list past the fetch limit; it does not
+  // pin or reorder it). Sort explicitly rather than trusting API array order
+  // so local updated_at bumps (e.g. clicking a chat) reorder consistently.
+  const { pinnedRunning, restConversations } = useMemo(() => {
     const running: Session[] = [];
-    const starred: Session[] = [];
     const rest: Session[] = [];
     for (const s of conversations) {
       const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
       if (isRunning) running.push(s);
-      else if (s.starred) starred.push(s);
       else rest.push(s);
     }
-    return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
+    rest.sort((a, b) => parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime());
+    return { pinnedRunning: running, restConversations: rest };
   }, [conversations, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
@@ -370,28 +373,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               </div>
             )}
 
-            {/* Pinned starred sessions */}
-            {pinnedStarred.length > 0 && (
-              <div>
-                <div className="px-3 pt-2 pb-0.5">
-                  <span className="text-[10px] text-yellow-600/70 font-medium">Starred</span>
-                </div>
-                {pinnedStarred.map((s) => (
-                  <SessionItem
-                    key={s.id}
-                    session={s}
-                    isActive={s.id === activeSession}
-                    isRunning={false}
-                    onDelete={onDelete}
-                    onRename={renameSession}
-                    onToggleStar={toggleStar}
-                  />
-                ))}
-              </div>
-            )}
-
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
+            {groupedConversations.length === 0 && pinnedRunning.length === 0 && !virtualSession && (
               <div className="px-3 py-2 text-[11px] text-text-faint">No conversations yet</div>
             )}
 

@@ -452,6 +452,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
     ws.switchSession(id);
+    // Opening a chat marks it freshly active server-side (set_active_session
+    // bumps updated_at). Mirror that locally so the sidebar — sorted purely by
+    // updated_at — reorders now rather than surprising on the next refetch.
+    const openedAt = new Date().toISOString();
+    set((s) => ({
+      sessions: s.sessions.map(sess =>
+        sess.id === id ? { ...sess, updated_at: openedAt } : sess,
+      ),
+    }));
     try {
       const data = await api.getMessages(id);
       const hydrated = data.messages.map(hydrateMessage);
