@@ -186,6 +186,52 @@ class TestListSessions:
         assert "list-a2" in ids
         assert "list-arch2" in ids
 
+    async def test_starred_bypasses_limit(self, db: Database):
+        """Starred sessions are returned even when older than the last-N
+        cutoff; the limit only applies to non-starred sessions."""
+        import asyncio
+
+        await db.create_session("lim-starred")
+        await db.update_session_fields("lim-starred", {"starred": 1})
+        for i in range(3):
+            await asyncio.sleep(0.01)
+            await db.create_session(f"lim-{i}")
+
+        sessions = await db.list_sessions(limit=2)
+        ids = [s["id"] for s in sessions]
+        # Starred session is older than the 2 most recent but still listed
+        assert "lim-starred" in ids
+        # The 2 most recent non-starred sessions fill the limit
+        assert "lim-2" in ids
+        assert "lim-1" in ids
+        # Older non-starred session falls off, as before
+        assert "lim-0" not in ids
+        # Results stay sorted by updated_at DESC
+        assert ids == ["lim-2", "lim-1", "lim-starred"]
+
+    async def test_starred_bypasses_limit_include_archived(self, db: Database):
+        import asyncio
+
+        await db.create_session("slim-starred", status="archived")
+        await db.update_session_fields("slim-starred", {"starred": 1})
+        for i in range(2):
+            await asyncio.sleep(0.01)
+            await db.create_session(f"slim-{i}")
+
+        sessions = await db.list_sessions(limit=1, include_archived=True)
+        ids = [s["id"] for s in sessions]
+        assert "slim-starred" in ids
+        assert "slim-1" in ids
+        assert "slim-0" not in ids
+
+    async def test_starred_archived_stays_hidden(self, db: Database):
+        """The starred bypass does not leak archived sessions into the
+        default (non-archived) listing."""
+        await db.create_session("arch-star", status="archived")
+        await db.update_session_fields("arch-star", {"starred": 1})
+        sessions = await db.list_sessions(include_archived=False)
+        assert "arch-star" not in [s["id"] for s in sessions]
+
 
 @pytest.mark.asyncio
 class TestSessionEvents:
