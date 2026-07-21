@@ -228,11 +228,14 @@ _SESSION_LABEL_MAX = 40         # Telegram wraps long button labels poorly
 
 
 def _session_label(session: dict, current_id: str | None) -> str:
-    """Button label for one session: title (or short id), current marked ✓."""
+    """Button label for one session: title (or short id), current marked ✓,
+    starred (kept-alive) marked ⭐."""
     title = (session.get("title") or "").strip() or session.get("id", "?")
     if len(title) > _SESSION_LABEL_MAX:
         title = title[: _SESSION_LABEL_MAX - 1] + "…"
     prefix = "✓ " if session.get("id") == current_id else ""
+    if session.get("starred"):
+        prefix += "⭐ "
     return f"{prefix}{title}"
 
 
@@ -255,9 +258,17 @@ def build_sessions_view(
         # ids are short, but guard defensively so a button always round-trips.
         if sid is None or len(cb.encode("utf-8")) > 64:
             continue
-        rows.append(
-            [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
-        )
+        row = [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
+        # Per-session star toggle: ⭐ = kept alive (never auto-closed),
+        # ☆ = normal. Add it only when its callback also round-trips.
+        star_cb = f"sessstar:{sid}"
+        if len(star_cb.encode("utf-8")) <= 64:
+            row.append(
+                InlineKeyboardButton(
+                    "⭐" if s.get("starred") else "☆", callback_data=star_cb,
+                )
+            )
+        rows.append(row)
     rows.append([InlineKeyboardButton("➕ New session", callback_data="sess:new")])
 
     # The New-session button switches routing to a fresh session WITHOUT
@@ -277,6 +288,7 @@ def build_sessions_view(
         if current_title:
             text += f"\nCurrent: {current_title}"
         text += "\n➕ New session keeps the current one running."
+        text += "\n⭐ keeps a session alive (never auto-closed); tap ☆/⭐ to toggle."
     else:
         text = "No sessions yet — tap ➕ to start one."
     return text, InlineKeyboardMarkup(rows)
@@ -505,6 +517,8 @@ class TelegramChannel(BaseChannel):
         app.add_handler(CommandHandler("pair", self._handle_pair))
         app.add_handler(CommandHandler("session", self._handle_session))
         app.add_handler(CommandHandler("sessions", self._handle_sessions))
+        app.add_handler(CommandHandler("star", self._handle_star))
+        app.add_handler(CommandHandler("unstar", self._handle_unstar))
         app.add_handler(CommandHandler("new", self._handle_new_session))
         app.add_handler(CommandHandler("stop", self._handle_stop))
         app.add_handler(CommandHandler("restart", self._handle_restart))
@@ -1090,6 +1104,37 @@ class TelegramChannel(BaseChannel):
         channel_key = f"telegram:{update.effective_chat.id}"
         text, markup = await self._sessions_view_for(channel_key)
         await update.message.reply_text(text, reply_markup=markup)
+
+    async def _handle_star(self, update: Update, context: Any) -> None:
+        """Handle /star — star the current session so it never auto-closes."""
+        await self._set_current_starred(update, True)
+
+    async def _handle_unstar(self, update: Update, context: Any) -> None:
+        """Handle /unstar — clear the current session's kept-alive flag."""
+        await self._set_current_starred(update, False)
+
+    async def _set_current_starred(self, update: Update, starred: bool) -> None:
+        self._touch()
+        if not self._is_authorized(update.effective_user.id):
+            return
+        channel_key = f"telegram:{update.effective_chat.id}"
+        current = await self.router.get_last_session(channel_key)
+        if not current:
+            await update.message.reply_text("No active session to star.")
+            return
+        try:
+            await self.router.set_session_starred(current, starred)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+            return
+        if starred:
+            await update.message.reply_text(
+                "⭐ Session starred — it won't auto-close when idle."
+            )
+        else:
+            await update.message.reply_text(
+                "☆ Session unstarred — normal auto-close applies."
+            )
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
         """Handle /new [title] — stop current session, create and switch to a new one."""
@@ -1755,6 +1800,7 @@ class TelegramChannel(BaseChannel):
           ``sess:new``            — create a fresh session (current keeps running)
           ``sess:<id>``           — switch routing to <id>, then show its history
           ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
+          ``sessstar:<id>``       — toggle the session's starred (kept-alive) flag
 
         After a switch/create the card is replaced by that session's recent
         history (native order, oldest→newest) so the user can catch up — which
@@ -1782,6 +1828,24 @@ class TelegramChannel(BaseChannel):
                 window = _TAIL_WINDOW
             await query.answer()
             await self._edit_session_tail(query, sid, window)
+            return
+
+        if data.startswith("sessstar:"):
+            sid = data.split(":", 1)[1]
+            try:
+                now_starred = await self.router.toggle_session_starred(sid)
+            except ValueError:
+                await query.answer(
+                    "That session is no longer available", show_alert=True,
+                )
+            else:
+                await query.answer(
+                    "⭐ Kept alive — won't auto-close"
+                    if now_starred
+                    else "☆ Normal — may auto-close when idle"
+                )
+            text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
             return
 
         # sess:new / sess:<id>
@@ -1817,7 +1881,11 @@ class TelegramChannel(BaseChannel):
             return
 
         # /sessions inline keyboard: switch/create/list + history buttons.
-        if query.data.startswith("sess:") or query.data.startswith("sesstail:"):
+        if (
+            query.data.startswith("sess:")
+            or query.data.startswith("sesstail:")
+            or query.data.startswith("sessstar:")
+        ):
             await self._handle_session_button(query)
             return
 

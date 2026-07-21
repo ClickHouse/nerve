@@ -609,6 +609,37 @@ class SessionManager:
             limit=limit, include_archived=include_archived,
         )
 
+    async def set_starred(self, session_id: str, starred: bool) -> bool:
+        """Star or unstar a session.
+
+        Starred sessions are exempt from every auto-archival path (the idle
+        cutoff, the age backstop, and the overflow eviction), so they stay
+        resumable until explicitly unstarred or deleted. Returns the new
+        starred state; raises ``ValueError`` if the session does not exist.
+        """
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        await self.db.update_session_fields(
+            session_id, {"starred": 1 if starred else 0},
+        )
+        return starred
+
+    async def toggle_starred(self, session_id: str) -> bool:
+        """Flip a session's starred flag.
+
+        Returns the new starred state; raises ``ValueError`` if the session
+        does not exist.
+        """
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        new_starred = not session.get("starred")
+        await self.db.update_session_fields(
+            session_id, {"starred": 1 if new_starred else 0},
+        )
+        return new_starred
+
     # ------------------------------------------------------------------ #
     #  Archive & cleanup                                                   #
     # ------------------------------------------------------------------ #
@@ -652,7 +683,13 @@ class SessionManager:
         ones parked on an unanswered ``ask_user`` question, whose pending
         notification is expired so it doesn't dangle on a closed session.
         Cron/persistent sessions are excluded from the short cutoff and only
-        hit the ``archive_after_days`` backstop. Returns cleanup statistics.
+        hit the ``archive_after_days`` backstop. Starred sessions are exempt
+        from every auto-archival path (short cutoff, backstop, and the
+        max-session overflow eviction) and are off-budget for the
+        ``max_sessions`` cap — they are neither counted toward it nor evicted,
+        so the cap governs only cap-eligible (non-starred) sessions. A starred
+        session is kept until it is explicitly unstarred or deleted. Returns
+        cleanup statistics.
         """
         now = datetime.now(timezone.utc)
 
@@ -682,8 +719,10 @@ class SessionManager:
         for s in stale:
             await self.archive_session(s["id"])
 
-        # Enforce max session count (archive oldest beyond limit)
-        count = await self.db.count_active_sessions()
+        # Enforce max session count (archive oldest beyond limit). Starred
+        # sessions are off-budget: excluded from the count and never evicted,
+        # so the cap governs only cap-eligible (non-starred) sessions.
+        count = await self.db.count_active_sessions(exclude_starred=True)
         overflow = 0
         if count > max_sessions:
             excess = await self.db.get_oldest_sessions(
