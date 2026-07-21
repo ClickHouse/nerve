@@ -184,21 +184,26 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   const activeIsRunning = agentStatus.state !== 'idle';
 
-  // Split running conversations to pin them at the top. Everything else —
-  // starred included — stays in one flat list ordered purely by updated_at
-  // (starring keeps a session in the list past the fetch limit; it does not
-  // pin or reorder it). Sort explicitly rather than trusting API array order
-  // so local updated_at bumps (e.g. clicking a chat) reorder consistently.
-  const { pinnedRunning, restConversations } = useMemo(() => {
+  // Split running and starred conversations into their pinned groups at the
+  // top. Within every group the order is purely updated_at — which means
+  // "last message activity" (opening/starring a chat doesn't bump it), so
+  // browsing never reshuffles the list. Sort explicitly rather than trusting
+  // API array order to keep that invariant regardless of fetch shape.
+  const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
     const running: Session[] = [];
+    const starred: Session[] = [];
     const rest: Session[] = [];
     for (const s of conversations) {
       const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
       if (isRunning) running.push(s);
+      else if (s.starred) starred.push(s);
       else rest.push(s);
     }
-    rest.sort((a, b) => parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime());
-    return { pinnedRunning: running, restConversations: rest };
+    const byUpdatedDesc = (a: Session, b: Session) =>
+      parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime();
+    starred.sort(byUpdatedDesc);
+    rest.sort(byUpdatedDesc);
+    return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
   }, [conversations, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
@@ -373,8 +378,29 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               </div>
             )}
 
+            {/* Pinned starred sessions (ordered by last message activity —
+                stable while browsing, since opening a chat doesn't bump it) */}
+            {pinnedStarred.length > 0 && (
+              <div>
+                <div className="px-3 pt-2 pb-0.5">
+                  <span className="text-[10px] text-yellow-600/70 font-medium">Starred</span>
+                </div>
+                {pinnedStarred.map((s) => (
+                  <SessionItem
+                    key={s.id}
+                    session={s}
+                    isActive={s.id === activeSession}
+                    isRunning={false}
+                    onDelete={onDelete}
+                    onRename={renameSession}
+                    onToggleStar={toggleStar}
+                  />
+                ))}
+              </div>
+            )}
+
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && !virtualSession && (
+            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
               <div className="px-3 py-2 text-[11px] text-text-faint">No conversations yet</div>
             )}
 
