@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Depends
 
+from nerve.anthropic import discover_models as discover_anthropic_models
+from nerve.anthropic import latest_per_family
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -24,6 +27,28 @@ from nerve.ollama import discover_models
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Anthropic discovery cache — unlike the local Ollama/Codex probes this call
+# leaves the box, and /api/models fires on every composer mount. Successful
+# lists are reused for 15 minutes; failures retry after 60 seconds so a
+# keyless or offline box doesn't pay the discovery timeout on every mount.
+_ANTHROPIC_TTL_OK = 15 * 60.0
+_ANTHROPIC_TTL_EMPTY = 60.0
+_anthropic_cache: tuple[float, list[str]] = (0.0, [])
+
+
+async def _discovered_anthropic_ids(api_key: str) -> list[str]:
+    global _anthropic_cache
+    cached_at, ids = _anthropic_cache
+    ttl = _ANTHROPIC_TTL_OK if ids else _ANTHROPIC_TTL_EMPTY
+    if cached_at and time.monotonic() - cached_at < ttl:
+        return ids
+    # Discovery does blocking I/O (stdlib urllib) — keep the event loop free.
+    found = latest_per_family(
+        await asyncio.to_thread(discover_anthropic_models, api_key),
+    )
+    _anthropic_cache = (time.monotonic(), found)
+    return found
 
 
 @router.get("/api/models")
@@ -45,6 +70,16 @@ async def list_models(user: dict = Depends(require_auth)):
     deps = get_deps()
     default_model = config.agent.model
 
+    # Default model first, then the newest live-discovered model of each
+    # Anthropic family (opus/sonnet/haiku/...), de-duplicated. Discovery is
+    # best-effort — a keyless (OAuth/Bedrock) or offline box simply offers
+    # only the default model.
+    discovered = await _discovered_anthropic_ids(config.anthropic_api_key)
+    anthropic_ids: list[str] = [default_model]
+    for m in discovered:
+        if m and m not in anthropic_ids:
+            anthropic_ids.append(m)
+
     codex_backend = deps.engine._backends.get("codex")
     codex_preflight = (
         await codex_backend.preflight() if codex_backend is not None
@@ -56,7 +91,7 @@ async def list_models(user: dict = Depends(require_auth)):
     options = [
         {
             "id": "claude", "label": "Claude", "model": config.agent.model,
-            "models": [config.agent.model], "available": True,
+            "models": anthropic_ids, "available": True,
         },
     ]
     options.append({
@@ -81,7 +116,7 @@ async def list_models(user: dict = Depends(require_auth)):
     }
 
     models: list[dict[str, str]] = [
-        {"id": default_model, "provider": "anthropic", "backend": "claude"},
+        {"id": m, "provider": "anthropic", "backend": "claude"} for m in anthropic_ids
     ]
     if codex_preflight.get("available"):
         models.extend({
