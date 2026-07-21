@@ -302,13 +302,18 @@ class SessionStore:
     async def get_stale_sessions(
         self, before_iso: str, exclude_ids: list[str] | None = None,
     ) -> list[dict]:
-        """Get idle/stopped/error sessions not updated since before_iso."""
+        """Get idle/stopped/error sessions not updated since before_iso.
+
+        Starred sessions are excluded: a starred session is never
+        auto-archived, regardless of how long it has been idle.
+        """
         excludes = exclude_ids or []
         if excludes:
             placeholders = ",".join("?" for _ in excludes)
             query = f"""
                 SELECT * FROM sessions
                 WHERE status IN ('idle', 'stopped', 'error')
+                AND starred = 0
                 AND updated_at < ?
                 AND id NOT IN ({placeholders})
             """
@@ -317,6 +322,7 @@ class SessionStore:
             query = """
                 SELECT * FROM sessions
                 WHERE status IN ('idle', 'stopped', 'error')
+                AND starred = 0
                 AND updated_at < ?
             """
             params = (before_iso,)
@@ -330,7 +336,8 @@ class SessionStore:
 
         Scoped by ``source`` (web/telegram/…) so cron and persistent sessions
         keep their own long rotation and are never archived at the short
-        interactive cutoff. Returns [] when ``sources`` is empty.
+        interactive cutoff. Starred sessions are also excluded — a starred
+        session is never auto-archived. Returns [] when ``sources`` is empty.
         """
         if not sources:
             return []
@@ -338,30 +345,42 @@ class SessionStore:
         query = f"""
             SELECT * FROM sessions
             WHERE status IN ('idle', 'stopped', 'error')
+              AND starred = 0
               AND source IN ({src})
               AND updated_at < ?
         """
         async with self.db.execute(query, (*sources, before_iso)) as cursor:
             return [dict(row) async for row in cursor]
 
-    async def count_active_sessions(self) -> int:
-        """Count non-archived sessions."""
-        async with self.db.execute(
-            "SELECT COUNT(*) FROM sessions WHERE status != 'archived'"
-        ) as cursor:
+    async def count_active_sessions(self, exclude_starred: bool = False) -> int:
+        """Count non-archived sessions.
+
+        When ``exclude_starred`` is set, starred sessions are omitted: they are
+        off-budget for the ``max_sessions`` cap, so the overflow check counts
+        only cap-eligible sessions.
+        """
+        query = "SELECT COUNT(*) FROM sessions WHERE status != 'archived'"
+        if exclude_starred:
+            query += " AND starred = 0"
+        async with self.db.execute(query) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
     async def get_oldest_sessions(
         self, count: int, exclude_ids: list[str] | None = None,
     ) -> list[dict]:
-        """Get the oldest non-active, non-archived sessions for cleanup."""
+        """Get the oldest non-active, non-archived sessions for cleanup.
+
+        Starred sessions are excluded: they are never evicted to enforce the
+        session-count limit.
+        """
         excludes = exclude_ids or []
         if excludes:
             placeholders = ",".join("?" for _ in excludes)
             query = f"""
                 SELECT * FROM sessions
                 WHERE status NOT IN ('active', 'archived')
+                AND starred = 0
                 AND id NOT IN ({placeholders})
                 ORDER BY updated_at ASC LIMIT ?
             """
@@ -370,6 +389,7 @@ class SessionStore:
             query = """
                 SELECT * FROM sessions
                 WHERE status NOT IN ('active', 'archived')
+                AND starred = 0
                 ORDER BY updated_at ASC LIMIT ?
             """
             params = (count,)

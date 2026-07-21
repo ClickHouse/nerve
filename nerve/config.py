@@ -635,7 +635,7 @@ class BackupConfig:
 @dataclass
 class SessionsConfig:
     archive_after_days: int = 30
-    interactive_archive_after_hours: int = 0  # Interactive (web/telegram/…) sessions auto-close after this many idle hours (0 = disabled; opt in via config)
+    interactive_archive_after_hours: int = 0  # Interactive (web/telegram/…) sessions auto-close after this many idle hours (0 = disabled; opt in via config). Starred sessions are exempt and never auto-close.
     max_sessions: int = 500
     cron_session_mode: str = "per_run"  # "per_run" or "reuse"
     memorize_interval_minutes: int = 30  # Background memorization sweep interval
