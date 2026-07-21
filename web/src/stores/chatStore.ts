@@ -452,6 +452,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
     ws.switchSession(id);
+    // Note: opening a chat deliberately does NOT touch updated_at (locally or
+    // server-side) — updated_at means "last message activity", so browsing
+    // never reorders the session list.
     try {
       const data = await api.getMessages(id);
       const hydrated = data.messages.map(hydrateMessage);

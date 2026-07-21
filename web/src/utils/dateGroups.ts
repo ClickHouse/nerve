@@ -1,4 +1,13 @@
 /**
+ * Parse a server timestamp into a Date. Handles both ISO 8601 strings and
+ * legacy SQLite "YYYY-MM-DD HH:MM:SS" strings (which are UTC but lack a
+ * timezone marker).
+ */
+export function parseTimestamp(input: string): Date {
+  return new Date(input.includes('T') ? input : input.replace(' ', 'T') + 'Z');
+}
+
+/**
  * Assign a human-readable group label based on when something was last updated.
  *
  * Today     → "Last hour" / "N hours ago"
@@ -12,7 +21,7 @@
 export function getDateGroup(updatedAt: string): string {
   if (!updatedAt) return 'Recent';
   const now = new Date();
-  const date = new Date(updatedAt.includes('T') ? updatedAt : updatedAt.replace(' ', 'T') + 'Z');
+  const date = parseTimestamp(updatedAt);
 
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const yesterdayStart = new Date(todayStart.getTime() - 86400000);
@@ -46,7 +55,7 @@ export function getDateGroup(updatedAt: string): string {
  */
 export function formatTimeAgo(input: string): string {
   if (!input) return '';
-  const date = new Date(input.includes('T') ? input : input.replace(' ', 'T') + 'Z');
+  const date = parseTimestamp(input);
   const diffMs = Date.now() - date.getTime();
   if (diffMs < 0) return 'just now';
   const minutes = Math.floor(diffMs / 60000);

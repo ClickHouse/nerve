@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } fr
 import { Link } from 'react-router-dom';
 import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2 } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
-import { groupByDate } from '../../utils/dateGroups';
+import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
@@ -184,7 +184,11 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   const activeIsRunning = agentStatus.state !== 'idle';
 
-  // Split running and starred conversations to pin them at the top
+  // Split running and starred conversations into their pinned groups at the
+  // top. Within every group the order is purely updated_at — which means
+  // "last message activity" (opening/starring a chat doesn't bump it), so
+  // browsing never reshuffles the list. Sort explicitly rather than trusting
+  // API array order to keep that invariant regardless of fetch shape.
   const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
     const running: Session[] = [];
     const starred: Session[] = [];
@@ -195,6 +199,10 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       else if (s.starred) starred.push(s);
       else rest.push(s);
     }
+    const byUpdatedDesc = (a: Session, b: Session) =>
+      parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime();
+    starred.sort(byUpdatedDesc);
+    rest.sort(byUpdatedDesc);
     return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
   }, [conversations, activeSession, activeIsRunning]);
 
@@ -370,7 +378,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               </div>
             )}
 
-            {/* Pinned starred sessions */}
+            {/* Pinned starred sessions (ordered by last message activity —
+                stable while browsing, since opening a chat doesn't bump it) */}
             {pinnedStarred.length > 0 && (
               <div>
                 <div className="px-3 pt-2 pb-0.5">

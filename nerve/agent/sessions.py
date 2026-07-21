@@ -320,8 +320,10 @@ class SessionManager:
         await self.db.set_channel_session(channel_key, session_id)
         # An explicit switch is a deliberate choice: the next inbound message must
         # route to this session regardless of how long it has been idle. Mark it
-        # freshly active (this also bumps updated_at) so get_active_session's
-        # sticky-period check honours the switch instead of minting a new session.
+        # freshly active so get_active_session's sticky-period check honours the
+        # switch instead of minting a new session. Only last_activity_at moves —
+        # updated_at means "last message activity", so merely opening a chat
+        # never reorders the session list.
         await self.db.update_session_fields(
             session_id,
             {"last_activity_at": datetime.now(timezone.utc).isoformat()},
