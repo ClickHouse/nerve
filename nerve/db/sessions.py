@@ -146,6 +146,12 @@ class SessionStore:
 
         Returns ``None`` when no allowed field is present. Shared by
         :meth:`update_session_fields` and :meth:`update_session_metadata`.
+
+        Deliberately does NOT touch ``updated_at``: it means "last message
+        activity" and is bumped only by the ``add_message*`` methods (and
+        the explicit :meth:`touch_session`). Metadata writes — status flips,
+        open/switch bookkeeping, star/rename, memorization watermarks — must
+        not reorder the session list.
         """
         allowed = {
             "status", "sdk_session_id", "connected_at", "last_activity_at",
@@ -161,8 +167,6 @@ class SessionStore:
                 params.append(value)
         if not set_clauses:
             return None
-        set_clauses.append("updated_at = ?")
-        params.append(datetime.now(timezone.utc).isoformat())
         params.append(session_id)
         return (
             f"UPDATE sessions SET {', '.join(set_clauses)} WHERE id = ?",

@@ -156,14 +156,19 @@ class TestUpdateSessionFields:
         session = await db.get_session("upd-4")
         assert session["sdk_session_id"] is None
 
-    async def test_update_touches_updated_at(self, db: Database):
+    async def test_update_does_not_touch_updated_at(self, db: Database):
+        """updated_at means "last message activity": metadata writes (status
+        flips, star/rename, watermarks) must not reorder the session list.
+        Only message inserts (and the explicit touch_session) bump it."""
         await db.create_session("upd-5")
         before = (await db.get_session("upd-5"))["updated_at"]
         import asyncio
         await asyncio.sleep(0.01)
-        await db.update_session_fields("upd-5", {"status": "active"})
-        after = (await db.get_session("upd-5"))["updated_at"]
-        assert after >= before
+        await db.update_session_fields("upd-5", {"status": "active", "starred": 1})
+        assert (await db.get_session("upd-5"))["updated_at"] == before
+        # A real message DOES bump it.
+        await db.add_message("upd-5", "user", "hello")
+        assert (await db.get_session("upd-5"))["updated_at"] > before
 
 
 @pytest.mark.asyncio
