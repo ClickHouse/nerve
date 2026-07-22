@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api, setToken, clearToken, getToken } from '../api/client';
+import { clearAllDrafts } from './helpers/draftStorage';
 
 interface AuthState {
   authenticated: boolean;
@@ -30,6 +31,8 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   logout: () => {
     clearToken();
+    // Purge unsent drafts so nothing leaks to the next user on a shared browser.
+    clearAllDrafts();
     set({ authenticated: false });
   },
 

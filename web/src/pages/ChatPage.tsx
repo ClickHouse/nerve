@@ -308,11 +308,15 @@ export function ChatPage() {
           <InteractiveQuestionCard />
           <ApprovalCard />
 
+          {/* The composer stays typeable while a turn runs so a reply is never
+              lost mid-stream. `isStreaming` still swaps Send↔Stop and blocks
+              sending (canSend), so the text is just held as the session's draft
+              until the turn ends — a turn in progress is not a reason to block
+              typing, hence no `disabled`. */}
           <ChatInput
             onSend={sendMessage}
             onStop={stopSession}
             isStreaming={isStreaming}
-            disabled={isStreaming}
           />
         </div>
 
