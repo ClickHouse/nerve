@@ -8,6 +8,7 @@ import { randomUUID } from '../utils/uuid';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
+import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage } from './handlers/sessionHandlers';
@@ -207,7 +208,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   activeSession: '',
   virtualSession: null,
-  drafts: {},
+  // Rehydrated from localStorage so unsent composer text survives a reload.
+  drafts: loadDrafts(),
   messages: [],
   streamingBlocks: [],
   isStreaming: false,
@@ -415,6 +417,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const { sessions } = await api.listSessions();
       set({ sessions });
+      // Reclaim persisted drafts whose session no longer exists (deleted or
+      // archived elsewhere) — but never the chat you're in or an unsent one.
+      const keep = new Set(sessions.map(s => s.id));
+      const { activeSession, virtualSession } = get();
+      if (activeSession) keep.add(activeSession);
+      if (virtualSession) keep.add(virtualSession.id);
+      pruneDrafts(keep);
     } catch (e) {
       console.error('Failed to load sessions:', e);
     }
@@ -530,6 +539,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const carried = drafts[vs.id];
       delete drafts[vs.id];
       if (carried !== undefined) drafts[real.id] = carried;
+      // Mirror the carry in storage: the temp id's key is dead; the real id
+      // now owns the draft.
+      removeDraft(vs.id);
+      if (carried) persistDraft(real.id, carried);
       return {
         // Don't yank the view if the user navigated away during the POST.
         ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
@@ -551,6 +564,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const vs = get().virtualSession;
     if (!vs) return;
     set({ newChatBackend: null });
+    removeDraft(vs.id);
     set((s) => {
       const drafts = { ...s.drafts };
       delete drafts[vs.id];
@@ -565,11 +579,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setDraft: (sessionId: string, text: string) =>
-    set((s) => ({ drafts: { ...s.drafts, [sessionId]: text } })),
+    set((s) => {
+      persistDraft(sessionId, text);
+      return { drafts: { ...s.drafts, [sessionId]: text } };
+    }),
 
   deleteSession: async (id: string) => {
     try {
       await api.deleteSession(id);
+      removeDraft(id);
+      set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
       await get().loadSessions();
       if (get().activeSession === id) {
         // Switch to most recent remaining session
