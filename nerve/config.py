@@ -145,7 +145,7 @@ class AgentConfig:
     cron_model: str = "claude-sonnet-4-6"
     title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
     max_turns: int = 100
-    max_concurrent: int = 4
+    max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = "max"         # max, xhigh, high, medium, low
     # Effort for cron- and hook-sourced turns (sensing / triage work). These
@@ -204,7 +204,7 @@ class AgentConfig:
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
             title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
             max_turns=d.get("max_turns", 100),
-            max_concurrent=d.get("max_concurrent", 4),
+            max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
             cron_effort=str(d.get("cron_effort", "medium")),
