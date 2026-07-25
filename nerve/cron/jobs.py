@@ -6,6 +6,7 @@ Jobs are defined in a YAML file and loaded at startup.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -108,10 +109,11 @@ class CronJob:
             isinstance(budget, bool)
             or not isinstance(budget, (int, float))
             or budget <= 0
+            or not math.isfinite(float(budget))
         ):
             raise ValueError(
-                f"Cron job {self.id!r}: workflow needs a positive numeric "
-                f"'budget_usd', got {budget!r}"
+                f"Cron job {self.id!r}: workflow needs a positive finite "
+                f"numeric 'budget_usd', got {budget!r}"
             )
 
     def resolve_prompt(self) -> str:

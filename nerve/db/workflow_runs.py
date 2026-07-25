@@ -126,6 +126,20 @@ class WorkflowRunStore:
                 return int(row[0])
         return 0
 
+    async def next_pending_workflow_runs(self, limit: int) -> list[dict]:
+        """Oldest pending runs first — the dispatch (FIFO) order.
+
+        Dispatch must NOT use :meth:`list_workflow_runs`: its DESC ordering
+        makes LIMIT select the *newest* rows, which starves old queued runs
+        under backlog.
+        """
+        async with self.db.execute(
+            """SELECT * FROM workflow_runs WHERE status = 'pending'
+               ORDER BY created_at ASC, id ASC LIMIT ?""",
+            (max(0, limit),),
+        ) as cursor:
+            return [_parse_run(dict(row)) async for row in cursor]
+
     async def get_active_workflow_runs(self) -> list[dict]:
         """All pending/running runs, oldest first (dispatch order)."""
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)

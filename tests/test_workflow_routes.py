@@ -61,6 +61,15 @@ class FakeEngine:
     def get_live_workflow_tokens(self, session_id: str) -> int:
         return 0
 
+    def has_live_background_tasks(self, session_id: str) -> bool:
+        return False
+
+    def get_codex_ultracode_run_ids(self, session_id: str):
+        return None
+
+    def add_stop_listener(self, callback) -> None:
+        pass
+
 
 async def _settle(service) -> None:
     """Await spawned ``_execute`` tasks that live on the current loop.

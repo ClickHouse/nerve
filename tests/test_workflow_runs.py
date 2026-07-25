@@ -86,6 +86,9 @@ def _make_engine(db) -> MagicMock:
     engine._discard_client = AsyncMock()
     engine.is_session_running = MagicMock(return_value=False)
     engine.get_live_workflow_tokens = MagicMock(return_value=0)
+    engine.has_live_background_tasks = MagicMock(return_value=False)
+    engine.get_codex_ultracode_run_ids = MagicMock(return_value=None)
+    engine.add_stop_listener = MagicMock()
     engine.notification_service = MagicMock()
     engine.notification_service.send_notification = AsyncMock()
     return engine
@@ -570,6 +573,9 @@ class TestBudgetEnforcement:
     async def test_refresh_spend_uses_live_claude_tokens(self, service, db, engine):
         session_id = await _seed_running(db, "wfr-live0001", 50.0)
         engine.get_live_workflow_tokens = MagicMock(return_value=200_000)
+        # Live estimates apply only while the session's turn is actually
+        # running — between turns the recorded cost is authoritative.
+        engine.is_session_running = MagicMock(return_value=True)
 
         spent = await service._refresh_spend("wfr-live0001")
 
@@ -760,3 +766,193 @@ class TestWorkflowRunTools:
             _ctx(db, engine), {"status": "done"},
         )
         assert "No workflow runs with status 'done'" in none_match.content[0]["text"]
+
+
+# --------------------------------------------------------------------------- #
+#  Review-fix regressions (adversarial review pass, 2026-07)                   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestReviewRegressions:
+    async def test_dispatch_is_fifo_under_backlog(self, db, engine, tmp_path):
+        """Backlog > free slots must promote the OLDEST pending run.
+
+        Regression: LIMIT over a DESC-ordered list selected the NEWEST
+        pending runs — old queued runs starved under sustained arrivals.
+        """
+        cfg = _make_config(tmp_path)
+        cfg.workflows.max_concurrent_runs = 1
+        service = WorkflowRunService(cfg, db, engine)
+
+        gate = asyncio.Event()
+
+        async def _blocked_run(**kwargs):
+            await gate.wait()
+            return "ok"
+
+        engine.run = AsyncMock(side_effect=_blocked_run)
+
+        first = await service.start_run(ENGINE_CLAUDE, {"prompt": "a"}, 1.0)
+        second = await service.start_run(ENGINE_CLAUDE, {"prompt": "b"}, 1.0)
+        third = await service.start_run(ENGINE_CLAUDE, {"prompt": "c"}, 1.0)
+        assert first["status"] == "running"
+        assert second["status"] == "pending"
+        assert third["status"] == "pending"
+
+        gate.set()
+        await _drain(service)
+
+        # All finished; verify the SECOND (oldest queued) started before
+        # the third: started_at ordering matches creation ordering.
+        r2 = await db.get_workflow_run(second["id"])
+        r3 = await db.get_workflow_run(third["id"])
+        assert r2["status"] == "done" and r3["status"] == "done"
+        assert r2["started_at"] <= r3["started_at"]
+
+    async def test_next_pending_selects_oldest(self, db):
+        for n in range(3):
+            await db.create_workflow_run(f"wfr-fifo000{n}", ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
+        picked = await db.next_pending_workflow_runs(1)
+        assert [r["id"] for r in picked] == ["wfr-fifo0000"]
+
+    async def test_kill_run_retries_when_pending_promoted_concurrently(
+        self, service, db, engine, monkeypatch,
+    ):
+        """TOCTOU: a run read as pending may be promoted before the CAS —
+        kill must retry on the running side, not silently no-op."""
+        await db.create_workflow_run("wfr-toctou01", ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
+        orig_get = db.get_workflow_run
+        raced = {"done": False}
+
+        async def racing_get(run_id):
+            run = await orig_get(run_id)
+            if not raced["done"] and run and run["status"] == "pending":
+                raced["done"] = True
+                # Promote behind the killer's back; hand back the stale view.
+                await db.transition_workflow_run(run_id, "running", expect=("pending",))
+            return run
+
+        monkeypatch.setattr(db, "get_workflow_run", racing_get)
+        result = await service.kill_run("wfr-toctou01", reason="race")
+        assert result["status"] == "killed"
+        await _drain(service)
+
+    async def test_refresh_spend_never_touches_terminal_rows(self, db, engine, tmp_path):
+        service = WorkflowRunService(_make_config(tmp_path), db, engine)
+        session_id = await _seed_running(db, "wfr-term0001", 10.0)
+        await db.record_turn_usage(
+            session_id, 100, 50, 0, 0, 200000, cost_usd=3.0, cost_basis="sdk_delta",
+        )
+        await db.transition_workflow_run(
+            "wfr-term0001", "done", expect=("running",),
+        )
+        await db.update_workflow_run("wfr-term0001", {"spent_usd": 5.0})
+
+        spent = await service._refresh_spend("wfr-term0001")
+        assert spent == pytest.approx(5.0)  # settled figure, not re-metered
+        run = await db.get_workflow_run("wfr-term0001")
+        assert run["spent_usd"] == pytest.approx(5.0)
+
+    async def test_live_claude_estimate_zero_between_turns(self, service, db, engine):
+        await _seed_running(db, "wfr-idle0001", 10.0)
+        engine.get_live_workflow_tokens = MagicMock(return_value=500_000)
+        engine.is_session_running = MagicMock(return_value=False)
+        spent = await service._refresh_spend("wfr-idle0001")
+        assert spent == 0.0  # recorded cost authoritative between turns
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    async def test_nonfinite_budget_rejected(self, service, bad):
+        with pytest.raises(WorkflowRunError, match="budget_usd is required"):
+            await service.start_run(ENGINE_CLAUDE, {"prompt": "p"}, bad)
+
+    async def test_codex_unpriced_model_fails_closed(self, service):
+        with pytest.raises(WorkflowRunError, match="codex.pricing"):
+            await service.start_run(
+                ENGINE_CODEX,
+                {"prompt": "p", "model": "totally-unknown-model-x"},
+                budget_usd=5.0,
+            )
+
+    async def test_codex_default_model_is_priced(self, service, db, engine):
+        run = await service.start_run(ENGINE_CODEX, {"prompt": "p"}, 5.0)
+        assert run["id"].startswith("wfr-")
+        await _drain(service)
+
+    async def test_workflow_sessions_cannot_start_or_kill_runs(self, db, engine, tmp_path, monkeypatch):
+        import nerve.workflows as workflows_mod
+        from nerve.agent.tools.handlers.workflow_runs import (
+            workflow_run_kill_handler,
+            workflow_run_start_handler,
+        )
+
+        service = WorkflowRunService(_make_config(tmp_path), db, engine)
+        monkeypatch.setattr(workflows_mod, "_service", service)
+        await db.create_session("workflow:wfr-parent01", source="workflow")
+        ctx = ToolContext(session_id="workflow:wfr-parent01", db=db, engine=engine)
+
+        start = await workflow_run_start_handler(ctx, {
+            "engine": ENGINE_CLAUDE, "prompt": "nested", "budget_usd": 1.0,
+        })
+        assert start.is_error
+        assert "cannot start or kill" in start.content[0]["text"]
+
+        kill = await workflow_run_kill_handler(ctx, {"run_id": "wfr-whatever"})
+        assert kill.is_error
+
+    async def test_stop_listener_records_direct_session_stop_as_killed(
+        self, service, db, engine,
+    ):
+        await _seed_running(db, "wfr-stopped01", 10.0)
+        await service._on_session_stop("workflow:wfr-stopped01")
+        run = await db.get_workflow_run("wfr-stopped01")
+        assert run["status"] == "killed"
+        assert run["error"] == "session stopped"
+        # Non-workflow sessions and terminal runs are no-ops.
+        await service._on_session_stop("some-web-session")
+        await service._on_session_stop("workflow:wfr-stopped01")
+        run = await db.get_workflow_run("wfr-stopped01")
+        assert run["status"] == "killed"
+
+    async def test_execute_bails_on_terminal_row(self, service, db, engine):
+        """A kill landing between dispatch CAS and _execute must not run
+        the payload."""
+        await db.create_workflow_run("wfr-earlykill", ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
+        await db.transition_workflow_run("wfr-earlykill", "running", expect=("pending",))
+        await db.transition_workflow_run("wfr-earlykill", "killed", expect=("running",))
+        await service._execute("wfr-earlykill")
+        engine.run.assert_not_called()
+        run = await db.get_workflow_run("wfr-earlykill")
+        assert run["status"] == "killed"
+        await _drain(service)
+
+    async def test_done_path_tears_down_client(self, service, db, engine):
+        run = await service.start_run(ENGINE_CLAUDE, {"prompt": "p"}, 5.0)
+        await _drain(service)
+        final = await db.get_workflow_run(run["id"])
+        assert final["status"] == "done"
+        engine._discard_client.assert_called_with(
+            f"workflow:{run['id']}", background_memorize=True,
+        )
+
+    async def test_stopping_gate_blocks_dispatch(self, db, engine, tmp_path):
+        cfg = _make_config(tmp_path)
+        service = WorkflowRunService(cfg, db, engine)
+        service._stopping = True
+        await db.create_workflow_run("wfr-gated001", ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
+        await service._maybe_dispatch()
+        run = await db.get_workflow_run("wfr-gated001")
+        assert run["status"] == "pending"
+        engine.run.assert_not_called()
+
+    async def test_journal_cost_falls_back_to_aggregate(self, service):
+        run = {"spec": {"model": ""}, "id": "wfr-jc"}
+        journal = {
+            "workers": [{"model": "unpriced-model-z", "usage": {}}],
+            "aggregate_usage": {
+                "input_tokens": 1_000_000, "cached_input_tokens": 0,
+                "output_tokens": 0,
+            },
+        }
+        cost = service._journal_cost(journal, run)
+        assert cost > 0  # aggregate priced with the default codex model

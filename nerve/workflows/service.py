@@ -16,8 +16,10 @@ monitor loop re-computes each running run's spend every poll interval as
                 turns — see UsageStore.get_session_effective_cost)
     live      = in-flight estimate for the current turn (Claude: live
                 Workflow snapshot tokens priced as output tokens; Codex:
-                Ultracode run journals under the codex home, minus the
-                already-folded base)
+                Ultracode run journals attributed to this run, minus the
+                already-folded base). Live estimates apply only while the
+                session's turn is actually running — once a turn ends its
+                real cost is recorded and live must drop to zero.
 
 At ``warn_fraction`` a one-time notification fires; at 100% the run is
 terminated: graceful ``engine.stop_session`` (interrupt), a grace window,
@@ -25,6 +27,14 @@ then a force client discard — which kills the session's own CLI
 subprocess / process group and nothing else. Accuracy caveat: ``recorded``
 lands at turn end, so the overshoot bound is roughly one turn's cost
 beyond what the live estimates catch.
+
+Stop-vs-done disambiguation: ``engine.run`` swallows both graceful
+interrupts and hard cancels (it returns partial text), so this service
+registers an engine *stop listener* that CASes the run terminal BEFORE
+any stop touches the session — exactly the ordering the kill/budget paths
+already use. ``_execute`` additionally re-checks the row and the session
+status after ``engine.run`` returns, so a stopped/errored turn can never
+be recorded as ``done``.
 
 Runs do not survive a daemon restart: the startup recovery pass marks
 orphaned active runs ``failed`` and notifies, so a paid job can never
@@ -36,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from datetime import datetime
@@ -66,6 +77,8 @@ _SPEC_KEYS = {"prompt", "model", "effort", "cwd"}
 _RESULT_MAX = 4000
 _ERROR_MAX = 2000
 
+_SESSION_PREFIX = "workflow:"
+
 
 class WorkflowRunError(ValueError):
     """Raised for invalid start/kill requests (caller error, not a bug)."""
@@ -92,9 +105,14 @@ class WorkflowRunService:
         self._exec_tasks: dict[str, asyncio.Task] = {}
         # run_id -> codex journal dollars already folded into recorded cost
         self._codex_live_base: dict[str, float] = {}
-        # Detached kill/enforcement tasks (kept referenced until done).
+        # Detached kill/teardown/dispatch tasks (referenced until done).
         self._kill_tasks: set[asyncio.Task] = set()
         self._dispatch_lock = asyncio.Lock()
+        # Gate: no new dispatches once the daemon is shutting down —
+        # otherwise queued runs get promoted (and paid CLI sessions
+        # spawned) during teardown, only to die with the process.
+        self._stopping = False
+        self._stop_listener_registered = False
 
     # ------------------------------------------------------------------ #
     #  Lifespan                                                           #
@@ -102,6 +120,12 @@ class WorkflowRunService:
 
     async def start(self) -> None:
         """Recovery pass + monitor loop startup."""
+        self._stopping = False
+        if not self._stop_listener_registered:
+            # CAS runs terminal BEFORE any session stop lands (engine.run
+            # swallows interrupts/cancels — see module docstring).
+            self.engine.add_stop_listener(self._on_session_stop)
+            self._stop_listener_registered = True
         orphaned = await self.db.get_active_workflow_runs()
         for run in orphaned:
             flipped = await self.db.transition_workflow_run(
@@ -133,6 +157,7 @@ class WorkflowRunService:
         )
 
     async def stop(self) -> None:
+        self._stopping = True
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
@@ -179,14 +204,34 @@ class WorkflowRunService:
                 raise WorkflowRunError(f"cwd is not a directory: {cwd}")
             spec["cwd"] = str(cwd)
 
-        budget = float(budget_usd) if budget_usd is not None else None
-        if budget is not None and budget <= 0:
+        try:
+            budget = float(budget_usd) if budget_usd is not None else None
+        except (TypeError, ValueError) as e:
+            raise WorkflowRunError(f"budget_usd is not a number: {budget_usd!r}") from e
+        # NaN/Infinity would defeat every subsequent comparison — coerce to
+        # unbudgeted and let the allow_unbudgeted gate decide.
+        if budget is not None and (budget <= 0 or not math.isfinite(budget)):
             budget = None
         if budget is None and not self.config.workflows.allow_unbudgeted:
             raise WorkflowRunError(
-                "budget_usd is required (> 0). Unbudgeted runs are disabled; "
-                "set workflows.allow_unbudgeted: true to permit them."
+                "budget_usd is required (a finite number > 0). Unbudgeted "
+                "runs are disabled; set workflows.allow_unbudgeted: true to "
+                "permit them."
             )
+
+        if engine_kind == ENGINE_CODEX and budget is not None:
+            # Fail closed: a codex model absent from codex.pricing meters $0
+            # everywhere (journals price to zero, recorded cost is NULL), so
+            # a "budgeted" run would silently never be enforced.
+            from nerve.agent.backends.codex.pricing import match_pricing
+
+            model = str(spec.get("model") or "") or self.config.codex.model
+            if match_pricing(model, self.config.codex.pricing) is None:
+                raise WorkflowRunError(
+                    f"model {model!r} has no codex.pricing entry — the budget "
+                    "cannot be metered. Add a codex.pricing entry for it or "
+                    "pick a priced model."
+                )
 
         run_id = f"wfr-{uuid.uuid4().hex[:8]}"
         journal_dir = self.runs_dir() / run_id
@@ -210,7 +255,12 @@ class WorkflowRunService:
         return await self.db.get_workflow_run(run_id) or run
 
     async def kill_run(self, run_id: str, reason: str = "", killed_by: str = "") -> dict:
-        """Terminate a run. Scoped strictly to the run's own session."""
+        """Terminate a run. Scoped strictly to the run's own session.
+
+        CAS-loop against dispatch races: a run read as ``pending`` may be
+        promoted to ``running`` before our transition lands — retry on the
+        running side rather than silently reporting success on a live run.
+        """
         run = await self.db.get_workflow_run(run_id)
         if run is None:
             raise WorkflowRunError(f"no such workflow run: {run_id}")
@@ -218,22 +268,20 @@ class WorkflowRunService:
         if killed_by:
             detail = f"{detail} (by {killed_by})"
 
-        if run["status"] == "pending":
-            flipped = await self.db.transition_workflow_run(
-                run_id, "killed", expect=("pending",), error=detail,
-            )
-            if flipped:
-                await self._finalize_terminal(run_id, "killed", {"reason": detail})
+        if await self.db.transition_workflow_run(
+            run_id, "killed", expect=("pending",), error=detail,
+        ):
+            await self._finalize_terminal(run_id, "killed", {"reason": detail})
             return await self.db.get_workflow_run(run_id) or run
 
-        flipped = await self.db.transition_workflow_run(
+        if await self.db.transition_workflow_run(
             run_id, "killed", expect=("running",), error=detail,
-        )
-        if not flipped:
-            # Already terminal — idempotent.
+        ):
+            await self._finalize_terminal(run_id, "killed", {"reason": detail})
+            self._spawn_enforcement(run_id)
             return await self.db.get_workflow_run(run_id) or run
-        await self._finalize_terminal(run_id, "killed", {"reason": detail})
-        self._spawn_enforcement(run_id)
+
+        # Already terminal — idempotent.
         return await self.db.get_workflow_run(run_id) or run
 
     async def get_run(self, run_id: str) -> dict | None:
@@ -259,29 +307,36 @@ class WorkflowRunService:
     # ------------------------------------------------------------------ #
 
     async def _maybe_dispatch(self) -> None:
-        """Promote queued pending runs into free concurrency slots."""
+        """Promote queued pending runs into free concurrency slots (FIFO)."""
+        if self._stopping:
+            return
         async with self._dispatch_lock:
             limit = max(1, int(self.config.workflows.max_concurrent_runs))
             running = await self.db.count_workflow_runs("running")
             if running >= limit:
                 return
-            pending = await self.db.list_workflow_runs(
-                status="pending", limit=limit - running,
-            )
-            # list is newest-first; dispatch oldest-first
-            for run in reversed(pending):
-                flipped = await self.db.transition_workflow_run(
-                    run["id"], "running", expect=("pending",),
-                )
-                if not flipped:
-                    continue
-                task = asyncio.create_task(
-                    self._execute(run["id"]), name=f"workflow-run-{run['id']}",
-                )
-                self._exec_tasks[run["id"]] = task
+            pending = await self.db.next_pending_workflow_runs(limit - running)
+            for run in pending:
+                if self._stopping:
+                    return
+                # Shielded so a cancelled caller (e.g. an _execute finally)
+                # can never commit the pending->running CAS without also
+                # creating the executor task (zombie 'running' row).
+                await asyncio.shield(self._promote(run["id"]))
+
+    async def _promote(self, run_id: str) -> None:
+        flipped = await self.db.transition_workflow_run(
+            run_id, "running", expect=("pending",),
+        )
+        if not flipped:
+            return
+        task = asyncio.create_task(
+            self._execute(run_id), name=f"workflow-run-{run_id}",
+        )
+        self._exec_tasks[run_id] = task
 
     def _session_id(self, run_id: str) -> str:
-        return f"workflow:{run_id}"
+        return f"{_SESSION_PREFIX}{run_id}"
 
     def _default_model(self, backend: str) -> str:
         if backend == "codex":
@@ -328,10 +383,18 @@ class WorkflowRunService:
 
     async def _execute(self, run_id: str) -> None:
         """Drive one run: session, prompt, terminal transition, journal."""
-        run = await self.db.get_workflow_run(run_id)
-        if run is None:
-            return
         session_id = self._session_id(run_id)
+        current = asyncio.current_task()
+        if current is not None:
+            # Registered before the first await so engine.stop_session
+            # (manual kill, budget kill, or a user stop on the session)
+            # can cancel this exact task from its first suspension point.
+            self.engine.register_task(session_id, current)
+        run = await self.db.get_workflow_run(run_id)
+        if run is None or run["status"] != "running":
+            # A kill landed between the dispatch CAS and here — never
+            # execute a payload for a terminal row.
+            return
         backend = ENGINE_BACKENDS[run["engine"]]
         spec = run["spec"]
         model = str(spec.get("model") or "") or self._default_model(backend)
@@ -352,12 +415,6 @@ class WorkflowRunService:
             self._write_run_json(run)
             await self._broadcast(run)
 
-            current = asyncio.current_task()
-            if current is not None:
-                # Lets engine.stop_session (manual kill, budget kill, or a
-                # user stop on the session) cancel this exact task.
-                self.engine.register_task(session_id, current)
-
             response = await self.engine.run(
                 session_id=session_id,
                 user_message=self._build_prompt(run),
@@ -365,6 +422,58 @@ class WorkflowRunService:
                 model=model,
                 effort_override=str(spec.get("effort") or "") or None,
             )
+
+            # engine.run returns normally even for interrupted, cancelled,
+            # or errored turns — classify the outcome before recording it.
+            fresh = await self.db.get_workflow_run(run_id)
+            if fresh is None or fresh["status"] != "running":
+                # A terminator (kill/budget/stop-listener) owns the row:
+                # leave status AND spent_usd alone (a final re-meter here
+                # would clobber the live-estimate figure with the ~$0 of a
+                # never-finalized turn).
+                return
+
+            # Background tasks inside the CLI (run_in_background Bash /
+            # Agent / Workflow) keep spending after the turn returns. Keep
+            # the run 'running' — metered and budget-killable — until the
+            # session is quiescent.
+            waited_bg = False
+            while self.engine.has_live_background_tasks(session_id):
+                if not waited_bg:
+                    waited_bg = True
+                    self._journal_event(run, "waiting_background", {})
+                await asyncio.sleep(
+                    min(15, max(2, int(self.config.workflows.poll_interval_seconds)))
+                )
+                fresh = await self.db.get_workflow_run(run_id)
+                if fresh is None or fresh["status"] != "running":
+                    return
+
+            fresh = await self.db.get_workflow_run(run_id)
+            if fresh is None or fresh["status"] != "running":
+                return
+            session = await self.db.get_session(session_id)
+            session_status = str((session or {}).get("status") or "")
+            if session_status in ("stopped", "error"):
+                # The turn was stopped or died and engine.run swallowed it.
+                await self._refresh_spend(run_id, final=True)
+                to_status = "killed" if session_status == "stopped" else "failed"
+                flipped = await self.db.transition_workflow_run(
+                    run_id, to_status, expect=("running",),
+                    error=f"session {session_status}",
+                )
+                if flipped:
+                    await self._finalize_terminal(
+                        run_id, to_status, {"reason": f"session {session_status}"},
+                    )
+                    if to_status == "failed":
+                        await self._notify(
+                            f"Workflow run {run_id} failed",
+                            f"{run.get('title') or run['engine']}: session "
+                            "errored mid-run; partial output is in the journal.",
+                            priority="high",
+                        )
+                return
 
             await self._refresh_spend(run_id, final=True)
             flipped = await self.db.transition_workflow_run(
@@ -384,9 +493,8 @@ class WorkflowRunService:
                     f"${spent:.2f}{budget_txt}. Session: {session_id}",
                 )
         except asyncio.CancelledError:
-            # Terminator (kill/budget) flipped status before cancelling us;
-            # a user stop on the session lands here with status still
-            # 'running' — record it as killed.
+            # Backstop only: the stop listener / kill paths CAS the row
+            # terminal before cancelling us, so this usually no-ops.
             with_status = await self.db.transition_workflow_run(
                 run_id, "killed", expect=("running",),
                 error="session stopped",
@@ -418,11 +526,31 @@ class WorkflowRunService:
             fresh = await self.db.get_workflow_run(run_id)
             if fresh:
                 self._write_run_json(fresh)
-            # Free slot → promote the queue.
-            try:
-                await self._maybe_dispatch()
-            except Exception:  # noqa: BLE001
-                logger.exception("workflow dispatch after %s failed", run_id)
+            # Always tear down the run's client: a lingering CLI process
+            # (kept alive for background tasks) would spend outside the
+            # budget meter after the run is terminal. Detached so a
+            # cancelled _execute still triggers it.
+            self._spawn_detached(
+                self._teardown_client(run_id), f"workflow-teardown-{run_id}",
+            )
+            # Free slot -> promote the queue. Detached: _execute may be
+            # running its finally under cancellation, and dispatch must not
+            # be interruptible mid-promotion.
+            self._spawn_detached(self._maybe_dispatch(), f"workflow-dispatch-{run_id}")
+
+    async def _on_session_stop(self, session_id: str) -> None:
+        """Engine stop listener: a direct stop on a workflow session is a
+        kill. CASes the run terminal BEFORE the stop lands so the swallowed
+        interrupt/cancel can never be recorded as success. No-ops for
+        non-workflow sessions and for runs a terminator already owns."""
+        if not session_id.startswith(_SESSION_PREFIX):
+            return
+        run_id = session_id[len(_SESSION_PREFIX):]
+        flipped = await self.db.transition_workflow_run(
+            run_id, "killed", expect=("running",), error="session stopped",
+        )
+        if flipped:
+            await self._finalize_terminal(run_id, "killed", {"reason": "session stopped"})
 
     async def _finalize_terminal(self, run_id: str, status: str, detail: dict) -> None:
         run = await self.db.get_workflow_run(run_id)
@@ -448,8 +576,14 @@ class WorkflowRunService:
 
     async def _tick(self) -> None:
         runs = await self.db.list_workflow_runs(status="running", limit=200)
-        for run in runs:
-            spent = await self._refresh_spend(run["id"])
+        for stale in runs:
+            spent = await self._refresh_spend(stale["id"])
+            # Re-read: the run may have finished/been killed while (or
+            # since) we metered it — budget actions only apply to rows
+            # still running.
+            run = await self.db.get_workflow_run(stale["id"])
+            if run is None or run["status"] != "running":
+                continue
             budget = run.get("budget_usd")
             if not budget or budget <= 0:
                 continue
@@ -473,10 +607,17 @@ class WorkflowRunService:
         await self._maybe_dispatch()
 
     async def _refresh_spend(self, run_id: str, final: bool = False) -> float:
-        """Re-meter a run; persists + broadcasts when the number moved."""
+        """Re-meter a run; persists + broadcasts when the number moved.
+
+        Terminal rows are never touched: their spend was settled by
+        whichever path finished them, and a straggling monitor tick must
+        not clobber it (or resurrect codex live-base state).
+        """
         run = await self.db.get_workflow_run(run_id)
         if run is None:
             return 0.0
+        if run["status"] != "running":
+            return float(run.get("spent_usd") or 0.0)
         session_id = run.get("session_id")
         if not session_id:
             return float(run.get("spent_usd") or 0.0)
@@ -485,8 +626,9 @@ class WorkflowRunService:
         spent = round(recorded + live, 6)
         if abs(spent - float(run.get("spent_usd") or 0.0)) > 1e-9:
             await self.db.update_workflow_run(run_id, {"spent_usd": spent})
-            run["spent_usd"] = spent
-            await self._broadcast(run)
+            fresh = await self.db.get_workflow_run(run_id)
+            if fresh:
+                await self._broadcast(fresh)
         return spent
 
     def _live_estimate(self, run: dict) -> float:
@@ -501,6 +643,10 @@ class WorkflowRunService:
 
     def _live_estimate_claude(self, run: dict) -> float:
         session_id = run.get("session_id") or ""
+        if not self.engine.is_session_running(session_id):
+            # Between turns the recorded cost is authoritative; counting
+            # snapshots here would double-bill the just-recorded turn.
+            return 0.0
         tokens = self.engine.get_live_workflow_tokens(session_id)
         if tokens <= 0:
             return 0.0
@@ -508,13 +654,15 @@ class WorkflowRunService:
         return estimate_turn_cost({"output_tokens": tokens}, spec_model)
 
     def _live_estimate_codex(self, run: dict) -> float:
-        """Price Ultracode journals created since this run started.
+        """Price Ultracode journals attributed to this run.
 
-        Journals fold into recorded turn cost at each turn end, so the
-        between-turns total becomes the subtraction base and only the
-        current turn's delta counts as live. Attribution is heuristic
-        (start-time + cwd match): concurrent codex runs sharing one cwd
-        may cross-attribute mid-turn; the turn-end fold is exact.
+        Attribution prefers the exact run-id set the session's live Codex
+        client tracked for its current turn; the fallback is heuristic
+        (created since this run started + same effective cwd), which can
+        cross-attribute concurrent same-cwd runs mid-turn. Journals fold
+        into recorded turn cost at each turn end, so the between-turns
+        total becomes the subtraction base and only the current turn's
+        delta counts as live.
         """
         from nerve.agent.backends.codex import ultracode
 
@@ -522,21 +670,29 @@ class WorkflowRunService:
         run_dirpath = Path(self.config.codex.home_dir).expanduser() / "ultracode" / "runs"
         if not run_dirpath.is_dir():
             return 0.0
+        exact_ids = self.engine.get_codex_ultracode_run_ids(session_id)
         started = _iso_to_epoch(run.get("started_at"))
         run_cwd = self._effective_cwd(run)
         total = 0.0
         for path in run_dirpath.glob("ultra-*.json"):
-            try:
-                if path.stat().st_mtime < started - 60:
+            if exact_ids is not None:
+                if path.stem not in exact_ids:
                     continue
-            except OSError:
-                continue
+            else:
+                # started_at is stamped at dispatch, before the session's
+                # CLI exists — this run's journals can never predate it.
+                try:
+                    if path.stat().st_mtime < started:
+                        continue
+                except OSError:
+                    continue
             journal = ultracode.read_verified_run_journal(self.config, path.stem)
             if not journal:
                 continue
-            jcwd = str(journal.get("cwd") or "")
-            if jcwd and run_cwd and jcwd != run_cwd:
-                continue
+            if exact_ids is None:
+                jcwd = str(journal.get("cwd") or "")
+                if jcwd and run_cwd and jcwd != run_cwd:
+                    continue
             total += self._journal_cost(journal, run)
         if not self.engine.is_session_running(session_id):
             # All settled work is (about to be) folded into recorded cost.
@@ -546,7 +702,8 @@ class WorkflowRunService:
         return max(0.0, total - base)
 
     def _journal_cost(self, journal: dict, run: dict) -> float:
-        """Dollar-price one Ultracode journal (per-worker models when known)."""
+        """Dollar-price one Ultracode journal (per-worker models when known,
+        aggregate as fallback when worker rows carry no usable usage)."""
         from nerve.agent.backends.codex.pricing import match_pricing
 
         parent_model = str(run["spec"].get("model") or "") or self._default_model("codex")
@@ -573,7 +730,10 @@ class WorkflowRunService:
                 if not isinstance(w, dict):
                     continue
                 total += price(w.get("usage") or {}, w.get("model"))
-            return total
+            if total > 0:
+                return total
+            # Worker rows without usable usage/pricing — don't silently
+            # meter $0 when the aggregate is available.
         return price(journal.get("aggregate_usage") or {}, None)
 
     # ------------------------------------------------------------------ #
@@ -600,13 +760,30 @@ class WorkflowRunService:
         )
         self._spawn_enforcement(run["id"])
 
-    def _spawn_enforcement(self, run_id: str) -> None:
-        """Fire-and-forget the stop sequence so callers return immediately."""
-        task = asyncio.create_task(
-            self._stop_session_hard(run_id), name=f"workflow-kill-{run_id}",
-        )
+    def _spawn_detached(self, coro: Any, name: str) -> None:
+        """Fire-and-forget a coroutine, keeping it referenced until done."""
+        task = asyncio.create_task(coro, name=name)
         self._kill_tasks.add(task)
         task.add_done_callback(self._kill_tasks.discard)
+
+    def _spawn_enforcement(self, run_id: str) -> None:
+        """Fire-and-forget the stop sequence so callers return immediately."""
+        self._spawn_detached(
+            self._stop_session_hard(run_id), f"workflow-kill-{run_id}",
+        )
+
+    async def _teardown_client(self, run_id: str) -> None:
+        """Discard the run session's client (kills its CLI subprocess /
+        process group, including lingering background tasks). Safe when no
+        client exists. Does NOT go through engine.stop_session — that would
+        cancel a still-finalizing _execute task."""
+        session_id = self._session_id(run_id)
+        try:
+            await self.engine._discard_client(  # noqa: SLF001 — engine-internal by design
+                session_id, background_memorize=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("client teardown failed for %s", session_id)
 
     async def _stop_session_hard(self, run_id: str) -> None:
         """Graceful interrupt → grace window → force client discard.
@@ -618,9 +795,9 @@ class WorkflowRunService:
         its subprocess) alive indefinitely.
         """
         run = await self.db.get_workflow_run(run_id)
-        session_id = (run or {}).get("session_id")
-        if not session_id:
-            return
+        # The session id is deterministic — enforce even when the row never
+        # recorded it (kill racing the earliest phase of _execute).
+        session_id = (run or {}).get("session_id") or self._session_id(run_id)
         try:
             await self.engine.stop_session(session_id)
         except Exception:  # noqa: BLE001

@@ -264,21 +264,25 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-    # One-shot cleanup of retired houseofagents artifacts: its config.toml
-    # holds plaintext API keys, so park it out of the way; the binary is
-    # re-downloadable and just deleted. Best-effort — never blocks startup.
+    # One-shot cleanup of retired houseofagents artifacts. Gated on the
+    # NERVE-MANAGED binary existing (~/.nerve/bin/ is ours): a standalone
+    # houseofagents install the user runs outside Nerve keeps its
+    # ~/.config/houseofagents/config.toml untouched. When it was ours, the
+    # config.toml holds plaintext API keys Nerve wrote — park it out of the
+    # way; the binary is re-downloadable and just deleted. Best-effort —
+    # never blocks startup.
     try:
-        hoa_config = Path("~/.config/houseofagents/config.toml").expanduser()
-        if hoa_config.exists():
-            retired_dir = Path("~/.nerve/houseofagents-retired").expanduser()
-            retired_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            hoa_config.rename(retired_dir / "config.toml.bak")
-            logger.info(
-                "houseofagents retired: moved %s to %s",
-                hoa_config, retired_dir / "config.toml.bak",
-            )
         hoa_binary = Path("~/.nerve/bin/houseofagents").expanduser()
         if hoa_binary.exists():
+            hoa_config = Path("~/.config/houseofagents/config.toml").expanduser()
+            if hoa_config.exists() and not hoa_config.is_symlink():
+                retired_dir = Path("~/.nerve/houseofagents-retired").expanduser()
+                retired_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                hoa_config.rename(retired_dir / "config.toml.bak")
+                logger.info(
+                    "houseofagents retired: moved %s to %s",
+                    hoa_config, retired_dir / "config.toml.bak",
+                )
             hoa_binary.unlink()
             logger.info("houseofagents retired: deleted binary %s", hoa_binary)
     except Exception as e:

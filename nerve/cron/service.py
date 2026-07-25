@@ -723,6 +723,28 @@ class CronService:
             )
             return
 
+        if job.lock:
+            # ``lock`` promises no overlapping work for this job. The
+            # per-job asyncio.Lock only covers the (instant) launch, so
+            # extend the guarantee to run duration: skip while a previous
+            # run from this job is still pending/running. Without this, a
+            # schedule shorter than the run duration stacks full-budget
+            # runs.
+            active = await service.db.get_active_workflow_runs()
+            mine = [
+                r for r in active
+                if r.get("created_by") == f"cron:{job.id}"
+            ]
+            if mine:
+                await self.db.log_cron_finish(
+                    log_id, "success",
+                    output=(
+                        f"skipped: workflow run {mine[0]['id']} from this "
+                        "job is still active (lock)"
+                    ),
+                )
+                return
+
         w = job.workflow or {}
         try:
             run = await service.start_run(

@@ -41,8 +41,11 @@ WORKFLOW_RUN_START_SCHEMA = {
         "budget_usd": {
             "type": "number",
             "description": (
-                "Hard dollar budget. Spend is metered from Nerve's usage "
-                "accounting; the run is warned at 80% and stopped at 100%."
+                "Hard dollar budget (finite, > 0). Spend is metered from "
+                "Nerve's usage accounting; the run is warned at 80% and "
+                "stopped at 100%. Pass 0 to explicitly request an "
+                "unbudgeted run — honored only when "
+                "workflows.allow_unbudgeted is enabled."
             ),
         },
         "title": {
@@ -133,17 +136,28 @@ def _get_service(ctx: ToolContext):
     return service, ""
 
 
-async def _reject_external(ctx: ToolContext) -> ToolResult | None:
-    """Runs execute through the engine — reject external MCP satellites."""
+async def _reject_restricted(ctx: ToolContext) -> ToolResult | None:
+    """Gate start/kill: reject external MCP satellites (runs are owned by
+    the Nerve engine) AND workflow-run sessions themselves (a run spawning
+    further independently-budgeted runs would let it spend past its own
+    cap; killing a parent doesn't cascade)."""
     try:
         session = await ctx.db.get_session(ctx.session_id)
     except Exception:  # noqa: BLE001
         session = None
-    if session and session.get("source") == "external":
+    source = (session or {}).get("source")
+    if source == "external":
         return ToolResult.text(
             "workflow_run_start/kill are not available for external client "
             "sessions — runs are owned by the Nerve engine. Use "
             "workflow_run_list/status to inspect.",
+            is_error=True,
+        )
+    if source == "workflow":
+        return ToolResult.text(
+            "workflow runs cannot start or kill other workflow runs — a "
+            "run's budget must bound all spend it causes. Use the Workflow "
+            "tool / Ultracode for in-run parallelism instead.",
             is_error=True,
         )
     return None
@@ -168,7 +182,7 @@ async def workflow_run_start_handler(ctx: ToolContext, args: dict) -> ToolResult
     service, reason = _get_service(ctx)
     if service is None:
         return ToolResult.text(reason, is_error=True)
-    rejected = await _reject_external(ctx)
+    rejected = await _reject_restricted(ctx)
     if rejected:
         return rejected
     from nerve.workflows.service import WorkflowRunError
@@ -221,7 +235,7 @@ async def workflow_run_kill_handler(ctx: ToolContext, args: dict) -> ToolResult:
     service, reason = _get_service(ctx)
     if service is None:
         return ToolResult.text(reason, is_error=True)
-    rejected = await _reject_external(ctx)
+    rejected = await _reject_restricted(ctx)
     if rejected:
         return rejected
     from nerve.workflows.service import WorkflowRunError

@@ -30,11 +30,16 @@ Spec fields:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `prompt` | yes | Task instructions, written for an autonomous orchestrating agent |
-| `budget_usd` | yes* | Hard dollar cap. *Optional only with `workflows.allow_unbudgeted: true` |
+| `budget_usd` | yes* | Hard dollar cap (finite, > 0). *Pass `0` to explicitly request an unbudgeted run — honored only with `workflows.allow_unbudgeted: true`. NaN/Infinity are rejected. A budgeted `codex-ultracode` run additionally requires its model to have a `codex.pricing` entry (an unpriceable model would meter $0 and never enforce) |
 | `title` | no | Short human-readable label |
 | `model` | no | Model override (default: the backend's configured model — `agent.model` / `codex.model`) |
 | `effort` | no | Reasoning effort override (`low`/`medium`/`high`/`xhigh`/`max`) |
 | `cwd` | no | Working directory for the run's session; must exist (default: `workspace`) |
+
+Budget containment: a run's own session cannot call `workflow_run_start`
+or `workflow_run_kill` — nested runs would spend outside the parent's cap
+(and kills don't cascade). Use the in-run orchestration primitives
+(Workflow tool / Ultracode) for parallelism instead.
 
 ## Engines
 
@@ -212,12 +217,25 @@ jobs:
 ```
 
 The block mirrors the REST/MCP spec: `engine`, `prompt`, `budget_usd`
-(required, positive), `title` (defaults to the job id), `model`, `effort`,
-`cwd` (optional). `workflow` takes precedence over `prompt`/`prompt_file`.
-The job is fire-and-forget: the cron log records only the launch — no cron
-session is created, and the run sends its own budget/completion/failure
-notifications. General job fields (schedule, gates, enabled) are unchanged —
-see [cron.md](cron.md).
+(required, positive, finite), `title` (defaults to the job id), `model`,
+`effort`, `cwd` (optional). `workflow` takes precedence over
+`prompt`/`prompt_file`. The job is fire-and-forget: the cron log records
+only the launch — no cron session is created, and the run sends its own
+budget/completion/failure notifications. General job fields (schedule,
+gates, enabled) are unchanged — see [cron.md](cron.md).
+
+Two fields deserve care on workflow jobs:
+
+- **`lock: true` is recommended.** For workflow jobs it extends beyond the
+  launch: a trigger is skipped (logged as `skipped: … still active`) while a
+  previous run from the same job is still pending/running. Without it, a
+  schedule shorter than the run duration stacks concurrent full-budget runs.
+- **`catchup: false` is recommended.** The default (`true`) fires an
+  overdue job once at daemon startup — for a workflow job that launches a
+  paid multi-agent run right after every restart that crossed a scheduled
+  slot. Note this is the one exception to "nothing resumes on its own after
+  a restart": the *old* run is still marked failed; catchup starts a *new*
+  one.
 
 ## Spec Template: Re-Review Until Agreement
 
