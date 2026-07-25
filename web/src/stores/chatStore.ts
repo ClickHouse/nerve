@@ -810,6 +810,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'subagent_complete':  return handleSubagentComplete(msg, get, set);
       case 'hoa_progress':       return handleHoaProgress(msg, get, set);
       case 'workflow_progress':  return handleWorkflowProgress(msg, get, set);
+      // Workflow runs — global event (session_id may be null); upsert into
+      // the runs store so the /workflow-runs page stays live.
+      case 'workflow_run_update':
+        void import('./workflowRunStore').then(({ useWorkflowRunStore }) =>
+          useWorkflowRunStore.getState().handleRunUpdate(msg.run)
+        );
+        return;
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'interaction_resolved':     return handleInteractionResolved(msg, get, set);

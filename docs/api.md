@@ -188,6 +188,63 @@ Request: { "status": "done", "note": "Fixed in PR #123" }
 Request: { "content": "# Updated Title\n\n**Deadline:** 2026-03-15\n\nNew details..." }
 ```
 
+### Workflow Runs
+
+Budget-capped multi-agent jobs. See [workflow-runs.md](workflow-runs.md) for
+semantics (engines, budget metering, lifecycle, journals). On the wire,
+`spec.prompt` is trimmed to 500 chars.
+
+#### `GET /api/workflow-runs?status=&limit=50&offset=0`
+List runs, newest first. `status`: `active` (pending+running), an exact status (`pending`, `running`, `done`, `failed`, `killed`, `budget_exhausted`), or empty for all.
+
+```json
+Response: {
+  "runs": [{
+    "id": "wfr-a1b2c3d4", "engine": "claude-workflow", "title": "Sample batch audit",
+    "spec": { "prompt": "Audit samples/batch-07/ for ..." },
+    "status": "running", "budget_usd": 12.0, "spent_usd": 3.42, "warned_at": null,
+    "session_id": "workflow:wfr-a1b2c3d4", "journal_dir": "/home/alice/.nerve/workflow-runs/wfr-a1b2c3d4",
+    "created_by": "session:main", "error": null, "result": null,
+    "created_at": "...", "started_at": "...", "finished_at": null, "updated_at": "..."
+  }],
+  "total": 1
+}
+```
+
+#### `POST /api/workflow-runs`
+Start a run. `engine` is `claude-workflow` or `codex-ultracode`; `budget_usd` is required unless `workflows.allow_unbudgeted` is set. Optional: `title`, `model`, `effort`, `cwd` (must be an existing directory). Returns the created run immediately (`pending`, or `running` once dispatched); execution happens in the background.
+
+```json
+Request:  { "engine": "claude-workflow", "prompt": "Audit samples/batch-07/ for ...", "budget_usd": 12, "title": "Sample batch audit" }
+Response: { "id": "wfr-a1b2c3d4", "status": "pending", ... }
+```
+
+#### `GET /api/workflow-runs/{id}`
+Run detail (same shape as the list items).
+
+#### `POST /api/workflow-runs/{id}/kill`
+Terminate a run. Scoped strictly to the run's own session/subprocess; idempotent on already-terminal runs.
+
+```json
+Request:  { "reason": "superseded" }
+Response: { "id": "wfr-a1b2c3d4", "status": "killed", ... }
+```
+
+#### `GET /api/workflow-runs/{id}/journal`
+Journal contents from `<runs_dir>/<run-id>/`: the `run.json` snapshot, the parsed `events.ndjson` lifecycle events (created, started, budget_warning, terminal status, enforced_stop), and `result.md` when the run finished.
+
+```json
+Response: {
+  "run_json": { "id": "wfr-a1b2c3d4", ... },
+  "events": [
+    { "ts": "...", "run_id": "wfr-a1b2c3d4", "event": "created", "engine": "claude-workflow", "budget_usd": 12.0, "created_by": "session:main" },
+    { "ts": "...", "run_id": "wfr-a1b2c3d4", "event": "started", "session_id": "workflow:wfr-a1b2c3d4", "backend": "claude", "model": "..." }
+  ],
+  "has_result": false,
+  "result": ""
+}
+```
+
 ### Skills
 
 #### `GET /api/skills`
@@ -473,6 +530,10 @@ Connect to `ws[s]://host:port/ws?token=<jwt>`.
 
 // Plan file updated (Write/Edit to .claude/plans/)
 { type: "plan_update", session_id: "main", content: "# Plan\n..." }
+
+// Workflow run created / status or spend changed (broadcast to all clients;
+// session_id is the run's own session, null before dispatch)
+{ type: "workflow_run_update", session_id: "workflow:wfr-a1b2c3d4", run: { id: "wfr-a1b2c3d4", status: "running", spent_usd: 3.42, budget_usd: 12.0, ... } }
 
 // File modified by agent (Edit/Write/NotebookEdit succeeded)
 { type: "file_changed", session_id: "main", path: "/home/user/project/foo.py", operation: "edit", tool_use_id: "toolu_..." }

@@ -31,6 +31,12 @@ class CronJob:
     # the inline prompt; the inline prompt acts as a fallback if the file
     # is unreadable.
     prompt_file: str = ""
+    # Workflow-run declaration: instead of prompting a cron session, the
+    # job launches a budget-capped workflow run (see nerve/workflows) and
+    # returns immediately — the run notifies on its own. Required keys:
+    # 'engine', 'prompt', and a positive numeric 'budget_usd'. Optional:
+    # title, model, effort, cwd. Takes precedence over prompt/prompt_file.
+    workflow: dict | None = None
     description: str = ""
     model: str = ""  # Override model; empty = use config default
     effort: str = ""  # Override reasoning effort (low/medium/high/xhigh/max); empty = source default (cron_effort)
@@ -66,13 +72,47 @@ class CronJob:
 
     def __post_init__(self) -> None:
         self.gates = self._build_gates()
-        if not self.prompt and not self.prompt_file:
+        if self.workflow is not None:
+            self._validate_workflow()
+        elif not self.prompt and not self.prompt_file:
             raise ValueError(
-                f"Cron job {self.id!r} needs a 'prompt' or 'prompt_file'"
+                f"Cron job {self.id!r} needs a 'prompt', 'prompt_file', "
+                "or 'workflow'"
             )
         if self.prompt_file and self.prompt_path is None:
             # Direct construction (tests, programmatic) — resolve against cwd.
             self.prompt_path = Path(self.prompt_file).expanduser()
+
+    def _validate_workflow(self) -> None:
+        """Validate the workflow declaration at construction time.
+
+        Raises ValueError with a precise message so invalid jobs are
+        dropped at load with a log, same as jobs missing a prompt.
+        """
+        w = self.workflow
+        if not isinstance(w, dict):
+            raise ValueError(
+                f"Cron job {self.id!r}: 'workflow' must be a mapping, "
+                f"got {type(w).__name__}"
+            )
+        if not str(w.get("engine") or "").strip():
+            raise ValueError(
+                f"Cron job {self.id!r}: workflow needs a non-empty 'engine'"
+            )
+        if not str(w.get("prompt") or "").strip():
+            raise ValueError(
+                f"Cron job {self.id!r}: workflow needs a non-empty 'prompt'"
+            )
+        budget = w.get("budget_usd")
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or budget <= 0
+        ):
+            raise ValueError(
+                f"Cron job {self.id!r}: workflow needs a positive numeric "
+                f"'budget_usd', got {budget!r}"
+            )
 
     def resolve_prompt(self) -> str:
         """Return the effective prompt for a run.
@@ -120,6 +160,7 @@ class CronJob:
             schedule=d["schedule"],
             prompt=d.get("prompt", ""),
             prompt_file=d.get("prompt_file", ""),
+            workflow=d.get("workflow"),
             description=d.get("description", ""),
             model=d.get("model", ""),
             effort=d.get("effort", ""),
@@ -183,6 +224,7 @@ def save_jobs(jobs: list[CronJob], jobs_file: Path) -> None:
             "schedule": job.schedule,
             "prompt": job.prompt,
             "prompt_file": job.prompt_file,
+            "workflow": job.workflow,
             "description": job.description,
             "model": job.model,
             "effort": job.effort,

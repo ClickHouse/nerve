@@ -405,3 +405,23 @@ Manual commands (run regardless of `enabled`):
 |-----|------|---------|-------------|
 | `cron.system_file` | path | `~/.nerve/cron/system.yaml` | System cron jobs (managed by `nerve init`) |
 | `cron.jobs_file` | path | `~/.nerve/cron/jobs.yaml` | User-defined custom cron jobs |
+
+## Workflow Runs
+
+Budget-capped multi-agent jobs (Claude harness `Workflow` tool or Codex
+Ultracode) in dedicated tracked sessions. Nerve meters real dollar spend from
+its own usage accounting, warns at `warn_fraction`, and terminates the run at
+100% of budget — the kill is scoped to the run's own session/subprocess. Each
+run keeps a journal under `runs_dir` (`<run-id>/{run.json,events.ndjson,result.md}`).
+Runs do not survive a daemon restart: a startup recovery pass marks orphaned
+active runs `failed` and notifies. See [workflow-runs.md](workflow-runs.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `workflows.enabled` | bool | `true` | Master switch — service, MCP tools, and API |
+| `workflows.runs_dir` | path | `~/.nerve/workflow-runs` | Root for per-run journal directories |
+| `workflows.poll_interval_seconds` | int | `60` | Budget monitor cadence — spend is re-metered (recorded turn costs + live in-flight estimate) every interval (min 5s) |
+| `workflows.warn_fraction` | float | `0.8` | Fraction of `budget_usd` at which the one-time warning notification fires |
+| `workflows.kill_grace_seconds` | int | `30` | After the graceful stop at 100% budget, how long to wait before force-discarding the session's client (kills its subprocess) |
+| `workflows.max_concurrent_runs` | int | `2` | Runs dispatched concurrently; excess queues in status `pending`. Each running workflow occupies one `agent.max_concurrent` slot for its whole turn — keep this well below that limit |
+| `workflows.allow_unbudgeted` | bool | `false` | Permit starting runs without `budget_usd`. Budget enforcement is the point of this surface, so off by default |

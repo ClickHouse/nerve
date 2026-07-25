@@ -1788,5 +1788,205 @@ def db_vacuum(ctx: click.Context) -> None:
     )
 
 
+def _format_workflow_run(run: dict) -> str:
+    """One compact status line: id, status, title, spent vs budget."""
+    budget = run.get("budget_usd")
+    budget_txt = f"${budget:.2f}" if budget else "none"
+    spent = float(run.get("spent_usd") or 0.0)
+    line = (
+        f"{run['id']} [{run['status']}] {run.get('title') or run['engine']} — "
+        f"spent ${spent:.2f} / budget {budget_txt}"
+    )
+    if run.get("error"):
+        line += f" — {run['error']}"
+    return line
+
+
+def _workflow_db_path(ctx: click.Context) -> Path:
+    db_path = Path("~/.nerve/nerve.db").expanduser()
+    if not db_path.exists():
+        click.echo(f"[ERR] Database not found: {db_path}")
+        ctx.exit(1)
+    return db_path
+
+
+def _gateway_request(
+    ctx: click.Context, config, method: str, path: str, body: dict | None = None,
+) -> dict:
+    """Call the local daemon's REST API; prints the failure and exits non-zero.
+
+    Start/kill must execute inside the daemon (runs live in its event
+    loop), so these commands go over HTTP instead of touching the DB.
+    """
+    import httpx
+
+    scheme = "https" if config.gateway.ssl.enabled else "http"
+    url = f"{scheme}://127.0.0.1:{config.gateway.port}{path}"
+    headers = {}
+    if config.auth.jwt_secret:
+        from nerve.gateway.auth import create_token
+
+        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
+    try:
+        # verify=False: gateway.ssl is normally a local self-signed cert,
+        # and this call only ever targets loopback.
+        resp = httpx.request(
+            method, url, json=body, headers=headers, timeout=30.0, verify=False,
+        )
+    except httpx.ConnectError:
+        click.echo(
+            f"[ERR] Cannot connect to the gateway at {url} — "
+            "is the nerve daemon running? (nerve start)"
+        )
+        ctx.exit(1)
+    except httpx.HTTPError as e:
+        click.echo(f"[ERR] Request to {url} failed: {e}")
+        ctx.exit(1)
+    if not (200 <= resp.status_code < 300):
+        click.echo(f"[ERR] {method} {path} -> HTTP {resp.status_code}: {resp.text}")
+        ctx.exit(1)
+    return resp.json()
+
+
+@main.group(name="workflow")
+def workflow_group() -> None:
+    """Inspect and control budget-capped workflow runs."""
+
+
+@workflow_group.command("list")
+@click.option(
+    "--status", default="",
+    help="Filter: 'active' (pending+running) or an exact status "
+         "(pending/running/done/failed/killed/budget_exhausted).",
+)
+@click.option(
+    "--limit", type=click.IntRange(1, 200), default=20, show_default=True,
+    help="Max runs to show (newest first).",
+)
+@click.pass_context
+def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
+    """List workflow runs straight from the database (daemon not required)."""
+    from nerve.db import Database
+
+    config = ctx.obj["config"]
+    db_path = _workflow_db_path(ctx)
+
+    async def _run() -> list[dict]:
+        # Read-only concurrent access is safe alongside the daemon (WAL).
+        database = Database(db_path, workspace=config.workspace)
+        await database.connect()
+        try:
+            return await database.list_workflow_runs(
+                status=status or None, limit=limit,
+            )
+        finally:
+            await database.close()
+
+    runs = asyncio.run(_run())
+    if not runs:
+        click.echo("No workflow runs" + (f" with status '{status}'" if status else "") + ".")
+        return
+    for run in runs:
+        click.echo(_format_workflow_run(run))
+
+
+@workflow_group.command("status")
+@click.argument("run_id")
+@click.pass_context
+def workflow_status(ctx: click.Context, run_id: str) -> None:
+    """Show one run's status, spend vs budget, session, and journal path."""
+    from nerve.db import Database
+
+    config = ctx.obj["config"]
+    db_path = _workflow_db_path(ctx)
+
+    async def _run() -> dict | None:
+        database = Database(db_path, workspace=config.workspace)
+        await database.connect()
+        try:
+            return await database.get_workflow_run(run_id)
+        finally:
+            await database.close()
+
+    run = asyncio.run(_run())
+    if run is None:
+        click.echo(f"[ERR] No such workflow run: {run_id}")
+        ctx.exit(1)
+        return
+    click.echo(_format_workflow_run(run))
+    click.echo(f"  engine:    {run['engine']}")
+    click.echo(f"  created:   {run.get('created_at')} (by {run.get('created_by')})")
+    if run.get("started_at"):
+        click.echo(f"  started:   {run['started_at']}")
+    if run.get("finished_at"):
+        click.echo(f"  finished:  {run['finished_at']}")
+    if run.get("session_id"):
+        click.echo(f"  session:   {run['session_id']}")
+    if run.get("journal_dir"):
+        click.echo(f"  journal:   {run['journal_dir']}")
+    if run.get("result"):
+        click.echo(f"  result:    {run['result'][:500]}")
+
+
+@workflow_group.command("start")
+@click.option(
+    "--engine", "engine_kind", required=True,
+    type=click.Choice(["claude-workflow", "codex-ultracode"]),
+    help="Execution engine for the run.",
+)
+@click.option("--prompt", required=True, help="Task prompt for the orchestrating agent.")
+@click.option(
+    "--budget", "budget_usd", type=float, default=None,
+    help="Hard dollar budget (warned at 80%, stopped at 100%). Required "
+         "unless workflows.allow_unbudgeted is enabled.",
+)
+@click.option("--title", default="", help="Short human-readable label.")
+@click.option("--model", default="", help="Model override (backend default otherwise).")
+@click.option("--effort", default="", help="Reasoning effort override.")
+@click.option("--cwd", default="", help="Working directory for the run's session.")
+@click.pass_context
+def workflow_start(
+    ctx: click.Context,
+    engine_kind: str,
+    prompt: str,
+    budget_usd: float | None,
+    title: str,
+    model: str,
+    effort: str,
+    cwd: str,
+) -> None:
+    """Start a workflow run in the running daemon."""
+    config = ctx.obj["config"]
+    run = _gateway_request(ctx, config, "POST", "/api/workflow-runs", {
+        "engine": engine_kind,
+        "prompt": prompt,
+        "budget_usd": budget_usd,
+        "title": title,
+        "model": model,
+        "effort": effort,
+        "cwd": cwd,
+    })
+    budget = run.get("budget_usd")
+    budget_txt = f"${budget:.2f}" if budget else "UNBUDGETED"
+    click.echo(f"Workflow run {run['id']} created ({run['status']}), budget {budget_txt}.")
+    if run.get("journal_dir"):
+        click.echo(f"Journal: {run['journal_dir']}")
+    click.echo(f"Track it with: nerve workflow status {run['id']}")
+
+
+@workflow_group.command("kill")
+@click.argument("run_id")
+@click.option("--reason", default="", help="Why the run is being killed (recorded).")
+@click.pass_context
+def workflow_kill(ctx: click.Context, run_id: str, reason: str) -> None:
+    """Kill a workflow run via the running daemon (scoped to that run)."""
+    config = ctx.obj["config"]
+    run = _gateway_request(
+        ctx, config, "POST", f"/api/workflow-runs/{run_id}/kill", {"reason": reason},
+    )
+    click.echo(f"Workflow run {run['id']} is now '{run['status']}'.")
+    click.echo(_format_workflow_run(run))
+
+
 if __name__ == "__main__":
     main()

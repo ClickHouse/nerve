@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, LogOut, Clock, Lightbulb, Sparkles, Bell, Plug, Users, Workflow } from 'lucide-react';
+import { MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, LogOut, Clock, Lightbulb, Sparkles, Bell, Plug, Users, Workflow, Rocket } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
@@ -17,6 +17,7 @@ const NAV_ITEMS = [
   { path: '/mcp', icon: Plug, label: 'MCP' },
   { path: '/houseofagents', icon: Users, label: 'HoA', feature: 'hoa' as const },
   { path: '/ultracode', icon: Workflow, label: 'Ultra', feature: 'ultracode' as const },
+  { path: '/workflow-runs', icon: Rocket, label: 'Runs' },
   { path: '/sources', icon: Inbox, label: 'Sources' },
   { path: '/cron', icon: Clock, label: 'Cron' },
   { path: '/memory', icon: Brain, label: 'Memory' },

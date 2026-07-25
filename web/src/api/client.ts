@@ -78,6 +78,57 @@ export interface UltracodeRun {
   cancelled?: number;
 }
 
+// Workflow runs — budgeted autonomous agent runs.
+// Mirrors public_run() in nerve/workflows/service.py (snake_case wire shape).
+export interface WorkflowRunSpec {
+  prompt: string;
+  model?: string;
+  effort?: string;
+  cwd?: string;
+}
+
+export type WorkflowRunStatus =
+  | 'pending'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'killed'
+  | 'budget_exhausted';
+
+export interface WorkflowRun {
+  id: string;
+  engine: 'claude-workflow' | 'codex-ultracode';
+  title: string;
+  spec: WorkflowRunSpec;
+  status: WorkflowRunStatus;
+  budget_usd: number | null;
+  spent_usd: number;
+  warned_at: string | null;
+  session_id: string | null;
+  journal_dir: string | null;
+  created_by: string;
+  error: string | null;
+  result: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+}
+
+export interface WorkflowRunJournalEvent {
+  ts: string;
+  run_id: string;
+  event: string;
+  [key: string]: unknown;
+}
+
+export interface WorkflowRunJournal {
+  run_json: Record<string, unknown> | null;
+  events: WorkflowRunJournalEvent[];
+  has_result: boolean;
+  result: string;
+}
+
 let authToken: string | null = localStorage.getItem('nerve_token');
 
 export function setToken(token: string) {
@@ -460,6 +511,23 @@ export const api = {
     request<{ runs: UltracodeRun[] }>(`/codex/ultracode/runs?limit=${encodeURIComponent(String(limit))}`),
   getUltracodeRun: (id: string) =>
     request<{ run: UltracodeRun }>(`/codex/ultracode/runs/${encodeURIComponent(id)}`),
+
+  // Workflow runs — budgeted autonomous agent runs
+  listWorkflowRuns: (status?: string, limit = 50) => {
+    const qs = new URLSearchParams();
+    if (status) qs.set('status', status);
+    qs.set('limit', String(limit));
+    return request<{ runs: WorkflowRun[]; total: number }>(`/workflow-runs?${qs}`);
+  },
+  getWorkflowRun: (id: string) =>
+    request<WorkflowRun>(`/workflow-runs/${encodeURIComponent(id)}`),
+  killWorkflowRun: (id: string, reason = '') =>
+    request<WorkflowRun>(`/workflow-runs/${encodeURIComponent(id)}/kill`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  getWorkflowRunJournal: (id: string) =>
+    request<WorkflowRunJournal>(`/workflow-runs/${encodeURIComponent(id)}/journal`),
 
   // Files
   uploadFiles: async (files: File[], sessionId: string): Promise<{ files: Array<{ id: string; filename: string; media_type: string; file_type: string; size: number }> }> => {
