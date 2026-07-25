@@ -257,20 +257,18 @@ export function ChatPage() {
                 activeSession={activeSession}
                 onSelect={switchSession}
               />
-              {fileCount > 0 && (
-                <button
-                  onClick={openFilesPanel}
-                  className={`flex items-center gap-1.5 px-2 py-1 rounded text-[12px] transition-colors cursor-pointer ${
-                    filesPanelActive
-                      ? 'text-hue-teal bg-teal-400/10'
-                      : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-                  }`}
-                  title="Modified files"
-                >
-                  <Files size={14} />
-                  <span className="tabular-nums">{fileCount}</span>
-                </button>
-              )}
+              <button
+                onClick={openFilesPanel}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded text-[12px] transition-colors cursor-pointer ${
+                  filesPanelActive
+                    ? 'text-hue-teal bg-teal-400/10'
+                    : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
+                }`}
+                title="Files & code review"
+              >
+                <Files size={14} />
+                {fileCount > 0 && <span className="tabular-nums">{fileCount}</span>}
+              </button>
               {contextUsage && <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />}
               {langfuse?.enabled && langfuse.host && activeSession && (
                 <a

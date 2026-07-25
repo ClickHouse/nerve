@@ -193,8 +193,13 @@ export const api = {
     request<{ path: string; content: string | null; binary: boolean; too_large: boolean }>(
       `/review/file?${new URLSearchParams({ worktree, path })}`,
     ),
-  listReviews: (status?: string) =>
-    request<{ reviews: Review[] }>(`/reviews${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  listReviews: (params?: { status?: string; session?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set('status', params.status);
+    if (params?.session) qs.set('session', params.session);
+    const q = qs.toString();
+    return request<{ reviews: Review[] }>(`/reviews${q ? '?' + q : ''}`);
+  },
   createReview: (data: {
     worktree: string; branch?: string | null; base_ref?: string;
     target_session_id?: string | null; created_by?: string; title?: string;

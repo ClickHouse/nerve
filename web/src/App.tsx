@@ -25,7 +25,6 @@ import { HouseOfAgentsPage } from './pages/HouseOfAgentsPage';
 import { UltracodePage } from './pages/UltracodePage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
-import { ReviewPage } from './pages/ReviewPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
@@ -54,7 +53,6 @@ function App() {
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
           <Route path="/files/*" element={<FilesPage />} />
-          <Route path="/review" element={<ReviewPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
           <Route path="/plans" element={<PlansPage />} />

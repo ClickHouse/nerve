@@ -105,6 +105,13 @@ class TestReviewStore:
         await db.delete_review(r["id"])
         assert await db.get_review(r["id"]) is None
 
+    async def test_filter_by_session(self, db: Database):
+        a = await db.create_review(repo_root="/r", worktree="/r/wt", target_session_id="sessAAAA")
+        b = await db.create_review(repo_root="/r", worktree="/r/wt2", target_session_id="sessBBBB")
+        assert {x["id"] for x in await db.list_reviews(target_session_id="sessAAAA")} == {a["id"]}
+        assert {x["id"] for x in await db.list_reviews(target_session_id="sessBBBB")} == {b["id"]}
+        assert {x["id"] for x in await db.list_reviews()} == {a["id"], b["id"]}
+
 
 # --------------------------------------------------------------------------- #
 #  Git helpers                                                                 #

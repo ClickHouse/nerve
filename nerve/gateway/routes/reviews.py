@@ -221,9 +221,13 @@ async def review_file(worktree: str, path: str, user: dict = Depends(require_aut
 # --- Review / thread / comment endpoints -----------------------------------
 
 @router.get("/api/reviews")
-async def list_reviews(status: str | None = None, user: dict = Depends(require_auth)):
+async def list_reviews(
+    status: str | None = None,
+    session: str | None = None,
+    user: dict = Depends(require_auth),
+):
     _cfg()
-    reviews = await get_deps().db.list_reviews(status=status)
+    reviews = await get_deps().db.list_reviews(status=status, target_session_id=session)
     return {"reviews": reviews}
 
 

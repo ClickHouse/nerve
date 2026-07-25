@@ -56,13 +56,19 @@ class ReviewStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def list_reviews(self, status: str | None = None, limit: int = 100) -> list[dict]:
-        """List reviews (newest first) with open-thread counts."""
+    async def list_reviews(
+        self, status: str | None = None, target_session_id: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        """List reviews (newest first) with open-thread counts, optionally
+        filtered by status and/or the session they're attached to."""
         conditions = []
         params: list = []
         if status:
             conditions.append("r.status = ?")
             params.append(status)
+        if target_session_id:
+            conditions.append("r.target_session_id = ?")
+            params.append(target_session_id)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
         async with self.db.execute(
