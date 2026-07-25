@@ -487,10 +487,14 @@ class WorkflowRunService:
                 spent = (fresh or {}).get("spent_usd") or 0.0
                 budget = (fresh or {}).get("budget_usd")
                 budget_txt = f" of ${budget:.2f} budget" if budget else ""
+                snippet = " ".join((response or "").split())
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "…"
                 await self._notify(
                     f"Workflow run {run_id} finished",
                     f"{run.get('title') or run['engine']} — spent "
-                    f"${spent:.2f}{budget_txt}. Session: {session_id}",
+                    f"${spent:.2f}{budget_txt}. Session: {session_id}"
+                    + (f"\n\n{snippet}" if snippet else ""),
                 )
         except asyncio.CancelledError:
             # Backstop only: the stop listener / kill paths CAS the row

@@ -18,6 +18,32 @@ import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
 import { PlanToolBlock } from './tools/PlanToolBlock';
 import { SkillToolBlock } from './tools/SkillToolBlock';
 import { NotificationToolBlock } from './tools/NotificationToolBlock';
+import { WorkflowRunToolBlock } from './tools/WorkflowRunToolBlock';
+
+const WORKFLOW_RUN_ID_RE = /wfr-[0-9a-f]{8}/;
+
+/**
+ * First wfr-xxxxxxxx id in a workflow_run_* tool result. Both tools embed it:
+ *   workflow_run_start  → "Workflow run wfr-xxxxxxxx created (running). ..."
+ *   workflow_run_status → "wfr-xxxxxxxx [status] title — spent $X / budget $Y"
+ * MCP results may arrive as JSON content-block arrays — unwrap text blocks
+ * first. Returns null while the call has no result yet.
+ */
+function extractWorkflowRunId(result?: string): string | null {
+  if (!result) return null;
+  let text = result;
+  try {
+    const parsed: unknown = JSON.parse(result);
+    if (Array.isArray(parsed)) {
+      text = parsed
+        .filter(b => b && b.type === 'text')
+        .map(b => String(b.text))
+        .join('\n');
+    }
+  } catch { /* not JSON */ }
+  const match = text.match(WORKFLOW_RUN_ID_RE);
+  return match ? match[0] : null;
+}
 
 const TOOL_ICONS: Record<string, typeof Terminal> = {
   Bash: Terminal,
@@ -76,6 +102,17 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
   // Notification tools
   if (block.tool.includes('notify') || block.tool.includes('ask_user')) {
     return <NotificationToolBlock block={block} />;
+  }
+
+  // Workflow runs (workflow_run_start / workflow_run_status) — live run card
+  // fed by the runs store (global workflow_run_update WS event). The run id
+  // only exists in the tool result, so while the call is still running (or
+  // errored, e.g. "no such workflow run") fall through to the generic block.
+  if (block.tool.includes('workflow_run_start') || block.tool.includes('workflow_run_status')) {
+    const runId = extractWorkflowRunId(block.result);
+    if (runId && !block.isError) {
+      return <WorkflowRunToolBlock block={block} runId={runId} />;
+    }
   }
 
   // MCP tool routing by name pattern
