@@ -464,6 +464,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Failed to send startup notification: %s", e)
 
+    # Re-drive any sessions enrolled via `nerve restart --resume`. Runs as a
+    # background task so a (possibly long) resumed turn never blocks startup;
+    # the engine, notification service and channels are all wired by now.
+    asyncio.create_task(_engine.resume_enrolled_sessions())
+
     yield
 
     # Stop the loopback listener before the manager so no new requests

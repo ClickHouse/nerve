@@ -31,6 +31,7 @@ from pathlib import Path
 import click
 
 from nerve.config import (
+    RESUME_QUEUE_FILE,
     load_config,
     resolve_config_dir,
     set_config,
@@ -361,15 +362,43 @@ def stop(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.option(
+    "--resume",
+    "resume_ids",
+    multiple=True,
+    metavar="SESSION_ID",
+    help=(
+        "Session id to auto-resume once the daemon is back (repeatable). The "
+        "fresh daemon re-drives an interrupted turn for each id that still has "
+        "a resumable SDK session."
+    ),
+)
 @click.pass_context
-def restart(ctx: click.Context) -> None:
+def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     """Restart the Nerve daemon.
 
     Spawns a detached helper process that stops the old daemon and starts a
     new one.  This ensures restarts work even when triggered from *inside*
     the running daemon (e.g. via the Telegram bot / agent), because the
     helper runs in its own session and survives the parent's death.
+
+    ``--resume SESSION_ID`` enrolls one or more sessions to be continued after
+    the restart: their ids are written to the resume queue now, and the fresh
+    daemon re-drives each interrupted turn on startup.
     """
+    # Enroll ids before anything else so the queue file is on disk — and
+    # survives even a hard kill — by the time the new instance reads it.
+    # Append mode lets concurrent enrollments from different sessions coexist.
+    # Written for every mode (normal / Docker / systemd) since all restart the
+    # daemon. Invalid/dead ids are skipped by the daemon-side drainer.
+    if resume_ids:
+        ids = [s.strip() for s in resume_ids if s.strip()]
+        if ids:
+            RESUME_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(RESUME_QUEUE_FILE, "a") as fh:
+                fh.writelines(f"{sid}\n" for sid in ids)
+            click.echo(f"Will resume {len(ids)} session(s) after restart.")
+
     config = ctx.obj["config"]
     # Already resolved via the waterfall (flag → env → cwd → pointer), so
     # this is an absolute path that doesn't depend on the caller's CWD.

@@ -63,6 +63,7 @@ def app_with_mcp(tmp_path, monkeypatch):
     fake_engine.sessions.run_cleanup = AsyncMock(return_value={})
     fake_engine.run_memorization_sweep = AsyncMock(return_value={})
     fake_engine.run_idle_client_sweep = AsyncMock()
+    fake_engine.resume_enrolled_sessions = AsyncMock(return_value=0)
 
     db_path = tmp_path / "test.db"
 
