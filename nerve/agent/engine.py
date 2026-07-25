@@ -1929,6 +1929,28 @@ class AgentEngine:
             return str(data.get("status") or "completed")
         return "running"
 
+    def get_live_workflow_tokens(self, session_id: str) -> int:
+        """Sum of subagent output tokens across the session's live
+        ``Workflow`` snapshots.
+
+        This is the only mid-turn spend signal the Claude backend offers:
+        real cost lands in ``session_usage`` at turn end, but a workflow
+        run's whole life can be one long turn. The budget monitor prices
+        these tokens as output tokens for an in-flight estimate; settled
+        workflows are pruned from the registry right around the time
+        their real cost is recorded, so recorded + live never double
+        counts across turns.
+        """
+        reg = self._workflows.get(session_id) or {}
+        total = 0
+        for entry in reg.values():
+            snap = entry.get("snapshot") or {}
+            try:
+                total += int(snap.get("totalTokens") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
     @staticmethod
     def _derive_workflow_name(tool_input: Any) -> str:
         """Best-effort workflow name: the ``name`` arg for a named workflow,

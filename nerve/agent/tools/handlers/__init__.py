@@ -18,6 +18,7 @@ from nerve.agent.tools.handlers.skills import SKILL_SPECS
 from nerve.agent.tools.handlers.sources import SOURCE_SPECS
 from nerve.agent.tools.handlers.tasks import TASK_SPECS
 from nerve.agent.tools.handlers.wakeups import WAKEUP_SPECS
+from nerve.agent.tools.handlers.workflow_runs import WORKFLOW_RUN_SPECS
 
 
 def build_default_registry() -> ToolRegistry:
@@ -38,6 +39,7 @@ def build_default_registry() -> ToolRegistry:
         *NOTIFICATION_SPECS,
         *MCP_ADMIN_SPECS,
         *WAKEUP_SPECS,
+        *WORKFLOW_RUN_SPECS,
         *HOA_SPECS,
     ):
         registry.register(spec)

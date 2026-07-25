@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 # Global references
 _engine: AgentEngine | None = None
 _cron_service = None  # CronService
+_workflow_run_service = None  # WorkflowRunService (nerve.workflows)
 # StreamableHTTPSessionManager assigned during lifespan when
 # config.mcp_endpoint.enabled. The /mcp/v1 mount handler reads it; until
 # lifespan finishes building it, the mount returns 503.
@@ -236,6 +237,32 @@ async def lifespan(app: FastAPI):
                 notification_service.hide_session_label_for(f"cron:{job.id}")
     except Exception as e:
         logger.warning("Cron service failed to start: %s", e)
+
+    # Start the workflow-run service (budget-capped multi-agent jobs).
+    # After notification_service wiring so budget alerts can deliver, and
+    # after engine init so runs execute against live backends. A startup
+    # failure here must be LOUD, not a silent warning — runs are
+    # budget-enforced only while this service is alive.
+    global _workflow_run_service
+    try:
+        from nerve.workflows import init_workflow_run_service
+
+        _workflow_run_service = init_workflow_run_service(config, db, _engine)
+        if _workflow_run_service is not None:
+            await _workflow_run_service.start()
+            logger.info("Workflow run service started")
+    except Exception as e:
+        logger.error("Workflow run service failed to start: %s", e)
+        _workflow_run_service = None
+        try:
+            await notification_service.send_notification(
+                session_id="system",
+                title="Workflow run service failed to start",
+                body=f"Budget-capped workflow runs are unavailable: {e}",
+                priority="high",
+            )
+        except Exception:
+            pass
 
     # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
     # it tightens to hourly only when the opt-in interactive idle auto-close
@@ -526,6 +553,12 @@ async def lifespan(app: FastAPI):
         await telegram_channel.stop()
     if cron_task:
         await cron_task.stop()
+    if _workflow_run_service is not None:
+        try:
+            await _workflow_run_service.stop()
+        except Exception as e:
+            logger.warning("Workflow run service shutdown raised: %s", e)
+        _workflow_run_service = None
 
     db_retention_task.cancel()
     notify_maintenance_task.cancel()

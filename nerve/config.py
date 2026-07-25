@@ -639,6 +639,49 @@ class BackupConfig:
 
 
 @dataclass
+class WorkflowRunsConfig:
+    """Budget-capped multi-agent workflow runs.
+
+    A workflow run wraps a dedicated agent session (Claude harness
+    Workflow tool or Codex Ultracode) in a dollar budget enforced from
+    Nerve's own usage metering, with run-scoped kill and a durable
+    journal directory under ``runs_dir``.
+    """
+
+    enabled: bool = True
+    # Root for per-run journal dirs: <runs_dir>/<run-id>/{run.json,events.ndjson,result.md}
+    runs_dir: Path = field(default_factory=lambda: Path("~/.nerve/workflow-runs"))
+    # Budget monitor cadence. Spend is re-metered (recorded turn costs +
+    # live in-flight estimate) every interval.
+    poll_interval_seconds: int = 60
+    # Fraction of budget_usd at which a one-time warning notification fires.
+    warn_fraction: float = 0.8
+    # After a graceful stop request at 100% budget, how long to wait before
+    # force-discarding the session's client (which kills its subprocess).
+    kill_grace_seconds: int = 30
+    # Runs dispatched concurrently; excess queues in status 'pending'.
+    # Each running workflow occupies one agent.max_concurrent slot for the
+    # duration of its turn — keep this well below that limit.
+    max_concurrent_runs: int = 2
+    # Whether workflow_run_start may launch runs without a budget. Budget
+    # enforcement is the point of this surface, so default is False.
+    allow_unbudgeted: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> WorkflowRunsConfig:
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            runs_dir=_expand_path(d.get("runs_dir", "~/.nerve/workflow-runs"))
+            or Path("~/.nerve/workflow-runs"),
+            poll_interval_seconds=int(d.get("poll_interval_seconds", 60)),
+            warn_fraction=float(d.get("warn_fraction", 0.8)),
+            kill_grace_seconds=int(d.get("kill_grace_seconds", 30)),
+            max_concurrent_runs=int(d.get("max_concurrent_runs", 2)),
+            allow_unbudgeted=bool(d.get("allow_unbudgeted", False)),
+        )
+
+
+@dataclass
 class SessionsConfig:
     archive_after_days: int = 30
     interactive_archive_after_hours: int = 0  # Interactive (web/telegram/…) sessions auto-close after this many idle hours (0 = disabled; opt in via config). Starred sessions are exempt and never auto-close.
@@ -1356,6 +1399,7 @@ class NerveConfig:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
+    workflows: WorkflowRunsConfig = field(default_factory=WorkflowRunsConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
@@ -1536,6 +1580,7 @@ class NerveConfig:
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             ollama=OllamaConfig.from_dict(d.get("ollama", {})),
             codex=CodexConfig.from_dict(d.get("codex", {})),
+            workflows=WorkflowRunsConfig.from_dict(d.get("workflows", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
