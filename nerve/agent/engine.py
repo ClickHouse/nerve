@@ -453,13 +453,6 @@ class AgentEngine:
         from nerve.config import load_claude_code_plugins
         self._claude_code_plugins = load_claude_code_plugins()
 
-        # Initialize houseofagents service (optional)
-        if self.config.houseofagents.enabled:
-            from nerve.houseofagents import init_hoa_service
-            svc = init_hoa_service(self.config)
-            if svc:
-                logger.info("houseofagents service initialized (available=%s)", svc.is_available())
-
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
 

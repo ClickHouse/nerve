@@ -14,8 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from nerve.houseofagents.config import HouseOfAgentsConfig
-
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -682,6 +680,25 @@ class WorkflowRunsConfig:
 
 
 @dataclass
+class HouseOfAgentsConfig:
+    """Deprecated — houseofagents was retired in favor of workflow runs.
+
+    Kept only so existing ``config.yaml`` files with a ``houseofagents:``
+    block keep parsing, and so ``enabled`` can gate visibility of the
+    ``hoa_*`` deprecation stub tools (``nerve/agent/tools/handlers/hoa.py``).
+    Every other legacy key (default_mode, default_agents, use_cli, ...) is
+    ignored. Use ``workflows:`` / the ``workflow_run_*`` tools instead —
+    see ``docs/workflow-runs.md``.
+    """
+
+    enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> HouseOfAgentsConfig:
+        return cls(enabled=bool(d.get("enabled", False)))
+
+
+@dataclass
 class SessionsConfig:
     archive_after_days: int = 30
     interactive_archive_after_hours: int = 0  # Interactive (web/telegram/…) sessions auto-close after this many idle hours (0 = disabled; opt in via config). Starred sessions are exempt and never auto-close.
@@ -880,7 +897,7 @@ class McpEndpointConfig:
 
     enabled: bool = False
     path: str = "/mcp/v1"
-    include_hoa: bool = False   # Expose HouseOfAgents tools to external clients
+    include_hoa: bool = False   # Expose the deprecated hoa_* stub tools to external clients
 
     @classmethod
     def from_dict(cls, d: dict) -> McpEndpointConfig:
@@ -1791,8 +1808,6 @@ def validate_config_keys(merged: dict) -> list[str]:
             return ftype
         if isinstance(ftype, str):
             candidate = globals().get(ftype)
-            if candidate is None and ftype == "HouseOfAgentsConfig":
-                candidate = HouseOfAgentsConfig
             if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
                 return candidate
         return None

@@ -58,17 +58,6 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
       }
       break;
     }
-    case 'hoa_progress': {
-      for (let i = result.length - 1; i >= 0; i--) {
-        const b = result[i];
-        if (b.type === 'tool_call' && b.tool.includes('hoa_execute')) {
-          const prev = b.hoaEvents || [];
-          result[i] = { ...b, hoaEvents: [...prev, event.event] };
-          break;
-        }
-      }
-      break;
-    }
     case 'workflow_progress': {
       for (let i = result.length - 1; i >= 0; i--) {
         const b = result[i];

@@ -264,6 +264,26 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+    # One-shot cleanup of retired houseofagents artifacts: its config.toml
+    # holds plaintext API keys, so park it out of the way; the binary is
+    # re-downloadable and just deleted. Best-effort — never blocks startup.
+    try:
+        hoa_config = Path("~/.config/houseofagents/config.toml").expanduser()
+        if hoa_config.exists():
+            retired_dir = Path("~/.nerve/houseofagents-retired").expanduser()
+            retired_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            hoa_config.rename(retired_dir / "config.toml.bak")
+            logger.info(
+                "houseofagents retired: moved %s to %s",
+                hoa_config, retired_dir / "config.toml.bak",
+            )
+        hoa_binary = Path("~/.nerve/bin/houseofagents").expanduser()
+        if hoa_binary.exists():
+            hoa_binary.unlink()
+            logger.info("houseofagents retired: deleted binary %s", hoa_binary)
+    except Exception as e:
+        logger.warning("houseofagents artifact cleanup failed: %s", e)
+
     # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
     # it tightens to hourly only when the opt-in interactive idle auto-close
     # (sessions.interactive_archive_after_hours > 0) is enabled and needs finer resolution.

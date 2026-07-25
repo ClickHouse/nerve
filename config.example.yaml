@@ -147,7 +147,7 @@ cron:
 # mcp_endpoint:
 #   enabled: false
 #   path: /mcp/v1
-#   include_hoa: false   # Expose hoa_* tools externally (default off)
+#   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
 # Observability (optional) — Langfuse tracing for the agent loop and memU.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.

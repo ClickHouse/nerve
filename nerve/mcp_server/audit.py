@@ -6,8 +6,8 @@ rows in the DB. Writing one ``session_events`` row per call gives the
 diagnostics views and the future per-session timeline UI something
 concrete to show, and provides an audit trail for security review.
 
-Args of long-running tools (``hoa_execute``, etc.) and big result blobs
-are truncated to keep the event log compact; the unfiltered payload
+Args of prompt-heavy tools (``workflow_run_start``, etc.) and big result
+blobs are truncated to keep the event log compact; the unfiltered payload
 lives in the broader conversation history if needed.
 """
 

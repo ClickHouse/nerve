@@ -16,7 +16,7 @@ web/src/
 │   ├── handlers/       # Domain-specific WebSocket message handlers
 │   │   ├── streamingHandlers.ts  # thinking, token, tool_use, tool_result, done, stopped, error
 │   │   ├── sessionHandlers.ts    # session lifecycle (updated/status/switched/forked/resumed/archived/running)
-│   │   ├── panelHandlers.ts      # plan_update, subagent_start/complete, hoa_progress
+│   │   ├── panelHandlers.ts      # plan_update, subagent_start/complete, workflow_progress
 │   │   ├── auxiliaryHandlers.ts  # interaction, file_changed, notifications, background_tasks
 │   │   └── types.ts              # Shared Get/Set type aliases for handlers
 │   ├── helpers/        # Stateless utility functions for chat state

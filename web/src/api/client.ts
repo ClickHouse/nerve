@@ -444,10 +444,9 @@ export const api = {
   getPlan: (id: string) => request<any>(`/plans/${id}`),
   updatePlan: (id: string, data: { status?: string; feedback?: string }) =>
     request<any>(`/plans/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  approvePlan: (id: string, options?: { runtime?: string; hoa_mode?: string; hoa_agents?: string[]; hoa_pipeline_id?: string }) =>
+  approvePlan: (id: string) =>
     request<{ plan_id: string; impl_session_id: string }>(`/plans/${id}/approve`, {
       method: 'POST',
-      body: JSON.stringify(options || {}),
     }),
   revisePlan: (id: string, feedback: string) =>
     request<any>(`/plans/${id}/revise`, { method: 'POST', body: JSON.stringify({ feedback }) }),
@@ -486,23 +485,6 @@ export const api = {
     }),
   deleteSilence: (id: string) =>
     request<any>(`/notifications/silences/${id}`, { method: 'DELETE' }),
-
-  // houseofagents
-  getHoaStatus: () =>
-    request<{ enabled: boolean; available: boolean; version: string | null; default_mode: string; default_agents: string[] }>('/houseofagents/status'),
-  listHoaPipelines: () =>
-    request<{ pipelines: Array<{ id: string; name: string; description: string }> }>('/houseofagents/pipelines'),
-  getHoaPipeline: (id: string) =>
-    request<{ id: string; name: string; content: string; description: string }>(`/houseofagents/pipelines/${id}`),
-  saveHoaPipeline: (id: string, content: string) =>
-    request<{ id: string; path: string }>(`/houseofagents/pipelines/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify({ content }),
-    }),
-  deleteHoaPipeline: (id: string) =>
-    request<{ deleted: boolean }>(`/houseofagents/pipelines/${id}`, { method: 'DELETE' }),
-  installHoaBinary: () =>
-    request<{ installed: boolean; path: string; version: string }>('/houseofagents/install', { method: 'POST' }),
 
   // Ultracode read-only dashboard
   getUltracodeDashboardStatus: () =>

@@ -3,7 +3,7 @@ import { scheduleAutoClose } from '../helpers/blockHelpers';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
-//  Panel handlers: plan_update, subagent_start/complete, hoa_progress //
+//  Panel handlers: plan_update, subagent_start/complete, workflow    //
 // ------------------------------------------------------------------ //
 
 export function handlePlanUpdate(
@@ -170,25 +170,5 @@ export function handleWorkflowProgress(
       };
     });
     if (touched) set({ messages });
-  }
-}
-
-export function handleHoaProgress(
-  msg: Extract<WSMessage, { type: 'hoa_progress' }>,
-  get: Get,
-  set: Set,
-): void {
-  const state = get();
-  // houseofagents NDJSON progress — update the running hoa_execute tool block
-  const blocks = [...state.streamingBlocks];
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    const b = blocks[i];
-    if (b.type === 'tool_call' && b.tool.includes('hoa_execute') && b.status === 'running') {
-      // Immutable append — new array reference so React detects the change
-      const prev = b.hoaEvents || [];
-      blocks[i] = { ...b, hoaEvents: [...prev, msg.event] };
-      set({ streamingBlocks: blocks });
-      break;
-    }
   }
 }

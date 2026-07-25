@@ -13,7 +13,6 @@ import { ScheduleWakeupBlock } from './tools/ScheduleWakeupBlock';
 import { SourceToolBlock } from './tools/SourceToolBlock';
 import { SubagentToolBlock } from './tools/SubagentToolBlock';
 import { WorkflowToolBlock } from './tools/WorkflowToolBlock';
-import { HoAToolBlock } from './tools/HoAToolBlock';
 import { QuestionBlock } from './tools/QuestionBlock';
 import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
 import { PlanToolBlock } from './tools/PlanToolBlock';
@@ -67,11 +66,6 @@ export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
     case 'ExitPlanMode':
     case 'EnterPlanMode':
       return <PlanApprovalBlock block={block} />;
-  }
-
-  // houseofagents
-  if (block.tool.includes('hoa_execute')) {
-    return <HoAToolBlock block={block} />;
   }
 
   // send_file — render as inline download card, no tool chrome

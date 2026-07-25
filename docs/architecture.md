@@ -128,15 +128,8 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
 
-### House of Agents (`nerve/houseofagents/`)
-Optional multi-agent execution runtime using [houseofagents](https://github.com/ClickHouse/houseofagents):
-- Orchestrates Claude, OpenAI, and Gemini agents in relay, swarm, or pipeline (DAG) modes
-- Exposed as a **session-scoped MCP tool** (`hoa_execute`) — the agent calls it, progress streams to UI in real-time via `StreamBroadcaster`, then the agent continues with verification and cleanup
-- Binary lifecycle: auto-download from GitHub releases, `cargo install` fallback for aarch64
-- Pipeline configs stored as TOML files in `~/.nerve/houseofagents/pipelines/`
-- Plan approval UI supports runtime selection: default (single session) or multi-agent
-- Disabled by default; enable via `houseofagents.enabled: true` in config
-- Configured via `houseofagents.*` settings in config
+### House of Agents (retired)
+The houseofagents multi-agent runtime was retired in favor of **workflow runs** (`nerve/workflows/`, the `workflow_run_*` tools) — budget-capped multi-agent runs with journals, live spend tracking, and run-scoped kill. See [workflow-runs.md](workflow-runs.md). The `hoa_*` tool names remain registered as deprecation stubs (gated by `houseofagents.enabled`) that point callers at `workflow_run_start`.
 
 ### Proxy (`nerve/proxy/`)
 Optional local HTTP proxy that routes Anthropic API calls through Claude Code's OAuth authentication:

@@ -910,7 +910,7 @@ class TestStepCounter:
         wizard._next_step("Mode")
         wizard.choices.mode = "personal"
         wizard._completed_steps.add("mode")
-        assert wizard._next_step("API") == "Step 3/11: API"
+        assert wizard._next_step("API") == "Step 3/10: API"
 
     def test_total_after_mode_worker(self, tmp_path: Path) -> None:
         wizard = SetupWizard(tmp_path)
@@ -927,4 +927,4 @@ class TestStepCounter:
         wizard._do("deployment", lambda: None)
         wizard._do("mode", lambda: None)
         assert wizard._step_counter == 2
-        assert wizard._next_step("API") == "Step 3/11: API"
+        assert wizard._next_step("API") == "Step 3/10: API"
