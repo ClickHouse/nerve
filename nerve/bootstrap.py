@@ -1957,7 +1957,7 @@ class SetupWizard:
                 "model": "claude-opus-4-8",
                 "cron_model": "claude-sonnet-4-6",
                 "max_turns": 50,
-                "max_concurrent": 4,
+                "max_concurrent": 32,
                 "thinking": "max",
                 "effort": "max",
                 "context_1m": True,

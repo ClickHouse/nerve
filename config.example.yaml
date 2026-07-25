@@ -38,7 +38,7 @@ agent:
   cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
   title_model: claude-haiku-4-5-20251001  # Session title generation
   max_turns: 50                  # Max agentic turns per request
-  max_concurrent: 4              # Max concurrent agent sessions
+  max_concurrent: 32             # Max concurrent agent sessions
   background_agent_permissions: true  # Background sub-agents (Agent run_in_background) get the same tool permissions as foreground; false denies their Write/Edit/Bash
   # First-prompt rewrite — the web UI can refine the opening message of a
   # new chat with a fast model, preview it, and send only after approval.
