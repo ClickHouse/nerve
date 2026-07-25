@@ -670,11 +670,18 @@ class ClaudeBackend:
             calls and denies Write/Edit/Bash by default. A PreToolUse
             hook DOES fire for them, so returning
             ``permissionDecision: "allow"`` grants the same auto-approval
-            foreground agents get. Interactive tools and Read are left
-            untouched (they defer to ``can_use_tool`` / the validator).
+            foreground agents get. Only interactive tools are left
+            untouched (they defer to ``can_use_tool``'s pause/deny).
+
+            Read is parity-allowed too: excluding it left background
+            agents unable to read outside the session cwd while their
+            Edit/Write sailed through — foreground Read is blanket-
+            approved via ``can_use_tool``, which never fires for them,
+            so the exclusion protected nothing. The image validator
+            still runs for Read and its deny wins over this allow.
             """
             tool_name = hook_input.get("tool_name", "")
-            if tool_name in INTERACTIVE_TOOLS or tool_name == "Read":
+            if tool_name in INTERACTIVE_TOOLS:
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
             return {
                 "hookSpecificOutput": {

@@ -437,7 +437,7 @@ class TestBuildHooksBackgroundPermissions:
             assert spec.get("permissionDecision") == "allow", tool
 
     @pytest.mark.asyncio
-    async def test_defers_interactive_and_read_when_enabled(self):
+    async def test_defers_interactive_but_grants_read_when_enabled(self):
         backend = _make_hook_backend(True)
         grant = _catch_all_grant_hook(backend._build_hooks(_hook_spec("sess-x")))
 
@@ -447,10 +447,12 @@ class TestBuildHooksBackgroundPermissions:
             out = await grant({"tool_name": tool}, "tid", None)
             assert "permissionDecision" not in out["hookSpecificOutput"], tool
 
-        # Read defers to the image validator (a deny there must win), so the
-        # catch-all hook leaves it untouched.
+        # Read IS parity-allowed: can_use_tool never fires for detached
+        # background agents, so excluding Read only broke their
+        # out-of-cwd reads (Edit/Write worked while Read was denied).
+        # The image validator still runs and its deny wins over this allow.
         out = await grant({"tool_name": "Read"}, "tid", None)
-        assert "permissionDecision" not in out["hookSpecificOutput"]
+        assert out["hookSpecificOutput"].get("permissionDecision") == "allow"
 
     @pytest.mark.asyncio
     async def test_no_grant_hook_when_disabled(self):
