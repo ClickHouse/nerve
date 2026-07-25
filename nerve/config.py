@@ -843,6 +843,39 @@ class McpEndpointConfig:
 
 
 @dataclass
+class CodeReviewConfig:
+    """Local code-review panel — browse on-disk git worktrees and exchange
+    line-anchored review comments with the agent, before anything is
+    committed or pushed.
+
+    Off by default; set ``enabled: true`` and list the repository roots you
+    want reviewable under ``code_review`` in config.local.yaml, e.g.::
+
+        code_review:
+          enabled: true
+          repos:
+            - ~/nerve
+            - ~/project
+
+    Only files inside a configured repo root (or one of its git worktrees)
+    are served. Authenticated with the existing web-UI JWT — same token
+    mechanism as the rest of the API.
+    """
+
+    enabled: bool = False
+    repos: list[str] = field(default_factory=list)
+    max_file_bytes: int = 2_000_000  # skip diffing/serving files larger than this
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CodeReviewConfig":
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            repos=[str(r) for r in (d.get("repos") or [])],
+            max_file_bytes=int(d.get("max_file_bytes", 2_000_000)),
+        )
+
+
+@dataclass
 class ExternalAgentTargetConfig:
     """One configured external agent (Codex, Claude Code, ...).
 
@@ -1356,6 +1389,7 @@ class NerveConfig:
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
+    code_review: CodeReviewConfig = field(default_factory=CodeReviewConfig)
 
     # API keys (from config.local.yaml)
     anthropic_api_key: str = ""
@@ -1536,6 +1570,7 @@ class NerveConfig:
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
+            code_review=CodeReviewConfig.from_dict(d.get("code_review", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
