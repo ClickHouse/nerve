@@ -61,6 +61,28 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const activeSession = useChatStore(s => s.activeSession);
   const ensureRealSession = useChatStore(s => s.ensureRealSession);
   const isNewChat = useChatStore(s => s.messages.length === 0);
+
+  // Persist the composer draft, but NOT on every keystroke. Writing to the
+  // global store per character re-renders every store subscriber (the message
+  // list included), which stalls typing on long chats. Debounce the write and
+  // flush it on blur / send so no draft is lost.
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelDraftFlush = useCallback(() => {
+    if (draftTimerRef.current !== null) {
+      clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+  }, []);
+  const scheduleDraft = useCallback((sessionId: string, text: string) => {
+    cancelDraftFlush();
+    draftTimerRef.current = setTimeout(() => {
+      draftTimerRef.current = null;
+      setDraft(sessionId, text);
+    }, 400);
+  }, [cancelDraftFlush, setDraft]);
+  // Clear any pending draft write when the composer unmounts.
+  useEffect(() => cancelDraftFlush, [cancelDraftFlush]);
+
   // Backend selector renders only while the chat is virtual (unsent):
   // the choice binds at server-side session creation and is sticky.
   const isVirtualChat = useChatStore(
@@ -259,6 +281,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       }));
 
     onSend(message, fileIds.length > 0 ? fileIds : undefined, imageBlocks.length > 0 ? imageBlocks : undefined);
+    cancelDraftFlush();
     setInput('');
     setDraft(activeSession, '');
     clearQuotes();
@@ -527,7 +550,8 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             id="nerve-chat-input"
             ref={textareaRef}
             value={input}
-            onChange={(e) => { setInput(e.target.value); setDraft(activeSession, e.target.value); }}
+            onChange={(e) => { const v = e.target.value; setInput(v); scheduleDraft(activeSession, v); }}
+            onBlur={() => { cancelDraftFlush(); setDraft(activeSession, input); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             placeholder={

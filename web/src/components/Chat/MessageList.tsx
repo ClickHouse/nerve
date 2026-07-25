@@ -1,11 +1,11 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, memo } from 'react';
 import type { ChatMessage, MessageBlock } from '../../types/chat';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 
-export function MessageList({ messages, streamingBlocks, isStreaming }: {
+function MessageListImpl({ messages, streamingBlocks, isStreaming }: {
   messages: ChatMessage[];
   streamingBlocks: MessageBlock[];
   isStreaming: boolean;
@@ -57,3 +57,9 @@ export function MessageList({ messages, streamingBlocks, isStreaming }: {
     </div>
   );
 }
+
+// Memoized so unrelated store updates (notably the per-keystroke draft write
+// from the composer) don't re-render the whole message list. Every prop is a
+// stable store slice, so the list re-renders only when messages,
+// streamingBlocks, or isStreaming actually change.
+export const MessageList = memo(MessageListImpl);
