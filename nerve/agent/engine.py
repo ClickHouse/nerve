@@ -64,7 +64,7 @@ from nerve.agent.tools import (
 # keep working. The new runtime path uses ``self.registry`` + a
 # per-session ``ToolContext`` and ignores those globals.
 from nerve.agent.tools import init_tools
-from nerve.config import NerveConfig, load_mcp_servers
+from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
@@ -73,6 +73,16 @@ logger = logging.getLogger(__name__)
 
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+# Injected as an internal turn when a session is resumed after a
+# ``nerve restart --resume`` (see AgentEngine.resume_enrolled_sessions).
+_RESUME_AFTER_RESTART_PROMPT = (
+    "The Nerve daemon was restarted while you were in the middle of a task. "
+    "Continue from where you left off — pick up the work you were doing before "
+    "the restart. If you triggered the restart yourself, confirm it succeeded "
+    "and carry on."
+)
+
 
 def _sanitize_surrogates(s: str) -> str:
     """Remove orphaned UTF-16 surrogates that break JSON serialization.
@@ -1354,6 +1364,91 @@ class AgentEngine:
         await self.sessions.transition(session_id, SessionStatus.CREATED)
         session = await self.db.get_session(session_id)
         return session
+
+    async def resume_enrolled_sessions(self) -> int:
+        """Re-drive sessions enrolled via ``nerve restart --resume`` on startup.
+
+        The CLI appends session ids to :data:`RESUME_QUEUE_FILE` before a
+        restart. Here we read them once, delete the file immediately (so a
+        resume that itself restarts re-enrolls cleanly and no id is ever
+        re-run), then drive one internal "continue" turn per still-resumable
+        session. Ids that no longer exist, are archived, belong to another
+        runtime (satellite ``source="external"``), or have no SDK session to
+        resume are skipped. ``internal=True`` keeps the synthetic trigger out
+        of the transcript while the assistant's continuation is persisted and
+        broadcast normally, and the preserved ``sdk_session_id`` restores full
+        context via the SDK's resume — exactly like :meth:`resume_session`.
+
+        Runs as a startup background task (never blocks the event loop set-up)
+        and returns the number of sessions resumed.
+        """
+        try:
+            raw = RESUME_QUEUE_FILE.read_text()
+        except FileNotFoundError:
+            return 0
+        except OSError as e:
+            logger.warning(
+                "Resume-after-restart: could not read %s: %s", RESUME_QUEUE_FILE, e,
+            )
+            return 0
+
+        # Drain the queue up front so a resumed turn that triggers another
+        # restart re-enrolls into a clean file and ids are never double-run.
+        with contextlib.suppress(FileNotFoundError):
+            RESUME_QUEUE_FILE.unlink()
+
+        seen: set[str] = set()
+        ids: list[str] = []
+        for line in raw.splitlines():
+            sid = line.strip()
+            if sid and sid not in seen:
+                seen.add(sid)
+                ids.append(sid)
+        if not ids:
+            return 0
+
+        resumed = 0
+        for sid in ids:
+            session = await self.db.get_session(sid)
+            if not session:
+                logger.info(
+                    "Resume-after-restart: session %s no longer exists — skipping", sid,
+                )
+                continue
+            if session.get("status") == SessionStatus.ARCHIVED.value:
+                logger.info(
+                    "Resume-after-restart: session %s is archived — skipping", sid,
+                )
+                continue
+            if session.get("source") == "external":
+                logger.info(
+                    "Resume-after-restart: session %s is a satellite — skipping", sid,
+                )
+                continue
+            if not session.get("sdk_session_id"):
+                logger.info(
+                    "Resume-after-restart: session %s has no resumable SDK session"
+                    " — skipping", sid,
+                )
+                continue
+            try:
+                logger.info("Resume-after-restart: continuing session %s", sid)
+                await self.run(
+                    session_id=sid,
+                    user_message=_RESUME_AFTER_RESTART_PROMPT,
+                    source=session.get("source") or "web",
+                    internal=True,
+                )
+                resumed += 1
+            except Exception as e:
+                logger.warning(
+                    "Resume-after-restart: session %s failed: %s",
+                    sid, e, exc_info=True,
+                )
+
+        if resumed:
+            logger.info("Resume-after-restart: resumed %d session(s)", resumed)
+        return resumed
 
     # ------------------------------------------------------------------ #
     #  Tool-result helpers                                                 #

@@ -20,6 +20,12 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Runtime queue of session ids to auto-resume after ``nerve restart --resume``.
+# The CLI appends ids here (synchronously, before triggering the restart) and
+# the fresh daemon drains it on startup. Kept next to the other ~/.nerve runtime
+# state (pid/log/db) and independent of ``-c`` so writer and reader always agree.
+RESUME_QUEUE_FILE = Path("~/.nerve/resume-after-restart").expanduser()
+
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge override into base, returning a new dict."""
