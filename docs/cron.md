@@ -70,7 +70,7 @@ prompt definition.
   trigger without a restart.
 - If both `prompt` and `prompt_file` are set, the file wins; the inline
   prompt is used as a fallback when the file can't be read.
-- A job must define at least one of `prompt` / `prompt_file`.
+- A job must define at least one of `prompt` / `prompt_file` / `workflow`.
 
 ## Job Fields
 
@@ -92,6 +92,7 @@ prompt definition.
 | `enabled` | bool | no | Whether the job is active (default: true) |
 | `lock` | bool | no | Prevent concurrent runs of this job — the next fire waits for the previous one (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
+| `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
 ## Run Gates
 

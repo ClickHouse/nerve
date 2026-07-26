@@ -132,6 +132,31 @@ class UsageStore:
                         "total_web_searches": 0, "total_web_fetches": 0}
             return dict(row)
 
+    async def get_session_effective_cost(self, session_id: str) -> float:
+        """Best-available dollar spend for a session.
+
+        Per turn: billed ``cost_usd`` when present and positive, else the
+        API-equivalent ``estimated_cost_usd`` (Codex ChatGPT-auth turns
+        report ``cost_usd`` NULL/0 with ``cost_basis`` of
+        ``chatgpt_credit``/``api_equivalent_estimate`` — the real spend
+        lives in the estimate column). This is the budget-enforcement
+        meter for workflow runs: a plain ``SUM(cost_usd)`` reads $0 for
+        subscription-auth Codex runs.
+        """
+        async with self.db.execute(
+            """
+            SELECT COALESCE(SUM(
+                CASE WHEN cost_usd IS NOT NULL AND cost_usd > 0
+                     THEN cost_usd
+                     ELSE COALESCE(estimated_cost_usd, 0)
+                END), 0)
+            FROM session_usage WHERE session_id = ?
+            """,
+            (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return float(row[0] or 0.0)
+
     async def get_usage_by_period(self, days: int = 7) -> list[dict]:
         """Daily aggregated usage for the past N days."""
         async with self.db.execute(

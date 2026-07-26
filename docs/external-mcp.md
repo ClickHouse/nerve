@@ -15,7 +15,7 @@ Add to `config.yaml` (or override in `config.local.yaml`):
 mcp_endpoint:
   enabled: true
   path: /mcp/v1          # default
-  include_hoa: false     # set true to expose hoa_* tools
+  include_hoa: false     # set true to expose the deprecated hoa_* stub tools (houseofagents was retired)
 ```
 
 Restart Nerve. The endpoint is mounted at `https://<host>:<port><path>/`.

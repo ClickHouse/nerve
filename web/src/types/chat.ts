@@ -16,8 +16,6 @@ export interface ToolCallBlockData {
   result?: string;
   isError?: boolean;
   status: 'running' | 'complete';
-  /** houseofagents NDJSON progress events (populated during hoa_execute runs) */
-  hoaEvents?: Record<string, unknown>[];
   /** Dynamic-workflow progress snapshot (populated during Workflow runs) */
   workflow?: WorkflowSnapshot;
 }

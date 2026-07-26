@@ -41,6 +41,12 @@ These tools are always available via MCP. **Call them as `mcp__nerve__<name>`** 
 - `poll_source` / `poll_all_sources` — Fetch new messages
 - `list_sources` / `sync_status` — Check integration health
 
+**Workflow Runs** — Budget-capped multi-agent jobs in dedicated tracked sessions.
+- `workflow_run_start` — Launch a Claude Workflow / Codex Ultracode run with a hard dollar budget (warned at 80%, killed at 100%)
+- `workflow_run_status` — Check a run's status, metered spend vs budget, and result
+- `workflow_run_list` — List runs, filterable by status (`active`, `running`, `done`, ...)
+- `workflow_run_kill` — Terminate a run (scoped to that run's own session only)
+
 Additional tools may be available depending on configuration. Check `skill_list` for skills that document how to use them.
 
 ## Every Session

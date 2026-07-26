@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, LogOut, Clock, Lightbulb, Sparkles, Bell, Plug, Users, Workflow } from 'lucide-react';
+import { MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, LogOut, Clock, Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
@@ -15,8 +15,8 @@ const NAV_ITEMS = [
   { path: '/plans', icon: Lightbulb, label: 'Plans' },
   { path: '/skills', icon: Sparkles, label: 'Skills' },
   { path: '/mcp', icon: Plug, label: 'MCP' },
-  { path: '/houseofagents', icon: Users, label: 'HoA', feature: 'hoa' as const },
   { path: '/ultracode', icon: Workflow, label: 'Ultra', feature: 'ultracode' as const },
+  { path: '/workflow-runs', icon: Rocket, label: 'Runs' },
   { path: '/sources', icon: Inbox, label: 'Sources' },
   { path: '/cron', icon: Clock, label: 'Cron' },
   { path: '/memory', icon: Brain, label: 'Memory' },
@@ -29,20 +29,17 @@ export function NavRail() {
   const { logout } = useAuthStore();
   const pendingCount = useNotificationStore(s => s.pendingCount);
   const loadNotifications = useNotificationStore(s => s.loadNotifications);
-  const [hoaEnabled, setHoaEnabled] = useState(false);
   const [ultracodeEnabled, setUltracodeEnabled] = useState(false);
 
   // Load notification count + feature flags on mount
   useEffect(() => {
     loadNotifications();
-    api.getHoaStatus().then(s => setHoaEnabled(s.enabled)).catch(() => {});
     // A 404 is expected until the dashboard backend is loaded after restart;
     // keep the currently-running UI unchanged in that case.
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []);
 
   const visibleItems = NAV_ITEMS.filter(item => {
-    if (item.feature === 'hoa' && !hoaEnabled) return false;
     if (item.feature === 'ultracode' && !ultracodeEnabled) return false;
     return true;
   });

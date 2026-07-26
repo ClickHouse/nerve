@@ -237,6 +237,10 @@ class AgentEngine:
         # terminal task_notification (which omits the tree) can still settle
         # the panel and persist the final state.
         self._workflows: dict[str, dict[str, dict[str, Any]]] = {}
+        # Callbacks awaited at the start of stop_session (see
+        # add_stop_listener) — lets workflow-run lifecycle owners record
+        # "this was a stop" before engine.run swallows the interrupt.
+        self._stop_listeners: list[Any] = []
         # Per-session active channel — set on run() entry, cleared on exit.
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
@@ -452,13 +456,6 @@ class AgentEngine:
         # Load Claude Code plugin directories for SDK plugins field
         from nerve.config import load_claude_code_plugins
         self._claude_code_plugins = load_claude_code_plugins()
-
-        # Initialize houseofagents service (optional)
-        if self.config.houseofagents.enabled:
-            from nerve.houseofagents import init_hoa_service
-            svc = init_hoa_service(self.config)
-            if svc:
-                logger.info("houseofagents service initialized (available=%s)", svc.is_available())
 
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
@@ -1315,8 +1312,22 @@ class AgentEngine:
         """Register a running asyncio.Task for a session (enables stop)."""
         self.sessions.register_task(session_id, task)
 
+    def add_stop_listener(self, callback: Any) -> None:
+        """Register an async callback invoked (with the session_id) at the
+        START of every :meth:`stop_session`, before the engine interrupts
+        anything. Lets run-lifecycle owners (workflow runs) CAS their state
+        terminal *before* the stop lands — ``engine.run`` swallows both the
+        graceful interrupt and the hard cancel, so callers cannot otherwise
+        distinguish "stopped" from "completed"."""
+        self._stop_listeners.append(callback)
+
     async def stop_session(self, session_id: str) -> bool:
         """Stop a running session."""
+        for cb in self._stop_listeners:
+            try:
+                await cb(session_id)
+            except Exception:  # noqa: BLE001 — listeners never block a stop
+                logger.exception("stop listener failed for %s", session_id)
         # Cancel any pending interactive tool prompts so the handler unblocks
         handler = get_handler(session_id)
         if handler:
@@ -1325,6 +1336,25 @@ class AgentEngine:
 
     def is_session_running(self, session_id: str) -> bool:
         return self.sessions.is_running(session_id)
+
+    def has_live_background_tasks(self, session_id: str) -> bool:
+        """Public passthrough: does the session's CLI still run background
+        tasks (run_in_background Bash/Agent/Workflow)? Used by workflow
+        runs to defer the terminal 'done' until spend-relevant work ends."""
+        return self._has_live_background_tasks(session_id)
+
+    def get_codex_ultracode_run_ids(self, session_id: str) -> set[str] | None:
+        """Ultracode run ids the session's live Codex client attributed to
+        its current turn, or None when unavailable (no client / claude
+        backend). Enables exact journal attribution for budget metering."""
+        client = self.sessions.get_client(session_id)
+        ids = getattr(client, "_ultracode_runs", None)
+        if not ids:
+            return None
+        try:
+            return {str(i) for i in ids}
+        except TypeError:
+            return None
 
     async def get_client_connected_at_async(self, session_id: str) -> str | None:
         """Async version: get connected_at from DB."""
@@ -1929,6 +1959,28 @@ class AgentEngine:
             return str(data.get("status") or "completed")
         return "running"
 
+    def get_live_workflow_tokens(self, session_id: str) -> int:
+        """Sum of subagent output tokens across the session's live
+        ``Workflow`` snapshots.
+
+        This is the only mid-turn spend signal the Claude backend offers:
+        real cost lands in ``session_usage`` at turn end, but a workflow
+        run's whole life can be one long turn. The budget monitor prices
+        these tokens as output tokens for an in-flight estimate; settled
+        workflows are pruned from the registry right around the time
+        their real cost is recorded, so recorded + live never double
+        counts across turns.
+        """
+        reg = self._workflows.get(session_id) or {}
+        total = 0
+        for entry in reg.values():
+            snap = entry.get("snapshot") or {}
+            try:
+                total += int(snap.get("totalTokens") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
     @staticmethod
     def _derive_workflow_name(tool_input: Any) -> str:
         """Best-effort workflow name: the ``name`` arg for a named workflow,
@@ -2011,6 +2063,16 @@ class AgentEngine:
 
         # Drop settled workflows too (terminal snapshot already broadcast +
         # persisted); keep running ones so late progress still maps back.
+        self._prune_settled_workflows(session_id)
+
+    def _prune_settled_workflows(self, session_id: str) -> None:
+        """Drop terminal Workflow snapshots from the live registry.
+
+        Called both at next-turn start (via _prune_bg_tasks) and at the END
+        of _finalize_turn: the moment a turn's real cost lands in
+        session_usage, settled snapshots must stop counting toward
+        get_live_workflow_tokens or budget metering double-counts them.
+        """
         wf_reg = self._workflows.get(session_id)
         if wf_reg:
             terminal = {"completed", "failed", "stopped"}
@@ -2179,6 +2241,10 @@ class AgentEngine:
             await self.db.update_session_fields(session_id, {
                 "total_cost_usd": current_session_cost + (turn_cost or 0.0),
             })
+
+        # The turn's cost is now recorded — settled Workflow snapshots must
+        # leave the live registry or budget metering double-counts them.
+        self._prune_settled_workflows(session_id)
 
         await broadcaster.broadcast_done(
             session_id,

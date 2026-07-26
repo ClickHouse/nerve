@@ -1,4 +1,5 @@
 import { getToken } from './client';
+import type { WorkflowRun } from './client';
 import type { WorkflowSnapshot } from '../types/chat';
 
 export type WSMessage =
@@ -31,8 +32,8 @@ export type WSMessage =
   | { type: 'session_running'; session_id: string; is_running: boolean }
   | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
-  | { type: 'hoa_progress'; session_id: string; event: Record<string, unknown> }
   | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }
+  | { type: 'workflow_run_update'; session_id: string | null; run: WorkflowRun }
   | { type: 'wakeup'; session_id: string }
   | { type: 'auto_turn'; session_id: string }
   | { type: 'model_changed'; session_id: string; from_model: string; to_model: string; downgrade: boolean }

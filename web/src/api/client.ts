@@ -78,6 +78,57 @@ export interface UltracodeRun {
   cancelled?: number;
 }
 
+// Workflow runs — budgeted autonomous agent runs.
+// Mirrors public_run() in nerve/workflows/service.py (snake_case wire shape).
+export interface WorkflowRunSpec {
+  prompt: string;
+  model?: string;
+  effort?: string;
+  cwd?: string;
+}
+
+export type WorkflowRunStatus =
+  | 'pending'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'killed'
+  | 'budget_exhausted';
+
+export interface WorkflowRun {
+  id: string;
+  engine: 'claude-workflow' | 'codex-ultracode';
+  title: string;
+  spec: WorkflowRunSpec;
+  status: WorkflowRunStatus;
+  budget_usd: number | null;
+  spent_usd: number;
+  warned_at: string | null;
+  session_id: string | null;
+  journal_dir: string | null;
+  created_by: string;
+  error: string | null;
+  result: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+}
+
+export interface WorkflowRunJournalEvent {
+  ts: string;
+  run_id: string;
+  event: string;
+  [key: string]: unknown;
+}
+
+export interface WorkflowRunJournal {
+  run_json: Record<string, unknown> | null;
+  events: WorkflowRunJournalEvent[];
+  has_result: boolean;
+  result: string;
+}
+
 let authToken: string | null = localStorage.getItem('nerve_token');
 
 export function setToken(token: string) {
@@ -393,10 +444,9 @@ export const api = {
   getPlan: (id: string) => request<any>(`/plans/${id}`),
   updatePlan: (id: string, data: { status?: string; feedback?: string }) =>
     request<any>(`/plans/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  approvePlan: (id: string, options?: { runtime?: string; hoa_mode?: string; hoa_agents?: string[]; hoa_pipeline_id?: string }) =>
+  approvePlan: (id: string) =>
     request<{ plan_id: string; impl_session_id: string }>(`/plans/${id}/approve`, {
       method: 'POST',
-      body: JSON.stringify(options || {}),
     }),
   revisePlan: (id: string, feedback: string) =>
     request<any>(`/plans/${id}/revise`, { method: 'POST', body: JSON.stringify({ feedback }) }),
@@ -436,23 +486,6 @@ export const api = {
   deleteSilence: (id: string) =>
     request<any>(`/notifications/silences/${id}`, { method: 'DELETE' }),
 
-  // houseofagents
-  getHoaStatus: () =>
-    request<{ enabled: boolean; available: boolean; version: string | null; default_mode: string; default_agents: string[] }>('/houseofagents/status'),
-  listHoaPipelines: () =>
-    request<{ pipelines: Array<{ id: string; name: string; description: string }> }>('/houseofagents/pipelines'),
-  getHoaPipeline: (id: string) =>
-    request<{ id: string; name: string; content: string; description: string }>(`/houseofagents/pipelines/${id}`),
-  saveHoaPipeline: (id: string, content: string) =>
-    request<{ id: string; path: string }>(`/houseofagents/pipelines/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify({ content }),
-    }),
-  deleteHoaPipeline: (id: string) =>
-    request<{ deleted: boolean }>(`/houseofagents/pipelines/${id}`, { method: 'DELETE' }),
-  installHoaBinary: () =>
-    request<{ installed: boolean; path: string; version: string }>('/houseofagents/install', { method: 'POST' }),
-
   // Ultracode read-only dashboard
   getUltracodeDashboardStatus: () =>
     request<{ enabled: boolean }>('/codex/ultracode/dashboard'),
@@ -460,6 +493,23 @@ export const api = {
     request<{ runs: UltracodeRun[] }>(`/codex/ultracode/runs?limit=${encodeURIComponent(String(limit))}`),
   getUltracodeRun: (id: string) =>
     request<{ run: UltracodeRun }>(`/codex/ultracode/runs/${encodeURIComponent(id)}`),
+
+  // Workflow runs — budgeted autonomous agent runs
+  listWorkflowRuns: (status?: string, limit = 50) => {
+    const qs = new URLSearchParams();
+    if (status) qs.set('status', status);
+    qs.set('limit', String(limit));
+    return request<{ runs: WorkflowRun[]; total: number }>(`/workflow-runs?${qs}`);
+  },
+  getWorkflowRun: (id: string) =>
+    request<WorkflowRun>(`/workflow-runs/${encodeURIComponent(id)}`),
+  killWorkflowRun: (id: string, reason = '') =>
+    request<WorkflowRun>(`/workflow-runs/${encodeURIComponent(id)}/kill`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  getWorkflowRunJournal: (id: string) =>
+    request<WorkflowRunJournal>(`/workflow-runs/${encodeURIComponent(id)}/journal`),
 
   // Files
   uploadFiles: async (files: File[], sessionId: string): Promise<{ files: Array<{ id: string; filename: string; media_type: string; file_type: string; size: number }> }> => {

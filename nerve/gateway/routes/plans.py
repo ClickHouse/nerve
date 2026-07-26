@@ -38,13 +38,6 @@ class PlanReviseRequest(BaseModel):
     feedback: str
 
 
-class PlanApproveRequest(BaseModel):
-    runtime: str = "default"       # "default" | "houseofagents"
-    hoa_mode: str = ""             # relay | swarm | pipeline
-    hoa_agents: list[str] = []
-    hoa_pipeline_id: str = ""
-
-
 @router.get("/api/plans")
 async def list_plans(status: str = "", task_id: str = "", user: dict = Depends(require_auth)):
     deps = get_deps()
@@ -130,7 +123,6 @@ async def revise_plan(plan_id: str, req: PlanReviseRequest, user: dict = Depends
 @router.post("/api/plans/{plan_id}/approve")
 async def approve_plan(
     plan_id: str,
-    req: PlanApproveRequest = PlanApproveRequest(),
     user: dict = Depends(require_auth),
 ):
     """Approve a plan and spawn an implementation session."""
@@ -223,26 +215,6 @@ async def approve_plan(
             f"After implementation, verify your changes work correctly.\n"
             f"If you encounter issues not covered by the plan, use your judgment or ask the user.\n"
         )
-
-    # Augment prompt with houseofagents instructions when selected
-    if req.runtime == "houseofagents":
-        hoa_instructions = (
-            "\n## Execution Runtime: houseofagents (Multi-Agent)\n"
-            "Use the `hoa_execute` tool to run the implementation with multi-agent collaboration.\n"
-            "This orchestrates multiple AI agents in relay/swarm/pipeline mode for higher quality output.\n\n"
-        )
-        hoa_mode = req.hoa_mode or "relay"
-        hoa_instructions += f"**Mode:** {hoa_mode}\n"
-        if req.hoa_agents:
-            hoa_instructions += f"**Agents:** {', '.join(req.hoa_agents)}\n"
-        if req.hoa_pipeline_id:
-            hoa_instructions += f"**Pipeline:** {req.hoa_pipeline_id}\n"
-        hoa_instructions += (
-            "\nPass the full plan content as the prompt to `hoa_execute`. "
-            "After it completes, review the output carefully, verify changes work correctly, "
-            "run tests if applicable, commit changes, and mark the task as done.\n"
-        )
-        prompt += hoa_instructions
 
     # Spawn implementation in background with error handling.  Register
     # the task with the engine so a manual /stop can cancel a stuck impl

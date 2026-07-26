@@ -109,6 +109,20 @@ cron:
   system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
   jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
 
+# Workflow runs — budget-capped multi-agent jobs (Claude Workflow tool or
+# Codex Ultracode) in dedicated tracked sessions. Nerve meters real dollar
+# spend, warns at 80% of budget, and kills the run at 100% (scoped to the
+# run's own session). Runs do not survive a daemon restart. Enabled by
+# default; values below are the defaults. See docs/workflow-runs.md.
+# workflows:
+#   enabled: true
+#   runs_dir: ~/.nerve/workflow-runs  # <runs_dir>/<run-id>/{run.json,events.ndjson,result.md}
+#   poll_interval_seconds: 60         # budget monitor cadence (re-meters spend)
+#   warn_fraction: 0.8                # one-time warning at this fraction of budget
+#   kill_grace_seconds: 30            # graceful stop -> grace -> force kill
+#   max_concurrent_runs: 2            # excess runs queue as 'pending'; keep well below agent.max_concurrent
+#   allow_unbudgeted: false           # require budget_usd on every run
+
 # Backup (optional) — scheduled, verified snapshots of Nerve state into a
 # single portable bundle (nerve-backup-<host>-<ts>.tar.zst). Off by default.
 # Point target_dir at an external mount or a synced directory — the OFF-BOX
@@ -133,7 +147,7 @@ cron:
 # mcp_endpoint:
 #   enabled: false
 #   path: /mcp/v1
-#   include_hoa: false   # Expose hoa_* tools externally (default off)
+#   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
 # Observability (optional) — Langfuse tracing for the agent loop and memU.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.

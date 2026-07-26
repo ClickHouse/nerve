@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Check, X, MessageSquare, ExternalLink, Users, ChevronDown } from 'lucide-react';
+import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from 'lucide-react';
 import { usePlanStore } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
-import { api } from '../api/client';
 
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
@@ -18,14 +17,6 @@ const TYPE_STYLES: Record<string, { label: string; className: string }> = {
   'skill-create': { label: 'Skill', className: 'bg-purple-400/10 text-hue-purple border-purple-400/20' },
   'skill-update': { label: 'Skill Update', className: 'bg-purple-400/10 text-hue-purple border-purple-400/20' },
 };
-
-interface HoaStatus {
-  enabled: boolean;
-  available: boolean;
-  version: string | null;
-  default_mode: string;
-  default_agents: string[];
-}
 
 export function PlanDetailPage() {
   const { planId } = useParams<{ planId: string }>();
@@ -47,26 +38,10 @@ export function PlanDetailPage() {
   const [declineFeedback, setDeclineFeedback] = useState('');
   const [showDeclineFeedback, setShowDeclineFeedback] = useState(false);
 
-  // houseofagents runtime selection state
-  const [hoaStatus, setHoaStatus] = useState<HoaStatus | null>(null);
-  const [useMultiAgent, setUseMultiAgent] = useState(false);
-  const [hoaMode, setHoaMode] = useState('relay');
-  const [hoaAgents, setHoaAgents] = useState('');
-
   useEffect(() => {
     if (planId) loadPlan(planId);
-    // Check houseofagents availability
-    api.getHoaStatus().then(setHoaStatus).catch(() => {});
     return () => clearSelectedPlan();
   }, [planId]);
-
-  // Pre-fill defaults when status loads
-  useEffect(() => {
-    if (hoaStatus?.enabled) {
-      setHoaMode(hoaStatus.default_mode);
-      setHoaAgents(hoaStatus.default_agents.join(', '));
-    }
-  }, [hoaStatus]);
 
   if (detailLoading || !plan) {
     return (
@@ -78,16 +53,9 @@ export function PlanDetailPage() {
 
   const isPending = plan.status === 'pending';
   const isImplementing = plan.status === 'implementing';
-  const hoaAvailable = hoaStatus?.enabled && hoaStatus?.available;
 
   const handleApprove = async () => {
-    const options = useMultiAgent ? {
-      runtime: 'houseofagents' as const,
-      hoa_mode: hoaMode,
-      hoa_agents: hoaAgents.split(',').map(a => a.trim()).filter(Boolean),
-    } : undefined;
-
-    const result = await approvePlan(plan.id, options);
+    const result = await approvePlan(plan.id);
     if (result?.impl_session_id) {
       navigate(`/chat/${result.impl_session_id}`);
     }
@@ -173,62 +141,14 @@ export function PlanDetailPage() {
           {/* Action bar for pending plans */}
           {isPending && (
             <div className="mt-6 space-y-3">
-              {/* Multi-agent toggle (only when houseofagents is available) */}
-              {hoaAvailable && (
-                <div className="space-y-2">
-                  <button
-                    onClick={() => setUseMultiAgent(!useMultiAgent)}
-                    className={`flex items-center gap-2 px-3 py-1.5 text-[12px] rounded-lg border cursor-pointer transition-colors ${
-                      useMultiAgent
-                        ? 'bg-amber-400/10 text-hue-amber border-amber-400/30'
-                        : 'bg-surface-raised text-text-dim border-border-subtle hover:border-border'
-                    }`}
-                  >
-                    <Users size={13} />
-                    Multi-Agent
-                    <ChevronDown size={12} className={`transition-transform ${useMultiAgent ? 'rotate-180' : ''}`} />
-                  </button>
-
-                  {useMultiAgent && (
-                    <div className="flex gap-3 pl-1">
-                      <div className="flex items-center gap-1.5">
-                        <label className="text-[11px] text-text-faint">Mode</label>
-                        <select
-                          value={hoaMode}
-                          onChange={e => setHoaMode(e.target.value)}
-                          className="px-2 py-1 text-[12px] bg-surface-raised border border-border-subtle rounded text-text-secondary focus:outline-none focus:border-accent/50"
-                        >
-                          <option value="relay">Relay</option>
-                          <option value="swarm">Swarm</option>
-                          <option value="pipeline">Pipeline</option>
-                        </select>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <label className="text-[11px] text-text-faint">Agents</label>
-                        <input
-                          value={hoaAgents}
-                          onChange={e => setHoaAgents(e.target.value)}
-                          placeholder="Claude, OpenAI"
-                          className="px-2 py-1 text-[12px] bg-surface-raised border border-border-subtle rounded text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-accent/50 w-40"
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
               <div className="flex items-center gap-3">
                 <button
                   onClick={handleApprove}
                   disabled={actionLoading}
-                  className={`flex items-center gap-1.5 px-4 py-2 text-[13px] disabled:opacity-50 text-white rounded-lg cursor-pointer ${
-                    useMultiAgent
-                      ? 'bg-amber-600 hover:bg-amber-500'
-                      : 'bg-emerald-600 hover:bg-emerald-500'
-                  }`}
+                  className="flex items-center gap-1.5 px-4 py-2 text-[13px] disabled:opacity-50 text-white rounded-lg cursor-pointer bg-emerald-600 hover:bg-emerald-500"
                 >
-                  {useMultiAgent ? <Users size={14} /> : <Check size={14} />}
-                  {useMultiAgent ? 'Approve (Multi-Agent)' : 'Approve & Implement'}
+                  <Check size={14} />
+                  Approve &amp; Implement
                 </button>
                 <button
                   onClick={() => setShowDeclineFeedback(!showDeclineFeedback)}

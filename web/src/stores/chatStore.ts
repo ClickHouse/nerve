@@ -12,7 +12,7 @@ import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/dr
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage } from './handlers/sessionHandlers';
-import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleHoaProgress, handleWorkflowProgress } from './handlers/panelHandlers';
+import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
@@ -67,7 +67,7 @@ const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'tool_output', 'done', 'stopped', 'error',
   'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
   'backend_status',
-  'subagent_start', 'subagent_complete', 'hoa_progress', 'interaction',
+  'subagent_start', 'subagent_complete', 'interaction',
   'interaction_resolved', 'file_changed',
 ]);
 
@@ -808,8 +808,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       case 'subagent_start':     return handleSubagentStart(msg, get, set);
       case 'subagent_complete':  return handleSubagentComplete(msg, get, set);
-      case 'hoa_progress':       return handleHoaProgress(msg, get, set);
       case 'workflow_progress':  return handleWorkflowProgress(msg, get, set);
+      // Workflow runs — global event (session_id may be null); upsert into
+      // the runs store so the /workflow-runs page stays live.
+      case 'workflow_run_update':
+        void import('./workflowRunStore').then(({ useWorkflowRunStore }) =>
+          useWorkflowRunStore.getState().handleRunUpdate(msg.run)
+        );
+        return;
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'interaction_resolved':     return handleInteractionResolved(msg, get, set);

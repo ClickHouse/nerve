@@ -83,7 +83,7 @@ nerve/
 │   │       ├── cron.py          # /api/cron/*
 │   │       ├── sources.py       # /api/sources/*
 │   │       ├── notifications.py # /api/notifications/*
-│   │       └── houseofagents.py # /api/houseofagents/*
+│   │       └── workflow_runs.py # /api/workflow-runs/*
 │   ├── channels/       # Telegram bot, web UI channel adapters
 │   ├── cron/           # APScheduler job runner
 │   ├── sources/        # Data source adapters (Telegram, Gmail, GitHub)
@@ -92,12 +92,12 @@ nerve/
 │   ├── tasks/          # Task markdown files + SQLite index
 │   ├── notifications/  # Fire-and-forget + async question delivery
 │   ├── proxy/          # CLIProxyAPI daemon (Docker/worker mode)
-│   ├── houseofagents/  # Optional multi-agent runtime
+│   ├── workflows/      # Budget-capped workflow runs (workflow_run_* tools)
 │   └── templates/      # Mode templates for nerve init (personal/, worker/)
 ├── web/                # React + TypeScript + Vite frontend
 │   ├── src/
 │   │   ├── components/ # React components
-│   │   ├── pages/      # Route pages
+│   │   ├── pages/      # Route pages (ChatPage.tsx, WorkflowRunsPage.tsx, ...)
 │   │   ├── stores/     # Zustand state stores
 │   │   │   ├── chatStore.ts    # Chat state + thin WS dispatcher
 │   │   │   ├── handlers/       # Domain-specific WS message handlers

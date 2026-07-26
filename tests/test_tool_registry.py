@@ -163,6 +163,9 @@ class TestDefaultRegistry:
             "notify", "ask_user", "react", "send_sticker", "send_file",
             # mcp admin
             "nerve_api", "mcp_reload",
+            # workflow runs
+            "workflow_run_start", "workflow_run_status",
+            "workflow_run_kill", "workflow_run_list",
             # hoa
             "hoa_status", "hoa_list_pipelines", "hoa_execute",
         }

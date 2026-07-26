@@ -605,6 +605,14 @@ class CronService:
 
         log_id = await self.db.log_cron_start(job.id)
         logger.info("Running cron job: %s (mode=%s)", job.id, job.session_mode)
+
+        if job.workflow is not None:
+            # Workflow-run job: launch a budget-capped workflow run and
+            # return — the run executes and notifies on its own, so none
+            # of the cron session machinery below applies.
+            await self._start_workflow_run(job, log_id)
+            return
+
         session_id: str | None = None
 
         try:
@@ -693,6 +701,82 @@ class CronService:
             await self.db.log_cron_finish(
                 log_id, "error", error=str(e), session_id=session_id,
             )
+
+    async def _start_workflow_run(self, job: CronJob, log_id: int) -> None:
+        """Start the workflow run a job declares instead of a prompt.
+
+        Fire-and-forget: the cron log records only the launch. The run
+        owns its ``workflow:<run-id>`` session and sends its own budget /
+        completion / failure notifications — no cron session is created
+        and the job does not wait for the run to finish.
+        """
+        from nerve.workflows import get_workflow_run_service
+
+        service = get_workflow_run_service()
+        if service is None:
+            logger.warning(
+                "Cron job %s declares a workflow run but workflow runs "
+                "are disabled", job.id,
+            )
+            await self.db.log_cron_finish(
+                log_id, "error", error="workflow runs disabled",
+            )
+            return
+
+        if job.lock:
+            # ``lock`` promises no overlapping work for this job. The
+            # per-job asyncio.Lock only covers the (instant) launch, so
+            # extend the guarantee to run duration: skip while a previous
+            # run from this job is still pending/running. Without this, a
+            # schedule shorter than the run duration stacks full-budget
+            # runs.
+            active = await service.db.get_active_workflow_runs()
+            mine = [
+                r for r in active
+                if r.get("created_by") == f"cron:{job.id}"
+            ]
+            if mine:
+                await self.db.log_cron_finish(
+                    log_id, "success",
+                    output=(
+                        f"skipped: workflow run {mine[0]['id']} from this "
+                        "job is still active (lock)"
+                    ),
+                )
+                return
+
+        w = job.workflow or {}
+        try:
+            run = await service.start_run(
+                engine_kind=w["engine"],
+                spec={
+                    "prompt": w["prompt"],
+                    "model": w.get("model") or "",
+                    "effort": w.get("effort") or "",
+                    "cwd": w.get("cwd") or "",
+                },
+                budget_usd=w["budget_usd"],
+                title=w.get("title") or job.id,
+                created_by=f"cron:{job.id}",
+            )
+            session_id = run.get("session_id") or ("workflow:" + run["id"])
+            await self.db.set_cron_log_session(log_id, session_id)
+            budget = float(run.get("budget_usd") or w["budget_usd"])
+            await self.db.log_cron_finish(
+                log_id, "success",
+                output=(
+                    f"workflow run {run['id']} started (budget ${budget:.2f})"
+                ),
+            )
+            logger.info(
+                "Cron job %s started workflow run %s", job.id, run["id"],
+            )
+        except Exception as e:
+            logger.error(
+                "Cron job %s failed to start workflow run: %s",
+                job.id, e, exc_info=True,
+            )
+            await self.db.log_cron_finish(log_id, "error", error=str(e))
 
     async def _run_source_wrapper(self, runner: SourceRunner) -> None:
         """Wrapper to run a source ingestion with cron and source logging."""
