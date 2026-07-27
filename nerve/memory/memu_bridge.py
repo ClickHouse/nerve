@@ -11,11 +11,12 @@ import ctypes
 import gc
 import json
 import logging
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Coroutine
 from zoneinfo import ZoneInfo
@@ -68,6 +69,18 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
     # Belt-and-suspenders: the proxy's stuck-cooldown signature regardless of
     # how the status surfaced.
     return "auth_unavailable" in low
+
+
+def _is_sqlite_locked_error(exc: BaseException) -> bool:
+    """True if ``exc`` is SQLite lock contention — worth retrying.
+
+    Matches both the raw ``sqlite3.OperationalError`` message and the
+    SQLAlchemy-wrapped form (``(sqlite3.OperationalError) database is
+    locked``). Lock contention means another writer held the database
+    past ``busy_timeout``; the write never happened, so a retry is safe.
+    """
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg
 
 
 # Semantic dedup threshold — set from config at init time.
@@ -1339,6 +1352,23 @@ class MemUBridge:
         except Exception as exc:
             logger.warning("memU WAL setup skipped: %s", exc)
 
+        # Best-effort WAL truncate at startup: long-lived readers (recall
+        # scans, backups) can starve passive checkpoints until the WAL grows
+        # to GBs, which makes every commit slow. Startup is the one moment
+        # this process has no other memU connections, so a TRUNCATE
+        # checkpoint can usually reclaim the backlog.
+        try:
+            conn = _sqlite3.connect(db_path, timeout=30)
+            conn.execute("PRAGMA busy_timeout=30000")
+            res = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            conn.close()
+            logger.info(
+                "memU WAL startup checkpoint: blocked=%s wal_pages=%s checkpointed=%s",
+                *(res if res else ("?", "?", "?")),
+            )
+        except Exception as exc:
+            logger.warning("memU WAL startup checkpoint skipped: %s", exc)
+
     def _attach_engine_pragmas(self) -> None:
         """Per-connection pragmas for memU's SQLAlchemy engine.
 
@@ -1347,7 +1377,9 @@ class MemUBridge:
         connection via the ``connect`` event.  ``synchronous=NORMAL`` is
         the recommended pairing with WAL (fsync on checkpoint, not on every
         commit); ``busy_timeout`` stops concurrent writers from failing
-        fast with "database is locked".
+        fast with "database is locked"; ``journal_size_limit`` lets
+        checkpoints truncate a ballooned WAL back to a sane size instead
+        of leaving a multi-GB file behind forever.
         """
         try:
             from sqlalchemy import event
@@ -1357,14 +1389,18 @@ class MemUBridge:
             @event.listens_for(engine, "connect")
             def _set_pragmas(dbapi_conn, _record):  # pragma: no cover - thin
                 cursor = dbapi_conn.cursor()
-                cursor.execute("PRAGMA busy_timeout=10000")
+                cursor.execute("PRAGMA busy_timeout=30000")
                 cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA journal_size_limit=67108864")  # 64 MiB
                 cursor.close()
 
             # Recycle connections opened before the listener existed
             # (table-creation during MemoryService init).
             engine.dispose()
-            logger.info("memU engine pragmas attached (busy_timeout, synchronous=NORMAL)")
+            logger.info(
+                "memU engine pragmas attached (busy_timeout=30s, "
+                "synchronous=NORMAL, journal_size_limit=64MiB)"
+            )
         except Exception as exc:
             logger.warning("Could not attach memU engine pragmas: %s", exc)
 
@@ -1875,6 +1911,19 @@ class MemUBridge:
     # Per-call timeout for individual LLM requests (chat, embed, etc.).
     _LLM_CALL_TIMEOUT = 120
 
+    # _resolve_event_dates_sync scoping. Only items created within this
+    # window that were never stamped with ``extra.mentioned_at`` are swept.
+    # Historically the sweep matched EVERY ``happened_at IS NULL`` row —
+    # and non-events keep happened_at NULL *by design*, so each conversation
+    # memorize rewrote the entire non-event corpus in one write transaction
+    # (388K rows / minutes holding the SQLite write lock on a large fleet
+    # instance, starving every concurrent memorize into "database is
+    # locked"). The window covers items persisted by this or a recently
+    # cancelled pipeline; the cap bounds the worst case.
+    _DATE_SWEEP_WINDOW_HOURS = 24
+    _DATE_SWEEP_MAX_ROWS = 2000
+    _DATE_SWEEP_COMMIT_EVERY = 500
+
     def _make_bedrock_client(self, chat_model: str) -> _BedrockLLMClient:
         """Create a _BedrockLLMClient using Nerve's provider config."""
         return _BedrockLLMClient(
@@ -1956,10 +2005,14 @@ class MemUBridge:
                     # memU otherwise fails fast with SDK retries disabled
                     # (see max_retries=0 above), so a transient proxy/auth blip
                     # (503/429/auth_unavailable) that the agent SDK rides out via
-                    # its own retries takes memory down instead. Retry a few
-                    # times with short backoff on transient errors only; keep the
-                    # per-attempt wait_for so genuine hangs still fail fast.
-                    _RETRY_BACKOFFS = (0.5, 1.5, 3.0)
+                    # its own retries takes memory down instead. Retry with
+                    # backoff on transient errors only; keep the per-attempt
+                    # wait_for so genuine hangs still fail fast. The schedule
+                    # is long enough to ride out sustained rate-limit storms
+                    # (e.g. a shared Bedrock guardrail TPS quota under fleet
+                    # load), and jittered so concurrent pipelines don't
+                    # re-collide in lockstep.
+                    _RETRY_BACKOFFS = (1.0, 3.0, 8.0, 20.0)
                     for _attempt in range(len(_RETRY_BACKOFFS) + 1):
                         t0 = time.monotonic()
                         try:
@@ -2000,6 +2053,19 @@ class MemUBridge:
                             # it loudly as MemoryBackendUnavailable.
                             if _is_transient_llm_error(_e) and _attempt < len(_RETRY_BACKOFFS):
                                 _delay = _RETRY_BACKOFFS[_attempt]
+                                # Honor an explicit Retry-After when present
+                                # (capped — a huge server value must not park
+                                # the pipeline).
+                                try:
+                                    _hdrs = getattr(
+                                        getattr(_e, "response", None), "headers", None,
+                                    )
+                                    _ra = float(_hdrs.get("retry-after")) if _hdrs and _hdrs.get("retry-after") else 0.0
+                                    if _ra > 0:
+                                        _delay = max(_delay, min(_ra, 60.0))
+                                except (TypeError, ValueError, AttributeError):
+                                    pass
+                                _delay *= 0.75 + random.random() * 0.5  # ±25% jitter
                                 logger.warning(
                                     "memU LLM transient error [%s] attempt %d/%d: %s — retrying in %.1fs",
                                     _prof, _attempt + 1, len(_RETRY_BACKOFFS) + 1, _e, _delay,
@@ -2161,6 +2227,7 @@ class MemUBridge:
 
         attempt = 0
         last_error = ""
+        locked_exc: Exception | None = None
 
         while attempt <= self._MEMORIZE_MAX_RETRIES:
             op_id = self._metrics.begin_op("memorize_file", file_path)
@@ -2267,6 +2334,24 @@ class MemUBridge:
                         logger.info("Resetting LLM clients and retrying in %ds...", delay)
                         await self._reset_llm_clients()
                         await asyncio.sleep(delay)
+                elif _is_sqlite_locked_error(e):
+                    # SQLite write-lock contention: another writer held the
+                    # database past busy_timeout. The write did not happen,
+                    # so retrying the pipeline is safe (semantic dedup
+                    # absorbs re-extracted items). No LLM client reset —
+                    # this is a DB-side condition.
+                    elapsed = time.monotonic() - t0
+                    last_error = f"database locked after {elapsed:.0f}s: {e}"
+                    locked_exc = e
+                    logger.error(
+                        "memU memorize_file hit SQLite lock contention %sfor %s: %s",
+                        label + " " if label else "", file_path, e,
+                    )
+                    self._metrics.end_op(op_id, success=False, error=last_error)
+                    if attempt < self._MEMORIZE_MAX_RETRIES:
+                        delay = self._MEMORIZE_RETRY_DELAY * (2 ** attempt)
+                        logger.info("Retrying after lock contention in %ds...", delay)
+                        await asyncio.sleep(delay)
                 else:
                     last_error = str(e)
                     logger.error("memU memorize_file failed %sfor %s: %s", label + " " if label else "", file_path, e)
@@ -2282,6 +2367,12 @@ class MemUBridge:
 
         logger.error("memU memorize_file gave up after %d attempts for %s", attempt, file_path)
         await asyncio.to_thread(self._release_memory)
+        if locked_exc is not None:
+            # Exhausted retries on lock contention: surface loudly so the
+            # tool layer reports "backend busy", not a silent failure.
+            raise MemoryBackendUnavailable(
+                f"memory backend busy (SQLite write-lock contention): {locked_exc}"
+            ) from locked_exc
         return False
 
     async def memorize_conversation(self, session_id: str, messages: list[dict]) -> bool:
@@ -2381,23 +2472,48 @@ class MemUBridge:
         )
 
     def _resolve_event_dates_sync(self, conversation_ts: str) -> None:
-        """Synchronous implementation of event date resolution."""
+        """Synchronous implementation of event date resolution.
+
+        Scoped to recent, never-stamped items (see the ``_DATE_SWEEP_*``
+        constants): non-events keep ``happened_at`` NULL forever, so an
+        unscoped ``happened_at IS NULL`` sweep grows with the corpus and
+        rewrites every non-event row on every conversation memorize —
+        holding the SQLite write lock for minutes on a large database.
+        The ``mentioned_at`` substring guard also makes the sweep
+        idempotent: an item is stamped once, when first seen, instead of
+        being rewritten (and its ``mentioned_at`` overwritten) forever.
+        """
         import sqlite3
 
         db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
         try:
-            db = sqlite3.connect(db_path, timeout=10)
+            db = sqlite3.connect(db_path, timeout=30)
             db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=30000")
             db.execute("PRAGMA synchronous=NORMAL")
 
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=self._DATE_SWEEP_WINDOW_HOURS)
+            ).strftime("%Y-%m-%d %H:%M:%S")
             rows = db.execute(
                 "SELECT id, memory_type, summary, extra "
-                "FROM memu_memory_items WHERE happened_at IS NULL"
+                "FROM memu_memory_items "
+                "WHERE happened_at IS NULL "
+                "  AND (created_at IS NULL OR created_at >= ?) "
+                "  AND (extra IS NULL OR instr(extra, '\"mentioned_at\"') = 0) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (cutoff, self._DATE_SWEEP_MAX_ROWS),
             ).fetchall()
 
             if not rows:
                 db.close()
                 return
+            if len(rows) >= self._DATE_SWEEP_MAX_ROWS:
+                logger.warning(
+                    "Event date sweep hit its %d-row cap — stamping the newest slice only",
+                    self._DATE_SWEEP_MAX_ROWS,
+                )
 
             # Convert UTC timestamp to user's local date
             try:
@@ -2419,15 +2535,27 @@ class MemUBridge:
                 except Exception as e:
                     logger.warning("LLM date resolution failed, falling back to conversation date: %s", e)
 
-            # Update event items
+            # Update event items + stamp mentioned_at, committing in small
+            # batches so the write transaction never holds the write lock
+            # long enough to starve concurrent memorize pipelines.
+            pending = 0
+
+            def _commit_batch(force: bool = False) -> None:
+                nonlocal pending
+                if pending and (force or pending >= self._DATE_SWEEP_COMMIT_EVERY):
+                    db.commit()
+                    pending = 0
+
             for item_id, summary in event_items:
                 happened_at = resolved_dates.get(item_id) or conv_date
                 db.execute(
                     "UPDATE memu_memory_items SET happened_at = ? WHERE id = ?",
                     (happened_at, item_id),
                 )
+                pending += 1
+                _commit_batch()
 
-            # Set mentioned_at on ALL items (events + non-events)
+            # Set mentioned_at on ALL swept items (events + non-events)
             for row in rows:
                 item_id = row["id"]
                 extra = json.loads(row["extra"]) if row["extra"] else {}
@@ -2436,8 +2564,10 @@ class MemUBridge:
                     "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
                     (json.dumps(extra, ensure_ascii=False), item_id),
                 )
+                pending += 1
+                _commit_batch()
 
-            db.commit()
+            _commit_batch(force=True)
             db.close()
             logger.debug(
                 "Resolved dates for %d items (%d events via LLM, %d non-events left NULL)",

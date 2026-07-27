@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,10 +12,12 @@ import pytest_asyncio
 
 from nerve.config import MemoryConfig, NerveConfig
 from nerve.memory.memu_bridge import (
+    MemoryBackendUnavailable,
     MemUBridge,
     _KNOWLEDGE_CUSTOM_RULES,
     _KNOWLEDGE_CUSTOM_EXAMPLES,
     _SEMANTIC_DEDUP_THRESHOLD,
+    _is_sqlite_locked_error,
 )
 
 
@@ -66,8 +69,8 @@ def _insert_items(db_path: str, items: list[dict]) -> None:
     db = sqlite3.connect(db_path)
     for item in items:
         db.execute(
-            "INSERT INTO memu_memory_items (id, resource_id, memory_type, summary, happened_at, extra) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO memu_memory_items (id, resource_id, memory_type, summary, happened_at, extra, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 item["id"],
                 item.get("resource_id", "res-1"),
@@ -75,6 +78,7 @@ def _insert_items(db_path: str, items: list[dict]) -> None:
                 item["summary"],
                 item.get("happened_at"),
                 json.dumps(item.get("extra", {})),
+                item.get("created_at"),
             ),
         )
     db.commit()
@@ -225,6 +229,93 @@ class TestResolveEventDatesSync:
         assert extra["content_hash"] == "abc123"
         assert extra["reinforcement_count"] == 3
         assert extra["mentioned_at"] == "2026-02-27"
+
+    def test_sweep_skips_old_and_already_stamped_items(self, tmp_path):
+        """The sweep is scoped: items outside the recency window and items
+        already carrying ``mentioned_at`` are never rewritten. This is the
+        fix for the unbounded whole-corpus rewrite that held the SQLite
+        write lock for minutes per conversation on large databases."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        _insert_items(db_path, [
+            # Ancient item (outside the 24h window) — must NOT be touched.
+            {"id": "old-1", "memory_type": "profile", "summary": "Old fact",
+             "created_at": "2020-01-01 00:00:00.000000"},
+            # Already stamped — must NOT be re-stamped.
+            {"id": "stamped-1", "memory_type": "knowledge", "summary": "Known fact",
+             "extra": {"mentioned_at": "2026-01-15"}},
+            # Fresh, unstamped — must be stamped.
+            {"id": "fresh-1", "memory_type": "behavior", "summary": "New habit"},
+        ])
+
+        bridge = MemUBridge(config)
+        bridge._resolve_event_dates_sync("2026-02-27T10:00:00")
+
+        items = _read_items(db_path)
+        assert "mentioned_at" not in json.loads(items["old-1"]["extra"])
+        assert json.loads(items["stamped-1"]["extra"])["mentioned_at"] == "2026-01-15"
+        assert json.loads(items["fresh-1"]["extra"])["mentioned_at"] == "2026-02-27"
+
+    def test_sweep_is_idempotent(self, tmp_path):
+        """Running the sweep twice keeps the FIRST mentioned_at stamp."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        _insert_items(db_path, [
+            {"id": "prof-1", "memory_type": "profile", "summary": "A fact"},
+        ])
+
+        bridge = MemUBridge(config)
+        bridge._resolve_event_dates_sync("2026-02-27T10:00:00")
+        bridge._resolve_event_dates_sync("2026-03-05T10:00:00")
+
+        items = _read_items(db_path)
+        assert json.loads(items["prof-1"]["extra"])["mentioned_at"] == "2026-02-27"
+
+    def test_sweep_commits_in_batches(self, tmp_path, monkeypatch):
+        """All rows are stamped even when the batch size forces multiple
+        commits mid-sweep."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        _insert_items(db_path, [
+            {"id": f"item-{i}", "memory_type": "knowledge", "summary": f"Fact {i}"}
+            for i in range(5)
+        ])
+
+        bridge = MemUBridge(config)
+        monkeypatch.setattr(bridge, "_DATE_SWEEP_COMMIT_EVERY", 2)
+        bridge._resolve_event_dates_sync("2026-02-27T10:00:00")
+
+        items = _read_items(db_path)
+        assert len(items) == 5
+        for item in items.values():
+            assert json.loads(item["extra"])["mentioned_at"] == "2026-02-27"
+
+    def test_sweep_row_cap_takes_newest(self, tmp_path, monkeypatch):
+        """When the cap is hit, only the newest rows are processed."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        now = datetime.now(timezone.utc)
+        _insert_items(db_path, [
+            {"id": "newest", "memory_type": "knowledge", "summary": "n",
+             "created_at": now.strftime("%Y-%m-%d %H:%M:%S.%f")},
+            {"id": "newer", "memory_type": "knowledge", "summary": "n",
+             "created_at": (now - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S.%f")},
+            {"id": "oldest", "memory_type": "knowledge", "summary": "n",
+             "created_at": (now - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S.%f")},
+        ])
+
+        bridge = MemUBridge(config)
+        monkeypatch.setattr(bridge, "_DATE_SWEEP_MAX_ROWS", 2)
+        bridge._resolve_event_dates_sync("2026-02-27T10:00:00")
+
+        items = _read_items(db_path)
+        assert "mentioned_at" in json.loads(items["newest"]["extra"])
+        assert "mentioned_at" in json.loads(items["newer"]["extra"])
+        assert "mentioned_at" not in json.loads(items["oldest"]["extra"])
 
 
 def _mock_anthropic(response_text: str) -> tuple[MagicMock, MagicMock]:
@@ -952,3 +1043,94 @@ class TestIndexedUpdateItemForwarding:
                         delattr(Repo, name)
                 else:
                     setattr(Repo, name, fn)
+
+
+class TestSqliteLockedClassifier:
+    """_is_sqlite_locked_error truth table."""
+
+    def test_raw_sqlite_message(self):
+        assert _is_sqlite_locked_error(sqlite3.OperationalError("database is locked"))
+
+    def test_sqlalchemy_wrapped_message(self):
+        assert _is_sqlite_locked_error(
+            Exception("(sqlite3.OperationalError) database is locked\n[SQL: UPDATE ...]")
+        )
+
+    def test_table_locked_variant(self):
+        assert _is_sqlite_locked_error(Exception("database table is locked: memu_memory_items"))
+
+    def test_unrelated_errors_not_matched(self):
+        assert not _is_sqlite_locked_error(Exception("no such table: foo"))
+        assert not _is_sqlite_locked_error(Exception("Error code: 429 - rate limited"))
+
+
+def _make_lock_test_bridge(tmp_path: Path) -> MemUBridge:
+    """Bridge wired for memorize_file tests: available, mocked service,
+    zero retry delay, no memU loop (inline _submit)."""
+    config = _make_config(tmp_path)
+    bridge = MemUBridge(config)
+    bridge._available = True
+    bridge._service = MagicMock()
+    bridge._MEMORIZE_RETRY_DELAY = 0
+    return bridge
+
+
+_LOCKED_ERR = "(sqlite3.OperationalError) database is locked"
+
+
+class TestMemorizeFileLockRetry:
+    """memorize_file retries SQLite lock contention instead of failing the
+    write outright (the "memU refused" failure mode under fleet load)."""
+
+    @pytest.mark.asyncio
+    async def test_lock_then_success_returns_true(self, tmp_path):
+        bridge = _make_lock_test_bridge(tmp_path)
+        bridge._service.memorize = AsyncMock(
+            side_effect=[Exception(_LOCKED_ERR), {"items": []}],
+        )
+
+        target = tmp_path / "note.txt"
+        target.write_text("knowledge: a fact")
+        ok = await bridge.memorize_file(str(target))
+
+        assert ok is True
+        assert bridge._service.memorize.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_lock_exhausted_raises_backend_unavailable(self, tmp_path):
+        bridge = _make_lock_test_bridge(tmp_path)
+        bridge._service.memorize = AsyncMock(side_effect=Exception(_LOCKED_ERR))
+
+        target = tmp_path / "note.txt"
+        target.write_text("knowledge: a fact")
+        with pytest.raises(MemoryBackendUnavailable, match="write-lock contention"):
+            await bridge.memorize_file(str(target))
+
+        # Initial attempt + _MEMORIZE_MAX_RETRIES retries
+        assert bridge._service.memorize.await_count == bridge._MEMORIZE_MAX_RETRIES + 1
+
+    @pytest.mark.asyncio
+    async def test_non_transient_error_still_fails_fast(self, tmp_path):
+        bridge = _make_lock_test_bridge(tmp_path)
+        bridge._service.memorize = AsyncMock(side_effect=ValueError("bad payload"))
+
+        target = tmp_path / "note.txt"
+        target.write_text("knowledge: a fact")
+        ok = await bridge.memorize_file(str(target))
+
+        assert ok is False
+        assert bridge._service.memorize.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_llm_error_still_raises_backend_unavailable(self, tmp_path):
+        bridge = _make_lock_test_bridge(tmp_path)
+        bridge._service.memorize = AsyncMock(
+            side_effect=Exception("Error code: 429 - guardrail text units per second limit exceeded"),
+        )
+
+        target = tmp_path / "note.txt"
+        target.write_text("knowledge: a fact")
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.memorize_file(str(target))
+
+        assert bridge._service.memorize.await_count == 1

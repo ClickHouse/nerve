@@ -435,13 +435,27 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(f"Memorized: {content}{suffix}")
     if memu_down:
         return ToolResult.text(
-            "⚠️ NOT saved — MEMORY BACKEND DOWN (transient proxy/auth error). "
-            "The fact was NOT stored; retry shortly. If it persists, `nerve restart` "
-            f"clears a stuck proxy cooldown. ({memu_err})"
+            "⚠️ NOT saved — MEMORY BACKEND UNAVAILABLE (transient infrastructure "
+            "error — NOT a judgment on the content). The fact was NOT stored; "
+            f"retry shortly. ({memu_err})"
         )
     if memu_err is not None:
         return ToolResult.text(f"Error: {memu_err}")
-    return ToolResult.text("Failed to memorize.")
+    # memorize_file returned False without raising — pull the underlying
+    # cause from bridge metrics so the agent sees an infrastructure error,
+    # not an unexplained "refusal".
+    cause = ""
+    try:
+        stats = getattr(ctx.memory_bridge, "_metrics", None)
+        op_stats = stats.ops.get("memorize_file") if stats else None
+        if op_stats and op_stats.last_error:
+            cause = f" (last error: {op_stats.last_error})"
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return ToolResult.text(
+        f"Failed to memorize{cause}. This is an infrastructure failure, "
+        "not a content refusal — retry later or keep the fact elsewhere."
+    )
 
 
 async def memory_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
