@@ -45,7 +45,9 @@ export const useAuthStore = create<AuthState>((set) => ({
           // No password configured — auto-login
           const { token } = await api.login('');
           setToken(token);
-          set({ authenticated: true });
+          // checking must be cleared here too — App renders null while it
+          // is true, so leaving it set blanks the app after auto-login.
+          set({ authenticated: true, checking: false });
           return;
         }
       } catch {
