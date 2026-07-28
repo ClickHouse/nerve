@@ -13,6 +13,44 @@ A blank value (`runs_dir:` with nothing after it, or `""`) means *unset*, so the
 documented default applies. That includes `gateway.ssl.cert`/`key`: blank means
 TLS is off, not TLS with an empty certificate path.
 
+## Environment Variable References
+
+Any string value in `config.yaml` or `config.local.yaml` may reference an
+environment variable, so secrets can come from the environment (or a secret
+store) instead of being written into a file:
+
+```yaml
+anthropic_api_key: ${ANTHROPIC_API_KEY}     # required: load fails if unset
+gateway:
+  host: ${BIND_HOST:-127.0.0.1}             # optional: default when unset or empty
+```
+
+| Form | Behavior |
+|------|----------|
+| `${VAR}` | Required. Loading fails with an error listing every unresolved variable. Only an *unset* variable is an error; `VAR=""` resolves to an empty string. |
+| `${VAR:-default}` | Optional. Uses `default` when `VAR` is unset or empty (shell `:-` semantics). |
+| `$$` | A literal `$`, so `$${X}` yields the text `${X}`. |
+
+Only the braced `${...}` form is interpolated. A bare `$` is never touched, so
+bcrypt `password_hash` values (`$2b$...`), jwt secrets and connection strings
+are safe as written. Interpolation runs once, after `config.local.yaml` is
+merged on top, so either file may use references.
+
+Resolved values arrive as strings and are converted back to the field's declared
+type, including `int | None` and `list[int]`. So `port: ${PORT}` and
+`enabled: ${FEATURE}` behave the same as literal YAML values.
+
+- Booleans accept `true/false`, `1/0`, `yes/no`, `on/off`, `y/n`, `t/f`
+  (case-insensitive). `enabled: ${FLAG}` with `FLAG=false` is **off**: the
+  string is parsed, not tested for truthiness. An empty value (`FLAG=`) and a
+  bare `enabled:` are also off, so blanking a variable reliably disables a
+  feature.
+- An unrecognized value is logged with the field that owns it, and that field
+  keeps its documented default. Integers are parsed with `int()`, so `"1.5"`
+  and `"1e3"` are rejected rather than truncated.
+- Defaults are not re-scanned: `${A:-${B}}` yields the literal `${B}` when `A`
+  is unset. Use a single reference instead.
+
 ## Config Directory Resolution
 
 `nerve` commands locate the config directory via a waterfall, so they work
