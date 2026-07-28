@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from nerve.config import ensure_path_not_tracked_config
 from nerve.db import Database
 from nerve.tasks.models import Task, TaskStatus, parse_task_frontmatter, parse_task_title
 
@@ -76,12 +77,21 @@ class TaskManager:
         return task
 
     async def mark_done(self, task_id: str) -> bool:
-        """Mark a task as done and move its file."""
+        """Mark a task as done and move its file.
+
+        Raises :class:`~nerve.config.LockdownError` on a locked instance when the
+        stored ``file_path`` lands inside the tracked config subtree.
+        """
         row = await self.db.get_task(task_id)
         if not row:
             return False
 
         src = self.workspace / row["file_path"]
+        # Done is a write like any other — it copies the file into done/ and
+        # unlinks the source, so a stored ``file_path`` inside the tracked config
+        # subtree would delete config. Refuse before any of it runs, or the
+        # refusal still leaves that config file mirrored into done/.
+        ensure_path_not_tracked_config(src, "move")
         if src.exists():
             dst = self.done_dir / src.name
             content = await asyncio.to_thread(src.read_text, encoding="utf-8")

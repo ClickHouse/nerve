@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
-from nerve.config import get_config
+from nerve.config import ensure_path_not_tracked_config, get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
 
@@ -86,6 +86,10 @@ async def write_memory_file(file_path: str, req: FileWriteRequest, user: dict = 
         full_path.resolve().relative_to(config.workspace.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
+    # This endpoint writes anywhere under the workspace, which includes the
+    # tracked config subtree — settings.yaml and the gate plugins the daemon
+    # executes. A locked instance must not be editable through it.
+    ensure_path_not_tracked_config(full_path, "write")
 
     def _write() -> None:
         full_path.parent.mkdir(parents=True, exist_ok=True)

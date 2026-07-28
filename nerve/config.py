@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from nerve import paths
+from nerve.coerce import FALSY, TRUTHY
+from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
 
@@ -240,7 +242,11 @@ def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     except yaml.YAMLError as e:
         raise ConfigError(f"Failed to parse {path}: {e}") from e
     except (OSError, UnicodeDecodeError) as e:
-        raise ConfigError(f"Failed to read {path}: {e}") from e
+        # A file that exists but cannot be read — mode 000, a directory in its
+        # place, a dead mount — or one whose bytes are not the encoding we pinned.
+        # Same promise as a parse failure: the callers that route around a broken
+        # config report it, they don't show a traceback.
+        raise ConfigError(f"Cannot read {path}: {e}") from e
     if data is None:
         return {}
     if not isinstance(data, dict):
@@ -285,6 +291,196 @@ def _load_workspace_settings(workspace: Path) -> dict[str, Any]:
     return data
 
 
+# The literal an unresolved ``${VAR}`` reference leaves behind. Interpolation is
+# a string substitution, so a reference nothing resolved is still sitting in the
+# value — which is how a "present" secret can turn out to be nothing of the kind.
+_UNRESOLVED_REF = "${"
+
+# The two variables that anchor lockdown outside every file on the box. Set in
+# the service definition (systemd ``Environment=``, docker ``-e``), which is the
+# one place neither the agent nor a config edit reaches.
+LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
+WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
+
+
+def lockdown_anchor() -> bool:
+    """Whether the environment forces this instance into lockdown.
+
+    Hardening the flag's *value* does nothing about which file supplies it, and
+    that file is chosen by ``workspace:`` in the machine-local ``config.yaml``.
+    One local edit repoints the workspace at a tree whose ``settings.yaml`` says
+    nothing, lockdown evaluates to false, the machine layers come back, and with
+    them ``auth.jwt_secret``. Every guarantee in this module rests on a file the
+    thing being guarded against can rewrite. The anchor is the way out: an
+    environment variable set by whatever starts the daemon is outside the config
+    tree, outside the workspace, and outside anything the agent can edit.
+
+    **The anchor can only lock.** The effective state is this OR the tracked
+    flag, so ``NERVE_LOCKDOWN=false`` and an unset variable both mean "the
+    environment has no opinion", never "force unlocked". Monotonicity is the
+    property worth having: once an operator has anchored a box, nothing that
+    arrives in a file can take it back — including a file the agent wrote. It
+    also means the anchor cannot be used to *escape* a locked tracked config;
+    unlocking still takes a reviewed, merged change.
+
+    An empty value is "no opinion" rather than an error, unlike an empty
+    ``lockdown:`` in the tracked file. ``Environment=NERVE_LOCKDOWN=`` and a
+    bare ``docker -e NERVE_LOCKDOWN`` both produce it, and under the OR above it
+    can only ever fail to *add* a restriction — the tracked flag still decides.
+    An unreadable value is refused, because the only other reading is "no
+    opinion", which would silently discard an operator's intent to lock.
+    """
+    raw = os.environ.get(LOCKDOWN_ANCHOR_ENV)
+    if raw is None:
+        return False
+    text = raw.strip().lower()
+    if not text or text in FALSY:
+        return False
+    if text in TRUTHY:
+        return True
+    raise ConfigError(
+        f"{LOCKDOWN_ANCHOR_ENV}={raw!r} is neither true nor false. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); "
+        f"unset or empty means the environment has no opinion and the tracked "
+        f"settings decide. Refused rather than assumed, because assuming would "
+        f"mean discarding an instruction to lock this instance."
+    )
+
+
+def _anchored_workspace() -> Path:
+    """The workspace an env-anchored instance must use.
+
+    Anchoring the flag alone buys nothing. ``workspace:`` still comes from the
+    machine-local ``config.yaml``, so an attacker who can write that file
+    repoints the workspace and gets an instance that is locked *onto config they
+    supplied* — strictly worse than an unlocked one, because it now treats that
+    tree as its sole authority and stops reading anything else. The anchor has
+    to cover both, so the two variables are a single deployment unit: whatever
+    sets ``NERVE_LOCKDOWN`` sets ``NERVE_WORKSPACE`` beside it.
+
+    Refused rather than defaulted. Falling back to ``~/nerve-workspace`` would
+    quietly re-admit a path that is a machine-local decision, and defaulting is
+    how an operator ends up believing an anchor holds when it does not.
+    """
+    raw = os.environ.get(WORKSPACE_ANCHOR_ENV, "").strip()
+    if not raw:
+        raise ConfigError(
+            f"{LOCKDOWN_ANCHOR_ENV} anchors this instance in lockdown, but "
+            f"{WORKSPACE_ANCHOR_ENV} is not set. Anchoring the flag alone is not "
+            f"an anchor: the workspace — which selects the settings.yaml that is "
+            f"then the only source of truth — would still come from the "
+            f"machine-local config.yaml. Set both in the service definition "
+            f"(systemd Environment=, docker -e)."
+        )
+    workspace = _expand_path(raw)
+    if workspace is None or not workspace.is_absolute():
+        raise ConfigError(
+            f"{WORKSPACE_ANCHOR_ENV}={raw!r} must be an absolute path — a "
+            f"relative one means a different directory in every process that "
+            f"reads it."
+        )
+    return workspace
+
+
+def _as_lockdown(value: Any) -> bool:
+    """Parse the ``lockdown`` flag, refusing anything that isn't a plain yes/no.
+
+    Every other boolean in this module is coerced *leniently*: a value nobody can
+    parse falls back to the field's declared default, so one typo in a section
+    that isn't even switched on cannot stop the daemon from booting. That trade
+    is the wrong way round here, because this field's default is ``False``, and
+    ``False`` is the position in which nothing else is protected — the
+    machine-local layers come back, the legacy cron directory comes back, and
+    runtime writes to tracked config are allowed again. Guessing "off" from a
+    value we could not read would quietly undo every guarantee the flag exists to
+    make, and it would do it on a box nobody is watching. So an unreadable value
+    is a hard :class:`ConfigError` instead: the instance does not start, and
+    ``nerve config validate`` reports it before the change is ever merged.
+
+    ``None`` (a bare ``lockdown:`` in YAML, or the key absent) is off — that is
+    the file declining to set the flag, which is what the default is for. An
+    *empty string* is not: it arrives from an environment variable that exists
+    and carries no value, and while blanking a variable is a perfectly good way
+    to switch an ordinary feature off, the one switch that governs whether
+    anything else is enforced must not be flipped by a value that says nothing.
+    Spell a default-unlocked box ``${VAR:-false}``.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    shown = repr(value)
+    if isinstance(value, str):
+        # The flag decides which layers get merged, so it is read before the
+        # single post-merge interpolation pass and has to resolve its own
+        # reference — otherwise `lockdown: ${NERVE_LOCKDOWN}` is judged as the
+        # literal string it still is, which is truthy whatever the variable says.
+        resolved = _interpolate_str(value, []).strip()
+        if resolved.lower() in TRUTHY:
+            return True
+        if resolved.lower() in FALSY:
+            return False
+        if resolved != value.strip():
+            shown = f"{value!r} (which resolved to {resolved!r})"
+        if _UNRESOLVED_REF in resolved:
+            raise ConfigError(
+                f"lockdown: {shown} names an environment variable that is not "
+                f"set, so whether this instance is locked cannot be determined. "
+                f"Set it, or write ${{VAR:-false}} to declare the unlocked "
+                f"default explicitly."
+            )
+    raise ConfigError(
+        f"lockdown must be true or false, got {shown}. Accepted spellings are "
+        f"true/false, 1/0, yes/no, on/off (case-insensitive); an empty value is "
+        f"not one of them. Refused rather than assumed, because assuming would "
+        f"mean assuming 'unlocked' — the setting that drops every restriction "
+        f"lockdown exists to impose."
+    )
+
+
+def _resolved(path: Path) -> Path:
+    """``path`` with symlinks followed; the path itself if it cannot be resolved."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return path
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """True if ``path`` resolves inside ``root``, symlinks followed.
+
+    Both sides are resolved, so ``..`` segments, an absolute path elsewhere, a
+    symlink pointing out of the tree, and a path inside the workspace but
+    outside its ``config/`` subtree all answer False. An unreadable path (a
+    symlink loop, a permission refusal partway up) answers False too: not being
+    able to establish that something is contained is not containment.
+
+    Note what resolving ``root`` too means: containment is judged *relative to
+    wherever root actually is*. If ``root`` is itself a symlink out of the tree,
+    everything under it is contained and this answers True — correctly, for the
+    question it is asked. Whether ``root`` is the tree it claims to be is a
+    separate question, and :func:`lockdown_workspace_problems` is where it is
+    asked.
+    """
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def read_machine_layers(config_dir: Path) -> dict[str, Any]:
+    """The machine-local overlay on its own, for diagnostics.
+
+    Lockdown discards these layers, so reporting what was discarded needs a way
+    to read them afterwards. Two small YAML reads, not memoized: a caller asking
+    for this wants the current contents of the files.
+    """
+    return _deep_merge(
+        _read_yaml_mapping(config_dir / "config.yaml"),
+        _read_yaml_mapping(config_dir / "config.local.yaml"),
+    )
+
+
 def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     """Merge all config layers for ``config_dir`` and resolve ${ENV_VAR} refs.
 
@@ -294,22 +490,57 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
 
-    # The workspace path comes from the machine-local config (or the default),
-    # never from the tracked settings file — resolve it first. Best-effort
-    # ${VAR}/${VAR:-default} interpolation is applied so an env-based workspace
-    # path is honored when locating settings.yaml; an unresolved required ref is
-    # left intact here and surfaces later in the full _resolve_env_refs pass.
     machine = _deep_merge(base, local)
-    ws_raw = machine.get("workspace")
-    if isinstance(ws_raw, str) and "${" in ws_raw:
-        ws_raw = _interpolate_str(ws_raw, [])
-    workspace = _expand_path(ws_raw) or paths.default_workspace()
+    # An env-anchored instance takes its workspace from the environment too, so
+    # that the file which decides everything else cannot decide *which* file that
+    # is. Without the anchor nothing changes: the workspace comes from the
+    # machine-local config, which is where it has always come from and which is
+    # the right place for a per-machine path.
+    anchored = lockdown_anchor()
+    if anchored:
+        workspace = _anchored_workspace()
+    else:
+        # The workspace path comes from the machine-local config (or the
+        # default), never from the tracked settings file — resolve it first.
+        # Best-effort ${VAR}/${VAR:-default} interpolation is applied so an
+        # env-based workspace path is honored when locating settings.yaml; an
+        # unresolved required ref is left intact here and surfaces later in the
+        # full _resolve_env_refs pass.
+        ws_raw = machine.get("workspace")
+        if isinstance(ws_raw, str) and "${" in ws_raw:
+            ws_raw = _interpolate_str(ws_raw, [])
+        workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
 
-    # Precedence, lowest first: workspace settings < config.yaml < config.local.yaml
-    merged = _deep_merge(ws_settings, base)
-    merged = _deep_merge(merged, local)
+    # Lockdown is owned by the *tracked* settings file only, so a local edit to
+    # config.yaml/config.local.yaml can't unlock (or fake-lock) an instance — the
+    # remote is the authority. When locked, the machine layers are dropped
+    # entirely: config comes only from workspace/config + ${ENV_VAR} (secrets from
+    # the environment), never from local drop-in files.
+    # OR, not override: the environment can add lockdown but never remove it.
+    # The tracked flag is still evaluated (and still refuses an unreadable value)
+    # so an anchored box doesn't quietly run a bundle nobody can parse.
+    locked = _as_lockdown(ws_settings.get("lockdown")) or anchored
+    if "lockdown" in machine:
+        # Mirrors the warning for a `workspace` key in settings.yaml. Ignoring it
+        # is the point of the feature, but ignoring it *in silence* leaves someone
+        # who wrote it in the wrong file believing the box is locked when nothing
+        # about it is, and no other signal would ever tell them.
+        logger.warning(
+            "config: ignoring 'lockdown' in config.yaml/config.local.yaml — the "
+            "flag is honored only in workspace/config/settings.yaml, so that a "
+            "local edit cannot unlock or fake-lock an instance. This instance is "
+            "%s.", "LOCKED" if locked else "not locked",
+        )
+    if locked:
+        merged = dict(ws_settings)
+        merged["workspace"] = str(workspace)  # keep the machine-local workspace path
+    else:
+        # Precedence, lowest first: settings < config.yaml < config.local.yaml
+        merged = _deep_merge(_deep_merge(ws_settings, base), local)
+    # Authoritative: the effective lockdown flag matches the resolution decision.
+    merged["lockdown"] = locked
 
     return _resolve_env_refs(merged)
 
@@ -562,7 +793,7 @@ class TelegramConfig:
 
     @classmethod
     @_coerced
-    def from_dict(cls, d: dict) -> TelegramConfig:
+    def from_dict(cls, d: dict, locked: bool = False) -> TelegramConfig:
         dm_policy = d.get("dm_policy", "pairing")
         if dm_policy not in ("pairing", "open"):
             logger.warning(
@@ -571,8 +802,27 @@ class TelegramConfig:
                 dm_policy,
             )
             dm_policy = "pairing"
+        # Whether a given box answers Telegram DMs is a per-machine decision, so
+        # `nerve init` writes this key to the machine-local config.yaml. Lockdown
+        # drops that layer, which would leave the declared default — on —
+        # deciding for it: a box where Telegram was switched off would start
+        # serving DMs, with full agent access, the moment the shared settings
+        # carried a token this machine's environment can resolve.
+        #
+        # So the fallback direction is chosen by lockdown, and parsed here rather
+        # than left to @_coerced. The decorator falls back to the *declared*
+        # default, which is True, so `enabled: ${TG_ON:-nope}` — an env-reference
+        # spelling this file's own docs recommend for per-box fleet config — would
+        # turn the bot on everywhere one bad value reached. Deliberately still
+        # lenient rather than fatal: an unreadable value in one section must not
+        # stop the daemon booting, and off is the safe end of the guess.
+        enabled = (
+            _as_bool(d["enabled"], not locked, label="TelegramConfig.enabled")
+            if "enabled" in d
+            else not locked
+        )
         return cls(
-            enabled=d.get("enabled", True),
+            enabled=enabled,
             bot_token=d.get("bot_token", ""),
             # Deliberately uncast. The declared list[int] is converted after
             # construction, which logs an unconvertible entry and keeps it
@@ -917,7 +1167,7 @@ def _cron_dir_has_jobs(d: Path) -> bool:
     return (d / "jobs.yaml").exists() or (d / "system.yaml").exists()
 
 
-def _resolve_cron_dir(workspace: Path | None) -> Path:
+def _resolve_cron_dir(workspace: Path | None, locked: bool = False) -> Path:
     """Effective directory holding cron config (jobs/system/gates).
 
     Prefers the git-syncable ``workspace/config/cron`` so cron definitions live
@@ -929,16 +1179,64 @@ def _resolve_cron_dir(workspace: Path | None) -> Path:
       * If the workspace location has job files → use it.
       * Else, if the legacy location has job files → use it (un-migrated install).
       * Else → the workspace location (new install; may be about to be populated).
+
+    Under ``locked`` (lockdown), the legacy ``~/.nerve/cron`` fallback is disabled
+    entirely — cron config comes only from the workspace.
     """
     legacy = paths.cron_dir()
     if workspace is None:
         return legacy
     ws_cron = workspace_config_dir(workspace) / "cron"
+    if locked:
+        return ws_cron
     if _cron_dir_has_jobs(ws_cron):
         return ws_cron
     if _cron_dir_has_jobs(legacy):
         return legacy
     return ws_cron
+
+
+def _locked_cron_path(configured: Path, default: Path, root: Path, key: str) -> Path:
+    """Keep one locked cron path inside the tracked config subtree.
+
+    A locked instance runs only what the reviewed workspace repo carries, and
+    these three keys decide which files it reads — including, for
+    ``gate_plugins_dir``, which ``.py`` files it imports and *executes* at
+    start-up and on every cron reload. A tracked ``settings.yaml`` that pointed
+    any of them elsewhere would hand the box job definitions and code that never
+    went through review, using nothing but a YAML edit. So a path that escapes is
+    dropped in favour of the in-workspace default and reported.
+
+    Called only when locked. An unmigrated install is entitled to point cron at
+    the legacy ``~/.nerve/cron``, and that is the whole reason the machine-local
+    layers exist.
+
+    The default is verified too, and the instance refuses to load when it also
+    escapes. That is not a defensive afterthought — it is the case with no YAML
+    key in it at all. ``<workspace>/config/cron/gates`` is a name a config repo
+    can carry as a *symlink*, and git tracks symlinks, so a reviewed and merged
+    bundle can point the default itself anywhere. Substituting the default there
+    would hand back the exact path just rejected, log a warning that contradicts
+    itself, and import whatever was on the other end.
+    """
+    if _is_within(configured, root):
+        return configured
+    if _is_within(default, root):
+        logger.warning(
+            "cron.%s (%s) resolves outside %s — ignoring it and using %s "
+            "instead, because a locked instance takes its cron config, and its "
+            "gate plugins, only from the tracked workspace",
+            key, configured, root, default,
+        )
+        return default
+    also_default = "" if configured == default else f" — as does the default {default}"
+    raise ConfigError(
+        f"lockdown: cron.{key} resolves outside the tracked config subtree "
+        f"{root}: {configured} points at {_resolved(configured)}{also_default}. "
+        f"A locked instance reads its cron config, and imports its gate plugins, "
+        f"only from the reviewed workspace, and there is no contained path left "
+        f"to fall back to."
+    )
 
 
 @dataclass
@@ -953,12 +1251,33 @@ class CronConfig:
 
     @classmethod
     @_coerced
-    def from_dict(cls, d: dict, workspace: Path | None = None) -> CronConfig:
-        base = _resolve_cron_dir(workspace)
+    def from_dict(cls, d: dict, workspace: Path | None = None, locked: bool = False) -> CronConfig:
+        base = _resolve_cron_dir(workspace, locked=locked)
+        jobs_file = _expand_path(d.get("jobs_file")) or base / "jobs.yaml"
+        system_file = _expand_path(d.get("system_file")) or base / "system.yaml"
+        gate_plugins_dir = _expand_path(d.get("gate_plugins_dir")) or base / "gates"
+        if locked and workspace is not None:
+            root = workspace_config_dir(workspace)
+            if not _is_within(base, root):
+                # The subtree itself leaves the workspace — a symlinked
+                # config/cron, say. No substitution fixes that, since every
+                # default is derived from it, so refuse to run rather than read
+                # cron config from a directory outside the reviewed tree.
+                raise ConfigError(
+                    f"lockdown: the cron directory {base} resolves outside the "
+                    f"tracked config subtree {root}. A locked instance must read "
+                    f"its cron config, and import its gate plugins, only from the "
+                    f"reviewed workspace."
+                )
+            jobs_file = _locked_cron_path(jobs_file, base / "jobs.yaml", root, "jobs_file")
+            system_file = _locked_cron_path(system_file, base / "system.yaml", root, "system_file")
+            gate_plugins_dir = _locked_cron_path(
+                gate_plugins_dir, base / "gates", root, "gate_plugins_dir",
+            )
         return cls(
-            jobs_file=_expand_path(d.get("jobs_file")) or base / "jobs.yaml",
-            system_file=_expand_path(d.get("system_file")) or base / "system.yaml",
-            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir")) or base / "gates",
+            jobs_file=jobs_file,
+            system_file=system_file,
+            gate_plugins_dir=gate_plugins_dir,
         )
 
 
@@ -1913,6 +2232,11 @@ class XmemoryConfig:
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
     timezone: str = "America/New_York"
+    # Remote-only, read-only mode. When set (in workspace/config/settings.yaml —
+    # the tracked file the remote controls), config comes ONLY from the workspace
+    # + ${ENV_VAR}; machine config.yaml/config.local.yaml overrides and legacy
+    # ~/.nerve/cron are ignored, and runtime edits to tracked config are blocked.
+    lockdown: bool = False
     deployment: str = "server"            # "server" or "docker"
     quiet_start: str = "02:00"            # HH:MM — start of quiet period (local timezone)
     quiet_end: str = "08:00"              # HH:MM — end of quiet period (local timezone)
@@ -2116,19 +2440,25 @@ class NerveConfig:
         # Resolve the workspace once so workspace-aware sub-configs (e.g. cron,
         # which now lives in workspace/config/cron) can be located relative to it.
         workspace = _expand_path(d.get("workspace")) or paths.default_workspace()
+        # Parsed here rather than left to @_coerced, which would fall back to the
+        # field's default — i.e. to "unlocked" — for a value it cannot read. It is
+        # also needed *before* construction, because it changes how the cron paths
+        # and the Telegram switch resolve. See :func:`_as_lockdown`.
+        locked = _as_lockdown(d.get("lockdown"))
         return cls(
             workspace=workspace,
             timezone=d.get("timezone", "America/New_York"),
+            lockdown=locked,
             deployment=d.get("deployment", "server"),
             quiet_start=d.get("quiet_start", "02:00"),
             quiet_end=d.get("quiet_end", "08:00"),
             provider=ProviderConfig.from_dict(d.get("provider", {})),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
-            telegram=TelegramConfig.from_dict(d.get("telegram", {})),
+            telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
-            cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace),
+            cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),
             workspace_sync=WorkspaceSyncConfig.from_dict(d.get("workspace_sync", {})),
             backup=BackupConfig.from_dict(d.get("backup", {})),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
@@ -2271,7 +2601,128 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
 
     config = NerveConfig.from_dict(merged)
     config.config_dir = Path(config_dir)
+    problems = lockdown_workspace_problems(config.workspace) if config.lockdown else []
+    for problem in problems:
+        # Fail closed: don't boot a locked instance that would take its "tracked"
+        # config from somewhere the config repo never saw.
+        raise ConfigError(problem)
+    for note in lockdown_machine_local_notes(
+        merged, read_machine_layers(config_dir) if config.lockdown else None
+    ):
+        logger.warning("config: %s", note)
     return config
+
+
+def lockdown_workspace_problems(workspace: Path) -> list[str]:
+    """Ways a locked instance's tracked config tree isn't the tree it claims.
+
+    Everything else here judges a path against ``<workspace>/config``. That
+    settles whether a path stays inside the subtree, and says nothing about
+    whether the subtree is the one the config repo was reviewed in. If ``config``
+    is a symlink out of the workspace, every path under it is contained relative
+    to itself, every containment check passes, and the whole tracked layer —
+    settings.yaml, the cron files, the gate plugins the daemon imports — comes
+    from an untracked directory somewhere else on the box, with lockdown itself
+    read from there and reporting that all is well.
+
+    So the subtree is judged against the workspace instead, once, and a locked
+    instance that fails it does not start. The workspace *path* may still be
+    anything, including a symlink: where a machine keeps its workspace is a
+    machine-local decision and the one thing lockdown never took away.
+    """
+    config_root = workspace_config_dir(workspace)
+    if _is_within(config_root, workspace):
+        return []
+    return [
+        f"lockdown is enabled but the tracked config subtree {config_root} "
+        f"resolves to {_resolved(config_root)}, outside the workspace "
+        f"{_resolved(workspace)} — so nothing it holds is part of the reviewed "
+        f"repo. A locked instance takes its config only from the workspace's own "
+        f"config/ directory."
+    ]
+
+
+def _has_dotted(data: dict[str, Any], dotted: str) -> bool:
+    """Whether ``dotted`` names a key present in ``data``.
+
+    Presence, not truthiness: ``enabled: false`` and ``accounts: []`` are stated
+    values, and reporting them as unstated would be wrong.
+    """
+    node: Any = data
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def lockdown_machine_local_notes(
+    merged: dict[str, Any], machine: dict[str, Any] | None = None
+) -> list[str]:
+    """Machine-local settings a locked bundle leaves for the defaults to decide.
+
+    Lockdown reads only the tracked settings, so a key whose natural home is
+    ``config.yaml`` has nowhere left to be said — and the declared default
+    silently answers for it on every box in the fleet. That is invisible in the
+    diff of the change that turned lockdown on, which is exactly when someone
+    could still do something about it, so name it while the config is being
+    loaded and while it is being validated.
+
+    The per-box answer belongs in the tracked settings as an ``${ENV_VAR}``
+    reference; that is the only channel a locked instance still has.
+
+    ``machine`` is the dropped ``config.yaml``/``config.local.yaml`` overlay,
+    which callers still hold at the point lockdown discards it. Without it this
+    function can only report that a key is absent from the tracked settings, and
+    most machine-local keys are legitimately absent with an acceptable default —
+    so warning on all of them is noise. With it, the note fires only when a local
+    file states something that lockdown is about to ignore.
+    """
+    if not _as_lockdown(merged.get("lockdown")):
+        return []
+    notes: list[str] = []
+
+    if machine:
+        # The list of machine-local paths lives next to the wizard split it
+        # mirrors, and is guarded by tests in both directions. Imported inside the
+        # function because nerve.migrate imports this module.
+        from nerve.migrate import _is_machine_local, _leaf_paths
+
+        # `workspace` is the one key lockdown keeps, so it is never dropped.
+        dropped = sorted(
+            path
+            for path in _leaf_paths(machine)
+            if path != "workspace" and not _has_dotted(merged, path)
+        )
+        shareable = [p for p in dropped if not _is_machine_local(p)]
+        local_only = [p for p in dropped if _is_machine_local(p)]
+        if shareable:
+            notes.append(
+                f"{', '.join(shareable)} are set in config.yaml/config.local.yaml"
+                " and not in the tracked settings. Lockdown does not read those"
+                " files, so this instance is using the declared defaults."
+                " These values are shareable: move them to"
+                " workspace/config/settings.yaml."
+            )
+        if local_only:
+            notes.append(
+                f"{', '.join(local_only)} are machine-local, so lockdown leaves"
+                " them at their declared defaults. If a default is not the right"
+                " answer for this box, state the key in the tracked settings as"
+                " a ${VAR} reference."
+            )
+
+    telegram = merged.get("telegram")
+    telegram = telegram if isinstance(telegram, dict) else {}
+    if telegram.get("bot_token") and "enabled" not in telegram:
+        notes.append(
+            "workspace/config/settings.yaml sets telegram.bot_token but not "
+            "telegram.enabled, and lockdown does not read config.yaml (where "
+            "`nerve init` puts it) — so the Telegram bot stays OFF on this "
+            "instance. Set telegram.enabled in the tracked settings, using "
+            "${VAR} if the answer differs per machine."
+        )
+    return notes
 
 
 # --- Unknown-key validation ---
@@ -2348,7 +2799,11 @@ def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
     Used by the pairing flow. Reads, merges, and rewrites the local config
     (config.local.yaml is generated — comment loss is acceptable there).
     Returns True if the file was updated (False if the ID was already present).
+
+    Blocked under lockdown: config.local.yaml isn't even loaded when locked, and
+    tracked config is remote-only — pair by updating the workspace repo instead.
     """
+    ensure_not_locked("add a Telegram user")
     local_path = Path(config_dir) / "config.local.yaml"
     data: dict[str, Any] = {}
     if local_path.exists():
@@ -2392,3 +2847,91 @@ def set_config(config: NerveConfig) -> None:
     """Override the global config (for testing or CLI-driven loading)."""
     global _config
     _config = config
+
+
+class LockdownError(RuntimeError):
+    """Raised when a runtime edit to tracked config is attempted under lockdown."""
+
+
+def is_locked() -> bool:
+    """True if the *loaded* config puts this instance in lockdown.
+
+    A statement about the process, not about the box: with no config loaded there
+    is no lockdown state and this answers False. That is a fail-open, and it is
+    reachable — the CLI hands ``config=None`` to the commands that exist to repair
+    a config which failed to load, and never calls :func:`set_config` on that
+    path. Left as it is deliberately, because every caller of the guards below is
+    a server-side write path that runs with a loaded config, and making this read
+    files would put I/O behind a predicate called on every skill toggle to protect
+    a case none of them are in.
+
+    What that does mean is that a guard cannot be *added* by calling this from a
+    command on the ``config=None`` path and expecting it to hold. Such a caller
+    has to be given the flag explicitly.
+    """
+    return _config is not None and bool(_config.lockdown)
+
+
+def ensure_not_locked(action: str = "modify configuration") -> None:
+    """Raise :class:`LockdownError` if locked. Call before any runtime edit to
+    tracked config (skills, cron, pairing, ...)."""
+    if is_locked():
+        raise LockdownError(
+            f"Cannot {action}: this instance is in lockdown (remote-only, "
+            "read-only). Change config via a PR to the workspace repo instead."
+        )
+
+
+def ensure_path_not_tracked_config(path: Path, action: str = "write") -> None:
+    """Refuse, under lockdown, to touch a path inside the tracked config subtree.
+
+    The other guards sit in front of a specific operation — creating a skill,
+    persisting a pairing — and know what they are about to change. This one is
+    for the endpoints that take a caller-supplied path anywhere under the
+    workspace: whether they are editing tracked config is a property of the
+    argument, not of the endpoint. Left unguarded, ``<workspace>/config/`` is
+    reachable through them, which means both ``settings.yaml`` (including the
+    ``lockdown`` flag itself) and ``cron/gates/*.py``, which the daemon imports
+    and runs. Either one turns lockdown off from inside the box it is meant to be
+    protecting.
+
+    A path outside the subtree is none of lockdown's business — the workspace is
+    also the agent's working directory, and normal files there are the point.
+    """
+    reason = tracked_config_write_refusal(path)
+    if reason:
+        raise LockdownError(f"Cannot {action} {path}: {reason}")
+
+
+def tracked_config_write_refusal(path: Path | str) -> str | None:
+    """Why a locked instance refuses to write ``path``, or ``None`` to allow it.
+
+    The same rule as :func:`ensure_path_not_tracked_config`, phrased as a value
+    rather than an exception, because the agent backends express a refusal by
+    returning one — a raise there aborts the turn instead of telling the model
+    what to do differently. The wording is aimed at the model for that reason:
+    it names the alternative, so a capable agent routes to the review flow rather
+    than retrying the same write with a different tool.
+
+    A relative path is taken as relative to the workspace, which is the agent's
+    working directory. That can in principle over-refuse for an agent that has
+    changed directory into a subtree of its own with a ``config/`` in it; erring
+    that way costs a clear message and a retry, and erring the other way is the
+    hole this exists to close.
+    """
+    if not is_locked():
+        return None
+    workspace = get_config().workspace
+    target = Path(path)
+    if not target.is_absolute():
+        target = workspace / target
+    config_root = workspace_config_dir(workspace)
+    if not _is_within(target, config_root):
+        return None
+    return (
+        f"this instance is in lockdown (remote-only, read-only) and {target} is "
+        f"inside the tracked config subtree {config_root}, which only a reviewed, "
+        f"merged change to the workspace repo may alter. Open a pull request "
+        f"against that repo instead; the instance will pick the change up when it "
+        f"syncs. Everything outside {config_root} is still writable."
+    )

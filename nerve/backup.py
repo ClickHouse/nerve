@@ -107,6 +107,18 @@ _SECRET_RESTORE_PATHS: tuple[str, ...] = (
 WORKSPACE_INCLUDE_DIRS: tuple[str, ...] = ("config", "memory", "scripts", "skills")
 WORKSPACE_INCLUDE_FILE_GLOBS: tuple[str, ...] = ("*.md",)
 
+# What restore may write back, which is deliberately *not* what backup collects.
+# The asymmetry is the point, and it is one directory wide: `config` is captured
+# so a lost machine loses nothing, and never written back, because the authority
+# for tracked config is the git remote rather than a tarball. Writing it back
+# would replace reviewed config on a locked instance, and on any instance leave
+# the checkout dirty enough that the next sync refuses to merge.
+#
+# These must stay separate constants. Defining the restore side as "whatever
+# backup collects" is what silently opened that hole the moment `config` was
+# added above — one edit, two opposite meanings.
+WORKSPACE_RESTORE_DIRS: tuple[str, ...] = ("memory", "scripts", "skills")
+
 # Directory names always pruned while walking the included workspace dirs.
 _PRUNE_DIR_NAMES: frozenset[str] = frozenset({
     ".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -116,6 +128,30 @@ _PRUNE_DIR_NAMES: frozenset[str] = frozenset({
 # Warn if the workspace payload exceeds this — a sign the junk exclusion
 # missed something (e.g. a build artifact landed under memory/).
 WORKSPACE_WARN_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+
+def _restorable_workspace_path(rel: Path) -> bool:
+    """Whether a workspace path from a bundle may be written back on restore.
+
+    Restore applies :data:`WORKSPACE_RESTORE_DIRS`, not the collect-side
+    allowlist. Bundles this module writes *do* carry ``config/`` — deliberately,
+    so a lost machine loses no settings or schedule — and a bundle it is handed
+    can carry anything at all. Either way, writing ``config/settings.yaml`` or
+    ``config/cron/gates/x.py`` back would let a tarball replace the git-tracked
+    config subtree: on a locked instance that displaces the reviewed remote
+    config the whole mode exists to guarantee, and on any instance it leaves the
+    checkout dirty enough that the next sync refuses to merge.
+
+    So the config subtree travels in the bundle and is never written back. It is
+    still there to be read out and applied through review if a restore really
+    needs it, which the skip warning says.
+    """
+    import fnmatch
+
+    parts = rel.parts
+    if len(parts) == 1:
+        return any(fnmatch.fnmatch(parts[0], g) for g in WORKSPACE_INCLUDE_FILE_GLOBS)
+    return parts[0] in WORKSPACE_RESTORE_DIRS
 
 # Retention prune only ever touches files matching this exact pattern, so it
 # can never delete an unrelated file that happens to share the directory.
@@ -876,13 +912,33 @@ def restore_bundle(
         staged_ws = staging / "workspace"
         if staged_ws.is_dir():
             workspace.mkdir(parents=True, exist_ok=True)
+            refused: list[str] = []
             for src in sorted(staged_ws.rglob("*")):
                 if not src.is_file():
                     continue
                 rel = src.relative_to(staged_ws)
+                if not _restorable_workspace_path(rel):
+                    refused.append(str(rel))
+                    continue
                 dst = workspace / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
+            if refused:
+                logger.warning(
+                    "Restore: skipped %d workspace file(s) not restorable (%s): "
+                    "%s. The config subtree is intentionally among these — it "
+                    "travels in the bundle but is never written back, because "
+                    "tracked config comes from the git remote. Read it out of "
+                    "the bundle and apply it through review if you need it.",
+                    len(refused), ", ".join(WORKSPACE_RESTORE_DIRS),
+                    ", ".join(refused[:10]),
+                )
+                report.warnings.append(
+                    f"skipped {len(refused)} workspace file(s) this bundle "
+                    f"carries that restore does not write back (the config "
+                    f"subtree is deliberately one of them) — including "
+                    f"{refused[0]!r}"
+                )
 
         logger.info("Restore complete: %s → %s", path.name, nerve_dir)
         return report

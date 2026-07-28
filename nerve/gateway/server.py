@@ -690,6 +690,23 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Render a lockdown violation as a clean 403 instead of an opaque 500.
+    from fastapi.responses import JSONResponse
+
+    from nerve.config import LockdownError
+
+    @app.exception_handler(LockdownError)
+    async def _lockdown_handler(request, exc: LockdownError):  # noqa: ANN001
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+    # A malformed skill id is the caller's mistake, not a server fault, and the
+    # id arrives as a path segment so it is trivially reachable.
+    from nerve.skills.manager import SkillIdError
+
+    @app.exception_handler(SkillIdError)
+    async def _skill_id_handler(request, exc: SkillIdError):  # noqa: ANN001
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
     # CORS for development
     app.add_middleware(
         CORSMiddleware,

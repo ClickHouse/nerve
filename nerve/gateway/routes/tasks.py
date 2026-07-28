@@ -7,7 +7,7 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from nerve.config import get_config
+from nerve.config import ensure_path_not_tracked_config, get_config
 from nerve.db.task_statuses import STATUS_NAME_RE, normalize_color
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import (
@@ -129,6 +129,11 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
     if req.content:
         config = get_config()
         file_path = config.workspace / task["file_path"]
+        # file_path comes from the DB row, which the task indexer only ever fills
+        # from a glob of tasks/ — but it is still a stored path being joined to
+        # the workspace and written to, so it gets the same guard as every other
+        # caller-influenced write.
+        ensure_path_not_tracked_config(file_path, "write")
         if file_path.exists():
             await asyncio.to_thread(
                 file_path.write_text, req.content, encoding="utf-8",

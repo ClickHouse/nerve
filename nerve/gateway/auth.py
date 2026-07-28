@@ -141,6 +141,14 @@ async def require_auth(request: Request) -> dict:
     """FastAPI dependency: require valid authentication."""
     config = get_config()
     if not config.auth.jwt_secret:
+        if config.lockdown:
+            # Fail closed: a locked instance must never fall into the open
+            # dev-mode bypass just because its jwt_secret wasn't supplied via env.
+            raise HTTPException(
+                status_code=503,
+                detail="Locked instance has no auth.jwt_secret (set it via "
+                "${ENV_VAR} in settings.yaml or the environment).",
+            )
         # Auth not configured — allow access (development mode)
         return {"sub": "user"}
 
@@ -156,6 +164,8 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     """
     config = get_config()
     if not config.auth.jwt_secret:
+        if config.lockdown:
+            return False  # Fail closed under lockdown — never open the socket
         return True  # Dev mode
 
     # Check query parameter

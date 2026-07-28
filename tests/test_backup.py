@@ -267,6 +267,44 @@ def test_backup_excludes_junk(nerve_dir, workspace, config_dir, tmp_path):
     assert any(m.endswith("workspace/scripts/helper.py") for m in members)
 
 
+def test_config_travels_in_the_bundle_but_is_not_written_back(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """The two halves of the config asymmetry, on an ordinary bundle.
+
+    The other restore test smuggles entries in to prove a hostile bundle is
+    refused. This one uses a bundle this module wrote itself, because the
+    surprising half is that our *own* config/ is not written back either — it is
+    captured so nothing is lost, and withheld because tracked config comes from
+    the git remote, not a tarball.
+    """
+    cfg = workspace / "config"
+    (cfg / "cron").mkdir(parents=True)
+    (cfg / "settings.yaml").write_text("timezone: UTC\n")
+    (cfg / "cron" / "jobs.yaml").write_text("jobs:\n  - id: nightly\n")
+
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+    # Captured.
+    members = _bundle_members(result.path)
+    assert any(m.endswith("workspace/config/settings.yaml") for m in members)
+    assert any(m.endswith("workspace/config/cron/jobs.yaml") for m in members)
+
+    # Not written back — and what is already on disk survives untouched.
+    ws_out = tmp_path / "ws_restored"
+    (ws_out / "config").mkdir(parents=True)
+    (ws_out / "config" / "settings.yaml").write_text("timezone: Europe/Berlin\n")
+    report = backup_mod.restore_bundle(result.path, tmp_path / "target", ws_out)
+
+    assert (ws_out / "config" / "settings.yaml").read_text() == "timezone: Europe/Berlin\n"
+    assert not (ws_out / "config" / "cron").exists()
+    # The rest of the brain did come back.
+    assert (ws_out / "SOUL.md").read_text() == "soul"
+    assert (ws_out / "skills" / "s1" / "SKILL.md").exists()
+    assert any("skipped" in w for w in report.warnings), report.warnings
+
+
 def test_backup_captures_tracked_workspace_config(
     nerve_dir, workspace, config_dir, tmp_path,
 ):
@@ -419,6 +457,54 @@ def test_restore_force_relocates_old_dir(nerve_dir, workspace, config_dir, tmp_p
     # New state installed.
     assert (target / "nerve.db").exists()
     assert "old_marker.txt" not in [p.name for p in target.iterdir()]
+
+
+def test_restore_refuses_workspace_paths_the_backup_would_never_take(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """The workspace allowlist is applied when a bundle is *collected*; restore
+    has to apply it again when a bundle is *read*.
+
+    "config/ is never in a bundle" is true of bundles this module writes and says
+    nothing about bundles it is handed. One carrying config/settings.yaml or a gate
+    plugin would overwrite the git-tracked config subtree from a tarball — which on
+    a locked instance replaces the reviewed remote config outright, and on any
+    instance leaves a checkout dirty enough that the next sync refuses to merge.
+    """
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+    compression = backup_mod._compression_for(result.path)
+
+    # Re-pack the bundle with two extra workspace entries the collector would
+    # never have produced, using the module's own reader/writer so it stays a
+    # bundle this code accepts.
+    staging = tmp_path / "repack"
+    staging.mkdir()
+    with backup_mod._tar_reader(result.path, compression) as tf:
+        tf.extractall(staging)
+    smuggled = staging / "workspace" / "config" / "cron" / "gates"
+    smuggled.mkdir(parents=True)
+    (smuggled / "evil.py").write_text("MARKER = 1\n")
+    (staging / "workspace" / "config" / "settings.yaml").write_text("lockdown: false\n")
+    result.path.unlink()
+    with backup_mod._tar_writer(result.path, compression) as tf:
+        for entry in sorted(staging.iterdir()):
+            tf.add(entry, arcname=entry.name)
+
+    target = tmp_path / "restored"
+    ws_out = tmp_path / "ws_restored"
+    ws_out.mkdir()
+    (ws_out / "config").mkdir()
+    (ws_out / "config" / "settings.yaml").write_text("lockdown: true\n")
+
+    report = backup_mod.restore_bundle(result.path, target, ws_out)
+
+    # The tracked subtree is untouched; the allowlisted brain still came back.
+    assert (ws_out / "config" / "settings.yaml").read_text() == "lockdown: true\n"
+    assert not (ws_out / "config" / "cron").exists()
+    assert (ws_out / "SOUL.md").read_text() == "soul"
+    assert (ws_out / "memory" / "people.md").exists()
+    assert any("skipped" in w for w in report.warnings), report.warnings
 
 
 # --------------------------------------------------------------------------- #

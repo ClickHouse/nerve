@@ -43,6 +43,11 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     info: list[str] = field(default_factory=list)
+    #: Names of ``${VAR}`` references the bundle needs and the environment does
+    #: not have. Kept as data rather than only as prose, because which bucket the
+    #: prose lands in depends on ``strict_env`` — and a caller that tolerates
+    #: unset variables still needs to know the daemon will refuse this config.
+    unresolved_env: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -55,6 +60,7 @@ def validate_config_bundle(
     strict_env: bool = False,
     strict_keys: bool = False,
     portable_only: bool = False,
+    assume_locked: bool = False,
 ) -> ValidationResult:
     """Validate the config bundle rooted at ``config_dir``.
 
@@ -71,6 +77,15 @@ def validate_config_bundle(
     running the check. Pair it with ``workspace_override``: with no machine
     config left to read the workspace location from, it falls back to the
     default one.
+
+    ``assume_locked`` judges the locked view whatever the bundle's own
+    ``lockdown`` flag resolves to here. A fleet repo states the flag as
+    ``${NERVE_LOCKDOWN:-false}`` so that one bundle can serve locked and unlocked
+    boxes — which means CI, where the variable is unset, resolves it to false and
+    validates the view *no locked box will ever run*. The lockdown checks then
+    have nothing to fire on and the only machine that finds out is the locked one,
+    at boot. This is how a config repo whose members include a locked instance
+    checks the configuration that instance will actually load.
     """
     result = ValidationResult()
     config_dir = Path(config_dir)
@@ -91,8 +106,28 @@ def validate_config_bundle(
     base, local = layers[0] or {}, layers[1] or {}
     machine = cfg._deep_merge(base, local)
 
+    # An environment anchor forces lockdown regardless of the files, so a run in
+    # the daemon's environment has to judge the same thing the daemon will.
+    # Errors from a malformed anchor are reported rather than raised — the
+    # validator's job is to say what is wrong, not to become unusable.
+    try:
+        anchored = cfg.lockdown_anchor()
+    except cfg.ConfigError as e:
+        result.errors.append(str(e))
+        anchored = False
+
     if workspace_override is not None:
         workspace = Path(workspace_override).expanduser()
+    elif anchored:
+        # Same rule as the loader: the anchor selects the workspace too, so an
+        # unpinned run in an anchored environment looks at the tree the daemon
+        # will. An explicit --workspace still wins — pointing the validator at a
+        # checkout is the whole point of the flag, and CI is not the anchored box.
+        try:
+            workspace = cfg._anchored_workspace()
+        except cfg.ConfigError as e:
+            result.errors.append(str(e))
+            workspace = cfg.paths.default_workspace()
     else:
         # Resolve the workspace the same way load_config does, incl. best-effort
         # ${VAR}/${VAR:-default} interpolation of the path itself. Under
@@ -105,9 +140,50 @@ def validate_config_bundle(
         workspace = cfg._expand_path(ws_raw) or cfg.paths.default_workspace()
 
     ws_settings = _read_workspace_settings(workspace, result)
-    merged = cfg._deep_merge(cfg._deep_merge(ws_settings, base), local)
-    # Before the pin below overwrites the bundle's own ``workspace`` value with
-    # the resolved one — that value is part of what is under review.
+    # Mirror _read_config_sources: when the tracked settings lock the instance,
+    # validate the LOCKED view (workspace-only), since that's what production runs.
+    # An unreadable flag is refused rather than assumed, exactly as at load time —
+    # reported here, before the change is merged, which is the whole point. That
+    # error is already fatal, so nothing is fail-open in carrying on with the
+    # unlocked view; judging the locked one instead would bury the real problem
+    # under a pile of errors derived from a lockdown the bundle never asked for.
+    raw_lockdown = ws_settings.get("lockdown")
+    try:
+        locked = cfg._as_lockdown(raw_lockdown)
+    except cfg.ConfigError as e:
+        result.errors.append(str(e))
+        locked = False
+    if anchored and not locked:
+        result.info.append(
+            f"validating the LOCKED view: {cfg.LOCKDOWN_ANCHOR_ENV} is set in "
+            f"this environment, which locks the instance whatever the tracked "
+            f"settings say"
+        )
+        locked = True
+    if assume_locked and not locked:
+        result.info.append(
+            "validating the LOCKED view on request (--assume-lockdown); this "
+            "bundle's own lockdown flag resolves to false in this environment"
+        )
+        locked = True
+    elif not locked and isinstance(raw_lockdown, str) and "${" in raw_lockdown:
+        # The flag is env-controlled and this environment says off, so everything
+        # below judges a view no locked member of the fleet will run. Say so:
+        # nobody would otherwise think to ask for the other one.
+        result.warnings.append(
+            f"lockdown is set from the environment ({raw_lockdown}) and resolves "
+            f"to false here, so the locked view was NOT validated — a locked "
+            f"instance loads a different config than this. Re-run with "
+            f"--assume-lockdown to check it."
+        )
+    if locked:
+        merged = dict(ws_settings)
+    else:
+        merged = cfg._deep_merge(cfg._deep_merge(ws_settings, base), local)
+    merged["lockdown"] = locked
+    # Judge the same view the instance will run, so a locked bundle is checked on
+    # its tracked values alone. Before the pin below overwrites the bundle's own
+    # ``workspace`` value with the resolved one — that value is under review too.
     _validate_working_dir_paths(merged, result)
     # Pin the workspace so cron paths resolve against the validated workspace.
     merged["workspace"] = str(workspace)
@@ -116,6 +192,7 @@ def validate_config_bundle(
     missing: list[str] = []
     merged = cfg._interpolate_env(merged, missing)
     env_names = ", ".join(sorted(set(missing)))
+    result.unresolved_env = sorted(set(missing))
     if missing:
         msg = f"references unset environment variable(s): {env_names}"
         # Say which layer asked for them. The refs are collected from the merged
@@ -196,6 +273,19 @@ def validate_config_bundle(
             # be env-caused, with a real one behind it.
             result.errors.append(f"config error: {residual}")
 
+    if locked:
+        # Judged on the workspace the run was pointed at, so a candidate bundle
+        # is checked against its own checkout rather than this machine's tree.
+        result.errors.extend(cfg.lockdown_workspace_problems(workspace))
+    if config is not None:
+        # The machine overlay read at the top of this function is what a locked
+        # instance discards, so pass it through: with it the note can name the
+        # keys this bundle strands rather than describing the hazard in general.
+        # Empty under portable_only, which the callee guards against.
+        result.warnings.extend(
+            cfg.lockdown_machine_local_notes(merged, machine if locked else None)
+        )
+
     # Resolve the cron locations even if full typed construction failed above.
     if config is not None:
         cron_files = (
@@ -203,7 +293,7 @@ def validate_config_bundle(
             ("jobs", config.cron.jobs_file),
         )
     else:
-        base_cron = cfg._resolve_cron_dir(workspace)
+        base_cron = cfg._resolve_cron_dir(workspace, locked=locked)
         cron_files = (
             ("system", base_cron / "system.yaml"),
             ("jobs", base_cron / "jobs.yaml"),
