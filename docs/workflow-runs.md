@@ -205,7 +205,7 @@ A cron job may declare a `workflow` block **instead of** `prompt` — each
 trigger starts a workflow run:
 
 ```yaml
-# ~/.nerve/cron/jobs.yaml
+# <workspace>/config/cron/jobs.yaml
 jobs:
   - id: nightly-sample-audit
     schedule: "0 3 * * *"

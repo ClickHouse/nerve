@@ -39,7 +39,7 @@ On first boot, Nerve detects that `TASK.md` contains a raw description (no `## M
    - `## Approval` — what needs human approval vs autonomous action
    - `## References` — links to docs, APIs, tools
 3. **Create skills** — writes domain-specific procedures as reusable skills (`skill_create`)
-4. **Configure cron jobs** — adds monitoring and task-specific crons to `~/.nerve/cron/jobs.yaml`
+4. **Configure cron jobs** — adds monitoring and task-specific crons to `<workspace>/config/cron/jobs.yaml`
 5. **Create initial tasks** — files setup tasks that need manual work (credentials, access tokens, etc.)
 6. **Notify** — sends a notification that onboarding is complete with a summary of what was configured
 
@@ -165,8 +165,7 @@ Run `nerve doctor` to verify the worker is healthy:
 nerve doctor
 #   [OK] Config loaded
 #   [OK] Database schema: v14
-#   [OK] System crons: ~/.nerve/cron/system.yaml (3/4 enabled)
-#   [OK] User crons: ~/.nerve/cron/jobs.yaml (2 jobs)
+#   [OK] Cron jobs: 3/4 enabled, 1 overridden in jobs.yaml
 #   [OK] Proxy: running on port 8317
 ```
 
@@ -185,7 +184,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. Configure quiet hours in `config.yaml` to avoid late-night pings.
+Priority levels: `urgent`, `high`, `normal`, `low`. Configure quiet hours in `<workspace>/config/settings.yaml` to avoid late-night pings.
 
 ### Logs
 

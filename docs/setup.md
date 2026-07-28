@@ -104,11 +104,12 @@ You can re-run `nerve init` at any time — it's safe on existing installations.
 
 **What gets overwritten:**
 - `config.yaml` and `config.local.yaml` — regenerated from your choices
-- `~/.nerve/cron/system.yaml` — regenerated (picks up new built-in cron prompts from Nerve updates)
+- `<workspace>/config/cron/system.yaml` — regenerated (picks up new built-in cron prompts from Nerve updates)
 
 **What's preserved:**
 - All workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, skills, tasks, etc.)
-- `~/.nerve/cron/jobs.yaml` — your custom crons are never touched
+- `<workspace>/config/cron/jobs.yaml` — your custom crons are never touched
+- `<workspace>/config/settings.yaml` — only the keys `nerve init` generates are rewritten; anything else you added stays
 - `~/.nerve/nerve.db` and `~/.nerve/memu.sqlite` — databases are preserved
 
 When you run `nerve init` on an existing install, it prompts: *"Nerve is already configured. Re-run setup?"* The `--if-needed` flag skips setup entirely if already configured (useful in Docker entrypoints).

@@ -125,13 +125,10 @@ class TestNonInteractiveSetup:
         assert (ws / "SOUL.md").exists()
         assert (ws / "AGENTS.md").exists()
 
-        # Cron jobs land under NERVE_HOME (the conftest tmpdir), not the real
-        # ~/.nerve — until this was fixed, running the suite rewrote the
-        # developer's own system.yaml.
-        from nerve import paths
-
-        assert (paths.cron_dir() / "jobs.yaml").exists()
-        assert (paths.cron_dir() / "system.yaml").exists()
+        # Cron config now lives in the git-syncable workspace/config/cron subtree
+        assert (ws / "config" / "cron" / "system.yaml").exists()
+        assert (ws / "config" / "cron" / "jobs.yaml").exists()
+        assert (ws / "config" / "cron" / "gates").is_dir()
 
     def test_worker_mode(self, tmp_path: Path) -> None:
         """Worker mode should create minimal workspace."""
@@ -432,12 +429,17 @@ class TestEnsureDockerFiles:
         to claim the opposite, which sends the agent to edit a file nothing
         reads (and on a different bind mount than the one it meant).
         """
-        from nerve.bootstrap import _DOCKER_NERVE_HOME, _DOCKER_TOOLS_SECTION
+        from nerve.bootstrap import (
+            _DOCKER_NERVE_HOME,
+            _DOCKER_TOOLS_SECTION,
+            _DOCKER_WORKSPACE,
+        )
 
-        assert f"Config files live in `/nerve/`" in _DOCKER_TOOLS_SECTION
+        assert "Config files live in `/nerve/`" in _DOCKER_TOOLS_SECTION
         assert f"`{_DOCKER_NERVE_HOME}/config.local.yaml`" not in _DOCKER_TOOLS_SECTION
-        # Cron still lives under the machine-local state dir on this branch.
-        assert f"{_DOCKER_NERVE_HOME}/cron/" in _DOCKER_TOOLS_SECTION
+        # Cron now lives in the workspace's syncable config subtree.
+        assert f"{_DOCKER_WORKSPACE}/config/cron/" in _DOCKER_TOOLS_SECTION
+        assert f"{_DOCKER_NERVE_HOME}/cron" not in _DOCKER_TOOLS_SECTION
 
     def test_entrypoint_executable(self, tmp_path: Path) -> None:
         """docker-entrypoint.sh should be executable."""
@@ -1345,6 +1347,18 @@ class TestPortableSettingsSplit:
 
         assert (real_ws / "config" / "settings.yaml").exists()
         assert load_config(tmp_path).timezone == "Asia/Tokyo"
+
+        # Every writer has to agree on where the workspace is, not just the one
+        # this test was originally written for. The cron writer expanded only
+        # `~`, so it created a literal "${MY_WS}" directory next to the process
+        # CWD — which is how one got committed to this repo.
+        cron_dir = real_ws / "config" / "cron"
+        assert (cron_dir / "system.yaml").exists()
+        assert (cron_dir / "jobs.yaml").exists()
+        assert not (Path.cwd() / "${MY_WS}").exists()
+        cfg = load_config(tmp_path)
+        assert cfg.cron.system_file == cron_dir / "system.yaml"
+        assert cfg.cron.jobs_file == cron_dir / "jobs.yaml"
 
     def test_reinit_backs_up_settings(self, tmp_path: Path) -> None:
         wizard = self._wizard(tmp_path)

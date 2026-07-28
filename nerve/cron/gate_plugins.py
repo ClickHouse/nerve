@@ -3,8 +3,9 @@
 Built-in gates live in :mod:`nerve.cron.gates` and are registered directly in
 :data:`nerve.cron.gates.GATE_REGISTRY`. To add a *custom* gate **without
 editing core source**, drop a ``.py`` file into the gate-plugins directory
-(``~/.nerve/cron/gates/`` by default, overridable via the ``cron.gate_plugins_dir``
-config key). On daemon startup each file is imported and every
+(``<workspace>/config/cron/gates/`` by default — falling back to the legacy
+``~/.nerve/cron/gates/`` for un-migrated installs — overridable via the
+``cron.gate_plugins_dir`` config key). On daemon startup each file is imported and every
 :class:`~nerve.cron.gates.CronGate` subclass it defines with a non-empty
 ``type`` is registered into ``GATE_REGISTRY`` — after which ``jobs.yaml`` can
 reference it via ``run_if: [{type: <name>, ...}]`` exactly like a built-in.
@@ -14,7 +15,7 @@ pulling Nerve upstream; the loader itself is generic and upstreamable.
 
 A plugin file looks like any other module defining a gate::
 
-    # ~/.nerve/cron/gates/stale_tasks.py
+    # <workspace>/config/cron/gates/stale_tasks.py
     from nerve.cron.gates import CronGate, GateContext
 
     class StaleTasksGate(CronGate):

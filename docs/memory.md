@@ -45,7 +45,9 @@ memU provides semantic search over conversations and workspace files. It runs em
 
 ### Categories
 
-Memory items are organized into categories defined in `config.yaml`. Categories are seeded on startup — only missing ones are created, so adding new entries is safe.
+Memory items are organized into categories defined in `<workspace>/config/settings.yaml`
+(the shareable layer — `config.yaml` can still override them per machine).
+Categories are seeded on startup — only missing ones are created, so adding new entries is safe.
 
 ```yaml
 memory:
@@ -85,14 +87,20 @@ memU uses two or three LLM profiles depending on configuration:
 
 When no OpenAI key is configured, memU uses **LLM-based recall** instead of vector search — the Chat profile ranks memories directly, requiring no embeddings. This uses more Anthropic API tokens per recall but removes the OpenAI dependency entirely.
 
-Config in `config.yaml`:
+Config in `<workspace>/config/settings.yaml`:
 ```yaml
 memory:
-  chat_model: claude-sonnet-4-6       # recall routing
-  fast_model: claude-haiku-4-5-20251001  # extraction & categorization
-  # embed_model: text-embedding-3-small  # only needed with openai_api_key
+  recall_model: claude-sonnet-4-6         # recall routing
+  memorize_model: claude-sonnet-4-6       # writing memories back
+  fast_model: claude-haiku-4-5-20251001   # extraction & categorization
+  # embed_model: text-embedding-3-small   # only needed with openai_api_key
   categories: [...]  # see Categories section above
 ```
+
+> On a **Bedrock** install the three model keys are machine-local instead:
+> `nerve init` writes region-scoped inference-profile IDs into `config.yaml`,
+> which shadows `settings.yaml`. The prefix must match the configured region
+> or every call 400s, so they can't be shared. `categories` stays portable.
 
 ### Event Date Resolution
 

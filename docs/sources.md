@@ -420,7 +420,7 @@ if ms.enabled:
     ))
 ```
 
-4. **Add config** to `config.yaml`:
+4. **Add config** to `<workspace>/config/settings.yaml`:
 ```yaml
 sync:
   mysource:

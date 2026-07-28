@@ -250,9 +250,11 @@ nerve (single Python process)
 
 ## Configuration
 
-Two config files:
-- `config.yaml` — Template settings (committed)
-- `config.local.yaml` — Secrets and overrides (gitignored)
+Three layers, lowest precedence first:
+- `<workspace>/config/settings.yaml` — shareable settings, git-tracked with the
+  workspace (this is the layer you review in a PR and sync between machines)
+- `config.yaml` — machine-local settings (gitignored)
+- `config.local.yaml` — secrets and personal overrides (gitignored)
 
 See [docs/config.md](docs/config.md) for all options.
 
