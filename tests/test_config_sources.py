@@ -447,3 +447,41 @@ class TestBrokenConfigIsRepairable:
         assert result.exit_code != 0
         assert "must be a mapping" in result.output
         assert "Traceback" not in result.output
+
+    def test_a_bad_backend_value_is_a_clean_error_too(self, tmp_path):
+        """The other half of "the config is broken": typing is what rejects an
+        unknown agent.backend, and it raises a plain ValueError rather than
+        ConfigError. Re-raising that gave a traceback for a one-word typo."""
+        from click.testing import CliRunner
+
+        from nerve.cli import main
+
+        config_dir, workspace = _setup(tmp_path)
+        _write(config_dir / "config.yaml", f"workspace: {workspace}\n")
+        _write(workspace_settings_file(workspace), "agent:\n  backend: bogus\n")
+
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "status"])
+
+        assert result.exit_code != 0
+        assert "agent.backend" in result.output
+        assert "Traceback" not in result.output
+        assert not isinstance(result.exception, ValueError)
+
+    def test_an_internal_error_keeps_its_traceback(self, tmp_path, monkeypatch):
+        """The clean-error path is for the operator's config, not for nerve's
+        own bugs: reporting a defect here as "Error: <config problem>" sends
+        someone off to edit a file that was never at fault."""
+        import nerve.cli as cli_mod
+        from click.testing import CliRunner
+
+        config_dir, workspace = _setup(tmp_path)
+        _write(config_dir / "config.yaml", f"workspace: {workspace}\n")
+
+        def _boom(_dir):
+            raise RuntimeError("internal defect")
+
+        monkeypatch.setattr(cli_mod, "load_config", _boom)
+
+        result = CliRunner().invoke(cli_mod.main, ["-c", str(config_dir), "status"])
+
+        assert isinstance(result.exception, RuntimeError)

@@ -91,13 +91,15 @@ class InvalidScheduleError(ConfigError):
     """
 
 
-def _parse_interval(interval: str) -> int:
-    """Parse an interval string like '2h', '30m', '1h30m', '0.5h' into seconds.
+def _interval_seconds(interval: str) -> int | None:
+    """Seconds for an interval string like '2h', '30m', '1h30m', '0.5h'.
 
-    The whole string has to be a run of ``<number><unit>`` tokens. Anything
-    else — ``hourly``, ``@daily``, ``???``, ``1h junk`` — is not an interval at
-    all and gets the 2h default, because the daemon has to keep running: a job
-    on a conservative cadence beats a scheduler that refused to start.
+    ``None`` when the string names no usable interval: either it is not a run of
+    ``<number><unit>`` tokens at all (``hourly``, ``@daily``, ``???``,
+    ``1h junk``), or it names zero (``0h``, or ``0.4s`` rounding down to it).
+    The daemon has to keep running either way and substitutes a default (see
+    :func:`_parse_interval`); config validation, which can still refuse the
+    file, needs to tell both cases apart from a real '2h'.
     """
     import re
     # One token, and the same expression used to check that the string is
@@ -117,7 +119,7 @@ def _parse_interval(interval: str) -> int:
     token = r"(\d+(?:\.\d+)?|\.\d+)([hms])"
     text = interval.strip().lower()
     if not re.fullmatch(rf"(?:{token}\s*)+", text):
-        return 7200  # Not an interval at all → default 2h
+        return None
     total = 0.0
     for value, unit in re.findall(token, text):
         v = float(value)
@@ -129,11 +131,20 @@ def _parse_interval(interval: str) -> int:
             total += v
     # Fractions mean what they say ("0.5h" is 1800s), rounded to the nearest
     # whole second because IntervalTrigger counts seconds and half a second of
-    # drift on a cadence measured in minutes is noise. Zero takes the default
-    # too — written ("0h") or rounded down to it ("0.4s") — since
-    # IntervalTrigger(seconds=0) is a fire-as-fast-as-you-can loop rather than
-    # a schedule.
-    return round(total) or 7200  # Default 2h
+    # drift on a cadence measured in minutes is noise. Zero is not a schedule —
+    # IntervalTrigger(seconds=0) is a fire-as-fast-as-you-can loop — so a zero,
+    # written or rounded down to, is reported as no interval at all.
+    return round(total) or None
+
+
+def _parse_interval(interval: str) -> int:
+    """Parse an interval string like '2h', '30m', '1h30m', '0.5h' into seconds.
+
+    Falls back to 2h when the string names no usable interval, because the
+    daemon has to keep running: a job on a conservative cadence beats a
+    scheduler that refuses to start.
+    """
+    return _interval_seconds(interval) or 7200  # Default 2h
 
 
 # Unix crontab day-of-week numbering is 0=Sun..6=Sat (7 also means Sun).

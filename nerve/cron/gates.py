@@ -79,6 +79,14 @@ class CronGate(ABC):
     #: Registry key — must match the ``type`` field in the YAML spec.
     type: ClassVar[str] = ""
 
+    #: Keys this gate reads from its spec, besides ``type``. Declaring them
+    #: lets ``nerve config validate`` catch a misspelled field, which is
+    #: otherwise invisible: ``from_config`` uses ``spec.get()``, so a typo just
+    #: takes the default and the gate quietly does something else. Empty means
+    #: "unknown" — no field checking — which is the right default for an
+    #: out-of-tree gate nothing has read.
+    spec_keys: ClassVar[frozenset[str]] = frozenset()
+
     @abstractmethod
     async def is_satisfied(self, ctx: GateContext) -> bool:
         """Return True if the job is allowed to run under this condition."""
@@ -110,6 +118,11 @@ class MessagesGate(CronGate):
     """
 
     type = "messages"
+    # "skip_when_idle"/"idle_consumer" are the legacy spellings from_config
+    # still accepts.
+    spec_keys = frozenset({
+        "sources", "consumer", "skip_when_idle", "idle_consumer",
+    })
 
     def __init__(self, sources: list[str], consumer: str = "inbox") -> None:
         if not sources:
@@ -167,6 +180,7 @@ class TasksGate(CronGate):
     """
 
     type = "tasks"
+    spec_keys = frozenset({"status", "tag", "min_count"})
 
     def __init__(
         self,
@@ -278,6 +292,7 @@ class GitHubPrActivityGate(CronGate):
     """
 
     type = "github_pr_activity"
+    spec_keys = frozenset({"author", "force_run_after_hours"})
 
     def __init__(self, author: str, force_run_after_hours: float = 8.0) -> None:
         if not author:
@@ -449,6 +464,13 @@ def build_gate(spec: dict) -> CronGate:
     gate_type = spec.get("type")
     if not gate_type:
         raise GateConfigError("gate spec missing required 'type' key")
+    if not isinstance(gate_type, str):
+        # A YAML list or mapping under `type:` is unhashable, so the registry
+        # lookup below would raise TypeError — which build_gates does not catch,
+        # taking the whole job down instead of just this gate.
+        raise GateConfigError(
+            f"gate 'type' must be a string, got {type(gate_type).__name__}"
+        )
     cls = GATE_REGISTRY.get(gate_type)
     if cls is None:
         known = ", ".join(sorted(GATE_REGISTRY)) or "(none)"

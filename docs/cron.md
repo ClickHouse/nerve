@@ -121,7 +121,7 @@ prompt definition.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | string | yes | Unique job identifier. `cleanup`, `wakeup_sweep` and anything starting with `source:` are **reserved by the daemon** — a job using one is skipped (with a warning naming it in the daemon log) and never scheduled, so rename it |
-| `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`, `1h30m`, `0.5h`) — see [Interval syntax](#interval-syntax). A 5-field crontab with an out-of-range field (`99 * * * *`) is **rejected**, never reinterpreted as an interval — reload returns `400` and startup skips that one job with an error in the daemon log |
+| `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`, `1h30m`, `0.5h`) — see [Interval syntax](#interval-syntax). A 5-field crontab with an out-of-range field (`99 * * * *`) is **rejected**, never reinterpreted as an interval — reload returns `400` and startup skips that one job with an error in the daemon log. Anything that names no usable interval (`hourly`, `@daily`, `1h junk`, or a zero like `0h`) silently becomes a 2-hour interval at run time; `nerve config validate` fails on both, which is the only warning you get about the second |
 | `prompt` | string | yes* | Message sent to the agent |
 | `prompt_file` | string | yes* | Path to a file containing the prompt (relative to the YAML's directory). Read fresh each run; shareable between jobs. *One of `prompt`/`prompt_file` is required |
 | `description` | string | no | Human-readable description |

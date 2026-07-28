@@ -97,6 +97,95 @@ type, including `int | None`, `list[int]` and `list[str]`. So `port: ${PORT}` an
 - Defaults are not re-scanned: `${A:-${B}}` yields the literal `${B}` when `A`
   is unset. Use a single reference instead.
 
+## Validating Configuration
+
+`nerve config validate` checks a whole config bundle and exits non-zero on any
+error, so it can gate a config repo in CI:
+
+```bash
+nerve config validate                  # the active install's config
+nerve config validate --workspace .    # a checked-out config repo
+nerve config validate --portable-only  # ignore this machine's config.yaml layers
+nerve config validate --strict-keys    # unknown keys become errors
+nerve config validate --strict-env     # every ${ENV_VAR} must be set
+```
+
+It runs even when the config cannot otherwise load, so a missing secret does not
+stop it. It reports an error for:
+
+- an unparseable or invalid cron file, a malformed `run_if` gate spec, or a bad
+  spec for a built-in gate;
+- backend and codex misconfiguration;
+- a schedule the daemon would not run as written, in `cron/*.yaml` or in
+  `sync.<source>.schedule`, named by job id. Either a 5-field crontab the
+  scheduler rejects (`99 * * * *`), which at run time the daemon only refuses
+  after the change has merged and synced, or a value that is neither a crontab
+  nor an interval (`hourly`, `@daily`), which silently becomes a fixed 2-hour
+  cadence. Write a crontab (`*/15 * * * *`) or an interval (`4h`, `30m`,
+  `1h30m`, `90s`);
+- a blank `workspace`, `cron.jobs_file`, `cron.system_file` or
+  `cron.gate_plugins_dir`. An empty value reads as "unset, use the default", but
+  `Path("")` is `Path(".")`, so it resolves to whatever directory the daemon was
+  started in. Omit the key instead, and never set it to `''`, `.` or `./`. This
+  matters most for `cron.gate_plugins_dir`, whose `.py` files the daemon imports
+  and executes at startup and on every cron reload.
+
+Validation never imports those gate plugins, because checking them would mean
+running the bundle it is judging. A `run_if` entry naming a gate type that is not
+built in is therefore reported as a warning: validation can confirm neither that
+the type exists nor that the spec's fields are right. Gate plugins are code, so
+test them as code.
+
+Two checks are lenient by default, so that validating a live install does not cry
+wolf:
+
+| Flag | Default | With the flag |
+|------|---------|---------------|
+| `--strict-keys` | An unknown or misspelled key is a warning. Covers config keys and the fields of a built-in gate's `run_if` spec. | Unknown keys are errors. |
+| `--strict-env` | An unset `${ENV_VAR}` is info, since CI has no secrets. | Every reference must resolve. |
+
+Turn `--strict-keys` on in CI. A typo'd key is the most common config mistake and
+the quietest, because nothing reads it.
+
+`--portable-only` judges the tracked `<workspace>/config/settings.yaml` layer on
+its own. Use it for a change headed to a shared repo: a local override can
+otherwise mask an invalid shared value, and, more often, a broken local file can
+fail a shared bundle that has nothing wrong with it. Pass `--workspace` with it,
+because with the machine layers dropped there is nothing left to read the
+workspace location from and it falls back to the default tree. It fails outright
+if it opened no file under the workspace's `config/`, so an empty directory, a
+`settings.yml` typo or a `settings.yaml` left at the repo root cannot pass as
+clean. Every run names the layers it read, in absolute paths:
+
+```
+[info] portable layer: /home/you/config-repo/config/settings.yaml
+[info] machine-local layers (config.yaml, config.local.yaml) not read: validating the portable workspace config on its own
+```
+
+Without `--portable-only` the second line names the machine-local files that were
+overlaid instead, and the directory they came from.
+
+In CI, install nerve and run the same command:
+
+```yaml
+jobs:
+  validate-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      # nerve is not published to PyPI: the bare name is an unrelated project.
+      - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
+      - run: nerve config validate --workspace . --portable-only --strict-keys
+```
+
+Installing from the default branch keeps the validator at or ahead of your
+instance, which is the safe direction for `--strict-keys`: a newer validator
+knows every key your instance reads. A key the validator accepts but the instance
+is too old to read shows up as a startup warning on the instance and in `nerve
+doctor`. If a key is ever retired upstream, `--strict-keys` flags it here first;
+drop the key, or install the ref you deploy (`nerve @ git+...@v1.2.3`) instead.
+
 ## Config Directory Resolution
 
 `nerve` commands locate the config directory via a waterfall, so they work
