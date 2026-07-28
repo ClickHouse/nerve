@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from nerve.utils.fs import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 _MARKETPLACE = "nerve-ultracode"
@@ -93,15 +95,6 @@ def managed_dir(home: str | Path) -> Path:
     return Path(home).expanduser() / "nerve-managed" / "ultracode"
 
 
-def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.chmod(tmp, mode)
-    tmp.replace(path)
-    os.chmod(path, mode)
-
-
 def materialize_worker_wrapper(home: str | Path) -> Path:
     """Write an owner-only executable pointing at Nerve's wrapper module."""
     path = managed_dir(home) / "codex-worker"
@@ -110,7 +103,7 @@ def materialize_worker_wrapper(home: str | Path) -> Path:
         "from nerve.agent.backends.codex.worker_wrapper import main\n"
         "raise SystemExit(main())\n"
     )
-    _atomic_write(path, script, mode=0o700)
+    atomic_write_text(path, script, mode=0o700)
     return path
 
 
@@ -123,7 +116,7 @@ def _replace_overlay(path: Path, old: str, new: str) -> None:
             f"Pinned Ultracode source drifted; policy overlay does not match {path}"
         )
     mode = path.stat().st_mode & 0o777
-    _atomic_write(path, content.replace(old, new), mode=mode)
+    atomic_write_text(path, content.replace(old, new), mode=mode)
 
 
 def _sha256(path: Path) -> str:
@@ -156,7 +149,7 @@ def apply_policy_overlay(config: Any, plugin_root: str | Path) -> dict[str, Any]
             "scripts/ultracode-script-runner.js": _sha256(script_runner),
         },
     }
-    _atomic_write(
+    atomic_write_text(
         managed_dir(config.codex.home_dir) / "policy-overlay.json",
         json.dumps(marker, indent=2, sort_keys=True) + "\n",
     )
@@ -318,7 +311,7 @@ async def ensure_installed(config: Any) -> dict[str, Any]:
 
         root = managed_dir(config.codex.home_dir) / "marketplace"
         manifest_path = root / ".agents" / "plugins" / "marketplace.json"
-        _atomic_write(
+        atomic_write_text(
             manifest_path,
             json.dumps(_marketplace_manifest(config), indent=2) + "\n",
         )
