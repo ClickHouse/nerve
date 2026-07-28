@@ -727,6 +727,13 @@ def propose_config_change(
         # one, and the boxes that merge it refuse to load. The masking also runs
         # the other way — an explicit machine-local cron.jobs_file wins, and a
         # proposed config/cron/jobs.yaml is then never opened at all.
+        #
+        # Still not --strict-keys, which the config repo's own CI does add, so a
+        # typo'd key it would reject only warns here and the PR still opens. That
+        # asymmetry is on purpose — the reviewer sees the red check and the
+        # explanation with the change in front of them, which is a better place to
+        # settle "is this key real" than a refusal here with no diff to look at.
+        # Erring the other way would block proposals on keys a newer nerve knows.
         from nerve.config_validate import validate_config_bundle
         errors = [
             e for e in validate_config_bundle(

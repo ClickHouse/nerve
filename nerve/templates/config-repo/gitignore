@@ -1,0 +1,31 @@
+# Nerve config repo — keep secrets and machine-local state OUT of the shared repo.
+# Secrets are referenced from settings.yaml via ${ENV_VAR} and supplied by the
+# environment; nothing sensitive should ever be committed here.
+
+# Machine-local overrides / secrets
+config.local.yaml
+.env
+.env.*
+
+# Migration breadcrumbs (originals left behind by `nerve migrate`)
+*.migrated
+
+# Runtime state and credentials (only appear if the workspace doubles as a
+# runtime dir). These are nerve's secret-bearing state files — a Telethon
+# session grants full account access, so never let `git add -A` catch one.
+*.db
+*.db-journal
+*.log
+*.pid
+.nerve/
+*.session
+mcp-token
+certs/
+
+# The nerve source checkout used by the CI validation workflow
+.nerve-src/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

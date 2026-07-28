@@ -143,3 +143,20 @@ propose_config_change(
   same content straight to the file instead only moves an invalid config onto the
   instance — that is the one case where editing directly is the wrong answer even
   on a local workspace.
+
+## Setting up a config repo (when the user wants review)
+
+On a local workspace you edit directly, as above — that is not a stopgap. But if
+the user wants config changes reviewed before they take effect, or wants one repo
+to serve several instances, the workspace has to become a git repo synced from a
+remote. That is an **operator** task, not something you do autonomously — walk the
+human through it:
+
+1. Run `nerve config init-repo` — scaffolds the CI workflow, `.gitignore`, a
+   README and a `config/settings.yaml` into the workspace, and prints the
+   remaining git/`gh` steps.
+2. Create the private GitHub repo and push (`git init` → commit → `gh repo create`).
+3. Enable `workspace_sync` (and, when ready, `lockdown`) in `settings.yaml`.
+
+Full runbook: `docs/config.md` → "Setting up the config repo". Once the remote
+exists and sync is on, use `propose_config_change` for all further changes.

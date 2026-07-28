@@ -1020,6 +1020,50 @@ class TestPortableOnly:
             assert not result.ok, name
             assert any("nothing to validate" in e for e in result.errors), name
 
+    def test_portable_only_ignores_the_machine_local_cron_fallback(
+        self, tmp_path, monkeypatch,
+    ):
+        """A workspace carrying no jobs falls back to ~/.nerve/cron, which is
+        right for an un-migrated install and wrong for judging a shared bundle:
+        a broken file there condemns a repo that doesn't contain it."""
+        home = tmp_path / "home"
+        (home / "cron").mkdir(parents=True)
+        (home / "cron" / "jobs.yaml").write_text("jobs: [oops\n", encoding="utf-8")
+        monkeypatch.setenv("NERVE_HOME", str(home))
+        ws = tmp_path / "ws"
+        _settings(ws, "timezone: UTC\n")
+        config_dir = _cfg(tmp_path, workspace=ws)
+
+        overlaid = validate_config_bundle(config_dir, workspace_override=ws)
+        assert not overlaid.ok  # the fallback applies, and the bundle is blamed
+
+        portable = validate_config_bundle(
+            config_dir, workspace_override=ws, portable_only=True,
+        )
+        assert portable.ok, portable.errors
+        assert any("outside the tracked config" in i for i in portable.info)
+
+    def test_portable_only_reads_the_repos_own_cron(self, tmp_path, monkeypatch):
+        """Suppressing the fallback must not suppress the real thing."""
+        home = tmp_path / "home"
+        (home / "cron").mkdir(parents=True)
+        (home / "cron" / "jobs.yaml").write_text(
+            "jobs:\n  - id: machine\n    schedule: 1h\n    prompt: hi\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("NERVE_HOME", str(home))
+        ws = tmp_path / "ws"
+        tracked = ws / "config" / "cron"
+        tracked.mkdir(parents=True)
+        (tracked / "jobs.yaml").write_text("jobs: [broken\n", encoding="utf-8")
+
+        result = validate_config_bundle(
+            _cfg(tmp_path, workspace=ws), workspace_override=ws, portable_only=True,
+        )
+
+        assert not result.ok
+        assert any(str(tracked / "jobs.yaml") in e for e in result.errors)
+
     def test_portable_only_passes_on_a_workspace_with_only_cron(self, tmp_path):
         """A repo may legitimately carry cron and no settings.yaml — that is a
         bundle, and it was read."""
@@ -1203,3 +1247,158 @@ class TestValidateCli:
         assert result.exit_code == 1
         assert "MISSING_SECRET" in result.output
         assert "Traceback" not in result.output
+
+
+class TestStandaloneEntryPoint:
+    """`python -m nerve.config_validate` — validation without installing nerve.
+
+    It runs from a source checkout with only PyYAML installed, so this entry point
+    must not depend on click or any of nerve's runtime dependencies, and it must
+    agree with the CLI that CI runs.
+    """
+
+    def test_main_ok_exit_zero(self, tmp_path, capsys):
+        from nerve.config_validate import main
+
+        config_dir = _cfg(tmp_path, "timezone: UTC\n")
+        assert main(["--config-dir", str(config_dir)]) == 0
+        assert "Config OK" in capsys.readouterr().out
+
+    def test_main_bad_exit_one(self, tmp_path, capsys):
+        from nerve.config_validate import main
+
+        config_dir = _cfg(tmp_path, "agent:\n  backend: bogus\n")
+        assert main(["--config-dir", str(config_dir)]) == 1
+        assert "[ERR]" in capsys.readouterr().out
+
+    def test_main_strict_keys_flag(self, tmp_path):
+        from nerve.config_validate import main
+
+        config_dir = _cfg(tmp_path, "tiimezone: UTC\n")
+        assert main(["--config-dir", str(config_dir)]) == 0  # warning by default
+        assert main(["--config-dir", str(config_dir), "--strict-keys"]) == 1
+
+    def test_main_workspace_override(self, tmp_path, capsys):
+        """--workspace . is how CI points at the checked-out config repo."""
+        from nerve.config_validate import main
+
+        ws = tmp_path / "configrepo"
+        (ws / "config" / "cron").mkdir(parents=True)
+        (ws / "config" / "settings.yaml").write_text("timezone: UTC\n", "utf-8")
+        (ws / "config" / "cron" / "jobs.yaml").write_text(
+            "jobs:\n  - id: j\n    schedule: '0 6 * * *'\n    prompt: hi\n", "utf-8"
+        )
+        assert main(["--config-dir", str(_cfg(tmp_path)), "--workspace", str(ws)]) == 0
+        assert "1 job(s)" in capsys.readouterr().out
+
+    def test_agrees_with_cli(self, tmp_path, capsys):
+        """Both entry points share render_result, so their text must match."""
+        from click.testing import CliRunner
+
+        from nerve.cli import main as cli_main
+        from nerve.config_validate import main
+
+        config_dir = _cfg(tmp_path, "agent:\n  backend: bogus\n")
+        code = main(["--config-dir", str(config_dir)])
+        standalone = capsys.readouterr().out
+
+        cli = CliRunner().invoke(
+            cli_main, ["-c", str(config_dir), "config", "validate"],
+            color=False,
+        )
+        assert code != 0 and cli.exit_code != 0
+        assert standalone.strip() == cli.output.strip()
+
+    def test_main_portable_only_flag(self, tmp_path, capsys):
+        """The scaffolded CI workflow passes it, so this parser has to take it —
+        without it CI silently overlays whatever config the runner has."""
+        from nerve.config_validate import main
+
+        ws = tmp_path / "ws"
+        _settings(ws, "agent:\n  backend: bogus\n")
+        config_dir = _cfg(tmp_path, "agent:\n  backend: claude\n", workspace=ws)
+        args = ["--config-dir", str(config_dir), "--workspace", str(ws)]
+
+        assert main(args) == 0  # the machine layer masks the shared error
+        capsys.readouterr()
+        assert main([*args, "--portable-only"]) == 1
+        assert "bogus" in capsys.readouterr().out
+
+    def test_main_assume_lockdown_flag(self, tmp_path, capsys):
+        from nerve.config_validate import main
+
+        ws = tmp_path / "ws"
+        _settings(ws, "lockdown: ${NERVE_LOCKDOWN:-false}\n")
+        args = ["--config-dir", str(_cfg(tmp_path, workspace=ws)),
+                "--workspace", str(ws)]
+
+        # A locked-only error to have something to catch: the tracked subtree is a
+        # symlink out of the workspace, so nothing under it is part of the repo.
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        (outside / "settings.yaml").write_text(
+            "lockdown: ${NERVE_LOCKDOWN:-false}\n", encoding="utf-8",
+        )
+        (ws / "config").rename(tmp_path / "discarded")
+        (ws / "config").symlink_to(outside)
+
+        assert main(args) == 0  # unlocked here, so the lockdown checks don't run
+        capsys.readouterr()
+        assert main([*args, "--assume-lockdown"]) == 1
+        assert "outside the workspace" in capsys.readouterr().out
+
+    def test_flag_set_matches_the_cli(self):
+        """Same flags, not just the same output.
+
+        The docs recommend one invocation for CI, and CI runs it through this
+        parser. A flag the Click command grew and this one didn't is an
+        invocation the config repo cannot run — which is how the workflow ended
+        up validating with the runner's machine config merged in.
+        """
+        from nerve.cli import config_validate, main as cli_main
+        from nerve.config_validate import _build_parser
+
+        def _long_opts(params) -> set[str]:
+            return {
+                opt for p in params for opt in getattr(p, "opts", [])
+                if opt.startswith("--")
+            }
+
+        standalone = {
+            opt for action in _build_parser()._actions
+            for opt in action.option_strings if opt.startswith("--")
+        } - {"--help"}
+
+        command = _long_opts(config_validate.params)
+        assert command <= standalone, (
+            f"`nerve config validate` accepts {sorted(command - standalone)} and "
+            f"`python -m nerve.config_validate` does not"
+        )
+        # The reverse, allowing for what the CLI takes on the group instead.
+        group = _long_opts(cli_main.params)
+        assert standalone <= command | group, (
+            f"only the standalone entry point accepts "
+            f"{sorted(standalone - (command | group))}"
+        )
+
+    def test_imports_without_runtime_deps(self):
+        """The module chain must stay stdlib+PyYAML so CI needs no install.
+
+        A new top-level import of click/fastapi/boto3/... in this chain would
+        silently break the zero-install workflow; catch it here instead.
+        """
+        import subprocess
+        import sys
+
+        heavy = ["click", "fastapi", "apscheduler", "telethon", "boto3", "anthropic"]
+        code = (
+            "import sys\n"
+            "import nerve.config_validate as m\n"
+            "m.main\n"
+            f"leaked=[n for n in {heavy!r} if n in sys.modules]\n"
+            "print(','.join(leaked))\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True,
+        )
+        assert out.stdout.strip() == "", f"heavy imports leaked: {out.stdout.strip()}"

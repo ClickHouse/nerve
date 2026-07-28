@@ -1469,7 +1469,7 @@ def config_validate(
     portable_only: bool, assume_locked: bool,
 ) -> None:
     """Validate the configuration bundle. Non-zero exit on any error (CI-ready)."""
-    from nerve.config_validate import validate_config_bundle
+    from nerve.config_validate import render_result, validate_config_bundle
 
     config_dir = Path(ctx.obj["config_dir"])
     result = validate_config_bundle(
@@ -1477,17 +1477,90 @@ def config_validate(
         strict_env=strict_env, strict_keys=strict_keys,
         portable_only=portable_only, assume_locked=assume_locked,
     )
-    for msg in result.info:
-        click.echo(f"[info] {msg}")
-    for msg in result.warnings:
-        click.secho(f"[WARN] {msg}", fg="yellow")
-    for msg in result.errors:
-        click.secho(f"[ERR] {msg}", fg="red")
-    if result.ok:
-        click.secho("Config OK", fg="green")
-    else:
-        click.secho(f"Config invalid: {len(result.errors)} error(s)", fg="red")
+    # Same renderer as `python -m nerve.config_validate` (the no-install path),
+    # just colorized here.
+    lines, summary = render_result(result)
+    _SEVERITY_COLORS = {"[WARN]": "yellow", "[ERR]": "red"}
+    for line in lines:
+        click.secho(line, fg=_SEVERITY_COLORS.get(line.split(" ", 1)[0]))
+    click.secho(summary, fg="green" if result.ok else "red")
+    if not result.ok:
         ctx.exit(1)
+
+
+@config_group.command("init-repo")
+@click.option(
+    "--workspace", "workspace", type=click.Path(), default=None,
+    help="Workspace to scaffold (default: the resolved workspace).",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be created without writing.",
+)
+@click.pass_context
+def config_init_repo(
+    ctx: click.Context, workspace: str | None, dry_run: bool,
+) -> None:
+    """Scaffold the workspace into a shareable git config repo.
+
+    Drops a CI validation workflow, a secrets-aware .gitignore, and a README into
+    the workspace (never overwriting existing files), then prints the remaining
+    git/gh and instance-config steps. Safe to re-run.
+    """
+    from nerve.config_repo import scaffold_config_repo
+
+    if workspace:
+        ws = Path(workspace).expanduser()
+    else:
+        config = ctx.obj["config"]
+        if config is None:
+            raise click.ClickException(
+                "Config could not be loaded; pass --workspace or run 'nerve doctor'."
+            )
+        ws = Path(config.workspace)
+
+    if not ws.is_dir():
+        raise click.ClickException(f"Workspace does not exist: {ws}")
+
+    result = scaffold_config_repo(ws, dry_run=dry_run)
+
+    verb = "Would create" if dry_run else "Created"
+    for rel in result.created:
+        click.secho(f"  {verb}: {rel}", fg="green")
+    for rel in result.skipped:
+        click.secho(f"  Skipped (exists): {rel}", fg="yellow")
+    if not result.created:
+        click.echo("Config-repo scaffold already in place — nothing to create.")
+
+    # Remaining steps the CLI can't do for you (they need a repo URL + auth).
+    click.secho("\nNext steps:", bold=True)
+    click.echo(f"  cd {ws}")
+    if not result.is_git_repo:
+        click.echo("  git init && git add -A && git commit -m 'Initial Nerve config'")
+    else:
+        click.echo("  git add -A && git commit -m 'Add config-repo scaffold'")
+    click.echo(
+        "  gh repo create <org>/nerve-config --private --source=. "
+        "--remote=origin --push"
+    )
+    click.echo(
+        "\nCI validates every PR out of the box (no secrets needed) — see\n"
+        ".github/workflows/validate-config.yml. It installs nerve from the\n"
+        "default branch, which stays at or ahead of this instance; append a ref\n"
+        "to that install line to check against one release instead."
+    )
+    click.echo(
+        "\nOn the instance, enable sync in workspace/config/settings.yaml:\n"
+        "  workspace_sync:\n"
+        "    enabled: true\n"
+        "    branch: main\n"
+        "    interval_minutes: 5\n"
+        "Then verify — the same check CI runs, so a pass here means a green PR:\n"
+        f"  nerve config validate --workspace {ws} --portable-only --strict-keys\n"
+        "Drop --portable-only to include this machine's config.yaml and\n"
+        "config.local.yaml, i.e. what the daemon itself loads.\n"
+        "When ready to lock down, set 'lockdown: true' in settings.yaml (move\n"
+        "secrets to ${ENV_VAR} first — see docs/config.md)."
+    )
 
 
 @main.group()

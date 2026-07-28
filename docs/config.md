@@ -156,12 +156,16 @@ the quietest, because nothing reads it.
 `--portable-only` judges the tracked `<workspace>/config/settings.yaml` layer on
 its own. Use it for a change headed to a shared repo: a local override can
 otherwise mask an invalid shared value, and, more often, a broken local file can
-fail a shared bundle that has nothing wrong with it. Pass `--workspace` with it,
-because with the machine layers dropped there is nothing left to read the
-workspace location from and it falls back to the default tree. It fails outright
-if it opened no file under the workspace's `config/`, so an empty directory, a
-`settings.yml` typo or a `settings.yaml` left at the repo root cannot pass as
-clean. Every run names the layers it read, in absolute paths:
+fail a shared bundle that has nothing wrong with it. Cron is covered too. A
+workspace carrying no jobs normally falls back to the machine-local
+`~/.nerve/cron`, which is right for an un-migrated install but wrong here, so under
+`--portable-only` only the repo's own `config/cron/` counts and anything skipped is
+named in the report. Pass `--workspace` as well, because with the machine layers
+dropped there is nothing left to read the workspace location from and it falls back
+to the default tree. It fails outright if it opened no file under the workspace's
+`config/`, so an empty directory, a `settings.yml` typo or a `settings.yaml` left
+at the repo root cannot pass as clean. Every run names the layers it read, in
+absolute paths:
 
 ```
 [info] portable layer: /home/you/config-repo/config/settings.yaml
@@ -182,10 +186,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       # nerve is not published to PyPI: the bare name is an unrelated project.
       - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
-      - run: nerve config validate --workspace . --portable-only --strict-keys
       # Add --assume-lockdown if any instance served by this repo is locked and
       # the flag comes from the environment. Without it CI checks the unlocked
       # view and the lockdown checks never run. See "Lockdown" below.
+      - run: nerve config validate --workspace . --portable-only --strict-keys
 ```
 
 Installing from the default branch keeps the validator at or ahead of your
@@ -194,6 +198,11 @@ knows every key your instance reads. A key the validator accepts but the instanc
 is too old to read shows up as a startup warning on the instance and in `nerve
 doctor`. If a key is ever retired upstream, `--strict-keys` flags it here first;
 drop the key, or install the ref you deploy (`nerve @ git+...@v1.2.3`) instead.
+
+`nerve config init-repo` scaffolds this workflow, plus a
+[gitleaks](https://github.com/gitleaks/gitleaks) scan ahead of it to catch a
+credential pasted into a tracked file. See [Setting up the config
+repo](#setting-up-the-config-repo) for the generated file and the end-to-end setup.
 
 ## Hot-Reload
 
@@ -329,6 +338,140 @@ reports it too. `status` is the field to branch on:
 
 It describes *this call*. Whether the daemon is running the revision currently on
 disk is a different question, answered by `GET /api/config/sync` below.
+
+## Setting up the config repo
+
+The workspace *is* the config repo: its root holds `config/` (settings, cron) and
+`skills/`. To put it under review and sync it to an instance, turn the workspace
+into a git repo with a GitHub remote, add CI validation, and optionally enable
+lockdown.
+
+**1. Scaffold the repo files.** From the instance, or anywhere the workspace is
+checked out:
+
+```bash
+nerve config init-repo                       # scaffolds into the resolved workspace
+nerve config init-repo --workspace ./ws      # or an explicit path; --dry-run to preview
+```
+
+This writes four files, never overwriting an existing one:
+
+- `.github/workflows/validate-config.yml`: the CI check, shown below.
+- `.gitignore`: keeps `config.local.yaml`, `.env`, `*.migrated`, databases and the
+  like out of the shared repo. Secrets belong in the environment, referenced as
+  `${ENV_VAR}`.
+- `README.md`: a short explainer of the PR-based flow.
+- `config/settings.yaml`: the commented portable settings scaffold, if the
+  workspace has none. An instance's workspace already has one; a bare directory
+  does not, and the CI check fails a repo with no `config/` at all rather than
+  passing it.
+
+**2. Create the GitHub repo and push.** The command prints these rather than
+running them, since they need a repo name and auth:
+
+```bash
+cd <workspace>
+git init && git add -A && git commit -m "Initial Nerve config"
+gh repo create <org>/nerve-config --private --source=. --remote=origin --push
+```
+
+**3. CI validation.** The scaffolded workflow scans for committed secrets and
+validates the bundle on every PR. It needs no secrets or tokens of its own, since
+`ClickHouse/nerve` is public:
+
+```yaml
+name: validate-config
+
+# Validates the Nerve config bundle on every PR so a broken change can't be
+# merged and then synced onto a live instance. See docs/config.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Backstop for the one thing review is worst at spotting: a credential
+      # pasted into a tracked file. Secrets belong in the environment and are
+      # referenced from settings.yaml as ${ENV_VAR}. Runs before anything else
+      # is fetched, so it scans this repo and nothing else, and needs no token
+      # of its own. The image is used directly because the marketplace action
+      # asks organizations for a license key.
+      #
+      # The tag is pinned because an argument renamed in a later gitleaks would
+      # fail every config repo at once, with no pull request anywhere to explain
+      # it. (From 8.19 this subcommand is spelled `gitleaks dir <path>`; bump the
+      # tag and the args together.) A false positive on a high-entropy string is
+      # silenced with a trailing `# gitleaks:allow`, or repo-wide in a
+      # .gitleaks.toml.
+      - name: Scan for committed secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.18.4
+        with:
+          args: detect --no-git --source=/github/workspace --redact
+
+      # nerve is not published to PyPI, so this installs from git; the bare name
+      # would fetch an unrelated project. Tracking the default branch keeps the
+      # validator at or ahead of the instance, which is the safe direction for
+      # --strict-keys below: a newer validator knows every key the instance
+      # reads. To check against one release instead, append a ref (nerve@v1.2.3).
+      - uses: astral-sh/setup-uv@v6
+      - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
+
+      # The config repo root IS the workspace (it holds config/ and skills/).
+      #
+      # --portable-only judges the tracked bundle on its own: no machine-local
+      # config.yaml, and no falling back to a machine-local cron directory when
+      # this repo carries no jobs. It fails outright if it opened no file under
+      # config/ at all, so a layout mistake cannot pass as clean.
+      # --strict-keys makes a misspelled key block the PR rather than warn.
+      #
+      # Unset ${ENV_VAR} secret refs are reported as info (CI has no secrets);
+      # add --strict-env to require them. If any instance served by this repo is
+      # locked through ${NERVE_LOCKDOWN}, add --assume-lockdown as well, or CI
+      # only ever checks the unlocked view that instance never loads.
+      - name: Validate config bundle
+        run: nerve config validate --workspace . --portable-only --strict-keys
+```
+
+That is the file verbatim, comments included, because they explain each flag where
+the person editing it will be looking. The command is the same one you can run
+locally, so a local `nerve config validate --workspace . --portable-only
+--strict-keys` gives the verdict CI will. Note that the *config* repo is private;
+only nerve itself is public.
+
+`init-repo` never overwrites an existing workflow, so a repo scaffolded earlier
+keeps whatever it has; compare it against the file above after a nerve upgrade.
+
+Gate plugins need nothing installed here: validation never loads them (see
+[Validating Configuration](#validating-configuration)), so their imports are never
+resolved in CI.
+
+**4. Point the instance at the remote and enable sync.** The workspace is already
+a git clone of the repo, so the remote and credentials come from git itself. Turn
+on periodic pulls in `workspace/config/settings.yaml`:
+
+```yaml
+workspace_sync:
+  enabled: true
+  branch: main
+  interval_minutes: 5
+```
+
+**5. Optionally lock it down.** Once secrets are in the environment as `${ENV_VAR}`
+refs, set `lockdown: true` in `settings.yaml` so the instance only ever runs the
+reviewed, merged remote. See [Lockdown](#lockdown-remote-only-read-only).
+
+From here the loop is: open a PR, CI validates, review and merge, the instance
+syncs and reloads. The agent proposes its own changes the same way, through the
+`nerve-workspace` skill.
 
 ## Git-Backed Workspace Sync
 
