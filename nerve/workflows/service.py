@@ -71,7 +71,10 @@ ENGINE_CODEX = "codex-ultracode"
 ENGINE_BACKENDS = {ENGINE_CLAUDE: "claude", ENGINE_CODEX: "codex"}
 
 # Spec keys accepted by start_run; everything else is dropped.
-_SPEC_KEYS = {"prompt", "model", "effort", "cwd"}
+_SPEC_KEYS = {"prompt", "model", "effort", "cwd", "sandbox"}
+
+# Valid per-run sandbox overrides (codex sessions only; claude ignores it).
+_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 # Cap stored result/error text.
 _RESULT_MAX = 4000
@@ -113,6 +116,10 @@ class WorkflowRunService:
         # spawned) during teardown, only to die with the process.
         self._stopping = False
         self._stop_listener_registered = False
+        # Run-completion listeners, invoked (awaited, exception-isolated)
+        # from _finalize_terminal with the fresh terminal run row. Listeners
+        # must hand off quickly (enqueue) — never start work inline.
+        self._completion_listeners: list[Any] = []
 
     # ------------------------------------------------------------------ #
     #  Lifespan                                                           #
@@ -140,11 +147,14 @@ class WorkflowRunService:
                     })
                     self._write_run_json(fresh)
                     await self._broadcast(fresh)
-        if orphaned:
-            ids = ", ".join(r["id"] for r in orphaned)
+        loud = [r for r in orphaned if not self._is_quiet(r)]
+        if loud:
+            # Loop-owned legs are excluded: the review-loop recovery pass
+            # owns their restart story (auto re-issue / escalation).
+            ids = ", ".join(r["id"] for r in loud)
             await self._notify(
                 "Workflow runs interrupted by restart",
-                f"{len(orphaned)} active workflow run(s) were marked failed "
+                f"{len(loud)} active workflow run(s) were marked failed "
                 f"after a Nerve restart: {ids}. Their sessions did not "
                 "survive the restart; restart them explicitly if still needed.",
                 priority="high",
@@ -175,6 +185,21 @@ class WorkflowRunService:
     def runs_dir(self) -> Path:
         return Path(self.config.workflows.runs_dir).expanduser()
 
+    def add_completion_listener(self, callback: Any) -> None:
+        """Register an async callable invoked with the fresh run row every
+        time a run reaches a terminal status through the live service
+        (_finalize_terminal). NOT invoked by the restart-recovery pass —
+        consumers own their own recovery. Idempotent per callback."""
+        if callback not in self._completion_listeners:
+            self._completion_listeners.append(callback)
+
+    def remove_completion_listener(self, callback: Any) -> None:
+        """Unregister a completion listener (consumer failed to start)."""
+        try:
+            self._completion_listeners.remove(callback)
+        except ValueError:
+            pass
+
     async def start_run(
         self,
         engine_kind: str,
@@ -182,8 +207,13 @@ class WorkflowRunService:
         budget_usd: float | None,
         title: str = "",
         created_by: str = "user",
+        run_id: str | None = None,
     ) -> dict:
-        """Validate, persist, journal, and (slots permitting) dispatch."""
+        """Validate, persist, journal, and (slots permitting) dispatch.
+
+        ``run_id`` lets a controller pre-generate the id and persist its own
+        intent row before dispatch (the review-loop outbox pattern). A reused
+        id is a caller error and raises."""
         if engine_kind not in ENGINE_BACKENDS:
             raise WorkflowRunError(
                 f"unknown engine {engine_kind!r} — expected one of: "
@@ -203,6 +233,18 @@ class WorkflowRunService:
             if not cwd.is_dir():
                 raise WorkflowRunError(f"cwd is not a directory: {cwd}")
             spec["cwd"] = str(cwd)
+        if spec.get("sandbox"):
+            sandbox = str(spec["sandbox"])
+            if sandbox not in _SANDBOX_MODES:
+                raise WorkflowRunError(
+                    f"spec.sandbox must be one of {_SANDBOX_MODES}, got {sandbox!r}"
+                )
+            if engine_kind != ENGINE_CODEX:
+                # Claude sessions have no sandbox knob — drop silently would
+                # hide a config mistake; fail loud instead.
+                raise WorkflowRunError(
+                    "spec.sandbox is only supported for codex-ultracode runs"
+                )
 
         try:
             budget = float(budget_usd) if budget_usd is not None else None
@@ -233,18 +275,23 @@ class WorkflowRunService:
                     "pick a priced model."
                 )
 
-        run_id = f"wfr-{uuid.uuid4().hex[:8]}"
+        run_id = str(run_id or "").strip() or f"wfr-{uuid.uuid4().hex[:8]}"
         journal_dir = self.runs_dir() / run_id
         try:
             journal_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as e:
             raise WorkflowRunError(f"cannot create journal dir: {e}") from e
 
-        run = await self.db.create_workflow_run(
-            run_id, engine_kind, spec, budget,
-            title=title.strip(), created_by=created_by,
-            journal_dir=str(journal_dir),
-        )
+        try:
+            run = await self.db.create_workflow_run(
+                run_id, engine_kind, spec, budget,
+                title=title.strip(), created_by=created_by,
+                journal_dir=str(journal_dir),
+            )
+        except Exception as e:
+            if "UNIQUE" in str(e) or "unique" in str(e):
+                raise WorkflowRunError(f"run id already exists: {run_id}") from e
+            raise
         self._journal_event(run, "created", {
             "engine": engine_kind, "budget_usd": budget,
             "created_by": created_by,
@@ -398,11 +445,17 @@ class WorkflowRunService:
         backend = ENGINE_BACKENDS[run["engine"]]
         spec = run["spec"]
         model = str(spec.get("model") or "") or self._default_model(backend)
+        metadata = None
+        if backend == "codex" and spec.get("sandbox"):
+            # Per-leg sandbox override, read at codex client build
+            # (SessionSpec.extra["sandbox"] beats the global codex.sandbox).
+            metadata = {"codex_sandbox": str(spec["sandbox"])}
         try:
             await self.engine.sessions.get_or_create(
                 session_id,
                 title=f"Workflow: {run.get('title') or run_id}",
                 source="workflow",
+                metadata=metadata,
                 backend=backend,
                 model=model,
                 cwd=spec.get("cwd") or None,
@@ -434,15 +487,33 @@ class WorkflowRunService:
                 return
 
             # Background tasks inside the CLI (run_in_background Bash /
-            # Agent / Workflow) keep spending after the turn returns. Keep
-            # the run 'running' — metered and budget-killable — until the
-            # session is quiescent.
+            # Agent / Workflow) keep spending after the turn returns, and
+            # their completion re-invokes the session with a follow-up
+            # auto-turn that carries the REAL final text. Keep the run
+            # 'running' — metered and budget-killable — until the session is
+            # fully quiescent: background tasks drained, auto-turns finished,
+            # plus a short settle grace for the bg-done → auto-turn-spawn gap.
             waited_bg = False
-            while self.engine.has_live_background_tasks(session_id):
-                if not waited_bg:
-                    waited_bg = True
-                    self._journal_event(run, "waiting_background", {})
+            grace_left = 2
+            while True:
+                busy = (
+                    self.engine.has_live_background_tasks(session_id)
+                    or self.engine.is_session_running(session_id)
+                )
+                if busy:
+                    if not waited_bg:
+                        waited_bg = True
+                        self._journal_event(run, "waiting_background", {})
+                    grace_left = 2
+                elif not waited_bg:
+                    break  # plain single-turn run — nothing pending
+                elif grace_left > 0:
+                    grace_left -= 1
+                else:
+                    break
                 await asyncio.sleep(
+                    min(3, max(1, int(self.config.workflows.poll_interval_seconds)))
+                    if not busy else
                     min(15, max(2, int(self.config.workflows.poll_interval_seconds)))
                 )
                 fresh = await self.db.get_workflow_run(run_id)
@@ -466,7 +537,7 @@ class WorkflowRunService:
                     await self._finalize_terminal(
                         run_id, to_status, {"reason": f"session {session_status}"},
                     )
-                    if to_status == "failed":
+                    if to_status == "failed" and not self._is_quiet(run):
                         await self._notify(
                             f"Workflow run {run_id} failed",
                             f"{run.get('title') or run['engine']}: session "
@@ -476,26 +547,41 @@ class WorkflowRunService:
                 return
 
             await self._refresh_spend(run_id, final=True)
+            result_text = response or ""
+            if waited_bg:
+                # A background-orchestrating run's final text lands in the
+                # follow-up auto-turn, NOT in engine.run's return (which
+                # holds only the pre-background text). The session's newest
+                # assistant message is the authoritative final output.
+                try:
+                    messages = await self.db.get_messages(session_id, limit=50)
+                    for msg in reversed(messages):
+                        if msg.get("role") == "assistant" and str(msg.get("content") or "").strip():
+                            result_text = str(msg["content"])
+                            break
+                except Exception:  # noqa: BLE001 — fall back to turn text
+                    logger.exception("post-background result read failed for %s", run_id)
             flipped = await self.db.transition_workflow_run(
                 run_id, "done", expect=("running",),
-                result=(response or "")[-_RESULT_MAX:],
+                result=result_text[-_RESULT_MAX:],
             )
             if flipped:
-                self._write_result(run, response or "")
+                self._write_result(run, result_text)
                 await self._finalize_terminal(run_id, "done", {})
                 fresh = await self.db.get_workflow_run(run_id)
                 spent = (fresh or {}).get("spent_usd") or 0.0
                 budget = (fresh or {}).get("budget_usd")
                 budget_txt = f" of ${budget:.2f} budget" if budget else ""
-                snippet = " ".join((response or "").split())
+                snippet = " ".join(result_text.split())
                 if len(snippet) > 300:
                     snippet = snippet[:300] + "…"
-                await self._notify(
-                    f"Workflow run {run_id} finished",
-                    f"{run.get('title') or run['engine']} — spent "
-                    f"${spent:.2f}{budget_txt}. Session: {session_id}"
-                    + (f"\n\n{snippet}" if snippet else ""),
-                )
+                if not self._is_quiet(run):
+                    await self._notify(
+                        f"Workflow run {run_id} finished",
+                        f"{run.get('title') or run['engine']} — spent "
+                        f"${spent:.2f}{budget_txt}. Session: {session_id}"
+                        + (f"\n\n{snippet}" if snippet else ""),
+                    )
         except asyncio.CancelledError:
             # Backstop only: the stop listener / kill paths CAS the row
             # terminal before cancelling us, so this usually no-ops.
@@ -519,11 +605,12 @@ class WorkflowRunService:
             )
             if flipped:
                 await self._finalize_terminal(run_id, "failed", {"error": str(e)[:500]})
-                await self._notify(
-                    f"Workflow run {run_id} failed",
-                    f"{run.get('title') or run['engine']}: {str(e)[:500]}",
-                    priority="high",
-                )
+                if not self._is_quiet(run):
+                    await self._notify(
+                        f"Workflow run {run_id} failed",
+                        f"{run.get('title') or run['engine']}: {str(e)[:500]}",
+                        priority="high",
+                    )
         finally:
             self._exec_tasks.pop(run_id, None)
             self._codex_live_base.pop(run_id, None)
@@ -560,9 +647,30 @@ class WorkflowRunService:
         run = await self.db.get_workflow_run(run_id)
         if run is None:
             return
+        # Belt-and-braces vs budget escape: any wakeup a leg managed to
+        # schedule must die with the run (a cron-fired wakeup would execute
+        # after terminal, unmetered). schedule_wakeup also rejects workflow
+        # sessions outright; this covers rows created before that guard.
+        try:
+            await self.db.cancel_wakeups_for_session(self._session_id(run_id))
+        except Exception:  # noqa: BLE001
+            logger.debug("wakeup cancellation failed for %s", run_id, exc_info=True)
         self._journal_event(run, status, detail)
         self._write_run_json(run)
         await self._broadcast(run)
+        for listener in list(self._completion_listeners):
+            try:
+                await listener(run)
+            except Exception:  # noqa: BLE001 — listeners never break run paths
+                logger.exception(
+                    "workflow run completion listener failed for %s", run_id,
+                )
+
+    @staticmethod
+    def _is_quiet(run: dict | None) -> bool:
+        """Loop-owned legs are reported by their controller, not per-run
+        notifications (a 3-iteration loop would otherwise ping 6-8 times)."""
+        return str((run or {}).get("created_by") or "").startswith("review-loop:")
 
     # ------------------------------------------------------------------ #
     #  Budget monitor                                                     #
@@ -601,13 +709,14 @@ class WorkflowRunService:
                 self._journal_event(run, "budget_warning", {
                     "spent_usd": spent, "budget_usd": budget,
                 })
-                await self._notify(
-                    f"Workflow run {run['id']} at "
-                    f"{int(frac * 100)}% of budget",
-                    f"{run.get('title') or run['engine']} — ${spent:.2f} of "
-                    f"${budget:.2f}. It will be stopped at 100%.",
-                    priority="high",
-                )
+                if not self._is_quiet(run):
+                    await self._notify(
+                        f"Workflow run {run['id']} at "
+                        f"{int(frac * 100)}% of budget",
+                        f"{run.get('title') or run['engine']} — ${spent:.2f} of "
+                        f"${budget:.2f}. It will be stopped at 100%.",
+                        priority="high",
+                    )
         await self._maybe_dispatch()
 
     async def _refresh_spend(self, run_id: str, final: bool = False) -> float:
@@ -755,13 +864,14 @@ class WorkflowRunService:
         await self._finalize_terminal(run["id"], "budget_exhausted", {
             "spent_usd": spent, "budget_usd": budget,
         })
-        await self._notify(
-            f"Workflow run {run['id']} stopped: budget exhausted",
-            f"{run.get('title') or run['engine']} hit its ${budget:.2f} "
-            f"budget (metered ${spent:.2f}). The run's session was stopped; "
-            f"partial results are in its journal: {run.get('journal_dir')}",
-            priority="high",
-        )
+        if not self._is_quiet(run):
+            await self._notify(
+                f"Workflow run {run['id']} stopped: budget exhausted",
+                f"{run.get('title') or run['engine']} hit its ${budget:.2f} "
+                f"budget (metered ${spent:.2f}). The run's session was stopped; "
+                f"partial results are in its journal: {run.get('journal_dir')}",
+                priority="high",
+            )
         self._spawn_enforcement(run["id"])
 
     def _spawn_detached(self, coro: Any, name: str) -> None:

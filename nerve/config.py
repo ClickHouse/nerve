@@ -637,6 +637,97 @@ class BackupConfig:
 
 
 @dataclass
+class ReviewLoopLegConfig:
+    """Engine/model/effort defaults for one review-loop role."""
+
+    engine: str = "claude-workflow"
+    model: str = ""    # "" = backend default (agent.model / codex.model)
+    effort: str = ""   # "" = source default
+
+    @classmethod
+    def from_dict(cls, d: dict, default_engine: str) -> ReviewLoopLegConfig:
+        engine = str(d.get("engine", default_engine))
+        if engine not in ("claude-workflow", "codex-ultracode"):
+            raise ValueError(
+                "review_loop leg engine must be 'claude-workflow' or "
+                f"'codex-ultracode', got {engine!r}"
+            )
+        return cls(
+            engine=engine,
+            model=str(d.get("model", "")),
+            effort=str(d.get("effort", "")),
+        )
+
+
+@dataclass
+class ReviewLoopConfig:
+    """Deterministic implement→verify loops composed of workflow runs.
+
+    An implementer leg works toward a Goal prompt; a verifier leg judges
+    the workspace against Verifier criteria and returns a structured
+    verdict; the server-side controller iterates until pass or caps
+    (iterations, dollars, no-progress). See docs/review-loops.md.
+    """
+
+    enabled: bool = True
+    implementer: ReviewLoopLegConfig = field(
+        default_factory=lambda: ReviewLoopLegConfig(engine="claude-workflow"),
+    )
+    # Cross-vendor verification by default: a different model family has
+    # decorrelated blind spots and no self-preference toward the
+    # implementer's work. Falls back to claude/claude when codex is not
+    # configured (checked at loop creation, not here).
+    verifier: ReviewLoopLegConfig = field(
+        default_factory=lambda: ReviewLoopLegConfig(engine="codex-ultracode"),
+    )
+    max_iterations: int = 3            # per-loop default; hard code ceiling 8
+    default_budget_usd: float = 10.0
+    min_leg_budget_usd: float = 0.5    # never start a leg with less than this
+    verifier_reserve_fraction: float = 0.15  # held back so the last attempt is always verified
+    criteria_adoption: str = "no"      # no | ask | auto (verifier-proposed criteria)
+    max_new_criteria_per_iteration: int = 3
+    max_discovered_criteria: int = 12
+    discovery_grace_rounds: int = 2
+    auto_reissue_implementer: bool = False  # restart recovery: re-issue interrupted implementer legs
+    escalation_reproposals: int = 2    # re-file expired/dismissed decision cards this many times
+    verifier_sandbox: str = "workspace-write"  # codex verifier legs (isolation vs test-writes)
+    reconcile_interval_seconds: int = 600
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ReviewLoopConfig:
+        adoption = d.get("criteria_adoption", "no")
+        if adoption is False:
+            adoption = "no"  # YAML parses an unquoted `no` as boolean False
+        adoption = str(adoption).lower()
+        if adoption not in ("no", "ask", "auto"):
+            raise ValueError(
+                "review_loop.criteria_adoption must be 'no', 'ask' or "
+                f"'auto', got {adoption!r}"
+            )
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            implementer=ReviewLoopLegConfig.from_dict(
+                d.get("implementer", {}) or {}, "claude-workflow",
+            ),
+            verifier=ReviewLoopLegConfig.from_dict(
+                d.get("verifier", {}) or {}, "codex-ultracode",
+            ),
+            max_iterations=int(d.get("max_iterations", 3)),
+            default_budget_usd=float(d.get("default_budget_usd", 10.0)),
+            min_leg_budget_usd=float(d.get("min_leg_budget_usd", 0.5)),
+            verifier_reserve_fraction=float(d.get("verifier_reserve_fraction", 0.15)),
+            criteria_adoption=adoption,
+            max_new_criteria_per_iteration=int(d.get("max_new_criteria_per_iteration", 3)),
+            max_discovered_criteria=int(d.get("max_discovered_criteria", 12)),
+            discovery_grace_rounds=int(d.get("discovery_grace_rounds", 2)),
+            auto_reissue_implementer=bool(d.get("auto_reissue_implementer", False)),
+            escalation_reproposals=int(d.get("escalation_reproposals", 2)),
+            verifier_sandbox=str(d.get("verifier_sandbox", "workspace-write")),
+            reconcile_interval_seconds=int(d.get("reconcile_interval_seconds", 600)),
+        )
+
+
+@dataclass
 class WorkflowRunsConfig:
     """Budget-capped multi-agent workflow runs.
 
@@ -664,6 +755,8 @@ class WorkflowRunsConfig:
     # Whether workflow_run_start may launch runs without a budget. Budget
     # enforcement is the point of this surface, so default is False.
     allow_unbudgeted: bool = False
+    # Review loops (implement→verify cycles) — nested feature config.
+    review_loop: ReviewLoopConfig = field(default_factory=ReviewLoopConfig)
 
     @classmethod
     def from_dict(cls, d: dict) -> WorkflowRunsConfig:
@@ -676,6 +769,7 @@ class WorkflowRunsConfig:
             kill_grace_seconds=int(d.get("kill_grace_seconds", 30)),
             max_concurrent_runs=int(d.get("max_concurrent_runs", 2)),
             allow_unbudgeted=bool(d.get("allow_unbudgeted", False)),
+            review_loop=ReviewLoopConfig.from_dict(d.get("review_loop", {}) or {}),
         )
 
 

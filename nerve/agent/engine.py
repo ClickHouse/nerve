@@ -1166,6 +1166,35 @@ class AgentEngine:
                 excluded_tools=backend.excluded_tools(),
             )
 
+            # Observer sessions of a review loop get a context block so the
+            # session's assistant knows its loop from turn one — the
+            # controller's milestone rows are UI-only (outside the native
+            # transcript), so without this the assistant is loop-blind.
+            # Status is as-of client build; the tools provide live state.
+            review_loop_id = session_meta.get("review_loop_id")
+            if review_loop_id:
+                try:
+                    rl = await self.db.get_review_loop(str(review_loop_id))
+                except Exception:  # noqa: BLE001 — context enrichment only
+                    rl = None
+                if rl:
+                    system_prompt += (
+                        "\n\n# Review Loop (observer session)\n"
+                        f"This chat is the observer of review loop {rl['id']} — "
+                        f"\"{rl.get('title') or ''}\" (status {rl['status']} as of "
+                        f"session start, iteration {rl.get('iteration')}/"
+                        f"{rl.get('max_iterations')}, workspace {rl.get('cwd')}).\n"
+                        "- The loop milestone cards in this chat are controller-"
+                        "written status updates, not your messages.\n"
+                        "- For LIVE state, criteria, and the attempt ledger call "
+                        "review_loop_status — it defaults to this session's loop.\n"
+                        "- Artifacts: the implementer's handoff file is "
+                        f"{rl.get('cwd')}/.nerve-review/{rl['id']}/STATE.md; leg "
+                        "transcripts are the sessions named workflow:<run-id>.\n"
+                        "- While the loop is implementing/verifying, do NOT edit "
+                        "files in its workspace — you would race the running leg."
+                    )
+
             async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
                 return await self._record_wakeup(self.db, sid, tool_input)
 
@@ -1188,6 +1217,12 @@ class AgentEngine:
                 cache_ttl=cache_ttl,
                 max_turns=self.config.agent.max_turns,
                 idle_timeout=float(self.config.agent.cli_idle_timeout_seconds),
+                extra=(
+                    # Per-session codex sandbox override (review-loop verifier
+                    # legs run workspace-write instead of the global default).
+                    {"sandbox": str(session_meta.get("codex_sandbox"))}
+                    if session_meta.get("codex_sandbox") else {}
+                ),
             )
 
             client = await backend.create_client(spec)

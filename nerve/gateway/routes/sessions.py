@@ -54,6 +54,24 @@ class MessageResponse(BaseModel):
     session_id: str
 
 
+class ReviewLoopLegRequest(BaseModel):
+    engine: str | None = None   # "claude-workflow" | "codex-ultracode"
+    model: str | None = None
+    effort: str | None = None
+
+
+class ReviewLoopRequest(BaseModel):
+    """Per-session review-loop config (see docs/review-loops.md)."""
+
+    goal: str
+    verifier: str
+    budget_usd: float | None = None
+    max_iterations: int | None = None
+    criteria_adoption: str | None = None  # no | ask | auto
+    implementer: ReviewLoopLegRequest | None = None
+    verifier_leg: ReviewLoopLegRequest | None = None
+
+
 class SessionCreateRequest(BaseModel):
     title: str | None = None
     source: str = "web"
@@ -61,6 +79,9 @@ class SessionCreateRequest(BaseModel):
     # immediately; metadata keeps the override only for old readers.
     backend: str | None = None
     cwd: str | None = None
+    # Optional review loop attached at creation: this session becomes the
+    # loop's observer (milestones land here; cwd is the shared workspace).
+    review_loop: ReviewLoopRequest | None = None
 
 
 class ForkRequest(BaseModel):
@@ -71,6 +92,42 @@ class ForkRequest(BaseModel):
 
 # --- Session endpoints ---
 
+def _loop_summary(lp: dict) -> dict:
+    return {
+        "id": lp["id"],
+        "status": lp["status"],
+        "iteration": lp.get("iteration"),
+        "max_iterations": lp.get("max_iterations"),
+        "failure_reason": lp.get("failure_reason"),
+        "budget_usd": lp.get("budget_usd"),
+        "spent_usd": lp.get("spent_usd"),
+        "updated_at": lp.get("updated_at"),
+    }
+
+
+async def _attach_review_loops(deps, sessions: list[dict]) -> None:
+    """Stamp each observer session with its newest loop's summary — the
+    sidebar icon, status dot, and header chip rehydrate from this (the
+    review_loop_update WS event only covers the live tab)."""
+    try:
+        from nerve.workflows import get_review_loop_service
+
+        if get_review_loop_service() is None:
+            return
+        loops = await deps.db.list_review_loops(limit=100)
+    except Exception:  # noqa: BLE001 — enrichment must never break listing
+        return
+    newest: dict[str, dict] = {}
+    for lp in loops:  # newest first
+        sid = lp.get("session_id")
+        if sid and sid not in newest:
+            newest[sid] = lp
+    for s in sessions:
+        lp = newest.get(s["id"])
+        if lp:
+            s["review_loop"] = _loop_summary(lp)
+
+
 @router.get("/api/sessions")
 async def list_sessions(user: dict = Depends(require_auth)):
     deps = get_deps()
@@ -80,6 +137,7 @@ async def list_sessions(user: dict = Depends(require_auth)):
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
+    await _attach_review_loops(deps, sessions)
     return {"sessions": sessions}
 
 
@@ -95,6 +153,7 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
+    await _attach_review_loops(deps, sessions)
     return {"sessions": sessions}
 
 
@@ -133,6 +192,58 @@ async def create_session(req: SessionCreateRequest, user: dict = Depends(require
         session_id, title=req.title, source=req.source, metadata=metadata,
         backend=backend, model=model, cwd=cwd,
     )
+    if req.review_loop is not None:
+        session = await _attach_review_loop(deps, session, session_id, cwd, req)
+    return session
+
+
+async def _attach_review_loop(deps, session: dict, session_id: str, cwd: str, req: SessionCreateRequest) -> dict:
+    """Create the review loop for a freshly created observer session. A
+    rejected loop config rolls the session back — no stray empty sessions."""
+    from nerve.workflows import get_review_loop_service
+    from nerve.workflows.review_loop import ReviewLoopError
+
+    service = get_review_loop_service()
+    if service is None:
+        await deps.db.delete_session(session_id)
+        raise HTTPException(
+            status_code=503,
+            detail="review loops are disabled (workflows.review_loop.enabled)",
+        )
+    rl = req.review_loop
+    try:
+        loop = await service.create_loop(
+            goal=rl.goal,
+            verifier=rl.verifier,
+            session_id=session_id,
+            cwd=cwd,
+            title=req.title or "",
+            budget_usd=rl.budget_usd,
+            max_iterations=rl.max_iterations,
+            criteria_adoption=rl.criteria_adoption,
+            implementer=(
+                rl.implementer.model_dump(exclude_none=True)
+                if rl.implementer else None
+            ),
+            verifier_leg=(
+                rl.verifier_leg.model_dump(exclude_none=True)
+                if rl.verifier_leg else None
+            ),
+            created_by=f"session:{session_id}",
+        )
+    except ReviewLoopError as e:
+        await deps.db.delete_session(session_id)
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        meta = json.loads(session.get("metadata") or "{}")
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["review_loop_id"] = loop["id"]
+        await deps.db.update_session_metadata(session_id, meta)
+    except Exception:  # noqa: BLE001 — pointer metadata is best-effort
+        logger.warning("review_loop_id metadata stamp failed for %s", session_id)
+    session = dict(session)
+    session["review_loop_id"] = loop["id"]
     return session
 
 

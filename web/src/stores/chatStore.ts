@@ -11,7 +11,7 @@ import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
-import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage } from './handlers/sessionHandlers';
+import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
 
@@ -35,6 +35,31 @@ export interface CCTask {
   owner?: string;
   blockedBy?: string[];
 }
+
+/**
+ * Review-loop config drafted in the new-chat composer panel. Form-shaped
+ * (strings for numeric fields); converted to the wire payload at session
+ * materialization (ensureRealSession). Must live in the store — not in
+ * ChatInput state — because ensureRealSession has TWO call sites
+ * (sendMessage and the pre-message file-upload path).
+ */
+export interface NewChatReviewLoop {
+  goal: string;
+  verifier: string;
+  budget: string;                 // '' = config default
+  adoption: 'no' | 'ask' | 'auto';
+  implementerEngine: string;      // '' = config default
+  implementerModel: string;
+  verifierEngine: string;
+  verifierModel: string;
+  maxIterations: string;          // '' = config default
+}
+
+export const EMPTY_REVIEW_LOOP: NewChatReviewLoop = {
+  goal: '', verifier: '', budget: '', adoption: 'no',
+  implementerEngine: '', implementerModel: '',
+  verifierEngine: '', verifierModel: '', maxIterations: '',
+};
 
 export type QuoteAction = 'add' | 'remove' | 'improve' | 'question' | 'note';
 
@@ -152,6 +177,9 @@ interface ChatState {
   // Backend picked for the CURRENT virtual (unsent) chat; null = default.
   // Bound at session materialization (ensureRealSession) and reset after.
   newChatBackend: string | null;
+  // Review-loop config for the CURRENT virtual chat; null = panel closed.
+  // Bound at session materialization (like newChatBackend) and reset after.
+  newChatReviewLoop: NewChatReviewLoop | null;
   selectedModels: Record<string, string | null>;
 
   loadSessions: () => Promise<void>;
@@ -177,6 +205,8 @@ interface ChatState {
   /** Fetch selectable models for the composer picker (GET /api/models). */
   loadModels: () => Promise<void>;
   setNewChatBackend: (backend: string | null) => void;
+  /** Patch (or close with null) the new-chat review-loop panel state. */
+  setNewChatReviewLoop: (patch: Partial<NewChatReviewLoop> | null) => void;
   /** Set the model for the next message (null → server default). */
   setSelectedModel: (backend: string, model: string | null) => void;
   stopSession: () => void;
@@ -240,6 +270,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   backendOptions: [],
   backendDefault: null,
   newChatBackend: null,
+  newChatReviewLoop: null,
   selectedModels: {
     claude: localStorage.getItem('nerve_selected_model_claude')
       || localStorage.getItem('nerve_selected_model') || null,
@@ -431,10 +462,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   switchSession: async (id: string) => {
     // Leaving an untouched (empty-draft) virtual chat discards it, so the
-    // sidebar never accumulates empty "New chat" entries.
+    // sidebar never accumulates empty "New chat" entries. A filled
+    // review-loop form counts as touched — don't silently drop it.
     const vs = get().virtualSession;
+    const rl = get().newChatReviewLoop;
+    const rlDirty = !!(rl && (rl.goal.trim() || rl.verifier.trim()));
     if (vs && get().activeSession === vs.id && id !== vs.id
-        && !(get().drafts[vs.id] || '').trim()) {
+        && !(get().drafts[vs.id] || '').trim() && !rlDirty) {
       set((s) => {
         const drafts = { ...s.drafts };
         delete drafts[vs.id];
@@ -529,8 +563,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // server-minted id, so anything needing a persisted session — the first
     // message OR a file upload before it — targets a real row, not the
     // client-only temp id (which the backend has never seen → 404).
+    const rl = get().newChatReviewLoop;
+    const rlPayload = rl && rl.goal.trim() && rl.verifier.trim()
+      ? {
+          goal: rl.goal.trim(),
+          verifier: rl.verifier.trim(),
+          ...(rl.budget.trim() && !isNaN(parseFloat(rl.budget)) ? { budget_usd: parseFloat(rl.budget) } : {}),
+          ...(rl.maxIterations.trim() && !isNaN(parseInt(rl.maxIterations, 10)) ? { max_iterations: parseInt(rl.maxIterations, 10) } : {}),
+          // Always sent: an explicit UI "no" must override an operator-
+          // configured ask/auto default.
+          criteria_adoption: rl.adoption,
+          ...(rl.implementerEngine || rl.implementerModel ? {
+            implementer: {
+              ...(rl.implementerEngine ? { engine: rl.implementerEngine } : {}),
+              ...(rl.implementerModel ? { model: rl.implementerModel } : {}),
+            },
+          } : {}),
+          ...(rl.verifierEngine || rl.verifierModel ? {
+            verifier_leg: {
+              ...(rl.verifierEngine ? { engine: rl.verifierEngine } : {}),
+              ...(rl.verifierModel ? { model: rl.verifierModel } : {}),
+            },
+          } : {}),
+        }
+      : null;
     const real: Session = await api.createSession(
-      undefined, get().newChatBackend,
+      undefined, get().newChatBackend, undefined, rlPayload,
     );
     set((state) => {
       const drafts = { ...state.drafts };
@@ -548,6 +606,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
         virtualSession: null,
         newChatBackend: null,  // bound into the created session; reset for the next chat
+        newChatReviewLoop: null,  // ditto — the loop (if any) is now running server-side
         drafts,
         // POST /api/sessions returns a partial row (no updated_at); fill the
         // fields the sidebar needs so date-grouping doesn't choke.
@@ -563,7 +622,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
-    set({ newChatBackend: null });
+    set({ newChatBackend: null, newChatReviewLoop: null });
     removeDraft(vs.id);
     set((s) => {
       const drafts = { ...s.drafts };
@@ -689,6 +748,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setNewChatBackend: (backend: string | null) => set({ newChatBackend: backend }),
+
+  setNewChatReviewLoop: (patch) => set((s) => ({
+    newChatReviewLoop: patch === null
+      ? null
+      : { ...(s.newChatReviewLoop ?? EMPTY_REVIEW_LOOP), ...patch },
+  })),
 
   setSelectedModel: (backend: string, model: string | null) => {
     const key = `nerve_selected_model_${backend}`;
@@ -816,6 +881,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           useWorkflowRunStore.getState().handleRunUpdate(msg.run)
         );
         return;
+      // Review loops — global event (session_running pattern): chip state on
+      // the observer session row + live milestone append for the open view.
+      case 'review_loop_update': return handleReviewLoopUpdate(msg, get, set);
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'interaction_resolved':     return handleInteractionResolved(msg, get, set);

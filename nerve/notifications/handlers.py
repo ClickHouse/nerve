@@ -81,8 +81,13 @@ class DispatchResult:
 # ----------------------------------------------------------------------
 
 
+# Sync dispatchers run in a worker thread (asyncio.to_thread); ASYNC
+# dispatchers (coroutine functions) are awaited directly on the event
+# loop — required when the dispatcher touches loop-bound services (e.g.
+# the review-loop decision handler CASes rows via aiosqlite).
 Dispatcher = Callable[
-    [dict[str, Any], str, str, "NerveConfig | None"], DispatchResult
+    [dict[str, Any], str, str, "NerveConfig | None"],
+    "DispatchResult | Any",
 ]
 
 

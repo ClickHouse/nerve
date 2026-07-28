@@ -20,6 +20,48 @@ export function handleSessionUpdated(
   }));
 }
 
+export function handleReviewLoopUpdate(
+  msg: Extract<WSMessage, { type: 'review_loop_update' }>,
+  get: Get,
+  set: Set,
+): void {
+  // Global event (session_running pattern): update the observer session's
+  // loop state everywhere it's listed, and live-append the milestone
+  // message when the observer chat is on screen (persisted rows hydrate on
+  // reload; this covers the open view).
+  const chip = {
+    id: msg.loop.id,
+    status: msg.loop.status,
+    iteration: msg.loop.iteration,
+    max_iterations: msg.loop.max_iterations,
+    failure_reason: msg.loop.failure_reason,
+    budget_usd: msg.loop.budget_usd,
+    spent_usd: msg.loop.spent_usd,
+    updated_at: msg.loop.updated_at,
+  };
+  set((s) => ({
+    sessions: s.sessions.map(sess =>
+      sess.id === msg.session_id ? { ...sess, review_loop: chip } : sess,
+    ),
+    searchResults: s.searchResults?.map(sess =>
+      sess.id === msg.session_id ? { ...sess, review_loop: chip } : sess,
+    ) ?? null,
+  }));
+  if (msg.message && msg.session_id && msg.session_id === get().activeSession) {
+    const content = msg.message.content || '';
+    set((s) => ({
+      messages: [
+        ...s.messages,
+        {
+          role: 'assistant' as const,
+          channel: 'review-loop',
+          blocks: [{ type: 'text' as const, content }],
+        },
+      ],
+    }));
+  }
+}
+
 export function handleSessionStatus(
   msg: Extract<WSMessage, { type: 'session_status' }>,
   get: Get,

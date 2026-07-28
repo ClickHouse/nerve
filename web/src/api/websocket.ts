@@ -1,5 +1,5 @@
 import { getToken } from './client';
-import type { WorkflowRun } from './client';
+import type { ReviewLoop, WorkflowRun } from './client';
 import type { WorkflowSnapshot } from '../types/chat';
 
 export type WSMessage =
@@ -34,6 +34,7 @@ export type WSMessage =
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }
   | { type: 'workflow_run_update'; session_id: string | null; run: WorkflowRun }
+  | { type: 'review_loop_update'; session_id: string | null; loop: ReviewLoop; message?: { role: string; content: string; channel?: string; created_at?: string } }
   | { type: 'wakeup'; session_id: string }
   | { type: 'auto_turn'; session_id: string }
   | { type: 'model_changed'; session_id: string; from_model: string; to_model: string; downgrade: boolean }

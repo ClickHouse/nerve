@@ -14,6 +14,7 @@ from nerve.agent.tools.handlers.mcp_admin import MCP_ADMIN_SPECS
 from nerve.agent.tools.handlers.memory import MEMORY_SPECS
 from nerve.agent.tools.handlers.notifications import NOTIFICATION_SPECS
 from nerve.agent.tools.handlers.plans import PLAN_SPECS
+from nerve.agent.tools.handlers.review_loops import REVIEW_LOOP_SPECS
 from nerve.agent.tools.handlers.skills import SKILL_SPECS
 from nerve.agent.tools.handlers.sources import SOURCE_SPECS
 from nerve.agent.tools.handlers.tasks import TASK_SPECS
@@ -40,6 +41,7 @@ def build_default_registry() -> ToolRegistry:
         *MCP_ADMIN_SPECS,
         *WAKEUP_SPECS,
         *WORKFLOW_RUN_SPECS,
+        *REVIEW_LOOP_SPECS,
         *HOA_SPECS,
     ):
         registry.register(spec)

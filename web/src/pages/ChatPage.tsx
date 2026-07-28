@@ -11,6 +11,7 @@ import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
+import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'lucide-react';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
@@ -230,6 +231,35 @@ export function ChatPage() {
                   </span>
                 ) : null;
               })()}
+              {(() => {
+                // Live review-loop chip for observer sessions (fed by the
+                // global review_loop_update event; rehydrate via reload).
+                const rl = sessions.find(s => s.id === activeSession)?.review_loop;
+                if (!rl) return null;
+                const live = rl.status === 'implementing' || rl.status === 'verifying' || rl.status === 'pending';
+                const label = rl.status === 'awaiting_user'
+                  ? `needs decision${rl.failure_reason ? ` (${rl.failure_reason})` : ''}`
+                  : rl.status === 'passed' ? 'passed'
+                  : rl.status === 'failed' ? `failed${rl.failure_reason ? ` (${rl.failure_reason})` : ''}`
+                  : rl.status === 'killed' ? 'killed'
+                  : rl.status;
+                const tone = rl.status === 'passed'
+                  ? 'text-emerald-400 border-emerald-400/25 bg-emerald-400/10'
+                  : rl.status === 'awaiting_user'
+                  ? 'text-hue-orange border-orange-400/25 bg-orange-400/10'
+                  : rl.status === 'failed' || rl.status === 'killed'
+                  ? 'text-error border-red-400/25 bg-red-400/10'
+                  : 'text-emerald-400 border-emerald-400/25 bg-emerald-400/10';
+                return (
+                  <span
+                    title={`Review loop ${rl.id}: ${rl.status}${rl.failure_reason ? ` — ${rl.failure_reason}` : ''}`}
+                    className={`text-[11px] px-1.5 py-0.5 rounded border flex items-center gap-1.5 ${tone}`}
+                  >
+                    {live && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
+                    🔁 {rl.iteration}/{rl.max_iterations} — {label}
+                  </span>
+                );
+              })()}
               {statusLabel && (
                 <div className="flex items-center gap-1.5 text-[12px] text-text-muted">
                   <Loader2 size={12} className="animate-spin text-accent" />
@@ -286,6 +316,14 @@ export function ChatPage() {
               )}
             </div>
           </div>
+
+          {/* Review-loop dashboard — sticky above the transcript for
+              observer sessions: live criteria, attempt timeline with
+              watch-the-leg jumps, inline decisions when parked. */}
+          {(() => {
+            const rl = sessions.find(s => s.id === activeSession)?.review_loop;
+            return rl ? <ReviewLoopCard key={rl.id} loopId={rl.id} /> : null;
+          })()}
 
           {/* Messages region: wraps the scrollable list so the width handle
               anchors to the reading-column edge. The header and composer keep

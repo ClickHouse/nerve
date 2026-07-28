@@ -69,6 +69,17 @@ async def schedule_wakeup_handler(ctx: ToolContext, args: dict) -> ToolResult:
             "it can only wake sessions owned by the Nerve engine.",
             is_error=True,
         )
+    if session and session.get("source") == "workflow":
+        # A workflow run is a single budgeted job. A cron-fired wakeup would
+        # execute AFTER the run is terminal — outside its budget meter, able
+        # to mutate the workspace and reschedule forever. Wait in-turn
+        # (poll/sleep inside the session) instead.
+        return ToolResult.text(
+            "schedule_wakeup is not available inside workflow-run sessions — "
+            "wakeups fire after the run ends and would spend outside its "
+            "budget. Wait for conditions in-turn instead.",
+            is_error=True,
+        )
 
     wakeup_id = await ctx.engine._record_wakeup(ctx.db, ctx.session_id, args)
     if wakeup_id is None:
