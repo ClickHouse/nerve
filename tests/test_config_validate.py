@@ -160,6 +160,50 @@ class TestValidateBundle:
         assert not result.ok
         assert any("SECRET_X" in e for e in result.errors)
 
+    def test_unset_env_from_machine_layer_only_is_named_as_such(
+        self, tmp_path, monkeypatch
+    ):
+        """A var only this host asks for must be pinned on this host's config —
+        otherwise a sync refusal reads as a defect in the incoming bundle."""
+        monkeypatch.delenv("MACHINE_ONLY_TOKEN", raising=False)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        _settings(ws, "timezone: UTC\n")
+        result = validate_config_bundle(
+            _cfg(tmp_path, "anthropic_api_key: ${MACHINE_ONLY_TOKEN}\n", workspace=ws)
+        )
+        msg = next(i for i in result.info if "MACHINE_ONLY_TOKEN" in i)
+        assert "only by this machine's" in msg
+        assert "not by the workspace config" in msg
+
+    def test_unset_env_from_both_layers_is_not_blamed_on_the_machine(
+        self, tmp_path, monkeypatch
+    ):
+        """A var *both* layers reference is not the machine's alone: claiming it
+        is sends the reader to config.yaml for a variable the portable bundle
+        needs just as much."""
+        monkeypatch.delenv("SHARED_TOKEN", raising=False)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        _settings(ws, "openai_api_key: ${SHARED_TOKEN}\n")
+        result = validate_config_bundle(
+            _cfg(tmp_path, "anthropic_api_key: ${SHARED_TOKEN}\n", workspace=ws)
+        )
+        msg = next(i for i in result.info if "SHARED_TOKEN" in i)
+        assert "not by the workspace config" not in msg
+        assert "both the workspace config" in msg
+
+    def test_unset_env_from_workspace_only_is_not_attributed_to_the_machine(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("WS_ONLY_TOKEN", raising=False)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        _settings(ws, "anthropic_api_key: ${WS_ONLY_TOKEN}\n")
+        result = validate_config_bundle(_cfg(tmp_path, "timezone: UTC\n", workspace=ws))
+        msg = next(i for i in result.info if "WS_ONLY_TOKEN" in i)
+        assert "this machine's" not in msg
+
     def test_malformed_cron_is_error(self, tmp_path):
         ws = tmp_path / "ws"
         cron = ws / "config" / "cron"

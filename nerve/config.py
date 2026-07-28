@@ -196,8 +196,7 @@ def _resolve_env_refs(merged: dict[str, Any]) -> dict[str, Any]:
 #
 # ${ENV_VAR} interpolation is applied once at the end. This keeps existing
 # single-file installs working unchanged (layer 1 absent → prior behavior) while
-# letting shared settings live in the workspace. Lockdown mode (a later story)
-# will drop layers 2/3 so only the tracked workspace layer applies.
+# letting shared settings live in the workspace.
 
 
 def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
@@ -960,6 +959,44 @@ class CronConfig:
             jobs_file=_expand_path(d.get("jobs_file")) or base / "jobs.yaml",
             system_file=_expand_path(d.get("system_file")) or base / "system.yaml",
             gate_plugins_dir=_expand_path(d.get("gate_plugins_dir")) or base / "gates",
+        )
+
+
+@dataclass
+class WorkspaceSyncConfig:
+    """Git-backed sync of the workspace from a remote (the config repo).
+
+    Opt-in. When enabled, the daemon periodically ``git pull --ff-only``s the
+    workspace so config changes reviewed & merged via PR on the remote land on
+    the instance and hot-reload. The remote/branch come from git itself; only the
+    cadence and enablement live here.
+    """
+
+    enabled: bool = False
+    branch: str = ""               # empty → git's default (current tracking branch)
+    # How often the daemon pulls. This is also the upper bound on how long a
+    # merged config change takes to reach the instance, since the pull is what
+    # applies it, so it is deliberately short; a fetch that finds nothing new is
+    # one round trip. Raise it for a large fleet pointed at one repo.
+    interval_minutes: int = 1
+    validate: bool = True          # validate the pulled bundle before applying
+    # Treat an unset required ${VAR} in the pulled bundle as invalid. On by
+    # default: the daemon refuses to load such a config, so merging it only
+    # defers the failure to the next restart. Configurable because a shared repo
+    # can introduce a ${VAR} that this particular box legitimately does not set,
+    # and the alternative is a machine whose every sync fails until someone
+    # notices.
+    strict_env: bool = True
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> WorkspaceSyncConfig:
+        return cls(
+            enabled=d.get("enabled", False),
+            branch=str(d.get("branch", "") or ""),
+            interval_minutes=d.get("interval_minutes", 1),
+            validate=d.get("validate", True),
+            strict_env=d.get("strict_env", True),
         )
 
 
@@ -1886,6 +1923,7 @@ class NerveConfig:
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
+    workspace_sync: WorkspaceSyncConfig = field(default_factory=WorkspaceSyncConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
@@ -2091,6 +2129,7 @@ class NerveConfig:
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace),
+            workspace_sync=WorkspaceSyncConfig.from_dict(d.get("workspace_sync", {})),
             backup=BackupConfig.from_dict(d.get("backup", {})),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),
