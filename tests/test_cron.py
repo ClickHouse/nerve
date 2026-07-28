@@ -13,6 +13,8 @@ import pytest_asyncio
 from nerve.cron.jobs import CronJob
 from nerve.cron.service import (
     CronService,
+    InvalidScheduleError,
+    NotCrontabError,
     _crontab_to_trigger,
     _parse_interval,
     _parse_timestamp,
@@ -137,6 +139,48 @@ class TestParseInterval:
     def test_default_on_garbage(self):
         assert _parse_interval("???") == 7200
 
+    @pytest.mark.parametrize(
+        ("interval", "expected"),
+        [
+            ("0.5h", 1800),
+            ("1.5h", 5400),
+            ("10.5m", 630),
+            ("0.25h", 900),
+            ("1.5h30s", 5430),
+        ],
+    )
+    def test_fractions_mean_what_they_say(self, interval, expected):
+        # An unanchored scan reads only the digits touching the unit: "0.5h"
+        # becomes 5 hours, and "1.5h" becomes 5 hours with the leading 1 gone.
+        assert _parse_interval(interval) == expected
+
+    def test_fraction_rounds_to_whole_seconds(self):
+        # IntervalTrigger counts whole seconds; never hand it a float.
+        result = _parse_interval("1.333m")
+        assert result == 80
+        assert isinstance(result, int)
+
+    @pytest.mark.parametrize(
+        "interval",
+        ["hourly", "@daily", "4x", "0.5.3h", "1h junk", "5.h", ""],
+    )
+    def test_not_an_interval_takes_the_default(self, interval):
+        # Leftover text means the string isn't an interval, not that the parser
+        # keeps the part it liked ("1h junk" used to come back as 1h).
+        assert _parse_interval(interval) == 7200
+
+    @pytest.mark.parametrize("interval", ["0h", "0m", "0s", "0.0h", "0.4s"])
+    def test_zero_interval_takes_the_default(self, interval):
+        # IntervalTrigger(seconds=0) is a hot loop, not a schedule.
+        assert _parse_interval(interval) == 7200
+
+    def test_whitespace_between_tokens(self):
+        assert _parse_interval("1h 30m") == 5400
+        assert _parse_interval(" 4h ") == 14400
+
+    def test_uppercase_units(self):
+        assert _parse_interval("30M") == 1800
+
 
 # ---------------------------------------------------------------------------
 # Configured timezone
@@ -225,6 +269,29 @@ class TestCrontabToTrigger:
         with pytest.raises(ValueError):
             _crontab_to_trigger(schedule)
 
+    @pytest.mark.parametrize("schedule", ["4h", "30m", "1h30m", "???", ""])
+    def test_non_crontab_raises_not_crontab_error(self, schedule):
+        """And raises the subclass the interval fallback actually catches."""
+        with pytest.raises(NotCrontabError):
+            _crontab_to_trigger(schedule)
+
+    @pytest.mark.parametrize("schedule", [
+        "99 * * * *",        # minute out of range
+        "0 99 * * *",        # hour out of range
+        "* * * * 9",         # day-of-week out of range
+        "nonsense * * * *",  # not a number at all
+    ])
+    def test_invalid_crontab_field_is_not_a_fallthrough(self, schedule):
+        """Five fields and one is bad: a typo, never an interval string.
+
+        Must not be a NotCrontabError, or the callers' interval fallback
+        swallows it and _parse_interval turns the typo into its 2h default.
+        """
+        with pytest.raises(InvalidScheduleError) as ei:
+            _crontab_to_trigger(schedule)
+        assert not isinstance(ei.value, NotCrontabError)
+        assert schedule in str(ei.value)
+
 
 # ---------------------------------------------------------------------------
 # _is_overdue
@@ -292,6 +359,17 @@ class TestIsOverdue:
             job, last_run, last_run + timedelta(days=7, minutes=1),
         ) is True
 
+    def test_invalid_crontab_is_never_overdue(self):
+        """start() refused to schedule it, so catch-up must not fire it either.
+
+        Without this the invalid crontab fell through to the interval parser's
+        2h default and every restart ran a job that has no schedule at all.
+        """
+        job = _make_job(schedule="99 * * * *")
+        assert CronService._is_overdue(
+            job, _utc_now() - timedelta(days=3), _utc_now(),
+        ) is False
+
 
 # ---------------------------------------------------------------------------
 # _make_trigger (interval alignment)
@@ -335,6 +413,18 @@ class TestMakeTrigger:
         assert timedelta(hours=3.5) < delta < timedelta(hours=4.5)
 
     @pytest.mark.asyncio
+    async def test_fractional_interval(self, cron_service):
+        """"0.5h" is half an hour, and IntervalTrigger gets whole seconds."""
+        cron_service.db.get_last_successful_cron_run.return_value = None
+
+        job = _make_job(schedule="0.5h")
+        trigger = await cron_service._make_trigger(job)
+
+        from apscheduler.triggers.interval import IntervalTrigger
+        assert isinstance(trigger, IntervalTrigger)
+        assert trigger.interval == timedelta(minutes=30)
+
+    @pytest.mark.asyncio
     async def test_crontab_unchanged(self, cron_service):
         """Crontab triggers are returned as-is (already absolute)."""
         job = _make_job(schedule="0 5 * * *")
@@ -362,6 +452,32 @@ class TestMakeTrigger:
         from apscheduler.triggers.interval import IntervalTrigger
         assert isinstance(trigger, IntervalTrigger)
         assert str(trigger.timezone) == "America/Los_Angeles"
+
+    @pytest.mark.asyncio
+    async def test_invalid_crontab_refused_not_turned_into_2h(self, cron_service):
+        """A typo'd crontab used to come back as a silent 2h interval.
+
+        Both ValueErrors out of _crontab_to_trigger looked alike, so an invalid
+        field fell through to _parse_interval, which finds no h/m/s token and
+        returns its 2h default — a job running on a cadence nobody asked for,
+        with nothing logged.
+        """
+        job = _make_job(id="typo", schedule="99 * * * *")
+
+        with pytest.raises(InvalidScheduleError) as ei:
+            await cron_service._make_trigger(job)
+
+        # The message has to name the job: the schedule alone doesn't say which
+        # YAML entry to fix.
+        assert "typo" in str(ei.value) and "99 * * * *" in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_invalid_crontab_raises_config_error(self, cron_service):
+        """reload()'s route maps ConfigError to 400; a bare ValueError 500s."""
+        from nerve.config import ConfigError
+
+        with pytest.raises(ConfigError):
+            await cron_service._make_trigger(_make_job(schedule="0 99 * * *"))
 
 
 # ---------------------------------------------------------------------------

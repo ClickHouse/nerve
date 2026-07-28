@@ -461,17 +461,21 @@ def build_gate(spec: dict) -> CronGate:
 def build_gates(specs: list[dict]) -> list[CronGate]:
     """Build gates from a list of config specs.
 
-    Invalid specs are logged and skipped rather than raising, so one bad
-    gate can't take down the whole cron service at load time. A job whose
-    gates all fail to build behaves as if it has no gates (runs normally).
+    Raises :class:`GateConfigError` if any spec cannot be built — an unknown
+    ``type`` above all, which is what a deleted or unimportable gate plugin looks
+    like from here. This runs from ``CronJob.__post_init__``, so it takes the job
+    with it: skipped with an error at startup, and a ``400`` that refuses the
+    whole change set at reload.
+
+    Skipping the spec instead would be worse than losing the job. A gate is a
+    *precondition*, so dropping one makes the job run more often, not less: a
+    job that asked to run "only when the inbox is busy" starts running every
+    time, and the config that said otherwise is still sitting there. With
+    hot-reload that arrives unattended, from a workspace pull that removed a
+    plugin file. Refusing is the visible failure of the two — the reload names
+    the job in its 400, startup logs it, and no job silently changes meaning.
     """
-    gates: list[CronGate] = []
-    for spec in specs or []:
-        try:
-            gates.append(build_gate(spec))
-        except GateConfigError as e:
-            logger.warning("Ignoring invalid cron gate %s: %s", spec, e)
-    return gates
+    return [build_gate(spec) for spec in specs or []]
 
 
 async def evaluate_gates(

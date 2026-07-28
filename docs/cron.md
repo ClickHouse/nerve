@@ -26,6 +26,43 @@ Both files use the same format. On startup, CronService loads and merges both:
 
 Running `nerve init` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`.
 
+### Hot-reload (no restart)
+
+`POST /api/cron/reload` re-reads `jobs.yaml` and `system.yaml` and applies them
+to the running daemon, so a job you add, remove, reschedule, enable or disable
+takes effect **without a restart**. The same call re-reads the gate-plugins
+directory, so an added, edited or deleted plugin file lands with it. A
+`prompt_file` needs no reload: its contents are read on every run.
+
+A reload rebuilds every enabled job from the file, and leaves source runners and
+internal cleanup/wakeup jobs alone.
+
+Notes:
+- Rebuilding a job normally leaves its next fire time alone: a crontab is
+  absolute, and an interval is measured from the job's last successful run. An
+  interval job that has never succeeded has no such anchor, so each reload
+  restarts its countdown. On a fresh install, where nothing has run yet, editing
+  the file repeatedly keeps every interval job's wait starting over — they
+  settle once each has run for the first time.
+- A **malformed** `jobs.yaml`/`system.yaml` (bad YAML, or a job that doesn't
+  parse) is refused: reload returns `400` and the running schedule is left
+  untouched, so a typo can't wipe your crons.
+- A reload is **all-or-nothing**. The whole change set is computed (files parsed,
+  every trigger built) before the scheduler is touched, so a reload that fails
+  for any reason leaves every job on its existing schedule instead of applying
+  half the change. Gate plugins are covered too: a refused reload leaves the
+  registered gates as they were, so a deleted plugin file only takes its gate
+  away once a reload succeeds.
+- A job holding a [reserved id](#job-fields) is **skipped**, at reload and at
+  startup alike. The reload itself still succeeds; only that job is dropped.
+- An **invalid schedule** (a crontab whose fields the scheduler rejects, e.g.
+  `99 * * * *`) is refused the same way at reload: `400`, nothing applied.
+  Startup is the one case that differs — the daemon logs an error naming the job
+  and comes up without it, rather than taking every other cron down over one
+  typo. `GET /api/cron/jobs` still lists the job, with a null `next_run`.
+- `show_session_label` is **restart-only**: changing it and reloading has no
+  effect until the daemon restarts.
+
 ## Job Definition
 
 ```yaml
@@ -83,8 +120,8 @@ prompt definition.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `id` | string | yes | Unique job identifier |
-| `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`) |
+| `id` | string | yes | Unique job identifier. `cleanup`, `wakeup_sweep` and anything starting with `source:` are **reserved by the daemon** — a job using one is skipped (with a warning naming it in the daemon log) and never scheduled, so rename it |
+| `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`, `1h30m`, `0.5h`) — see [Interval syntax](#interval-syntax). A 5-field crontab with an out-of-range field (`99 * * * *`) is **rejected**, never reinterpreted as an interval — reload returns `400` and startup skips that one job with an error in the daemon log |
 | `prompt` | string | yes* | Message sent to the agent |
 | `prompt_file` | string | yes* | Path to a file containing the prompt (relative to the YAML's directory). Read fresh each run; shareable between jobs. *One of `prompt`/`prompt_file` is required |
 | `description` | string | no | Human-readable description |
@@ -100,6 +137,31 @@ prompt definition.
 | `lock` | bool | no | Prevent concurrent runs of this job — the next fire waits for the previous one (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
+
+### Interval syntax
+
+A `schedule` that isn't a 5-field crontab is read as an interval: a run of
+`<number><unit>` tokens, where the unit is `h`, `m` or `s`. Tokens add up, and
+fractions are allowed.
+
+| Schedule | Interval |
+|----------|----------|
+| `4h` | 4 hours |
+| `30m` | 30 minutes |
+| `90s` | 90 seconds |
+| `1h30m` | 90 minutes (`1h 30m` works too) |
+| `0.5h` | 30 minutes |
+| `10.5m` | 10 minutes 30 seconds |
+
+A fractional interval is rounded to the nearest whole second (`1.333m` → 80s).
+
+Anything that isn't a whole string of such tokens is **not an interval** and
+silently falls back to **every 2 hours** — `hourly`, `@daily`, `4x`, `1h junk`,
+and a zero interval (`0h`, or a fraction that rounds down to zero seconds), which
+would otherwise mean "fire as fast as you can". The daemon keeps running on a
+conservative cadence rather than refusing to start over one mistyped field, so a
+job firing every 2 hours when you asked for something else means the schedule
+string didn't parse.
 
 ## Run Gates
 
@@ -134,9 +196,17 @@ When multiple gates are listed, the job runs only if every one passes:
         sources: [gmail, github]
 ```
 
-Gates are **fail-open**: if a gate errors while checking (e.g. a transient DB
-issue), the run proceeds rather than being skipped — an occasional wasted run
-beats a cron that silently never fires.
+Gates are **fail-open while checking**: if a gate raises during evaluation (e.g.
+a transient DB issue), the run proceeds rather than being skipped — an occasional
+wasted run beats a cron that silently never fires.
+
+A gate that can't be *built* is a different matter and is **refused**. If a
+`run_if` entry names a type nothing provides — a typo, or a gate plugin that was
+deleted or fails to import — the job does not load: reload returns `400` naming
+it, and at startup the daemon logs an error and comes up without that job. The
+alternative would be to drop the gate and run the job anyway, which turns "only
+when this holds" into "every time" — a precondition removed by accident is not a
+precondition.
 
 ### Gate types
 
@@ -230,7 +300,8 @@ run_if:
 A gate must implement the same three methods as a built-in (`is_satisfied`,
 `describe`, `from_config`).
 
-**Rules** (all fail-safe — a bad plugin never crashes the daemon):
+**Rules** (a bad plugin never crashes the daemon — though it does cost the jobs
+that name its gate, see below):
 
 - Files whose name starts with `_` (and `__pycache__`) are ignored.
 - A plugin whose `type` collides with an already-registered gate is skipped
@@ -238,8 +309,14 @@ A gate must implement the same three methods as a built-in (`is_satisfied`,
   loaded (filename-sorted) wins**.
 - Any import error in a plugin file is logged (naming the file) and that file
   is skipped; the rest still load.
-- **No hot-reload:** adding or changing a plugin requires a daemon restart —
-  the same as every other piece of cron config.
+- **Hot-reloadable:** `POST /api/cron/reload` re-reads the directory from
+  scratch, so an added, edited, deleted or renamed plugin takes effect without a
+  daemon restart. Built-in gates are never dropped.
+- A plugin that stops registering its gate — deleted, renamed, or newly failing
+  to import — takes the jobs that name that gate with it: the reload is refused
+  with a `400`, and the running schedule is left as it was. Restore the file (or
+  remove the `run_if` entry) and reload again. Deleting a plugin is not a way to
+  switch a gate off; it stops those jobs instead of ungating them.
 
 > **Context is DB-only.** A gate receives `GateContext{job_id, db}`, which is
 > enough for DB-driven conditions (task counts, source cursors, age filters). A

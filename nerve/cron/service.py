@@ -17,11 +17,17 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve.agent.engine import AgentEngine
-from nerve.config import NerveConfig
-from nerve.cron.jobs import CronJob, load_jobs
+from nerve.config import ConfigError, NerveConfig
+from nerve.cron.jobs import (
+    CronJob,
+    describe_reserved_job_ids,
+    is_reserved_job_id,
+    load_jobs,
+)
 from nerve.db import Database
 
 if TYPE_CHECKING:
+    from nerve.cron.gates import CronGate
     from nerve.sources.runner import SourceRunner
 
 logger = logging.getLogger(__name__)
@@ -45,20 +51,89 @@ def _resolve_wakeup_prompt(prompt: str) -> str:
     return _WAKEUP_SENTINEL_PROMPT if prompt.strip() in _WAKEUP_SENTINELS else prompt
 
 
+def _drop_reserved(jobs: list[CronJob]) -> list[CronJob]:
+    """Drop jobs holding a reserved id, warning once per offender.
+
+    Nothing but a hand-edited YAML file can produce one of these, and a job that
+    simply never runs is near-impossible to diagnose from the outside, so the
+    warning has to name the job and the way out of it.
+    """
+    kept: list[CronJob] = []
+    for job in jobs:
+        if is_reserved_job_id(job.id):
+            logger.warning(
+                "Cron job '%s' (from %s) will not be scheduled: its id is "
+                "reserved by the daemon (%s). Rename the job to schedule it.",
+                job.id,
+                job.metadata.get("_source", "user"),
+                describe_reserved_job_ids(),
+            )
+        else:
+            kept.append(job)
+    return kept
+
+
+class NotCrontabError(ValueError):
+    """A schedule string that isn't a crontab expression at all.
+
+    Signals "try the interval parser instead" — as opposed to
+    :class:`InvalidScheduleError`, which means the string *is* a crontab and
+    the interval parser must never see it.
+    """
+
+
+class InvalidScheduleError(ConfigError):
+    """A 5-field crontab expression the scheduler rejects.
+
+    A ``ConfigError`` because that is exactly what it is — an operator typo in
+    a schedule — and because the reload route turns ConfigError into a 400
+    naming the offending job instead of a bare 500.
+    """
+
+
 def _parse_interval(interval: str) -> int:
-    """Parse an interval string like '2h', '30m', '1h30m' into seconds."""
+    """Parse an interval string like '2h', '30m', '1h30m', '0.5h' into seconds.
+
+    The whole string has to be a run of ``<number><unit>`` tokens. Anything
+    else — ``hourly``, ``@daily``, ``???``, ``1h junk`` — is not an interval at
+    all and gets the 2h default, because the daemon has to keep running: a job
+    on a conservative cadence beats a scheduler that refused to start.
+    """
     import re
-    total = 0
-    parts = re.findall(r"(\d+)([hms])", interval.lower())
-    for value, unit in parts:
-        v = int(value)
+    # One token, and the same expression used to check that the string is
+    # *only* tokens. An unanchored scan (the obvious `findall`) matches just the
+    # digits touching each unit, so it reads "0.5h" as 5 hours and "1.5h" as 5
+    # hours with the leading 1 dropped entirely — a partial match silently
+    # mistaken for a whole one. fullmatch makes that impossible: leftovers mean
+    # the string isn't an interval, not that the parser gets to keep the part
+    # it liked. Whitespace between tokens is allowed ("1h 30m"); a 5-field
+    # crontab has already been ruled out by the time we get here.
+    #
+    # The number is spelled out the long way instead of as `\d*\.?\d+` so that
+    # each token matches exactly one way. Two ways to match a multi-digit number
+    # would make the repetition backtrack through every combination of them
+    # before giving up on a string that doesn't match — seconds of CPU for a
+    # schedule of twenty-odd tokens, which is a config typo away.
+    token = r"(\d+(?:\.\d+)?|\.\d+)([hms])"
+    text = interval.strip().lower()
+    if not re.fullmatch(rf"(?:{token}\s*)+", text):
+        return 7200  # Not an interval at all → default 2h
+    total = 0.0
+    for value, unit in re.findall(token, text):
+        v = float(value)
         if unit == "h":
             total += v * 3600
         elif unit == "m":
             total += v * 60
         elif unit == "s":
             total += v
-    return total or 7200  # Default 2h
+    # Fractions mean what they say ("0.5h" is 1800s), rounded to the nearest
+    # whole second because IntervalTrigger counts seconds and half a second of
+    # drift on a cadence measured in minutes is noise. Zero takes the default
+    # too — written ("0h") or rounded down to it ("0.4s") — since
+    # IntervalTrigger(seconds=0) is a fire-as-fast-as-you-can loop rather than
+    # a schedule.
+    return round(total) or 7200  # Default 2h
 
 
 # Unix crontab day-of-week numbering is 0=Sun..6=Sat (7 also means Sun).
@@ -110,25 +185,39 @@ def _crontab_to_trigger(
     Drop-in replacement for ``CronTrigger.from_crontab`` that fixes the
     day-of-week off-by-one (see ``_UNIX_DOW_TO_NAME``). Only the DOW field is
     treated differently; the other four fields and the no-explicit-timezone
-    behaviour are identical to ``from_crontab``. Raises ``ValueError`` for
-    anything that is not a 5-field expression, so interval strings like ``4h``
-    keep falling through to the IntervalTrigger path.
+    behaviour are identical to ``from_crontab``.
+
+    The two failure modes are different exceptions, because callers have to
+    tell them apart: :class:`NotCrontabError` for anything that is not a
+    5-field expression, so interval strings like ``4h`` keep falling through
+    to the IntervalTrigger path, and :class:`InvalidScheduleError` when it is
+    a crontab whose fields the scheduler rejects. Both subclass ``ValueError``.
     """
     fields = schedule.split()
     if len(fields) != 5:
-        raise ValueError(f"Not a 5-field crontab expression: {schedule!r}")
+        raise NotCrontabError(f"Not a 5-field crontab expression: {schedule!r}")
     minute, hour, day, month, day_of_week = fields
     remapped_dow = ",".join(
         _remap_dow_atom(atom) for atom in day_of_week.split(",")
     )
-    return CronTrigger(
-        minute=minute,
-        hour=hour,
-        day=day,
-        month=month,
-        day_of_week=remapped_dow,
-        timezone=timezone,
-    )
+    try:
+        return CronTrigger(
+            minute=minute,
+            hour=hour,
+            day=day,
+            month=month,
+            day_of_week=remapped_dow,
+            timezone=timezone,
+        )
+    except ValueError as e:
+        # Five fields and one of them is bad ("99 * * * *"): a typo in a
+        # crontab, not an interval. Re-raised as its own type so no caller can
+        # mistake it for "not a crontab" and hand it to _parse_interval, which
+        # finds no h/m/s token and returns its 2h default — turning the typo
+        # into a job that quietly runs on a cadence nobody asked for.
+        raise InvalidScheduleError(
+            f"Invalid crontab expression {schedule!r}: {e}",
+        ) from e
 
 
 def _parse_timestamp(ts: str) -> datetime:
@@ -170,7 +259,26 @@ class CronService:
             if not job.enabled:
                 continue
 
-            trigger = await self._make_trigger(job)
+            try:
+                trigger = await self._make_trigger(job)
+            except InvalidScheduleError as e:
+                # Deliberately the opposite of reload(), which refuses the whole
+                # change set: there the running schedule survives untouched and
+                # a synchronous caller gets a 400 naming the job. Nothing can be
+                # handed back that way here — gateway/server.py wraps this call
+                # in `except Exception: logger.warning(...)`, so raising over one
+                # typo would cost every other cron, every source runner and the
+                # reload endpoint itself (503 with no service) until someone
+                # noticed one warning line and restarted the daemon. Skip the
+                # offender loudly instead; it stays in _jobs, so /api/cron/jobs
+                # keeps listing it with a null next run rather than dropping it
+                # out of sight.
+                # _make_trigger's message already names the job; don't say it
+                # twice.
+                logger.error(
+                    "%s. Not scheduled — fix the schedule and reload.", e,
+                )
+                continue
 
             self.scheduler.add_job(
                 self._run_job_wrapper,
@@ -202,11 +310,21 @@ class CronService:
                     trigger = _crontab_to_trigger(
                         schedule_str, timezone=self.timezone,
                     )
-                except ValueError:
+                except NotCrontabError:
                     seconds = _parse_interval(schedule_str)
                     trigger = IntervalTrigger(
                         seconds=seconds, timezone=self.timezone,
                     )
+                except InvalidScheduleError as e:
+                    # Same call as the cron loop above, same answer — skip this
+                    # one, keep the rest. Letting it reach the enclosing
+                    # `except Exception` would abandon every source after it in
+                    # the list under a single "failed to register source
+                    # runners" warning that names the wrong problem.
+                    logger.error(
+                        "Source '%s' will not be scheduled: %s", source_name, e,
+                    )
+                    continue
 
                 self.scheduler.add_job(
                     self._run_source_wrapper,
@@ -250,6 +368,169 @@ class CronService:
         # Catch up missed jobs in background (don't block startup)
         asyncio.create_task(self._catchup_missed_jobs())
 
+    async def reload(self) -> dict:
+        """Re-read cron config and apply changes to the running scheduler.
+
+        Picks up added / removed / rescheduled / enabled-toggled jobs without a
+        daemon restart, mirroring the MCP-config reload pattern:
+
+          * jobs removed or newly disabled → unscheduled
+          * every other enabled job        → rebuilt from the new definition
+
+        Every enabled job is rebuilt, not only the ones whose YAML changed.
+        Rebuilding a trigger keeps the next fire time as it was for a crontab
+        job, and for an interval job anchored to a successful run; an interval
+        job that has never succeeded has no anchor and restarts its countdown,
+        which is the only thing this costs (documented in docs/cron.md).
+
+        Source runners and the fixed cleanup/wakeup jobs are left untouched.
+        Custom gate plugins are re-read from scratch (replace=True): a new file
+        registers, an edited file's code takes effect, and a deleted file's gate
+        unregisters (see nerve/cron/gate_plugins.py). Rebuilding every job is
+        what puts those gates in front of the jobs that run: the scheduler
+        executes the CronJob object it holds, and gates are built into that
+        object when it is constructed.
+
+        All-or-nothing: the complete change set — every trigger included — is
+        built before the scheduler is touched, so a reload the daemon cannot
+        carry out raises with the running schedule exactly as it was. That
+        covers the gate registry too; see :meth:`_reload_from_disk`.
+
+        Returns a summary dict: ``{"added", "removed", "updated", "enabled"}``,
+        where "updated" is every enabled job that already had a trigger. It says
+        what the reload rescheduled, not which jobs the file changed.
+        """
+        from nerve.cron.gates import GATE_REGISTRY
+
+        # The one piece of reload state that isn't local: GATE_REGISTRY is
+        # process-global and has to be replaced *before* jobs are rebuilt,
+        # because a CronJob builds its gates from it at construction time. That
+        # puts it ahead of every check that can still refuse the reload, so it
+        # needs undoing by hand — leaving the scheduler untouched is not enough
+        # when a deleted plugin's gate has already been unregistered. The next
+        # CronJob built from disk (run_job, rotate_session) would then fail to
+        # build for want of a gate type, off a reload that returned 400: the
+        # instance would lose jobs it had never agreed to change.
+        gates_before = dict(GATE_REGISTRY)
+        try:
+            return await self._reload_from_disk(gates_before)
+        except BaseException:
+            # BaseException, not Exception: a cancelled reload has to put the
+            # registry back too.
+            GATE_REGISTRY.clear()
+            GATE_REGISTRY.update(gates_before)
+            raise
+
+    async def _reload_from_disk(
+        self, gates_before: dict[str, type["CronGate"]],
+    ) -> dict:
+        """The body of :meth:`reload`. Only call it through there.
+
+        Takes the pre-reload registry snapshot so it can report which gates
+        vanished once the change is committed, and so its caller can restore
+        that snapshot if this raises.
+        """
+        from nerve.cron.gate_plugins import load_gate_plugins, warn_vanished_gates
+
+        # Re-read drop-in gate plugins before jobs are rebuilt (their gates are
+        # constructed at CronJob build time). replace=True so an edited/deleted
+        # plugin's code is picked up, not just newly-added files. The loader's own
+        # "gate vanished" warning is held back until the reload commits, since a
+        # refused one leaves those jobs holding the gate after all.
+        load_gate_plugins(
+            self.config.cron.gate_plugins_dir, replace=True, warn_vanished=False,
+        )
+
+        # -- Plan: everything that can fail, before anything is applied --------
+        #
+        # Both the strict load below and the trigger construction further down
+        # can raise: the load on a malformed file, _make_trigger on a schedule
+        # the scheduler rejects (InvalidScheduleError → 400 — unlike at startup,
+        # where the offending job is skipped and the daemon comes up anyway,
+        # because here the running schedule survives and someone is waiting on
+        # an answer) or a failing DB read (interval jobs anchor their timer to
+        # the last successful run). Neither may run after a scheduler
+        # mutation. Unscheduling first and only then discovering a job whose
+        # trigger won't build would leave the daemon half-reloaded — part of the
+        # crons unscheduled, part still on their old triggers, and nothing to
+        # tell an operator which is which. Refusing the whole reload is the only
+        # outcome anyone can reason about, and the only one the API's 400 and
+        # the docs actually promise.
+        #
+        # Load strictly so a malformed jobs.yaml/system.yaml raises (and the
+        # route returns 400) instead of silently reading as "all jobs removed"
+        # and unscheduling everything.
+        # The loader already drops (and warns about) reserved ids, so nothing
+        # here can replace or remove the internal cleanup/wakeup/source
+        # triggers. _jobs is re-filtered in case it was seeded directly.
+        new_jobs = self._load_merged_jobs(strict=True)
+        new_by_id = {j.id: j for j in new_jobs}
+        old_by_id = {j.id: j for j in self._jobs if not is_reserved_job_id(j.id)}
+
+        added: list[str] = []
+        removed: list[str] = []
+        updated: list[str] = []
+
+        unschedule: list[str] = []
+        reschedule: list[tuple[CronJob, CronTrigger | IntervalTrigger]] = []
+
+        # Jobs that disappeared or became disabled → unschedule.
+        for jid, old in old_by_id.items():
+            gone = jid not in new_by_id
+            disabled = (not gone) and (not new_by_id[jid].enabled)
+            if (gone or disabled) and self.scheduler.get_job(jid) is not None:
+                unschedule.append(jid)
+                if gone:
+                    removed.append(jid)
+
+        # Every enabled job is rebuilt from the file, whether or not its YAML
+        # changed. The scheduler lookup here still sees the pre-reload schedule,
+        # which is what it is meant to report against; the two loops never visit
+        # the same id anyway (this one skips disabled jobs and only walks ids
+        # present in the new config).
+        for jid, job in new_by_id.items():
+            if not job.enabled:
+                continue
+            existing = self.scheduler.get_job(jid) is not None
+            reschedule.append((job, await self._make_trigger(job)))
+            # Report against the scheduler, not against _jobs: a job that was in
+            # _jobs but had no trigger is newly scheduled, not re-scheduled.
+            if existing:
+                updated.append(jid)
+            else:
+                added.append(jid)
+
+        # -- Apply: scheduler bookkeeping only --------------------------------
+        # No parsing, no DB, no awaits past this point, so the whole diff lands
+        # in one event-loop step and no job can fire against a half-applied set.
+        for jid in unschedule:
+            self.scheduler.remove_job(jid)
+        for job, trigger in reschedule:
+            self.scheduler.add_job(
+                self._run_job_wrapper,
+                trigger,
+                args=[job],
+                id=job.id,
+                name=job.description or job.id,
+                replace_existing=True,
+            )
+
+        self._jobs = new_jobs
+        # Committed, so the gates that disappeared really are gone from the jobs
+        # that are now live — say so (the loader was told to keep quiet above).
+        warn_vanished_gates(gates_before)
+        enabled = sum(1 for j in new_by_id.values() if j.enabled)
+        logger.info(
+            "Cron reloaded: +%d added, ~%d updated, -%d removed (%d enabled)",
+            len(added), len(updated), len(removed), enabled,
+        )
+        return {
+            "added": added,
+            "removed": removed,
+            "updated": updated,
+            "enabled": enabled,
+        }
+
     async def stop(self) -> None:
         """Stop the scheduler."""
         self.scheduler.shutdown(wait=False)
@@ -262,11 +543,20 @@ class CronService:
 
         For interval schedules, anchors to the last successful run so
         the cadence survives restarts (persistent timer).
+
+        Raises :class:`InvalidScheduleError` for a crontab the scheduler
+        rejects; each caller decides what refusing means (see start() and
+        reload()).
         """
         try:
             return _crontab_to_trigger(job.schedule, timezone=self.timezone)
-        except ValueError:
-            pass
+        except NotCrontabError:
+            pass  # not a crontab → an interval string like "4h"
+        except InvalidScheduleError as e:
+            # Name the job: the schedule alone doesn't say which YAML entry to
+            # go and fix, and this message is what an operator sees, either in
+            # the startup log or in the reload's 400.
+            raise InvalidScheduleError(f"Cron job '{job.id}': {e}") from e
 
         seconds = _parse_interval(job.schedule)
         last_run = await self.db.get_last_successful_cron_run(job.id)
@@ -328,9 +618,16 @@ class CronService:
             )
             next_fire = trigger.get_next_fire_time(last_run, last_run)
             return next_fire is not None and next_fire < now
-        except ValueError:
+        except NotCrontabError:
             seconds = _parse_interval(job.schedule)
             return (now - last_run).total_seconds() >= seconds
+        except InvalidScheduleError:
+            # start() refused to schedule this job, so it has no fire times it
+            # could have missed. Catching it up would run, once per restart,
+            # precisely the job the daemon declined to schedule. start() already
+            # logged the typo, so this stays quiet rather than reporting it
+            # twice per boot.
+            return False
 
     # -- End persistent timers ---------------------------------------------
 
@@ -536,18 +833,24 @@ class CronService:
 
     # -- End persistent session generations ----------------------------------
 
-    def _load_merged_jobs(self) -> list[CronJob]:
+    def _load_merged_jobs(self, strict: bool = False) -> list[CronJob]:
         """Load and merge jobs from system.yaml and jobs.yaml.
 
         System jobs come from system.yaml (managed by `nerve init`).
         User jobs come from jobs.yaml (user-defined, never touched by Nerve).
         If a user job has the same ID as a system job, the user version wins.
+
+        Jobs holding an id the daemon reserves for itself are dropped here, so
+        no caller can schedule, catch up or hand-run one.
+
+        With ``strict=True`` a malformed file raises ConfigError instead of
+        being silently treated as empty (used by reload()).
         """
         system_file = self.config.cron.system_file
         jobs_file = self.config.cron.jobs_file
 
-        system_jobs = load_jobs(system_file)
-        user_jobs = load_jobs(jobs_file)
+        system_jobs = load_jobs(system_file, strict=strict)
+        user_jobs = load_jobs(jobs_file, strict=strict)
 
         if not system_jobs and user_jobs:
             # Backward compat: old install with everything in jobs.yaml
@@ -558,7 +861,7 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
-            return user_jobs
+            return _drop_reserved(user_jobs)
 
         # Tag sources for display in CLI
         for j in system_jobs:
@@ -579,7 +882,7 @@ class CronService:
         for j in user_jobs:
             jobs_by_id[j.id] = j
 
-        return list(jobs_by_id.values())
+        return _drop_reserved(list(jobs_by_id.values()))
 
     async def _run_job_wrapper(self, job: CronJob) -> None:
         """Wrapper to run a cron job with logging and optional lock."""

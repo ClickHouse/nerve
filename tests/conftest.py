@@ -78,6 +78,24 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     _repoint_import_time_state_paths(monkeypatch)
 
 
+@pytest.fixture
+def clean_registry():
+    """Snapshot ``GATE_REGISTRY`` and restore it after the test.
+
+    The gate-plugin loader mutates the process-global registry; without this,
+    gates registered by one test would leak into the others (and into
+    test_cron_gates.py, which asserts on the exact built-in set).
+    """
+    from nerve.cron.gates import GATE_REGISTRY
+
+    saved = dict(GATE_REGISTRY)
+    try:
+        yield
+    finally:
+        GATE_REGISTRY.clear()
+        GATE_REGISTRY.update(saved)
+
+
 @pytest_asyncio.fixture
 async def db(tmp_path):
     """Create a fresh in-memory-like database for each test."""
