@@ -53,6 +53,13 @@ from nerve.workflows.service import ENGINE_CLAUDE, WorkflowRunService
 
 def _make_config(tmp_path: Path) -> NerveConfig:
     cfg = NerveConfig()
+    # Isolate the workspace: loops default legs' cwd to config.workspace,
+    # which start_run validates as a real directory — the default
+    # ~/nerve-workspace exists on dev machines but NOT on CI runners
+    # (every dispatch would fail as 'cwd is not a directory').
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    cfg.workspace = workspace
     cfg.workflows.runs_dir = tmp_path / "runs"
     cfg.workflows.kill_grace_seconds = 0
     rl = cfg.workflows.review_loop
