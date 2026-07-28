@@ -193,19 +193,15 @@ class AgentEngine:
         # when Nerve is invoked from within a Claude Code session (e.g. CLI).
         os.environ.pop("CLAUDECODE", None)
 
-        self.config = config
+        self._config = config
         self.db = db
-        self.sessions = SessionManager(
-            db,
-            sticky_period_minutes=config.sessions.sticky_period_minutes,
-            default_backend=config.agent.backend,
-            cron_backend=config.agent.resolved_cron_backend,
-            backend_models={
-                "claude": config.agent.model,
-                "codex": config.codex.model,
-            },
-            default_cwd=str(config.workspace),
-        )
+        # ``default_cwd`` is seeded once and never re-seeded: it comes from
+        # ``workspace``, which the skill manager, the tool context and the memory
+        # bridges also captured at construction, so following a reload here alone
+        # would put the session manager in a different workspace from everything
+        # else. Everything the setter below *does* re-seed follows a reload.
+        self.sessions = SessionManager(db, default_cwd=str(config.workspace))
+        self.config = config
         self._semaphore = asyncio.Semaphore(config.agent.max_concurrent)
         self._memory_bridge = None
         self._xmemory_bridge = None
@@ -281,9 +277,12 @@ class AgentEngine:
         # session by the STICKY rule (stored sessions.backend first, then
         # config) — see _backend_for. ``_session_backends`` mirrors the
         # live client's backend for hot paths (finalize, idle watcher).
+        # Config is handed over as a callable reading this engine's attribute,
+        # so a reload that re-points the engine moves the backends with it and
+        # a single key can never be live here and frozen there.
         self._backends: dict[str, AgentBackend] = build_backends(
             BackendDeps(
-                config=self.config,
+                config=lambda: self.config,
                 db=self.db,
                 registry=self.registry,
                 tool_ctx_factory=self._build_tool_context,
@@ -294,6 +293,43 @@ class AgentEngine:
             )
         )
         self._session_backends: dict[str, str] = {}
+
+    @property
+    def config(self) -> NerveConfig:
+        return self._config
+
+    @config.setter
+    def config(self, config: NerveConfig) -> None:
+        """Adopt a freshly loaded config, moving the seeded collaborators with it.
+
+        A setter rather than a method because assignment is how a config reload
+        hands the new object over, and because the values the session manager was
+        seeded with at construction have to move in the same step. Backend
+        resolution reads ``agent.backend`` live off this object but the session
+        manager holds its own copy for the rows it creates; leaving one behind
+        would route new sessions by the old default while every other read used
+        the new one — live on one side of the engine, frozen on the other, and
+        nothing to say which answer you were looking at.
+
+        The backends need nothing here: they resolve config through a callable
+        onto this attribute, so they follow automatically.
+
+        NOT re-seeded, and so still restart-only: ``agent.max_concurrent`` (its
+        semaphore cannot be resized under in-flight turns) and everything derived
+        from ``workspace``.
+        """
+        self._config = config
+        sessions = getattr(self, "sessions", None)
+        if sessions is not None:
+            sessions.sticky_period_minutes = config.sessions.sticky_period_minutes
+            sessions.default_backend = config.agent.backend
+            sessions.cron_backend = (
+                config.agent.resolved_cron_backend or config.agent.backend
+            )
+            sessions.backend_models = {
+                "claude": config.agent.model,
+                "codex": config.codex.model,
+            }
 
     def set_notification_service(self, service: Any) -> None:
         """Install the notification service used by per-session ``ToolContext``.

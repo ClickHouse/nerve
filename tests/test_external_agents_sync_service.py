@@ -262,3 +262,70 @@ class TestShutdownWaitsForTheSweep:
     ) -> None:
         """Lifespan shutdown runs even when startup failed before start()."""
         await SyncService(codex_config).stop()
+
+
+@pytest.mark.asyncio
+async def test_update_config_swaps_targets_and_conflict_policy(
+    fake_home: Path, codex_config: NerveConfig, workspace: Path,
+) -> None:
+    """A config reload replaces the process config object, and the routes that
+    add / remove / toggle a target edit that object in place — so a sweeper still
+    holding the previous one would keep rendering the old target list while every
+    toggle reported success.
+    """
+    with _patch_writer_allowlist(fake_home):
+        svc = SyncService(codex_config)
+        assert svc._writer.policy == "backup"
+
+        reloaded = NerveConfig()
+        reloaded.workspace = workspace
+        reloaded.external_agents = ExternalAgentsConfig(
+            enabled=True,
+            sync_interval_minutes=5,
+            conflict_policy="skip",
+            targets=[
+                ExternalAgentTargetConfig(name="codex", enabled=False, token="t"),
+            ],
+        )
+        svc.update_config(reloaded)
+
+        assert svc._config is reloaded
+        assert svc._writer.policy == "skip"
+        result = await svc.run_once()
+        assert result["codex"].enabled is False
+
+
+@pytest.mark.asyncio
+async def test_loop_reads_the_interval_every_cycle(
+    fake_home: Path, codex_config: NerveConfig,
+) -> None:
+    """The interval used to be computed once before the loop, so a reload that
+    changed it could never take effect."""
+    import asyncio
+
+    with _patch_writer_allowlist(fake_home):
+        svc = SyncService(codex_config)
+
+    timeouts: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def fake_wait_for(coro, timeout=None):
+        timeouts.append(timeout)
+        coro.close()
+        if len(timeouts) == 1:
+            # Between cycles: a reload halves the configured interval.
+            svc._config.external_agents.sync_interval_minutes = 30
+            raise asyncio.TimeoutError
+        svc._stop_event.set()
+        return True
+
+    with patch.object(asyncio, "wait_for", fake_wait_for), \
+            patch.object(svc, "run_once", new=_noop_sweep):
+        await svc._loop()
+
+    assert real_wait_for is asyncio.wait_for  # patch cleanly undone
+    assert timeouts == [3600, 1800]
+
+
+async def _noop_sweep():
+    return {}

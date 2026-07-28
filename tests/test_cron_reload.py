@@ -1,4 +1,4 @@
-"""Tests for cron hot-reload and the reserved job-id namespace (Story 5)."""
+"""Tests for cron hot-reload and the reserved job-id namespace."""
 
 from __future__ import annotations
 
@@ -158,6 +158,7 @@ class TestReload:
         result = await service.reload()  # identical file
         assert result == {
             "added": [], "removed": [], "updated": ["j1"], "enabled": 1,
+            "rejected": [],
         }
         assert service.scheduler.get_job("j1") is not None
 
@@ -168,7 +169,9 @@ class TestReloadSafety:
         service, jobs_file = svc
         _write_jobs(jobs_file, [_job_dict("j1", enabled=False)])
         result = await service.reload()
-        assert result == {"added": [], "removed": [], "updated": [], "enabled": 0}
+        assert result == {
+            "added": [], "removed": [], "updated": [], "enabled": 0, "rejected": [],
+        }
         assert service.scheduler.get_job("j1") is None
 
     @pytest.mark.asyncio
@@ -274,6 +277,69 @@ class TestReloadSafety:
         assert service.scheduler.get_job("source:github") is None
         # The daemon's own wakeup sweep is never displaced by a same-named job.
         assert service.scheduler.get_job("wakeup_sweep") is None
+
+    @pytest.mark.asyncio
+    async def test_reload_names_the_jobs_it_refused(self, svc):
+        """A refused job is missing from the schedule *and* from added/removed/
+        updated, so without this it disappears from the reload entirely and the
+        only trace is a log line on a box nobody is tailing.
+        """
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [
+            _job_dict("source:gmail", schedule="1h"),
+            _job_dict("cleanup", schedule="1h"),
+            _job_dict("legit", schedule="1h"),
+        ])
+        result = await service.reload()
+        assert result["rejected"] == ["source:gmail", "cleanup"]
+        assert result["enabled"] == 1  # only 'legit' — not 3
+
+        # Renaming the job clears the refusal on the next reload.
+        _write_jobs(jobs_file, [
+            _job_dict("my-gmail", schedule="1h"),
+            _job_dict("legit", schedule="1h"),
+        ])
+        result = await service.reload()
+        assert result["rejected"] == []
+        assert result["added"] == ["my-gmail"] and result["enabled"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_source_reload_cannot_take_a_colliding_job_off_the_schedule(
+        self, svc, monkeypatch,
+    ):
+        """Source runners schedule with ``replace_existing=True``, so before the
+        whole ``source:`` namespace was reserved, turning a source on removed a
+        user job's trigger while every later reload kept counting it as enabled —
+        unrecoverable short of a restart. Both halves are checked here: the job
+        never gets a trigger to lose, and the reload says so.
+        """
+        import nerve.sources.registry as registry
+
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [
+            _job_dict("source:gmail", schedule="1h"),
+            _job_dict("legit", schedule="1h"),
+        ])
+        result = await service.reload()
+        assert result["rejected"] == ["source:gmail"]
+        assert result["enabled"] == 1
+
+        runner = MagicMock()
+        runner.job_id = "source:gmail"
+        runner.source.source_name = "gmail"
+        service.config.sync.gmail.schedule = "5m"
+        monkeypatch.setattr(
+            registry, "build_source_runners", lambda config, db: [runner],
+        )
+        await service.reload_sources()
+
+        # The trigger under that id belongs to the source runner, and the reload
+        # after it still reports one enabled job — the one that is really live.
+        assert service.scheduler.get_job("source:gmail") is not None
+        result = await service.reload()
+        assert result["enabled"] == 1
+        assert result["rejected"] == ["source:gmail"]
+        assert service.scheduler.get_job("legit") is not None
 
     @pytest.mark.asyncio
     async def test_reserved_rejection_is_logged(self, svc, caplog):

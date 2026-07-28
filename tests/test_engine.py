@@ -116,7 +116,7 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
     """Codex-only runbook semantics must never alter Claude's prompt."""
     cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
     backend = ClaudeBackend(SimpleNamespace(
-        config=cfg,
+        config=lambda: cfg,
         claude_plugins=lambda: [],
     ))
     marker = "exact claude system prompt"
@@ -264,7 +264,7 @@ async def test_receive_turn_handles_empty_stream():
 
 def _make_backend() -> ClaudeBackend:
     """Minimal ClaudeBackend (validate_resume_target reads no config)."""
-    return ClaudeBackend(SimpleNamespace(config=SimpleNamespace()))
+    return ClaudeBackend(SimpleNamespace(config=lambda: SimpleNamespace()))
 
 
 class TestValidateResumeTarget:
@@ -407,7 +407,7 @@ def _make_hook_backend(background_agent_permissions: bool) -> ClaudeBackend:
             background_agent_permissions=background_agent_permissions,
         ),
     )
-    return ClaudeBackend(SimpleNamespace(config=config))
+    return ClaudeBackend(SimpleNamespace(config=lambda: config))
 
 
 def _hook_spec(session_id: str) -> SessionSpec:

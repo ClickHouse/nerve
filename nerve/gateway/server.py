@@ -113,6 +113,117 @@ async def _send_session_status(
     await websocket.send_json(status_msg)
 
 
+async def _periodic_db_retention(db) -> None:
+    """Opt-in DB retention loop: compact old memorized messages' blocks/thinking
+    JSON, prune append-only telemetry + file snapshots, checkpoint the WAL.
+
+    The file shrink (VACUUM) is an explicit operator step (``nerve db vacuum``),
+    never on this loop.
+
+    Every setting is read from the current config each cycle, so the interval and
+    the retention windows follow a config reload, and switching retention off
+    stops the work from the next tick. Switching it *on* needs a restart: with no
+    task running there is nothing left to notice the flag.
+    """
+    if not get_config().retention.enabled:
+        return
+    while True:
+        retention = get_config().retention
+        await asyncio.sleep(retention.interval_hours * 3600)
+        retention = get_config().retention
+        if not retention.enabled:
+            continue
+        try:
+            report = await db.run_retention(
+                retention_days=retention.retention_days,
+                retention_full_days=retention.retention_full_days,
+            )
+            if (
+                report.get("messages_compacted")
+                or report.get("telemetry_deleted")
+                or report.get("snapshots_deleted")
+            ):
+                logger.info("DB retention: %s", report)
+        except Exception as e:
+            logger.error("DB retention failed: %s", e)
+
+
+async def _periodic_backup(notification_service) -> None:
+    """Opt-in backup loop: hourly tick, runs a bundle when the newest one in the
+    target dir is older than ``backup.interval_hours`` (or none exists).
+
+    The heavy work (consistent DB snapshots + tar) runs in a thread so it never
+    blocks the event loop. Failures notify high-priority — a backup that fails
+    silently is worse than no backup at all.
+
+    The tick runs whether or not backups are on and reads the current config each
+    time, so every ``backup.*`` setting — enabling it included — takes effect
+    without a restart.
+    """
+    from nerve import backup as backup_mod
+
+    nerve_dir = paths.nerve_home()
+    while True:
+        await asyncio.sleep(3600)  # hourly tick
+        config = get_config()
+        bcfg = config.backup
+        interval_s = max(1, bcfg.interval_hours) * 3600
+        target = Path(bcfg.target_dir).expanduser() if bcfg.target_dir else None
+        if not bcfg.enabled or target is None:
+            continue
+        try:
+            age = await asyncio.to_thread(
+                backup_mod.latest_bundle_age_seconds, target,
+            )
+            if age is not None and age < interval_s:
+                continue  # not due yet
+
+            result = await asyncio.to_thread(
+                backup_mod.create_backup,
+                nerve_dir,
+                config.workspace,
+                target,
+                config_dir=config.config_dir,
+                include_workspace=bcfg.include_workspace,
+                include_secrets=True,
+                workspace_excludes=bcfg.workspace_excludes,
+            )
+            deleted = await asyncio.to_thread(
+                backup_mod.prune, target, bcfg.retention_count,
+            )
+            size_str = (
+                f"{result.size / (1024 ** 3):.1f} GB"
+                if result.size >= 1024 ** 3
+                else f"{result.size / (1024 ** 2):.0f} MB"
+            )
+            logger.info(
+                "Scheduled backup OK: %s (%s, pruned %d)",
+                result.path.name, size_str, len(deleted),
+            )
+            if bcfg.notify_on_success:
+                await notification_service.send_notification(
+                    session_id="system",
+                    title="💾 Backup OK",
+                    body=(
+                        f"{size_str}, {len(backup_mod.list_bundles(target))} "
+                        f"kept ({result.file_count} files)"
+                    ),
+                    priority="low",
+                )
+        except Exception as e:
+            logger.error("Scheduled backup failed: %s", e, exc_info=True)
+            if bcfg.notify_on_failure:
+                try:
+                    await notification_service.send_notification(
+                        session_id="system",
+                        title="⚠️ Nerve backup FAILED",
+                        body=f"{e}\n\nTarget: {target}",
+                        priority="high",
+                    )
+                except Exception as ne:
+                    logger.error("Backup failure notify failed: %s", ne)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
@@ -227,14 +338,13 @@ async def lifespan(app: FastAPI):
     try:
         from nerve.cron.service import CronService
         cron = CronService(config, _engine, db)
+        # Wire health-alert notifications before start() so source runners built
+        # during start (and any later reload) pick it up.
+        cron.notification_service = notification_service
         await cron.start()
         cron_task = cron
         _cron_service = cron
         logger.info("Cron service started")
-
-        # Wire notification service to source runners for health alerts
-        for runner in cron._source_runners:
-            runner.set_notification_service(notification_service)
 
         # Register cron jobs that suppress the session label in notifications
         for job in cron._jobs:
@@ -353,18 +463,26 @@ async def lifespan(app: FastAPI):
     # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
     # it tightens to hourly only when the opt-in interactive idle auto-close
     # (sessions.interactive_archive_after_hours > 0) is enabled and needs finer resolution.
+    #
+    # This and the loops below re-read get_config() per cycle rather than closing
+    # over the start-up object: a config reload replaces that object, and a loop
+    # holding the old one would keep applying settings the operator has already
+    # changed, with nothing to show for it.
     async def _periodic_cleanup():
         while True:
             interval = (
-                3600 if config.sessions.interactive_archive_after_hours > 0 else 6 * 3600
+                3600
+                if get_config().sessions.interactive_archive_after_hours > 0
+                else 6 * 3600
             )
             await asyncio.sleep(interval)
             try:
                 if _engine:
+                    sessions = get_config().sessions
                     stats = await _engine.sessions.run_cleanup(
-                        archive_after_days=config.sessions.archive_after_days,
-                        max_sessions=config.sessions.max_sessions,
-                        interactive_archive_after_hours=config.sessions.interactive_archive_after_hours,
+                        archive_after_days=sessions.archive_after_days,
+                        max_sessions=sessions.max_sessions,
+                        interactive_archive_after_hours=sessions.interactive_archive_after_hours,
                     )
                     if (
                         stats.get("archived_stale")
@@ -391,7 +509,10 @@ async def lifespan(app: FastAPI):
     async def _periodic_memorize():
         from datetime import datetime, timezone
         while True:
-            await asyncio.sleep(config.sessions.memorize_interval_minutes * 60)
+            interval_minutes = get_config().sessions.memorize_interval_minutes
+            # Keep the diagnostics figure honest about the cadence in force.
+            _memorize_stats["interval_minutes"] = interval_minutes
+            await asyncio.sleep(interval_minutes * 60)
             try:
                 if _engine:
                     result = await _engine.run_memorization_sweep()
@@ -441,102 +562,10 @@ async def lifespan(app: FastAPI):
 
     notify_maintenance_task = asyncio.create_task(_periodic_notify_maintenance())
 
-    # Periodic DB retention (opt-in). Compacts old memorized messages'
-    # blocks/thinking JSON and prunes append-only telemetry + file snapshots,
-    # then checkpoints the WAL. No-ops unless retention.enabled is set. The
-    # file shrink (VACUUM) is an explicit operator step (`nerve db vacuum`),
-    # never on this loop.
-    async def _periodic_db_retention():
-        if not config.retention.enabled:
-            return
-        interval = config.retention.interval_hours * 3600
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                report = await db.run_retention(
-                    retention_days=config.retention.retention_days,
-                    retention_full_days=config.retention.retention_full_days,
-                )
-                if (
-                    report.get("messages_compacted")
-                    or report.get("telemetry_deleted")
-                    or report.get("snapshots_deleted")
-                ):
-                    logger.info("DB retention: %s", report)
-            except Exception as e:
-                logger.error("DB retention failed: %s", e)
-
-    db_retention_task = asyncio.create_task(_periodic_db_retention())
-
-    # Periodic backup (opt-in). Hourly tick; runs a bundle when the newest
-    # one in the target dir is older than interval_hours (or none exists).
-    # The heavy work (consistent DB snapshots + tar) runs in a thread so it
-    # never blocks the event loop. Failures notify high-priority — a backup
-    # that fails silently is worse than no backup at all.
-    async def _periodic_backup():
-        from nerve import backup as backup_mod
-
-        bcfg = config.backup
-        nerve_dir = paths.nerve_home()
-        interval_s = max(1, bcfg.interval_hours) * 3600
-        target = Path(bcfg.target_dir).expanduser() if bcfg.target_dir else None
-        while True:
-            await asyncio.sleep(3600)  # hourly tick
-            if not bcfg.enabled or target is None:
-                continue
-            try:
-                age = await asyncio.to_thread(
-                    backup_mod.latest_bundle_age_seconds, target,
-                )
-                if age is not None and age < interval_s:
-                    continue  # not due yet
-
-                result = await asyncio.to_thread(
-                    backup_mod.create_backup,
-                    nerve_dir,
-                    config.workspace,
-                    target,
-                    config_dir=config.config_dir,
-                    include_workspace=bcfg.include_workspace,
-                    include_secrets=True,
-                    workspace_excludes=bcfg.workspace_excludes,
-                )
-                deleted = await asyncio.to_thread(
-                    backup_mod.prune, target, bcfg.retention_count,
-                )
-                size_str = (
-                    f"{result.size / (1024 ** 3):.1f} GB"
-                    if result.size >= 1024 ** 3
-                    else f"{result.size / (1024 ** 2):.0f} MB"
-                )
-                logger.info(
-                    "Scheduled backup OK: %s (%s, pruned %d)",
-                    result.path.name, size_str, len(deleted),
-                )
-                if bcfg.notify_on_success:
-                    await notification_service.send_notification(
-                        session_id="system",
-                        title="💾 Backup OK",
-                        body=(
-                            f"{size_str}, {len(backup_mod.list_bundles(target))} "
-                            f"kept ({result.file_count} files)"
-                        ),
-                        priority="low",
-                    )
-            except Exception as e:
-                logger.error("Scheduled backup failed: %s", e, exc_info=True)
-                if bcfg.notify_on_failure:
-                    try:
-                        await notification_service.send_notification(
-                            session_id="system",
-                            title="⚠️ Nerve backup FAILED",
-                            body=f"{e}\n\nTarget: {target}",
-                            priority="high",
-                        )
-                    except Exception as ne:
-                        logger.error("Backup failure notify failed: %s", ne)
-
-    backup_task = asyncio.create_task(_periodic_backup())
+    # Both opt-in, both no-ops unless their config says otherwise; see their
+    # docstrings for which of their settings survive a config reload.
+    db_retention_task = asyncio.create_task(_periodic_db_retention(db))
+    backup_task = asyncio.create_task(_periodic_backup(notification_service))
 
     # Start the external-agents sync service. It re-renders
     # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace

@@ -177,7 +177,7 @@ def _make_env_backend(
         effective_api_key="",
         agent=SimpleNamespace(model_aliases=aliases or {}),
     )
-    return ClaudeBackend(SimpleNamespace(config=config))
+    return ClaudeBackend(SimpleNamespace(config=lambda: config))
 
 
 def test_build_env_5m_has_no_cache_flag():

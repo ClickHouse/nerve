@@ -6,9 +6,11 @@ pulls the merged result onto the instance so it can hot-reload — no restart, n
 hand-editing on the box.
 
 ``sync_workspace`` does a guarded ``git pull --ff-only`` and (optionally)
-validates the pulled bundle. Applying the change (reloading cron / MCP) is the
-caller's job: the in-daemon periodic loop reloads explicitly, while the CLI only
-moves the files and leaves a running daemon to pick them up on its next cycle.
+validates the pulled bundle. Applying the merged change is the caller's job: the
+in-daemon periodic loop runs the unified reload itself — the config object and the
+services holding their own reference, then cron jobs, cron sources, MCP servers
+and skills — while the CLI only moves the files and leaves a running daemon to
+pick them up on its next cycle.
 """
 
 from __future__ import annotations
@@ -467,9 +469,11 @@ def _sync_workspace(
 async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Event) -> None:
     """Daemon loop: pull the workspace every ``interval_minutes`` and apply.
 
-    On a successful, changed, valid pull it reloads MCP config and cron so the
-    merged changes take effect without a restart. Best-effort — a failed cycle is
-    logged and the loop continues.
+    On a successful, changed, valid pull it runs the same unified reload as
+    ``POST /api/config/reload`` — the process-wide config object and the services
+    holding their own reference, then cron jobs, cron sources, MCP servers and
+    skills — so the merged changes take effect without a restart. Best-effort: a
+    failed cycle is logged and the loop continues.
 
     This loop is the only thing that applies a merged change on its own, so
     ``interval_minutes`` is the upper bound on how stale an instance can be.
@@ -477,15 +481,17 @@ async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Ev
 
     Every cycle re-reads the process-wide config object rather than working from
     a reference captured before the loop, so the loop can never be the reason a
-    setting is stuck. What refreshes that object is :func:`_apply_sync`, i.e. a
-    sync that actually merged something — after which ``branch``, ``validate``,
-    ``strict_env``, ``interval_minutes``, the workspace location and turning sync
-    off all apply from the following cycle. Nothing *else* refreshes it, so a
-    hand-edited ``config.yaml`` on the box still needs a restart. Turning sync
-    *on* needs one regardless: this task is created at start-up only when sync is
-    already enabled, and nothing creates it later.
+    setting is stuck. That object is replaced by any config reload — a sync that
+    merged something, or ``POST /api/config/reload`` — after which ``branch``,
+    ``validate``, ``strict_env``, ``interval_minutes``, the workspace location and
+    turning sync off all apply from the following cycle. A file edited on the box
+    does *not* reload itself, so a hand-edited ``config.yaml`` reaches this loop
+    only once a reload is asked for. Turning sync *on* needs a restart regardless:
+    this task is created at start-up only when sync is already enabled, and
+    nothing creates it later.
     """
     from nerve.config import get_config
+    from nerve.config_reload import reload_failures
 
     cfg = config.workspace_sync
     interval = max(1, cfg.interval_minutes) * 60
@@ -528,65 +534,64 @@ async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Ev
                 continue
             if result.changed:
                 logger.info("Workspace sync: %s — applying", result.message)
-                apply_error = await _apply_sync(
+                summary = await _apply_sync(
                     engine, cron_service, config.config_dir or config.workspace,
                 )
-                if apply_error:
+                failures = reload_failures(summary)
+                # Both branches sit at WARNING beside the INFO line above, which
+                # on its own reads as "applied".
+                if "config" in failures:
                     # The merge landed but the daemon is still running the old
-                    # config. Logged at WARNING beside the INFO line above, which
-                    # otherwise reads as "applied".
+                    # config.
                     logger.warning(
                         "Workspace sync: merged %s but the new config could not "
                         "be loaded, so NOTHING was applied and this daemon is "
                         "still running the previous configuration: %s",
-                        result.new_rev[:8], apply_error,
+                        result.new_rev[:8], failures["config"],
+                    )
+                elif failures:
+                    # Config loaded, so the merge is partly live — which is the
+                    # state hardest to spot from the outside and so the one that
+                    # has to be named rather than left to the summary line.
+                    logger.warning(
+                        "Workspace sync: merged %s and loaded the new config, but "
+                        "%s did not take it — this daemon is running the merged "
+                        "configuration only in part",
+                        result.new_rev[:8],
+                        "; ".join(f"{k} ({v})" for k, v in sorted(failures.items())),
                     )
         except Exception as e:  # noqa: BLE001 — never let the loop die
             logger.warning("Workspace sync cycle failed: %s", e)
             continue
 
 
-async def _apply_sync(engine, cron_service, config_dir) -> str | None:
+async def _apply_sync(engine, cron_service, config_dir) -> dict:
     """Hot-reload the subsystems affected by a workspace pull.
 
-    Re-reads the typed config and re-points the singleton, so a synced settings
-    change engages here without a restart for everything that reads the singleton
-    per use: the lockdown write guards (``is_locked``), gateway authentication,
-    and — because it re-reads the singleton every cycle — the sync loop itself.
-    ``cron_service.config`` and ``engine.config`` are re-pointed too. What is
-    *not*: cron jobs and gates already built, which follow on the next
-    ``cron_service.reload()``, and anything captured in a closure or a dataclass
-    at start-up, which follows on a restart. This is also the only path that
-    refreshes any of it — a hand edit to a config file on the box is not picked
-    up, by design for a locked instance and by omission otherwise.
+    Delegates to the unified reload so a synced pull applies the SAME set of
+    subsystems as a manual ``POST /api/config/reload`` — the process config
+    object, cron jobs, sources, MCP, and skills.
 
-    Returns the config-reload error, if any. A merge that lands config the daemon
-    cannot load has applied nothing, however well the merge itself went, and the
-    caller must not report success for it: the case that makes this concrete is a
-    pull that turns ``lockdown`` on, where reporting success tells the operator a
-    box is locked while its write guards are still open.
+    Replacing the config object is what makes a synced settings change engage
+    without a restart, for everything that reads it per use: the lockdown write
+    guards (``is_locked``), gateway authentication, and — because it re-reads it
+    every cycle — the sync loop itself. The services that captured the old object
+    are re-pointed with it. What is *not*: cron jobs and gates already built,
+    which follow on the next ``cron_service.reload()``, and anything a service
+    derived from config when it was constructed, which follows on a restart.
+
+    Returns the per-subsystem summary. It has to be *read*, not assumed: a merge
+    that lands config the daemon cannot load has applied nothing however well the
+    merge itself went, and a merge whose config loaded but whose cron reload
+    failed is in effect only in part. The case that makes this concrete is a pull
+    that turns ``lockdown`` on, where reporting a clean success tells the operator
+    the box is locked while its write guards are still open.
     """
-    from nerve.config import load_config, set_config
+    from nerve.config_reload import reload_all, reload_failures
 
-    config_error: str | None = None
-    try:
-        new_config = load_config(config_dir)
-        set_config(new_config)
-        if cron_service is not None:
-            cron_service.config = new_config
-        if engine is not None and hasattr(engine, "config"):
-            engine.config = new_config
-    except Exception as e:  # noqa: BLE001 — a bad reload must not kill the loop
-        config_error = f"{type(e).__name__}: {e}"
-        logger.warning("config reload after sync failed: %s", e, exc_info=True)
-    if cron_service is not None:
-        try:
-            await cron_service.reload()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("cron reload after sync failed: %s", e, exc_info=True)
-    if engine is not None:
-        try:
-            await engine.reload_mcp_config()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("MCP reload after sync failed: %s", e, exc_info=True)
-    return config_error
+    summary = await reload_all(engine, cron_service, config_dir)
+    if reload_failures(summary):
+        logger.warning("Applied synced config, with failures: %s", summary)
+    else:
+        logger.info("Applied synced config: %s", summary)
+    return summary

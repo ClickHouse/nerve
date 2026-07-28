@@ -1165,6 +1165,107 @@ def doctor(ctx: click.Context) -> None:
         ctx.exit(1)
 
 
+# Bind addresses that name no connectable destination, so a client on the same
+# box has to ask for loopback instead.
+_WILDCARD_BINDS = ("", "0.0.0.0", "::", "*")
+
+
+def _gateway_url(config, path: str) -> str:
+    """URL for a loopback call to this box's own gateway.
+
+    ``gateway.host`` is a *bind* address, not necessarily somewhere a client can
+    connect to; see :data:`_WILDCARD_BINDS`.
+    """
+    scheme = "https" if config.gateway.ssl.enabled else "http"
+    host = config.gateway.host
+    if host in _WILDCARD_BINDS:
+        host = "127.0.0.1"
+    return f"{scheme}://{host}:{config.gateway.port}{path}"
+
+
+@main.command()
+@click.pass_context
+def reload(ctx: click.Context) -> None:
+    """Apply config edits to the running daemon without restarting it.
+
+    Re-reads config.yaml, config.local.yaml and the workspace settings, then
+    reloads cron jobs, cron sources, MCP servers and skills. Anything that needs
+    a restart instead is listed rather than silently skipped; `docs/config.md`
+    has the full table.
+    """
+    import httpx
+
+    from nerve.gateway.auth import create_token
+
+    config = ctx.obj["config"]
+    if config is None:
+        raise click.ClickException(
+            f"Config could not be loaded ({ctx.obj.get('config_error')}); "
+            "run 'nerve config validate' to see why."
+        )
+    if not config.auth.jwt_secret:
+        raise click.ClickException(
+            "auth.jwt_secret is not set, so this command cannot authenticate to "
+            "the gateway. Run 'nerve init', or POST /api/config/reload yourself."
+        )
+    url = _gateway_url(config, "/api/config/reload")
+    # Certificate verification stands except in the one case where it cannot
+    # hold: a wildcard bind means the request goes to 127.0.0.1, and the
+    # daemon's certificate is issued for a hostname, so checking it there would
+    # fail on exactly the setups that bothered to configure TLS. When
+    # gateway.host names a real host the certificate should match it, and a
+    # failure there is worth hearing about rather than skipping past.
+    verify = config.gateway.host not in _WILDCARD_BINDS
+    try:
+        resp = httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {create_token(config.auth.jwt_secret)}"},
+            verify=verify,
+            # A reload re-reads config and rebuilds cron, sources, MCP and
+            # skills; MCP servers in particular can take a while to come up.
+            timeout=120,
+        )
+    except httpx.ConnectError:
+        raise click.ClickException(
+            f"No daemon answering at {url} — nothing to reload. "
+            "A stopped daemon reads config fresh when it starts ('nerve start')."
+        ) from None
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"Could not reach {url}: {e}") from None
+    if resp.status_code in (401, 403):
+        raise click.ClickException(
+            "The gateway rejected the token. This usually means the running "
+            "daemon started with a different auth.jwt_secret than the config "
+            "here — restart it to pick up the new one."
+        )
+    if resp.status_code != 200:
+        raise click.ClickException(f"{url} returned {resp.status_code}: {resp.text[:400]}")
+
+    body = resp.json()
+    errors = body.get("errors") or {}
+    for name, outcome in (body.get("detail") or {}).items():
+        if name == "restart_required":
+            continue
+        if name in errors:
+            click.secho(f"  [ERR] {name}: {errors[name]}", fg="red")
+            continue
+        if isinstance(outcome, dict):
+            outcome = ", ".join(f"{k}={v}" for k, v in outcome.items())
+        click.echo(f"  {name}: {outcome}")
+    if body.get("restart_required"):
+        click.secho(
+            f"  [WARN] changed but needs a restart: {body['restart_required']}",
+            fg="yellow",
+        )
+    if body.get("ok"):
+        click.secho("Config reloaded", fg="green")
+    else:
+        # Partial by design: a bad settings.yaml must not block a valid cron
+        # edit. Non-zero so a script doesn't read this as a clean apply.
+        click.secho("Config reload incomplete — see the errors above", fg="red")
+        ctx.exit(1)
+
+
 @main.command()
 @click.option("--dry-run", is_flag=True, help="Show what would change without writing.")
 @click.pass_context

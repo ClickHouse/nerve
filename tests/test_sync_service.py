@@ -9,12 +9,13 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import nerve.sync_service as sync
 from nerve.config import WorkspaceSyncConfig
+from nerve.config_reload import reload_failures
 from nerve.config_validate import ValidationResult
 from nerve.sync_service import sync_workspace
 
@@ -744,6 +745,17 @@ class TestApplySync:
         engine.reload_mcp_config.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_apply_reloads_sources_and_skills(self, tmp_path):
+        """Sync applies the SAME subsystems as a manual reload (sources+skills)."""
+        cron = AsyncMock()
+        engine = MagicMock()
+        engine.reload_mcp_config = AsyncMock(return_value=[])
+        engine._skill_manager.discover = AsyncMock(return_value=[])
+        await sync._apply_sync(engine, cron, tmp_path)
+        cron.reload_sources.assert_awaited_once()
+        engine._skill_manager.discover.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_apply_survives_reload_error(self, tmp_path):
         cron = AsyncMock()
         cron.reload.side_effect = RuntimeError("boom")
@@ -771,8 +783,8 @@ class TestApplySync:
         monkeypatch.setattr(sync, "_git", lambda args, cwd: _cp(stdout="origin\n"))
         monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
         assert not is_locked()
-        err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
-        assert err is None
+        summary = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
+        assert "config" not in reload_failures(summary)
         assert is_locked()  # the reloaded config engaged lockdown
 
     @pytest.mark.asyncio
@@ -796,8 +808,9 @@ class TestApplySync:
             encoding="utf-8",
         )
         monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
-        err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
-        assert err and "NO_SUCH_SECRET_HERE" in err
+        summary = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
+        failures = reload_failures(summary)
+        assert "NO_SUCH_SECRET_HERE" in failures["config"]
         assert not is_locked()  # still running the old config — which the caller must say
 
     @pytest.mark.asyncio
@@ -823,13 +836,50 @@ class TestApplySync:
         )
 
         async def _failing_apply(engine, cron_service, config_dir):
-            return "ConfigError: nope"
+            return {"config": "error: ConfigError: nope"}
 
         monkeypatch.setattr(sync, "_apply_sync", _failing_apply)
         body = await route_mod.sync_workspace_route(user={})
         assert body["ok"] is False
         assert body["changed"] is True and body["applied"] is False
         assert body["apply_error"] == "ConfigError: nope"
+
+    @pytest.mark.asyncio
+    async def test_route_reports_a_partly_applied_merge(self, tmp_path, monkeypatch):
+        """The config loaded, so the merged settings *are* live — but cron didn't
+        take it, so the daemon is on the merged config only in part. Reporting a
+        clean `applied` for that hides the one outcome an operator cannot see
+        from the outside.
+        """
+        import nerve.gateway.server as srv
+
+        import nerve.gateway.routes.config as route_mod
+        from nerve.sync_service import SyncResult
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace = str(tmp_path / "ws")
+        fake_cfg.config_dir = str(tmp_path / "cfg")
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        monkeypatch.setattr(
+            route_mod, "get_deps", lambda: type("D", (), {"engine": None})(),
+        )
+        monkeypatch.setattr(
+            sync, "sync_workspace",
+            lambda *a, **k: SyncResult(ok=True, changed=True, message="updated"),
+        )
+
+        async def _partial_apply(engine, cron_service, config_dir):
+            return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _partial_apply)
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["ok"] is True  # the merged config itself is in effect
+        assert body["applied"] is False  # ...but not everywhere
+        assert body["apply_error"] is None
+        assert body["reload_errors"] == {"cron": "bad jobs.yaml"}
 
 
 class TestNeverRaises:
@@ -1022,17 +1072,16 @@ class TestPeriodicLoop:
         )
 
     @pytest.mark.asyncio
-    async def test_editing_config_on_disk_does_not_reach_the_loop(
+    async def test_editing_config_on_disk_does_not_reach_the_loop_on_its_own(
         self, tmp_path, monkeypatch,
     ):
-        """What actually happens today, and what the docs must therefore say.
+        """A file changing on disk is not a reload, and deliberately so.
 
-        The loop re-reads the process-wide config object every cycle, but nothing
-        refreshes that object after start-up, so an edited config.yaml is never
-        seen. If this test starts failing because something now reloads the
-        singleton, that is good news — update the loop's docstring and the
-        "workspace_sync changes need a restart" paragraph in docs/config.md,
-        which are written to this behavior.
+        The loop re-reads the process-wide config object every cycle, but only an
+        explicit reload replaces that object, so editing config.yaml on the box
+        and waiting achieves nothing. The companion test below covers what
+        happens once a reload is actually asked for; ``docs/config.md`` says the
+        same thing to operators, under "What triggers a reload".
         """
         import nerve.config as nerve_config
 
@@ -1056,6 +1105,52 @@ class TestPeriodicLoop:
 
         assert [k["branch"] for k in seen] == ["OLD", "OLD", "OLD"]
         assert nerve_config.get_config() is started_with
+
+    @pytest.mark.asyncio
+    async def test_a_reload_makes_the_loop_see_the_edited_file(
+        self, tmp_path, monkeypatch,
+    ):
+        """Drives the real config object, not a stand-in for it.
+
+        The loop's per-cycle re-read was correct in shape long before anything
+        replaced the object it reads, and a test that patched ``get_config``
+        would have passed throughout. So this one edits a real config.yaml, runs
+        a real reload, and checks the branch the next cycle actually pulls.
+        """
+        import nerve.config as nerve_config
+        from nerve.config_reload import reload_all
+
+        config_dir = tmp_path / "cfg"
+        _write_config(config_dir, tmp_path / "ws", enabled="true", branch="OLD")
+        monkeypatch.setattr(
+            nerve_config, "_config", nerve_config.load_config(config_dir),
+        )
+        started_with = nerve_config.get_config()
+
+        seen: list[dict] = []
+
+        def edit_then_reload():
+            """Stand in for a hand edit followed by POST /api/config/reload.
+
+            The loop hands ``sync_workspace`` to ``asyncio.to_thread``, so this
+            runs on a worker thread with no event loop of its own — which is what
+            lets it drive the real coroutine rather than a substitute for it.
+            """
+            if len(seen) > 1:
+                return
+            _write_config(
+                config_dir, tmp_path / "ws", enabled="true", branch="NEW",
+            )
+            asyncio.run(reload_all(None, None, config_dir))
+
+        monkeypatch.setattr(
+            sync, "sync_workspace", _sync_double(seen, then=edit_then_reload),
+        )
+        stop, _clock = _run_cycles(monkeypatch, 3)
+        await sync.run_periodic_sync(started_with, AsyncMock(), AsyncMock(), stop)
+
+        assert [k["branch"] for k in seen] == ["OLD", "NEW", "NEW"]
+        assert nerve_config.get_config() is not started_with
 
     @pytest.mark.asyncio
     async def test_loop_follows_the_current_config_object(self, monkeypatch):
@@ -1191,8 +1286,9 @@ class TestSyncRoute:
 
         async def _fake_apply(engine, cron_service, config_dir):
             applied.append(Path(config_dir))
+            return {"config": "reloaded"}
 
         monkeypatch.setattr(sync, "_apply_sync", _fake_apply)
         body = await route_mod.sync_workspace_route(user={})
-        assert body["ok"] and body["changed"]
+        assert body["ok"] and body["changed"] and body["applied"]
         assert applied == [tmp_path / "cfg"]

@@ -45,9 +45,17 @@ class BackendDeps:
 
     Callables (rather than direct references) where the underlying value
     is hot-reloadable or wired up after engine construction.
+
+    ``config`` is one of the hot ones. A config reload replaces the process
+    config object; a backend that captured the old one would keep sending the
+    options the operator has just changed, while the engine — which *is*
+    re-pointed — reported the change applied and rendered it in the UI. One key
+    live on one side of that seam and frozen on the other is the hardest state
+    to diagnose there is, so backends resolve config per read instead of holding
+    it.
     """
 
-    config: "NerveConfig"
+    config: Callable[[], "NerveConfig"]
     db: "Database"
     registry: Any                                   # ToolRegistry
     tool_ctx_factory: Callable[[str], Any]          # session_id -> ToolContext
