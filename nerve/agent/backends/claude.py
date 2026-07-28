@@ -87,6 +87,17 @@ except ImportError:  # pragma: no cover - depends on SDK version
 # kernel limit to leave room for env/argv overhead.
 SYSTEM_PROMPT_INLINE_MAX = 100_000  # bytes
 
+# CLI env vars that remap model *aliases* (the short names accepted by the
+# Agent/Workflow tools' model option, skill frontmatter, `--model opus`,
+# etc.) to concrete model IDs. Consumed by the Claude Code CLI at process
+# start; emitted from agent.model_aliases config in ``_build_env``.
+_MODEL_ALIAS_ENV_VARS: dict[str, str] = {
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+}
+
 
 # ------------------------------------------------------------------ #
 #  SDK message → normalized events                                     #
@@ -558,6 +569,28 @@ class ClaudeBackend:
                 env["ANTHROPIC_BASE_URL"] = (
                     f"http://{config.proxy.host}:{config.proxy.port}"
                 )
+        # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
+        # in Agent/Workflow tool model options, skill frontmatter, and cron
+        # overrides resolve INSIDE the CLI via ANTHROPIC_DEFAULT_<ALIAS>_MODEL
+        # env vars. Nerve defaults "opus" → claude-opus-5 (skipped on Bedrock,
+        # where model IDs need a geo prefix — set agent.model_aliases with
+        # explicit prefixed IDs there). User-configured aliases merge over
+        # the default; an empty value unsets it (CLI built-in mapping wins).
+        aliases: dict[str, str] = {}
+        if not config.provider.is_bedrock:
+            aliases["opus"] = "claude-opus-5"
+        aliases.update(config.agent.model_aliases)
+        for alias, target in aliases.items():
+            env_name = _MODEL_ALIAS_ENV_VARS.get(alias.strip().lower())
+            if env_name is None:
+                logger.warning(
+                    "Unknown model alias %r in agent.model_aliases "
+                    "(supported: %s) — ignored",
+                    alias, ", ".join(sorted(_MODEL_ALIAS_ENV_VARS)),
+                )
+                continue
+            if target:
+                env[env_name] = str(target)
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
@@ -755,6 +788,8 @@ class ClaudeBackend:
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
+        "opus-5":     ("low", "medium", "high", "xhigh", "max"),
+        "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),

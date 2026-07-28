@@ -145,9 +145,17 @@ class AgentConfig:
     # Wakeup turns fire on existing sessions and inherit their stored
     # backend — this only affects freshly minted cron/hook sessions.
     cron_backend: str = ""
-    model: str = "claude-opus-4-8"
+    model: str = "claude-opus-5"
     cron_model: str = "claude-sonnet-4-6"
     title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
+    # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
+    # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
+    # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
+    # overrides) resolve to the mapped model. Supported aliases: opus,
+    # sonnet, haiku, fable. Nerve defaults opus → claude-opus-5 on
+    # non-Bedrock providers; entries here merge over that default, and an
+    # empty value ("") unsets it (falls back to the CLI's built-in mapping).
+    model_aliases: dict[str, str] = field(default_factory=dict)
     max_turns: int = 100
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
@@ -204,9 +212,13 @@ class AgentConfig:
         return cls(
             backend=str(d.get("backend", "claude")).strip().lower(),
             cron_backend=str(d.get("cron_backend") or "").strip().lower(),
-            model=d.get("model", "claude-opus-4-8"),
+            model=d.get("model", "claude-opus-5"),
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
             title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
+            model_aliases={
+                str(k): str(v or "")
+                for k, v in (d.get("model_aliases") or {}).items()
+            },
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
