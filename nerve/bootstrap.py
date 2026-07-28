@@ -988,7 +988,7 @@ class SetupWizard:
         click.echo()
         click.secho(
             f"  → Model IDs will use the '{prefix}.' inference-profile prefix\n"
-            f"    (e.g. {prefix}.anthropic.claude-opus-4-8) based on region {region}.",
+            f"    (e.g. {prefix}.anthropic.claude-opus-5) based on region {region}.",
             fg="green",
         )
         click.echo()
@@ -1917,7 +1917,7 @@ class SetupWizard:
             "timezone": tz,
             "deployment": self.choices.deployment,
             "agent": {
-                "model": "claude-opus-4-8",
+                "model": "claude-opus-5",
                 "cron_model": "claude-sonnet-4-6",
                 "max_turns": 50,
                 "max_concurrent": 32,
@@ -1983,7 +1983,7 @@ class SetupWizard:
             # The prefix is geography-scoped (us./eu./apac.) and must match
             # the configured region or every call 400s.
             geo = bedrock_geo_prefix(self.choices.aws_region)
-            config["agent"]["model"] = f"{geo}.anthropic.claude-opus-4-8"
+            config["agent"]["model"] = f"{geo}.anthropic.claude-opus-5"
             config["agent"]["cron_model"] = f"{geo}.anthropic.claude-sonnet-4-6"
             config["agent"]["title_model"] = f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"
             config["memory"]["recall_model"] = f"{geo}.anthropic.claude-sonnet-4-6"

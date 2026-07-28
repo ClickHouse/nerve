@@ -165,7 +165,9 @@ class TestResolveAutoCadence:
 # Backend env wiring — the switch reaches the CLI subprocess iff resolved 1h
 # ---------------------------------------------------------------------------
 
-def _make_env_backend(is_bedrock: bool = False) -> ClaudeBackend:
+def _make_env_backend(
+    is_bedrock: bool = False, aliases: dict[str, str] | None = None
+) -> ClaudeBackend:
     config = SimpleNamespace(
         provider=SimpleNamespace(
             is_bedrock=is_bedrock, aws_region="", aws_profile="",
@@ -173,6 +175,7 @@ def _make_env_backend(is_bedrock: bool = False) -> ClaudeBackend:
         ),
         proxy=SimpleNamespace(enabled=False, host="", port=0),
         effective_api_key="",
+        agent=SimpleNamespace(model_aliases=aliases or {}),
     )
     return ClaudeBackend(SimpleNamespace(config=config))
 
@@ -197,6 +200,56 @@ def test_build_env_1h_bedrock_sets_bedrock_flag():
 def test_build_env_default_is_5m():
     env = _make_env_backend()._build_env()
     assert "ENABLE_PROMPT_CACHING_1H" not in env
+
+
+# ---------------------------------------------------------------------------
+# Model-alias env emission (agent.model_aliases → ANTHROPIC_DEFAULT_*_MODEL)
+# ---------------------------------------------------------------------------
+
+def test_build_env_default_opus_alias_maps_to_opus_5():
+    # No config → Nerve's built-in default: the "opus" alias resolves to
+    # claude-opus-5 in every spawned CLI (Agent/Workflow model options etc.).
+    env = _make_env_backend()._build_env()
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5"
+
+
+def test_build_env_alias_config_overrides_default():
+    env = _make_env_backend(aliases={"opus": "claude-opus-4-8"})._build_env()
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-4-8"
+
+
+def test_build_env_alias_empty_value_unsets_default():
+    # Explicit "" opts out — CLI falls back to its built-in mapping.
+    env = _make_env_backend(aliases={"opus": ""})._build_env()
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
+
+
+def test_build_env_extra_alias_merges_over_default():
+    env = _make_env_backend(aliases={"sonnet": "claude-sonnet-5"})._build_env()
+    assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5"
+    # The built-in opus default survives a partial user mapping.
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5"
+
+
+def test_build_env_bedrock_skips_default_alias():
+    # Bare model IDs 400 on Bedrock (geo prefix required) — no implicit
+    # default there.
+    env = _make_env_backend(is_bedrock=True)._build_env()
+    assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
+
+
+def test_build_env_bedrock_explicit_alias_respected():
+    env = _make_env_backend(
+        is_bedrock=True, aliases={"opus": "us.anthropic.claude-opus-5"}
+    )._build_env()
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-5"
+
+
+def test_build_env_unknown_alias_ignored():
+    env = _make_env_backend(aliases={"turbo": "claude-x"})._build_env()
+    assert not any("TURBO" in k for k in env)
+    # Known defaults unaffected by the bad entry.
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5"
 
 
 # ---------------------------------------------------------------------------

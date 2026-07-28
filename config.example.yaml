@@ -32,11 +32,17 @@ timezone: America/New_York
 
 # Agent
 agent:
-  model: claude-opus-4-8         # Primary model for conversations
+  model: claude-opus-5           # Primary model for conversations
   # Use claude-fable-5 for Anthropic's most capable (Mythos-class) model.
-  # Note: ~2x the cost of Opus 4.8 ($10/$50 per MTok in/out).
+  # Note: ~2x the cost of Opus 5 ($10/$50 per MTok in/out).
   cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
   title_model: claude-haiku-4-5-20251001  # Session title generation
+  # Model-alias remapping for the CLI: short aliases ("opus") used in
+  # Agent/Workflow tool model options and skill frontmatter resolve to the
+  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5
+  # is the built-in default (not applied on Bedrock); "" unsets an alias.
+  # model_aliases:
+  #   opus: claude-opus-5
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
   background_agent_permissions: true  # Background sub-agents (Agent run_in_background) get the same tool permissions as foreground; false denies their Write/Edit/Bash
@@ -48,7 +54,7 @@ agent:
     max_tokens: 1024
     timeout_seconds: 45
   # For Bedrock, use model IDs like:
-  #   model: us.anthropic.claude-opus-4-8
+  #   model: us.anthropic.claude-opus-5
   #   cron_model: us.anthropic.claude-sonnet-4-6
   #   title_model: us.anthropic.claude-haiku-4-5-20251001-v1:0
 

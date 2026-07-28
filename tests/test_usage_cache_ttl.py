@@ -191,6 +191,36 @@ class TestPricing:
         assert c5m == 12.50
         assert c1h == 20.00
 
+    def test_opus_5_rates(self):
+        # Anchor: Opus 5 — same tier as 4.8 (verified against published
+        # pricing 2026-07-28). Base $5/MTok in, $25/MTok out, 5m write =
+        # 1.25x = $6.25/MTok, 1h write = 2.00x = $10.00/MTok.
+        from nerve.db.usage import _get_pricing
+        p_in, p_out, _, c5m, c1h, _ = _get_pricing("claude-opus-5")
+        assert p_in == 5
+        assert p_out == 25
+        assert c5m == 6.25
+        assert c1h == 10.00
+
+    def test_opus_5_dated_id_resolves_to_opus_5_tier(self):
+        # Substring precedence: a dated Opus 5 ID must hit the "opus-5"
+        # key — not any 4.x key, and not the silent DEFAULT fallback.
+        from nerve.db.usage import MODEL_PRICING, _get_pricing
+        assert _get_pricing("claude-opus-5-20260720") == MODEL_PRICING["opus-5"]
+
+    def test_opus_4_5_does_not_bleed_into_opus_5(self):
+        # "opus-5" must not substring-match claude-opus-4-5 (or vice versa).
+        from nerve.db.usage import MODEL_PRICING, _get_pricing
+        assert _get_pricing("claude-opus-4-5-20251101") == MODEL_PRICING["opus-4-5"]
+
+    def test_sonnet_5_rates(self):
+        # Sonnet 5 gets its own tier; sonnet 4.x keeps resolving to
+        # "sonnet-4"; old-style claude-3-5-sonnet must NOT hit "sonnet-5".
+        from nerve.db.usage import MODEL_PRICING, _get_pricing
+        assert _get_pricing("claude-sonnet-5") == MODEL_PRICING["sonnet-5"]
+        assert _get_pricing("claude-sonnet-4-6") == MODEL_PRICING["sonnet-4"]
+        assert _get_pricing("claude-3-5-sonnet-20241022") != MODEL_PRICING["sonnet-5"]
+
 
 class TestEstimateCost:
     def test_falls_back_to_5m_when_split_absent(self):

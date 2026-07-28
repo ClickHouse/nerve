@@ -22,6 +22,14 @@ from nerve.config import AgentConfig, NerveConfig
         ("max",    "claude-fable-5",            "max"),
         ("xhigh",  "claude-fable-5",            "xhigh"),
         ("low",    "claude-fable-5",            "low"),
+        # Opus 5 supports the full ladder (verified via Models API 2026-07-28)
+        ("max",    "claude-opus-5",             "max"),
+        ("xhigh",  "claude-opus-5",             "xhigh"),
+        ("xhigh",  "claude-opus-5-20260720",    "xhigh"),
+        ("max",    "us.anthropic.claude-opus-5", "max"),
+        # Sonnet 5 supports the full ladder (unlike Sonnet 4.6's high cap)
+        ("max",    "claude-sonnet-5",           "max"),
+        ("xhigh",  "claude-sonnet-5",           "xhigh"),
         # Opus 4.8 supports every level (same ladder as 4.7)
         ("max",    "claude-opus-4-8",           "max"),
         ("xhigh",  "claude-opus-4-8",           "xhigh"),

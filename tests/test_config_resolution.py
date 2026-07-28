@@ -226,3 +226,26 @@ class TestAppendTelegramAllowedUser:
         append_telegram_allowed_user(tmp_path, 42)
         mode = stat.S_IMODE(os.stat(tmp_path / "config.local.yaml").st_mode)
         assert mode == 0o600
+
+
+class TestModelDefaultsAndAliases:
+    def test_default_model_is_opus_5(self):
+        from nerve.config import AgentConfig
+
+        cfg = AgentConfig.from_dict({})
+        assert cfg.model == "claude-opus-5"
+        assert cfg.model_aliases == {}
+
+    def test_model_aliases_parsed_and_normalized(self):
+        from nerve.config import AgentConfig
+
+        cfg = AgentConfig.from_dict(
+            {"model_aliases": {"opus": "claude-opus-5", "sonnet": None}}
+        )
+        # None/falsy values normalize to "" (explicit unset marker).
+        assert cfg.model_aliases == {"opus": "claude-opus-5", "sonnet": ""}
+
+    def test_model_aliases_key_recognized_by_validator(self):
+        # Guard: agent.model_aliases must not trip unknown-key warnings.
+        merged = {"agent": {"model_aliases": {"opus": "claude-opus-5"}}}
+        assert validate_config_keys(merged) == []
