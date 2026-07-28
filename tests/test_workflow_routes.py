@@ -71,17 +71,20 @@ class FakeEngine:
         pass
 
 
-async def _settle(service) -> None:
-    """Await spawned ``_execute`` tasks that live on the current loop.
+async def _drain(setup) -> None:
+    """Execute spawned run payloads on the current (test) event loop.
 
-    Tasks spawned during a TestClient request run on the request portal's
-    own loop and are already finalized (and popped from ``_exec_tasks``)
-    by the time the request returns — so this only really waits in the
-    direct ``service.start_run(...)`` case.
+    The fixture patches ``service._spawn_execute`` to only record run ids
+    instead of creating real fire-and-forget tasks: under ``TestClient``
+    each request runs on an ephemeral portal loop, and a task spawned
+    there may be cancelled mid-flight at request teardown — leaving
+    futures bound to a dead loop that hang whatever awaits them next
+    (the 6h CI hang). Driving ``_execute`` here keeps every await on one
+    live loop, deterministically. ``_execute`` may re-dispatch queued
+    runs, so drain until the spawn log is empty.
     """
-    tasks = [t for t in service._exec_tasks.values() if not t.done()]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    while setup.spawned:
+        await setup.service._execute(setup.spawned.pop(0))
 
 
 @pytest.mark.asyncio
@@ -113,15 +116,22 @@ class TestWorkflowRunRoutes:
         service = WorkflowRunService(cfg, db, engine)  # type: ignore[arg-type]
         monkeypatch.setattr(workflows_mod, "_service", service)
 
+        # Record dispatched run ids instead of spawning tasks on the
+        # request's portal loop — tests execute them via _drain (above).
+        spawned: list[str] = []
+        monkeypatch.setattr(service, "_spawn_execute", spawned.append)
+
         app = FastAPI()
         app.include_router(wf_router)
         client = TestClient(app)
 
-        yield SimpleNamespace(
+        ns = SimpleNamespace(
             client=client, service=service, engine=engine, db=db, cfg=cfg,
+            spawned=spawned,
         )
+        yield ns
 
-        await _settle(service)
+        await _drain(ns)
         cfg_mod._config = None  # leave global state clean for other tests
 
     async def test_list_empty(self, setup):
@@ -144,7 +154,7 @@ class TestWorkflowRunRoutes:
         assert body["created_by"] == "api"
         assert body["spec"]["prompt"] == "fix issue #12 in myorg/myrepo"
 
-        await _settle(setup.service)
+        await _drain(setup)
 
         resp = setup.client.get("/api/workflow-runs")
         assert resp.status_code == 200
@@ -188,7 +198,7 @@ class TestWorkflowRunRoutes:
         })
         assert resp.status_code == 200
         run_id = resp.json()["id"]
-        await _settle(setup.service)
+        await _drain(setup)
 
         resp = setup.client.post(
             f"/api/workflow-runs/{run_id}/kill", json={"reason": "operator abort"},
@@ -211,7 +221,7 @@ class TestWorkflowRunRoutes:
             budget_usd=3.0,
             title="journal demo",
         )
-        await _settle(setup.service)
+        await _drain(setup)
 
         fresh = await setup.service.get_run(run["id"])
         assert fresh is not None
@@ -243,7 +253,7 @@ class TestWorkflowRunRoutes:
             spec={"prompt": "traversal check"},
             budget_usd=1.0,
         )
-        await _settle(setup.service)
+        await _drain(setup)
 
         # Point the row at a directory outside runs_dir; the endpoint must
         # refuse to read it and return the empty journal shape.

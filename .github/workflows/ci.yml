@@ -19,6 +19,10 @@ jobs:
   backend-tests:
     name: Backend tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The suite finishes in ~1 minute; a hang should fail fast instead of
+    # burning the 6h default (bit us on 2026-07-27: a test awaiting a task
+    # on a dead TestClient portal loop parked two runs for 6h each).
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +54,7 @@ jobs:
   frontend-build:
     name: Frontend build (Vite)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
