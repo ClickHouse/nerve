@@ -330,6 +330,18 @@ class WorkflowRunService:
         )
         if not flipped:
             return
+        self._spawn_execute(run_id)
+
+    def _spawn_execute(self, run_id: str) -> None:
+        """Spawn the run payload as a fire-and-forget task (test seam).
+
+        Route tests replace this to drive ``_execute`` on their own event
+        loop: under ``TestClient`` each request runs on an ephemeral
+        portal loop, so a task spawned here is cancelled mid-flight when
+        that portal shuts down — leaving futures bound to a dead loop
+        that hang whatever awaits them next (surfaced as a 6h CI hang in
+        test_workflow_routes).
+        """
         task = asyncio.create_task(
             self._execute(run_id), name=f"workflow-run-{run_id}",
         )
