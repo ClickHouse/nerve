@@ -30,6 +30,7 @@ from pathlib import Path
 
 import click
 
+from nerve import paths
 from nerve.config import (
     RESUME_QUEUE_FILE,
     load_config,
@@ -38,10 +39,9 @@ from nerve.config import (
     write_config_pointer,
 )
 
-# Default PID file location
-PID_DIR = Path("~/.nerve").expanduser()
-PID_FILE = PID_DIR / "nerve.pid"
-LOG_FILE = PID_DIR / "nerve.log"
+# PID / log file locations resolve lazily through nerve.paths so that a
+# NERVE_HOME override (e.g. in tests or multi-instance setups) is always
+# honored — nothing is frozen at import time.
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -62,7 +62,7 @@ def setup_logging(verbose: bool = False) -> None:
 def _read_pid() -> int | None:
     """Read PID from file. Returns None if no valid PID file."""
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid = int(paths.pid_file().read_text().strip())
         return pid
     except (FileNotFoundError, ValueError):
         return None
@@ -80,14 +80,14 @@ def _is_running(pid: int) -> bool:
 
 
 def _write_pid(pid: int, config_dir: Path | None = None) -> None:
-    PID_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(pid))
+    paths.nerve_home().mkdir(parents=True, exist_ok=True)
+    paths.pid_file().write_text(str(pid))
     if config_dir is not None:
         write_config_pointer(config_dir)
 
 
 def _remove_pid() -> None:
-    PID_FILE.unlink(missing_ok=True)
+    paths.pid_file().unlink(missing_ok=True)
 
 
 def _get_daemon_status() -> tuple[bool, int | None]:
@@ -294,9 +294,9 @@ def start(ctx: click.Context, foreground: bool) -> None:
         cmd.extend(["start", "--foreground"])
 
         # Ensure log directory exists
-        PID_DIR.mkdir(parents=True, exist_ok=True)
+        paths.nerve_home().mkdir(parents=True, exist_ok=True)
 
-        log_fd = open(LOG_FILE, "a")
+        log_fd = open(paths.log_file(), "a")
         proc = subprocess.Popen(
             cmd,
             stdout=log_fd,
@@ -310,13 +310,13 @@ def start(ctx: click.Context, foreground: bool) -> None:
         time.sleep(1)
         if proc.poll() is not None:
             click.echo(f"Nerve failed to start (exit code {proc.returncode})")
-            click.echo(f"Check logs: {LOG_FILE}")
+            click.echo(f"Check logs: {paths.log_file()}")
             ctx.exit(1)
             return
 
         click.echo(f"Nerve started (PID {proc.pid})")
         click.echo(f"  Listening on {config.gateway.host}:{config.gateway.port}")
-        click.echo(f"  Logs: {LOG_FILE}")
+        click.echo(f"  Logs: {paths.log_file()}")
 
 
 @main.command()
@@ -440,8 +440,8 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     helper_script = (
         "import os, signal, subprocess, sys, time\n"
         f"old_pid = {old_pid if running else 'None'}\n"
-        f"pid_file = {str(PID_FILE)!r}\n"
-        f"log_file = {str(LOG_FILE)!r}\n"
+        f"pid_file = {str(paths.pid_file())!r}\n"
+        f"log_file = {str(paths.log_file())!r}\n"
         f"start_cmd = {start_cmd_parts!r}\n"
         "if old_pid is not None:\n"
         "    try:\n"
@@ -480,7 +480,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         "    sys.exit(1)\n"
     )
 
-    log_fd = open(LOG_FILE, "a")
+    log_fd = open(paths.log_file(), "a")
     subprocess.Popen(
         [sys.executable, "-c", helper_script],
         stdout=log_fd,
@@ -549,14 +549,14 @@ def status(ctx: click.Context, follow: bool) -> None:
 
         config = ctx.obj["config"]
         click.echo(f"  Listening on {config.gateway.host}:{config.gateway.port}")
-        click.echo(f"  Logs: {LOG_FILE}")
+        click.echo(f"  Logs: {paths.log_file()}")
     else:
         click.echo("Nerve is not running")
 
-    if follow and LOG_FILE.exists():
-        click.echo(f"\n--- Tailing {LOG_FILE} ---")
+    if follow and paths.log_file().exists():
+        click.echo(f"\n--- Tailing {paths.log_file()} ---")
         try:
-            os.execlp("tail", "tail", "-f", str(LOG_FILE))
+            os.execlp("tail", "tail", "-f", str(paths.log_file()))
         except Exception:
             click.echo("Cannot tail log file")
 
@@ -573,16 +573,16 @@ def logs(ctx: click.Context) -> None:
         _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         return  # unreachable
 
-    if not LOG_FILE.exists():
-        click.echo(f"No log file at {LOG_FILE}")
+    if not paths.log_file().exists():
+        click.echo(f"No log file at {paths.log_file()}")
         return
 
-    click.echo(f"--- {LOG_FILE} ---")
+    click.echo(f"--- {paths.log_file()} ---")
     try:
-        os.execlp("tail", "tail", "-f", str(LOG_FILE))
+        os.execlp("tail", "tail", "-f", str(paths.log_file()))
     except Exception:
         # Fallback: print last 50 lines
-        lines = LOG_FILE.read_text().splitlines()
+        lines = paths.log_file().read_text().splitlines()
         for line in lines[-50:]:
             click.echo(line)
 
@@ -693,13 +693,21 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
     click.echo("  nerve restart")
 
 
-_CONFIG_SOURCE_LABELS = {
-    "flag": "--config-dir flag",
-    "env": "NERVE_CONFIG_DIR env var",
-    "cwd": "current directory",
-    "pointer": "~/.nerve/config_dir pointer",
-    "default": "current directory (no config found anywhere)",
-}
+def _config_source_label(source: str) -> str:
+    """Human-readable name for where the config directory was discovered.
+
+    A function rather than a module-level dict because the pointer label names
+    a machine-local path: baked in at import time it would report whatever
+    ``NERVE_HOME`` said before the process was fully set up, so doctor output
+    could point the reader at a file that is not the one being consulted.
+    """
+    return {
+        "flag": "--config-dir flag",
+        "env": "NERVE_CONFIG_DIR env var",
+        "cwd": "current directory",
+        "pointer": f"{paths.config_pointer_file()} pointer",
+        "default": "current directory (no config found anywhere)",
+    }.get(source, source)
 
 
 def _check_api_connectivity(config) -> tuple[bool, str]:
@@ -742,7 +750,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # Where the config came from — surfaces CWD mixups immediately
     config_dir = getattr(config, "config_dir", None)
     if config_dir is not None:
-        source_label = _CONFIG_SOURCE_LABELS.get(config_source, config_source)
+        source_label = _config_source_label(config_source)
         suffix = f" (via {source_label})" if source_label else ""
         has_base = (Path(config_dir) / "config.yaml").exists()
         has_local = (Path(config_dir) / "config.local.yaml").exists()
@@ -910,7 +918,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         warnings.append("[WARN] JWT secret not set — running in dev mode")
 
     # Check DB
-    db_path = Path("~/.nerve/nerve.db").expanduser()
+    db_path = paths.db_path()
     if db_path.exists():
         lines.append(f"[OK] Database: {db_path} ({db_path.stat().st_size / 1024:.1f} KB)")
     else:
@@ -986,7 +994,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append(
             "[--] Backups not configured — set backup.target_dir + enabled to "
-            "protect ~/.nerve against disk loss"
+            f"protect {paths.home_label()} against disk loss"
         )
 
     # Check external tools
@@ -1221,7 +1229,7 @@ def setup_telegram(ctx: click.Context) -> None:
         ctx.exit(1)
         return
 
-    session_path = os.path.expanduser("~/.nerve/telegram_sync")
+    session_path = str(paths.nerve_path("telegram_sync"))
     click.echo(f"Telethon session: {session_path}.session")
     click.echo(f"API ID: {api_id}")
     click.echo()
@@ -1322,7 +1330,7 @@ def backup(ctx: click.Context, output: str | None, state_only: bool, no_secrets:
             "in config.yaml (an external mount or synced dir is recommended)."
         )
 
-    nerve_dir = PID_DIR
+    nerve_dir = paths.nerve_home()
     include_workspace = config.backup.include_workspace and not state_only
 
     if not quiet:
@@ -1381,7 +1389,7 @@ def restore(ctx: click.Context, bundle: str, verify_only: bool, force: bool) -> 
     if not bundle_path.is_file():
         raise click.ClickException(f"Bundle not found: {bundle_path}")
 
-    nerve_dir = PID_DIR
+    nerve_dir = paths.nerve_home()
 
     if verify_only:
         try:
@@ -1448,7 +1456,7 @@ def migrate_openclaw(ctx: click.Context, sessions_dir: str, dry_run: bool, min_m
 
     config = ctx.obj["config"]
     sessions_path = Path(sessions_dir).expanduser()
-    conv_dir = Path("~/.nerve/memu-conversations").expanduser()
+    conv_dir = paths.nerve_path("memu-conversations")
 
     if not sessions_path.exists():
         click.echo(f"[ERR] Sessions directory not found: {sessions_path}")
@@ -1695,7 +1703,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
     from nerve.db import Database
 
     config = ctx.obj["config"]
-    db_path = Path("~/.nerve/nerve.db").expanduser()
+    db_path = paths.db_path()
     if not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
@@ -1750,7 +1758,7 @@ def db_vacuum(ctx: click.Context) -> None:
     from nerve.db import Database
 
     config = ctx.obj["config"]
-    db_path = Path("~/.nerve/nerve.db").expanduser()
+    db_path = paths.db_path()
     if not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
@@ -1803,7 +1811,7 @@ def _format_workflow_run(run: dict) -> str:
 
 
 def _workflow_db_path(ctx: click.Context) -> Path:
-    db_path = Path("~/.nerve/nerve.db").expanduser()
+    db_path = paths.db_path()
     if not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)

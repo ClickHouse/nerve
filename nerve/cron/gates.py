@@ -41,6 +41,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+from nerve import paths
+
 if TYPE_CHECKING:
     from nerve.db import Database
 
@@ -402,7 +404,7 @@ class GitHubPrActivityGate(CronGate):
 
     def _state_path(self, job_id: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in job_id)
-        d = Path.home() / ".nerve" / "cache"
+        d = paths.cache_dir()
         d.mkdir(parents=True, exist_ok=True)
         return d / f"pr_activity_{safe}.json"
 

@@ -1,5 +1,5 @@
 """Tests for config-dir resolution, the pointer file, unknown-key
-validation, and config write-back helpers."""
+validation, blank path settings, and config write-back helpers."""
 
 from __future__ import annotations
 
@@ -10,8 +10,17 @@ from pathlib import Path
 import pytest
 import yaml
 
+from nerve import paths
 from nerve.config import (
+    BackupConfig,
+    CodexConfig,
+    CodexOriginConfig,
+    CronConfig,
+    NerveConfig,
+    ProxyConfig,
+    SSLConfig,
     TelegramConfig,
+    WorkflowRunsConfig,
     append_telegram_allowed_user,
     load_config,
     read_config_pointer,
@@ -322,3 +331,139 @@ class TestClaudeModels:
         # Guard: agent.models must not trip unknown-key warnings.
         merged = {"agent": {"models": ["claude-opus-5"]}}
         assert validate_config_keys(merged) == []
+
+
+class TestBlankPathSettingsMeanUnset:
+    """A path setting left blank must fall back to its default, not to ".".
+
+    ``Path("")`` is ``Path(".")`` and truthy, so a key written as ``runs_dir:``
+    or ``cert: ""`` would otherwise sail straight past the ``or <default>``
+    fallback and resolve to the working directory the daemon was started in —
+    silently, since that directory usually exists and is writable. One test per
+    key, because each one goes wrong in its own way: writing state where nobody
+    will look for it, importing whatever ``.py`` files happen to be lying
+    around, or serving TLS with no certificate.
+    """
+
+    def test_gateway_ssl_blank_cert_and_key_disable_tls(self):
+        ssl = SSLConfig.from_dict({"cert": "", "key": ""})
+        assert (ssl.cert, ssl.key) == (None, None)
+        assert ssl.enabled is False
+
+    def test_gateway_ssl_blank_cert_alone_disables_tls(self):
+        """``enabled`` means "both files are set" — half-configured is off."""
+        ssl = SSLConfig.from_dict({"cert": "", "key": "/etc/ssl/nerve.key"})
+        assert ssl.enabled is False
+
+    def test_workflows_runs_dir(self):
+        """Run journals belong under the state dir, not next to the daemon."""
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": ""})
+        assert cfg.runs_dir == paths.nerve_path("workflow-runs")
+
+    def test_proxy_binary_path(self):
+        cfg = ProxyConfig.from_dict({"binary_path": ""})
+        assert cfg.binary_path == paths.nerve_path("bin", "cli-proxy-api")
+
+    def test_proxy_auth_dir(self):
+        """Proxy OAuth material must not be dropped into the cwd."""
+        cfg = ProxyConfig.from_dict({"auth_dir": ""})
+        assert cfg.auth_dir == paths.nerve_path("cli-proxy-auth")
+
+    def test_proxy_log_file(self):
+        cfg = ProxyConfig.from_dict({"log_file": ""})
+        assert cfg.log_file == paths.nerve_path("proxy.log")
+
+    def test_cron_gate_plugins_dir(self):
+        """This one executes what it finds — every ``*.py`` in the directory."""
+        cfg = CronConfig.from_dict({"gate_plugins_dir": ""})
+        assert cfg.gate_plugins_dir == paths.cron_dir() / "gates"
+
+    def test_cron_jobs_file(self):
+        cfg = CronConfig.from_dict({"jobs_file": ""})
+        assert cfg.jobs_file == paths.cron_dir() / "jobs.yaml"
+
+    def test_cron_system_file(self):
+        cfg = CronConfig.from_dict({"system_file": ""})
+        assert cfg.system_file == paths.cron_dir() / "system.yaml"
+
+    def test_workspace(self):
+        cfg = NerveConfig.from_dict({"workspace": ""})
+        assert cfg.workspace == paths.default_workspace()
+
+    @pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t "])
+    def test_whitespace_only_counts_as_blank(self, blank):
+        """A stray space after the colon is the likeliest way to write this."""
+        cfg = CronConfig.from_dict({"gate_plugins_dir": blank})
+        assert cfg.gate_plugins_dir == paths.cron_dir() / "gates"
+
+    def test_an_env_var_that_expands_to_nothing_is_blank_too(self, monkeypatch):
+        """``NERVE_TEST_RUNS_DIR=`` in a unit file or compose env block."""
+        monkeypatch.setenv("NERVE_TEST_RUNS_DIR", "")
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "$NERVE_TEST_RUNS_DIR"})
+        assert cfg.runs_dir == paths.nerve_path("workflow-runs")
+
+    def test_a_configured_path_is_still_honored(self):
+        cfg = CronConfig.from_dict({"gate_plugins_dir": "/opt/nerve/gates"})
+        assert cfg.gate_plugins_dir == Path("/opt/nerve/gates")
+
+    def test_tilde_still_expands(self):
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "~/runs"})
+        assert cfg.runs_dir == Path.home() / "runs"
+
+    def test_surrounding_whitespace_is_trimmed_not_baked_in(self):
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "  ~/runs  "})
+        assert cfg.runs_dir == Path.home() / "runs"
+
+    def test_a_set_env_var_still_expands(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("NERVE_TEST_RUNS_DIR", str(tmp_path / "runs"))
+        cfg = WorkflowRunsConfig.from_dict({"runs_dir": "$NERVE_TEST_RUNS_DIR"})
+        assert cfg.runs_dir == tmp_path / "runs"
+
+
+class TestBlankStringPathSettingsMeanUnset:
+    """The same rule for the path settings that stay ``str``.
+
+    These fields are not ``Path``-typed, so they never reach
+    ``_expand_path`` — something downstream re-expands them instead. That
+    makes the rule easy to lose: ``or <default>`` catches ``""`` and a
+    missing key but not ``"  "``, which is truthy and survives all the way
+    to ``Path("  ")`` — a directory named two spaces, relative to wherever
+    the daemon happened to start. A stray space after the colon is the
+    likeliest way to write any of these.
+    """
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n", " \t "])
+    def test_codex_origin_sessions_path(self, blank):
+        cfg = CodexOriginConfig.from_dict({"path": blank})
+        assert cfg.path == "~/.codex/sessions"
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n", " \t "])
+    def test_codex_origin_archive_path(self, blank):
+        """Rollouts get *moved* here — a wrong value relocates real data."""
+        cfg = CodexOriginConfig.from_dict({"archive_path": blank})
+        assert cfg.archive_path == "~/.codex/archived_sessions"
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n", " \t "])
+    def test_codex_home_dir(self, blank):
+        cfg = CodexConfig.from_dict({"home_dir": blank})
+        assert cfg.home_dir == str(paths.nerve_path("codex"))
+
+    @pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t "])
+    def test_backup_target_dir_stays_unset(self, blank):
+        """Blank means "no destination configured", and must keep meaning it.
+
+        ``target_dir`` has no default to fall back to — the empty string *is*
+        the unset value, and callers gate on it. Whitespace would read as a
+        configured destination and send bundles to a directory named for a
+        space.
+        """
+        cfg = BackupConfig.from_dict({"target_dir": blank})
+        assert cfg.target_dir == ""
+
+    def test_a_configured_string_path_is_still_honored(self):
+        cfg = CodexOriginConfig.from_dict({"path": "/srv/codex/sessions"})
+        assert cfg.path == "/srv/codex/sessions"
+
+    def test_surrounding_whitespace_is_trimmed_not_baked_in(self):
+        cfg = CodexOriginConfig.from_dict({"path": "  /srv/codex/sessions  "})
+        assert cfg.path == "/srv/codex/sessions"

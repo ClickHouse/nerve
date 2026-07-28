@@ -20,6 +20,7 @@ from typing import Any
 import click
 import yaml
 
+from nerve import paths
 from nerve.workspace import initialize_workspace, install_bundled_skills
 
 
@@ -423,7 +424,9 @@ def _check_openai_key(key: str, timeout: float = 7.0) -> tuple[bool, str]:
 # to start over. Answers are now checkpointed after every step so an
 # interrupted setup resumes where it left off.
 
-INIT_STATE_FILE = Path("~/.nerve/init-state.json")
+def _init_state_file() -> Path:
+    """Wizard checkpoint file under the machine-local state dir."""
+    return paths.nerve_path("init-state.json")
 
 
 def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
@@ -439,7 +442,7 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
             "completed": sorted(completed),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
-        path = INIT_STATE_FILE.expanduser()
+        path = _init_state_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state), encoding="utf-8")
         os.chmod(path, 0o600)  # contains API keys
@@ -450,14 +453,14 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
 def _load_init_state() -> dict | None:
     try:
         return json.loads(
-            INIT_STATE_FILE.expanduser().read_text(encoding="utf-8")
+            _init_state_file().read_text(encoding="utf-8")
         )
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 
 
 def _clear_init_state() -> None:
-    INIT_STATE_FILE.expanduser().unlink(missing_ok=True)
+    _init_state_file().unlink(missing_ok=True)
 
 
 def _choices_from_dict(data: dict) -> SetupChoices:
@@ -1065,10 +1068,13 @@ class SetupWizard:
                     self.choices.use_proxy = False
                     self._step_api_key_direct()
         else:
+            # The operator is meant to paste this, so the paths have to be the
+            # ones the proxy service actually uses (nerve/proxy/service.py).
             click.secho(
                 "\n  You can authenticate later by running:\n"
-                "    ~/.nerve/bin/cli-proxy-api --claude-login --no-browser \\\n"
-                "      --config ~/.nerve/cli-proxy-config.yaml",
+                f"    {paths.path_label('bin', 'cli-proxy-api')}"
+                " --claude-login --no-browser \\\n"
+                f"      --config {paths.path_label('cli-proxy-config.yaml')}",
                 dim=True,
             )
 
@@ -1102,13 +1108,13 @@ class SetupWizard:
             click.secho("    TOOLS.md      — Environment-specific notes", dim=True)
 
         click.echo()
-        default_ws = "/root/nerve-workspace" if self._inside_docker else "~/nerve-workspace"
+        default_ws = _DOCKER_WORKSPACE if self._inside_docker else "~/nerve-workspace"
         ws = click.prompt("Workspace path", default=default_ws)
         self.choices.workspace_path = Path(ws)
         click.echo()
         click.secho(
             "  Nerve also stores databases, logs, and session data in\n"
-            "  ~/.nerve/ — this is separate from your workspace.",
+            f"  {paths.home_label()}/ — this is separate from your workspace.",
             dim=True,
         )
         click.echo()
@@ -1676,9 +1682,9 @@ class SetupWizard:
         self._write_config_local_yaml()
         click.secho(" ✓", fg="green")
 
-        # 9. Create ~/.nerve directory structure
-        click.echo("  Setting up ~/.nerve/...", nl=False)
-        nerve_dir = Path("~/.nerve").expanduser()
+        # 9. Create the machine-local state directory
+        click.echo(f"  Setting up {paths.home_label()}/...", nl=False)
+        nerve_dir = paths.nerve_home()
         nerve_dir.mkdir(parents=True, exist_ok=True)
         (nerve_dir / "cron").mkdir(parents=True, exist_ok=True)
         click.secho(" ✓", fg="green")
@@ -1941,10 +1947,9 @@ class SetupWizard:
                     else _WORKER_MEMORY_CATEGORIES
                 ),
             },
-            "cron": {
-                "system_file": "~/.nerve/cron/system.yaml",
-                "jobs_file": "~/.nerve/cron/jobs.yaml",
-            },
+            # No "cron" block: CronConfig already defaults to paths.cron_dir().
+            # Pinning literal ~/.nerve paths here overrode NERVE_HOME and sent
+            # the daemon looking somewhere `nerve init` had not written.
             "sessions": {
                 "sticky_period_minutes": 120,
                 "archive_after_days": 30,
@@ -2127,8 +2132,12 @@ class SetupWizard:
                     job["run_if"] = cron["run_if"]
                 jobs.append(job)
 
-        # Write system crons (managed by nerve init, safe to regenerate)
-        system_file = Path("~/.nerve/cron/system.yaml").expanduser()
+        # Write system crons (managed by nerve init, safe to regenerate).
+        # Must go through paths.cron_dir() -- a literal ~/.nerve here ignores
+        # NERVE_HOME, so a relocated instance writes its jobs into the default
+        # state dir while the daemon reads them from the relocated one.
+        cron_dir = paths.cron_dir()
+        system_file = cron_dir / "system.yaml"
         system_file.parent.mkdir(parents=True, exist_ok=True)
 
         with open(system_file, "w") as f:
@@ -2138,7 +2147,7 @@ class SetupWizard:
             yaml.safe_dump({"jobs": jobs}, f, default_flow_style=False, sort_keys=False)
 
         # Create empty jobs.yaml scaffold if it doesn't exist
-        jobs_file = Path("~/.nerve/cron/jobs.yaml").expanduser()
+        jobs_file = cron_dir / "jobs.yaml"
         if not jobs_file.exists():
             with open(jobs_file, "w") as f:
                 f.write("# Nerve — Custom Cron Jobs\n")
@@ -2313,7 +2322,7 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     # Optional
     choices.mode = os.environ.get("NERVE_MODE", "personal")
     choices.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-    default_ws = "/root/nerve-workspace" if is_docker else "~/nerve-workspace"
+    default_ws = _DOCKER_WORKSPACE if is_docker else "~/nerve-workspace"
     choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", default_ws))
     choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")
     choices.telegram_bot_token = os.environ.get("NERVE_TELEGRAM_BOT_TOKEN", "")
@@ -2420,6 +2429,23 @@ def _wrap_text(text: str, width: int = 51) -> list[str]:
 
 # --- Docker file templates ---
 
+# Container-side locations, referenced by the Dockerfile, the compose mounts and
+# the agent-facing docs below so they can't drift apart. The image sets both as
+# environment variables rather than relying on the root user's $HOME happening
+# to be /root — see nerve.paths.nerve_home() for how NERVE_HOME is consumed.
+_DOCKER_NERVE_HOME = "/root/.nerve"
+_DOCKER_WORKSPACE = "/root/nerve-workspace"
+
+
+def _compose_host_state_dir() -> str:
+    """Host-side path to mount as the container's state dir.
+
+    Uses the raw ``NERVE_HOME`` value rather than the expanded one: compose
+    expands ``~`` itself, so echoing what the operator wrote keeps the
+    generated file portable between machines.
+    """
+    return os.environ.get(paths.NERVE_HOME_ENV, "").strip() or "~/.nerve"
+
 _DOCKERFILE_TEMPLATE = """
 FROM python:3.13-slim
 
@@ -2442,11 +2468,13 @@ RUN GOG_VERSION=0.11.0 \\
     && ARCH=$(dpkg --print-architecture) \\
     && curl -fsSL "https://github.com/steipete/gogcli/releases/download/v${GOG_VERSION}/gogcli_${GOG_VERSION}_linux_${ARCH}.tar.gz" \\
     | tar xz -C /usr/local/bin gog
-
-RUN mkdir -p /root/.nerve /root/nerve-workspace
+""" + f"""
+RUN mkdir -p {_DOCKER_NERVE_HOME} {_DOCKER_WORKSPACE}
 
 ENV NERVE_DOCKER=1
-
+ENV NERVE_HOME={_DOCKER_NERVE_HOME}
+ENV NERVE_WORKSPACE={_DOCKER_WORKSPACE}
+""" + """
 WORKDIR /nerve
 
 # Pre-install Python dependencies for caching
@@ -2483,11 +2511,16 @@ def _build_docker_compose(
     # sdk_session_id rows fail every --resume with "No conversation found"
     # exit 1. Siloed under ~/.nerve so the agent's CLI is isolated from
     # the host user's personal ~/.claude (where macOS stores OAuth tokens).
+    # The host side follows NERVE_HOME too. Deriving only the container side
+    # would mount the default ~/.nerve into an instance the operator had
+    # deliberately relocated, giving the host and the container two different
+    # databases with no indication anything was wrong.
+    host_state = _compose_host_state_dir()
     volumes = [
         ".:/nerve",
-        "~/.nerve:/root/.nerve",
-        "~/.nerve/claude:/root/.claude",
-        f"{workspace_path}:/root/nerve-workspace",
+        f"{host_state}:{_DOCKER_NERVE_HOME}",
+        f"{host_state}/claude:/root/.claude",
+        f"{workspace_path}:{_DOCKER_WORKSPACE}",
     ]
 
     # Optional auth mounts — only include if the host directory exists.
@@ -2568,8 +2601,10 @@ fi
 mkdir -p /root/.claude
 chmod 700 /root/.claude
 
-# Clean up stale PID file from previous container runs
-rm -f ~/.nerve/nerve.pid
+# Clean up stale PID file from previous container runs. The Dockerfile sets
+# NERVE_HOME; the fallback keeps this working if the entrypoint is reused
+# somewhere that doesn't.
+rm -f "${NERVE_HOME:-$HOME/.nerve}/nerve.pid"
 
 # If no arguments, default to init + start
 if [ $# -eq 0 ]; then
@@ -2580,29 +2615,32 @@ else
 fi
 """
 
-_DOCKER_TOOLS_SECTION = """
+_DOCKER_TOOLS_SECTION = f"""
 ## Docker Environment
 
 You are running inside a Docker container. Key paths:
 
 | Path | Contents | Writable | Notes |
 |------|----------|----------|-------|
-| `/nerve` | Nerve source code | ✓ (bind mount) | `pyproject.toml`, `nerve/` package, `web/` — the full repo. Changes persist to host. |
-| `/root/.nerve` | Config directory | ✓ (bind mount) | `config.yaml`, `config.local.yaml`, `cron/` jobs. |
-| `/root/nerve-workspace` | Your workspace | ✓ (bind mount) | AGENTS.md, SOUL.md, MEMORY.md, etc. — where you live. |
+| `/nerve` | Nerve source code **and config** | ✓ (bind mount) | `pyproject.toml`, `nerve/` package, `web/` — the full repo. The config directory resolves to the working directory, so `config.yaml` and `config.local.yaml` live here. |
+| `{_DOCKER_NERVE_HOME}` | Machine-local state (`$NERVE_HOME`) | ✓ (bind mount) | Databases, logs, PID, caches, `cron/` jobs. Never synced. |
+| `{_DOCKER_WORKSPACE}` | Your workspace (`$NERVE_WORKSPACE`) | ✓ (bind mount) | AGENTS.md, SOUL.md, MEMORY.md, skills — where you live. |
 
 ### Working with Nerve source
 
 - The Nerve package is installed in editable mode (`pip install -e /nerve`).
 - After modifying Nerve source code, changes take effect immediately for Python.
 - If you modify the web UI (`/nerve/web/`), rebuild with: `cd /nerve/web && npm run build`
-- Config files live in `/root/.nerve/`, NOT in `/nerve/`.
+- Config files live in `/nerve/`, NOT in `{_DOCKER_NERVE_HOME}/` — the config
+  directory is the working directory the daemon was started from.
+- Cron jobs live in `{_DOCKER_NERVE_HOME}/cron/` (`jobs.yaml`, `system.yaml`, `gates/`).
 
 ### Credentials
 
 Docker can't access the host's macOS Keychain. Credentials are extracted during
-`nerve init` and stored in `/root/.nerve/config.local.yaml`. The entrypoint exports
-them as environment variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `GH_TOKEN`).
+`nerve init` and stored in `/nerve/config.local.yaml` (alongside `config.yaml`).
+The entrypoint reads that file and exports them as environment variables
+(`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `GH_TOKEN`).
 """
 
 _DOCKERIGNORE_TEMPLATE = """

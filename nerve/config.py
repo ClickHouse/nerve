@@ -14,15 +14,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nerve import paths
+
 import yaml
 
 logger = logging.getLogger(__name__)
 
 # Runtime queue of session ids to auto-resume after ``nerve restart --resume``.
 # The CLI appends ids here (synchronously, before triggering the restart) and
-# the fresh daemon drains it on startup. Kept next to the other ~/.nerve runtime
-# state (pid/log/db) and independent of ``-c`` so writer and reader always agree.
-RESUME_QUEUE_FILE = Path("~/.nerve/resume-after-restart").expanduser()
+# the fresh daemon drains it on startup. Kept next to the other machine-local
+# runtime state (pid/log/db) and independent of ``-c`` so writer and reader
+# always agree — which is why it goes through the path provider rather than a
+# literal home: with NERVE_HOME set, a hardcoded path would have the CLI write
+# one file and the daemon read another.
+RESUME_QUEUE_FILE = paths.nerve_path("resume-after-restart")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -37,9 +42,55 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _expand_path(p: str | None) -> Path | None:
+    """Expand a configured path; a blank value means "not set" (``None``).
+
+    Blank has to mean unset because ``Path("")`` is ``Path(".")``, which is
+    *truthy*. Callers spell their defaults as ``_expand_path(...) or
+    <default>``, so a key written ``runs_dir: ""`` — or left as a bare
+    ``runs_dir:`` with a stray space after it — would otherwise sail past the
+    fallback and quietly mean "the directory the daemon was started in": run
+    journals, proxy auth material, and the gate-plugin directory whose ``*.py``
+    files get imported and executed, all landing somewhere nobody chose, with
+    nothing logged to say so. ``gateway.ssl`` is sharper still because it has no
+    fallback at all — ``enabled`` is "cert and key are both set", so a blank
+    cert would switch TLS *on* with ``.`` as the certificate file. Blank there
+    means TLS off.
+
+    Expansion covers ``~`` and environment variables that are set, and the
+    blank check is applied to what comes back out as well: a variable that is
+    set but *empty* (``NERVE_RUNS_DIR=`` in a unit file or a compose env block)
+    expands to nothing and would land right back on ``Path(".")``. An unset
+    ``$VAR`` is a different case — ``expandvars`` leaves it in the string
+    verbatim, which yields a literal, obviously-wrong path instead of another
+    silent "unset", and that is the more useful failure. Stripping happens
+    before ``expanduser`` because ``expanduser`` only expands a leading ``~``,
+    so ``" ~/runs"`` would otherwise keep its tilde.
+    """
     if p is None:
         return None
-    return Path(os.path.expanduser(os.path.expandvars(str(p))))
+    expanded = os.path.expanduser(os.path.expandvars(str(p).strip())).strip()
+    if not expanded:
+        return None
+    return Path(expanded)
+
+
+def _setting_str(value: object, default: str = "") -> str:
+    """The same "blank means unset" rule for path settings that stay ``str``.
+
+    A few settings are declared ``str`` rather than ``Path`` because something
+    downstream expands them instead, so they never reach :func:`_expand_path`
+    and need the rule spelled out again. Writing it once keeps the two from
+    drifting: the ``or <default>`` idiom on its own catches ``""`` and a missing
+    key but not ``"  "``, which is truthy and survives to become a directory
+    named for a space, created relative to wherever the process happened to
+    start. Where there is no default, ``""`` *is* the unset value and callers
+    gate on it, so whitespace would read as deliberately configured.
+
+    Non-strings are stringified rather than rejected, matching the surrounding
+    ``str(d.get(...))`` calls; a wrong *type* is a separate concern from a blank
+    value, and it surfaces as an obviously-wrong path rather than a silent one.
+    """
+    return str(value or "").strip() or default
 
 
 @dataclass
@@ -494,8 +545,10 @@ class CodexOriginConfig:
             id=d.get("id", "local"),
             type=d.get("type", "local_rollout"),
             enabled=bool(d.get("enabled", True)),
-            path=d.get("path", "~/.codex/sessions"),
-            archive_path=d.get("archive_path", "~/.codex/archived_sessions"),
+            path=_setting_str(d.get("path"), "~/.codex/sessions"),
+            archive_path=_setting_str(
+                d.get("archive_path"), "~/.codex/archived_sessions"
+            ),
             poll_interval_seconds=float(d.get("poll_interval_seconds", 2.0)),
             transport=d.get("transport", {}),
         )
@@ -606,7 +659,7 @@ class MemoryConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> MemoryConfig:
-        default_dsn = f"sqlite:///{Path('~/.nerve/memu.sqlite').expanduser()}"
+        default_dsn = f"sqlite:///{paths.memu_sqlite()}"
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
         return cls(
@@ -623,18 +676,18 @@ class MemoryConfig:
 
 @dataclass
 class CronConfig:
-    jobs_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/jobs.yaml"))
-    system_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/system.yaml"))
+    jobs_file: Path = field(default_factory=lambda: paths.cron_dir() / "jobs.yaml")
+    system_file: Path = field(default_factory=lambda: paths.cron_dir() / "system.yaml")
     # Directory scanned at startup for drop-in custom gate plugins (.py files
     # defining CronGate subclasses). See nerve/cron/gate_plugins.py.
-    gate_plugins_dir: Path = field(default_factory=lambda: Path("~/.nerve/cron/gates"))
+    gate_plugins_dir: Path = field(default_factory=lambda: paths.cron_dir() / "gates")
 
     @classmethod
     def from_dict(cls, d: dict) -> CronConfig:
         return cls(
-            jobs_file=_expand_path(d.get("jobs_file", "~/.nerve/cron/jobs.yaml")) or Path("~/.nerve/cron/jobs.yaml"),
-            system_file=_expand_path(d.get("system_file", "~/.nerve/cron/system.yaml")) or Path("~/.nerve/cron/system.yaml"),
-            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir", "~/.nerve/cron/gates")) or Path("~/.nerve/cron/gates"),
+            jobs_file=_expand_path(d.get("jobs_file")) or paths.cron_dir() / "jobs.yaml",
+            system_file=_expand_path(d.get("system_file")) or paths.cron_dir() / "system.yaml",
+            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir")) or paths.cron_dir() / "gates",
         )
 
 
@@ -662,7 +715,7 @@ class BackupConfig:
     def from_dict(cls, d: dict) -> BackupConfig:
         return cls(
             enabled=bool(d.get("enabled", False)),
-            target_dir=d.get("target_dir", ""),
+            target_dir=_setting_str(d.get("target_dir")),
             interval_hours=int(d.get("interval_hours", 24)),
             retention_count=int(d.get("retention_count", 7)),
             include_workspace=bool(d.get("include_workspace", True)),
@@ -775,7 +828,7 @@ class WorkflowRunsConfig:
 
     enabled: bool = True
     # Root for per-run journal dirs: <runs_dir>/<run-id>/{run.json,events.ndjson,result.md}
-    runs_dir: Path = field(default_factory=lambda: Path("~/.nerve/workflow-runs"))
+    runs_dir: Path = field(default_factory=lambda: paths.nerve_path("workflow-runs"))
     # Budget monitor cadence. Spend is re-metered (recorded turn costs +
     # live in-flight estimate) every interval.
     poll_interval_seconds: int = 60
@@ -798,8 +851,7 @@ class WorkflowRunsConfig:
     def from_dict(cls, d: dict) -> WorkflowRunsConfig:
         return cls(
             enabled=bool(d.get("enabled", True)),
-            runs_dir=_expand_path(d.get("runs_dir", "~/.nerve/workflow-runs"))
-            or Path("~/.nerve/workflow-runs"),
+            runs_dir=_expand_path(d.get("runs_dir")) or paths.nerve_path("workflow-runs"),
             poll_interval_seconds=int(d.get("poll_interval_seconds", 60)),
             warn_fraction=float(d.get("warn_fraction", 0.8)),
             kill_grace_seconds=int(d.get("kill_grace_seconds", 30)),
@@ -953,10 +1005,10 @@ class ProxyConfig:
     enabled: bool = False
     port: int = 8317
     host: str = "127.0.0.1"
-    binary_path: Path = field(default_factory=lambda: Path("~/.nerve/bin/cli-proxy-api"))
-    auth_dir: Path = field(default_factory=lambda: Path("~/.nerve/cli-proxy-auth"))
+    binary_path: Path = field(default_factory=lambda: paths.nerve_path("bin", "cli-proxy-api"))
+    auth_dir: Path = field(default_factory=lambda: paths.nerve_path("cli-proxy-auth"))
     api_key: str = "sk-nerve-local-proxy"   # local-only auth between Nerve and the proxy
-    log_file: Path = field(default_factory=lambda: Path("~/.nerve/proxy.log"))
+    log_file: Path = field(default_factory=lambda: paths.nerve_path("proxy.log"))
 
     @classmethod
     def from_dict(cls, d: dict) -> ProxyConfig:
@@ -964,10 +1016,10 @@ class ProxyConfig:
             enabled=d.get("enabled", False),
             port=d.get("port", 8317),
             host=d.get("host", "127.0.0.1"),
-            binary_path=_expand_path(d.get("binary_path", "~/.nerve/bin/cli-proxy-api")) or Path("~/.nerve/bin/cli-proxy-api"),
-            auth_dir=_expand_path(d.get("auth_dir", "~/.nerve/cli-proxy-auth")) or Path("~/.nerve/cli-proxy-auth"),
+            binary_path=_expand_path(d.get("binary_path")) or paths.nerve_path("bin", "cli-proxy-api"),
+            auth_dir=_expand_path(d.get("auth_dir")) or paths.nerve_path("cli-proxy-auth"),
             api_key=d.get("api_key", "sk-nerve-local-proxy"),
-            log_file=_expand_path(d.get("log_file", "~/.nerve/proxy.log")) or Path("~/.nerve/proxy.log"),
+            log_file=_expand_path(d.get("log_file")) or paths.nerve_path("proxy.log"),
         )
 
 
@@ -1199,7 +1251,7 @@ class CodexConfig:
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.144.1"            # inclusive tested protocol range
     max_version: str = "0.145.0"            # exclusive
-    home_dir: str = "~/.nerve/codex"        # isolated CODEX_HOME (auth/config/sessions)
+    home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
     auth: str = "chatgpt"                   # chatgpt | api_key
@@ -1253,7 +1305,9 @@ class CodexConfig:
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.144.1")),
             max_version=str(d.get("max_version", "0.145.0")),
-            home_dir=str(d.get("home_dir", "~/.nerve/codex")),
+            home_dir=_setting_str(
+                d.get("home_dir"), str(paths.nerve_path("codex"))
+            ),
             model=str(d.get("model", "gpt-5.6-sol")),
             cron_model=str(d.get("cron_model") or ""),
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
@@ -1526,7 +1580,7 @@ class XmemoryConfig:
 
 @dataclass
 class NerveConfig:
-    workspace: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
+    workspace: Path = field(default_factory=paths.default_workspace)
     timezone: str = "America/New_York"
     deployment: str = "server"            # "server" or "docker"
     quiet_start: str = "02:00"            # HH:MM — start of quiet period (local timezone)
@@ -1727,7 +1781,7 @@ class NerveConfig:
     @classmethod
     def _build_from_dict(cls, d: dict) -> NerveConfig:
         return cls(
-            workspace=_expand_path(d.get("workspace", "~/nerve-workspace")) or Path("~/nerve-workspace"),
+            workspace=_expand_path(d.get("workspace")) or paths.default_workspace(),
             timezone=d.get("timezone", "America/New_York"),
             deployment=d.get("deployment", "server"),
             quiet_start=d.get("quiet_start", "02:00"),
@@ -1806,9 +1860,6 @@ def load_mcp_servers(config_dir: Path | None = None) -> list[McpServerConfig]:
 #      daemon start), if it names a directory that still has config files
 #   5. Current directory (fresh-install fallback)
 
-CONFIG_POINTER_FILE = Path("~/.nerve/config_dir")
-
-
 def _has_config_files(directory: Path) -> bool:
     """True if the directory contains config.yaml or config.local.yaml."""
     try:
@@ -1822,7 +1873,7 @@ def _has_config_files(directory: Path) -> bool:
 def read_config_pointer() -> Path | None:
     """Read the persisted config directory pointer. None if absent/invalid."""
     try:
-        raw = CONFIG_POINTER_FILE.expanduser().read_text(encoding="utf-8").strip()
+        raw = paths.config_pointer_file().read_text(encoding="utf-8").strip()
     except (FileNotFoundError, OSError):
         return None
     if not raw:
@@ -1837,12 +1888,12 @@ def write_config_pointer(config_dir: Path) -> None:
     Written by `nerve init` (after a successful apply) and on daemon start.
     Best-effort: failure to write must never break the caller.
     """
+    pointer = paths.config_pointer_file()
     try:
-        pointer = CONFIG_POINTER_FILE.expanduser()
         pointer.parent.mkdir(parents=True, exist_ok=True)
         pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
     except OSError as e:
-        logger.warning("Could not write config pointer %s: %s", CONFIG_POINTER_FILE, e)
+        logger.warning("Could not write config pointer %s: %s", pointer, e)
 
 
 def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:

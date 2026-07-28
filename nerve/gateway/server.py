@@ -20,6 +20,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from nerve import paths
 from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
@@ -140,7 +141,7 @@ async def lifespan(app: FastAPI):
         )
 
     # Initialize database
-    db_path = Path("~/.nerve/nerve.db").expanduser()
+    db_path = paths.db_path()
     db = await init_db(db_path, workspace=config.workspace)
     logger.info("Database initialized at %s", db_path)
 
@@ -312,18 +313,21 @@ async def lifespan(app: FastAPI):
                 pass
 
     # One-shot cleanup of retired houseofagents artifacts. Gated on the
-    # NERVE-MANAGED binary existing (~/.nerve/bin/ is ours): a standalone
+    # NERVE-MANAGED binary existing (our own bin/ is ours): a standalone
     # houseofagents install the user runs outside Nerve keeps its
     # ~/.config/houseofagents/config.toml untouched. When it was ours, the
     # config.toml holds plaintext API keys Nerve wrote — park it out of the
     # way; the binary is re-downloadable and just deleted. Best-effort —
-    # never blocks startup.
+    # never blocks startup. The two Nerve-owned paths go through the path
+    # provider so a NERVE_HOME install cleans up its own artifacts instead of
+    # inspecting a directory it never wrote to; the houseofagents config path
+    # is that tool's own and stays literal.
     try:
-        hoa_binary = Path("~/.nerve/bin/houseofagents").expanduser()
+        hoa_binary = paths.nerve_path("bin", "houseofagents")
         if hoa_binary.exists():
             hoa_config = Path("~/.config/houseofagents/config.toml").expanduser()
             if hoa_config.exists() and not hoa_config.is_symlink():
-                retired_dir = Path("~/.nerve/houseofagents-retired").expanduser()
+                retired_dir = paths.nerve_path("houseofagents-retired")
                 retired_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                 hoa_config.rename(retired_dir / "config.toml.bak")
                 logger.info(
@@ -462,7 +466,7 @@ async def lifespan(app: FastAPI):
         from nerve import backup as backup_mod
 
         bcfg = config.backup
-        nerve_dir = Path("~/.nerve").expanduser()
+        nerve_dir = paths.nerve_home()
         interval_s = max(1, bcfg.interval_hours) * 3600
         target = Path(bcfg.target_dir).expanduser() if bcfg.target_dir else None
         while True:

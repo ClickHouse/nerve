@@ -161,10 +161,12 @@ def _persist_external_agents_yaml(config) -> None:
     """
     from pathlib import Path
 
+    from nerve import paths
+
     # Reuse the same config dir resolution the bootstrap wizard uses.
-    # The path stamp lives in ``~/.nerve/config_dir`` after the daemon
-    # starts via ``nerve start``.
-    config_dir_marker = Path("~/.nerve/config_dir").expanduser()
+    # The path stamp lives in the config-dir pointer file under the state dir
+    # after the daemon starts via ``nerve start``.
+    config_dir_marker = paths.config_pointer_file()
     if config_dir_marker.exists():
         try:
             config_dir = Path(config_dir_marker.read_text().strip())

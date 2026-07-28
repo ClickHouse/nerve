@@ -29,6 +29,7 @@ import nerve._env  # noqa: F401  isort: skip
 
 import numpy as np
 
+from nerve import paths
 from nerve.config import NerveConfig
 from nerve.observability.langfuse import attributes as lf_attrs
 
@@ -1476,7 +1477,7 @@ class MemUBridge:
                     "client_backend": "sdk",
                 }
 
-            resources_dir = Path("~/.nerve/memu-resources").expanduser()
+            resources_dir = paths.nerve_path("memu-resources")
             resources_dir.mkdir(parents=True, exist_ok=True)
 
             # Fast model for category summaries and date resolution (Haiku).
@@ -2406,7 +2407,7 @@ class MemUBridge:
         op_id = self._metrics.begin_op("memorize_conversation", f"session {session_id}")
 
         now = int(time.time())
-        conv_dir = Path("~/.nerve/memu-conversations").expanduser()
+        conv_dir = paths.nerve_path("memu-conversations")
         conv_path = conv_dir / f"session-{session_id}-{now}.json"
 
         def _write_conversation() -> int:

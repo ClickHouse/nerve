@@ -18,6 +18,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from nerve import paths
 from nerve.sources.base import Source
 from nerve.sources.models import FetchResult, SourceRecord
 
@@ -32,6 +33,20 @@ class TelegramSource(Source):
     def __init__(self, config: dict[str, Any]):
         self._config = config
         self._client = None
+
+    def _session_path(self) -> str:
+        """Where Telethon keeps the authenticated session, minus ``.session``.
+
+        A blank ``session_path`` means unset. Blank is truthy, so without the
+        strip the session would land in a file named for a space, *relative to
+        the cwd* — which is how the interactive ``nerve sync telegram`` and a
+        later cron run end up looking in two different places, leaving the sync
+        insisting it is not authenticated with no hint as to why.
+        """
+        configured = str(self._config.get("session_path") or "").strip()
+        return os.path.expanduser(
+            configured or str(paths.nerve_path("telegram_sync"))
+        )
 
     async def _ensure_client(self) -> bool:
         """Initialize Telethon client if not already connected."""
@@ -50,9 +65,7 @@ class TelegramSource(Source):
             logger.warning("Telegram source: api_id/api_hash not configured")
             return False
 
-        session_path = os.path.expanduser(
-            self._config.get("session_path", "~/.nerve/telegram_sync")
-        )
+        session_path = self._session_path()
 
         # Check if session file exists — Telethon requires interactive auth
         # on first use, which can't happen in a cron context.
