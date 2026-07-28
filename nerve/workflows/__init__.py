@@ -45,3 +45,37 @@ def reset_workflow_run_service() -> None:
     """Test hook: drop the singleton."""
     global _service
     _service = None
+
+
+# --------------------------------------------------------------------- #
+#  Review loops (implement→verify cycles over workflow runs)             #
+# --------------------------------------------------------------------- #
+
+_review_loop_service = None
+
+
+def init_review_loop_service(
+    config: NerveConfig, db: Database, engine: AgentEngine, runs,
+):
+    """Initialise the review-loop singleton. Requires a live
+    WorkflowRunService (legs are workflow runs). Returns None when the
+    feature (or workflow runs) is disabled."""
+    global _review_loop_service
+    if runs is None or not config.workflows.enabled \
+            or not config.workflows.review_loop.enabled:
+        _review_loop_service = None
+        return None
+    from nerve.workflows.review_loop import ReviewLoopService as _RL
+    _review_loop_service = _RL(config, db, engine, runs)
+    return _review_loop_service
+
+
+def get_review_loop_service():
+    """Return the initialised review-loop service, or None when disabled."""
+    return _review_loop_service
+
+
+def reset_review_loop_service() -> None:
+    """Test hook: drop the singleton."""
+    global _review_loop_service
+    _review_loop_service = None

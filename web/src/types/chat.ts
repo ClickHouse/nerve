@@ -121,6 +121,19 @@ export interface Session {
   // Drives the sidebar "waiting" indicator. Set by backend + WS updates.
   awaiting_input?: boolean;
   starred?: boolean;
+  // Live review-loop state for this observer session (rehydrated from
+  // GET /api/sessions, kept fresh by the global review_loop_update event;
+  // drives the sidebar icon, header chip, and the in-chat loop card).
+  review_loop?: {
+    id: string;
+    status: string;
+    iteration: number;
+    max_iterations: number;
+    failure_reason?: string | null;
+    budget_usd?: number;
+    spent_usd?: number;
+    updated_at?: string;
+  };
 }
 
 export type AgentStatus =

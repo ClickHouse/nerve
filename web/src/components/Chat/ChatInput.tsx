@@ -1,11 +1,12 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2 } from 'lucide-react';
-import { useChatStore } from '../../stores/chatStore';
+import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat } from 'lucide-react';
+import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
 import { PromptRewriteCard } from './PromptRewriteCard';
 import { BackendSelector } from './BackendSelector';
+import { ReviewLoopPanel } from './ReviewLoopPanel';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
   add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)', placeholder: 'Instructions...' },
@@ -89,6 +90,8 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     s => s.virtualSession !== null && s.virtualSession.id === s.activeSession,
   );
   const newChatBackend = useChatStore(s => s.newChatBackend);
+  const newChatReviewLoop = useChatStore(s => s.newChatReviewLoop);
+  const setNewChatReviewLoop = useChatStore(s => s.setNewChatReviewLoop);
   const backendDefault = useChatStore(s => s.backendDefault);
   const chosenBackend = newChatBackend ?? backendDefault;
   const sessions = useChatStore(s => s.sessions);
@@ -197,6 +200,15 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const addFiles = useCallback(async (files: File[]) => {
+    // Uploading materializes the session (ensureRealSession) — which would
+    // BIND AND START a filled review-loop config prematurely. Block uploads
+    // while the loop form is dirty; start the loop (or clear the form) first.
+    const rl = useChatStore.getState().newChatReviewLoop;
+    const virtual = useChatStore.getState().virtualSession;
+    if (virtual && virtual.id === useChatStore.getState().activeSession
+        && rl && (rl.goal.trim() || rl.verifier.trim())) {
+      return;
+    }
     const newAttachments: AttachmentFile[] = files.map(file => ({
       id: randomUUID(),
       file,
@@ -415,6 +427,11 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
         </div>
       )}
 
+      {/* Review-loop config panel — new chats only */}
+      {isVirtualChat && newChatReviewLoop && (
+        <ReviewLoopPanel disabled={disabled || isStreaming || rewriteActive} />
+      )}
+
       {/* Prompt rewrite preview */}
       {rewrite.status !== 'idle' && (
         <div className="px-4 pt-3 pb-1">
@@ -470,9 +487,12 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           {/* File attach button */}
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || isStreaming || rewriteActive}
+            disabled={disabled || isStreaming || rewriteActive
+              || (isVirtualChat && !!(newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())))}
             className="w-10 h-10 text-text-muted hover:text-text-secondary rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0 disabled:opacity-30"
-            title="Attach files"
+            title={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
+              ? 'Attaching files would start the review loop — start it or clear the form first'
+              : 'Attach files'}
           >
             <Paperclip size={18} />
           </button>
@@ -494,9 +514,28 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               <Sparkles size={18} />
             </button>
           )}
+          {/* Review-loop toggle — new chats only. Opens the Goal/Verifier
+              panel; the loop binds at session creation. */}
+          {isVirtualChat && (
+            <button
+              onClick={() => setNewChatReviewLoop(newChatReviewLoop ? null : { ...EMPTY_REVIEW_LOOP })}
+              disabled={disabled || isStreaming || rewriteActive}
+              className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
+                newChatReviewLoop
+                  ? 'text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/15 shadow-[inset_0_0_0_1px_rgba(52,211,153,0.25)]'
+                  : 'text-text-muted hover:text-text-secondary'
+              }`}
+              title={newChatReviewLoop
+                ? 'Review loop on — configure Goal + Verifier criteria; an implementer/verifier agent pair iterates until the criteria pass'
+                : 'Review loop — set a Goal and Verifier criteria; an implementer/verifier agent pair iterates until the criteria pass'}
+            >
+              <Repeat size={18} />
+            </button>
+          )}
           {/* Agent backend selector — Claude vs Codex, new chats only.
               Binds at session creation; sticky afterwards (the header's
-              model badge shows what a running session uses). */}
+              model badge shows what a running session uses). Picks the
+              OBSERVER session's backend — loop legs use the panel config. */}
           {isVirtualChat && (
             <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
           )}

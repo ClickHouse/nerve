@@ -184,6 +184,19 @@ def test_config_overrides_use_runtime_loopback_port(tmp_path):
     )
 
 
+def test_nerve_mcp_preapproved_for_noninteractive_sources(tmp_path):
+    """Non-web sessions can't answer codex's per-tool MCP approvals (the
+    hub auto-denies → "user rejected MCP tool call"), so the trusted nerve
+    server is pre-approved for them. Web sessions keep the prompts."""
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    approve = 'mcp_servers.nerve.default_tools_approval_mode="approve"'
+    assert approve not in backend.build_config_overrides(_spec(cfg))
+    for source in ("workflow", "cron", "hook"):
+        overrides = backend.build_config_overrides(_spec(cfg, source=source))
+        assert approve in overrides, f"missing pre-approval for source={source}"
+
+
 def test_notification_backlog_fails_transport_instead_of_dropping(monkeypatch):
     from types import SimpleNamespace
 

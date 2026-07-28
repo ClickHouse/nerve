@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 _engine: AgentEngine | None = None
 _cron_service = None  # CronService
 _workflow_run_service = None  # WorkflowRunService (nerve.workflows)
+_review_loop_service = None  # ReviewLoopService (nerve.workflows.review_loop)
 # StreamableHTTPSessionManager assigned during lifespan when
 # config.mcp_endpoint.enabled. The /mcp/v1 mount handler reads it; until
 # lifespan finishes building it, the mount returns 503.
@@ -255,6 +256,15 @@ async def lifespan(app: FastAPI):
         logger.error("Workflow run service failed to start: %s", e)
         _workflow_run_service = None
         try:
+            # Drop the module singleton too — otherwise REST/MCP/cron keep
+            # reaching a monitor-less service and "budgeted" runs start with
+            # no budget enforcement (fail-open).
+            from nerve.workflows import reset_workflow_run_service
+
+            reset_workflow_run_service()
+        except Exception:
+            pass
+        try:
             await notification_service.send_notification(
                 session_id="system",
                 title="Workflow run service failed to start",
@@ -263,6 +273,43 @@ async def lifespan(app: FastAPI):
             )
         except Exception:
             pass
+
+    # Review loops ride on workflow runs. STRICTLY after
+    # workflow_run_service.start(): the runs orphan-recovery pass must
+    # finish before the loop recovery pass reads leg statuses (and the
+    # completion listener must not observe recovery transitions).
+    global _review_loop_service
+    if _workflow_run_service is not None:
+        try:
+            from nerve.workflows import init_review_loop_service
+
+            _review_loop_service = init_review_loop_service(
+                config, db, _engine, _workflow_run_service,
+            )
+            if _review_loop_service is not None:
+                await _review_loop_service.start()
+                logger.info("Review loop service started")
+        except Exception as e:
+            logger.error("Review loop service failed to start: %s", e)
+            _review_loop_service = None
+            try:
+                # Drop the module singleton too — routes/MCP must see the
+                # feature as unavailable, not a half-started zombie whose
+                # worker/reconcile tasks never came up.
+                from nerve.workflows import reset_review_loop_service
+
+                reset_review_loop_service()
+            except Exception:
+                pass
+            try:
+                await notification_service.send_notification(
+                    session_id="system",
+                    title="Review loop service failed to start",
+                    body=f"Review loops are unavailable: {e}",
+                    priority="high",
+                )
+            except Exception:
+                pass
 
     # One-shot cleanup of retired houseofagents artifacts. Gated on the
     # NERVE-MANAGED binary existing (~/.nerve/bin/ is ours): a standalone
@@ -577,6 +624,12 @@ async def lifespan(app: FastAPI):
         await telegram_channel.stop()
     if cron_task:
         await cron_task.stop()
+    if _review_loop_service is not None:
+        try:
+            await _review_loop_service.stop()
+        except Exception as e:
+            logger.warning("Review loop service shutdown raised: %s", e)
+        _review_loop_service = None
     if _workflow_run_service is not None:
         try:
             await _workflow_run_service.stop()

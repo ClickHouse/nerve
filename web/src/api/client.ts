@@ -122,6 +122,77 @@ export interface WorkflowRunJournalEvent {
   [key: string]: unknown;
 }
 
+// ── Review loops (implement→verify cycles over workflow runs) ──
+
+export type ReviewLoopStatus =
+  | 'pending'
+  | 'implementing'
+  | 'verifying'
+  | 'awaiting_user'
+  | 'passed'
+  | 'failed'
+  | 'killed';
+
+export interface ReviewLoopCriterion {
+  id: string;
+  statement: string;
+  source: 'user' | 'verifier';
+  added_iteration: number;
+  last_status: 'pending' | 'met' | 'unmet' | 'unverifiable';
+}
+
+export interface ReviewLoop {
+  id: string;
+  title: string;
+  session_id: string | null;
+  status: ReviewLoopStatus;
+  failure_reason: string | null;
+  goal_prompt: string;
+  verifier_prompt: string;
+  criteria_adoption: 'no' | 'ask' | 'auto';
+  criteria: ReviewLoopCriterion[];
+  implementer: { engine: string; model?: string; effort?: string };
+  verifier: { engine: string; model?: string; effort?: string };
+  cwd: string | null;
+  max_iterations: number;
+  budget_usd: number;
+  spent_usd: number;
+  iteration: number;
+  current_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+  ended_at: string | null;
+}
+
+export interface ReviewLoopAttempt {
+  id: number;
+  loop_id: string;
+  iteration: number;
+  role: 'implementer' | 'verifier';
+  attempt_no: number;
+  run_id: string;
+  status: string;
+  spend_usd: number;
+  verdict: {
+    verdict?: string;
+    summary?: string;
+    criteria?: { id: string; status: string; evidence?: string; fix_hint?: string }[];
+  } | null;
+  detail: Record<string, unknown> | null;
+  created_at: string;
+  settled_at: string | null;
+}
+
+export interface ReviewLoopCreatePayload {
+  goal: string;
+  verifier: string;
+  budget_usd?: number;
+  max_iterations?: number;
+  criteria_adoption?: 'no' | 'ask' | 'auto';
+  implementer?: { engine?: string; model?: string; effort?: string };
+  verifier_leg?: { engine?: string; model?: string; effort?: string };
+}
+
 export interface WorkflowRunJournal {
   run_json: Record<string, unknown> | null;
   events: WorkflowRunJournalEvent[];
@@ -202,11 +273,32 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string, backend?: string | null, cwd?: string | null) =>
+  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null) =>
     request<any>('/sessions', {
       method: 'POST',
-      body: JSON.stringify({ title, ...(backend ? { backend } : {}), ...(cwd ? { cwd } : {}) }),
+      body: JSON.stringify({
+        title,
+        ...(backend ? { backend } : {}),
+        ...(cwd ? { cwd } : {}),
+        ...(reviewLoop ? { review_loop: reviewLoop } : {}),
+      }),
     }),
+  listReviewLoops: (status?: string) =>
+    request<{ loops: ReviewLoop[] }>(`/review-loops${status ? `?status=${status}` : ''}`),
+  getReviewLoop: (loopId: string) =>
+    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[] }>(`/review-loops/${loopId}`),
+  killReviewLoop: (loopId: string, reason = '') =>
+    request<ReviewLoop>(`/review-loops/${loopId}/kill`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+  decideReviewLoop: (loopId: string, decision: string) =>
+    request<{ ok: boolean; message: string }>(`/review-loops/${loopId}/decision`, {
+      method: 'POST', body: JSON.stringify({ decision }),
+    }),
+  getReviewLoopState: (loopId: string) =>
+    request<{ exists: boolean; truncated: boolean; content: string; path: string }>(
+      `/review-loops/${loopId}/state`,
+    ),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
   updateSession: (id: string, data: { title?: string; starred?: boolean }) =>

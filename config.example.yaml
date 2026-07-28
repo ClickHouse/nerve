@@ -122,6 +122,30 @@ cron:
 #   kill_grace_seconds: 30            # graceful stop -> grace -> force kill
 #   max_concurrent_runs: 2            # excess runs queue as 'pending'; keep well below agent.max_concurrent
 #   allow_unbudgeted: false           # require budget_usd on every run
+#
+#   # Review loops — deterministic implement→verify cycles built from
+#   # workflow runs: an implementer leg works toward a Goal prompt, an
+#   # independent verifier leg judges the workspace against Verifier
+#   # criteria (structured, evidence-backed verdict), and the server
+#   # iterates until the criteria pass or a cap fires. Cross-vendor legs
+#   # (Claude implements, Codex verifies) are the default when Codex is
+#   # configured. See docs/review-loops.md.
+#   review_loop:
+#     enabled: true
+#     implementer: {engine: claude-workflow, model: "", effort: ""}  # "" = backend default
+#     verifier:    {engine: codex-ultracode, model: "", effort: ""}  # cross-vendor default
+#     max_iterations: 3                 # per-loop default; hard ceiling 8
+#     default_budget_usd: 10.0          # total loop budget (all legs)
+#     min_leg_budget_usd: 0.5           # never start a leg with less
+#     verifier_reserve_fraction: 0.15   # held back so the last attempt is always verified
+#     criteria_adoption: "no"           # no | ask | auto — verifier-proposed criteria policy
+#     max_new_criteria_per_iteration: 3 # auto mode adoption caps
+#     max_discovered_criteria: 12
+#     discovery_grace_rounds: 2         # discovery-only rounds before escalating "scope keeps growing"
+#     auto_reissue_implementer: false   # restart recovery: re-run interrupted implementer legs
+#     escalation_reproposals: 2         # re-file expired decision cards this many times
+#     verifier_sandbox: workspace-write # codex verifier legs (isolation vs test-writes)
+#     reconcile_interval_seconds: 600   # card-liveness + loop budget-warn tick
 
 # Backup (optional) — scheduled, verified snapshots of Nerve state into a
 # single portable bundle (nerve-backup-<host>-<ts>.tar.zst). Off by default.

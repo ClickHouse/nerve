@@ -436,6 +436,20 @@ class CodexBackend:
                 f"{base}.startup_timeout_sec=30",
                 f"{base}.tool_timeout_sec={int(self.codex.tool_timeout_sec)}",
             ]
+            if spec.source not in ("web",):
+                # Non-interactive sessions (workflow-run legs, cron, hooks)
+                # cannot answer codex's per-tool MCP approvals — the hub
+                # auto-denies and every nerve tool call dies with "user
+                # rejected MCP tool call" (the same failure mode the
+                # Ultracode child config below already works around). The
+                # nerve server is Nerve's own gateway behind a session-scoped
+                # token, and its tool handlers enforce source gating
+                # server-side (e.g. workflow sessions can't start runs) —
+                # pre-approve it. Interactive (web) sessions keep the
+                # approval prompts.
+                overrides.append(
+                    f'{base}.default_tools_approval_mode="approve"'
+                )
         else:
             logger.warning(
                 "Codex session %s starts WITHOUT nerve tools: gateway port "
@@ -536,7 +550,10 @@ class CodexBackend:
         params: dict[str, Any] = {
             "cwd": spec.cwd,
             "model": spec.model or self.codex.model,
-            "sandbox": self.codex.sandbox,
+            # Per-session override (SessionSpec.extra, set from session
+            # metadata ``codex_sandbox``) beats the global default — used by
+            # review-loop verifier legs to enforce workspace-write.
+            "sandbox": str(spec.extra.get("sandbox") or "") or self.codex.sandbox,
             "approvalPolicy": self.codex.approval_policy,
             "developerInstructions": spec.system_prompt + _BACKEND_NOTES,
         }

@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2 } from 'lucide-react';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Repeat } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
@@ -480,6 +480,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 }
 
 
+/** Sidebar icon tint for review-loop observer sessions, by loop status. */
+function reviewLoopIconTone(status: string): string {
+  switch (status) {
+    case 'passed': return 'text-emerald-500/80';
+    case 'awaiting_user': return 'text-orange-400/90';
+    case 'failed':
+    case 'killed': return 'text-red-400/70';
+    default: return 'text-emerald-400/80';  // pending / implementing / verifying
+  }
+}
+
+
 /** Pulsing dot for running sessions, solid dot for other notable states. */
 function StatusIndicator({ session, isActive, isRunning }: {
   session: Session;
@@ -494,6 +506,30 @@ function StatusIndicator({ session, isActive, isRunning }: {
       <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+      </span>
+    );
+  }
+
+  // Review loop parked on a decision: pulsing orange dot — same "needs you"
+  // urgency class as awaiting_input.
+  if (session.review_loop?.status === 'awaiting_user') {
+    return (
+      <span className="relative flex h-2 w-2 shrink-0" title="Review loop needs your decision">
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-orange-500" />
+      </span>
+    );
+  }
+
+  // Review loop leg working: the observer session itself is idle (legs run
+  // in their own workflow sessions), so surface the loop's activity here.
+  const loopLive = session.review_loop
+    && ['pending', 'implementing', 'verifying'].includes(session.review_loop.status);
+  if (loopLive && !isRunning) {
+    return (
+      <span className="relative flex h-2 w-2 shrink-0" title={`Review loop ${session.review_loop!.status}`}>
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
       </span>
     );
   }
@@ -598,7 +634,9 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
         }`}
     >
-      {isImplementSession(session)
+      {session.review_loop
+        ? <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
+        : isImplementSession(session)
         ? <Hammer size={13} className="shrink-0 text-hue-violet/60" />
         : <MessageSquare size={13} className="shrink-0 opacity-50" />
       }

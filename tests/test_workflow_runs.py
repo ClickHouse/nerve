@@ -110,6 +110,39 @@ async def _drain(service: WorkflowRunService, timeout: float = 5.0) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_background_run_result_taken_from_final_auto_turn(db, engine, service):
+    """A run whose agent orchestrates in the background gets its REAL final
+    text from a follow-up auto-turn — the recorded result must be the
+    session's newest assistant message, not engine.run's pre-background
+    return (regression: a review-loop verifier's verdict was truncated to
+    its opening sentence)."""
+    service.config.workflows.poll_interval_seconds = 1
+    calls = {"n": 0}
+
+    def _bg(session_id: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] <= 1  # busy exactly once, then quiescent
+
+    engine.has_live_background_tasks = MagicMock(side_effect=_bg)
+    engine.run = AsyncMock(return_value="opening message only")
+    run = await service.start_run(ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
+    session_id = f"workflow:{run['id']}"
+    # Wait for _execute to create the session, then land the auto-turn's
+    # final message while the service sits in its quiescence wait.
+    deadline = time.monotonic() + 5
+    while await db.get_session(session_id) is None:
+        assert time.monotonic() < deadline, "leg session never appeared"
+        await asyncio.sleep(0.01)
+    await db.add_message(session_id, "assistant", "FINAL: the real verdict")
+    await _drain(service, timeout=20)
+    fresh = await db.get_workflow_run(run["id"])
+    assert fresh["status"] == "done"
+    assert fresh["result"] == "FINAL: the real verdict"
+    result_md = Path(fresh["journal_dir"]) / "result.md"
+    assert result_md.read_text(encoding="utf-8") == "FINAL: the real verdict"
+
+
 async def _seed_running(db, run_id: str, budget, engine_kind: str = ENGINE_CLAUDE) -> str:
     """Insert a running run wired to a real session row; returns session id."""
     session_id = f"workflow:{run_id}"

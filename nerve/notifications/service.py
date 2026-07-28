@@ -536,9 +536,18 @@ class NotificationService:
             )
         else:
             try:
-                result = await asyncio.to_thread(
-                    dispatcher, notif, target_id, answer, self.config,
-                )
+                import inspect
+
+                if inspect.iscoroutinefunction(dispatcher):
+                    # Async dispatchers (e.g. review-loop decisions) run on
+                    # the event loop — they need the loop-bound DB/services.
+                    result = await dispatcher(
+                        notif, target_id, answer, self.config,
+                    )
+                else:
+                    result = await asyncio.to_thread(
+                        dispatcher, notif, target_id, answer, self.config,
+                    )
             except Exception as exc:  # defensive: never crash the route
                 logger.exception(
                     "approval dispatch raised for %s (target=%s:%s, "
