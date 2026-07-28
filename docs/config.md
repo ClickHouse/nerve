@@ -1,10 +1,49 @@
 # Configuration Reference
 
-Nerve uses two YAML config files:
-- `config.yaml` — Template settings (version controlled)
-- `config.local.yaml` — Secrets and personal overrides (gitignored)
+Nerve merges configuration from up to three layers, lowest precedence first:
 
-Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
+1. `workspace/config/settings.yaml`: shareable, git-tracked settings that live
+   inside the workspace. This is the layer a remote config repo syncs.
+2. `config.yaml`: machine-local base settings.
+3. `config.local.yaml`: machine-local secrets and personal overrides (gitignored).
+
+Each layer is deep-merged over the one before it, so a machine can override a
+shared setting locally. Lockdown mode drops both machine-local layers and leaves
+the workspace as the only source of truth. With no `settings.yaml` present, only
+`config.yaml` and `config.local.yaml` are read.
+
+The workspace location is resolved from `config.yaml` (or the default
+`~/nerve-workspace`) *before* `settings.yaml` is read, so a `workspace:` key
+inside `settings.yaml` is ignored.
+
+## Which layer a key belongs in
+
+`nerve init` splits its answers between the first two layers:
+
+| Layer | Gets |
+|-------|------|
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint` |
+| `settings.yaml` | `timezone`, `gateway.host`/`port`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
+
+The test is whether the value would be wrong on another machine: filesystem
+paths, credential handles, whose mailboxes this person syncs, which agent
+binaries this box has paired. Which provider the deployment uses and which port
+it serves on are not in that category, so they are shared. Lockdown makes this
+concrete: it drops `config.yaml`, so a key belongs there only if its declared
+default is an acceptable answer on every locked box.
+
+Write each key to one layer only. `config.yaml` shadows `settings.yaml`, so a
+shared value repeated in both leaves the tracked copy with no effect.
+
+Re-running `nerve init` regenerates `config.yaml` and `config.local.yaml`
+wholesale. `settings.yaml` may be shared, so the wizard rewrites only the keys in
+the table above and leaves the rest of the file alone; it prints what it added,
+updated and removed. Each file is copied to `*.bak` first unless it is empty or
+comments-only. Two things to expect: `settings.yaml` is rewritten with
+`yaml.safe_dump`, which drops comments whenever anything changed (the previous
+file is in `settings.yaml.bak`), and changing an answer overwrites whatever
+someone else had under those keys, so review the diff before committing.
+
 Unknown keys are ignored but logged as warnings at startup (and shown by
 `nerve doctor`) so typos don't fail silently.
 
@@ -15,9 +54,9 @@ TLS is off, not TLS with an empty certificate path.
 
 ## Environment Variable References
 
-Any string value in `config.yaml` or `config.local.yaml` may reference an
-environment variable, so secrets can come from the environment (or a secret
-store) instead of being written into a file:
+Any string value in any of the three layers may reference an environment
+variable, so secrets can come from the environment (or a secret store) instead of
+being written into a file:
 
 ```yaml
 anthropic_api_key: ${ANTHROPIC_API_KEY}     # required: load fails if unset
@@ -33,8 +72,8 @@ gateway:
 
 Only the braced `${...}` form is interpolated. A bare `$` is never touched, so
 bcrypt `password_hash` values (`$2b$...`), jwt secrets and connection strings
-are safe as written. Interpolation runs once, after `config.local.yaml` is
-merged on top, so either file may use references.
+are safe as written. Interpolation runs once, after all three layers are merged,
+so any of them may use references.
 
 Resolved values arrive as strings and are converted back to the field's declared
 type, including `int | None`, `list[int]` and `list[str]`. So `port: ${PORT}` and

@@ -185,6 +185,136 @@ def _resolve_env_refs(merged: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+# --- Multi-source config resolution ----------------------------------------- #
+#
+# Configuration is assembled from up to three layers, lowest precedence first:
+#
+#   1. workspace/config/settings.yaml  — shareable, git-tracked settings (the
+#      portable surface synced from a remote workspace repo)
+#   2. config.yaml                     — machine-local base (the historical file)
+#   3. config.local.yaml               — machine-local secrets / overrides
+#
+# ${ENV_VAR} interpolation is applied once at the end. This keeps existing
+# single-file installs working unchanged (layer 1 absent → prior behavior) while
+# letting shared settings live in the workspace. Lockdown mode (a later story)
+# will drop layers 2/3 so only the tracked workspace layer applies.
+
+
+def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
+    """Read a YAML file into a dict; ``{}`` if absent or empty.
+
+    ``strict`` controls what happens when the file parses to something that
+    isn't a mapping — a list, a bare string, a number. Without it the file is
+    ignored with a warning, which is a bad failure mode for a config layer:
+    every key it was supposed to supply silently reverts to whatever the lower
+    layers said, and validation reports the bundle as fine. A truncated write,
+    a `yq` mishap, or a merge conflict resolved into a sequence all produce
+    exactly this shape.
+
+    An *empty* file (or one that is nothing but comments) still yields ``{}``
+    in both modes — the shipped ``settings.yaml`` scaffold is all comments and
+    parses to ``None``, so treating that as an error would break every fresh
+    install.
+
+    Every way this can fail is raised as :class:`ConfigError` rather than
+    escaping as a parser or OS exception, so the callers that route around a
+    broken config (``nerve doctor``, ``config validate``, the reload paths) can
+    report it instead of showing a traceback. That includes the file being
+    unreadable: a mode-600 file owned by another user, or one deleted between
+    the ``exists()`` check and the open, is a config problem like any other and
+    deserves the same one-line message naming the path and the reason.
+
+    The content is decoded as UTF-8 rather than in whatever encoding the locale
+    implies. The daemon usually runs under a service manager with ``LC_ALL=C``,
+    where the interpreter's default is ASCII unless it manages to coerce the
+    locale to C.UTF-8 — so on a box that lacks that locale, a settings file with
+    an accent in a name or a prompt hint refuses to load under the service
+    manager and loads fine from an interactive shell, which is a miserable thing
+    to debug. YAML is UTF-8 by spec, so pinning it is also the correct reading
+    of the file.
+    """
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Failed to parse {path}: {e}") from e
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"Failed to read {path}: {e}") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        if strict:
+            raise ConfigError(
+                f"{path}: root must be a mapping of config keys, got "
+                f"{type(data).__name__}"
+            )
+        logger.warning("config: %s is not a mapping — ignoring", path)
+        return {}
+    return data
+
+
+def workspace_config_dir(workspace: Path) -> Path:
+    """The git-syncable config subtree inside a workspace (``<ws>/config``)."""
+    return Path(workspace) / "config"
+
+
+def workspace_settings_file(workspace: Path) -> Path:
+    """Shareable settings file inside a workspace (``<ws>/config/settings.yaml``)."""
+    return workspace_config_dir(workspace) / "settings.yaml"
+
+
+def _load_workspace_settings(workspace: Path) -> dict[str, Any]:
+    """Load ``workspace/config/settings.yaml``.
+
+    The ``workspace`` key is stripped: the workspace location is resolved from
+    the machine-local config *before* this file is read, so honoring a
+    ``workspace`` value here would be circular.
+
+    Read strictly. This is the layer that arrives from a shared repo, where
+    nobody is watching the daemon's log — a file of the wrong shape has to
+    fail loudly rather than evaporate into ``{}``.
+    """
+    data = _read_yaml_mapping(workspace_settings_file(workspace), strict=True)
+    if "workspace" in data:
+        logger.warning(
+            "config: ignoring 'workspace' key in workspace/config/settings.yaml "
+            "(the workspace location must come from config.yaml or the default)"
+        )
+        data = {k: v for k, v in data.items() if k != "workspace"}
+    return data
+
+
+def _read_config_sources(config_dir: Path) -> dict[str, Any]:
+    """Merge all config layers for ``config_dir`` and resolve ${ENV_VAR} refs.
+
+    Returns the fully-merged, env-interpolated config dict (untyped). Shared by
+    :func:`load_config` and :func:`load_mcp_servers` so both see the same view.
+    """
+    base = _read_yaml_mapping(config_dir / "config.yaml")
+    local = _read_yaml_mapping(config_dir / "config.local.yaml")
+
+    # The workspace path comes from the machine-local config (or the default),
+    # never from the tracked settings file — resolve it first. Best-effort
+    # ${VAR}/${VAR:-default} interpolation is applied so an env-based workspace
+    # path is honored when locating settings.yaml; an unresolved required ref is
+    # left intact here and surfaces later in the full _resolve_env_refs pass.
+    machine = _deep_merge(base, local)
+    ws_raw = machine.get("workspace")
+    if isinstance(ws_raw, str) and "${" in ws_raw:
+        ws_raw = _interpolate_str(ws_raw, [])
+    workspace = _expand_path(ws_raw) or paths.default_workspace()
+
+    ws_settings = _load_workspace_settings(workspace)
+
+    # Precedence, lowest first: workspace settings < config.yaml < config.local.yaml
+    merged = _deep_merge(ws_settings, base)
+    merged = _deep_merge(merged, local)
+
+    return _resolve_env_refs(merged)
+
+
 @dataclass
 class SSLConfig:
     cert: Path | None = None
@@ -1961,21 +2091,7 @@ def load_mcp_servers(config_dir: Path | None = None) -> list[McpServerConfig]:
     if config_dir is None:
         config_dir = Path.cwd()
 
-    base_path = config_dir / "config.yaml"
-    local_path = config_dir / "config.local.yaml"
-
-    base: dict[str, Any] = {}
-    if base_path.exists():
-        with open(base_path) as f:
-            base = yaml.safe_load(f) or {}
-
-    local: dict[str, Any] = {}
-    if local_path.exists():
-        with open(local_path) as f:
-            local = yaml.safe_load(f) or {}
-
-    merged = _deep_merge(base, local)
-    merged = _resolve_env_refs(merged)
+    merged = _read_config_sources(config_dir)
     return _parse_mcp_servers(merged)
 
 
@@ -2055,7 +2171,14 @@ def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:
 
 
 def load_config(config_dir: Path | None = None) -> NerveConfig:
-    """Load config from config.yaml + config.local.yaml in the given directory.
+    """Load and type the effective configuration.
+
+    Merges (lowest→highest precedence) ``workspace/config/settings.yaml``
+    (shareable, git-tracked), ``config.yaml`` (machine base), and
+    ``config.local.yaml`` (machine secrets/overrides), then resolves
+    ``${ENV_VAR}`` references. The workspace location is taken from the
+    machine-local config (or the default) before the tracked settings file is
+    read.
 
     If config_dir is None, the directory is resolved via the waterfall in
     :func:`resolve_config_dir` (flag/env/cwd/pointer), so commands behave the
@@ -2064,24 +2187,9 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
     if config_dir is None:
         config_dir, _source = resolve_config_dir()
 
-    base_path = config_dir / "config.yaml"
-    local_path = config_dir / "config.local.yaml"
-
-    base: dict[str, Any] = {}
-    if base_path.exists():
-        with open(base_path) as f:
-            base = yaml.safe_load(f) or {}
-
-    local: dict[str, Any] = {}
-    if local_path.exists():
-        with open(local_path) as f:
-            local = yaml.safe_load(f) or {}
-
-    merged = _deep_merge(base, local)
-
-    # Resolve ${ENV_VAR} references before typing the config so secrets can be
-    # supplied from the environment rather than committed to tracked files.
-    merged = _resolve_env_refs(merged)
+    # Assemble config from workspace/config/settings.yaml + config.yaml +
+    # config.local.yaml (lowest→highest precedence) and resolve ${ENV_VAR} refs.
+    merged = _read_config_sources(config_dir)
 
     # Surface typos and stale keys instead of silently ignoring them.
     for warning in validate_config_keys(merged):

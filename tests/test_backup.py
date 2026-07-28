@@ -267,6 +267,40 @@ def test_backup_excludes_junk(nerve_dir, workspace, config_dir, tmp_path):
     assert any(m.endswith("workspace/scripts/helper.py") for m in members)
 
 
+def test_backup_captures_tracked_workspace_config(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """The shareable config subtree has to survive a lost machine.
+
+    Everything that decides *what the agent does on a schedule* lives here. A
+    bundle that restores the identity files and the skills but not the settings
+    or the cron jobs looks complete and is not, and the gap only shows up when
+    someone restores it.
+    """
+    cfg = workspace / "config"
+    (cfg / "cron" / "gates").mkdir(parents=True)
+    (cfg / "settings.yaml").write_text("agent:\n  name: nerve\n")
+    (cfg / "cron" / "jobs.yaml").write_text("jobs:\n  - id: nightly\n")
+    (cfg / "cron" / "system.yaml").write_text("jobs:\n  - id: cleanup\n")
+    (cfg / "cron" / "gates" / "quiet_hours.py").write_text("def gate():\n    return True\n")
+    # Junk inside the subtree is still pruned like anywhere else.
+    (cfg / "cron" / "gates" / "__pycache__").mkdir()
+    (cfg / "cron" / "gates" / "__pycache__" / "quiet_hours.pyc").write_text("junk")
+
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+    members = _bundle_members(result.path)
+
+    for expected in (
+        "workspace/config/settings.yaml",
+        "workspace/config/cron/jobs.yaml",
+        "workspace/config/cron/system.yaml",
+        "workspace/config/cron/gates/quiet_hours.py",
+    ):
+        assert any(m.endswith(expected) for m in members), f"missing {expected}"
+    assert "__pycache__" not in "\n".join(members)
+
+
 def test_workspace_extra_excludes(nerve_dir, workspace, config_dir, tmp_path):
     # Plant a file the user wants excluded via config glob.
     (workspace / "memory" / "diagram.png").write_text("PNG")

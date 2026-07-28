@@ -125,6 +125,58 @@ def install_bundled_skills(workspace_path: Path) -> list[str]:
     return installed
 
 
+def _get_config_scaffold_dir() -> Path | None:
+    """Resolve the shared config scaffold directory (nerve/templates/config/).
+
+    Returns None if it doesn't exist.
+    """
+    try:
+        ref = importlib.resources.files("nerve") / "templates" / "config"
+        cfg_path = Path(str(ref))
+        if cfg_path.is_dir():
+            return cfg_path
+    except (TypeError, FileNotFoundError):
+        pass
+
+    cfg_path = Path(__file__).parent / "templates" / "config"
+    if cfg_path.is_dir():
+        return cfg_path
+
+    return None
+
+
+def install_config_scaffold(workspace_path: Path) -> list[str]:
+    """Create the git-syncable ``workspace/config/`` subtree.
+
+    Copies the shared scaffold (currently ``settings.yaml``) into
+    ``workspace/config/`` without overwriting anything that already exists.
+    Later stories add ``cron/`` and ``sources.yaml`` under the same subtree.
+
+    Returns the list of files created (relative to the workspace).
+    """
+    scaffold_dir = _get_config_scaffold_dir()
+    config_dir = workspace_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    if scaffold_dir is None:
+        logger.debug("No config scaffold directory found — created empty config/")
+        return []
+
+    created: list[str] = []
+    for src in sorted(scaffold_dir.iterdir()):
+        if not src.is_file():
+            continue
+        dst = config_dir / src.name
+        if dst.exists():
+            logger.debug("Skipping config/%s — already exists", src.name)
+            continue
+        shutil.copy2(src, dst)
+        logger.info("Created config/%s", src.name)
+        created.append(f"config/{src.name}")
+
+    return created
+
+
 def initialize_workspace(workspace_path: Path, mode: str) -> list[str]:
     """Copy mode-appropriate template files into a workspace directory.
 

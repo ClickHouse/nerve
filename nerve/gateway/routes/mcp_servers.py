@@ -46,7 +46,14 @@ async def get_mcp_server_usage(
 @router.post("/api/mcp-servers/reload")
 async def reload_mcp_servers(user: dict = Depends(require_auth)):
     """Re-read MCP server config from YAML files and refresh cache."""
+    from nerve.config import ConfigError
+
     deps = get_deps()
-    servers = await deps.engine.reload_mcp_config()
+    try:
+        servers = await deps.engine.reload_mcp_config()
+    except ConfigError as e:
+        # e.g. an unresolved required ${ENV_VAR} in config — report cleanly
+        # instead of a 500 so the caller sees what to fix.
+        raise HTTPException(status_code=400, detail=str(e)) from e
     stats = await deps.db.get_mcp_server_stats()
     return {"reloaded": len(servers), "servers": stats}

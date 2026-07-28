@@ -1,0 +1,46 @@
+# Nerve — shareable workspace configuration
+#
+# This file lives inside the workspace (workspace/config/settings.yaml) and is
+# the portable, git-syncable home for settings you want to share across a team
+# or a fleet of instances. It is merged UNDERNEATH the machine-local config.yaml
+# and config.local.yaml, so a machine can still override anything here locally
+# (until lockdown mode is enabled, which makes this the only source of truth).
+#
+# Precedence (lowest → highest):
+#   1. this file (workspace/config/settings.yaml)   ← shareable, tracked
+#   2. config.yaml                                   ← machine base
+#   3. config.local.yaml                             ← machine secrets/overrides
+#
+# Keep SECRETS out of this file — it is meant to be committed to a shared repo.
+# Reference them from the environment instead:
+#   anthropic_api_key: ${ANTHROPIC_API_KEY}
+#   some_optional: ${SOME_VAR:-default}
+#
+# The `workspace` key is NOT honored here (it would be circular — the workspace
+# location is resolved from config.yaml or the default before this file loads).
+#
+# Everything below is commented out; uncomment and edit what you want to share.
+
+# timezone: America/New_York
+
+# Where the gateway listens. A box needing a different port overrides in its own
+# config.yaml. Do not put gateway.ssl.cert/.key here: they are local filesystem
+# paths, and a box without that file fails to start.
+# gateway:
+#   host: 0.0.0.0
+#   port: 8900
+
+# Provider and region. Bedrock model IDs are geography-scoped to aws_region
+# (us./eu./apac.) and must match it or every call is rejected, so they belong
+# next to it. provider.aws_profile does not go here — it names a profile in one
+# machine's AWS credentials file.
+# provider:
+#   type: bedrock
+#   aws_region: eu-west-1
+
+# agent:
+#   model: claude-opus-5
+#   effort: high
+
+# notifications:
+#   channels: [telegram]

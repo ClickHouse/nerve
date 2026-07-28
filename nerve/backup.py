@@ -96,7 +96,15 @@ _SECRET_RESTORE_PATHS: tuple[str, ...] = (
 # take an *allowlist* of the small, irreplaceable "brain": identity markdown
 # at the root plus a few known directories. Extra excludes from config are
 # applied *within* these.
-WORKSPACE_INCLUDE_DIRS: tuple[str, ...] = ("memory", "scripts", "skills")
+#
+# ``config`` carries the shareable settings and the cron jobs. It is tracked in
+# the workspace repo, but so are ``skills`` and ``memory`` — "it is in git" has
+# never been the rule here, and a backup taken to survive a lost machine is
+# worth little if restoring it brings back no schedule. Nothing in it is secret
+# by construction: values that matter are ``${ENV_VAR}`` references, and the
+# real secrets live in the machine-local overlay that is already handled
+# separately.
+WORKSPACE_INCLUDE_DIRS: tuple[str, ...] = ("config", "memory", "scripts", "skills")
 WORKSPACE_INCLUDE_FILE_GLOBS: tuple[str, ...] = ("*.md",)
 
 # Directory names always pruned while walking the included workspace dirs.

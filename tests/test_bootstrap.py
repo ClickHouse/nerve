@@ -100,11 +100,17 @@ class TestNonInteractiveSetup:
         with patch.dict(os.environ, env, clear=False):
             run_non_interactive(tmp_path)
 
-        # config.yaml exists
+        # config.yaml holds the machine-local half...
         assert (tmp_path / "config.yaml").exists()
         config = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert config["timezone"] == "Europe/London"
         assert config["workspace"] == str(tmp_path / "workspace")
+        # ...and the portable half lands in the git-tracked workspace layer,
+        # which is what `nerve config sync` and lockdown actually read.
+        settings = yaml.safe_load(
+            (tmp_path / "workspace" / "config" / "settings.yaml").read_text()
+        )
+        assert settings["timezone"] == "Europe/London"
+        assert "timezone" not in config
 
         # config.local.yaml exists with API key
         assert (tmp_path / "config.local.yaml").exists()
@@ -201,7 +207,11 @@ class TestDeferredWrites:
 
         # Config content is valid YAML
         config = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert config["timezone"] == "US/Pacific"
+        assert config["workspace"] == str(tmp_path / "workspace")
+        settings = yaml.safe_load(
+            (tmp_path / "workspace" / "config" / "settings.yaml").read_text()
+        )
+        assert settings["timezone"] == "US/Pacific"
 
         # Local config has keys
         local = yaml.safe_load((tmp_path / "config.local.yaml").read_text())
@@ -235,6 +245,25 @@ class TestCliInit:
         )
         assert result.exit_code == 0
         assert (tmp_path / "config.local.yaml").exists()
+
+    def test_reinit_prompt_describes_the_backups_it_actually_makes(
+        self, configured_dir: Path
+    ) -> None:
+        """This prompt is how an operator decides whether re-running is safe.
+
+        The wizard deliberately skips the ``.bak`` for an empty or
+        comments-only file — a freshly scaffolded settings.yaml has nothing to
+        lose and lives in a git-tracked directory. So a flat "all three are
+        backed up" is a promise the code does not keep, exactly where being
+        misled costs the most.
+        """
+        result = CliRunner().invoke(
+            main, ["-c", str(configured_dir), "init"], input="n\n"
+        )
+        assert result.exit_code == 0
+        assert "*.bak" in result.output
+        assert "All three are backed up" not in result.output
+        assert "comments-only" in result.output
 
     def test_non_interactive_fails_without_key(self, tmp_path: Path) -> None:
         """Non-interactive should fail without ANTHROPIC_API_KEY."""
@@ -841,11 +870,15 @@ class TestNonInteractiveBedrockRegion:
         with patch.dict(os.environ, env, clear=False):
             run_non_interactive(tmp_path)
 
-        config = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert config["provider"]["aws_region"] == "eu-central-1"
-        assert config["agent"]["model"].startswith("eu.anthropic.")
-        assert config["agent"]["cron_model"].startswith("eu.anthropic.")
-        assert config["memory"]["fast_model"].startswith("eu.anthropic.")
+        # The region and the model IDs derived from it are shared policy, so
+        # they land in the tracked layer and survive lockdown.
+        settings = yaml.safe_load(
+            (tmp_path / "ws" / "config" / "settings.yaml").read_text()
+        )
+        assert settings["provider"]["aws_region"] == "eu-central-1"
+        assert settings["agent"]["model"].startswith("eu.anthropic.")
+        assert settings["agent"]["cron_model"].startswith("eu.anthropic.")
+        assert settings["memory"]["fast_model"].startswith("eu.anthropic.")
 
     def test_us_region_writes_us_models(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -858,8 +891,10 @@ class TestNonInteractiveBedrockRegion:
         with patch.dict(os.environ, env, clear=False):
             run_non_interactive(tmp_path)
 
-        config = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert config["agent"]["model"].startswith("us.anthropic.")
+        settings = yaml.safe_load(
+            (tmp_path / "ws" / "config" / "settings.yaml").read_text()
+        )
+        assert settings["agent"]["model"].startswith("us.anthropic.")
 
 
 class TestNonInteractiveTelegramAllowedUsers:
@@ -1007,3 +1042,336 @@ class TestStepCounter:
         wizard._do("mode", lambda: None)
         assert wizard._step_counter == 2
         assert wizard._next_step("API") == "Step 3/10: API"
+
+
+class TestWorkspaceExpansionMatchesTheLoader:
+    """The wizard must resolve `workspace` to the same directory as the loader.
+
+    It decides where settings.yaml is written; the loader decides where it is
+    read. Any disagreement means `nerve init` reports success and every portable
+    setting is silently absent — and on a locked box, which has no other layer,
+    that leaves the instance running entirely on declared defaults.
+    """
+
+    @staticmethod
+    def _loader_answer(raw: str) -> Path:
+        """What nerve.config would resolve `workspace: <raw>` to."""
+        import nerve.config as cfgmod
+        from nerve import paths
+
+        if "${" in raw:
+            raw = cfgmod._interpolate_str(raw, [])
+        return cfgmod._expand_path(raw) or paths.default_workspace()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "~/nerve-workspace",
+            "  ~/nerve-workspace",          # leading space: expanduser is a no-op
+            "~/nerve-workspace\n",          # e.g. NERVE_WORKSPACE from a heredoc
+            " /srv/nerve/ws ",
+            "${NERVE_TEST_WS}",
+            "$NERVE_TEST_WS",               # bare form: needs expandvars first
+            "",                             # blank means unset
+        ],
+    )
+    def test_agrees_with_the_loader(self, raw: str, monkeypatch) -> None:
+        monkeypatch.setenv("NERVE_TEST_WS", "~/from-env")
+        from nerve.bootstrap import _expand_workspace
+
+        assert _expand_workspace(raw) == self._loader_answer(raw)
+
+    def test_leading_whitespace_still_expands_the_home_directory(
+        self, monkeypatch,
+    ) -> None:
+        """The concrete failure: expanduser only expands a *leading* ``~``.
+
+        Running it before the strip left ``Path("  ~/nerve-workspace")`` — a
+        relative path with a component literally named ``  ~``.
+        """
+        from nerve.bootstrap import _expand_workspace
+
+        expanded = _expand_workspace("  ~/nerve-workspace")
+        assert expanded.is_absolute()
+        assert "~" not in str(expanded)
+
+    def test_a_bare_env_var_holding_a_tilde_is_fully_expanded(
+        self, monkeypatch,
+    ) -> None:
+        """expandvars has to run before expanduser, not after.
+
+        ``$WS`` expands to ``~/ws``, which then still needs expanduser. Doing it
+        the other way round ends at a literal tilde.
+        """
+        monkeypatch.setenv("NERVE_TEST_WS", "~/ws")
+        from nerve.bootstrap import _expand_workspace
+
+        expanded = _expand_workspace("$NERVE_TEST_WS")
+        assert expanded.is_absolute()
+        assert "~" not in str(expanded)
+        assert expanded.name == "ws"
+
+    def test_the_wizard_writes_where_the_loader_reads(self, tmp_path: Path) -> None:
+        """End to end, with the whitespace that used to split the two apart."""
+        from nerve.config import load_config
+
+        ws = tmp_path / "ws"
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.mode = "personal"
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.timezone = "Europe/Amsterdam"
+        # A trailing newline is what an env var out of a compose file or heredoc
+        # actually looks like.
+        wizard.choices.workspace_path = f"{ws}\n"
+        wizard._write_config_yaml()
+        wizard._write_workspace_settings()
+
+        assert load_config(tmp_path).timezone == "Europe/Amsterdam"
+
+
+class TestPortableSettingsSplit:
+    """`nerve init` must actually populate the tracked settings layer.
+
+    Before the split the wizard wrote ~33 keys into machine-local config.yaml
+    and zero into settings.yaml, so `nerve config sync` and lockdown were
+    no-ops on a default install: adopting the shared layer meant hand-adding a
+    key to settings.yaml *and* deleting it from config.yaml, because
+    config.yaml shadows it.
+    """
+
+    def _wizard(self, tmp_path: Path, **choices: Any) -> SetupWizard:
+        w = SetupWizard(tmp_path)
+        w.choices.workspace_path = tmp_path / "workspace"
+        w.choices.mode = "personal"
+        w.choices.anthropic_api_key = "sk-ant-api03-test"
+        for k, v in choices.items():
+            setattr(w.choices, k, v)
+        return w
+
+    def test_layers_are_disjoint(self, tmp_path: Path) -> None:
+        """A key in both layers makes the tracked copy dead weight.
+
+        config.yaml shadows settings.yaml, so a value written to both can be
+        edited in the shared repo forever with no effect.
+        """
+        def leaves(d: dict, prefix: str = "") -> set[str]:
+            out: set[str] = set()
+            for k, v in d.items():
+                path = f"{prefix}{k}"
+                if isinstance(v, dict):
+                    out |= leaves(v, f"{path}.")
+                else:
+                    out.add(path)
+            return out
+
+        for kwargs in (
+            {},
+            {"provider_type": "bedrock", "aws_region": "eu-west-1"},
+            {"use_proxy": True},
+            {"deployment": "docker"},
+            {"mode": "worker"},
+            {"telegram_bot_token": "123:abc"},
+        ):
+            machine, portable, _ = self._wizard(tmp_path, **kwargs)._build_config_layers()
+            overlap = leaves(machine) & leaves(portable)
+            assert not overlap, f"{kwargs} → written to both layers: {overlap}"
+
+    def test_machine_layer_is_only_machine_things(self, tmp_path: Path) -> None:
+        machine, _portable, _shadowed = self._wizard(tmp_path)._build_config_layers()
+        assert set(machine) <= {
+            "workspace", "deployment", "gateway", "telegram",
+            "provider", "proxy", "docker", "agent", "memory", "sync",
+        }
+        assert "timezone" not in machine
+        assert "sessions" not in machine
+        # Which sources sync is shared policy; whose mailboxes is not.
+        assert set(machine.get("sync", {})) == {"gmail"}
+        assert set(machine["sync"]["gmail"]) == {"accounts"}
+
+    def test_bedrock_models_travel_with_the_region(self, tmp_path: Path) -> None:
+        """Geography-scoped model IDs are shared, because the region is.
+
+        They were machine-local on the grounds that a ``us.`` id is wrong for an
+        ``eu-`` box. The effect was that a locked instance fell back to the
+        non-prefixed declared defaults, which Bedrock rejects, and to an
+        ``anthropic`` provider, since that block was machine-local too. The
+        prefix is a function of the region alone, so tracking the region lets
+        the IDs be tracked with it.
+        """
+        machine, portable, shadowed = self._wizard(
+            tmp_path, provider_type="bedrock", aws_region="eu-west-1"
+        )._build_config_layers()
+        assert portable["provider"]["type"] == "bedrock"
+        assert portable["provider"]["aws_region"] == "eu-west-1"
+        assert portable["agent"]["model"].startswith("eu.anthropic.")
+        assert portable["memory"]["fast_model"].startswith("eu.anthropic.")
+        assert "agent" not in machine
+        assert "memory" not in machine
+        # Non-model agent settings were portable already and stay that way.
+        assert portable["agent"]["thinking"] == "max"
+
+    def test_only_the_aws_profile_stays_machine_local(self, tmp_path: Path) -> None:
+        """The profile names an entry in this box's AWS credentials file.
+
+        Provider and region describe the deployment; the profile is the only part
+        of the block that cannot be shared.
+        """
+        machine, portable, _ = self._wizard(
+            tmp_path,
+            provider_type="bedrock",
+            aws_region="eu-west-1",
+            aws_profile="nerve-prod",
+        )._build_config_layers()
+        assert machine["provider"] == {"aws_profile": "nerve-prod"}
+        assert "aws_profile" not in portable["provider"]
+
+    def test_switching_off_bedrock_clears_the_tracked_region(
+        self, tmp_path: Path
+    ) -> None:
+        """settings.yaml is merge-preserving, so the region must be deleted.
+
+        Omitting it would leave the tracked file naming a region the box no
+        longer uses, and under lockdown that stale value is the only one there.
+        """
+        self._wizard(
+            tmp_path, provider_type="bedrock", aws_region="eu-west-1"
+        )._apply()
+        settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
+        before = yaml.safe_load(settings_path.read_text())
+        assert before["provider"]["aws_region"] == "eu-west-1"
+        assert before["agent"]["model"].startswith("eu.anthropic.")
+
+        self._wizard(tmp_path, provider_type="anthropic")._apply()
+
+        after = yaml.safe_load(settings_path.read_text())
+        assert after["provider"]["type"] == "anthropic"
+        assert "aws_region" not in after.get("provider", {})
+        # The non-prefixed names overwrite rather than needing deletion.
+        assert after["agent"]["model"] == "claude-opus-5"
+
+    def test_gateway_host_and_port_are_shared(self, tmp_path: Path) -> None:
+        """The tracked layer has to be able to state the bind address.
+
+        While these were machine-local the wizard only ever wrote the declared
+        defaults, so settings.yaml could not express them at all.
+        """
+        machine, portable, _ = self._wizard(tmp_path)._build_config_layers()
+        assert portable["gateway"] == {"host": "0.0.0.0", "port": 8900}
+        assert "gateway" not in machine
+
+    def test_reinit_applies_new_answers(self, tmp_path: Path) -> None:
+        """The wizard owns the keys it generates.
+
+        "Existing always wins" sounds safer for a shared file, but it makes
+        re-running init a no-op: you are prompted for a timezone, shown a
+        tick, and the answer is discarded because the key already exists.
+        """
+        self._wizard(tmp_path, timezone="Europe/Berlin")._apply()
+        settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
+        assert yaml.safe_load(settings_path.read_text())["timezone"] == "Europe/Berlin"
+
+        self._wizard(tmp_path, timezone="US/Pacific", gmail_sync=True)._apply()
+        after = yaml.safe_load(settings_path.read_text())
+        assert after["timezone"] == "US/Pacific"
+        assert after["sync"]["gmail"]["enabled"] is True
+
+    def test_reinit_preserves_keys_the_wizard_does_not_own(self, tmp_path: Path) -> None:
+        """A team policy key the wizard never emits must survive."""
+        self._wizard(tmp_path)._apply()
+        settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
+        edited = yaml.safe_load(settings_path.read_text())
+        edited["team_only_key"] = "keep me"
+        edited["agent"]["cache_ttl"] = "1h"      # real key, not wizard-generated
+        settings_path.write_text(yaml.safe_dump(edited), encoding="utf-8")
+
+        self._wizard(tmp_path)._apply()
+
+        after = yaml.safe_load(settings_path.read_text())
+        assert after["team_only_key"] == "keep me"
+        assert after["agent"]["cache_ttl"] == "1h"
+        assert after["agent"]["thinking"] == "max"
+
+    def test_switching_to_bedrock_rewrites_the_tracked_model_names(
+        self, tmp_path: Path
+    ) -> None:
+        """Re-running init replaces the names in place, in the shared file.
+
+        The previous behaviour routed them to config.yaml and deleted them here,
+        which left a locked box with no model names at all: it fell back to the
+        non-prefixed declared defaults, which Bedrock rejects.
+        """
+        self._wizard(tmp_path)._apply()
+        settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
+        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == (
+            "claude-opus-5"
+        )
+
+        self._wizard(
+            tmp_path, provider_type="bedrock", aws_region="eu-west-1"
+        )._apply()
+
+        after = yaml.safe_load(settings_path.read_text())
+        assert after["agent"]["model"].startswith("eu.anthropic.")
+        assert after["memory"]["recall_model"].startswith("eu.anthropic.")
+        assert after["provider"] == {"type": "bedrock", "aws_region": "eu-west-1"}
+        # And still nothing left in both layers.
+        machine = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert not (
+            set(SetupWizard._leaf_paths(after))
+            & set(SetupWizard._leaf_paths(machine))
+        )
+
+    def test_fresh_install_leaves_no_bak_in_the_tracked_subtree(
+        self, tmp_path: Path
+    ) -> None:
+        """The scaffold is comments-only; backing it up drops junk in a git dir."""
+        self._wizard(tmp_path)._apply()
+        ws_config = tmp_path / "workspace" / "config"
+        assert not (ws_config / "settings.yaml.bak").exists()
+
+    def test_workspace_path_with_env_ref_lands_where_the_loader_looks(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The loader interpolates ${VAR} in `workspace`; the writer must too,
+        or settings.yaml goes to a literal './${VAR}/config' directory and
+        every portable setting is silently lost."""
+        from nerve.config import load_config
+
+        real_ws = tmp_path / "real-ws"
+        monkeypatch.setenv("MY_WS", str(real_ws))
+        wizard = self._wizard(tmp_path, timezone="Asia/Tokyo")
+        wizard.choices.workspace_path = Path("${MY_WS}")
+        wizard._apply()
+
+        assert (real_ws / "config" / "settings.yaml").exists()
+        assert load_config(tmp_path).timezone == "Asia/Tokyo"
+
+    def test_reinit_backs_up_settings(self, tmp_path: Path) -> None:
+        wizard = self._wizard(tmp_path)
+        wizard._apply()
+        settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
+        settings_path.write_text("timezone: UTC\n", encoding="utf-8")
+        self._wizard(tmp_path)._apply()
+        assert (settings_path.parent / "settings.yaml.bak").read_text() == "timezone: UTC\n"
+
+    def test_malformed_settings_is_left_alone(self, tmp_path: Path) -> None:
+        """Don't destroy a file we can't parse — the operator needs to see it."""
+        wizard = self._wizard(tmp_path)
+        ws_config = tmp_path / "workspace" / "config"
+        ws_config.mkdir(parents=True)
+        broken = "timezone: [unclosed\n"
+        (ws_config / "settings.yaml").write_text(broken, encoding="utf-8")
+        wizard._apply()
+        assert (ws_config / "settings.yaml").read_text() == broken
+
+    def test_merged_result_still_loads(self, tmp_path: Path) -> None:
+        """The split must be invisible to the loader: same effective config."""
+        from nerve.config import load_config
+
+        self._wizard(tmp_path, timezone="US/Pacific")._apply()
+        cfg = load_config(tmp_path)
+        assert cfg.timezone == "US/Pacific"                 # from settings.yaml
+        assert cfg.workspace == tmp_path / "workspace"      # from config.yaml
+        assert cfg.gateway.port == 8900                     # from config.yaml
+        assert cfg.agent.thinking == "max"                  # from settings.yaml
+        assert cfg.sessions.max_sessions == 500             # from settings.yaml
