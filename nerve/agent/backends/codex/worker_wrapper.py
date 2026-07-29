@@ -9,8 +9,6 @@ import urllib.error
 import urllib.request
 from uuid import uuid4
 
-from nerve.agent.backends.codex.mcp_stdio_wrapper import EXTERNAL_MCP_ENV_PREFIX
-
 
 def _worker_token(worker_id: str) -> str:
     url = os.environ.get("NERVE_MCP_WORKER_TOKEN_URL", "")
@@ -71,12 +69,9 @@ def main() -> int:
     env["NERVE_ULTRACODE_WORKER_ID"] = worker_id
     # Prevent nested plugin refreshes even if upstream defaults change.
     env["ULTRACODE_NO_AUTO_UPDATE"] = "1"
-    # The parent app-server needs synthetic external-MCP credential variables,
-    # but Ultracode workers have no external MCP configuration and must not
-    # inherit the corresponding secrets.
-    for key in tuple(env):
-        if key.startswith(EXTERNAL_MCP_ENV_PREFIX):
-            env.pop(key, None)
+    # Workers inherit the parent's external MCP servers, so the synthetic
+    # credential variables stay in the environment — the stdio MCP launcher
+    # maps and strips them at server spawn (never in argv).
     argv = [real_bin, *_inject_config_overrides(sys.argv[1:], overrides)]
     os.execvpe(real_bin, argv, env)
     return 127

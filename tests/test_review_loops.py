@@ -960,3 +960,38 @@ class TestReviewLoopTools:
         result2 = await rls._dispatch_decision({}, loop["id"], "accept", None)
         assert result2.ok
         assert (await db.get_review_loop(loop["id"]))["status"] == "passed"
+
+
+# --------------------------------------------------------------------------- #
+#  Workdir handling                                                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestCreateLoopCwd:
+    async def test_missing_cwd_is_created(self, db, engine, tmp_path):
+        cfg = _make_config(tmp_path)
+        runs = WorkflowRunService(cfg, db, engine)
+        rls = ReviewLoopService(cfg, db, engine, runs)
+        target = tmp_path / "fresh" / "nested"
+        assert not target.exists()
+        loop = await rls.create_loop(
+            goal="g", verifier="- a", session_id=None,
+            cwd=str(target), autostart=False,
+        )
+        assert target.is_dir()
+        assert loop["cwd"] == str(target.resolve())
+
+    async def test_cwd_conflicting_with_file_is_rejected(
+        self, db, engine, tmp_path,
+    ):
+        occupied = tmp_path / "occupied"
+        occupied.write_text("not a directory")
+        cfg = _make_config(tmp_path)
+        runs = WorkflowRunService(cfg, db, engine)
+        rls = ReviewLoopService(cfg, db, engine, runs)
+        with pytest.raises(ReviewLoopError, match="invalid cwd"):
+            await rls.create_loop(
+                goal="g", verifier="- a", session_id=None,
+                cwd=str(occupied), autostart=False,
+            )

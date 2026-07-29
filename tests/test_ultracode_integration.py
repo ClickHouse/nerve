@@ -88,22 +88,31 @@ def test_worker_wrapper_is_owner_only(tmp_path):
     assert "worker_wrapper import main" in wrapper.read_text()
 
 
-def test_child_environment_inherits_mcp_without_persisting_token(tmp_path):
+def test_child_environment_inherits_full_mcp_without_persisting_token(tmp_path):
+    external = McpServerConfig(
+        name="external_http", type="http", url="https://mcp.invalid/",
+        headers={"Authorization": "http-secret-value"},
+    )
     cfg = _config(tmp_path)
-    backend = _backend(cfg)
+    backend = _backend(cfg, [external])
     from nerve.agent.backends.codex.backend import CodexClient
 
     client = CodexClient(backend, _spec(cfg))
     env = client._transport._env
     child = json.loads(env["NERVE_CODEX_CHILD_CONFIG"])
     assert any(value.startswith("mcp_servers.nerve.url=") for value in child)
+    # Workers inherit the parent session's full MCP surface: external
+    # servers included, no worker-side tool allowlist, and every server
+    # pre-approved (workers are non-interactive and cannot answer prompts).
+    assert any(value.startswith("mcp_servers.external_http.") for value in child)
     assert 'mcp_servers.nerve.default_tools_approval_mode="approve"' in child
-    enabled = next(
-        value for value in child
-        if value.startswith("mcp_servers.nerve.enabled_tools=")
+    assert (
+        'mcp_servers.external_http.default_tools_approval_mode="approve"'
+        in child
     )
-    assert "session_context" in enabled
-    assert "task_create" not in enabled
+    assert not any("enabled_tools" in value for value in child)
+    # Secrets stay env-referenced — never inline in the child config.
+    assert all("http-secret-value" not in value for value in child)
     assert all("parent-s1" not in value for value in child)
     assert env["ULTRACODE_NO_AUTO_UPDATE"] == "1"
     assert env["CODEX_CLI_PATH"].endswith("codex-worker")
@@ -146,7 +155,7 @@ def test_worker_wrapper_exchanges_token_and_injects_config(monkeypatch):
     assert captured["env"]["ULTRACODE_NO_AUTO_UPDATE"] == "1"
 
 
-def test_external_mcp_secrets_are_env_referenced_and_stripped_from_worker(
+def test_external_mcp_secrets_are_env_referenced_and_inherited_by_worker(
     tmp_path, monkeypatch,
 ):
     stdio = McpServerConfig(
@@ -202,7 +211,12 @@ def test_external_mcp_secrets_are_env_referenced_and_stripped_from_worker(
     monkeypatch.setattr(worker_wrapper.os, "execvpe", fake_exec)
     with pytest.raises(RuntimeError, match="stop"):
         worker_wrapper.main()
-    assert all(name not in captured["env"] for name in secret_names)
+    # Workers inherit the parent's external MCP servers, so the synthetic
+    # credential variables must survive into the worker environment — the
+    # stdio launcher maps + strips them later, at MCP server spawn.
+    assert {captured["env"].get(name) for name in secret_names} == {
+        "stdio-secret-value", "http-secret-value",
+    }
 
 
 def test_stdio_mcp_wrapper_maps_synthetic_secret_only_for_server(monkeypatch):

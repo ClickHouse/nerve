@@ -115,6 +115,18 @@ export function ReviewLoopPanel({ disabled }: { disabled?: boolean }) {
 
           {advancedOpen && (
             <div className="grid grid-cols-2 gap-3 pt-1 border-t border-border-subtle">
+              <div className="space-y-1 col-span-2">
+                <div className={labelCls}>Workdir — shared workspace for all legs (created if missing)</div>
+                <input
+                  type="text"
+                  value={rl.cwd}
+                  onChange={(e) => setRL({ cwd: e.target.value })}
+                  placeholder="default: the global workspace"
+                  disabled={disabled || starting}
+                  className={inputCls + ' font-mono'}
+                  spellCheck={false}
+                />
+              </div>
               <div className="space-y-1">
                 <div className={labelCls}>Implementer engine</div>
                 <select
