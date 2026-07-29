@@ -154,6 +154,20 @@ async def _wait_status(db, loop_id: str, statuses: tuple[str, ...], timeout: flo
     )
 
 
+async def _wait_awaited(mock, timeout: float = 8.0) -> None:
+    """Wait for an AsyncMock to be awaited. The status CAS flips BEFORE the
+    decision card is proposed (single-winner transition; a card death in the
+    gap is covered by the reconcile tick), so tests that observe the parked
+    status must not assert the card synchronously — that's a race on slow
+    runners."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if mock.await_count:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("mock was never awaited")
+
+
 @pytest_asyncio.fixture
 async def engine(db):
     return _make_engine(db)
@@ -436,7 +450,7 @@ class TestReviewLoopService:
         loop = await rls.create_loop(goal="g", verifier="- a", session_id=obs)
         parked = await _wait_status(db, loop["id"], ("awaiting_user",))
         assert parked["failure_reason"] == "gamed"
-        engine.notification_service.propose_action.assert_awaited()
+        await _wait_awaited(engine.notification_service.propose_action)
 
     async def test_budget_too_low_escalates_and_accept_decision(self, db, engine, services):
         runs, rls = services
