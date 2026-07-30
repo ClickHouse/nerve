@@ -1203,10 +1203,13 @@ def reload(ctx: click.Context) -> None:
             f"Config could not be loaded ({ctx.obj.get('config_error')}); "
             "run 'nerve config validate' to see why."
         )
-    if not config.auth.jwt_secret:
+    if not config.auth.jwt_secret and config.lockdown:
         raise click.ClickException(
-            "auth.jwt_secret is not set, so this command cannot authenticate to "
-            "the gateway. Run 'nerve init', or POST /api/config/reload yourself."
+            "No auth.jwt_secret in the config read here, and a locked gateway "
+            "never runs open, so nothing sent from this shell can be "
+            "authenticated. If the secret comes from ${ENV_VAR}, export it here "
+            "too; if the daemon has none either, it is refusing every request "
+            "and needs one before it can be reloaded."
         )
     url = _gateway_url(config, "/api/config/reload")
     # Certificate verification stands except in the one case where it cannot
@@ -1216,10 +1219,17 @@ def reload(ctx: click.Context) -> None:
     # gateway.host names a real host the certificate should match it, and a
     # failure there is worth hearing about rather than skipping past.
     verify = config.gateway.host not in _WILDCARD_BINDS
+    # A token when there is a secret to sign one with, and otherwise none: an
+    # unlocked gateway with no auth.jwt_secret does not ask for one (require_auth
+    # runs open there), so an empty secret is not a reason to refuse to call. The
+    # operator hand-editing config on a dev box is the likeliest caller of all.
+    headers = {}
+    if config.auth.jwt_secret:
+        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
     try:
         resp = httpx.post(
             url,
-            headers={"Authorization": f"Bearer {create_token(config.auth.jwt_secret)}"},
+            headers=headers,
             verify=verify,
             # A reload re-reads config and rebuilds cron, sources, MCP and
             # skills; MCP servers in particular can take a while to come up.
@@ -1234,9 +1244,10 @@ def reload(ctx: click.Context) -> None:
         raise click.ClickException(f"Could not reach {url}: {e}") from None
     if resp.status_code in (401, 403):
         raise click.ClickException(
-            "The gateway rejected the token. This usually means the running "
-            "daemon started with a different auth.jwt_secret than the config "
-            "here — restart it to pick up the new one."
+            "The gateway rejected the request. The running daemon's "
+            "auth.jwt_secret is not the one read here — it either started with a "
+            "different value, or with one this config no longer supplies. Restart "
+            "it to pick up the current config."
         )
     if resp.status_code != 200:
         raise click.ClickException(f"{url} returned {resp.status_code}: {resp.text[:400]}")

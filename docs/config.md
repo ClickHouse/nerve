@@ -274,16 +274,28 @@ Check `errors` rather than reading the 200 as success.
 nerve reload    # apply config edits to the running daemon
 ```
 
-It calls the endpoint above on this box's own gateway, authenticating with
-`auth.jwt_secret` from the config it just read, and prints the per-subsystem
+It calls the endpoint above on this box's own gateway and prints the per-subsystem
 result. It exits non-zero on a partial reload, so it can gate a deploy step rather
 than only informing a human. Anything in the restart table that changed is printed
 as a warning: nothing failed, but the new value is not live yet.
 
 With no daemon running there is nothing to reload and the command says so. Config
-is read fresh at startup, so `nerve start` already picks the edit up. If
-`auth.jwt_secret` differs from the one the running daemon started with, the gateway
-rejects the token and only a restart resolves it.
+is read fresh at startup, so `nerve start` already picks the edit up.
+
+It authenticates the way the gateway asks to be authenticated, which depends on
+`auth.jwt_secret` in the config it just read:
+
+- **Set** → it signs a token with it. If that is not the secret the running daemon
+  started with, the gateway rejects the request and only a restart resolves it.
+- **Empty, unlocked** → the gateway is in dev mode and does not ask for a token
+  (`require_auth` runs open), so the call goes unauthenticated.
+- **Empty, locked** → refused before anything is sent. A locked gateway never takes
+  the open path, so no request from that shell can be authenticated. If the secret
+  comes from `${ENV_VAR}`, export it in that shell too.
+
+`auth.password_hash` is not an alternative here. It gates the browser login, which
+is what mints a token from it; `require_auth` reads `auth.jwt_secret` alone, so a
+password neither makes the endpoint ask for a token nor gives the CLI one to sign.
 
 `POST /api/config/sync` runs the same reload but scores it differently, because it
 answers a different question. Its `ok` is about the *merge*: true once the merged

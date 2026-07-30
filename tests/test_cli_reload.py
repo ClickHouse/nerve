@@ -16,6 +16,23 @@ def _config(tmp_path, extra=""):
     return tmp_path
 
 
+def _locked_config(tmp_path, extra=""):
+    """A config dir the daemon would read as locked.
+
+    The flag has to come from the workspace's tracked settings.yaml: `lockdown`
+    in config.yaml is ignored by design, so setting it there would produce an
+    unlocked instance and a test that passes for the wrong reason.
+    """
+    from nerve.config import workspace_settings_file
+
+    config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (workspace / "config").mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+    workspace_settings_file(workspace).write_text("lockdown: true\n" + extra, encoding="utf-8")
+    return config_dir
+
+
 class _Response:
     def __init__(self, status_code=200, payload=None, text=""):
         self.status_code = status_code
@@ -122,16 +139,53 @@ class TestReloadCommand:
         assert "jwt_secret" in result.output
         assert "Traceback" not in result.output
 
-    def test_missing_jwt_secret_does_not_call_the_gateway(self, tmp_path, monkeypatch):
-        """Minting a token needs the secret, so there is nothing to send. Say so
-        instead of sending an unauthenticated request and reporting its 401."""
+    def test_no_jwt_secret_still_calls_the_gateway(self, tmp_path, monkeypatch):
+        """An unlocked gateway with no auth.jwt_secret does not ask for a token —
+        require_auth runs open there. Refusing to send one would refuse the reload
+        the endpoint would have accepted, on the dev box where the hand edits this
+        command exists for are most of the edits there are."""
         calls: list = []
-        monkeypatch.setattr(httpx, "post", _post(calls))
+        monkeypatch.setattr(httpx, "post", _post(calls, payload={"ok": True}))
         (tmp_path / "config.yaml").write_text("timezone: UTC\n", encoding="utf-8")
         result = CliRunner().invoke(main, ["-c", str(tmp_path), "reload"])
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert "Authorization" not in calls[0]["headers"]
+
+    def test_a_password_hash_is_not_a_second_source_of_a_token(self, tmp_path, monkeypatch):
+        """auth.password_hash gates the browser login, which is what mints a token
+        from it. require_auth reads auth.jwt_secret alone, so a password neither
+        makes the endpoint ask for a token nor gives this command one to sign."""
+        calls: list = []
+        monkeypatch.setattr(httpx, "post", _post(calls, payload={"ok": True}))
+        (tmp_path / "config.yaml").write_text(
+            "auth:\n  password_hash: $2b$12$notarealhashatall\n", encoding="utf-8"
+        )
+        result = CliRunner().invoke(main, ["-c", str(tmp_path), "reload"])
+        assert result.exit_code == 0, result.output
+        assert "Authorization" not in calls[0]["headers"]
+
+    def test_lockdown_without_a_secret_refuses_before_calling(self, tmp_path, monkeypatch):
+        """The one case where an empty secret is a dead end: a locked gateway never
+        takes the open path, so no request from this shell can be authenticated.
+        Sending it anyway would report the gateway's refusal as the problem."""
+        calls: list = []
+        monkeypatch.setattr(httpx, "post", _post(calls))
+        result = CliRunner().invoke(main, ["-c", str(_locked_config(tmp_path)), "reload"])
         assert result.exit_code != 0
-        assert "jwt_secret is not set" in result.output
+        assert "locked gateway" in result.output
         assert not calls
+
+    def test_lockdown_with_a_secret_authenticates_normally(self, tmp_path, monkeypatch):
+        """The refusal above is about the missing secret, not about lockdown."""
+        calls: list = []
+        monkeypatch.setattr(httpx, "post", _post(calls, payload={"ok": True}))
+        cfg = _locked_config(
+            tmp_path, extra="auth:\n  jwt_secret: test-secret-value-long-enough-for-hs256\n"
+        )
+        result = CliRunner().invoke(main, ["-c", str(cfg), "reload"])
+        assert result.exit_code == 0, result.output
+        assert calls[0]["headers"]["Authorization"].startswith("Bearer ")
 
     def test_tls_verification_is_only_skipped_for_the_loopback_rewrite(
         self, tmp_path, monkeypatch
