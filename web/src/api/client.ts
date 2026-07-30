@@ -274,12 +274,16 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null) =>
+  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null) =>
     request<any>('/sessions', {
       method: 'POST',
       body: JSON.stringify({
         title,
         ...(backend ? { backend } : {}),
+        // Composer's model pick — persisted on the session row at creation
+        // so the header badge is right from the first render (omitted →
+        // the backend's default model).
+        ...(model ? { model } : {}),
         ...(cwd ? { cwd } : {}),
         ...(reviewLoop ? { review_loop: reviewLoop } : {}),
       }),

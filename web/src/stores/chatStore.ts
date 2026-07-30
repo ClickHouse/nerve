@@ -591,8 +591,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // The loop's workdir rides the session-level cwd (the loop inherits the
     // observer session's cwd server-side); only sent when a loop is bound.
     const rlCwd = rlPayload && rl ? rl.cwd.trim() || undefined : undefined;
+    // Composer's model pick for the chosen backend — sent at creation so
+    // the session row (and the header badge) carries it from the start,
+    // instead of the backend default until the first turn resolves it.
+    const effBackend = get().newChatBackend ?? get().backendDefault ?? 'claude';
+    const pickedModel = get().selectedModels[effBackend] ?? undefined;
     const real: Session = await api.createSession(
-      undefined, get().newChatBackend, rlCwd, rlPayload,
+      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel,
     );
     set((state) => {
       const drafts = { ...state.drafts };
