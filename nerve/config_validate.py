@@ -9,8 +9,8 @@ hard failures — unless ``strict_env`` is requested.
 Structural problems are hard errors so a bad config PR fails CI before merge: an
 unparseable or invalid cron file, a bad backend / codex config, a malformed cron
 gate spec, a schedule the scheduler will not run as written
-(:func:`_schedule_problem`), or a path setting left blank — which is not "unset"
-but the daemon's working directory (:data:`_WORKING_DIR_PATH_KEYS`). Unknown /
+(:func:`_schedule_problem`), or a path setting written ``.`` — which aims nerve
+at the daemon's working directory (:data:`_WORKING_DIR_PATH_KEYS`). Unknown /
 misspelled top-level keys are warnings by default (a config carrying a key from
 a newer nerve, or the shipped example, shouldn't fail CI) — pass ``strict_keys``
 to promote them to errors.
@@ -278,14 +278,21 @@ def _is_unresolved(value: Any) -> bool:
     return isinstance(value, str) and "${" in value
 
 
-#: Path settings that decide *where nerve reads its config and its code from*,
-#: paired with what pointing them at the working directory would actually do.
+#: Path settings that must not resolve to the process's working directory, paired
+#: with what aiming each one there would actually do.
 #:
-#: ``Path("")`` is ``Path(".")``, so ``key: ''`` in a bundle does not mean "unset,
-#: use the default" the way it reads — it means the directory the daemon happened
-#: to be started in. Nothing legitimate wants any of these aimed there, and a
-#: value that means something other than what it looks like is precisely what a
+#: The value that gets here is an explicit ``.``, ``./`` or ``./.``: those survive
+#: :func:`nerve.config._expand_path` as the path they are, so the setting really
+#: does mean "wherever the daemon was started". A *blank* value is not one of
+#: these — ``_expand_path`` maps it to ``None`` and the field takes its documented
+#: default, which is why nothing below applies to it.
+#:
+#: Nothing legitimate wants any of these aimed at a working directory, and a
+#: bundle whose meaning depends on where the daemon was launched from is what a
 #: config gate exists to stop, so each is a hard error regardless of strictness.
+#: Kept in step with the config dataclasses by the coverage test in
+#: tests/test_config_validate.py: a new ``Path`` setting has to be listed here or
+#: exempted there.
 _WORKING_DIR_PATH_KEYS: dict[tuple[str, ...], str] = {
     ("workspace",): (
         "the entire workspace (settings.yaml, the cron config, memory, "
@@ -300,6 +307,34 @@ _WORKING_DIR_PATH_KEYS: dict[tuple[str, ...], str] = {
     ("cron", "jobs_file"): "cron would try to read a directory as its jobs file",
     ("cron", "system_file"): (
         "cron would try to read a directory as its system-jobs file"
+    ),
+    ("gateway", "ssl", "cert"): (
+        "TLS is 'on' precisely when cert and key are both set, so this turns it "
+        "on with a directory as the certificate file and the gateway fails to "
+        "bind at startup"
+    ),
+    ("gateway", "ssl", "key"): (
+        "TLS is 'on' precisely when cert and key are both set, so this turns it "
+        "on with a directory as the private-key file and the gateway fails to "
+        "bind at startup"
+    ),
+    ("proxy", "binary_path"): (
+        "a directory satisfies the exists-and-executable check that decides "
+        "whether to download the proxy, so nerve skips the download and tries "
+        "to exec the working directory"
+    ),
+    ("proxy", "auth_dir"): (
+        "the proxy's credential store (its OAuth tokens) would be created in "
+        "whatever directory the daemon was started in"
+    ),
+    ("proxy", "log_file"): (
+        "the proxy's output is opened for append at that path, which a directory "
+        "refuses, so the proxy does not start"
+    ),
+    ("workflows", "runs_dir"): (
+        "every workflow run's journal directory would be created in whatever "
+        "directory the daemon was started in, and the API's containment check "
+        "on run paths would be rooted there too"
     ),
 }
 
@@ -318,9 +353,9 @@ def _validate_working_dir_paths(
         raw = _nested_get(merged, key)
         if not isinstance(raw, str):
             continue
-        # ``${VAR:-}`` is the same empty string, one indirection later. Expand
-        # best-effort as elsewhere here; an unset *required* ``${VAR}`` stays
-        # literal (so it isn't flagged) and is reported on its own.
+        # ``${VAR:-.}`` reaches the same directory, one indirection later.
+        # Expand best-effort as elsewhere here; an unset *required* ``${VAR}``
+        # stays literal (so it isn't flagged) and is reported on its own.
         value = cfg._interpolate_str(raw, []) if "${" in raw else raw
         reason = _working_dir_reason(value)
         if reason is None:
@@ -333,15 +368,12 @@ def _validate_working_dir_paths(
 
 
 def _working_dir_reason(value: str) -> str | None:
-    """Why *value* points at the process's working directory, or ``None``."""
-    if not value.strip():
-        # Includes whitespace-only, which is a relative path *inside* the
-        # working directory rather than the directory itself — same mistake,
-        # same answer.
-        return (
-            'is not "no path": an empty value resolves against the process\'s '
-            "working directory"
-        )
+    """Why *value* points at the process's working directory, or ``None``.
+
+    Asked of ``_expand_path``, the function the daemon resolves these settings
+    with, so the two cannot disagree about which values reach a working
+    directory and which are the blank that means "use the default".
+    """
     if cfg._expand_path(value) == Path("."):  # "." , "./" , "./."
         return "resolves to the process's working directory"
     return None

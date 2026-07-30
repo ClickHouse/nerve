@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from nerve.config_validate import validate_config_bundle
+from nerve.config import NerveConfig
+from nerve.config_validate import _WORKING_DIR_PATH_KEYS, validate_config_bundle
 from nerve.cron.gates import GATE_REGISTRY
 
 
@@ -31,6 +32,14 @@ def _jobs(workspace: Path, jobs: list[dict]) -> None:
     cron = workspace / "config" / "cron"
     cron.mkdir(parents=True, exist_ok=True)
     (cron / "jobs.yaml").write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+
+
+def _nested(key: tuple[str, ...], value) -> dict:
+    """``("a", "b"), 1`` -> ``{"a": {"b": 1}}`` — one config key, written out."""
+    out = {key[-1]: value}
+    for part in reversed(key[:-1]):
+        out = {part: out}
+    return out
 
 
 def _gate_plugin(workspace: Path, name: str, body: str) -> Path:
@@ -249,15 +258,20 @@ class TestGatePluginsAreNotExecuted:
 
 
 class TestWorkingDirectoryPaths:
-    """A blank path setting is not "unset": ``Path("")`` is ``Path(".")``.
+    """An explicit ``.`` is refused; a blank value is the documented default.
 
-    So ``key: ''`` does not fall back to the default the way it reads — it points
-    nerve at whichever directory the daemon happened to be started in. The sharp
-    one is ``cron.gate_plugins_dir``, which the daemon imports every ``*.py``
-    from at startup and again on every reload: one missing character turns the
-    working directory into a source of code the daemon executes. Nothing
-    legitimate wants any of these aimed there, so validation refuses them
-    outright rather than passing a bundle whose meaning depends on a cwd.
+    ``.``, ``./`` and ``./.`` survive ``config._expand_path`` as the path they
+    are, so they really do point nerve at whichever directory the daemon happened
+    to be started in. The sharp one is ``cron.gate_plugins_dir``, which the daemon
+    imports every ``*.py`` from at startup and again on every reload: one
+    character turns the working directory into a source of code the daemon
+    executes.
+
+    Blank is the opposite case and must not be reported at all. ``_expand_path``
+    maps it to ``None`` before it can become ``Path(".")`` and the field takes its
+    documented default, so flagging it would fail a bundle that runs correctly —
+    ``jobs_file: ${CRON_JOBS_FILE:-}`` is the shape that turns up, and the docs
+    promote that idiom.
     """
 
     def _validate(self, tmp_path: Path, settings: str):
@@ -265,29 +279,27 @@ class TestWorkingDirectoryPaths:
         _settings(ws, settings)
         return validate_config_bundle(_cfg(tmp_path, workspace=ws), workspace_override=ws)
 
-    def test_empty_gate_plugins_dir_is_error(self, tmp_path):
-        result = self._validate(tmp_path, "cron:\n  gate_plugins_dir: ''\n")
-        assert not result.ok
-        [err] = [e for e in result.errors if "gate_plugins_dir" in e]
-        # The message has to say what the setting would *do*. "Invalid path"
-        # would leave the reader thinking they had a typo, not a code-execution
-        # path into the daemon.
-        assert "working directory" in err
-        assert "executed" in err
-
     def test_dot_gate_plugins_dir_is_error(self, tmp_path):
-        """Spelling the working directory out loud is the same setting."""
-        for value in (".", "./"):
+        for value in (".", "./", "./."):
             result = self._validate(
                 tmp_path, f"cron:\n  gate_plugins_dir: '{value}'\n"
             )
-            assert any("gate_plugins_dir" in e for e in result.errors), value
+            [err] = [e for e in result.errors if "gate_plugins_dir" in e]
+            # The message has to say what the setting would *do*. "Invalid path"
+            # would leave the reader thinking they had a typo, not a
+            # code-execution path into the daemon.
+            assert "working directory" in err, value
+            assert "executed" in err, value
 
-    def test_whitespace_only_gate_plugins_dir_is_error(self, tmp_path):
-        result = self._validate(tmp_path, "cron:\n  gate_plugins_dir: '   '\n")
-        assert any("gate_plugins_dir" in e for e in result.errors)
+    def test_blank_gate_plugins_dir_is_accepted(self, tmp_path):
+        """Blank, whitespace-only and a bare key all mean the default."""
+        for value in ("''", "'   '", ""):
+            result = self._validate(
+                tmp_path, f"cron:\n  gate_plugins_dir: {value}\n"
+            )
+            assert result.ok, (value, result.errors)
 
-    def test_empty_workspace_is_error(self, tmp_path):
+    def test_dot_workspace_is_error(self, tmp_path):
         """The worst one: the whole tree nerve reads and writes moves to the cwd.
 
         Flagged even though this run pins the workspace itself — the pin says
@@ -298,17 +310,36 @@ class TestWorkingDirectoryPaths:
         _settings(ws, "timezone: UTC\n")
         config_dir = tmp_path / "cfg"
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "config.yaml").write_text("workspace: ''\n", encoding="utf-8")
+        (config_dir / "config.yaml").write_text("workspace: .\n", encoding="utf-8")
         result = validate_config_bundle(config_dir, workspace_override=ws)
         assert not result.ok
         assert any(e.startswith("workspace: ") for e in result.errors)
 
-    def test_empty_cron_file_names_the_key(self, tmp_path):
+    def test_blank_workspace_is_accepted(self, tmp_path):
+        ws = tmp_path / "ws"
+        _settings(ws, "timezone: UTC\n")
+        config_dir = tmp_path / "cfg"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.yaml").write_text("workspace: ''\n", encoding="utf-8")
+        result = validate_config_bundle(config_dir, workspace_override=ws)
+        assert result.ok, result.errors
+
+    def test_dot_cron_file_names_the_key(self, tmp_path):
         """These already fail — as ``Is a directory: '.'``, which names neither
         the setting at fault nor what it meant."""
         for key in ("jobs_file", "system_file"):
-            result = self._validate(tmp_path, f"cron:\n  {key}: ''\n")
+            result = self._validate(tmp_path, f"cron:\n  {key}: '.'\n")
             assert any(e.startswith(f"cron.{key}: ") for e in result.errors), key
+
+    def test_blank_cron_file_resolves_to_the_default(self, tmp_path):
+        """The loader's contract, checked from the validator's side.
+
+        A blank ``jobs_file`` loads ``<ws>/config/cron/jobs.yaml``; reporting it
+        would have the two disagree about the same bundle.
+        """
+        for key in ("jobs_file", "system_file"):
+            result = self._validate(tmp_path, f"cron:\n  {key}: ''\n")
+            assert result.ok, (key, result.errors)
 
     def test_explicit_path_is_accepted(self, tmp_path):
         result = self._validate(
@@ -326,15 +357,116 @@ class TestWorkingDirectoryPaths:
         assert result.ok, result.errors
         assert any("GATES_DIR" in i for i in result.info)
 
-    def test_env_default_expanding_to_empty_is_error(self, tmp_path, monkeypatch):
-        """``${VAR:-}`` with VAR unset is the same empty string, one indirection
-        later, and a gate that only reads literals would wave it through."""
+    def test_env_default_expanding_to_empty_is_accepted(self, tmp_path, monkeypatch):
+        """``${VAR:-}`` is how the docs say to make a fleet setting optional, and
+        an unset variable then leaves the field on its default."""
         monkeypatch.delenv("GATES_DIR", raising=False)
         result = self._validate(
             tmp_path, "cron:\n  gate_plugins_dir: ${GATES_DIR:-}\n"
         )
+        assert result.ok, result.errors
+
+    def test_env_default_expanding_to_a_dot_is_error(self, tmp_path, monkeypatch):
+        """A gate that only read literals would wave this one through."""
+        monkeypatch.delenv("GATES_DIR", raising=False)
+        result = self._validate(
+            tmp_path, "cron:\n  gate_plugins_dir: ${GATES_DIR:-.}\n"
+        )
         assert not result.ok
-        assert any("gate_plugins_dir" in e for e in result.errors)
+        [err] = [e for e in result.errors if "gate_plugins_dir" in e]
+        # Both texts, or the author cannot see which of the two is at fault.
+        assert "${GATES_DIR:-.}" in err
+        assert "expands to '.'" in err
+
+
+def _declared_path_keys(klass, prefix: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    """Dotted keys of every ``Path`` / ``Path | None`` field under *klass*.
+
+    Read off ``typing.get_type_hints``, walking into nested config dataclasses
+    (including ones reached through ``X | None`` or ``list[X]``), so the answer
+    comes from what the config declares rather than from what any consumer of it
+    happens to handle.
+    """
+    import dataclasses
+    import typing
+
+    keys: list[tuple[str, ...]] = []
+    hints = typing.get_type_hints(klass)
+    for f in dataclasses.fields(klass):
+        declared = hints.get(f.name)
+        key = (*prefix, f.name)
+        if declared is Path or declared == (Path | None):
+            keys.append(key)
+            continue
+        for arg in (declared, *typing.get_args(declared)):
+            if isinstance(arg, type) and dataclasses.is_dataclass(arg):
+                keys.extend(_declared_path_keys(arg, key))
+    return keys
+
+
+class TestWorkingDirPathCoverage:
+    """The rule is a hand-written literal; the settings it must cover are not.
+
+    Every ``Path`` setting missing from ``_WORKING_DIR_PATH_KEYS`` is one where an
+    explicit ``.`` passes validation and lands the daemon on its working directory
+    anyway — which is how ``gateway.ssl.cert`` and ``proxy.auth_dir`` went
+    uncovered while the check's own tests stayed green. So the field set here is
+    derived from the config dataclasses' annotations, never from the rule under
+    test, which would only agree with itself.
+    """
+
+    # Path settings the working-directory rule cannot apply to, with the reason.
+    EXEMPT = {
+        # Not a bundle key at all: load_config overwrites it with the directory
+        # the config was read from, so no written value ever reaches the check.
+        ("config_dir",): "set by load_config, not by the config",
+    }
+
+    def test_every_path_setting_is_covered_or_exempt(self):
+        found = _declared_path_keys(NerveConfig)
+        assert len(found) >= 11, (
+            f"the walk reached only {len(found)} Path settings — did it break?"
+        )
+        uncovered = sorted(set(found) - set(_WORKING_DIR_PATH_KEYS) - set(self.EXEMPT))
+        assert not uncovered, (
+            "Path settings that neither the working-directory rule nor the "
+            "exemptions above account for — add a consequence to "
+            "_WORKING_DIR_PATH_KEYS, or exempt it here with the reason:\n"
+            + "\n".join(".".join(k) for k in uncovered)
+        )
+
+    def test_the_rule_names_only_real_settings(self):
+        """A key that matches no field silently checks nothing forever."""
+        found = set(_declared_path_keys(NerveConfig))
+        unknown = sorted(set(_WORKING_DIR_PATH_KEYS) - found)
+        assert not unknown, (
+            "_WORKING_DIR_PATH_KEYS entries that are not Path settings of the "
+            "config (renamed? misspelled?):\n"
+            + "\n".join(".".join(k) for k in unknown)
+        )
+
+    def test_every_covered_key_refuses_an_explicit_dot(self, tmp_path):
+        """The listing is only half of it; each key has to actually be read.
+
+        ``gateway.ssl.cert`` is three levels deep and ``workspace`` is only ever
+        set in the machine layer, so a rule entry can be correct and still never
+        be reached.
+        """
+        for i, key in enumerate(_WORKING_DIR_PATH_KEYS):
+            ws = tmp_path / f"ws{i}"
+            _settings(ws, "timezone: UTC\n")
+            config_dir = tmp_path / f"cfg{i}"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            data = _nested(key, ".")
+            data.setdefault("workspace", str(ws))
+            (config_dir / "config.yaml").write_text(
+                yaml.safe_dump(data), encoding="utf-8"
+            )
+            result = validate_config_bundle(config_dir, workspace_override=ws)
+            dotted = ".".join(key)
+            assert any(e.startswith(f"{dotted}: ") for e in result.errors), (
+                dotted, result.errors,
+            )
 
 
 class TestScheduleChecking:

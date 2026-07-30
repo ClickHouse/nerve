@@ -123,12 +123,14 @@ stop it. It reports an error for:
   nor an interval (`hourly`, `@daily`), which silently becomes a fixed 2-hour
   cadence. Write a crontab (`*/15 * * * *`) or an interval (`4h`, `30m`,
   `1h30m`, `90s`);
-- a blank `workspace`, `cron.jobs_file`, `cron.system_file` or
-  `cron.gate_plugins_dir`. An empty value reads as "unset, use the default", but
-  `Path("")` is `Path(".")`, so it resolves to whatever directory the daemon was
-  started in. Omit the key instead, and never set it to `''`, `.` or `./`. This
-  matters most for `cron.gate_plugins_dir`, whose `.py` files the daemon imports
-  and executes at startup and on every cron reload.
+- a path setting written `.` or `./`: `workspace`, `cron.jobs_file`,
+  `cron.system_file`, `cron.gate_plugins_dir`, `gateway.ssl.cert`,
+  `gateway.ssl.key`, `proxy.binary_path`, `proxy.auth_dir`, `proxy.log_file` or
+  `workflows.runs_dir`. A dot is a path like any other, so it aims the setting at
+  whatever directory the daemon was started in. Write the path out, or omit the
+  key to get the default — a blank value is *unset* (above) and is not an error.
+  This matters most for `cron.gate_plugins_dir`, whose `.py` files the daemon
+  imports and executes at startup and on every cron reload.
 
 Validation never imports those gate plugins, because checking them would mean
 running the bundle it is judging. A `run_if` entry naming a gate type that is not
