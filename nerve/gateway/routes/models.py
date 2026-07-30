@@ -1,6 +1,8 @@
 """Model discovery routes — which chat models the UI can offer.
 
-Exposes the configured Anthropic chat model plus any locally-installed
+Exposes the selectable Claude models (``config.claude_models`` — the
+configured default plus ``agent.models`` or a built-in current-generation
+list), the Codex app-server's advertised models, and any locally-installed
 Ollama models (auto-discovered from the running Ollama server). The web
 composer's model picker calls GET /api/models to populate its options.
 
@@ -37,13 +39,14 @@ async def list_models(user: dict = Depends(require_auth)):
           "ollama": {"enabled", "routable", "available"}
         }
 
-    ``provider`` is ``"anthropic"`` or ``"ollama"``; the frontend formats
-    display labels. Discovery is best-effort — if the Ollama server is
-    unreachable the list simply contains no Ollama entries.
+    ``provider`` is ``"anthropic"``, ``"openai"`` or ``"ollama"``; the
+    frontend formats display labels. Discovery is best-effort — if the
+    Ollama server is unreachable the list simply contains no Ollama entries.
     """
     config = get_config()
     deps = get_deps()
     default_model = config.agent.model
+    claude_models = config.claude_models
 
     codex_backend = deps.engine._backends.get("codex")
     codex_preflight = (
@@ -56,7 +59,7 @@ async def list_models(user: dict = Depends(require_auth)):
     options = [
         {
             "id": "claude", "label": "Claude", "model": config.agent.model,
-            "models": [config.agent.model], "available": True,
+            "models": claude_models, "available": True,
         },
     ]
     options.append({
@@ -81,7 +84,8 @@ async def list_models(user: dict = Depends(require_auth)):
     }
 
     models: list[dict[str, str]] = [
-        {"id": default_model, "provider": "anthropic", "backend": "claude"},
+        {"id": model_id, "provider": "anthropic", "backend": "claude"}
+        for model_id in claude_models
     ]
     if codex_preflight.get("available"):
         models.extend({

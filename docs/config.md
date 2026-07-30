@@ -38,6 +38,7 @@ from any working directory:
 |-----|------|---------|-------------|
 | `agent.model` | string | `claude-opus-5` | Primary model for conversations |
 | `agent.cron_model` | string | `claude-sonnet-4-6` | Model for cron jobs (cheaper) |
+| `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → a built-in current-generation list (opus / sonnet / haiku) on the direct Anthropic API; on Bedrock only configured models are offered |
 | `agent.model_aliases` | map | `{opus: claude-opus-5}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5` default (not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias |
 | `agent.max_turns` | int | `50` | Max agentic turns per request |
 | `agent.max_concurrent` | int | `32` | Max concurrent agent sessions |

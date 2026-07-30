@@ -249,3 +249,76 @@ class TestModelDefaultsAndAliases:
         # Guard: agent.model_aliases must not trip unknown-key warnings.
         merged = {"agent": {"model_aliases": {"opus": "claude-opus-5"}}}
         assert validate_config_keys(merged) == []
+
+
+class TestClaudeModels:
+    """config.claude_models — the composer's selectable Claude model list."""
+
+    def test_defaults_offer_current_generation(self):
+        from nerve.config import DEFAULT_CLAUDE_MODELS, NerveConfig
+
+        cfg = NerveConfig()
+        # The configured default always leads; the built-ins follow.
+        assert cfg.claude_models[0] == cfg.agent.model
+        for model_id in DEFAULT_CLAUDE_MODELS:
+            assert model_id in cfg.claude_models
+        # More than one entry → the web composer renders the picker.
+        assert len(cfg.claude_models) > 1
+
+    def test_configured_model_leads_and_dedupes(self):
+        from nerve.config import AgentConfig, NerveConfig
+
+        cfg = NerveConfig(agent=AgentConfig.from_dict({
+            "model": "claude-sonnet-4-6",
+            "models": ["claude-opus-5", "claude-sonnet-4-6"],
+        }))
+        assert cfg.claude_models == ["claude-sonnet-4-6", "claude-opus-5"]
+
+    def test_explicit_models_replace_builtins(self):
+        from nerve.config import AgentConfig, NerveConfig
+
+        cfg = NerveConfig(agent=AgentConfig.from_dict({
+            "model": "claude-fable-5",
+            "models": ["claude-opus-5"],
+        }))
+        assert cfg.claude_models == ["claude-fable-5", "claude-opus-5"]
+
+    def test_bedrock_offers_only_configured_models(self):
+        from nerve.config import AgentConfig, NerveConfig, ProviderConfig
+
+        cfg = NerveConfig(
+            provider=ProviderConfig(type="bedrock"),
+            agent=AgentConfig.from_dict(
+                {"model": "us.anthropic.claude-opus-5"}
+            ),
+        )
+        # Bare built-in IDs don't resolve on Bedrock — never advertised.
+        assert cfg.claude_models == ["us.anthropic.claude-opus-5"]
+
+    def test_bedrock_with_explicit_models(self):
+        from nerve.config import AgentConfig, NerveConfig, ProviderConfig
+
+        cfg = NerveConfig(
+            provider=ProviderConfig(type="bedrock"),
+            agent=AgentConfig.from_dict({
+                "model": "us.anthropic.claude-opus-5",
+                "models": ["us.anthropic.claude-sonnet-4-6"],
+            }),
+        )
+        assert cfg.claude_models == [
+            "us.anthropic.claude-opus-5",
+            "us.anthropic.claude-sonnet-4-6",
+        ]
+
+    def test_empty_entries_filtered(self):
+        from nerve.config import AgentConfig
+
+        cfg = AgentConfig.from_dict(
+            {"models": ["", None, "  claude-opus-5  "]}
+        )
+        assert cfg.models == ["claude-opus-5"]
+
+    def test_models_key_recognized_by_validator(self):
+        # Guard: agent.models must not trip unknown-key warnings.
+        merged = {"agent": {"models": ["claude-opus-5"]}}
+        assert validate_config_keys(merged) == []

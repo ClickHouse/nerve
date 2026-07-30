@@ -43,6 +43,14 @@ agent:
   # is the built-in default (not applied on Bedrock); "" unsets an alias.
   # model_aliases:
   #   opus: claude-opus-5
+  # Claude models selectable in the web composer's model picker. The
+  # configured `model` above is always offered first; entries here extend
+  # the list. Unset → a built-in current-generation list (opus / sonnet /
+  # haiku). On Bedrock only models named in config are offered (Bedrock
+  # IDs are region-prefixed, so the bare built-ins would not resolve).
+  # models:
+  #   - claude-opus-5
+  #   - claude-sonnet-4-6
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
   background_agent_permissions: true  # Background sub-agents (Agent run_in_background) get the same tool permissions as foreground; false denies their Write/Edit/Bash
