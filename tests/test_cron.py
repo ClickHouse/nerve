@@ -973,6 +973,46 @@ class TestRunGates:
 
 
 # ---------------------------------------------------------------------------
+# Job loading
+# ---------------------------------------------------------------------------
+
+class TestLoadJobs:
+    def test_accepts_top_level_list(self, tmp_path):
+        from nerve.cron.jobs import load_jobs
+
+        yaml_file = tmp_path / "jobs.yaml"
+        yaml_file.write_text(
+            "- id: hourly-review\n"
+            "  schedule: 1h\n"
+            "  prompt: Review pending tasks\n",
+            encoding="utf-8",
+        )
+
+        jobs = load_jobs(yaml_file)
+
+        assert len(jobs) == 1
+        assert jobs[0].id == "hourly-review"
+        assert jobs[0].schedule == "1h"
+        assert jobs[0].prompt == "Review pending tasks"
+
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [
+            ("invalid\n", "expected a mapping or list, got str"),
+            ("jobs: invalid\n", "expected 'jobs' to be a list, got str"),
+        ],
+    )
+    def test_rejects_invalid_structure(self, tmp_path, caplog, content, message):
+        from nerve.cron.jobs import load_jobs
+
+        yaml_file = tmp_path / "jobs.yaml"
+        yaml_file.write_text(content, encoding="utf-8")
+
+        assert load_jobs(yaml_file) == []
+        assert message in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Prompt files (prompt_file)
 # ---------------------------------------------------------------------------
 

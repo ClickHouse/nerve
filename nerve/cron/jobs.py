@@ -201,9 +201,25 @@ def load_jobs(jobs_file: Path) -> list[CronJob]:
         logger.error("Failed to load cron jobs from %s: %s", jobs_file, e)
         return []
 
-    jobs_data = data.get("jobs", [])
     if isinstance(data, list):
         jobs_data = data
+    elif isinstance(data, dict):
+        jobs_data = data.get("jobs", [])
+    else:
+        logger.warning(
+            "Invalid cron jobs file %s: expected a mapping or list, got %s",
+            jobs_file,
+            type(data).__name__,
+        )
+        return []
+
+    if not isinstance(jobs_data, list):
+        logger.warning(
+            "Invalid cron jobs file %s: expected 'jobs' to be a list, got %s",
+            jobs_file,
+            type(jobs_data).__name__,
+        )
+        return []
 
     jobs = []
     for item in jobs_data:
