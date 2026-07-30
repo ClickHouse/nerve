@@ -162,19 +162,36 @@ class ProposeResult:
     validation_errors: list[str] = field(default_factory=list)
     #: Staged paths that change what runs (see :func:`_executable_effect`).
     code_paths: list[str] = field(default_factory=list)
+    #: The workspace has no repo or no ``origin`` to propose against, as opposed
+    #: to a proposal that was refused or a step that failed. Set apart because it
+    #: is the one failure where the answer may be "don't use this tool": an
+    #: unlocked instance with a purely local workspace has nothing to open a PR
+    #: against and nothing stopping it editing the files. Callers that know
+    #: whether the instance is locked say so; this module is not given that.
+    no_remote_configured: bool = False
 
 
 def _gh(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    """Run a gh command; captured, never raises (missing gh → rc=1)."""
+    """Run a gh command; captured, never raises (missing gh → rc=1).
+
+    Decoded like :func:`nerve.sync_service._git`, and for the same reason: gh
+    relays bytes it was handed — branch names, a remote's error text, a PR title
+    someone else wrote — and ``errors="strict"`` (the default, whatever the
+    codec) turns one such byte into an exception instead of output. This one is
+    called after the push, so raising here loses the message that says the branch
+    is already on the remote and the PR has to be opened by hand.
+    """
     try:
         return subprocess.run(
             ["gh", *args], cwd=str(cwd), capture_output=True, text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
+            encoding="utf-8", errors="replace", timeout=_GIT_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         return subprocess.CompletedProcess(args, 1, "", "gh CLI not found on PATH")
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 1, "", "gh command timed out")
+    except Exception as e:  # noqa: BLE001 — bad cwd, OS refusal, undecodable output…
+        return subprocess.CompletedProcess(args, 1, "", f"could not run gh: {e}")
 
 
 def _remote_default_branch(workspace: Path) -> str:
@@ -506,6 +523,30 @@ def _body_with_code_notice(body: str, effects: dict[str, str]) -> str:
     return f"{notice}\n\n---\n\n{body}" if body else notice
 
 
+def _staging_dir(workspace: Path) -> Path | None:
+    """A scratch directory for the staged worktree, or ``None`` if there is none.
+
+    Beside the workspace by preference, so the worktree is not inside it: an
+    untracked directory in the workspace would show up in the status that ff-only
+    sync reads, and this module's promise is that the live tree is left alone.
+
+    Falling back to the system temp directory because the parent being writable
+    is an assumption nothing else here makes — sync needs the workspace itself
+    writable and no more. A workspace provisioned into a root-owned directory
+    with the daemon running unprivileged is an ordinary locked-fleet layout, and
+    it is the parent that is refused there, not ``$TMPDIR``. Git does not mind
+    the worktree living on another filesystem.
+    """
+    for parent in (workspace.parent, None):
+        try:
+            return Path(tempfile.mkdtemp(
+                prefix=".nerve-pr-", dir=str(parent) if parent else None,
+            ))
+        except OSError as e:
+            logger.warning("cannot stage a proposal in %s: %s", parent or "$TMPDIR", e)
+    return None
+
+
 def propose_config_change(
     workspace: Path,
     config_dir: Path,
@@ -527,9 +568,32 @@ def propose_config_change(
     """
     workspace = Path(workspace)
     if not is_git_repo(workspace):
-        return ProposeResult(ok=False, message=f"{workspace} is not a git repository")
-    if not _git(["remote"], workspace).stdout.strip():
-        return ProposeResult(ok=False, message="workspace has no git remote configured")
+        return ProposeResult(
+            ok=False, no_remote_configured=True,
+            message=(
+                f"{workspace} is not a git repository, so there is nothing to open "
+                "a pull request against"
+            ),
+        )
+    # Specifically ``origin``, not "a remote". Everything downstream names origin
+    # — the ls-remote, the fetch, the branch the worktree comes from, the push —
+    # and so does the sync that pulls merged config back (``sync_workspace``,
+    # which has no remote setting either). A workspace whose only remote is
+    # ``upstream`` is not a case to accommodate by following that name here: the
+    # proposal has to target the branch sync pulls from, so a PR against
+    # ``upstream`` would be one that can never reach the instance. Asked here
+    # rather than left to _remote_default_branch, which would report a missing
+    # origin as an unreachable one and prescribe a set-head that itself fails.
+    if _git(["remote", "get-url", "origin"], workspace).returncode != 0:
+        return ProposeResult(
+            ok=False, no_remote_configured=True,
+            message=(
+                "workspace has no 'origin' remote — a proposal is a PR against "
+                "the branch origin merges into, which is also where the workspace "
+                "sync pulls from. Add one with 'git remote add origin <url>' in "
+                f"{workspace}."
+            ),
+        )
     if not changes:
         return ProposeResult(ok=False, message="no changes provided")
 
@@ -578,7 +642,15 @@ def propose_config_change(
             ok=False, message=f"git fetch failed: {fetch.stderr.strip()}",
         )
 
-    tmp = Path(tempfile.mkdtemp(prefix=".nerve-pr-", dir=str(workspace.parent)))
+    tmp = _staging_dir(workspace)
+    if tmp is None:
+        return ProposeResult(
+            ok=False, branch=branch,
+            message=(
+                f"nowhere to stage the proposal: neither {workspace.parent} nor the "
+                "system temp directory could be written to"
+            ),
+        )
     wt = tmp / "wt"
     add = _git(["worktree", "add", "-b", branch, str(wt), f"origin/{base_branch}"], workspace)
     if add.returncode != 0:

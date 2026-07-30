@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,13 @@ class _FakeGit:
         if verb in self.fail:
             return _cp(1, stderr=f"{verb} failed")
         if verb == "remote":
+            # ``remote get-url <name>`` exits non-zero for a remote that is not
+            # configured, which is how the origin check asks the question.
+            if args[1:2] == ["get-url"]:
+                wanted = args[2] if len(args) > 2 else ""
+                if wanted in self.remote.split():
+                    return _cp(stdout=f"git@example.invalid:o/{wanted}.git\n")
+                return _cp(2, stderr=f"error: No such remote '{wanted}'")
             return _cp(stdout=self.remote)
         if verb == "ls-remote":
             return _cp(stdout=f"ref: refs/heads/{self.base}\tHEAD\ndeadbeef\tHEAD\n")
@@ -59,7 +68,27 @@ class TestProposeConfigChange:
         ws = _repo(tmp_path)
         monkeypatch.setattr(cpr, "_git", _FakeGit(remote=""))
         r = propose_config_change(ws, tmp_path / "cfg", "t", "b", _changes(), now=1)
-        assert not r.ok and "no git remote" in r.message
+        assert not r.ok and "no 'origin' remote" in r.message
+
+    def test_a_differently_named_remote_is_not_origin(self, tmp_path, monkeypatch):
+        """Having *a* remote is not having origin, and the difference matters.
+
+        Everything downstream names origin, as does the sync that pulls merged
+        config back, so a proposal cannot follow ``upstream`` instead — it would
+        target a branch the instance never reads. Refused here rather than at
+        ``_remote_default_branch``, which sees only that origin said nothing and
+        reports a missing remote as an unreachable one.
+        """
+        ws = _repo(tmp_path)
+        git = _FakeGit(remote="upstream")
+        monkeypatch.setattr(cpr, "_git", git)
+        r = propose_config_change(ws, tmp_path / "cfg", "t", "b", _changes(), now=1)
+        assert not r.ok
+        assert "no 'origin' remote" in r.message
+        # Named, so 'which remote' is answerable from the message alone.
+        assert "git remote add origin" in r.message
+        # Stopped before the branch hunt, whose failure would blame reachability.
+        assert not git.did("ls-remote"), git.calls
 
     def test_no_changes(self, tmp_path, monkeypatch):
         ws = _repo(tmp_path)
@@ -581,6 +610,39 @@ class TestRealGit:
         ).stdout
         assert "nerve-config/change-tz-999" in remote_branches
 
+    def test_undecodable_gh_output_still_reports_the_pushed_branch(
+        self, tmp_path, monkeypatch,
+    ):
+        """gh runs after the push, so its failure mode decides what is recoverable.
+
+        There is a message for exactly this state — branch on the remote, no PR —
+        and a decode error used to replace it with "internal error: 'utf-8' codec
+        can't decode…", leaving the pushed branch with nothing pointing at it.
+        """
+        import os
+
+        ws = self._setup(tmp_path)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "gh").write_bytes(
+            b'#!/bin/sh\nprintf "error: could not create pull request \\337\\n" >&2\n'
+            b"exit 1\n"
+        )
+        (bin_dir / "gh").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Change tz", "body",
+            [{"path": "config/settings.yaml", "content": "timezone: Europe/Berlin\n"}],
+            now=42,
+        )
+        assert not r.ok
+        assert "gh pr create" in r.message, r.message
+        assert "Open the PR manually" in r.message
+        assert r.branch
+        # And the branch the message sends them to really is there.
+        assert r.branch in self._out("ls-remote", "--heads", "origin", cwd=ws)
+
     def _capture_gh(self, monkeypatch, url="https://gh/pr/1"):
         seen = {}
 
@@ -909,6 +971,117 @@ class TestRealGit:
             assert not (ws / "skills" / "evil.py").exists()
 
 
+class TestGhHelper:
+    """``_gh`` itself. Every other test replaces it, so it is only covered here."""
+
+    def _stub_gh(self, tmp_path, monkeypatch, script: bytes):
+        import os
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "gh").write_bytes(script)
+        (bin_dir / "gh").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    def test_undecodable_output_is_replaced_not_raised(self, tmp_path, monkeypatch):
+        """gh relays bytes from elsewhere and owes us no encoding.
+
+        ``errors="strict"`` is the default under every codec, so this is not a
+        C-locale edge case — one stray byte in a remote's error text raised.
+        """
+        self._stub_gh(
+            tmp_path, monkeypatch,
+            b'#!/bin/sh\nprintf "error: \\337\\337 bad\\n" >&2\nexit 1\n',
+        )
+        r = cpr._gh(["pr", "create"], tmp_path)
+        assert r.returncode == 1
+        assert "�" in r.stderr           # the byte survives as a replacement
+        assert "bad" in r.stderr              # and the readable part is still there
+
+    def test_an_unusable_cwd_is_reported(self, tmp_path):
+        not_a_dir = tmp_path / "file"
+        not_a_dir.write_text("x")
+        r = cpr._gh(["--version"], not_a_dir)
+        assert r.returncode == 1 and "could not run gh" in r.stderr
+
+
+class TestStagingDirectory:
+    def test_beside_the_workspace_not_inside_it(self, tmp_path):
+        ws = tmp_path / "sub" / "ws"
+        ws.mkdir(parents=True)
+        staged = cpr._staging_dir(ws)
+        assert staged is not None
+        assert staged.parent == ws.parent
+        # Inside the workspace it would be untracked state in the tree that
+        # ff-only sync reads the status of.
+        assert not staged.is_relative_to(ws)
+        shutil.rmtree(staged, ignore_errors=True)
+
+    def test_falls_back_when_the_parent_is_refused(self, tmp_path, monkeypatch):
+        """A workspace provisioned into a directory the daemon cannot write to.
+
+        Sync needs the workspace itself writable and no more, so the parent being
+        refused is an ordinary locked-fleet layout rather than a broken install —
+        there is somewhere else to stage and it must be used.
+        """
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        real = tempfile.mkdtemp
+
+        def _refuse_parent(*args, **kwargs):
+            if kwargs.get("dir") is not None:
+                raise PermissionError(13, "Permission denied")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(cpr.tempfile, "mkdtemp", _refuse_parent)
+        staged = cpr._staging_dir(ws)
+        assert staged is not None and staged.is_dir()
+        assert staged.parent != ws.parent
+        shutil.rmtree(staged, ignore_errors=True)
+
+    def test_nowhere_at_all_is_reported_not_raised(self, tmp_path, monkeypatch):
+        """The documented contract is that this function never raises."""
+        ws = _repo(tmp_path)
+        monkeypatch.setattr(cpr, "_git", _FakeGit())
+
+        def _refuse(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(cpr.tempfile, "mkdtemp", _refuse)
+        r = propose_config_change(ws, tmp_path / "cfg", "t", "b", _changes(), now=1)
+        assert not r.ok
+        assert "nowhere to stage" in r.message
+
+
+class TestNoRemoteConfigured:
+    """The flag that separates "wrong tool for this instance" from "it failed".
+
+    A plain local install has no repo to propose against, and nothing stopping it
+    editing the files. The skill tells the agent to propose, so the refusal is
+    where it finds out otherwise — it has to say which situation this is.
+    """
+
+    def test_a_plain_directory_sets_the_flag(self, tmp_path):
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        r = propose_config_change(ws, tmp_path / "cfg", "t", "b", _changes(), now=1)
+        assert not r.ok and r.no_remote_configured
+        assert "nothing to open a pull request against" in r.message
+
+    def test_a_repo_without_origin_sets_the_flag(self, tmp_path, monkeypatch):
+        ws = _repo(tmp_path)
+        monkeypatch.setattr(cpr, "_git", _FakeGit(remote="upstream"))
+        r = propose_config_change(ws, tmp_path / "cfg", "t", "b", _changes(), now=1)
+        assert not r.ok and r.no_remote_configured
+
+    def test_an_ordinary_failure_does_not(self, tmp_path, monkeypatch):
+        """Push failed, gh failed, invalid change — all have a remote and a repo."""
+        ws = _repo(tmp_path)
+        monkeypatch.setattr(cpr, "_git", _FakeGit(fail={"fetch"}))
+        r = propose_config_change(ws, tmp_path / "cfg", "t", "b", _changes(), now=1)
+        assert not r.ok and not r.no_remote_configured
+
+
 class TestHandler:
     @pytest.mark.asyncio
     async def test_handler_ok(self, monkeypatch):
@@ -970,3 +1143,62 @@ class TestHandler:
             ctx, {"title": "t", "changes": _changes()}
         )
         assert result.is_error
+
+    def _no_remote_ctx(self, monkeypatch, *, lockdown: bool):
+        from nerve.agent.tools.registry import ToolContext
+        from nerve.config import NerveConfig
+
+        config = NerveConfig()
+        config.config_dir = Path("/tmp/cfg")
+        config.workspace = Path("/tmp/ws")
+        config.lockdown = lockdown
+        monkeypatch.setattr(
+            cpr, "propose_config_change",
+            lambda *a, **k: ProposeResult(
+                ok=False, no_remote_configured=True,
+                message="/tmp/ws is not a git repository, so there is nothing to "
+                        "open a pull request against",
+            ),
+        )
+        return ToolContext(session_id="s", config=config)
+
+    @pytest.mark.asyncio
+    async def test_unlocked_and_no_remote_sends_the_agent_to_edit_directly(
+        self, monkeypatch,
+    ):
+        """The everyday local install, and the case the skill used to strand.
+
+        Told to always propose, refused by the tool, and told not to edit — an
+        agent reasoning from the error text alone concluded the config could not
+        be changed at all. Nothing was stopping it writing the file.
+        """
+        from nerve.agent.tools.handlers.config_pr import propose_config_change_handler
+
+        ctx = self._no_remote_ctx(monkeypatch, lockdown=False)
+        result = await propose_config_change_handler(
+            ctx, {"title": "t", "changes": _changes()}
+        )
+        text = result.content[0]["text"]
+        assert result.is_error
+        assert "not locked" in text
+        assert "directly" in text
+        assert "/tmp/ws" in text          # names where, not just that
+
+    @pytest.mark.asyncio
+    async def test_locked_and_no_remote_does_not_suggest_editing(self, monkeypatch):
+        """Same refusal, opposite advice — here a direct edit really is blocked.
+
+        A locked instance whose workspace has no remote is misconfigured rather
+        than local, and the fix belongs to the operator.
+        """
+        from nerve.agent.tools.handlers.config_pr import propose_config_change_handler
+
+        ctx = self._no_remote_ctx(monkeypatch, lockdown=True)
+        result = await propose_config_change_handler(
+            ctx, {"title": "t", "changes": _changes()}
+        )
+        text = result.content[0]["text"]
+        assert result.is_error
+        assert "locked" in text
+        assert "will not work either" in text
+        assert "operator" in text

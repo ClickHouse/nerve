@@ -13,9 +13,9 @@ context: domain
 # Nerve Development Skill
 
 > **Changing your own config (skills, cron, settings), not the app code?** Use
-> the `nerve-workspace` skill and the `propose_config_change` tool instead — that
-> edits the git-synced workspace repo. This skill is for developing the Nerve
-> *application* codebase.
+> the `nerve-workspace` skill instead — that covers the workspace, and which of a
+> pull request or a direct edit applies to this instance. This skill is for
+> developing the Nerve *application* codebase.
 
 ## Repository
 

@@ -61,6 +61,29 @@ async def propose_config_change_handler(ctx: ToolContext, args: dict) -> ToolRes
             f"Change is invalid — no PR opened. Fix these and retry:\n{errs}",
             is_error=True,
         )
+    if result.no_remote_configured:
+        # A workspace with no repo to propose against, which is what an ordinary
+        # local install is. Said here rather than in config_pr, which is handed a
+        # workspace and not told whether the instance is locked; and said at the
+        # point of failure rather than left to the skill, because an agent that
+        # reasons from the error text is the case that goes wrong — it has been
+        # told to always propose, the tool has refused, and without this it
+        # concludes the config cannot be changed on a box where writing the file
+        # is both allowed and correct.
+        if config.lockdown:
+            return ToolResult.text(
+                f"Cannot open a PR: {result.message}\n\nThis instance is locked, so "
+                "editing the files directly will not work either — tracked config "
+                "only changes by syncing a merged change. Ask the operator to point "
+                "the workspace at a config repo.",
+                is_error=True,
+            )
+        return ToolResult.text(
+            f"No PR opened: {result.message}\n\nThis instance is not locked and its "
+            "workspace is local, so there is no review to route through. Edit the "
+            f"files under {workspace} directly instead, and say what you changed.",
+            is_error=True,
+        )
     return ToolResult.text(f"Could not open PR: {result.message}", is_error=True)
 
 

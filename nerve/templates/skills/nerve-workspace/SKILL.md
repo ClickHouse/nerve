@@ -2,10 +2,11 @@
 name: Nerve Workspace Config
 description: >
   Change your own configuration — skills, cron jobs, sources, and settings that
-  live in the git-synced workspace repo. Use when asked to add/edit/remove a cron
-  job, create or change a skill, adjust settings, or "change your config", and
-  especially when this instance is locked (remote-only) so direct edits don't
-  apply. Triggers on "add a cron", "change your schedule", "edit your config",
+  live in the workspace. Covers both routes: a pull request when the workspace is
+  a shared config repo (and the only route when this instance is locked), or a
+  direct edit when the workspace is purely local. Use when asked to add/edit/remove
+  a cron job, create or change a skill, adjust settings, or "change your config".
+  Triggers on "add a cron", "change your schedule", "edit your config",
   "update settings", "propose a config change".
 version: 1.0.0
 context: domain
@@ -13,8 +14,7 @@ context: domain
 
 # Managing Your Own Configuration
 
-Your configuration lives in the **workspace** — a git repository synced from a
-shared remote (the config repo). It contains:
+Your configuration lives in the **workspace**. It contains:
 
 - `config/settings.yaml` — shareable settings
 - `config/cron/jobs.yaml`, `config/cron/system.yaml`, `config/cron/gates/` — cron
@@ -24,13 +24,32 @@ shared remote (the config repo). It contains:
 
 This is **not** the Nerve application source code (that's the `nerve-dev` skill).
 
+## First: is this workspace shared?
+
+The answer decides how you change config, so establish it before you start.
+
+The workspace **may** be a git repository synced from a shared remote (a config
+repo), in which case config is something a human reviews and merges, and your job
+is to propose rather than to edit. It may equally be a plain local directory that
+belongs to this instance alone — that is what an ordinary install looks like.
+
+- **Locked instance** (lockdown / remote-only) — a PR is the *only* thing that
+  works. Direct edits to tracked config are blocked, and would be overwritten by
+  the next sync even if they weren't.
+- **Workspace has a remote, not locked** — prefer a PR. Nothing forces it, but a
+  reviewed change is the point of having the repo.
+- **No remote, not locked** — there is nothing to open a PR against and no
+  review to route through. **Edit the files directly** and tell the user what you
+  changed. `propose_config_change` will refuse, and it is right to.
+
+If you don't know which you're in, try `propose_config_change` and read the
+refusal — it says whether the problem is a missing remote or a locked instance.
+
 ## How to change config
 
-**Always propose config changes as a pull request** with the
-`propose_config_change` tool — don't edit tracked config files directly. This
-keeps every change reviewed, approved, and traceable, and it is the *only* way to
-change config when the instance is **locked** (in lockdown, direct edits to
-skills/cron/settings are blocked and wouldn't be synced anyway).
+When the workspace is shared, **propose config changes as a pull request** with
+the `propose_config_change` tool rather than editing tracked config files. That
+keeps every change reviewed, approved, and traceable.
 
 `propose_config_change` takes a `title`, an optional `body`, and a list of
 `changes` — each the **full new content** of a file, path relative to the
@@ -70,9 +89,11 @@ script there reaches the instance through this route like anything else.
 
 So that a change to your configuration is reviewed, attributable, and visible in
 the repository's history. It is **not** a lock. You have a shell; you could write
-these files another way. Doing that produces a running config nobody agreed to
-and no record of who changed what, which is the thing this avoids — not something
-the tool could stop you doing.
+these files another way. On a workspace someone else reviews, doing that produces
+a running config nobody agreed to and no record of who changed what, which is the
+thing this avoids — not something the tool could stop you doing. On a local
+workspace there is nobody to route around, which is why editing directly there is
+the normal thing rather than a workaround.
 
 That's also why changes that alter *what runs* are flagged rather than refused.
 When the tool can tell — a gate plugin, a script replacing an executable file, an
@@ -109,5 +130,7 @@ propose_config_change(
   replacement, not a fragment).
 - One logical change per PR; write a clear title/body — a human will review it.
 - Never put secrets in tracked files; reference them as `${ENV_VAR}`.
-- If validation fails, fix the reported errors and re-submit — don't try to
-  bypass it by editing files directly.
+- If **validation** fails, fix the reported errors and re-submit. Writing the
+  same content straight to the file instead only moves an invalid config onto the
+  instance — that is the one case where editing directly is the wrong answer even
+  on a local workspace.
