@@ -81,7 +81,7 @@ async def main() -> int:
         },
     })
     deps = BackendDeps(
-        config=cfg, db=None, registry=None,
+        config=lambda: cfg, db=None, registry=None,
         tool_ctx_factory=lambda sid: None,
         external_mcp_servers=lambda: [],
         gateway_port=lambda: None,          # no MCP bridge in the smoke

@@ -1462,7 +1462,9 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
     )
 
     config = ctx.obj["config"]
-    backend = CodexBackend(SimpleNamespace(config=config))
+    # deps.config is a callable, not the object — see BackendDeps. Nothing
+    # reloads in a one-shot command, but the backend reads it as a callable.
+    backend = CodexBackend(SimpleNamespace(config=lambda: config))
     status = asyncio.run(backend.preflight(force=True))
     report = {
         "preflight": status,
