@@ -474,6 +474,10 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     file_path=rel_path,
                     title=task["title"],
                     status="done",
+                    source=task.get("source"),
+                    source_url=task.get("source_url"),
+                    deadline=task.get("deadline"),
+                    tags=task.get("tags") or "",
                     content=content,
                 )
 
