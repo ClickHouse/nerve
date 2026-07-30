@@ -211,14 +211,6 @@ A reload is always explicit. Two things cause one:
   reviewed config PR takes effect on the instance without anyone logging in.
   `workspace_sync.interval_minutes` (default 1) bounds how long that takes.
 
-No config file applies itself when it changes on disk, and that is deliberate. A
-hand edit is the change nobody reviewed: on a locked instance the running config is
-supposed to have come from the tracked repo, and sync already refuses to merge
-while `config/` has local modifications, so hot-applying the same edit would
-contradict that. Editors also write in pieces, and a reload re-points the whole
-process. Ask for it when you mean it; `nerve reload` prints what it applied, and
-the endpoint behind it is authenticated and logs the same.
-
 ### What a reload applies
 
 | Change | Reloaded? |
