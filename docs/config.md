@@ -231,6 +231,13 @@ A reload is always explicit. Two things cause one:
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
 
+All of that is reloaded together, and the response says what happened to each
+piece: `POST /api/config/reload` returns `ok`, a per-subsystem `detail`, and an
+`errors` map. A reload is best-effort by design, because a typo in `settings.yaml`
+must not stop a valid cron edit from being applied, so `ok: false` with `detail`
+showing four subsystems reloaded and one failed is a normal answer. Check `errors`
+rather than reading the 200 as success.
+
 ### What still needs a restart
 
 A reload compares the old and new config and reports any of these that changed, as
@@ -260,13 +267,6 @@ reload cannot inspect, and are documented here only.
 | Turning `workspace_sync.enabled` or `retention.enabled` **on** | their loops are only created at startup, so there is nothing running to see the flag change. Turning either **off** is hot |
 | `external_agents.enabled` (**both** directions) and adding the **first** target | the sweeper is only created when the flag is on *and* at least one target is configured; with none it is never created, so a first target added later reloads to `ok` and does nothing (`POST /api/external-agents/sync` answers 503). Once it exists, adding, removing and toggling targets is hot |
 | A session that is **already running** | the agent process was spawned with the options in force at the time; the new ones apply to the next session |
-
-Everything in the first table is reloaded together, and the response says what
-happened to each piece: `POST /api/config/reload` returns `ok`, a per-subsystem
-`detail`, and an `errors` map. A reload is best-effort by design, because a typo in
-`settings.yaml` must not stop a valid cron edit from being applied, so `ok: false`
-with `detail` showing four subsystems reloaded and one failed is a normal answer.
-Check `errors` rather than reading the 200 as success.
 
 ### From the command line
 
