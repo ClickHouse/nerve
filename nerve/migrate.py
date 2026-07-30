@@ -9,6 +9,7 @@ Moves an existing install from the pre-refactor layout:
 to the workspace-centric layout:
 
     <workspace>/config/settings.yaml    (shareable, git-tracked — SCRUBBED)
+    <config_dir>/config.yaml            (machine-local base — REWRITTEN)
     <config_dir>/config.local.yaml      (secrets, machine-local)
     <workspace>/config/cron/*           (cron config, git-tracked)
 
@@ -23,6 +24,11 @@ Design (confirmed with the user):
 * **Copy + keep as backup** — originals are never deleted; ``config.yaml`` and
   the legacy cron files are renamed to ``*.migrated`` breadcrumbs, and the new
   location wins. An existing breadcrumb is never overwritten.
+* **Split, don't copy** — a legacy ``config.yaml`` holds both halves, so the keys
+  :data:`_MACHINE_LOCAL_PATHS` names are rewritten into a fresh ``config.yaml``
+  and never reach the tracked file. A certificate path, an AWS profile handle or
+  a mount list is right on exactly one box; syncing it to the rest of a fleet
+  points them all at something that isn't there.
 * **Auto-scrub secrets** — before writing the *tracked* ``settings.yaml``, secret
   values are moved into machine-local ``config.local.yaml`` and replaced with
   ``${ENV_VAR}`` placeholders. Scrubbed: values under secret-looking keys
@@ -178,22 +184,27 @@ _SCRUB_EXCLUDE_PATHS = {"proxy.api_key", "memory.sqlite_dsn"}
 # a credential handle, a certificate path, whose mailboxes this person syncs,
 # which agent binaries this box has paired. Prefixes match their whole subtree.
 #
-# Migration uses these to tell the two shapes of ``config.yaml`` apart. A legacy
-# monolith holds everything — timezone, secrets, agent behaviour — and belongs in
-# the tracked layer. A post-split ``config.yaml`` holds *only* these, and copying
-# it into a file the docs say to commit would publish exactly the values the
-# split exists to keep local. If nothing else is in there, there is nothing to
-# migrate.
+# Migration uses these twice.
+#
+# They tell the two shapes of ``config.yaml`` apart: a legacy monolith holds
+# everything — timezone, secrets, agent behaviour — and belongs in the tracked
+# layer, while a post-split ``config.yaml`` holds *only* these, so if nothing else
+# is in there, there is nothing to migrate (see :func:`_has_portable_content`).
+#
+# And they are what a monolith is split *on*: the machine half is rewritten back
+# into ``config.yaml`` rather than copied into a file the docs say to commit (see
+# :func:`_partition_machine_local`).
 #
 # Entries are scoped to the part that is genuinely local. Listing a whole subtree
 # here keeps every key under it out of the tracked layer, which is why ``gateway``
 # and ``provider`` were wrong as whole subtrees: a legacy monolith's bind port and
 # provider type stayed in config.yaml, which lockdown does not read.
 #
-# The list mirrors what the wizard routes to the machine layer, and two tests
-# check both directions: one drives the wizard and fails if it emits a path this
-# does not cover, the other migrates a monolith and fails if a shareable key is
-# left behind.
+# The list is the ``config.yaml`` row of the layer table in ``docs/config.md``,
+# and tests check it from three sides: one parses that table and fails on any
+# disagreement (in either direction, and on a path that resolves to no real
+# setting), one drives the wizard and fails if it routes a path here that this
+# does not cover, one fails if this claims a path the wizard shares.
 _MACHINE_LOCAL_PATHS = frozenset({
     "workspace",
     "deployment",
@@ -227,6 +238,10 @@ class MigrationReport:
     migrated_cron: bool = False
     actions: list[str] = field(default_factory=list)
     secrets_moved: list[str] = field(default_factory=list)
+    # Dotted paths withheld from the tracked file and rewritten into
+    # config.yaml. Reported for the same reason the scrubbed secrets are: the
+    # operator has to be able to see which half of their config went where.
+    machine_local_kept: list[str] = field(default_factory=list)
     # Dotted paths left in the tracked file whose value still looks like a
     # credential. Nothing was done about them — they are for the operator to
     # look at before committing.
@@ -421,6 +436,36 @@ def _is_machine_local(dotted: str) -> bool:
     )
 
 
+def _partition_machine_local(data: dict, path: tuple[str, ...] = ()) -> tuple[dict, dict]:
+    """Split a config mapping into (portable, machine_local).
+
+    The split happens at whatever depth the path is listed at, not at the top
+    level: ``gateway.ssl`` takes the ``ssl`` subtree and leaves ``gateway.host``
+    and ``gateway.port`` behind. Moving whole top-level keys instead would drag
+    the bind address off to the machine layer along with the certificate paths,
+    and lockdown never reads that layer.
+
+    A subtree emptied by the split is dropped rather than left behind as
+    ``gateway: {}``. An empty mapping in the source is preserved as written —
+    there is nothing under it to be machine-local.
+    """
+    portable: dict = {}
+    machine: dict = {}
+    for key, value in data.items():
+        p = path + (str(key),)
+        if _is_machine_local(".".join(p)):
+            machine[key] = value
+        elif isinstance(value, dict) and value:
+            sub_portable, sub_machine = _partition_machine_local(value, p)
+            if sub_portable:
+                portable[key] = sub_portable
+            if sub_machine:
+                machine[key] = sub_machine
+        else:
+            portable[key] = value
+    return portable, machine
+
+
 def _has_portable_content(raw: dict) -> bool:
     """True if ``config.yaml`` holds anything the shareable layer should own.
 
@@ -537,8 +582,11 @@ def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationRep
         return  # a machine-local config.yaml from the split layout, not a legacy one
 
     # The workspace location is machine-local — it must not live in the tracked
-    # settings file (circular) but must be preserved so config still resolves the
-    # workspace after config.yaml is renamed away. Keep it in config.local.yaml.
+    # settings file (circular). It is the one machine-local key that does not go
+    # back into config.yaml with the rest: config.local.yaml is written before
+    # anything is consumed, so no interruption can lose it. Losing it is the only
+    # unrecoverable outcome here — the instance would resolve the *default*
+    # workspace and read no settings.yaml at all.
     ws_value = raw.pop("workspace", None)
 
     # ``lockdown`` is honored only in the tracked settings file — the machine
@@ -556,7 +604,14 @@ def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationRep
             "layers from being read. Set it there deliberately to lock this instance"
         )
 
-    tracked, secrets, moved = _scrub_secrets(raw)
+    # Split before scrubbing, so a machine-local value never reaches the tracked
+    # file even as a ${VAR} placeholder. The machine half is left unscrubbed:
+    # config.yaml is machine-local and gitignored, exactly like the overlay the
+    # placeholders would point at, so scrubbing it would only add indirection —
+    # which is why it is written owner-only below.
+    portable, machine_local = _partition_machine_local(raw)
+
+    tracked, secrets, moved = _scrub_secrets(portable)
 
     # Everything bound for the machine-local overlay: scrubbed secrets + the
     # workspace path (not a secret, but machine-specific).
@@ -566,13 +621,17 @@ def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationRep
 
     local_path = config_dir / "config.local.yaml"
     backup = _breadcrumb_path(config_yaml)
+    kept = _leaf_paths(machine_local)
 
     report.migrated_config = True
     report.secrets_moved.extend(moved)
+    report.machine_local_kept.extend(kept)
     report.suspect_values.extend(_suspect_values(tracked))
     if local_additions:
         report.actions.append(f"moved secrets + workspace path into {local_path}")
     report.actions.append(f"config.yaml → {settings} (scrubbed {len(moved)} secret(s))")
+    if kept:
+        report.actions.append(f"kept {len(kept)} machine-local key(s) in {config_yaml}")
     report.actions.append(f"config.yaml → {backup} (backup)")
     for dotted in _relocated_lists(secrets):
         report.warnings.append(
@@ -584,19 +643,26 @@ def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationRep
     if report.dry_run:
         return
 
-    # Order matters, and both writes are atomic (temp file + rename), so an
+    # Order matters, and every write is atomic (temp file + rename), so an
     # interruption at any point leaves a working install:
     #
     # 1. the local overlay first, so the tracked file never references secrets
     #    that exist nowhere on this machine;
     # 2. the tracked settings file;
-    # 3. only then rename config.yaml away.
+    # 3. rename config.yaml away;
+    # 4. write the machine-local half back to config.yaml.
     #
     # Stopping between 2 and 3 leaves config.yaml still shadowing an already
     # complete settings.yaml — the instance keeps working, and re-running is a
     # no-op. Renaming earlier would invert that: a crash before the settings
     # file existed would take every non-secret setting out of the live config
     # with no way to retry.
+    #
+    # Steps 3 and 4 cannot be one operation — they are the same path — so an
+    # interruption between them leaves the machine half only in the breadcrumb,
+    # to be copied back by hand. That window holds nothing that stops the
+    # instance from loading: the workspace path went to config.local.yaml at
+    # step 1.
     if local_additions:
         existing_local = _read_yaml_mapping(local_path)
         # Existing local values win — never clobber a value the operator already
@@ -626,6 +692,21 @@ def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationRep
     # locked down — so tighten it first, then move it.
     _restrict(config_yaml)
     config_yaml.rename(backup)
+
+    if machine_local:
+        # Owner-only, unlike the tracked file: this half is unscrubbed, and the
+        # subtrees that land in it are where a paired agent's token or a local
+        # service credential lives.
+        atomic_write_text(
+            config_yaml,
+            "# Nerve — machine-local configuration (migrated).\n"
+            "# The half of the old config.yaml that describes this box:\n"
+            "# filesystem paths, credential handles, what this machine has\n"
+            "# paired. Not for a shared repo. Shareable settings are in\n"
+            "# <workspace>/config/settings.yaml, which this file overrides.\n\n"
+            + yaml.safe_dump(machine_local, default_flow_style=False, sort_keys=False),
+            mode=_SECRET_FILE_MODE,
+        )
 
 
 def _migrate_cron(workspace: Path, legacy: Path, report: MigrationReport) -> None:

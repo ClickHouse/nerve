@@ -18,11 +18,12 @@ inside `settings.yaml` is ignored.
 
 ## Which layer a key belongs in
 
-`nerve init` splits its answers between the first two layers:
+The first two layers divide as below. `nerve init` writes its answers this way,
+and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -202,15 +203,21 @@ Nothing is deleted and the effective configuration does not change; values are
 only relocated. Originals are renamed to `*.migrated` breadcrumbs, and an existing
 breadcrumb is never overwritten.
 
-- `config.yaml` moves to the git-tracked `workspace/config/settings.yaml`. Secret
-  values are moved to machine-local `config.local.yaml` and replaced with
-  `${ENV_VAR}` placeholders. The machine-local `workspace` path also stays in
-  `config.local.yaml`.
+- `config.yaml` is split rather than copied. Shareable keys go to the git-tracked
+  `workspace/config/settings.yaml`; secret values go to machine-local
+  `config.local.yaml`, replaced with `${ENV_VAR}` placeholders; the machine-local
+  keys from the table above are rewritten into `config.yaml`, so a certificate
+  path or an AWS profile handle never travels with the workspace repo. The split
+  follows the table at whatever depth a key is listed, so `gateway.ssl.*` stays
+  local while `gateway.host`/`port` move across. Migration prints which keys it
+  kept. The `workspace` path is the exception that stays in `config.local.yaml`:
+  it is written before anything is consumed, so an interrupted migration cannot
+  leave the instance unable to find its workspace.
 - The legacy `~/.nerve/cron/*` moves to `workspace/config/cron/*`, including any
   `prompts/` referenced by `prompt_file`.
-- `config.local.yaml` and the breadcrumb hold plaintext secrets, so both are
-  written `0600`. `settings.yaml` is written normally, so a restrictive `umask` is
-  honored.
+- `config.local.yaml`, the rewritten `config.yaml` and the breadcrumb can all hold
+  plaintext credentials, so all three are written `0600`. `settings.yaml` is
+  written normally, so a restrictive `umask` is honored.
 
 A value is treated as secret when any of these hold:
 
@@ -241,13 +248,13 @@ tracked file that still looks like a credential, for you to judge.
 
 Migration only runs on a pre-refactor `config.yaml`, meaning one that holds
 shareable settings rather than only this box's. A `config.yaml` written by
-`nerve init` under the current layout holds only machine-local keys (workspace,
-bind address, provider handles), so it is left in place even when the workspace has
-no `settings.yaml`. Migration is also a no-op once `settings.yaml` carries real
-keys; the `nerve init` scaffold is all comments and counts as empty. A
-`config.yaml` with shareable keys sitting next to a populated `settings.yaml` is
-reported, because it overrides the tracked file, and you move those keys across by
-hand.
+`nerve init` — or left behind by an earlier migration — holds only machine-local
+keys (workspace, certificate paths, provider handles), so it is left in place even
+when the workspace has no `settings.yaml`. Migration is also a no-op once
+`settings.yaml` carries real keys; the `nerve init` scaffold is all comments and
+counts as empty. A `config.yaml` with shareable keys sitting next to a populated
+`settings.yaml` is reported, because it overrides the tracked file, and you move
+those keys across by hand.
 
 ## Config Directory Resolution
 

@@ -771,6 +771,12 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
                     "config.local.yaml; review workspace/config/settings.yaml "
                     "before committing)"
                 )
+            if report.machine_local_kept:
+                click.echo(
+                    f"  ({len(report.machine_local_kept)} machine-local key(s) kept "
+                    "in config.yaml instead of published: "
+                    f"{', '.join(report.machine_local_kept)})"
+                )
             if report.suspect_values:
                 click.secho(
                     f"  ({len(report.suspect_values)} value(s) left in settings.yaml "
@@ -1152,8 +1158,9 @@ def doctor(ctx: click.Context) -> None:
 def migrate(ctx: click.Context, dry_run: bool) -> None:
     """Migrate a legacy config layout into the workspace/config subtree.
 
-    Copies config.yaml → workspace/config/settings.yaml (scrubbing secrets into
-    config.local.yaml as ${ENV_VAR} refs) and ~/.nerve/cron → workspace/config/cron.
+    Splits config.yaml: shareable keys → workspace/config/settings.yaml (secrets
+    scrubbed into config.local.yaml as ${ENV_VAR} refs), machine-local keys stay
+    in config.yaml. Also moves ~/.nerve/cron → workspace/config/cron.
     Non-destructive (originals kept as *.migrated) and idempotent.
     """
     from nerve.migrate import migrate as run_migrate
@@ -1178,6 +1185,11 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
         click.secho(f"\n  Note: {warning}", fg="yellow")
     if report.secrets_moved:
         click.echo(f"\n  Secrets scrubbed to config.local.yaml: {', '.join(report.secrets_moved)}")
+    if report.machine_local_kept:
+        click.echo(
+            "\n  Machine-local keys kept in config.yaml: "
+            f"{', '.join(report.machine_local_kept)}"
+        )
     if report.suspect_values:
         click.secho(
             f"\n  {len(report.suspect_values)} value(s) headed for settings.yaml still "

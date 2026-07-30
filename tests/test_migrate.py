@@ -1,6 +1,7 @@
 """Tests for legacy → workspace/config migration."""
 
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -712,16 +713,15 @@ docker:
         assert settings["provider"]["type"] == "bedrock"
         assert settings["provider"]["aws_region"] == "eu-west-1"
 
-    def test_migration_still_publishes_machine_local_keys(self, tmp_path):
-        """Known gap, pinned here so that changing it is a deliberate act.
+    def test_machine_local_keys_are_not_published(self, tmp_path):
+        """A legacy monolith is split on ``_MACHINE_LOCAL_PATHS``, not copied.
 
-        ``_MACHINE_LOCAL_PATHS`` only gates whether a config.yaml is a legacy
-        monolith (``_has_portable_content``); it does not filter what gets copied,
-        so migration moves the whole file. A pre-split install with TLS paths
-        publishes them into a git-tracked settings file, and syncing that to a box
-        without the certificate makes its gateway fail to bind. Narrowing the list
-        neither caused nor fixes this: the fix is for migration to split the file
-        instead of renaming it wholesale, which is a larger change.
+        The machine half is rewritten into config.yaml and never reaches the
+        git-tracked settings file: syncing a settings.yaml that names a
+        certificate path present on one box makes every other box's gateway fail
+        to bind. The split has to happen at the depth the path is listed at —
+        ``gateway.ssl`` moving must not take ``gateway.port`` with it, which would
+        strand the bind port in a layer lockdown does not read.
         """
         config_dir, workspace = _legacy_install(
             tmp_path,
@@ -729,12 +729,77 @@ docker:
             "gateway:\n  port: 9100\n  ssl:\n    cert: /etc/nerve/tls/cert.pem\n"
             "provider:\n  type: bedrock\n  aws_profile: nerve-prod\n",
         )
-        migrate(config_dir, workspace=workspace)
+        report = migrate(config_dir, workspace=workspace)
         settings = yaml.safe_load(
             workspace_settings_file(workspace).read_text(encoding="utf-8")
         )
-        assert settings["gateway"]["ssl"]["cert"] == "/etc/nerve/tls/cert.pem"
-        assert settings["provider"]["aws_profile"] == "nerve-prod"
+        assert "ssl" not in settings["gateway"]
+        assert "aws_profile" not in settings["provider"]
+        assert settings["gateway"]["port"] == 9100          # portable sibling
+        assert settings["provider"]["type"] == "bedrock"    # portable sibling
+
+        machine = yaml.safe_load((config_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert machine["gateway"]["ssl"]["cert"] == "/etc/nerve/tls/cert.pem"
+        assert machine["provider"]["aws_profile"] == "nerve-prod"
+        assert "timezone" not in machine
+        assert sorted(report.machine_local_kept) == [
+            "gateway.ssl.cert", "provider.aws_profile",
+        ]
+
+    def test_the_split_preserves_the_effective_config(self, tmp_path):
+        """Relocated, not dropped: config.yaml is a layer the loader still reads,
+        so every machine-local value has to survive the split."""
+        config_dir, workspace = _legacy_install(
+            tmp_path,
+            "timezone: UTC\n"
+            "gateway:\n  port: 9100\n"
+            "  ssl:\n    cert: /etc/nerve/tls/cert.pem\n    key: /etc/nerve/tls/key.pem\n"
+            "docker:\n  extra_mounts: ['~/code:/code']\n"
+            "workflows:\n  runs_dir: /srv/box-42/workflow-runs\n",
+        )
+        before = load_config(config_dir)
+        migrate(config_dir, workspace=workspace)
+        after = load_config(config_dir)
+
+        assert after.gateway.ssl.cert == before.gateway.ssl.cert
+        assert after.gateway.ssl.key == before.gateway.ssl.key
+        assert after.gateway.port == before.gateway.port == 9100
+        assert after.docker.extra_mounts == before.docker.extra_mounts
+        assert after.workflows.runs_dir == before.workflows.runs_dir
+
+    def test_the_rewritten_config_yaml_is_owner_only(self, tmp_path, permissive_umask):
+        """It is the unscrubbed half — an ``external_agents`` target's token and a
+        local service's credentials are in the subtrees that land here."""
+        config_dir, workspace = _legacy_install(
+            tmp_path,
+            "timezone: UTC\n"
+            "external_agents:\n  targets:\n    - name: codex\n      token: tok-secret\n",
+        )
+        migrate(config_dir, workspace=workspace)
+        config_yaml = config_dir / "config.yaml"
+        assert _mode(config_yaml) == 0o600
+        assert "tok-secret" in config_yaml.read_text(encoding="utf-8")
+        assert "tok-secret" not in workspace_settings_file(workspace).read_text()
+
+    def test_the_split_half_does_not_look_legacy_on_a_re_run(self, tmp_path):
+        """The file migration leaves behind is a post-split config.yaml, so a
+        second pass has to read it as nothing to do rather than as a monolith
+        shadowing the tracked file."""
+        config_dir, workspace = _legacy_install(tmp_path, self.MACHINE_ONLY + "timezone: UTC\n")
+        assert migrate(config_dir, workspace=workspace).migrated_config
+
+        again = migrate(config_dir, workspace=workspace)
+        assert not again.did_anything
+        assert again.warnings == []
+        assert is_migrated(config_dir, workspace=workspace)
+
+    def test_no_config_yaml_is_written_when_there_is_no_machine_half(self, tmp_path):
+        """A wholly portable legacy config leaves nothing behind to shadow the
+        tracked file."""
+        config_dir, workspace = _legacy_install(tmp_path, "timezone: UTC\n")
+        report = migrate(config_dir, workspace=workspace)
+        assert report.machine_local_kept == []
+        assert not (config_dir / "config.yaml").exists()
 
     def test_the_external_agents_block_is_machine_local_too(self, tmp_path):
         """A second writer appends to config.yaml after the wizard has paired
@@ -769,6 +834,97 @@ docker:
         (workspace / "config").mkdir(parents=True)
         workspace_settings_file(workspace).write_text("timezone: UTC\n", encoding="utf-8")
         assert migrate(config_dir, workspace=workspace).warnings == []
+
+
+_DOCS_CONFIG_MD = Path(__file__).resolve().parents[1] / "docs" / "config.md"
+_LAYER_TABLE_HEADING = "## Which layer a key belongs in"
+# A sentinel rather than getattr's default of None: a setting whose default *is*
+# None (gateway.ssl.cert) has to read as present.
+_MISSING = object()
+
+
+def _documented_machine_local_paths() -> set[str]:
+    """The ``config.yaml`` row of the layer table in ``docs/config.md``.
+
+    Parsed out of the document rather than restated here. A copy of the table
+    kept in this file would agree with the test forever and with the docs never,
+    which is the failure mode the guard exists to catch.
+    """
+    text = _DOCS_CONFIG_MD.read_text(encoding="utf-8")
+    parts = text.split(_LAYER_TABLE_HEADING, 1)
+    assert len(parts) == 2, (
+        f"{_LAYER_TABLE_HEADING!r} is no longer in {_DOCS_CONFIG_MD} — the layer "
+        "table moved or was renamed, and this guard is now checking nothing"
+    )
+    rows = [
+        line for line in parts[1].splitlines() if line.startswith("| `config.yaml` |")
+    ]
+    assert len(rows) == 1, (
+        f"expected exactly one `config.yaml` row under {_LAYER_TABLE_HEADING!r}, "
+        f"found {len(rows)}"
+    )
+    tokens = re.findall(r"`([^`]+)`", rows[0].split("|")[2])
+    assert tokens, f"the `config.yaml` row names no keys: {rows[0]}"
+
+    paths = set()
+    for token in tokens:
+        # ``gateway.ssl.*`` names a subtree; the code lists its root.
+        assert re.fullmatch(r"[a-z_]+(?:\.[a-z_]+)*(?:\.\*)?", token), (
+            f"{token!r} in the layer table is not a plain dotted path. The "
+            "shorthand the settings.yaml row uses (`a`/`b` for two siblings) "
+            "would be read as one key here, so spell it out instead"
+        )
+        paths.add(token[:-2] if token.endswith(".*") else token)
+    return paths
+
+
+class TestMachineLocalPathsMatchTheDocs:
+    """The layer table in ``docs/config.md`` states which layer owns a key;
+    ``_MACHINE_LOCAL_PATHS`` is what migration and the wizard actually do. The
+    list's comment claims to mirror the table and nothing checked it.
+
+    Both directions matter now that the list decides what migration publishes. A
+    key the table calls machine-local but the list omits is copied into a file the
+    docs tell you to commit; one the list claims but the table shares is stranded
+    in a layer lockdown never reads.
+    """
+
+    def test_the_list_and_the_table_agree(self):
+        documented = _documented_machine_local_paths()
+        assert len(documented) >= 10, (
+            f"the parse found only {len(documented)} keys in the layer table — "
+            "did the table's formatting change?"
+        )
+        listed = set(nerve.migrate._MACHINE_LOCAL_PATHS)
+        assert documented == listed, (
+            "docs/config.md's `config.yaml` row and _MACHINE_LOCAL_PATHS "
+            "disagree.\n"
+            f"  in the docs, not in the code: {sorted(documented - listed)}\n"
+            f"  in the code, not in the docs: {sorted(listed - documented)}"
+        )
+
+    def test_every_listed_path_names_a_real_setting(self):
+        """A renamed or misspelled entry covers nothing and says nothing.
+
+        It matches no key, so ``_has_portable_content`` counts the value as
+        shareable and the split hands it to the tracked file — while the list
+        still reads as though that key were accounted for.
+        """
+        from nerve.config import NerveConfig
+
+        defaults = NerveConfig()
+        unresolved = []
+        for dotted in sorted(nerve.migrate._MACHINE_LOCAL_PATHS):
+            node = defaults
+            for part in dotted.split("."):
+                node = getattr(node, part, _MISSING)
+                if node is _MISSING:
+                    unresolved.append(dotted)
+                    break
+        assert not unresolved, (
+            "_MACHINE_LOCAL_PATHS entries that resolve to no setting on a default "
+            f"NerveConfig (renamed? misspelled?): {unresolved}"
+        )
 
 
 class TestMigrationIsolation:
