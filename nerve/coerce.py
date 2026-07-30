@@ -120,6 +120,11 @@ def _convert_element(base: type, value: Any) -> Any:
     """Strict conversion for a list element — no default to fall back to."""
     if type(value) is base:
         return value
+    if value is None:
+        # Already the answer for the numeric types (``int(None)`` raises), but
+        # spelled out because ``str(None)`` would otherwise turn a YAML ``~``
+        # entry into the literal text "None" instead of flagging it.
+        return _UNCONVERTIBLE
     if base is bool:
         if isinstance(value, (int, float)):
             return bool(value)
@@ -136,7 +141,7 @@ def _convert_element(base: type, value: Any) -> Any:
         return _UNCONVERTIBLE
 
 
-def _scalar_to_list(value: Any) -> list[Any] | None:
+def _scalar_to_list(value: Any, base: type) -> list[Any] | None:
     """Normalize a non-list value on a ``list[X]`` field, or ``None`` to skip.
 
     A ``${VAR}`` reference on a list field interpolates to a plain string, and
@@ -148,22 +153,27 @@ def _scalar_to_list(value: Any) -> list[Any] | None:
     fails open — an int chat id never equals a one-character string, so an
     excluded chat is ingested.
 
-    Comma is the separator, matching how the bootstrap wizard parses this same
-    field. A blank string yields the empty list rather than one empty entry, and
-    a lone non-string scalar (``exclude_chats: 42``) is wrapped so it reaches the
-    element coercion below.
+    **How a string becomes a list depends on the element type**, because the two
+    cases have different safe answers:
 
-    Only reached for ``list[int]``/``list[float]``/``list[bool]``, since
-    ``_classify`` ignores ``list[str]``. That limit is deliberate: a comma cannot
-    occur inside a valid int, but it can inside a string — three of the four
-    default ``langfuse.redact_patterns`` are regexes containing ``{20,}``, and
-    splitting those would break secret redaction. ``list[str]`` fields given a
-    bare string are still consumed character-by-character downstream; fixing that
-    needs a per-field opt-in rather than a blanket rule.
+    * ``list[int]``/``list[float]``/``list[bool]`` split on comma, matching how
+      the bootstrap wizard parses this same field. A comma cannot occur inside a
+      valid number, so the separator is unambiguous.
+    * ``list[str]`` is **wrapped as a single element**, never split. A comma is
+      legal inside a string — three of the four default
+      ``langfuse.redact_patterns`` are regexes containing ``{20,}`` — so
+      splitting would corrupt values that are correct as written. One ``${VAR}``
+      is one element; several values are spelled as a YAML list.
+
+    A blank string yields the empty list rather than one empty entry, and a lone
+    non-string scalar (``exclude_chats: 42``) is wrapped so it reaches the
+    element coercion below.
     """
     if value is None:
         return []
     if isinstance(value, str):
+        if base is str:
+            return [value] if value.strip() else []
         return [part.strip() for part in value.split(",") if part.strip()]
     if isinstance(value, (bool, int, float)):
         return [value]
@@ -175,6 +185,11 @@ def _classify(declared: Any) -> tuple[str, type] | None:
 
     Handles the three shapes that actually appear in the config dataclasses:
     a bare scalar, ``X | None``, and ``list[X]``. Anything else is left alone.
+
+    ``str`` is absent from ``_COERCERS`` — a bare ``str`` field needs no
+    coercion, since interpolation already yields one — but ``list[str]`` does,
+    because the container is the thing that gets lost. See
+    :func:`_scalar_to_list`.
     """
     if declared in _COERCERS:
         return ("scalar", declared)
@@ -185,7 +200,7 @@ def _classify(declared: Any) -> tuple[str, type] | None:
         if len(non_none) == 1 and non_none[0] in _COERCERS:
             return ("optional", non_none[0])
         return None
-    if origin is list and len(args) == 1 and args[0] in _COERCERS:
+    if origin is list and len(args) == 1 and (args[0] in _COERCERS or args[0] is str):
         return ("list", args[0])
     return None
 
@@ -220,7 +235,7 @@ def coerce_scalars(obj: Any) -> Any:
         if kind == "list":
             widened = False
             if not isinstance(value, list):
-                normalized = _scalar_to_list(value)
+                normalized = _scalar_to_list(value, base)
                 if normalized is None:
                     logger.warning(
                         "%s: ignoring non-list config value %r, leaving it as-is",

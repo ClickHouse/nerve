@@ -93,6 +93,26 @@ def _setting_str(value: object, default: str = "") -> str:
     value, and it surfaces as an obviously-wrong path rather than a silent one.
     """
     return str(value or "").strip() or default
+
+
+def _str_list(value: object, *, clean: bool = False) -> object:
+    """Copy a ``list[str]`` field's value, or hand a non-list straight through.
+
+    ``list("a@b.com")`` is nineteen single-character entries, and a builder that
+    widens the value itself gets there before ``@_coerced`` can intervene — at
+    which point nothing downstream can tell the result from a genuine list. So a
+    non-list is returned untouched for :func:`nerve.coerce.coerce_scalars` to
+    wrap as one element, which is what a ``${VAR}`` reference on a list field
+    means.
+
+    ``clean`` additionally strips each entry and drops the blanks, for the fields
+    that were already doing that.
+    """
+    if not isinstance(value, list):
+        return value
+    if clean:
+        return [s for s in (str(v or "").strip() for v in value) if s]
+    return list(value)
 class ConfigError(ValueError):
     """Raised when configuration cannot be loaded (e.g. an unresolved
     required ``${ENV_VAR}`` reference)."""
@@ -366,23 +386,19 @@ class AgentConfig:
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()
             },
-            models=[
-                s for s in (
-                    str(m or "").strip() for m in (d.get("models") or [])
-                ) if s
-            ],
+            models=_str_list(d.get("models"), clean=True),
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
             cron_effort=str(d.get("cron_effort", "medium")),
             context_1m=d.get("context_1m", True),
-            context_1m_excluded_models=list(
-                d.get("context_1m_excluded_models", []) or []
+            context_1m_excluded_models=_str_list(
+                d.get("context_1m_excluded_models")
             ),
             cache_ttl=str(d.get("cache_ttl", "5m")),
-            cache_ttl_excluded_models=list(
-                d.get("cache_ttl_excluded_models", []) or []
+            cache_ttl_excluded_models=_str_list(
+                d.get("cache_ttl_excluded_models")
             ),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             background_agent_permissions=d.get("background_agent_permissions", True),
@@ -663,7 +679,7 @@ class CodexWorkspaceFilterConfig:
     def from_dict(cls, d: dict) -> CodexWorkspaceFilterConfig:
         return cls(
             mode=str(d.get("mode", "nerve_workspace")),
-            explicit_paths=list(d.get("explicit_paths", [])),
+            explicit_paths=_str_list(d.get("explicit_paths")),
         )
 
 
@@ -814,7 +830,7 @@ class BackupConfig:
             interval_hours=d.get("interval_hours", 24),
             retention_count=d.get("retention_count", 7),
             include_workspace=d.get("include_workspace", True),
-            workspace_excludes=list(d.get("workspace_excludes", []) or []),
+            workspace_excludes=_str_list(d.get("workspace_excludes")),
             notify_on_failure=d.get("notify_on_failure", True),
             notify_on_success=d.get("notify_on_success", False),
         )
@@ -1641,12 +1657,17 @@ class LangfuseConfig:
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> "LangfuseConfig":
+        # A bare ``redact_patterns:`` parses to None, which the shared list
+        # handling reads as the empty list. That is the right answer for most
+        # fields and the wrong one here, because it would turn secret redaction
+        # off on a blank line. An explicit ``[]`` still means off.
+        patterns = d.get("redact_patterns", _DEFAULT_LANGFUSE_REDACT_PATTERNS)
         return cls(
             public_key=d.get("public_key", ""),
             secret_key=d.get("secret_key", ""),
             host=d.get("host", "https://cloud.langfuse.com"),
-            redact_patterns=list(
-                d.get("redact_patterns", _DEFAULT_LANGFUSE_REDACT_PATTERNS),
+            redact_patterns=_str_list(
+                _DEFAULT_LANGFUSE_REDACT_PATTERNS if patterns is None else patterns
             ),
         )
 

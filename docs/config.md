@@ -37,7 +37,7 @@ are safe as written. Interpolation runs once, after `config.local.yaml` is
 merged on top, so either file may use references.
 
 Resolved values arrive as strings and are converted back to the field's declared
-type, including `int | None` and `list[int]`. So `port: ${PORT}` and
+type, including `int | None`, `list[int]` and `list[str]`. So `port: ${PORT}` and
 `enabled: ${FEATURE}` behave the same as literal YAML values.
 
 - Booleans accept `true/false`, `1/0`, `yes/no`, `on/off`, `y/n`, `t/f`
@@ -45,6 +45,13 @@ type, including `int | None` and `list[int]`. So `port: ${PORT}` and
   string is parsed, not tested for truthiness. An empty value (`FLAG=`) and a
   bare `enabled:` are also off, so blanking a variable reliably disables a
   feature.
+- On a list field, **one reference is one element.** `accounts: ${GMAIL}` with
+  `GMAIL=a@example.com` yields `["a@example.com"]`. Numeric lists
+  (`list[int]`) additionally split on commas, because a comma cannot occur
+  inside a number — so `exclude_chats: ${SKIP}` with `SKIP=-100,-200` yields two
+  ids. String lists are never split, since a comma is legal inside the value:
+  the default `langfuse.redact_patterns` are regexes containing `{20,}`. To set
+  several strings, write a YAML list.
 - An unrecognized value is logged with the field that owns it, and that field
   keeps its documented default. Integers are parsed with `int()`, so `"1.5"`
   and `"1e3"` are rejected rather than truncated.

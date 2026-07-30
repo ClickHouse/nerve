@@ -436,6 +436,12 @@ class TestScalarCoercion:
             bool: [("false", False), ("true", True), ("0", False), ("on", True)],
             int: [("8900", 8900)],
             float: [("1.5", 1.5)],
+            # Only ever reached as list[str] — a bare str field needs no
+            # coercion, so _classify leaves it alone. The value is deliberately
+            # several characters long and contains a comma, because both of the
+            # ways a string can be mistaken for a collection (iterating it,
+            # splitting it) turn this into more than one entry.
+            str: [("alpha,beta", "alpha,beta")],
         }
         two_arg = {"McpServerConfig"}  # from_dict(cls, name, d)
         broken, checked = [], 0
@@ -465,6 +471,22 @@ class TestScalarCoercion:
                             f"{klass.__name__}.{f.name} ({kind} {base.__name__}): "
                             f"{value!r} -> {type(got).__name__}={got!r}"
                         )
+                    # A ${VAR} reference on a list field arrives as a bare
+                    # scalar, not a one-element list, and it has to become
+                    # exactly one element. This is the probe that separates a
+                    # wrap from a widen: `list("alpha,beta")` is ten entries and
+                    # a comma split is two, and once either has happened nothing
+                    # downstream can tell the result from a genuine list.
+                    if kind == "list":
+                        args = ("probe", {f.name: raw}) if klass.__name__ in two_arg \
+                            else ({f.name: raw},)
+                        got = getattr(from_dict(*args), f.name)
+                        if got != [want]:
+                            broken.append(
+                                f"{klass.__name__}.{f.name} ({kind} "
+                                f"{base.__name__}): bare {raw!r} -> {got!r}, "
+                                f"expected exactly one element"
+                            )
                 # Every probe above happens to convert, so a builder that casts
                 # eagerly still looks fine on a list. An unresolvable ref is the
                 # case that separates them: the decorator logs and keeps it, an
@@ -495,3 +517,73 @@ class TestScalarCoercion:
                         broken.append(f"{klass.__name__}.{f.name}: null -> {got!r}")
         assert checked > 60, f"probe only reached {checked} fields — did it break?"
         assert not broken, "fields that ignore their declared type:\n" + "\n".join(broken)
+
+    def test_every_declared_list_field_wraps_a_bare_scalar(self):
+        """Walk the declared annotations, not the coercion's own idea of them.
+
+        The sweep above asks `_classify` which fields it handles, so a type the
+        coercion silently ignores is invisible to it — a field it skips is a
+        field that test never probes. That is exactly how `list[str]` stayed
+        broken while the sweep stayed green. This one derives its field set from
+        `typing.get_type_hints`, so a `list[X]` the coercion does not cover fails
+        here instead of disappearing.
+
+        The rule: a `${VAR}` reference on a list field interpolates to a bare
+        string and must arrive as exactly one element. Both ways of getting that
+        wrong — widening it (`list("a@b.com")` is nineteen entries) and splitting
+        it (`redact_patterns` defaults contain `{20,}`) — produce a list nothing
+        downstream can distinguish from a genuine one.
+        """
+        import dataclasses
+        import inspect
+        import typing
+
+        import nerve.config as cfg
+
+        bare = {
+            str: ("alpha,beta", ["alpha,beta"]),
+            int: ("8900", [8900]),
+            float: ("1.5", [1.5]),
+            bool: ("true", [True]),
+        }
+        two_arg = {"McpServerConfig"}  # from_dict(cls, name, d)
+        broken, checked, skipped = [], 0, []
+        for _name, klass in sorted(vars(cfg).items()):
+            if not (inspect.isclass(klass) and dataclasses.is_dataclass(klass)):
+                continue
+            from_dict = getattr(klass, "from_dict", None)
+            if not callable(from_dict):
+                continue
+            hints = typing.get_type_hints(klass)
+            for f in dataclasses.fields(klass):
+                declared = hints.get(f.name)
+                if typing.get_origin(declared) is not list:
+                    continue
+                args = typing.get_args(declared)
+                element = args[0] if args else None
+                if element not in bare:
+                    skipped.append((f"{klass.__name__}.{f.name}", element))
+                    continue
+                raw, expected = bare[element]
+                checked += 1
+                call = ("probe", {f.name: raw}) if klass.__name__ in two_arg \
+                    else ({f.name: raw},)
+                got = getattr(from_dict(*call), f.name)
+                if got != expected:
+                    broken.append(
+                        f"{klass.__name__}.{f.name} (list[{element.__name__}]): "
+                        f"bare {raw!r} -> {got!r}, expected {expected!r}"
+                    )
+        assert checked >= 19, f"probe reached only {checked} list fields — did it break?"
+        assert not broken, (
+            "list fields that do not wrap a bare scalar as a single element:\n"
+            + "\n".join(broken)
+        )
+        # The skip bucket may only ever hold lists of dataclasses, where a bare
+        # string is not shorthand for a mapping and the builder fails loudly on
+        # its own. A new `list[<scalar>]` must not land here unprobed.
+        for name, element in skipped:
+            assert dataclasses.is_dataclass(element), (
+                f"{name} is list[{element}], which has no probe above — add one "
+                "rather than leaving the field unchecked"
+            )
