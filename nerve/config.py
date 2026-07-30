@@ -468,6 +468,31 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _is_lexically_within(path: Path, root: Path) -> bool:
+    """True if ``path`` *names* a location under ``root``, symlinks not followed.
+
+    The counterpart to :func:`_is_within`, and needed because the two disagree
+    exactly where a symlink is. ``_is_within`` answers "where does this path end
+    up", which is the right question for a path that reaches into the subtree
+    from outside. It is the wrong question for a reviewed *name*: put a symlink
+    at ``config/settings.yaml`` and the resolved path leaves the subtree, so a
+    guard that only resolves concludes the write is none of its business and
+    permits it — writing, through the link, the file the daemon then loads as
+    tracked config.
+
+    ``normpath`` collapses ``.`` and ``..`` textually, without touching the
+    filesystem, which is the point: a lexical comparison a symlink can influence
+    would answer the resolved question again. Collapsing ``..`` across a
+    symlinked directory can name a location the OS would not, so this can
+    over-refuse; callers pair it with :func:`_is_within` and only ever add
+    refusals that way.
+    """
+    try:
+        return Path(os.path.normpath(path)).is_relative_to(os.path.normpath(root))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def read_machine_layers(config_dir: Path) -> dict[str, Any]:
     """The machine-local overlay on its own, for diagnostics.
 
@@ -2629,17 +2654,61 @@ def lockdown_workspace_problems(workspace: Path) -> list[str]:
     instance that fails it does not start. The workspace *path* may still be
     anything, including a symlink: where a machine keeps its workspace is a
     machine-local decision and the one thing lockdown never took away.
+
+    Two more ways the same claim fails, checked here for the same reason. The
+    subtree can stay inside the workspace and still not be the reviewed tree —
+    ``config`` as a symlink to a sibling directory — and ``settings.yaml`` alone
+    can leave it while everything around it stays put.
+
+    Every problem found is reported rather than the first: an operator fixing a
+    layout wants the whole list, and the caller that refuses to boot only needs
+    one of them.
     """
+    problems: list[str] = []
     config_root = workspace_config_dir(workspace)
-    if _is_within(config_root, workspace):
-        return []
-    return [
-        f"lockdown is enabled but the tracked config subtree {config_root} "
-        f"resolves to {_resolved(config_root)}, outside the workspace "
-        f"{_resolved(workspace)} — so nothing it holds is part of the reviewed "
-        f"repo. A locked instance takes its config only from the workspace's own "
-        f"config/ directory."
-    ]
+    if not _is_within(config_root, workspace):
+        problems.append(
+            f"lockdown is enabled but the tracked config subtree {config_root} "
+            f"resolves to {_resolved(config_root)}, outside the workspace "
+            f"{_resolved(workspace)} — so nothing it holds is part of the reviewed "
+            f"repo. A locked instance takes its config only from the workspace's own "
+            f"config/ directory."
+        )
+    elif config_root.is_symlink():
+        # Contained, and still not the reviewed tree. git does not descend into a
+        # symlinked directory, so `git status -- <ws>/config` reports nothing no
+        # matter what is under there: sync calls the workspace clean while the
+        # daemon reads settings.yaml, and imports cron/gates/*.py, from a
+        # directory the config repo has never seen a single file of. The
+        # arrangement is also writable by the agent through its real path, which
+        # the write guard judges against config/ and lets past.
+        problems.append(
+            f"lockdown is enabled but the tracked config subtree {config_root} is a "
+            f"symlink to {_resolved(config_root)}. git does not track anything "
+            f"through a symlinked directory, so no file under it is part of the "
+            f"reviewed repo and a sync would report the workspace clean regardless "
+            f"of what it holds. A locked instance's config/ must be a real "
+            f"directory."
+        )
+
+    # The subtree can be the reviewed tree and this one file still not be part of
+    # it. settings.yaml carries the lockdown flag itself, the auth secret and
+    # every cron path, so a symlink here is the whole tracked layer arriving from
+    # somewhere the reviewer never looked — including from an ordinary workspace
+    # file the agent may write, which is why "still inside the workspace" is not
+    # good enough. The write guard refuses the name; this refuses the instance,
+    # because a file that is already in place was never written through the guard.
+    settings = workspace_settings_file(workspace)
+    if not _is_within(settings, config_root):
+        problems.append(
+            f"lockdown is enabled but the tracked settings file {settings} resolves "
+            f"to {_resolved(settings)}, outside the tracked config subtree "
+            f"{_resolved(config_root)} — so the file that states lockdown, and "
+            f"everything else this instance runs on, is not part of the reviewed "
+            f"repo. A locked instance reads its settings only from the workspace's "
+            f"own config/ directory."
+        )
+    return problems
 
 
 def _has_dotted(data: dict[str, Any], dotted: str) -> bool:
@@ -2918,6 +2987,15 @@ def tracked_config_write_refusal(path: Path | str) -> str | None:
     changed directory into a subtree of its own with a ``config/`` in it; erring
     that way costs a clear message and a retry, and erring the other way is the
     hole this exists to close.
+
+    Both views of the path are checked, because a symlink is the case where they
+    disagree and each direction of the disagreement is a way through. Resolving
+    catches a path that arrives from outside and lands in the subtree — a link in
+    the workspace pointing at ``config/``, a directory link, a ``..`` climb. The
+    lexical name catches the reverse: a symlink sitting *at* a reviewed path
+    resolves elsewhere, and a guard that only resolved would decide the write was
+    outside the subtree and allow it, while the daemon goes on loading that name
+    as tracked config.
     """
     if not is_locked():
         return None
@@ -2926,7 +3004,9 @@ def tracked_config_write_refusal(path: Path | str) -> str | None:
     if not target.is_absolute():
         target = workspace / target
     config_root = workspace_config_dir(workspace)
-    if not _is_within(target, config_root):
+    if not (
+        _is_within(target, config_root) or _is_lexically_within(target, config_root)
+    ):
         return None
     return (
         f"this instance is in lockdown (remote-only, read-only) and {target} is "

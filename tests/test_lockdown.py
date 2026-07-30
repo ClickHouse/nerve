@@ -1,5 +1,8 @@
 """Tests for lockdown / remote-only read-only mode."""
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,6 +16,8 @@ from nerve.config import (
     ensure_not_locked,
     is_locked,
     load_config,
+    lockdown_workspace_problems,
+    tracked_config_write_refusal,
     workspace_settings_file,
 )
 
@@ -605,6 +610,204 @@ class TestLockdownTrackedSubtreeIsInTheWorkspace:
         result = validate_config_bundle(config_dir, workspace_override=candidate)
         assert result.ok, result.errors
         assert any(str(candidate) in i and "cron jobs" in i for i in result.info)
+
+    def _sibling(self, tmp_path, settings):
+        """``config`` as a symlink to a sibling directory *inside* the workspace."""
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        config_dir.mkdir()
+        (ws / "notes" / "cfg" / "cron" / "gates").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        (ws / "config").symlink_to(Path("notes") / "cfg", target_is_directory=True)
+        (ws / "notes" / "cfg" / "settings.yaml").write_text(settings, encoding="utf-8")
+        return config_dir, ws
+
+    def test_config_symlinked_to_a_sibling_directory_refuses_to_load(self, tmp_path):
+        """Containment alone does not make the subtree the reviewed one. The link
+        target is inside the workspace, so every check that resolves passes."""
+        config_dir, ws = self._sibling(tmp_path, "lockdown: true\n" + _JWT)
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "must be a real directory" in str(ei.value)
+
+    def test_a_symlinked_config_stays_fine_unlocked(self, tmp_path):
+        config_dir, ws = self._sibling(tmp_path, "timezone: UTC\n")
+        assert load_config(config_dir).timezone == "UTC"
+
+    @pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+    def test_git_reports_nothing_under_a_symlinked_config(self, tmp_path):
+        """Why the symlink is refused rather than tolerated: git does not descend
+        into it, so sync's divergence check — the thing that keeps unreviewed
+        ``cron/gates/*.py`` off a locked box — sees an empty subtree and calls the
+        workspace clean while the daemon imports what is there.
+        """
+        from nerve.sync_service import _local_config_divergence
+
+        config_dir, ws = self._sibling(tmp_path, "lockdown: true\n" + _JWT)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+               "HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+        for args in (["init", "-b", "main"], ["add", "-A"], ["commit", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=str(ws), check=True,
+                           capture_output=True, text=True, env=env)
+        (ws / "notes" / "cfg" / "cron" / "gates" / "evil.py").write_text(
+            "MARKER = 1\n", encoding="utf-8",
+        )
+        # Untracked code the daemon would import, and git says the subtree is clean.
+        assert _local_config_divergence(ws, "HEAD", True) == ([], [])
+        # So the layout has to be refused at the only place that can see it.
+        with pytest.raises(ConfigError):
+            load_config(config_dir)
+
+
+class TestLockdownSettingsFileIsInTheSubtree:
+    """The subtree can be the reviewed tree and ``settings.yaml`` still not be
+    part of it. It carries the ``lockdown`` flag, the auth secret and the cron
+    paths, so a symlink there is the whole tracked layer arriving from a file no
+    reviewer saw — and, when it points at an ordinary workspace file, from one the
+    agent may write with the tools lockdown leaves it.
+    """
+
+    def _linked(self, tmp_path, target, settings="lockdown: true\n" + _JWT):
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        config_dir.mkdir()
+        (ws / "config").mkdir(parents=True)
+        (ws / "notes").mkdir()
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        real = ws / "notes" / "settings.yaml" if target == "inside" else tmp_path / "outside.yaml"
+        real.write_text(settings, encoding="utf-8")
+        link = Path("..") / "notes" / "settings.yaml" if target == "inside" else real
+        workspace_settings_file(ws).symlink_to(link)
+        return config_dir, ws
+
+    def test_settings_symlinked_out_of_the_workspace_refuses_to_load(self, tmp_path):
+        config_dir, ws = self._linked(tmp_path, "outside")
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "outside the tracked config subtree" in str(ei.value)
+
+    def test_settings_symlinked_to_an_ordinary_workspace_file_refuses_to_load(self, tmp_path):
+        """A relative link that never leaves the workspace, which is the harder
+        case: nothing about it escapes, and the target is a file the agent writes
+        the same way it writes its notes."""
+        config_dir, ws = self._linked(
+            tmp_path, "inside", "lockdown: true\nauth:\n  jwt_secret: attacker\n",
+        )
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "outside the tracked config subtree" in str(ei.value)
+
+    def test_the_validator_reports_it(self, tmp_path):
+        from nerve.config_validate import validate_config_bundle
+
+        config_dir, ws = self._linked(tmp_path, "inside")
+        result = validate_config_bundle(config_dir, workspace_override=ws)
+        assert any("outside the tracked config subtree" in e for e in result.errors)
+
+    def test_unlocked_is_unaffected(self, tmp_path):
+        config_dir, ws = self._linked(tmp_path, "outside", "timezone: UTC\n")
+        assert load_config(config_dir).timezone == "UTC"
+
+    def test_a_real_settings_file_loads(self, tmp_path):
+        config_dir, ws = _install(tmp_path, settings="lockdown: true\ntimezone: UTC\n" + _JWT)
+        assert lockdown_workspace_problems(ws) == []
+        assert load_config(config_dir).timezone == "UTC"
+
+    def test_an_absent_settings_file_is_not_a_problem(self, tmp_path):
+        """Nothing to point anywhere. A locked instance can be anchored by the
+        environment with no tracked settings file at all."""
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        assert lockdown_workspace_problems(ws) == []
+
+    def test_a_link_within_the_subtree_is_fine(self, tmp_path):
+        """Both ends are tracked and reviewed, so the name is a layout choice the
+        config repo is entitled to make. The check is containment, not a ban on
+        symlinks."""
+        config_dir, ws = _install(tmp_path)
+        (ws / "config" / "shared.yaml").write_text(
+            "lockdown: true\ntimezone: UTC\n" + _JWT, encoding="utf-8",
+        )
+        workspace_settings_file(ws).symlink_to(Path("shared.yaml"))
+        assert load_config(config_dir).timezone == "UTC"
+
+    def test_every_problem_is_reported_not_just_the_first(self, tmp_path):
+        """An operator fixing a layout wants the list; the loader only needs one."""
+        ws = tmp_path / "ws"
+        (ws / "notes" / "cfg").mkdir(parents=True)
+        (ws / "notes" / "settings.yaml").write_text("lockdown: true\n", encoding="utf-8")
+        (ws / "config").symlink_to(Path("notes") / "cfg", target_is_directory=True)
+        (ws / "notes" / "cfg" / "settings.yaml").symlink_to(
+            Path("..") / "settings.yaml",
+        )
+        problems = lockdown_workspace_problems(ws)
+        assert len(problems) == 2
+        assert any("must be a real directory" in p for p in problems)
+        assert any("outside the tracked config subtree" in p for p in problems)
+
+
+class TestLockdownWriteGuardJudgesBothViewsOfAPath:
+    """A symlink is where "where does this path end up" and "what does this path
+    name" stop agreeing, and each direction of the disagreement is a way through.
+    Both are checked, and both directions are pinned here so a later refactor
+    cannot drop one for the other.
+    """
+
+    def _locked(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "config" / "cron" / "gates").mkdir(parents=True)
+        (ws / "notes").mkdir()
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
+        return ws
+
+    def test_a_symlink_at_the_reviewed_name_is_refused(self, tmp_path, monkeypatch):
+        """The lexical direction. Resolving alone puts the target outside the
+        subtree, which reads as "not lockdown's business" — while the write goes
+        through the link to the file the daemon loads as tracked config."""
+        ws = self._locked(tmp_path, monkeypatch)
+        outside = tmp_path / "outside.yaml"
+        outside.write_text("lockdown: true\n", encoding="utf-8")
+        (ws / "config" / "settings.yaml").symlink_to(outside)
+        assert tracked_config_write_refusal("config/settings.yaml")
+        assert tracked_config_write_refusal(ws / "config" / "settings.yaml")
+
+    def test_a_relative_link_that_stays_in_the_workspace_is_refused_too(self, tmp_path, monkeypatch):
+        ws = self._locked(tmp_path, monkeypatch)
+        (ws / "notes" / "settings.yaml").write_text("lockdown: true\n", encoding="utf-8")
+        (ws / "config" / "settings.yaml").symlink_to(
+            Path("..") / "notes" / "settings.yaml",
+        )
+        assert tracked_config_write_refusal("config/settings.yaml")
+
+    @pytest.mark.parametrize("path", [
+        "notes/settings-link.yaml",          # a file symlink into the subtree
+        "notes/cfgdir/settings.yaml",        # through a directory symlink
+        "notes/cfgdir/cron/gates/new.py",    # a path that does not exist yet
+        "notes/../config/settings.yaml",     # .. traversal back in
+    ])
+    def test_a_path_that_reaches_into_the_subtree_is_refused(self, tmp_path, monkeypatch, path):
+        """The resolving direction, which the lexical check cannot see. Dropping
+        it in favour of comparing names would reopen every one of these."""
+        ws = self._locked(tmp_path, monkeypatch)
+        (ws / "config" / "settings.yaml").write_text("lockdown: true\n", encoding="utf-8")
+        (ws / "notes" / "settings-link.yaml").symlink_to(ws / "config" / "settings.yaml")
+        (ws / "notes" / "cfgdir").symlink_to(ws / "config", target_is_directory=True)
+        assert tracked_config_write_refusal(path)
+
+    def test_ordinary_workspace_files_stay_writable(self, tmp_path, monkeypatch):
+        """Including the target of the link above. The workspace is the agent's
+        working directory and lockdown does not make it read-only; what keeps a
+        link at ``config/settings.yaml`` from mattering is that a locked instance
+        with one refuses to start — see
+        :class:`TestLockdownSettingsFileIsInTheSubtree`.
+        """
+        ws = self._locked(tmp_path, monkeypatch)
+        (ws / "config" / "settings.yaml").symlink_to(
+            Path("..") / "notes" / "settings.yaml",
+        )
+        assert tracked_config_write_refusal("notes/settings.yaml") is None
+        assert tracked_config_write_refusal("memory/notes.md") is None
 
 
 def ws_escape(tmp_path: Path) -> str:

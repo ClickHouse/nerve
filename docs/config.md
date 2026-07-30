@@ -366,10 +366,20 @@ Two things to know about `NERVE_LOCKDOWN`:
   (memory, skills content, task files) are unaffected. `Bash` is not covered; see
   below.
 - **The tracked config subtree must really be in the workspace.**
-  `<workspace>/config` has to resolve inside `<workspace>`. If it is a symlink out,
-  nothing under it is part of the reviewed repo, `settings.yaml` included, and the
-  instance refuses to start. Where the workspace itself lives stays a machine-local
-  decision, symlink included.
+  `<workspace>/config` has to resolve inside `<workspace>`, and has to be a real
+  directory rather than a symlink. If it is a symlink out, nothing under it is part
+  of the reviewed repo, `settings.yaml` included. If it is a symlink to a sibling
+  inside the workspace, git does not descend into it, so nothing under it is tracked
+  and sync reports the workspace clean whatever it holds. Either way the instance
+  refuses to start. Where the workspace itself lives stays a machine-local decision,
+  symlink included.
+- **`settings.yaml` must be inside that subtree.** `<workspace>/config/settings.yaml`
+  has to resolve inside `<workspace>/config/`, so a symlink there cannot source the
+  lockdown flag, the auth secret and the cron paths from a file no reviewer saw — an
+  ordinary workspace file the agent can write included. A link to another file
+  *within* the subtree is fine; both ends are tracked. The write guard refuses the
+  path `config/settings.yaml` by name as well as by where it resolves, so a symlink
+  cannot turn a reviewed name into an allowed write.
 - **Cron cannot be pointed out of the workspace.** `cron.jobs_file`,
   `cron.system_file` and `cron.gate_plugins_dir` must resolve inside
   `<workspace>/config/`. One that does not is ignored, with a warning, in favour of
