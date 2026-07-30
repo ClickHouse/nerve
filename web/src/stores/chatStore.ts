@@ -53,12 +53,13 @@ export interface NewChatReviewLoop {
   verifierEngine: string;
   verifierModel: string;
   maxIterations: string;          // '' = config default
+  cwd: string;                    // '' = global workspace; created if missing
 }
 
 export const EMPTY_REVIEW_LOOP: NewChatReviewLoop = {
   goal: '', verifier: '', budget: '', adoption: 'no',
   implementerEngine: '', implementerModel: '',
-  verifierEngine: '', verifierModel: '', maxIterations: '',
+  verifierEngine: '', verifierModel: '', maxIterations: '', cwd: '',
 };
 
 export type QuoteAction = 'add' | 'remove' | 'improve' | 'question' | 'note';
@@ -587,8 +588,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
           } : {}),
         }
       : null;
+    // The loop's workdir rides the session-level cwd (the loop inherits the
+    // observer session's cwd server-side); only sent when a loop is bound.
+    const rlCwd = rlPayload && rl ? rl.cwd.trim() || undefined : undefined;
     const real: Session = await api.createSession(
-      undefined, get().newChatBackend, undefined, rlPayload,
+      undefined, get().newChatBackend, rlCwd, rlPayload,
     );
     set((state) => {
       const drafts = { ...state.drafts };

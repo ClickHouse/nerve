@@ -52,8 +52,8 @@ REVIEW_LOOP_START_SCHEMA = {
         "cwd": {
             "type": "string",
             "description": (
-                "Shared workspace for all legs (must exist). Defaults to "
-                "this session's cwd, then the global workspace."
+                "Shared workspace for all legs (created if missing). "
+                "Defaults to this session's cwd, then the global workspace."
             ),
             "default": "",
         },

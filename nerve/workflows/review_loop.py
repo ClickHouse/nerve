@@ -364,10 +364,12 @@ class ReviewLoopService:
             path = Path(cwd).expanduser()
             try:
                 path = path.resolve()
+                if not path.is_dir():
+                    # Auto-create missing workdirs — loops often target a
+                    # fresh scratch directory that should simply exist.
+                    path.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 raise ReviewLoopError(f"invalid cwd: {e}") from e
-            if not path.is_dir():
-                raise ReviewLoopError(f"cwd is not a directory: {path}")
             cwd = str(path)
         else:
             cwd = str(self.config.workspace)

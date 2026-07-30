@@ -183,7 +183,15 @@ async def create_session(req: SessionCreateRequest, user: dict = Depends(require
     if req.cwd:
         path = Path(req.cwd).expanduser().resolve()
         if not path.is_dir():
-            raise HTTPException(status_code=400, detail=f"Working directory not found: {path}")
+            # Auto-create missing workdirs (review loops and chats may
+            # target a fresh scratch directory).
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot create working directory {path}: {e}",
+                ) from e
         cwd = str(path)
     selected_backend = deps.engine._backends[backend]
     model = selected_backend.default_model(req.source)
