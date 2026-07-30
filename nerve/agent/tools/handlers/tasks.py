@@ -294,9 +294,6 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if not task:
             return ToolResult.text(f"Task not found: {task_id}")
 
-        if status:
-            await ctx.db.update_task_status(task_id, status)
-
         new_tags_str = ""
         if raw_tags:
             current_tags = set(parse_tags_string(task.get("tags", "") or ""))
@@ -311,8 +308,6 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
             else:
                 new_tags_str = tags_to_string(parse_tags_string(raw_tags))
 
-            await ctx.db.update_task_tags(task_id, new_tags_str)
-
         if ctx.workspace and (note or deadline or raw_tags or new_title):
             file_path = ctx.workspace / task["file_path"]
             if file_path.exists():
@@ -321,17 +316,6 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 )
                 if new_title:
                     content = re.sub(r"^# .+", f"# {new_title}", content, count=1)
-                    await ctx.db.upsert_task(
-                        task_id=task_id,
-                        file_path=task["file_path"],
-                        title=new_title,
-                        status=status or task["status"],
-                        source=task.get("source"),
-                        source_url=task.get("source_url"),
-                        deadline=deadline or task.get("deadline"),
-                        tags=new_tags_str if raw_tags else (task.get("tags") or ""),
-                        content=content,
-                    )
                 if note:
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     content += f"\n- {today}: {note}"
@@ -357,6 +341,29 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 await asyncio.to_thread(
                     file_path.write_text, content, encoding="utf-8",
                 )
+
+                final_title = new_title or task["title"]
+                final_status = status or task["status"]
+                final_deadline = deadline or task.get("deadline")
+                final_tags = new_tags_str if raw_tags else (task.get("tags") or "")
+                await ctx.db.upsert_task(
+                    task_id=task_id,
+                    file_path=task["file_path"],
+                    title=final_title,
+                    status=final_status,
+                    source=task.get("source"),
+                    source_url=task.get("source_url"),
+                    deadline=final_deadline,
+                    tags=final_tags,
+                    content=content,
+                )
+                return ToolResult.text(f"Task {task_id} updated.")
+
+        # Fall back to metadata updates when no task file was changed.
+        if status:
+            await ctx.db.update_task_status(task_id, status)
+        if raw_tags:
+            await ctx.db.update_task_tags(task_id, new_tags_str)
 
     return ToolResult.text(f"Task {task_id} updated.")
 
