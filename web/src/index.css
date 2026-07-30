@@ -211,12 +211,17 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: var(--theme-border); }
 
 /* ── Chat message backgrounds ── */
-/* Dark: assistant messages are slightly darker than the chat bg */
+/* Dark: assistant messages sink slightly below the chat bg; user prompts rise
+   to a greyer surface so the two roles read as distinct bands when scrolling. */
 .msg-assistant { background: var(--theme-bg-sunken); }
-/* Light: invert — assistant messages are lighter (white) to stand out */
+.msg-user { background: var(--theme-surface-hover); }
+/* Light: invert — assistant messages are lighter (white) to stand out; user
+   prompts stay on the page bg (already distinct from the white assistant band). */
 [data-theme="light"] .msg-assistant { background: var(--theme-surface); }
+[data-theme="light"] .msg-user { background: transparent; }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) .msg-assistant { background: var(--theme-surface); }
+  :root:not([data-theme="dark"]) .msg-user { background: transparent; }
 }
 
 /* Markdown rendering styles */

@@ -14,7 +14,7 @@ export function UserMessage({ message }: { message: ChatMessage }) {
   const files = message.blocks.filter(b => b.type === 'file') as FileBlockData[];
 
   return (
-    <div className="py-4 px-5">
+    <div className="py-4 px-5 msg-user" data-role="user">
       <div className="max-w-[var(--chat-width)] mx-auto">
         <div className="flex gap-3">
           <div className="w-7 h-7 rounded-full bg-surface-raised flex items-center justify-center text-xs font-medium text-text-muted shrink-0 mt-0.5">
