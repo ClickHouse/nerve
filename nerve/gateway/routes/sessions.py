@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from nerve.agent.backends.base import BackendError
 from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
@@ -78,6 +79,11 @@ class SessionCreateRequest(BaseModel):
     # Agent backend for this session ("claude" | "codex"). Persisted
     # immediately; metadata keeps the override only for old readers.
     backend: str | None = None
+    # Model for this session's turns (the composer's picker choice).
+    # Empty/None → the backend's default. Persisted at creation so the
+    # header's model badge is right from the first render — per-message
+    # overrides on the WS path can still change it later.
+    model: str | None = None
     cwd: str | None = None
     # Optional review loop attached at creation: this session becomes the
     # loop's observer (milestones land here; cwd is the shared workspace).
@@ -194,7 +200,19 @@ async def create_session(req: SessionCreateRequest, user: dict = Depends(require
                 ) from e
         cwd = str(path)
     selected_backend = deps.engine._backends[backend]
-    model = selected_backend.default_model(req.source)
+    requested_model = (req.model or "").strip()
+    if requested_model:
+        # Same optional-validation seam the engine uses per turn: backends
+        # that can cheaply reject a model (codex) do so here, before a row
+        # with an unservable model is minted; claude accepts any ID (Ollama
+        # models ride the claude backend, so the list is open-ended).
+        validate_model = getattr(selected_backend, "validate_model", None)
+        if validate_model is not None:
+            try:
+                await validate_model(requested_model)
+            except BackendError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+    model = requested_model or selected_backend.default_model(req.source)
     session_id = str(uuid.uuid4())[:8]
     session = await deps.engine.sessions.get_or_create(
         session_id, title=req.title, source=req.source, metadata=metadata,
