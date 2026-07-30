@@ -52,6 +52,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const lastInstructionRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCountRef = useRef(0);
+  // Shell-style prompt history (ArrowUp/ArrowDown recall previously-sent
+  // prompts of this chat). -1 = not navigating (live draft); 0 = most recent.
+  const historyIndexRef = useRef(-1);
+  const historyStashRef = useRef('');
 
   const quotes = useChatStore(s => s.quotes);
   const removeQuote = useChatStore(s => s.removeQuote);
@@ -150,6 +154,8 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   // Focus the composer on every switch so you can start typing right away.
   useEffect(() => {
     setInput(useChatStore.getState().drafts[activeSession] ?? '');
+    historyIndexRef.current = -1;
+    historyStashRef.current = '';
     if (activeSession) setTimeout(() => textareaRef.current?.focus(), 0);
   }, [activeSession]);
 
@@ -283,6 +289,8 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     onSend(message, fileIds.length > 0 ? fileIds : undefined, imageBlocks.length > 0 ? imageBlocks : undefined);
     cancelDraftFlush();
     setInput('');
+    historyIndexRef.current = -1;
+    historyStashRef.current = '';
     setDraft(activeSession, '');
     clearQuotes();
     // Clean up previews
@@ -339,10 +347,75 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     dispatchSend(message);
   };
 
+  // Previously-sent user prompts of this chat, newest first (adjacent dupes dropped).
+  const getPromptHistory = (): string[] => {
+    const msgs = useChatStore.getState().messages;
+    const out: string[] = [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role !== 'user') continue;
+      const text = msgs[i].blocks.find(b => b.type === 'text')?.content || '';
+      if (!text.trim()) continue;
+      if (out.length > 0 && out[out.length - 1] === text) continue;
+      out.push(text);
+    }
+    return out;
+  };
+
+  // Put the caret at the end after a programmatic recall (next tick, once React
+  // has committed the new value to the textarea).
+  const setCaretToEnd = () => {
+    setTimeout(() => {
+      const el = textareaRef.current;
+      if (el) el.setSelectionRange(el.value.length, el.value.length);
+    }, 0);
+  };
+
   const handleKeyDown = (e: KeyboardEvent) => {
+    // Never intercept mid-IME-composition (Enter commits the candidate, etc.).
+    if (e.nativeEvent.isComposing) return;
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       if (canSend) handleSend();
+      return;
+    }
+
+    // Shell-style history recall — only when the arrow wouldn't just move the
+    // caret within existing multi-line text: Up on the first line, Down on the
+    // last line, no active selection, no modifier held.
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+        !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const el = textareaRef.current;
+      if (!el || el.selectionStart !== el.selectionEnd) return;
+      const caret = el.selectionStart;
+
+      if (e.key === 'ArrowUp') {
+        if (input.slice(0, caret).includes('\n')) return;   // not on first line
+        const history = getPromptHistory();
+        if (history.length === 0) return;
+        let idx = historyIndexRef.current;
+        if (idx === -1) historyStashRef.current = input;     // stash live draft
+        if (idx >= history.length - 1) return;               // already oldest
+        idx += 1;
+        historyIndexRef.current = idx;
+        e.preventDefault();
+        setInput(history[idx]);
+        setCaretToEnd();
+      } else {
+        if (historyIndexRef.current === -1) return;          // not navigating
+        if (input.slice(caret).includes('\n')) return;       // not on last line
+        e.preventDefault();
+        const history = getPromptHistory();
+        const idx = historyIndexRef.current;
+        if (idx <= 0) {
+          historyIndexRef.current = -1;
+          setInput(historyStashRef.current);                 // restore live draft
+        } else {
+          historyIndexRef.current = idx - 1;
+          setInput(history[idx - 1] ?? '');
+        }
+        setCaretToEnd();
+      }
     }
   };
 
@@ -550,7 +623,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             id="nerve-chat-input"
             ref={textareaRef}
             value={input}
-            onChange={(e) => { const v = e.target.value; setInput(v); scheduleDraft(activeSession, v); }}
+            onChange={(e) => { const v = e.target.value; setInput(v); historyIndexRef.current = -1; scheduleDraft(activeSession, v); }}
             onBlur={() => { cancelDraftFlush(); setDraft(activeSession, input); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
