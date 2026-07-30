@@ -127,8 +127,9 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       .catch(() => setRewriteAvailable(false));
   }, []);
 
-  // Load selectable models once — the picker only renders when more than the
-  // default model is offered (i.e. local Ollama models are configured).
+  // Load selectable models once — the picker renders when the active backend
+  // offers more than one model (the configured Claude list, the Codex
+  // app-server's models, local Ollama models).
   useEffect(() => { loadModels(); }, [loadModels]);
 
   useEffect(() => {

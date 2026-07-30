@@ -253,8 +253,9 @@ export const api = {
 
   authStatus: () => request<{ auth_required: boolean }>('/auth/status'),
 
-  // Models — chat models offered to the composer's picker (Anthropic default
-  // plus any locally-installed Ollama models, auto-discovered server-side).
+  // Models — chat models offered to the composer's picker, per backend
+  // (the configured Claude list, Codex app-server models, and any
+  // locally-installed Ollama models, auto-discovered server-side).
   getModels: () =>
     request<{
       default: string;
