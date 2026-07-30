@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Repeat } from 'lucide-react';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, Repeat } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
@@ -53,7 +53,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   // Drag-to-resize the session list. It is left-anchored against the nav rail,
@@ -321,6 +321,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                       onDelete={onDelete}
                       onRename={renameSession}
                       onToggleStar={toggleStar}
+                      onArchive={archiveSession}
                       showDate
                     />
                   ))
@@ -373,6 +374,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
+                    onArchive={archiveSession}
                   />
                 ))}
               </div>
@@ -394,6 +396,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
+                    onArchive={archiveSession}
                   />
                 ))}
               </div>
@@ -418,6 +421,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     onDelete={onDelete}
                     onRename={renameSession}
                     onToggleStar={toggleStar}
+                    onArchive={archiveSession}
                   />
                 ))}
               </div>
@@ -564,13 +568,14 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, showDate }: {
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, showDate }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => Promise<void>;
   onToggleStar: (id: string) => Promise<void>;
+  onArchive: (id: string) => Promise<void>;
   showDate?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -707,6 +712,18 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
             >
               <Pencil size={14} />
               Rename
+            </button>
+            <button
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setMenuOpen(false);
+                onArchive(session.id);
+              }}
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+            >
+              <Archive size={14} />
+              Archive
             </button>
             <div className="border-t border-border my-1" />
             <button

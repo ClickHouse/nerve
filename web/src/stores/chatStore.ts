@@ -196,6 +196,7 @@ interface ChatState {
   discardVirtualSession: () => void;
   setDraft: (sessionId: string, text: string) => void;
   deleteSession: (id: string) => Promise<void>;
+  archiveSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
@@ -667,6 +668,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     } catch (e) {
       console.error('Failed to delete session:', e);
+    }
+  },
+
+  archiveSession: async (id: string) => {
+    try {
+      await api.archiveSession(id);
+      removeDraft(id);
+      set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
+      await get().loadSessions();
+      if (get().activeSession === id) {
+        // Switch to most recent remaining session
+        const remaining = get().sessions.filter(s => s.id !== id);
+        if (remaining.length > 0) {
+          await get().switchSession(remaining[0].id);
+        }
+      }
+    } catch (e) {
+      console.error('Failed to archive session:', e);
     }
   },
 
