@@ -307,6 +307,54 @@ def workspace_settings_file(workspace: Path) -> Path:
     return workspace_config_dir(workspace) / "settings.yaml"
 
 
+# Filenames served at /favicon.ico when one is present in the tracked config
+# subtree, best format first. Only one should exist; the order decides it if
+# several do.
+#
+# A convention rather than a setting. The file has to travel with the config repo
+# to be worth anything — a fleet pointed at one repo is exactly the case where
+# telling the instances apart in a tab bar matters — and the config subtree is
+# already synced, already reviewed, and already the surface a proposal may touch.
+# A path setting would add a second thing to keep in step with the file, and a
+# machine-local path in shared settings is the mistake `gateway.ssl.cert` is
+# documented as: a box without that file. There is nothing here to misconfigure.
+_FAVICON_FILES: tuple[tuple[str, str], ...] = (
+    ("favicon.svg", "image/svg+xml"),
+    ("favicon.png", "image/png"),
+    ("favicon.ico", "image/x-icon"),
+)
+
+
+def workspace_favicon(workspace: Path) -> tuple[Path, str] | None:
+    """The tracked favicon and its content type, or ``None`` if there is none.
+
+    Answered per call rather than cached at start-up, so a favicon that arrives
+    by sync — or is simply dropped in — is served without a restart.
+
+    The candidate is resolved and required to stay inside the config subtree,
+    which matters more here than the feature's size suggests. Git tracks
+    symlinks, so a config repo can carry ``config/favicon.png ->
+    /etc/shadow``; the route that serves this is unauthenticated by design,
+    since a browser asks for a favicon before anyone logs in. Following the link
+    would turn "set your own favicon" into an unauthenticated read of any file
+    the daemon can open, and a reviewer skimming a config PR would see a
+    plausible filename.
+    """
+    config_root = workspace_config_dir(workspace)
+    for name, content_type in _FAVICON_FILES:
+        candidate = config_root / name
+        if not candidate.is_file():
+            continue
+        if not _is_within(candidate, config_root):
+            logger.warning(
+                "Ignoring %s: it resolves outside the tracked config subtree %s",
+                candidate, config_root,
+            )
+            continue
+        return candidate, content_type
+    return None
+
+
 def _load_workspace_settings(workspace: Path) -> dict[str, Any]:
     """Load ``workspace/config/settings.yaml``.
 

@@ -94,6 +94,12 @@ dropped quietly. Fix the reported paths and re-submit.
 `skills/<id>/scripts/` **is** proposable — it's a normal part of a skill — so a
 script there reaches the instance through this route like anything else.
 
+Proposals carry **text**, so a binary file cannot go through this tool at all.
+That matters for one thing in practice: the instance's favicon
+(`config/favicon.svg` / `.png` / `.ico`, served at `/favicon.ico`). You can
+propose an `.svg`, since SVG is text. A `.png` or `.ico` has to be committed by a
+human — say so rather than submitting something that will be rejected.
+
 ### Why this exists, and what it isn't
 
 So that a change to your configuration is reviewed, attributable, and visible in

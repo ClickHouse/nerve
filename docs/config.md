@@ -998,6 +998,27 @@ Approve/Decline cards in the web UI.
 | `gateway.ssl.cert` | path | - | SSL certificate path |
 | `gateway.ssl.key` | path | - | SSL private key path |
 
+### Favicon
+
+Drop `favicon.svg`, `favicon.png` or `favicon.ico` into `workspace/config/` and
+the gateway serves it at `/favicon.ico`. There is no setting: the file is tracked
+config like anything else under `config/`, so a config repo carries it to every
+instance that syncs, and a fleet can be told apart by its browser tabs. Nothing
+is copied into the web bundle — the file is read per request, so one that arrives
+by sync appears without a restart, and removing it goes back to the browser
+default.
+
+Use one. If several are present the first of `.svg`, `.png`, `.ico` wins.
+
+A symlink is followed only while it stays inside `workspace/config/`. Git tracks
+symlinks, and `/favicon.ico` is served without authentication because a browser
+asks for it before anyone logs in — so a `config/favicon.png` pointing at
+`/etc/shadow` would otherwise be readable by anyone who can reach the port. One
+pointing at another file under `config/` is fine.
+
+An agent can propose an SVG through `propose_config_change`, since proposals
+carry text. A `.png` or `.ico` has to be committed by a human.
+
 ## Telegram
 
 | Key | Type | Default | Description |

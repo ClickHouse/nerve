@@ -964,6 +964,30 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok", "version": "0.1.0"}
 
+    # Favicon from the tracked config subtree (see config.workspace_favicon).
+    # No auth: a browser asks for this before anyone has logged in, so requiring
+    # a token would mean the login page never has an icon.
+    #
+    # Before the static mount for the same reason as /health, and the reason is
+    # not cosmetic here: the SPA catch-all answers every unmatched path with
+    # index.html, so /favicon.ico currently returns HTML with a 200 and the
+    # browser is left to make sense of markup it asked for an image.
+    #
+    # Registered whether or not the frontend has been built. The favicon is
+    # config, not build output, and an instance serving the API without a bundled
+    # UI can still be someone's browser tab.
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        from fastapi.responses import FileResponse, Response
+
+        from nerve.config import workspace_favicon
+
+        found = workspace_favicon(get_config().workspace)
+        if found is None:
+            return Response(status_code=404)
+        path, content_type = found
+        return FileResponse(str(path), media_type=content_type)
+
     # Serve static web UI files if built
     web_dist = Path(__file__).parent.parent.parent / "web" / "dist"
     if web_dist.exists():
