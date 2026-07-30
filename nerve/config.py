@@ -707,6 +707,7 @@ class SessionsConfig:
     memorize_interval_minutes: int = 30  # Background memorization sweep interval
     sticky_period_minutes: int = 120  # Reuse session if active within this window
     client_idle_timeout_minutes: int = 60  # Auto-disconnect clients idle longer than this (0 = disabled)
+    star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
 
     @classmethod
     def from_dict(cls, d: dict) -> SessionsConfig:
@@ -718,6 +719,7 @@ class SessionsConfig:
             memorize_interval_minutes=d.get("memorize_interval_minutes", 30),
             sticky_period_minutes=d.get("sticky_period_minutes", 120),
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
+            star_project_hook=bool(d.get("star_project_hook", False)),
         )
 
 
