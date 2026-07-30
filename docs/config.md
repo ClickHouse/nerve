@@ -1016,6 +1016,14 @@ asks for it before anyone logs in — so a `config/favicon.png` pointing at
 `/etc/shadow` would otherwise be readable by anyone who can reach the port. One
 pointing at another file under `config/` is fine.
 
+An SVG goes out under `Content-Security-Policy: default-src 'none'` — with
+`img-src data:` and `style-src 'unsafe-inline'` so ordinary icons still render —
+and every format gets `X-Content-Type-Options: nosniff`. Navigating straight to
+`/favicon.ico` makes an SVG a same-origin *document* rather than an image, and a
+`<script>` inside one would otherwise run there and could read the session token
+out of `localStorage`. Reviewing an icon for embedded script is not a reasonable
+thing to ask, so the policy does it instead.
+
 An agent can propose an SVG through `propose_config_change`, since proposals
 carry text. A `.png` or `.ico` has to be committed by a human.
 

@@ -324,6 +324,32 @@ _FAVICON_FILES: tuple[tuple[str, str], ...] = (
     ("favicon.ico", "image/x-icon"),
 )
 
+# Sent with the favicon, and the reason SVG can be on the list above.
+#
+# An SVG fetched through ``<link rel="icon">`` is an image and scripts in it do
+# not run, but the same URL *navigated to* is a same-origin document, and there
+# they do — the standard stored-XSS shape for uploaded SVG. The token this UI
+# authenticates with lives in ``localStorage``, so a script reaching that origin
+# reaches the session.
+#
+# What makes it worth a header rather than a note: an agent may propose a favicon
+# (SVG is text, so it fits through ``propose_config_change``), and the effect
+# classifier there judges by what a file causes the daemon to *run*, which is
+# nothing — so a reviewer is shown a graphic with no notice attached. Reviewing
+# an icon for embedded script is not a thing to ask of them.
+#
+# ``default-src 'none'`` stops script and every outbound request; ``img-src
+# data:`` keeps an embedded raster working, since design tools emit them; and
+# ``style-src 'unsafe-inline'`` keeps ordinary SVG styling working. ``nosniff``
+# is for the raster formats: it stops a ``favicon.png`` that is really HTML from
+# being re-interpreted as HTML.
+FAVICON_RESPONSE_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": (
+        "default-src 'none'; img-src data:; style-src 'unsafe-inline'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+}
+
 
 def workspace_favicon(workspace: Path) -> tuple[Path, str] | None:
     """The tracked favicon and its content type, or ``None`` if there is none.

