@@ -1192,4 +1192,3 @@ class TestSyncRoute:
         body = await route_mod.sync_workspace_route(user={})
         assert body["ok"] and body["changed"]
         assert applied == [tmp_path / "cfg"]
-
