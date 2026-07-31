@@ -22,14 +22,27 @@ def _locked_config(tmp_path, extra=""):
     The flag has to come from the workspace's tracked settings.yaml: `lockdown`
     in config.yaml is ignored by design, so setting it there would produce an
     unlocked instance and a test that passes for the wrong reason.
+
+    The workspace is a git repository with a remote for the same kind of reason.
+    A locked instance with nowhere to receive reviewed config from refuses to
+    start, so without one these would exercise that refusal instead of the
+    reload behaviour they are about. The remote is never contacted.
     """
+    import shutil
+    import subprocess
+
     from nerve.config import workspace_settings_file
 
+    if not shutil.which("git"):
+        pytest.skip("git not available")
     config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
     config_dir.mkdir(parents=True, exist_ok=True)
     (workspace / "config").mkdir(parents=True, exist_ok=True)
     (config_dir / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
     workspace_settings_file(workspace).write_text("lockdown: true\n" + extra, encoding="utf-8")
+    for args in (["init", "-q"],
+                 ["remote", "add", "origin", "https://example.invalid/config.git"]):
+        subprocess.run(["git", *args], cwd=str(workspace), check=True, capture_output=True)
     return config_dir
 
 

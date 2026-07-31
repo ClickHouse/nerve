@@ -908,6 +908,57 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         errors.append(f"[ERR] Workspace not found: {config.workspace}")
 
+    # Workspace sync. Two questions, because the answers come from different
+    # places: what the daemon's loop last did (retained in-process, so only the
+    # in-daemon /doctor sees it), and whether the reviewed files are clean right
+    # now (a git check any process can run, which is the one that matters from a
+    # shell — a blocked sync leaves the box pinned to an old revision with
+    # nothing but a log line to say so).
+    sync_cfg = getattr(config, "workspace_sync", None)
+    # Also when locked with the loop off: `nerve config sync` is still the only
+    # way config reaches that box, so a refusal is just as terminal there.
+    if sync_cfg is not None and (sync_cfg.enabled or config.lockdown):
+        try:
+            from nerve.sync_service import (
+                _describe_paths,
+                last_sync_state,
+                local_block_reasons,
+            )
+
+            state = last_sync_state()
+            if state is not None:
+                age = max(0, int(time.time() - state.checked_at))
+                if state.ok:
+                    lines.append(
+                        f"[OK] Workspace sync: applied "
+                        f"{state.applied_rev[:8] or '(unknown)'}, last checked "
+                        f"{age}s ago"
+                    )
+                else:
+                    # Covers the failures the local check below cannot see: a
+                    # dead remote, a diverged branch, an invalid bundle.
+                    warnings.append(
+                        f"[WARN] Workspace sync: last cycle ({age}s ago) failed "
+                        f"— {state.message}"
+                    )
+                for name, why in sorted(state.reload_errors.items()):
+                    warnings.append(
+                        f"[WARN] Workspace sync: {name} did not take the merged "
+                        f"config ({why}) — retried every cycle"
+                    )
+            blocking = local_block_reasons(config.workspace, config.lockdown)
+            if blocking:
+                warnings.append(
+                    f"[WARN] Workspace sync BLOCKED: the reviewed files have "
+                    f"local changes, so no merged config reaches this instance "
+                    f"— {_describe_paths(blocking)}. Commit them, discard them, "
+                    f"or re-propose them as a PR with propose_config_change"
+                )
+            else:
+                lines.append("[OK] Workspace sync: reviewed files clean")
+        except Exception as e:
+            warnings.append(f"[WARN] Workspace sync check failed: {e}")
+
     # Check proxy
     if config.proxy.enabled:
         binary = config.proxy.binary_path.expanduser()
@@ -1350,8 +1401,10 @@ def config_sync(
     """Pull the workspace from its git remote (the shared config repo).
 
     Fast-forward only. This moves the files; it does not tell a running daemon
-    about them. The daemon applies them on its next sync cycle, or immediately
-    via POST /api/config/sync.
+    about them. The daemon applies them on its next sync cycle, because that loop
+    compares what is on disk against the revision it last applied. For that to
+    happen sooner, run `nerve reload`: POST /api/config/sync would find nothing
+    left to merge and reload nothing.
     """
     from nerve.sync_service import sync_workspace
 

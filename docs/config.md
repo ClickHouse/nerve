@@ -207,9 +207,14 @@ A reload is always explicit. Two things cause one:
 - **`nerve reload`**, or `POST /api/config/reload` directly. Re-reads all three
   layers and reloads every reloadable subsystem at once. This is the one to use
   after editing a file on the box.
-- **A workspace sync that merged something.** Applies exactly the same set, so a
-  reviewed config PR takes effect on the instance without anyone logging in.
-  `workspace_sync.interval_minutes` (default 1) bounds how long that takes.
+- **A sync cycle that finds config this daemon is not running.** Applies exactly
+  the same set, so a reviewed config PR takes effect on the instance without
+  anyone logging in. `workspace_sync.interval_minutes` (default 1) bounds how long
+  that takes. The loop compares the revision on disk against the one it last
+  applied, not against what its own pull moved, so it also covers a HEAD that
+  moved out of band (`nerve config sync`, a bare `git pull` in the workspace) and
+  a previous cycle whose reload failed for one subsystem — that one is retried
+  every cycle until it takes.
 
 ### What a reload applies
 
@@ -307,6 +312,19 @@ failure gives `ok: false` on `/api/config/reload` and `ok: true, applied: false`
 `/api/config/sync`. **On the sync endpoint, read `applied`, not `ok`**, unless what
 you want to know is specifically whether the merge took.
 
+`applied: false` on its own does not say why, since a sync with nothing to merge
+reports it too. `status` is the field to branch on:
+
+| `status` | Meaning |
+|----------|---------|
+| `applied` | merged, and every subsystem took it |
+| `partial` | merged and the config loaded, but some subsystem did not take it (`reload_errors`) |
+| `not-applied` | merged, and the daemon could not load the merged config — nothing is in effect |
+| `up-to-date` | nothing to merge; this call applied nothing |
+
+It describes *this call*. Whether the daemon is running the revision currently on
+disk is a different question, answered by `GET /api/config/sync` below.
+
 ## Git-Backed Workspace Sync
 
 The workspace can be a git repository whose remote is a shared **config repo**.
@@ -358,6 +376,32 @@ push local edits; the failure message names the paths. So a skill the agent crea
 at runtime, or a locally edited `SOUL.md`, blocks the merge until it is committed or
 dropped. Files matched by `.gitignore` in there are warnings rather than refusals,
 since the shared repo can never carry them.
+
+**A blocked sync says so.** Left to a log line it is invisible: the instance keeps
+answering normally while every later config change stops arriving, indefinitely.
+So the first cycle that refuses sends a notification through the usual channels —
+naming the paths and what clears them — and only that first one, not one per
+cycle. Recovery sends a second, low-priority, when the merge goes through again.
+
+The state behind those is queryable rather than log-only. `nerve doctor` reports
+it, and `GET /api/config/sync` returns the daemon's record of the last cycle:
+
+```json
+{
+  "enabled": true, "checked": true, "ok": false,
+  "applied_rev": "a1b2c3d4...", "fetched_rev": "e5f6a7b8...",
+  "blocked": true, "blocked_paths": ["?? skills/backdoor/SKILL.md"],
+  "reload_errors": {}, "message": "fetched e5f6a7b8 but ...",
+  "checked_at": "2026-07-30T12:00:00+00:00"
+}
+```
+
+`applied_rev` is what this daemon has actually applied everywhere, which is not
+the same as what is checked out: a subsystem that refused the merged config, or a
+HEAD moved out of band, leaves the two different and the loop retries until they
+agree. `checked: false` means this process has no answer (sync off, or no cycle
+yet) rather than that all is well. `nerve doctor` runs the clean-tree check
+itself, so it answers from a shell where the daemon's own record is not visible.
 
 Sync validates more strictly than CI: an unset required `${VAR}` blocks the merge.
 CI has no secrets, so it reports those as info, but the daemon does have them, and a

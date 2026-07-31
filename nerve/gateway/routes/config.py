@@ -62,6 +62,13 @@ async def sync_workspace_route(user: dict = Depends(require_auth)):
     merged config loaded and only some later subsystem stumbled. That case is
     ``applied: false`` with the reason in ``reload_errors``. Callers who want
     "did everything apply" should read ``applied``.
+
+    ``applied`` alone cannot say *why* it is false: nothing needed merging and a
+    merge that no subsystem took both report false. ``status`` separates them —
+    ``applied``, ``partial``, ``not-applied``, ``up-to-date`` — so a script can
+    branch on the outcome rather than on the absence of one. It says what *this
+    call* did; whether the daemon is running the revision now on disk is
+    ``GET /api/config/sync``.
     """
     import asyncio
 
@@ -106,10 +113,19 @@ async def sync_workspace_route(user: dict = Depends(require_auth)):
     # still leaves the daemon only partly on the new config, so it keeps `ok` and
     # clears `applied` rather than being folded into either.
     apply_error = failures.get("config")
+    if not result.changed:
+        status = "up-to-date"
+    elif apply_error is not None:
+        status = "not-applied"
+    elif failures:
+        status = "partial"
+    else:
+        status = "applied"
     return {
         "ok": apply_error is None,
         "changed": result.changed,
         "applied": result.changed and not failures,
+        "status": status,
         "apply_error": apply_error,
         "reload": summary,
         "reload_errors": failures,
@@ -117,4 +133,51 @@ async def sync_workspace_route(user: dict = Depends(require_auth)):
         "old_rev": result.old_rev,
         "new_rev": result.new_rev,
         "warnings": result.validation_warnings,
+    }
+
+
+@router.get("/api/config/sync")
+async def sync_status_route(user: dict = Depends(require_auth)):
+    """What the periodic sync loop last did, and whether it is stuck.
+
+    The loop is the only thing that applies merged config on its own, and until
+    this endpoint existed its outcome went to the log and nowhere else — so an
+    instance that had been refusing to merge for a week answered every other
+    question exactly like a healthy one.
+
+    ``blocked_paths`` is the reviewed-surface local state that is making sync
+    refuse; while it is non-empty this instance is pinned to ``applied_rev`` and
+    no merged config reaches it. ``reload_errors`` names subsystems that did not
+    take the last applied config; those are retried every cycle.
+
+    ``checked: false`` means this process has no answer — sync is off, or the
+    loop has not completed a cycle yet — not that everything is fine.
+    """
+    from datetime import datetime, timezone
+
+    from nerve.config import get_config
+    from nerve.sync_service import last_sync_state
+
+    config = get_config()
+    state = last_sync_state()
+    body = {
+        "enabled": config.workspace_sync.enabled,
+        "interval_minutes": config.workspace_sync.interval_minutes,
+        "branch": config.workspace_sync.branch,
+        "checked": state is not None,
+    }
+    if state is None:
+        return body
+    return {
+        **body,
+        "ok": state.ok,
+        "applied_rev": state.applied_rev,
+        "fetched_rev": state.fetched_rev,
+        "blocked": bool(state.blocked_paths),
+        "blocked_paths": state.blocked_paths,
+        "reload_errors": state.reload_errors,
+        "message": state.message,
+        "checked_at": datetime.fromtimestamp(
+            state.checked_at, timezone.utc,
+        ).isoformat(),
     }
