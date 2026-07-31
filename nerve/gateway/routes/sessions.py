@@ -299,7 +299,12 @@ async def get_messages(session_id: str, limit: int = 500, user: dict = Depends(r
 
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
-    """Update session fields (title, starred)."""
+    """Update session fields (title, starred).
+
+    When ``sessions.star_project_hook`` is enabled (default off), a ``starred``
+    0<->1 transition fires a one-shot internal turn in that same session so the
+    agent can promote it to a project (create its Task card) or archive it.
+    """
     deps = get_deps()
     session = await deps.db.get_session(session_id)
     if not session:
@@ -311,8 +316,33 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
         fields["starred"] = 1 if req["starred"] else 0
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    old_starred = int(session.get("starred") or 0)
     await deps.db.update_session_fields(session_id, fields)
     updated = await deps.db.get_session(session_id)
+    # Star = opt-in project registration (sessions.star_project_hook, default
+    # off). On a starred transition fire a one-shot internal turn.
+    if (get_config().sessions.star_project_hook and "starred" in fields
+            and deps.engine and fields["starred"] != old_starred):
+        promoted = fields["starred"] == 1
+        trigger = (
+            "[system:star-promote] This session was just STARRED, which registers it as a "
+            "PROJECT. Per the multi-session protocol: create or refresh this project's Task card "
+            "(the umbrella for this session and its children), register it in the task-heartbeat "
+            "registry, then stop. Keep that card updated at the end of every future turn."
+            if promoted else
+            "[system:star-unpromote] This session was just UNSTARRED, so it is no longer a "
+            "project. Archive its project Task (keep the ## Updates audit trail) and deregister it "
+            "from the task-heartbeat registry, then stop."
+        )
+        try:
+            asyncio.create_task(
+                deps.engine.run(
+                    session_id=session_id, user_message=trigger,
+                    source="web", internal=True,
+                )
+            )
+        except Exception as e:  # a hook failure must never break the PATCH
+            logger.warning("star-project hook failed for %s: %s", session_id, e)
     return updated
 
 
