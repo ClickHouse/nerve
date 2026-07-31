@@ -1288,8 +1288,12 @@ def reload(ctx: click.Context) -> None:
         )
     except httpx.ConnectError:
         raise click.ClickException(
-            f"No daemon answering at {url} — nothing to reload. "
-            "A stopped daemon reads config fresh when it starts ('nerve start')."
+            f"No daemon answering at {url}, which is the address in the config "
+            "read here. If gateway.host, gateway.port or the SSL settings were "
+            "part of the edit, the running daemon is still bound to the old "
+            "address and only a restart moves it. Otherwise nothing is running, "
+            "and a stopped daemon reads config fresh when it starts "
+            "('nerve start')."
         ) from None
     except httpx.HTTPError as e:
         raise click.ClickException(f"Could not reach {url}: {e}") from None

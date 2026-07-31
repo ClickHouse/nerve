@@ -280,7 +280,7 @@ def _make_telegram_channel() -> TelegramChannel:
     cfg = NerveConfig()
     cfg.telegram.bot_token = "TEST:TOKEN"
     cfg.telegram.allowed_users = [1]
-    ch = TelegramChannel(cfg, router=MagicMock())
+    ch = TelegramChannel(lambda: cfg, router=MagicMock())
     # Bypass real PTB Application — only need send_document to exist.
     mock_app = MagicMock()
     mock_app.bot = MagicMock()

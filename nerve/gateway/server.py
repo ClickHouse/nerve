@@ -324,7 +324,9 @@ async def lifespan(app: FastAPI):
     telegram_channel = None
     if config.telegram.enabled and config.telegram.bot_token:
         from nerve.channels.telegram import TelegramChannel
-        telegram_channel = TelegramChannel(config, _engine.router)
+        # get_config, not the object read above: the channel resolves config per
+        # use so a reload reaches the reads that happen per update (dm_policy).
+        telegram_channel = TelegramChannel(get_config, _engine.router)
         telegram_channel.set_notification_service(notification_service)
         _engine.register_channel(telegram_channel)
         await telegram_channel.start()
@@ -398,7 +400,7 @@ async def lifespan(app: FastAPI):
             from nerve.workflows import init_review_loop_service
 
             _review_loop_service = init_review_loop_service(
-                config, db, _engine, _workflow_run_service,
+                get_config, db, _engine, _workflow_run_service,
             )
             if _review_loop_service is not None:
                 await _review_loop_service.start()

@@ -223,16 +223,18 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled. **`sync.codex` is not one of these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. **`sync.codex` is not one of these**; see the restart table |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | ✅ read per request |
+| Web gateway auth (`auth.*`) | ✅ read per request. Only the gateway's own auth: the MCP endpoint checks `/mcp/v1` against the `auth.jwt_secret` it was mounted with, so rotating that secret is half-hot (see the restart table) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
+| `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
+| `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
 
@@ -265,8 +267,11 @@ reload cannot inspect, and are documented here only.
 | `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing creates the new one. Change it and restart, rather than leaving sessions pointed somewhere that may not exist |
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
-| `telegram.*`, including `allowed_users` | the bot is running with the allow-list it was started with. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart |
-| `mcp_endpoint.*`, including the token check on `/mcp/v1` | fixed when the app was created. This is *not* the same code as the web gateway's auth above, which is hot |
+| `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
+| `mcp_endpoint.*` | fixed when the app was created |
+| `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
+| `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
+| `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
 | Turning `ollama.enabled` **on** while the proxy is not already running | Ollama routes through the proxy as its translation layer, and that process only starts at startup. With the proxy already up, this is read per use and follows a reload |
 | Turning `workspace_sync.enabled` or `retention.enabled` **on** | their loops are only created at startup, so there is nothing running to see the flag change. Turning either **off** is hot |

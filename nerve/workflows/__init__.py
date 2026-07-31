@@ -12,7 +12,7 @@ reached from tool handlers / REST routes via :func:`get_workflow_run_service`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -55,14 +55,21 @@ _review_loop_service = None
 
 
 def init_review_loop_service(
-    config: NerveConfig, db: Database, engine: AgentEngine, runs,
+    config: Callable[[], NerveConfig], db: Database, engine: AgentEngine, runs,
 ):
     """Initialise the review-loop singleton. Requires a live
     WorkflowRunService (legs are workflow runs). Returns None when the
-    feature (or workflow runs) is disabled."""
+    feature (or workflow runs) is disabled.
+
+    ``config`` is a callable, not the object: the service reads it per use so
+    its budgets and caps follow a reload (see
+    :attr:`~nerve.workflows.review_loop.ReviewLoopService.rl`). The two flags
+    below are read once here, which is exactly why they stay restart-only —
+    with the feature off there is no service for a later reload to reach."""
     global _review_loop_service
-    if runs is None or not config.workflows.enabled \
-            or not config.workflows.review_loop.enabled:
+    settings = config()
+    if runs is None or not settings.workflows.enabled \
+            or not settings.workflows.review_loop.enabled:
         _review_loop_service = None
         return None
     from nerve.workflows.review_loop import ReviewLoopService as _RL

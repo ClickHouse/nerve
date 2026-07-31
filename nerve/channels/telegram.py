@@ -21,7 +21,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -439,11 +439,13 @@ class TelegramChannel(BaseChannel):
     Delegates session management and agent execution to the ChannelRouter.
     """
 
-    def __init__(self, config: NerveConfig, router: ChannelRouter):
-        self.config = config
+    def __init__(
+        self, config: Callable[[], NerveConfig], router: ChannelRouter,
+    ):
+        self._config = config
         self.router = router
         self._app: Application | None = None
-        self._allowed_users: set[int] = set(config.telegram.allowed_users)
+        self._allowed_users: set[int] = set(self.config.telegram.allowed_users)
         self._notification_service = None  # Set after service is created
         self._watchdog_task: asyncio.Task | None = None
         self._stopping = False
@@ -462,6 +464,21 @@ class TelegramChannel(BaseChannel):
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
         self._notification_service = service
+
+    @property
+    def config(self) -> NerveConfig:
+        """The live config, resolved per read rather than captured.
+
+        The bot outlives every reload, and ``dm_policy`` decides on each update
+        whether a stranger may talk to the agent. Holding the start-up object
+        meant a reload that tightened ``open`` to ``pairing`` reported success
+        and authorized everyone until the daemon was restarted.
+
+        Only the reads that happen per use follow from this. The bot token was
+        handed to the Application at build time and ``allowed_users`` was copied
+        into a set, so both still need a restart.
+        """
+        return self._config()
 
     @property
     def name(self) -> str:

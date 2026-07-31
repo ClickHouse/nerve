@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +12,13 @@ import pytest
 import pytest_asyncio
 
 import nerve.sources.registry as registry
-from nerve.config_reload import reload_all, reload_failures
+from nerve.config_reload import (
+    _RESTART_ONLY_PATHS,
+    _UNSET,
+    _dotted_attr,
+    reload_all,
+    reload_failures,
+)
 from nerve.cron.service import CronService
 
 
@@ -181,6 +190,165 @@ class TestSourceReloadScope:
         after = [r.job_id for r in build_source_runners(on, db=None)]
         assert after == before  # turning it on changes nothing here
         assert "source:codex" not in after
+
+
+_DOC = Path(__file__).resolve().parents[1] / "docs" / "config.md"
+
+# A backticked token that could be a config path: lowercase segments, and a
+# trailing ``.*`` for a whole section. Rules out "/mcp/v1" and "origins[*]".
+_PATH_TOKEN = re.compile(r"[a-z_][a-z0-9_]*(\.[a-z0-9_]+)*(\.\*)?$")
+
+
+def _restart_table_paths() -> list[str]:
+    """The config paths in the "What still needs a restart" table of docs/config.md.
+
+    Read out of the document, never off the tuple under test: a check sourced
+    from the code it checks agrees with itself whatever the operator was
+    promised, which is how six unconditional rows came to be documented as
+    reported and reported by nothing.
+
+    A cell mixes paths with prose, so a backticked token counts as a path only
+    when its first segment is a field of ``NerveConfig``. That drops the
+    parentheticals naming a field of some sub-object ("`enabled`",
+    "`store_encrypted_reasoning`") along with the prose, and the leading-dot
+    shorthand ("`gateway.host`, `.port`") is resolved against the section of the
+    token before it.
+    """
+    from nerve.config import NerveConfig
+
+    body = _DOC.read_text(encoding="utf-8")
+    section = body.split("### What still needs a restart", 1)[1].split("\n### ", 1)[0]
+    roots = {f.name for f in dataclasses.fields(NerveConfig)}
+    paths: list[str] = []
+    for line in section.splitlines():
+        if not line.startswith("|"):
+            continue
+        cell, root = line.split("|")[1], ""
+        for token in re.findall(r"`([^`]+)`", cell):
+            if token.startswith("."):
+                token = root + token
+            if not _PATH_TOKEN.fullmatch(token):
+                continue
+            head = token.split(".")[0]
+            if head not in roots:
+                continue
+            root = head
+            paths.append(token)
+    return paths
+
+
+def _leaf_paths(obj, prefix: str) -> list[str]:
+    """Every settable path under *obj*, descending into nested config sections."""
+    leaves: list[str] = []
+    for f in dataclasses.fields(obj):
+        value, child = getattr(obj, f.name), f"{prefix}.{f.name}"
+        if dataclasses.is_dataclass(value):
+            leaves.extend(_leaf_paths(value, child))
+        else:
+            leaves.append(child)
+    return leaves
+
+
+def _compared(path: str) -> bool:
+    """True when some entry in the tuple compares *path* — itself, or its section."""
+    return any(
+        path == entry or path.startswith(f"{entry}.")
+        for entry in _RESTART_ONLY_PATHS
+    )
+
+
+class TestRestartTableCoverage:
+    """The table promises "the check covers the unconditional entries below".
+
+    A row with no entry in ``_RESTART_ONLY_PATHS`` is that promise broken: the
+    reload reports nothing, the operator reads `ok`, and the daemon keeps the
+    old value. A dead entry is the same failure from the other side — one that
+    resolves to nothing can never fire, which is what `langfuse.enabled` did for
+    as long as it was listed.
+    """
+
+    # Rows the check cannot decide by comparing two values, with the reason.
+    EXEMPT = {
+        "ollama.enabled": "conditional: only while the proxy is not running",
+        "workspace_sync.enabled": "conditional: only turning it on",
+        "retention.enabled": "conditional: only turning it on",
+    }
+
+    def test_every_documented_setting_is_compared(self):
+        from nerve.config import NerveConfig
+
+        defaults = NerveConfig()
+        documented = _restart_table_paths()
+        assert len(documented) >= 20, (
+            f"the table walk found only {len(documented)} paths — did it break?"
+        )
+
+        uncovered = []
+        for path in documented:
+            if path in self.EXEMPT:
+                continue
+            if path.endswith(".*"):
+                section = path[:-2]
+                node = _dotted_attr(defaults, section)
+                assert node is not _UNSET, f"{path} names nothing in the config"
+                candidates = _leaf_paths(node, section)
+            else:
+                candidates = [path]
+            uncovered.extend(p for p in candidates if not _compared(p))
+
+        assert not uncovered, (
+            "settings the restart table says a reload reports, that "
+            "_RESTART_ONLY_PATHS does not compare — add the path (or the "
+            "section holding it), or exempt the row here with the reason:\n"
+            + "\n".join(sorted(set(uncovered)))
+        )
+
+    def test_every_compared_setting_is_documented(self):
+        undocumented = []
+        for entry in _RESTART_ONLY_PATHS:
+            if not any(
+                entry == doc
+                or entry.startswith(f"{doc}.")
+                or (doc.endswith(".*") and (
+                    entry == doc[:-2] or entry.startswith(doc[:-1])
+                ))
+                for doc in _restart_table_paths()
+            ):
+                undocumented.append(entry)
+        assert not undocumented, (
+            "_RESTART_ONLY_PATHS entries with no row in the restart table of "
+            "docs/config.md — the warning fires and the operator has nothing to "
+            "read about it:\n" + "\n".join(undocumented)
+        )
+
+    def test_every_compared_setting_exists(self):
+        """A path that resolves to nothing is skipped in silence, forever.
+
+        ``restart_required`` treats a missing attribute as "not comparable" —
+        it has to, since the two configs can be of different vintages — so a
+        renamed or misspelled entry does not fail anything at runtime. It just
+        stops reporting.
+        """
+        from nerve.config import NerveConfig
+
+        defaults = NerveConfig()
+        missing = [
+            path for path in _RESTART_ONLY_PATHS
+            if _dotted_attr(defaults, path) is _UNSET
+        ]
+        assert not missing, (
+            "_RESTART_ONLY_PATHS entries that are not settings of the config "
+            "(renamed? misspelled? never existed?):\n" + "\n".join(missing)
+        )
+
+    def test_the_exemptions_still_name_rows_in_the_table(self):
+        """An exemption for a row that is gone hides the next one like it."""
+        documented = set(_restart_table_paths())
+        stale = sorted(set(self.EXEMPT) - documented)
+        assert not stale, (
+            "exemptions above that no longer match a row of the restart "
+            "table:\n" + "\n".join(stale)
+        )
 
 
 class TestReloadFailures:
@@ -493,6 +661,110 @@ class TestConfigObjectIsReplaced:
         assert summary["config"] == "reloaded"  # the load itself was fine
         assert "services" in reload_failures(summary)
         assert "cron service" in summary["services"]
+
+
+class TestTighteningActuallyTightens:
+    """Reporting a change is not applying it.
+
+    Everything in ``_RESTART_ONLY_PATHS`` is a setting the daemon keeps running
+    without — acceptable for a bound socket, and not for a policy the operator
+    just tightened, where the reload answers `ok` and the old, looser value
+    keeps deciding. The two below hold their config through a callable for that
+    reason, so they are not in the tuple: there is nothing left to warn about.
+    """
+
+    @pytest.mark.asyncio
+    async def test_telegram_dm_policy_follows_a_reload(self, tmp_path, monkeypatch):
+        """`open` authorizes every Telegram user there is. Closing it used to
+        take a restart, with the reload reporting success in the meantime."""
+        import nerve.config as cfgmod
+        from nerve.channels.telegram import TelegramChannel
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws, "telegram:\n  dm_policy: open\n")
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+        channel = TelegramChannel(cfgmod.get_config, router=MagicMock())
+        assert channel._is_authorized(99999) is True
+
+        _write_config(config_dir, ws, "telegram:\n  dm_policy: pairing\n")
+        summary = await reload_all(None, None, config_dir)
+
+        assert channel._is_authorized(99999) is False
+        # Applied, so it is not something to warn about either.
+        assert "dm_policy" not in summary.get("restart_required", "")
+
+    @pytest.mark.asyncio
+    async def test_the_telegram_allow_list_still_needs_a_restart(
+        self, tmp_path, monkeypatch,
+    ):
+        """The other half of the same channel, and the restart table says so:
+        the bot copied ``allowed_users`` into a set when it was built, so the
+        live config reaches ``dm_policy`` and stops there."""
+        import nerve.config as cfgmod
+        from nerve.channels.telegram import TelegramChannel
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws, "telegram:\n  allowed_users: [1]\n")
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+        channel = TelegramChannel(cfgmod.get_config, router=MagicMock())
+
+        _write_config(config_dir, ws, "telegram:\n  allowed_users: [1, 2]\n")
+        summary = await reload_all(None, None, config_dir)
+
+        assert channel._is_authorized(2) is False
+        assert "telegram.allowed_users" in summary["restart_required"]
+
+    @pytest.mark.asyncio
+    async def test_review_loop_budgets_follow_a_reload(self, tmp_path, monkeypatch):
+        """The service is a lifespan singleton that captured
+        ``config.workflows.review_loop`` — a sub-object, so re-pointing its
+        ``config`` would not have been enough. It reads the ceiling at the
+        moment a leg is funded, which is where a lowered budget has to arrive.
+        """
+        import nerve.config as cfgmod
+        from nerve.workflows.review_loop import ReviewLoopService
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws, (
+            "workflows:\n  review_loop:\n    default_budget_usd: 10.0\n"
+            "    max_iterations: 5\n"
+        ))
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+        service = ReviewLoopService(cfgmod.get_config, db=None, engine=None, runs=None)
+        assert service.rl.default_budget_usd == 10.0
+
+        _write_config(config_dir, ws, (
+            "workflows:\n  review_loop:\n    default_budget_usd: 2.5\n"
+            "    max_iterations: 2\n"
+        ))
+        await reload_all(None, None, config_dir)
+
+        assert service.rl.default_budget_usd == 2.5
+        assert service.rl.max_iterations == 2
+        assert service.config is cfgmod.get_config()
+
+    @pytest.mark.asyncio
+    async def test_a_rotated_secret_is_reported_without_its_value(
+        self, tmp_path, monkeypatch,
+    ):
+        """The summary goes into the log and back over HTTP. Reporting that the
+        secret needs a restart must not be a second copy of the secret."""
+        import nerve.config as cfgmod
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws, "auth:\n  jwt_secret: old-secret\n")
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+
+        _write_config(config_dir, ws, "auth:\n  jwt_secret: new-secret\n")
+        summary = await reload_all(None, None, config_dir)
+
+        assert "auth.jwt_secret" in summary["restart_required"]
+        assert "old-secret" not in summary["restart_required"]
+        assert "new-secret" not in summary["restart_required"]
 
 
 class TestReloadRoute:

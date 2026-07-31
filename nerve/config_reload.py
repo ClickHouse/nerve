@@ -14,23 +14,31 @@ Nothing reloads on its own. A reload happens when an operator asks for one
 change. Editing a config file on the box does not apply itself.
 
 Restart-only (NOT reloaded here): the gateway socket (host/port/SSL), the
-Telegram bot, the MCP endpoint's own authentication, Langfuse, the Codex
-thread-sync service (``sync.codex.*`` — a different service from the cron
-sources under ``sync.*``, and the one place those two names diverge), anything a
-service derived from config at construction, and a background loop that was
-never started because its feature was off. The hot-reload table in
-``docs/config.md`` is the operator-facing list of exactly what a reload covers;
-keep the two in step.
+Telegram bot's token and allow-list, the MCP endpoint (including the
+``auth.jwt_secret`` it checks ``/mcp/v1`` against, which the web gateway reads
+per request), Langfuse, the memory bridges, the Codex thread-sync service
+(``sync.codex.*`` — a different service from the cron sources under ``sync.*``,
+and the one place those two names diverge), anything a service derived from
+config at construction, and a background loop that was never started because its
+feature was off. The hot-reload table in ``docs/config.md`` is the
+operator-facing list of exactly what a reload covers; keep the two in step.
 
 :func:`restart_required` diffs the old and new config over
 :data:`_RESTART_ONLY_PATHS` and records what changed in the summary. Without it
 the summary reports only what was applied, which a caller cannot distinguish from
 "nothing needed applying". ``gateway.host``/``port`` are the case that matters:
 they live in the tracked settings, so the change can arrive by workspace sync.
+
+It reports; it does not gate. A setting whose only protection is a line in that
+report is a setting the daemon is not applying — which is tolerable for a bound
+socket and not for a policy that was tightened. Where the holder can resolve
+config per read instead, that is the fix, and the path leaves this list: see
+:func:`_repoint`.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -43,31 +51,62 @@ logger = logging.getLogger(__name__)
 _ERROR_PREFIX = "error: "
 
 # Config paths a reload cannot apply. Mirrors the "What still needs a restart"
-# table in ``docs/config.md``; keep the two in step.
+# table in ``docs/config.md``; keep the two in step. That table says the check
+# covers every unconditional entry in it, so a row without an entry here is a
+# promise the daemon does not keep —
+# ``tests/test_config_reload.py::TestRestartTableCoverage`` reads the table and
+# fails on the difference.
 #
 # Only the entries this function can decide by comparing two values. The
 # conditional ones in that table ("turning X on", "adding the first target", "a
 # session already running") depend on runtime state not available here, and
 # reporting them unconditionally would mean false alarms on every reload.
+#
+# A path may name a whole section (``proxy``) rather than its fields: where
+# everything under a section is restart-only and there is nothing useful to say
+# about which field moved, the section compares in one entry and keeps covering
+# it when a field is added later. Where only part of a section is restart-only,
+# or the individual values are what an operator needs to read, the entry names
+# the field.
 _RESTART_ONLY_PATHS = (
+    "agent.max_concurrent",
+    "auth.jwt_secret",
+    "codex.home_dir",
+    "external_agents.enabled",
     "gateway.host",
     "gateway.port",
     "gateway.ssl.cert",
     "gateway.ssl.key",
-    "timezone",
-    "workspace",
-    "agent.max_concurrent",
-    "codex.home_dir",
-    "langfuse.enabled",
     "langfuse.host",
+    "langfuse.public_key",
+    "langfuse.redact_patterns",
+    "langfuse.secret_key",
     "mcp_endpoint.enabled",
+    "mcp_endpoint.include_hoa",
     "mcp_endpoint.path",
-    "proxy.enabled",
-    "proxy.port",
-    "telegram.enabled",
-    "telegram.bot_token",
+    "memory",
+    "proxy",
+    "sync.codex",
     "telegram.allowed_users",
+    "telegram.bot_token",
+    "telegram.enabled",
+    "timezone",
+    "workflows.enabled",
+    "workflows.poll_interval_seconds",
+    "workflows.review_loop.enabled",
+    "workflows.review_loop.reconcile_interval_seconds",
+    "workspace",
+    "xmemory",
 )
+
+# Paths whose value the summary must not carry. It is logged and returned over
+# HTTP, so a secret printed here is a secret in the log file as well.
+_SECRET_PATHS = frozenset({
+    "auth.jwt_secret",
+    "langfuse.public_key",
+    "langfuse.secret_key",
+    "telegram.bot_token",
+})
 
 _UNSET = object()
 
@@ -86,6 +125,19 @@ def _dotted_attr(obj, dotted: str):
     return node
 
 
+def _describe(path: str, before, after) -> str:
+    """One summary line for a changed path.
+
+    The values are what make the warning actionable — "8900 → 9100" says which
+    edit is waiting on the restart — so they are shown except where they cannot
+    be: a secret, and a whole section, whose repr is both unreadable and liable
+    to hold one (``proxy`` carries the local proxy's API key).
+    """
+    if path in _SECRET_PATHS or dataclasses.is_dataclass(before):
+        return f"{path}: changed"
+    return f"{path}: {before!r} → {after!r}"
+
+
 def restart_required(old_config, new_config) -> list[str]:
     """Dotted paths that changed but cannot take effect until a restart.
 
@@ -101,7 +153,7 @@ def restart_required(old_config, new_config) -> list[str]:
         if before is _UNSET or after is _UNSET:
             continue
         if before != after:
-            changed.append(f"{path}: {before!r} → {after!r}")
+            changed.append(_describe(path, before, after))
     return changed
 
 
@@ -187,9 +239,9 @@ def _repoint(new_config, engine, cron_service) -> list[str]:
         hand_over("agent engine", engine)
         # Every notification setting is read at send time, so re-pointing the
         # service is all it takes for channels, expiry and quiet hours to follow
-        # a reload. The Telegram *channel* is deliberately not re-pointed — it
-        # cached its allow-list when the bot was built — so inbound Telegram
-        # authorization stays on the start-up value until a restart.
+        # a reload. The Telegram *channel* is not here because it needs nothing:
+        # it resolves config through a callable. Its allow-list is still
+        # restart-only, cached as a set when the bot was built.
         hand_over(
             "notification service", getattr(engine, "notification_service", None),
         )

@@ -145,6 +145,25 @@ class TestReloadCommand:
         assert "No daemon answering" in result.output
         assert "Traceback" not in result.output
 
+    def test_a_changed_port_is_offered_as_the_likelier_cause(
+        self, tmp_path, monkeypatch,
+    ):
+        """The URL is built from the config just read, so editing gateway.port is
+        itself a way to get here: the daemon is running fine on the old port and
+        this call goes to the new one. Telling the operator to start a daemon
+        that is already running sends them the wrong way.
+        """
+        def refuse(url, **_kw):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(httpx, "post", refuse)
+        config = _config(tmp_path, "gateway:\n  port: 9100\n")
+        result = CliRunner().invoke(main, ["-c", str(config), "reload"])
+        assert result.exit_code != 0
+        assert "9100" in result.output
+        assert "gateway.port" in result.output
+        assert "restart" in result.output
+
     def test_rejected_token_explains_the_likely_cause(self, tmp_path, monkeypatch):
         monkeypatch.setattr(httpx, "post", _post(status_code=401, text="nope"))
         result = CliRunner().invoke(main, ["-c", str(_config(tmp_path)), "reload"])
