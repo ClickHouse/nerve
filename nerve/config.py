@@ -1023,7 +1023,7 @@ class SessionsConfig:
             memorize_interval_minutes=d.get("memorize_interval_minutes", 30),
             sticky_period_minutes=d.get("sticky_period_minutes", 120),
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
-            star_project_hook=bool(d.get("star_project_hook", False)),
+            star_project_hook=d.get("star_project_hook", False),
         )
 
 
