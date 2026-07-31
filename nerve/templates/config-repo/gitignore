@@ -2,7 +2,13 @@
 # Secrets are referenced from settings.yaml via ${ENV_VAR} and supplied by the
 # environment; nothing sensitive should ever be committed here.
 
-# Machine-local overrides / secrets
+# Machine-local overrides / secrets. `/config.yaml` is anchored to the repo root
+# so it only covers the machine-local layer, not a `config/config.yaml` someone
+# adds under the tracked subtree. It is here because migration writes that file:
+# splitting a legacy monolith leaves the per-machine half — TLS paths, an AWS
+# profile, mail accounts — in `config.yaml` beside the settings it just published,
+# and the runbook's own next step is `git add -A`.
+/config.yaml
 config.local.yaml
 .env
 .env.*

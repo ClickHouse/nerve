@@ -100,6 +100,32 @@ class TestScaffold:
         assert "config.local.yaml" in body
         assert "*.migrated" in body
 
+    def test_the_machine_local_layer_is_ignored_at_the_root_only(self, tmp_path):
+        """Migration writes `config.yaml`, and the runbook then says `git add -A`.
+
+        Asked of git rather than of the file's text, because the whole point is
+        the leading slash: `config.yaml` unanchored would also swallow a
+        `config/config.yaml` inside the tracked subtree, which is reviewed
+        content and has to stay committable.
+        """
+        import shutil
+        import subprocess
+
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+        scaffold_config_repo(tmp_path)
+        subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+
+        def ignored(rel: str) -> bool:
+            return subprocess.run(
+                ["git", "check-ignore", "-q", rel], cwd=str(tmp_path),
+            ).returncode == 0
+
+        assert ignored("config.yaml"), "the machine-local layer must not be staged"
+        assert not ignored("config/config.yaml"), "tracked config must stay committable"
+        assert not ignored("config/settings.yaml")
+
     def test_gitignore_covers_backup_secret_members(self, tmp_path):
         # If the workspace doubles as the state dir, `git add -A` (which the
         # runbook tells operators to run) must not sweep up nerve's credentials.
