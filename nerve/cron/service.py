@@ -544,20 +544,91 @@ class CronService:
             "rejected": rejected,
         }
 
-    def _schedule_source_runners(self, runners: list) -> None:
-        """Schedule already-built source runners (wiring notifications)."""
+    def _source_schedule(self, runner) -> str | None:
+        """The configured schedule for *runner*, or ``None`` if it has no config.
+
+        Source names can be compound (e.g. "gmail:account@email.com"). The
+        config key is the base type before the colon.
+        """
+        config_key = runner.source.source_name.split(":")[0]
+        source_config = getattr(self.config.sync, config_key, None)
+        if source_config is None:
+            return None
+        return getattr(source_config, "schedule", "*/15 * * * *")
+
+    def _plan_source_runners(
+        self, runners: list,
+    ) -> list[tuple["SourceRunner", CronTrigger | IntervalTrigger, str]]:
+        """Pair every runner with the trigger it is to be scheduled on.
+
+        The planning half of a source reload: nothing here touches the
+        scheduler, and anything that cannot be scheduled raises before the
+        caller has removed the running jobs.
+        :meth:`_schedule_source_runners` is the start-up counterpart, which
+        skips what this refuses.
+
+        Stricter than start-up on both counts. An interval string naming no
+        usable interval (``hourly``, ``@daily``) raises instead of taking
+        :func:`_parse_interval`'s 2h default: at boot a conservative cadence
+        beats a source that never runs, but on a reload it moves a source off
+        the cadence the operator wrote while the response reports success. A
+        runner whose source has no config section is dropped here rather than
+        at the scheduler, so the response can be built from what was scheduled.
+
+        Raises :class:`InvalidScheduleError`, naming the source.
+        """
+        planned: list[tuple[SourceRunner, CronTrigger | IntervalTrigger, str]] = []
         for runner in runners:
+            schedule_str = self._source_schedule(runner)
+            if schedule_str is None:
+                continue
+            source_name = runner.source.source_name
+            try:
+                trigger = _crontab_to_trigger(schedule_str, timezone=self.timezone)
+            except NotCrontabError:
+                seconds = _interval_seconds(schedule_str)
+                if seconds is None:
+                    raise InvalidScheduleError(
+                        f"Source '{source_name}': schedule {schedule_str!r} is "
+                        "neither a crontab expression nor an interval",
+                    ) from None
+                trigger = IntervalTrigger(seconds=seconds, timezone=self.timezone)
+            except InvalidScheduleError as e:
+                raise InvalidScheduleError(f"Source '{source_name}': {e}") from e
+            planned.append((runner, trigger, schedule_str))
+        return planned
+
+    def _apply_source_runners(self, planned: list) -> None:
+        """Put planned runner/trigger pairs on the scheduler (wiring
+        notifications). No parsing, so nothing here can fail half-way."""
+        for runner, trigger, schedule_str in planned:
             if self.notification_service is not None:
                 runner.set_notification_service(self.notification_service)
             source_name = runner.source.source_name
-            # Source names can be compound (e.g. "gmail:account@email.com").
-            # The config key is the base type before the colon.
-            config_key = source_name.split(":")[0]
-            source_config = getattr(self.config.sync, config_key, None)
-            if source_config is None:
-                continue
-            schedule_str = getattr(source_config, "schedule", "*/15 * * * *")
+            self.scheduler.add_job(
+                self._run_source_wrapper,
+                trigger,
+                args=[runner],
+                id=runner.job_id,
+                name=f"Source: {source_name}",
+                replace_existing=True,
+            )
+            logger.info("Scheduled source: %s (%s)", source_name, schedule_str)
 
+    def _schedule_source_runners(self, runners: list) -> None:
+        """Schedule already-built source runners, skipping the unschedulable.
+
+        The start-up path, deliberately lenient: one source with a typo in its
+        schedule must not cost the daemon the others, and an interval string the
+        parser cannot use falls back to 2h rather than leaving the source
+        unscheduled. A reload plans first and refuses the whole change instead
+        (:meth:`_plan_source_runners`).
+        """
+        planned = []
+        for runner in runners:
+            schedule_str = self._source_schedule(runner)
+            if schedule_str is None:
+                continue
             try:
                 trigger = _crontab_to_trigger(schedule_str, timezone=self.timezone)
             except NotCrontabError:
@@ -570,19 +641,12 @@ class CronService:
                 # "failed to register source runners" warning naming the wrong
                 # problem.
                 logger.error(
-                    "Source '%s' will not be scheduled: %s", source_name, e,
+                    "Source '%s' will not be scheduled: %s",
+                    runner.source.source_name, e,
                 )
                 continue
-
-            self.scheduler.add_job(
-                self._run_source_wrapper,
-                trigger,
-                args=[runner],
-                id=runner.job_id,
-                name=f"Source: {source_name}",
-                replace_existing=True,
-            )
-            logger.info("Scheduled source: %s (%s)", source_name, schedule_str)
+            planned.append((runner, trigger, schedule_str))
+        self._apply_source_runners(planned)
 
     def _register_source_runners(self) -> None:
         """Build + schedule source runners at startup. Swallows errors so a bad
@@ -599,9 +663,17 @@ class CronService:
         """Rebuild source runners from config and reschedule them without a
         restart (picks up added/removed sources and schedule changes).
 
-        Builds the new runners BEFORE unscheduling the old ones, so a build
-        failure raises (surfaced by the caller) with the running sources intact —
-        never a silent drop.
+        All-or-nothing, like :meth:`reload`. Building the runners and planning
+        every trigger both happen before a single job is removed, so a build
+        failure or a schedule the scheduler will not take raises with the
+        running sources exactly as they were. Removing first and parsing the new
+        schedules afterwards is how a working ``*/15`` came to be destroyed by
+        the typo meant to replace it, with the source still named under
+        ``sources`` and the reload answering ``ok``.
+
+        The returned ``sources`` are the runners that are on the scheduler, not
+        the ones that were built: those are the same list only when nothing was
+        dropped, and the case where they differ is the one a caller needs told.
 
         Runners schedule under ``source:<name>``, and the whole ``source:``
         namespace is refused to cron jobs when they are loaded, so the
@@ -615,14 +687,18 @@ class CronService:
         from nerve.sources.registry import build_source_runners
 
         async with self._reload_lock:
+            # -- Plan: everything that can fail, before anything is applied ----
             new_runners = build_source_runners(self.config, self.db)  # may raise → caller reports
+            planned = self._plan_source_runners(new_runners)
+
+            # -- Apply: scheduler bookkeeping only -----------------------------
             old_ids = {r.job_id for r in self._source_runners}
             for jid in old_ids:
                 if self.scheduler.get_job(jid) is not None:
                     self.scheduler.remove_job(jid)
             self._source_runners = new_runners
-            self._schedule_source_runners(new_runners)
-            new_ids = {r.job_id for r in new_runners}
+            self._apply_source_runners(planned)
+            new_ids = {runner.job_id for runner, _, _ in planned}
             return {
                 "sources": sorted(new_ids),
                 "removed": sorted(old_ids - new_ids),
