@@ -273,6 +273,11 @@ it.
 
 ### Before you turn it on
 
+**Clone the config repo as the workspace first.** A locked instance takes config
+changes only as a merged commit that sync pulls in, so a workspace with no git
+remote has nowhere to receive one from and refuses to start. `git remote -v` in the
+workspace is the check.
+
 **Move any required secrets into the environment first.** `config.local.yaml` is
 ignored when locked, so a secret that lives only there stops being read, and the
 feature depending on it breaks on the next restart. Supply each one as `${ENV_VAR}`
@@ -377,6 +382,16 @@ Two things to know about `NERVE_LOCKDOWN`:
   `skills/` on the next reload however it got there. The refusal names the PR flow,
   so a capable agent routes to it instead of retrying. Writes elsewhere (memory,
   task files, scratch files) are unaffected. `Bash` is not covered; see below.
+- **The workspace must be a git repository with a remote.** Every local change to
+  the reviewed surface is refused, so a merged commit that sync pulls in is the only
+  way a config change can arrive. A workspace that is not a repository, or is one
+  with no remote, has no route at all: the instance would keep the configuration it
+  happens to hold, and nothing would report it. A locked instance without one
+  refuses to start rather than running unlocked — removing a remote is a
+  machine-local change, and a machine-local change does not unlock a box. Any remote
+  counts, and `workspace_sync.enabled: false` is not part of this: sync follows the
+  branch's own upstream when `workspace_sync.branch` is unset, and `nerve config
+  sync` is a manual route that works with the periodic loop off.
 - **The reviewed subtrees must really be in the workspace.** `<workspace>/config`
   and `<workspace>/skills` have to resolve inside `<workspace>`, and each has to be
   a real directory rather than a symlink. If one is a symlink out, nothing under it
@@ -417,7 +432,10 @@ Two things to know about `NERVE_LOCKDOWN`:
 Run `nerve config validate --workspace .` before merging; it validates the locked
 view when `lockdown: true`, which is where the checks above are decided. It also
 names the machine-local keys the bundle strands, so a key that quietly falls back
-to its default on every locked box is visible in the PR rather than at boot.
+to its default on every locked box is visible in the PR rather than at boot. The
+remote check is the one that judges the checkout the command runs in rather than
+the bundle: `actions/checkout` sets `origin`, but a run against an unpacked
+tarball reports it missing.
 
 **If the flag comes from the environment, add `--assume-lockdown` in CI.** With
 `lockdown: ${NERVE_LOCKDOWN:-false}` the validator resolves false wherever the

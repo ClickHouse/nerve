@@ -22,11 +22,32 @@ from nerve.config import (
 )
 
 
+def _repo(ws: Path, *, remote: str | None = "origin") -> Path:
+    """Make ``ws`` what a locked workspace is on a real box: a git repository
+    with a remote to receive reviewed config from.
+
+    A locked instance with nowhere to receive it from refuses to start — see
+    :class:`TestLockdownNeedsSomewhereToReceiveConfigFrom` — so every locked
+    workspace here that is expected to load has one. The remote is never
+    contacted; the check asks whether one is configured. ``remote=None`` leaves
+    the repository without one.
+    """
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    runs = [["init", "-q"]]
+    if remote:
+        runs.append(["remote", "add", remote, "https://example.invalid/config.git"])
+    for args in runs:
+        subprocess.run(["git", *args], cwd=str(ws), check=True, capture_output=True)
+    return ws
+
+
 def _install(tmp_path, *, settings="", base="", local=""):
     config_dir = tmp_path / "cfg"
     workspace = tmp_path / "ws"
     config_dir.mkdir(parents=True)
     (workspace / "config").mkdir(parents=True)
+    _repo(workspace)
     (config_dir / "config.yaml").write_text(f"workspace: {workspace}\n" + base, encoding="utf-8")
     if local:
         (config_dir / "config.local.yaml").write_text(local, encoding="utf-8")
@@ -565,6 +586,7 @@ class TestLockdownTrackedSubtreeIsInTheWorkspace:
         """Where a machine keeps its workspace stays a machine-local decision."""
         real = tmp_path / "real-ws"
         (real / "config").mkdir(parents=True)
+        _repo(real)
         link = tmp_path / "ws"
         link.symlink_to(real, target_is_directory=True)
         config_dir = tmp_path / "cfg"
@@ -598,6 +620,7 @@ class TestLockdownTrackedSubtreeIsInTheWorkspace:
         outside = tmp_path / "outside"
         config_dir.mkdir()
         (candidate / "config" / "cron").mkdir(parents=True)
+        _repo(candidate)
         outside.mkdir()
         (outside / "jobs.yaml").write_text("jobs: not-a-list\n", encoding="utf-8")
         (candidate / "config" / "cron" / "jobs.yaml").write_text(
@@ -719,6 +742,7 @@ class TestLockdownSettingsFileIsInTheSubtree:
         environment with no tracked settings file at all."""
         ws = tmp_path / "ws"
         (ws / "config").mkdir(parents=True)
+        _repo(ws)
         assert lockdown_workspace_problems(ws) == []
 
     def test_a_link_within_the_subtree_is_fine(self, tmp_path):
@@ -736,6 +760,7 @@ class TestLockdownSettingsFileIsInTheSubtree:
         """An operator fixing a layout wants the list; the loader only needs one."""
         ws = tmp_path / "ws"
         (ws / "notes" / "cfg").mkdir(parents=True)
+        _repo(ws)
         (ws / "notes" / "settings.yaml").write_text("lockdown: true\n", encoding="utf-8")
         (ws / "config").symlink_to(Path("notes") / "cfg", target_is_directory=True)
         (ws / "notes" / "cfg" / "settings.yaml").symlink_to(
@@ -745,6 +770,95 @@ class TestLockdownSettingsFileIsInTheSubtree:
         assert len(problems) == 2
         assert any("must be a real directory" in p for p in problems)
         assert any("outside the tracked config subtree" in p for p in problems)
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+class TestLockdownNeedsSomewhereToReceiveConfigFrom:
+    """A locked instance refuses every local change to the reviewed surface and
+    tells the operator to open a PR instead. That flow ends in a git pull, so
+    sync is the only route left in, and a workspace with no remote has no route
+    at all: nothing local may change the config and nothing remote can arrive.
+
+    Refused rather than ignored. Honoring the flag only where a remote happens to
+    be configured would make ``git remote remove origin`` an unlock — a
+    machine-local one, which is what ``lockdown`` being unreadable from
+    config.yaml and ``NERVE_LOCKDOWN`` never unlocking already exist to prevent.
+    """
+
+    def _workspace(self, tmp_path, settings="lockdown: true\n" + _JWT):
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        config_dir.mkdir()
+        (ws / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        workspace_settings_file(ws).write_text(settings, encoding="utf-8")
+        return config_dir, ws
+
+    def test_a_workspace_that_is_not_a_repository_refuses_to_load(self, tmp_path):
+        config_dir, ws = self._workspace(tmp_path)
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "is not a git repository" in str(ei.value)
+
+    def test_a_repository_with_no_remote_refuses_to_load(self, tmp_path):
+        config_dir, ws = self._workspace(tmp_path)
+        _repo(ws, remote=None)
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "has no git remote" in str(ei.value)
+
+    def test_a_remote_is_all_it_takes(self, tmp_path):
+        config_dir, ws = self._workspace(tmp_path)
+        _repo(ws)
+        assert load_config(config_dir).lockdown is True
+
+    def test_the_remote_need_not_be_named_origin(self, tmp_path):
+        """Which remote to fetch is sync's decision, not this check's: with
+        ``workspace_sync.branch`` unset it follows the current branch's own
+        upstream, which need not be ``origin``. Demanding the name would refuse a
+        workspace that syncs today."""
+        config_dir, ws = self._workspace(tmp_path)
+        _repo(ws, remote="upstream")
+        assert load_config(config_dir).lockdown is True
+
+    def test_dropping_the_remote_does_not_unlock_the_box(self, tmp_path):
+        """The fail-open version of this check, stated as what it would do. A box
+        that came up locked must not come up unlocked after one local command."""
+        config_dir, ws = self._workspace(tmp_path)
+        _repo(ws)
+        assert load_config(config_dir).lockdown is True
+        subprocess.run(["git", "remote", "remove", "origin"], cwd=str(ws),
+                       check=True, capture_output=True)
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "has no git remote" in str(ei.value)
+
+    def test_unlocked_is_unaffected(self, tmp_path):
+        """Most workspaces are not config repos at all. Where the config came from
+        is only a question for an instance that claims it came from review."""
+        config_dir, ws = self._workspace(tmp_path, "timezone: UTC\n")
+        assert load_config(config_dir).timezone == "UTC"
+
+    def test_the_validator_reports_it(self, tmp_path):
+        from nerve.config_validate import validate_config_bundle
+
+        config_dir, ws = self._workspace(tmp_path)
+        result = validate_config_bundle(config_dir, workspace_override=ws)
+        assert any("no way to reach this instance" in e for e in result.errors)
+
+    def test_git_being_unusable_is_not_a_pass(self, tmp_path, monkeypatch):
+        """Not being able to tell is not a yes, and a box that cannot run git
+        cannot sync either."""
+        import nerve.sync_service as sync
+
+        config_dir, ws = self._workspace(tmp_path)
+        _repo(ws)
+        monkeypatch.setattr(sync, "_git", lambda args, cwd: subprocess.CompletedProcess(
+            args, 1, "", "could not run git: [Errno 2] No such file or directory: 'git'",
+        ))
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "could not list the remotes" in str(ei.value)
 
 
 class TestLockdownWriteGuardJudgesBothViewsOfAPath:
@@ -930,6 +1044,7 @@ class TestLockdownReviewedSurface:
         a redirected one."""
         ws = tmp_path / "ws"
         (ws / "config").mkdir(parents=True)
+        _repo(ws)
         assert lockdown_workspace_problems(ws) == []
 
     def test_a_symlinked_skills_directory_stays_fine_unlocked(self, tmp_path):
@@ -1077,6 +1192,7 @@ class TestReviewedSurfaceAgreement:
                 continue
             ws = tmp_path / f"ws{i}"
             (ws / "config").mkdir(parents=True)
+            _repo(ws)
             workspace_settings_file(ws).write_text(
                 "lockdown: true\n" + _JWT, encoding="utf-8",
             )
@@ -1596,6 +1712,7 @@ class TestLockdownEnvironmentAnchor:
         config_dir.mkdir()
         (real / "config").mkdir(parents=True)
         (attacker / "config").mkdir(parents=True)
+        _repo(real)
         workspace_settings_file(real).write_text(
             "lockdown: true\ntimezone: UTC\n" + _JWT, encoding="utf-8",
         )

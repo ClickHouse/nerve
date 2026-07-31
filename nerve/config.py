@@ -2699,6 +2699,11 @@ def lockdown_workspace_problems(workspace: Path) -> list[str]:
     ``config`` as a symlink to a sibling directory — and ``settings.yaml`` alone
     can leave it while everything around it stays put.
 
+    One problem here is not about a subtree at all: whether the workspace has a
+    git remote. It belongs with these because it is the same claim from the other
+    side — the reviewed surface is only reviewed if reviewed changes can reach it.
+    See :func:`_workspace_remote_problem`.
+
     Every problem found is reported rather than the first: an operator fixing a
     layout wants the whole list, and the caller that refuses to boot only needs
     one of them.
@@ -2748,7 +2753,72 @@ def lockdown_workspace_problems(workspace: Path) -> list[str]:
             f"repo. A locked instance reads its settings only from the workspace's "
             f"own config/ directory."
         )
+
+    remote = _workspace_remote_problem(Path(workspace))
+    if remote:
+        problems.append(remote)
     return problems
+
+
+def _workspace_remote_problem(workspace: Path) -> str | None:
+    """Why this locked workspace has nowhere to receive reviewed config from.
+
+    Lockdown refuses every local change to the reviewed surface and its refusals
+    say so, naming the PR flow as the way to change config. That flow ends in a
+    git pull: sync is the only route left in. A locked workspace that is not a
+    repository, or is one with no remote, has no route at all — every local
+    change is refused and no remote change can arrive, so the instance keeps the
+    configuration it happens to hold and nothing on the box says why. Nothing
+    else reports it, because every other check here judges a tree that is present
+    and this one is about a tree that can never change.
+
+    Refused rather than ignored, for the reason the other two rules exist:
+    ``lockdown`` in config.yaml/config.local.yaml is not read, and
+    ``NERVE_LOCKDOWN`` can lock but never unlock, both so that a machine-local
+    change cannot turn lockdown off. ``git remote remove origin`` is a
+    machine-local change. Honoring the flag only when a remote happens to be
+    configured would make it one more way to unlock the box.
+
+    Any remote counts. Which one to fetch is sync's decision, not this one's:
+    with ``workspace_sync.branch`` unset it follows the current branch's own
+    upstream, which need not be named ``origin``, so demanding that name would
+    refuse a workspace that syncs today. Whether the periodic loop is enabled is
+    not asked either — ``nerve config sync`` and ``POST /api/config/sync`` are
+    manual routes that work on a locked box with the loop off, so a remote is a
+    route regardless.
+
+    Git being unusable is treated as no remote. The answer decides whether a
+    locked instance starts, and "could not tell" is not "yes"; a box that cannot
+    run git cannot sync either.
+    """
+    # Imported inside the function because sync_service imports this module. Its
+    # git runner is the one the sync route itself uses: captured, timed out and
+    # incapable of raising, which is what a call on the config load path needs.
+    from nerve.sync_service import _git, is_git_repo
+
+    if not is_git_repo(workspace):
+        found = f"the workspace {workspace} is not a git repository"
+        remedy = "Clone the config repo as the workspace"
+    else:
+        listed = _git(["remote"], workspace)
+        if listed.returncode == 0 and listed.stdout.strip():
+            return None
+        if listed.returncode == 0:
+            found = f"the workspace repository {workspace} has no git remote"
+            remedy = "Add the config repo as a remote (git remote add origin <url>)"
+        else:
+            found = (
+                f"git could not list the remotes of the workspace repository "
+                f"{workspace}: {listed.stderr.strip() or listed.stdout.strip()}"
+            )
+            remedy = "Fix the error git reports"
+    return (
+        f"lockdown is enabled but {found}, so reviewed config has no way to reach "
+        f"this instance. A locked instance refuses every local change to its "
+        f"reviewed surface and takes changes only as a merged commit that sync "
+        f"pulls in, so it would keep the config it currently holds for good. "
+        f"{remedy}, or drop lockdown from the tracked settings."
+    )
 
 
 def _has_dotted(data: dict[str, Any], dotted: str) -> bool:

@@ -765,6 +765,10 @@ class TestApplySync:
         workspace_settings_file(ws).write_text(
             "lockdown: true\nauth:\n  jwt_secret: x\n", encoding="utf-8"
         )
+        # A locked workspace has to be a repo with a remote or the load refuses;
+        # this one is synced, so it is one.
+        (ws / ".git").mkdir()
+        monkeypatch.setattr(sync, "_git", lambda args, cwd: _cp(stdout="origin\n"))
         monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
         assert not is_locked()
         err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
