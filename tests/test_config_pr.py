@@ -970,6 +970,191 @@ class TestRealGit:
             assert not (tmp_path / "outside" / "evil.py").exists()
             assert not (ws / "skills" / "evil.py").exists()
 
+    def _diverged_origin(self, tmp_path):
+        """An origin whose ``main`` holds a line ``staging`` does not, cloned on staging.
+
+        The layout of an instance that follows a pre-production branch: sync
+        pulls ``origin/staging``, so that is the tree the agent reads and the
+        branch a proposal has to target.
+        """
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        self._git("init", "-b", "main", cwd=origin)
+        (origin / "config").mkdir()
+        (origin / "config" / "settings.yaml").write_text("timezone: UTC\n")
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "init", cwd=origin)
+        self._git("branch", "staging", cwd=origin)
+        (origin / "config" / "settings.yaml").write_text(
+            "timezone: UTC\nquiet_start: '03:00'\n"
+        )
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "main moves on", cwd=origin)
+        ws = tmp_path / "ws"
+        self._git("clone", "--branch", "staging", str(origin), str(ws), cwd=tmp_path)
+        return ws
+
+    def test_proposal_targets_the_branch_sync_pulls_from(self, tmp_path, monkeypatch):
+        """``workspace_sync.branch`` decides the base, not origin's default.
+
+        An instance following ``staging`` that proposed against ``main`` would
+        open a pull request it can never receive: sync pulls ``origin/staging``,
+        and nothing merged into ``main`` reaches the instance.
+        """
+        ws = self._diverged_origin(tmp_path)
+        seen = self._capture_gh(monkeypatch)
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Set quiet end", "",
+            [{"path": "config/settings.yaml", "content": "timezone: UTC\nquiet_end: '09:00'\n"}],
+            now=31, base="staging",
+        )
+        assert r.ok, r.message
+        assert seen["args"][seen["args"].index("--base") + 1] == "staging"
+        # Branched from it as well — the fetch, the worktree and --base are one name.
+        assert self._out("rev-parse", f"origin/{r.branch}^", cwd=ws) == self._out(
+            "rev-parse", "origin/staging", cwd=ws,
+        )
+
+    def test_an_empty_sync_branch_keeps_the_remote_default(self, tmp_path, monkeypatch):
+        """Unset is a real state, and the fallback is origin's default.
+
+        Not the checkout's upstream — which is what sync follows when the setting
+        is empty, and which here is ``staging``. A detached HEAD (what sync
+        leaves behind while it validates a rev) or a feature branch would
+        otherwise choose what the pull request targets.
+        """
+        ws = self._diverged_origin(tmp_path)
+        assert self._out("rev-parse", "--abbrev-ref", "HEAD", cwd=ws) == "staging"
+        seen = self._capture_gh(monkeypatch)
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Set quiet end", "",
+            [{"path": "config/settings.yaml", "content": "timezone: UTC\nquiet_end: '09:00'\n"}],
+            now=32, base="",
+        )
+        assert r.ok, r.message
+        assert seen["args"][seen["args"].index("--base") + 1] == "main"
+
+    def test_a_full_content_proposal_does_not_revert_the_base(self, tmp_path, monkeypatch):
+        """``changes`` carries content, not a patch, so the base has to be right.
+
+        The agent reads the file in the synced tree and submits it whole. Staged
+        over a different branch's revision, everything that branch holds and the
+        synced one does not becomes a deletion — in a diff whose title says the
+        change adds a setting.
+        """
+        ws = self._diverged_origin(tmp_path)
+        live = (ws / "config" / "settings.yaml").read_text()
+        assert "quiet_start" not in live  # staging has never had main's line
+        seen = self._capture_gh(monkeypatch)
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Set quiet end", "",
+            [{"path": "config/settings.yaml", "content": live + "quiet_end: '09:00'\n"}],
+            now=33, base="staging",
+        )
+        assert r.ok, r.message
+        base = seen["args"][seen["args"].index("--base") + 1]
+        diff = self._out("diff", f"origin/{base}...origin/{r.branch}", cwd=ws)
+        assert "+quiet_end: '09:00'" in diff
+        assert "quiet_start" not in diff, diff
+
+    def _skills_only_origin(self, tmp_path):
+        """A workspace with ``skills/`` and no ``config/`` — what ``nerve init`` makes."""
+        origin = tmp_path / "origin"
+        (origin / "skills" / "demo").mkdir(parents=True)
+        self._git("init", "-b", "main", cwd=origin)
+        (origin / "skills" / "demo" / "SKILL.md").write_text("# demo\n")
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "init", cwd=origin)
+        ws = tmp_path / "ws"
+        self._git("clone", str(origin), str(ws), cwd=tmp_path)
+        return ws
+
+    def test_the_first_settings_yaml_is_proposable(self, tmp_path, monkeypatch):
+        """Validation sees the worktree with the change applied, so this file counts.
+
+        A workspace that gained a remote after ``nerve init`` has no portable
+        config layer at all, and the proposal creating one is the change that
+        would be refused by a check asking whether the layer already exists.
+        """
+        ws = self._skills_only_origin(tmp_path)
+        assert not (ws / "config").exists()
+        monkeypatch.setattr(cpr, "_gh", lambda a, c: _cp(stdout="https://gh/pr/5"))
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Add settings", "",
+            [{"path": "config/settings.yaml", "content": "timezone: UTC\n"}], now=34,
+        )
+        assert r.ok, f"{r.message} {r.validation_errors}"
+        assert "config/settings.yaml" in self._out(
+            "show", "--name-only", "--format=", f"origin/{r.branch}", cwd=ws,
+        )
+
+    def test_a_skill_only_proposal_needs_no_config_directory(self, tmp_path, monkeypatch):
+        """The one portable_only error a proposal must not be judged by.
+
+        Nothing this proposal could contain would make the bundle non-empty —
+        ``validate_config_bundle`` reads settings and cron, and a skill is
+        neither — so refusing it would refuse every skill change this workspace
+        will ever make, for a reason the agent cannot act on.
+        """
+        ws = self._skills_only_origin(tmp_path)
+        monkeypatch.setattr(cpr, "_gh", lambda a, c: _cp(stdout="https://gh/pr/6"))
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Extend the demo skill", "",
+            [{"path": "skills/demo/SKILL.md", "content": "# demo\n\nMore.\n"}], now=35,
+        )
+        assert r.ok, f"{r.message} {r.validation_errors}"
+
+
+class TestValidatesThePortableLayer:
+    """A proposal changes the portable layer, so that is the layer it is judged on."""
+
+    def test_a_machine_local_override_cannot_rescue_it(self, tmp_path, monkeypatch):
+        """Overlaid, this host's config.yaml answers for the shared config.
+
+        ``test_machine_override_masks_a_shared_error_by_default`` in
+        tests/test_config_validate.py pins the merge itself: the local value wins,
+        as it does at load. That is right for the box and wrong for a change
+        headed to a repo other boxes read — the proposal would open, merge, and
+        be refused on every instance whose config.yaml does not happen to set it.
+        """
+        ws = _repo(tmp_path)
+        config_dir = tmp_path / "cfg"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text(
+            "agent:\n  backend: claude\n", encoding="utf-8",
+        )
+        monkeypatch.setattr(cpr, "_git", _FakeGit())
+        gh_called = []
+        monkeypatch.setattr(cpr, "_gh", lambda a, c: gh_called.append(a) or _cp(stdout="u"))
+
+        r = propose_config_change(
+            ws, config_dir, "Switch backend", "",
+            [{"path": "config/settings.yaml", "content": "agent:\n  backend: bogus\n"}],
+            now=1,
+        )
+
+        assert not r.ok
+        assert any("bogus" in e for e in r.validation_errors), r.validation_errors
+        assert not gh_called
+
+    def test_the_tolerated_validation_error_is_still_the_one_produced(self, tmp_path):
+        """``_EMPTY_BUNDLE_ERROR`` is a prefix match on another module's wording.
+
+        Pinned here so a rewording fails this test, rather than silently going
+        back to refusing every proposal on a workspace with no ``config/``.
+        """
+        ws = tmp_path / "ws"
+        (ws / "skills").mkdir(parents=True)
+
+        result = cvmod.validate_config_bundle(
+            tmp_path / "cfg", workspace_override=ws, portable_only=True,
+        )
+
+        assert not result.ok
+        assert [e for e in result.errors if e.startswith(cpr._EMPTY_BUNDLE_ERROR)], (
+            result.errors
+        )
+
 
 class TestGhHelper:
     """``_gh`` itself. Every other test replaces it, so it is only covered here."""
@@ -1125,6 +1310,32 @@ class TestHandler:
         assert not result.is_error
         assert "changes what runs on the instance" in text
         assert "config/cron/gates/stale.py" in text
+
+    @pytest.mark.asyncio
+    async def test_handler_passes_the_branch_sync_pulls_from(self, monkeypatch):
+        """The handler is the layer holding the config, so it names the base.
+
+        ``config_pr`` is handed a workspace and cannot read ``workspace_sync``
+        itself; without this the proposal targets origin's default and an
+        instance following any other branch never receives its own change.
+        """
+        from nerve.agent.tools.handlers.config_pr import propose_config_change_handler
+        from nerve.agent.tools.registry import ToolContext
+        from nerve.config import NerveConfig
+
+        config = NerveConfig()
+        config.config_dir = Path("/tmp/cfg")
+        config.workspace_sync.branch = "staging"
+        seen = {}
+
+        def _propose(*args, **kwargs):
+            seen.update(kwargs)
+            return ProposeResult(ok=True, pr_url="https://gh/pull/3", branch="b")
+
+        monkeypatch.setattr(cpr, "propose_config_change", _propose)
+        ctx = ToolContext(session_id="s", config=config)
+        await propose_config_change_handler(ctx, {"title": "t", "changes": _changes()})
+        assert seen["base"] == "staging"
 
     @pytest.mark.asyncio
     async def test_handler_invalid(self, monkeypatch):

@@ -3,9 +3,9 @@
 This is how Nerve changes its own configuration when it can't (or shouldn't) edit
 the live workspace directly — notably under lockdown, where runtime edits to
 tracked config are blocked. Instead of touching the running workspace, it stages
-the change in a throwaway git worktree off the remote's default branch, validates it,
-pushes a branch, and opens a PR via ``gh`` for human review. Nothing in the live
-working tree is modified (so it never conflicts with ff-only sync).
+the change in a throwaway git worktree off the branch sync pulls from, validates
+it, pushes a branch, and opens a PR via ``gh`` for human review. Nothing in the
+live working tree is modified (so it never conflicts with ff-only sync).
 
 **What this is for.** A change that goes through here is reviewed, attributable
 and recorded in the repository's history. It is not a barrier and cannot be one:
@@ -141,6 +141,18 @@ _SECURITY_SETTINGS_KEYS: dict[tuple[str, ...], str] = {
 }
 
 _SETTINGS_FILE = "config/settings.yaml"
+
+# Under ``portable_only`` a bundle with no portable config file at all is an
+# error: a CI gate that validated nothing must not report success. A proposal is
+# not that gate. The staged worktree is validated with the change already
+# applied, so a proposal that creates the first ``config/settings.yaml`` carries
+# its own portable layer — but one that only touches ``skills/`` or a root
+# instruction file does not, and on a workspace ``nerve init`` made (skills/, no
+# config/) that error would refuse it for something the proposal has no way to
+# fix. Matched by its leading phrase, which
+# ``test_the_tolerated_validation_error_is_still_the_one_produced`` pins, so a
+# rewording fails there instead of quietly refusing valid proposals again.
+_EMPTY_BUNDLE_ERROR = "nothing to validate:"
 
 # Distinguishes "the settings do not mention this key" from a key stated with a
 # null or empty value, which ``None`` alone cannot (see
@@ -555,16 +567,22 @@ def propose_config_change(
     changes: list[dict],
     now: int,
     branch: str | None = None,
+    base: str = "",
 ) -> ProposeResult:
     """Open a PR against the workspace repo with the given file changes.
 
     ``changes`` is a list of ``{"path": <relative to workspace>, "content": <str>}``.
     Every path must be inside the proposable surface (see
     :func:`_proposal_path_problem`); one that is not rejects the whole proposal.
-    The change is staged in a temp worktree off origin's default branch (see
-    :func:`_remote_default_branch`, never the local ``HEAD``), validated, and —
-    only if valid — pushed as a branch with a PR opened via ``gh``. ``now`` is a
-    unix timestamp used to make the branch name unique. Never raises.
+    The change is staged in a temp worktree off ``base``, validated, and — only
+    if valid — pushed as a branch with a PR opened via ``gh``. ``branch`` names
+    that head branch; ``now`` is a unix timestamp used to make it unique.
+
+    ``base`` is the branch to propose against: the one workspace sync pulls from
+    (``workspace_sync.branch``). Empty falls back to origin's default branch —
+    never the local ``HEAD``, see :func:`_remote_default_branch`.
+
+    Never raises.
     """
     workspace = Path(workspace)
     if not is_git_repo(workspace):
@@ -621,7 +639,19 @@ def propose_config_change(
 
     # One resolved name for the base, used for the fetch, the worktree it is
     # branched from and the PR's --base, so the three can never disagree.
-    base_branch = _remote_default_branch(workspace)
+    #
+    # The caller's ``base`` is the branch sync pulls from. A proposal against any
+    # other branch is one the instance never receives, and it is worse than
+    # merely useless: the agent submits the full content of a file it read in the
+    # synced tree, so staging that over a different branch's revision reverts
+    # whatever that branch holds and the synced one does not — as a deletion in
+    # the diff, under a title that says the change adds a setting.
+    #
+    # An empty setting falls back to origin's default. Sync follows the
+    # checkout's upstream in that case, and this deliberately does not: a
+    # detached HEAD (what sync leaves behind while it validates a rev) or a
+    # feature checkout has no business choosing what a pull request targets.
+    base_branch = base or _remote_default_branch(workspace)
     if not base_branch:
         return ProposeResult(
             ok=False,
@@ -688,8 +718,22 @@ def propose_config_change(
             )
 
         # Validate the proposed bundle — never open a PR for a broken config.
+        #
+        # portable_only, because a pull request changes the portable layer alone
+        # and that is the layer every instance merging it will read. Overlaid,
+        # the machine-local config of whichever box happens to be proposing
+        # answers for the shared one: a proposal setting an invalid
+        # agent.backend passes here because this host's config.yaml names a valid
+        # one, and the boxes that merge it refuse to load. The masking also runs
+        # the other way — an explicit machine-local cron.jobs_file wins, and a
+        # proposed config/cron/jobs.yaml is then never opened at all.
         from nerve.config_validate import validate_config_bundle
-        errors = validate_config_bundle(config_dir, workspace_override=wt).errors
+        errors = [
+            e for e in validate_config_bundle(
+                config_dir, workspace_override=wt, portable_only=True,
+            ).errors
+            if not e.startswith(_EMPTY_BUNDLE_ERROR)
+        ]
         if errors:
             return ProposeResult(
                 ok=False, branch=branch, validation_errors=errors, code_paths=code_paths,

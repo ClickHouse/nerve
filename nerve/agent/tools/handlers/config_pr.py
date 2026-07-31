@@ -36,6 +36,10 @@ async def propose_config_change_handler(ctx: ToolContext, args: dict) -> ToolRes
         result = await asyncio.to_thread(
             propose_config_change,
             workspace, config_dir, title, body, changes, int(time.time()),
+            # The branch sync pulls from, so a merged proposal actually reaches
+            # this instance. Empty is a real setting — the tool falls back to
+            # origin's default rather than to whatever this checkout is on.
+            base=config.workspace_sync.branch,
         )
     except Exception as e:  # noqa: BLE001
         logger.error("propose_config_change failed: %s", e)
