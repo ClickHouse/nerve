@@ -228,17 +228,21 @@ config, so the merged change takes effect immediately. CI on the PR is still the
 first line of defense. The remote and credentials come from git itself, so
 configure `git remote` and auth in the workspace as usual.
 
-**Keep the config subtree clean.** Sync refuses to merge while
-`<workspace>/config/` has local changes: an edited or deleted tracked file, a
-staged change, or an untracked file. Validation judges a clean checkout of the
-fetched commit, but the merge lands in your working tree, and `--ff-only` only
-refuses when the incoming commit touches the same path. Anything else would survive
-the merge unchecked, leaving a bundle on disk that is not the one that passed. The
-case that matters most is an untracked `config/cron/gates/*.py`: the daemon imports
-and runs gate plugins and validation never loads them, so a box meant to run only
-reviewed config would be running local code. Commit, discard or push local edits;
-the failure message names the paths. Files matched by `.gitignore` inside `config/`
-are warnings rather than refusals, since the shared repo can never carry them.
+**Keep the reviewed files clean.** Sync refuses to merge while the workspace's
+reviewed files have local changes: an edited or deleted tracked file, a staged
+change, or an untracked file. That is `<workspace>/config/`, `<workspace>/skills/`
+and the root instruction files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`,
+`TOOLS.md`) — the same set lockdown's write guard refuses. Validation judges a clean
+checkout of the fetched commit, but the merge lands in your working tree, and
+`--ff-only` only refuses when the incoming commit touches the same path. Anything
+else would survive the merge unchecked, leaving a bundle on disk that is not the one
+that passed. The case that matters most is an untracked `config/cron/gates/*.py`:
+the daemon imports and runs gate plugins and validation never loads them, so a box
+meant to run only reviewed config would be running local code. Commit, discard or
+push local edits; the failure message names the paths. So a skill the agent created
+at runtime, or a locally edited `SOUL.md`, blocks the merge until it is committed or
+dropped. Files matched by `.gitignore` in there are warnings rather than refusals,
+since the shared repo can never carry them.
 
 Sync validates more strictly than CI: an unset required `${VAR}` blocks the merge.
 CI has no secrets, so it reports those as info, but the daemon does have them, and a
@@ -352,27 +356,38 @@ Two things to know about `NERVE_LOCKDOWN`:
   `settings.yaml`, so a local edit to `config.yaml` or `config.local.yaml` cannot
   unlock the instance or fake-lock it. With `NERVE_WORKSPACE` set, neither can
   repointing `workspace:`.
-- **Runtime edits to tracked config are blocked.** Creating, updating, deleting or
-  toggling a skill, Telegram pairing, writing a workspace file that lands inside
-  `config/`, and other config mutations fail with a "locked" error (HTTP 403).
-  Change config by opening a PR against the workspace repo and letting sync apply
-  the merge. Files elsewhere in the workspace are unaffected: the workspace is also
-  the agent's working directory, and lockdown covers tracked config rather than the
-  whole box.
-- **The agent's own `Write`/`Edit` are refused inside `config/`.** Every
+- **What lockdown protects is the workspace's *reviewed surface*.** That is
+  `config/`, `skills/`, and the root instruction files `AGENTS.md`, `SOUL.md`,
+  `IDENTITY.md`, `USER.md` and `TOOLS.md`. `config/` is the declarative half; a
+  `SKILL.md` is model-invocable text with its own `allowed-tools` frontmatter that
+  the skill index picks up on the next reload, and the root files are the system
+  prompt the agent starts every turn from. `memory/`, `tasks/`, `TASK.md` and
+  ordinary workspace files are outside it and stay writable.
+- **Runtime edits to the reviewed surface are blocked.** Creating, updating,
+  deleting or toggling a skill, Telegram pairing, writing a workspace file that
+  lands in that surface, and other config mutations fail with a "locked" error
+  (HTTP 403). Change config by opening a PR against the workspace repo and letting
+  sync apply the merge. The rest of the workspace is unaffected: it is also the
+  agent's working directory, and lockdown covers what the box was reviewed to run
+  rather than the whole box.
+- **The agent's own `Write`/`Edit` are refused across that surface.** Every
   non-interactive tool is otherwise auto-approved, so without this the ordinary way
-  an agent edits a file would never meet the guards above. The refusal names the PR
-  flow, so a capable agent routes to it instead of retrying. Writes elsewhere
-  (memory, skills content, task files) are unaffected. `Bash` is not covered; see
-  below.
-- **The tracked config subtree must really be in the workspace.**
-  `<workspace>/config` has to resolve inside `<workspace>`, and has to be a real
-  directory rather than a symlink. If it is a symlink out, nothing under it is part
-  of the reviewed repo, `settings.yaml` included. If it is a symlink to a sibling
-  inside the workspace, git does not descend into it, so nothing under it is tracked
-  and sync reports the workspace clean whatever it holds. Either way the instance
-  refuses to start. Where the workspace itself lives stays a machine-local decision,
-  symlink included.
+  an agent edits a file would never meet the guards above — and the skill
+  endpoints' 403 would be beside the point, since the index picks up whatever is in
+  `skills/` on the next reload however it got there. The refusal names the PR flow,
+  so a capable agent routes to it instead of retrying. Writes elsewhere (memory,
+  task files, scratch files) are unaffected. `Bash` is not covered; see below.
+- **The reviewed subtrees must really be in the workspace.** `<workspace>/config`
+  and `<workspace>/skills` have to resolve inside `<workspace>`, and each has to be
+  a real directory rather than a symlink. If one is a symlink out, nothing under it
+  is part of the reviewed repo, `settings.yaml` included. If it is a symlink to a
+  sibling inside the workspace, git does not descend into it, so nothing under it is
+  tracked and sync reports the workspace clean whatever it holds. Either way the
+  instance refuses to start. Where the workspace itself lives stays a machine-local
+  decision, symlink included. The root instruction files get no such startup check:
+  a locked instance whose `SOUL.md` is a symlink starts. What covers that case is
+  the write guard, which resolves the link and refuses its target too, so the file
+  the prompt is built from is not writable under another name.
 - **`settings.yaml` must be inside that subtree.** `<workspace>/config/settings.yaml`
   has to resolve inside `<workspace>/config/`, so a symlink there cannot source the
   lockdown flag, the auth secret and the cron paths from a file no reviewer saw — an
@@ -392,10 +407,12 @@ Two things to know about `NERVE_LOCKDOWN`:
   there is nothing contained left to fall back to and the instance refuses to
   start.
 - **Sync is stricter about local files.** [Workspace
-  sync](#git-backed-workspace-sync) already refuses to merge into a config subtree
-  with local changes; on a locked instance a `.gitignore`d file in there is a
-  refusal too rather than a warning. An ignored `config/cron/gates/*.py` is local
-  code the daemon runs, invisible to both the reviewer and the validator.
+  sync](#git-backed-workspace-sync) already refuses to merge when the reviewed
+  surface has local changes; on a locked instance a `.gitignore`d file in there is
+  a refusal too rather than a warning, and so is a submodule, which a validation
+  checkout never initializes and a fast-forward never updates. An ignored
+  `config/cron/gates/*.py` is local code the daemon runs, invisible to both the
+  reviewer and the validator.
 
 Run `nerve config validate --workspace .` before merging; it validates the locked
 view when `lockdown: true`, which is where the checks above are decided. It also
@@ -429,12 +446,12 @@ Nerve does not filter command strings — `sh -c`, redirection, `python -c` and 
 editor defeat such a filter, and a filter that looks like a boundary without being
 one is worse than a documented gap. If your threat model includes a deliberately
 hostile agent, run the daemon as a user that cannot write the workspace repo, or
-mount the config subtree read-only.
+mount the reviewed subtrees read-only.
 
 **The codex backend is weaker still.** Codex's sandbox is a mode, not a path list,
-so "everything except `config/`" cannot be expressed to it. Nerve declines a codex
-file change landing in the tracked subtree, but only through codex's approval
-request, and the shipped defaults (`sandbox: danger-full-access`,
+so "everything except the reviewed surface" cannot be expressed to it. Nerve
+declines a codex file change landing in that surface, but only through codex's
+approval request, and the shipped defaults (`sandbox: danger-full-access`,
 `approval_policy: never`) never ask. Treat the `Write`/`Edit` protection above as
 absent there unless you have configured approvals.
 

@@ -810,6 +810,291 @@ class TestLockdownWriteGuardJudgesBothViewsOfAPath:
         assert tracked_config_write_refusal("memory/notes.md") is None
 
 
+class TestLockdownReviewedSurface:
+    """``config/`` is not the whole of what a locked instance was reviewed for.
+
+    ``skills/`` reaches the model as instructions with their own
+    ``allowed-tools``, indexed by ``SkillManager.discover`` at startup and on
+    every reload, and the root instruction files are the system prompt. The skill
+    endpoints refuse under lockdown already, which only meant the 403 could be
+    walked around with the plainest tool the agent has.
+    """
+
+    def _locked(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
+        return ws
+
+    @pytest.mark.parametrize("path", [
+        "skills/backdoor/SKILL.md",
+        "skills/backdoor/scripts/run.sh",
+        "skills",
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "USER.md",
+        "TOOLS.md",
+    ])
+    def test_the_reviewed_surface_is_refused(self, tmp_path, monkeypatch, path):
+        self._locked(tmp_path, monkeypatch)
+        refusal = tracked_config_write_refusal(path)
+        assert refusal, path
+        assert "pull request" in refusal
+
+    @pytest.mark.parametrize("path", [
+        "memory/notes.md",
+        "tasks/active/t1.md",
+        "README.md",
+        # In PROMPT_FILES beside SOUL.md and read into the same prompt, and
+        # deliberately not reviewed: it is the running task list the agent keeps.
+        "TASK.md",
+        # Neighbouring names, to pin that the match is on path components.
+        "skills.md",
+        "SOUL.md.bak",
+        "memory/SOUL.md",
+    ])
+    def test_the_rest_of_the_workspace_stays_writable(self, tmp_path, monkeypatch, path):
+        self._locked(tmp_path, monkeypatch)
+        assert tracked_config_write_refusal(path) is None, path
+
+    def test_a_symlink_at_a_reviewed_root_file_is_refused(self, tmp_path, monkeypatch):
+        """The lexical half, one directory up from ``config/``: writing through
+        the link changes the file the prompt is built from.
+
+        The link's target goes with it, unlike the ``config/settings.yaml`` case
+        where the reviewed root is the directory and a link at a file inside it
+        leaves the target an ordinary workspace file. Here the reviewed root *is*
+        the file, so resolving it names the target — and that is the answer this
+        one needs: nothing refuses a locked instance whose ``SOUL.md`` is a
+        symlink, so the write guard is the only thing standing between the agent
+        and its own instructions.
+        """
+        ws = self._locked(tmp_path, monkeypatch)
+        (ws / "notes").mkdir()
+        (ws / "notes" / "soul.md").write_text("you are helpful\n", encoding="utf-8")
+        (ws / "SOUL.md").symlink_to(Path("notes") / "soul.md")
+        assert tracked_config_write_refusal("SOUL.md")
+        assert tracked_config_write_refusal("notes/soul.md")
+
+    def test_a_path_that_reaches_into_skills_is_refused(self, tmp_path, monkeypatch):
+        ws = self._locked(tmp_path, monkeypatch)
+        (ws / "skills" / "x").mkdir(parents=True)
+        (ws / "notes").mkdir()
+        (ws / "notes" / "skilldir").symlink_to(ws / "skills", target_is_directory=True)
+        assert tracked_config_write_refusal("notes/skilldir/x/SKILL.md")
+        assert tracked_config_write_refusal("notes/../skills/x/SKILL.md")
+
+    def test_unlocked_writes_skills_freely(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=False, workspace=ws))
+        assert tracked_config_write_refusal("skills/x/SKILL.md") is None
+        assert tracked_config_write_refusal("SOUL.md") is None
+
+    def test_a_symlinked_skills_directory_refuses_to_load(self, tmp_path):
+        """Same layout, same reason as a symlinked ``config/``: git does not
+        descend into it, so nothing under it is tracked while ``discover`` indexes
+        whatever is there."""
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        config_dir.mkdir()
+        (ws / "config").mkdir(parents=True)
+        (ws / "notes" / "skills").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        workspace_settings_file(ws).write_text("lockdown: true\n" + _JWT, encoding="utf-8")
+        (ws / "skills").symlink_to(Path("notes") / "skills", target_is_directory=True)
+
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "must be a real directory" in str(ei.value)
+        assert "skills" in str(ei.value)
+
+    def test_skills_symlinked_out_of_the_workspace_refuses_to_load(self, tmp_path):
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        elsewhere = tmp_path / "local-skills"
+        config_dir.mkdir()
+        elsewhere.mkdir()
+        (ws / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        workspace_settings_file(ws).write_text("lockdown: true\n" + _JWT, encoding="utf-8")
+        (ws / "skills").symlink_to(elsewhere, target_is_directory=True)
+
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "outside the workspace" in str(ei.value)
+
+    def test_an_absent_skills_directory_is_not_a_problem(self, tmp_path):
+        """Most workspaces have no skills at all, and a missing directory is not
+        a redirected one."""
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        assert lockdown_workspace_problems(ws) == []
+
+    def test_a_symlinked_skills_directory_stays_fine_unlocked(self, tmp_path):
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        elsewhere = tmp_path / "local-skills"
+        config_dir.mkdir()
+        elsewhere.mkdir()
+        (ws / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        workspace_settings_file(ws).write_text("timezone: UTC\n", encoding="utf-8")
+        (ws / "skills").symlink_to(elsewhere, target_is_directory=True)
+        assert load_config(config_dir).timezone == "UTC"
+
+
+# Representative workspace-relative paths, and whether each is part of the
+# reviewed surface. Hand-written on purpose: it is the statement the three
+# implementations below are measured against, and deriving it from any of them
+# would only make each agree with itself.
+_SURFACE_TABLE: dict[str, bool] = {
+    "config/settings.yaml": True,
+    "config/cron/jobs.yaml": True,
+    "config/cron/gates/gate.py": True,
+    "skills/x/SKILL.md": True,
+    "AGENTS.md": True,
+    "SOUL.md": True,
+    "IDENTITY.md": True,
+    "USER.md": True,
+    "TOOLS.md": True,
+    "memory/notes.md": False,
+    "tasks/active/t1.md": False,
+    "TASK.md": False,
+    "README.md": False,
+    "../outside.md": False,
+}
+
+
+class TestReviewedSurfaceAgreement:
+    """Three implementations, one surface, and nothing that made them agree.
+
+    The write guard decides what a locked instance may not write, sync's
+    divergence check decides what a local edit blocks a merge over, and the
+    startup check decides which subtrees have to really be in the workspace.
+    They were written at different times against ``config/`` alone, and the
+    branch that started treating ``skills/`` as reviewed changed one of them:
+    ``create_skill`` refused while ``Write`` did not, so the same file was
+    forbidden through the endpoint, allowed through the tool, and invisible to
+    sync.
+
+    Each row of ``_SURFACE_TABLE`` is put to all three. What is asserted is
+    agreement with the table, not agreement with each other — three
+    implementations can be uniformly wrong.
+    """
+
+    def test_the_table_covers_the_declared_surface(self):
+        """The table is the artifact the rest of this class trusts, so it is
+        checked against the constants rather than against any of the guards."""
+        from nerve.config import REVIEWED_DIRS, REVIEWED_ROOT_FILES
+
+        reviewed = [p for p, want in _SURFACE_TABLE.items() if want]
+        dirs_covered = {p.split("/")[0] for p in reviewed if "/" in p}
+        files_covered = {p for p in reviewed if "/" not in p}
+        assert set(REVIEWED_DIRS) <= dirs_covered, (
+            "a reviewed directory no row of the table names — every guard below "
+            "would pass without ever looking at it"
+        )
+        assert REVIEWED_ROOT_FILES <= files_covered, (
+            "a reviewed root file no row of the table names"
+        )
+        stray = [
+            p for p in reviewed
+            if p.split("/")[0] not in REVIEWED_DIRS and p not in REVIEWED_ROOT_FILES
+        ]
+        assert not stray, f"rows claiming to be reviewed that nothing declares: {stray}"
+
+    @pytest.mark.parametrize("path,reviewed", sorted(_SURFACE_TABLE.items()))
+    def test_the_write_guard_agrees(self, tmp_path, monkeypatch, path, reviewed):
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
+        assert (tracked_config_write_refusal(path) is not None) is reviewed, path
+
+    @pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+    def test_the_sync_pathspec_agrees(self, tmp_path):
+        """Asked of git, not of the pathspec: an entry that is spelled wrong, or
+        that git reads as something other than a path, matches nothing and would
+        pass a comparison against the list itself.
+        """
+        from nerve.sync_service import _local_config_divergence
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+               "HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+        (ws / ".keep").write_text("", encoding="utf-8")
+        for args in (["init", "-b", "main"], ["add", "-A"], ["commit", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=str(ws), check=True,
+                           capture_output=True, text=True, env=env)
+
+        # Outside the repository, so git has nothing to say about it either way.
+        skipped = [p for p in _SURFACE_TABLE if p.startswith("../")]
+        assert all(not _SURFACE_TABLE[p] for p in skipped), (
+            "a reviewed path outside the workspace makes no sense; the sync check "
+            "could never see it"
+        )
+        for path in _SURFACE_TABLE:
+            if path in skipped:
+                continue
+            target = ws / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("local\n", encoding="utf-8")
+
+        blocking, _warnings = _local_config_divergence(ws, "HEAD")
+        named = {entry.split(" ", 1)[1] for entry in blocking}
+        for path, reviewed in _SURFACE_TABLE.items():
+            if path in skipped:
+                continue
+            assert (path in named) is reviewed, (path, sorted(named))
+
+    def test_the_startup_check_agrees(self, tmp_path):
+        """Redirect the subtree each path lives in and ask whether a locked
+        instance still calls the layout sound.
+
+        The construction needs a subtree to redirect, so rows naming a file at
+        the workspace root, or a path outside it, have nothing to build — see the
+        skip assertion. What that leaves uncovered is real and named in
+        ``docs/config.md``: a locked instance whose ``SOUL.md`` is a symlink
+        starts, and it is the write guard, refusing the link's target as well,
+        that keeps the file the prompt is built from unwritable.
+        """
+        from nerve.config import REVIEWED_DIRS
+
+        skipped = [p for p in _SURFACE_TABLE if "/" not in p or p.startswith("../")]
+        assert all(
+            "/" not in p or p.startswith("../") for p in skipped
+        ), "only a path with no subtree of its own may be skipped here"
+        assert set(REVIEWED_DIRS) <= {
+            p.split("/")[0] for p, want in _SURFACE_TABLE.items()
+            if want and p not in skipped
+        }, "a reviewed directory that the skip rule would let past unchecked"
+
+        for i, (path, reviewed) in enumerate(sorted(_SURFACE_TABLE.items())):
+            if path in skipped:
+                continue
+            ws = tmp_path / f"ws{i}"
+            (ws / "config").mkdir(parents=True)
+            workspace_settings_file(ws).write_text(
+                "lockdown: true\n" + _JWT, encoding="utf-8",
+            )
+            subtree = path.split("/")[0]
+            elsewhere = tmp_path / f"elsewhere{i}"
+            elsewhere.mkdir()
+            if subtree == "config":
+                # Already a real directory; replace it with the redirect.
+                shutil.rmtree(ws / "config")
+                (elsewhere / "settings.yaml").write_text(
+                    "lockdown: true\n" + _JWT, encoding="utf-8",
+                )
+            (ws / subtree).symlink_to(elsewhere, target_is_directory=True)
+
+            problems = lockdown_workspace_problems(ws)
+            assert bool(problems) is reviewed, (path, problems)
+
+
 def ws_escape(tmp_path: Path) -> str:
     """A ``..``-traversal path that climbs out of the workspace config subtree."""
     return f"{tmp_path}/ws/config/cron/../../../system.yaml"
@@ -979,6 +1264,49 @@ class TestLockdownTrackedConfigWrites:
                 )
         assert not (ws / "config" / "settings.yaml").exists()
         assert not (ws / "config" / "cron" / "gates" / "evil.py").exists()
+
+    @pytest.mark.asyncio
+    async def test_memory_file_route_cannot_edit_the_instruction_files(self, tmp_path, monkeypatch):
+        """The route writes anywhere under the workspace, and the workspace root
+        is where the system prompt lives."""
+        from nerve.gateway.routes.memory import FileWriteRequest, write_memory_file
+
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
+        for path in ("SOUL.md", "AGENTS.md", "skills/x/SKILL.md"):
+            with pytest.raises(LockdownError):
+                await write_memory_file(
+                    path, FileWriteRequest(content="do whatever you like\n"), user={},
+                )
+            assert not (ws / path).exists()
+
+    @pytest.mark.asyncio
+    async def test_the_listing_marks_what_the_write_route_will_refuse(self, tmp_path, monkeypatch):
+        """A UI that offers an edit the PUT answers with a 403 is worse than one
+        that does not offer it. Both come from the same guard so they cannot part
+        company."""
+        from nerve.gateway.routes.memory import list_memory_files, read_memory_file
+
+        ws = tmp_path / "ws"
+        (ws / "memory").mkdir(parents=True)
+        (ws / "SOUL.md").write_text("reviewed\n", encoding="utf-8")
+        (ws / "NOTES.md").write_text("scratch\n", encoding="utf-8")
+        (ws / "memory" / "notes.md").write_text("scratch\n", encoding="utf-8")
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
+
+        listed = {f["path"]: f["read_only"] for f in
+                  (await list_memory_files(user={}))["files"]}
+        assert listed == {
+            "SOUL.md": True, "NOTES.md": False, "memory/notes.md": False,
+        }
+        assert (await read_memory_file("SOUL.md", user={}))["read_only"] is True
+        assert (await read_memory_file("NOTES.md", user={}))["read_only"] is False
+
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=False, workspace=ws))
+        unlocked = {f["path"]: f["read_only"] for f in
+                    (await list_memory_files(user={}))["files"]}
+        assert not any(unlocked.values())
 
     @pytest.mark.asyncio
     async def test_memory_file_route_still_writes_elsewhere(self, tmp_path, monkeypatch):
@@ -1457,8 +1785,40 @@ class TestAgentCannotWriteTrackedConfig:
         assert type(result).__name__ == "PermissionResultDeny"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", [
+        "skills/backdoor/SKILL.md",
+        "skills/existing/scripts/run.sh",
+        "AGENTS.md",
+        "SOUL.md",
+        "IDENTITY.md",
+        "USER.md",
+        "TOOLS.md",
+    ])
+    async def test_can_use_tool_denies_writes_across_the_reviewed_surface(
+        self, tmp_path, monkeypatch, path,
+    ):
+        """The plant-a-skill path, closed where the agent actually takes it.
+
+        ``create_skill`` raises under lockdown, but nothing consults that on the
+        way to a ``Write``: the file lands, ``SkillManager.discover`` indexes it
+        on the next reload, and the model can invoke it with whatever
+        ``allowed-tools`` its frontmatter claims. The root instruction files are
+        the same shape one directory up — they are the system prompt.
+        """
+        from nerve.agent.backends.claude import ClaudeToolPermissions
+
+        ws = self._locked(monkeypatch, tmp_path)
+        perms = ClaudeToolPermissions(self._hub())
+        result = await perms.can_use_tool(
+            "Write", {"file_path": str(ws / path)}, context=None,
+        )
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert "lockdown" in result.message
+        assert "pull request" in result.message
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "path", ["memory/notes.md", "skills/x/SKILL.md", "tasks/active/t1.md"],
+        "path", ["memory/notes.md", "tasks/active/t1.md", "TASK.md", "scratch.md"],
     )
     async def test_ordinary_agent_writes_are_untouched(self, tmp_path, monkeypatch, path):
         from nerve.agent.backends.claude import ClaudeToolPermissions

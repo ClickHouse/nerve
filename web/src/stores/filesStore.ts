@@ -8,6 +8,7 @@ interface OpenFile {
   content: string;
   originalContent: string;
   modified: boolean;
+  readOnly: boolean;
 }
 
 interface FilesState {
@@ -51,10 +52,13 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
     set({ loading: true });
     try {
-      const { content } = await api.readMemoryFile(path);
+      const { content, read_only } = await api.readMemoryFile(path);
       const name = path.split('/').pop() || path;
       set(s => ({
-        openFiles: [...s.openFiles, { path, name, content, originalContent: content, modified: false }],
+        openFiles: [...s.openFiles, {
+          path, name, content, originalContent: content, modified: false,
+          readOnly: !!read_only,
+        }],
         activeFile: path,
         loading: false,
       }));

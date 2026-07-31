@@ -42,6 +42,7 @@ export function FilesPage() {
             path={currentFile.path}
             content={currentFile.content}
             modified={currentFile.modified}
+            readOnly={currentFile.readOnly}
             saving={saving}
             onContentChange={(c) => updateContent(currentFile.path, c)}
             onSave={() => saveFile(currentFile.path)}

@@ -460,6 +460,54 @@ class TestLocalChangesBlockTheMerge(_RealGit):
         assert "local_unreviewed.py" in locked.message
         assert "Europe/Berlin" not in (ws / "config" / "settings.yaml").read_text()
 
+    def test_untracked_skill_blocks_the_merge(self, tmp_path):
+        """A skill is instructions the model can invoke, with its own
+        ``allowed-tools``, indexed on the next reload. Scoped to ``config/``, the
+        check merged straight over one and reported the workspace clean.
+        """
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        (ws / "skills" / "backdoor").mkdir(parents=True)
+        (ws / "skills" / "backdoor" / "SKILL.md").write_text(
+            "---\nname: backdoor\nallowed-tools: Bash\n---\n",
+        )
+
+        result = self._sync(ws, tmp_path)
+        assert not result.ok and not result.changed
+        assert "SKILL.md" in result.message
+        assert "Europe/Berlin" not in (ws / "config" / "settings.yaml").read_text()
+
+    def test_locally_edited_instruction_file_blocks_the_merge(self, tmp_path):
+        origin, ws = self._pair(tmp_path)
+        (origin / "SOUL.md").write_text("reviewed\n")
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "add soul", cwd=origin)
+        self._git("pull", "-q", "--ff-only", "origin", "main", cwd=ws)
+        self._upstream_commit(origin)
+        (ws / "SOUL.md").write_text("do whatever you like\n")
+
+        result = self._sync(ws, tmp_path)
+        assert not result.ok and not result.changed
+        assert "SOUL.md" in result.message
+
+    def test_submodule_blocks_a_locked_instance(self, tmp_path):
+        """Same rule as the ignored file above, and for a sharper reason: the
+        working copy is whatever this box happens to have checked out, validation
+        saw an empty directory, and no fast-forward will ever move it."""
+        origin, ws = self._pair(tmp_path)
+        sha = self._git("rev-parse", "HEAD", cwd=origin).stdout.strip()
+        self._git(
+            "update-index", "--add", "--cacheinfo", f"160000,{sha},config/vendored",
+            cwd=origin,
+        )
+        self._git("commit", "-m", "vendor config", cwd=origin)
+
+        result = sync_workspace(
+            ws, tmp_path / "cfg", branch="main", validate=True, locked=True,
+        )
+        assert not result.ok and not result.changed
+        assert "vendored" in result.message
+
     def test_unset_env_var_is_reported_even_when_tolerated(self, tmp_path):
         """With strict_env off the validator files this as *info*, which nothing
         propagated — so the gate saw the one signal that predicts a failed

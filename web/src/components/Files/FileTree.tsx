@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, File, Folder, FolderOpen } from 'lucide-react';
+import { ChevronRight, ChevronDown, File, Folder, FolderOpen, Lock } from 'lucide-react';
 import type { FileNode } from '../../utils/fileTree';
 
 function FileTreeNode({ node, depth, selectedPath, onSelect }: {
@@ -48,8 +48,12 @@ function FileTreeNode({ node, depth, selectedPath, onSelect }: {
       className={`flex items-center gap-1.5 w-full text-left px-2 py-1 text-[13px] cursor-pointer rounded
         ${isSelected ? 'bg-accent/10 text-text' : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'}`}
       style={{ paddingLeft: depth * 16 + 20 }}
+      title={node.readOnly ? `${node.name} — read-only (lockdown)` : node.name}
     >
-      <File size={13} className="shrink-0 text-text-dim" />
+      {node.readOnly
+        ? <Lock size={13} className="shrink-0 text-text-faint" />
+        : <File size={13} className="shrink-0 text-text-dim" />
+      }
       <span className="truncate">{node.name}</span>
     </button>
   );

@@ -12,7 +12,11 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
-from nerve.config import ensure_path_not_tracked_config, get_config
+from nerve.config import (
+    ensure_path_not_tracked_config,
+    get_config,
+    tracked_config_write_refusal,
+)
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
 
@@ -24,7 +28,14 @@ router = APIRouter()
 # --- Memory files ---
 
 def _list_memory_files_sync(workspace: Path) -> list[dict]:
-    """Walk + stat memory markdown files.  Sync — call via asyncio.to_thread."""
+    """Walk + stat memory markdown files.  Sync — call via asyncio.to_thread.
+
+    Each entry carries ``read_only``, answered by the same guard the write route
+    enforces. The listing includes the workspace's root markdown, which is where
+    SOUL.md and AGENTS.md live, and those are reviewed files a locked instance
+    will not write — so without this the UI offers an edit whose save comes back
+    a 403.
+    """
     files = []
     memory_dir = workspace / "memory"
     if memory_dir.exists():
@@ -36,6 +47,7 @@ def _list_memory_files_sync(workspace: Path) -> list[dict]:
                 "name": f.name,
                 "size": st.st_size,
                 "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                "read_only": tracked_config_write_refusal(f) is not None,
             })
 
     # Also include root-level md files
@@ -46,6 +58,7 @@ def _list_memory_files_sync(workspace: Path) -> list[dict]:
             "name": f.name,
             "size": st.st_size,
             "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+            "read_only": tracked_config_write_refusal(f) is not None,
         })
 
     return files
@@ -71,7 +84,13 @@ async def read_memory_file(file_path: str, user: dict = Depends(require_auth)):
     if not full_path.exists() or not full_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     content = await asyncio.to_thread(full_path.read_text, encoding="utf-8")
-    return {"path": file_path, "content": content}
+    # An editor that opened this file needs the same answer the listing gave, or
+    # it re-offers the edit the PUT below refuses.
+    return {
+        "path": file_path,
+        "content": content,
+        "read_only": tracked_config_write_refusal(full_path) is not None,
+    }
 
 
 class FileWriteRequest(BaseModel):

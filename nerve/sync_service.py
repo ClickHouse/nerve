@@ -111,17 +111,22 @@ def _rev(ref: str, cwd: Path) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _config_pathspec(workspace: Path) -> str:
-    """The git pathspec for the portable config subtree of ``workspace``."""
-    from nerve.config import workspace_config_dir
+def _reviewed_pathspec(workspace: Path) -> list[str]:
+    """The git pathspecs for the reviewed surface of ``workspace``.
 
-    return str(workspace_config_dir(workspace))
+    The same list the write guard refuses, so the two cannot disagree about what
+    a reviewed file is. A path this misses is one sync merges over without ever
+    reporting that the live copy differs from the one that passed validation.
+    """
+    from nerve.config import workspace_reviewed_paths
+
+    return [str(p) for p in workspace_reviewed_paths(workspace)]
 
 
 def _local_config_divergence(
     workspace: Path, rev: str, locked: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Local state in the config subtree that the validated rev does not contain.
+    """Local state in the reviewed surface that the validated rev does not contain.
 
     Validation runs against a clean detached checkout of ``rev``; the merge lands
     in the live working tree. ``git merge --ff-only`` only refuses when the
@@ -140,12 +145,12 @@ def _local_config_divergence(
     about what ends up on disk, and it cannot make that promise about a tree
     somebody else is also editing.
 
-    Scoped to the config subtree on purpose. A nerve workspace is also the
+    Scoped to the reviewed surface on purpose. A nerve workspace is also the
     agent's working directory, so uncommitted notes and scratch files elsewhere
     in it are normal and none of sync's business — and where they *would* break
     the fast-forward, git says so itself.
 
-    ``locked`` promotes ``.gitignore``d files inside the subtree from a warning to
+    ``locked`` promotes ``.gitignore``d files inside the surface from a warning to
     a refusal. On an ordinary box those files are the operator's own, kept
     deliberately out of the shared repo, and refusing a merge over them would be
     sync passing judgement on what a machine may hold locally. A locked instance
@@ -159,11 +164,11 @@ def _local_config_divergence(
     """
     blocking: list[str] = []
     warnings: list[str] = []
-    pathspec = _config_pathspec(workspace)
+    pathspec = _reviewed_pathspec(workspace)
 
     status = _git([
         *_QUOTEPATH_OFF, "status", "--porcelain",
-        "--untracked-files=all", "--ignored=matching", "--", pathspec,
+        "--untracked-files=all", "--ignored=matching", "--", *pathspec,
     ], workspace)
     if status.returncode != 0:
         # Fail closed: unable to establish that the tree is clean is not the
@@ -178,36 +183,43 @@ def _local_config_divergence(
             continue
         code, path = line[:2], line[3:]
         if code == "!!":
-            # An ignored file inside a *tracked config subtree* is a layout
-            # mistake — it is config the shared repo can never carry and no
-            # reviewer will ever see. Worth saying; on an unlocked box not worth
-            # refusing a merge over, since refusing would be a policy decision
-            # about what the machine is allowed to have locally rather than a
-            # statement about whether the merge is sound. Under lockdown that
-            # policy decision has already been made.
+            # An ignored file inside the *reviewed surface* is a layout mistake —
+            # it is config the shared repo can never carry and no reviewer will
+            # ever see. Worth saying; on an unlocked box not worth refusing a
+            # merge over, since refusing would be a policy decision about what
+            # the machine is allowed to have locally rather than a statement
+            # about whether the merge is sound. Under lockdown that policy
+            # decision has already been made.
             if locked:
                 blocking.append(f"!! {path} (gitignored)")
             else:
                 warnings.append(
-                    f"ignored file inside the tracked config subtree: {path}"
+                    f"ignored file inside the reviewed surface: {path}"
                 )
         else:
             blocking.append(f"{code.strip() or '??'} {path}")
 
-    # A submodule under the config subtree is a third case: `git worktree add`
+    # A submodule inside the reviewed surface is a third case: `git worktree add`
     # does not initialize submodules, so validation saw an empty directory, and
     # the fast-forward leaves the live checkout on its old commit. Neither the
     # old contents nor the new ones were checked.
-    tree = _git([*_QUOTEPATH_OFF, "ls-tree", "-r", rev, "--", pathspec], workspace)
+    #
+    # ``locked`` promotes it for the same reason as an ignored file: unvalidated
+    # content the daemon reads anyway is exactly what a locked box says cannot be
+    # there, and the submodule case is the worse of the two, since the working
+    # copy is whatever the box happens to have checked out and no remote change
+    # ever moves it.
+    tree = _git([*_QUOTEPATH_OFF, "ls-tree", "-r", rev, "--", *pathspec], workspace)
     if tree.returncode == 0:
         for line in tree.stdout.splitlines():
             if line.startswith("160000 "):
                 sub = line.split("\t", 1)[-1]
-                warnings.append(
-                    f"submodule {sub!r} in the config subtree was not validated "
+                note = (
+                    f"submodule {sub!r} in the reviewed surface was not validated "
                     f"(a validation checkout does not initialize submodules) and "
                     f"a fast-forward does not update it"
                 )
+                (blocking if locked else warnings).append(note)
     return blocking, warnings
 
 
@@ -318,8 +330,8 @@ def sync_workspace(
     :class:`SyncResult`.
 
     That guarantee is about the tree the daemon will read, not merely about the
-    commit that was checked, so a merge is also refused when the live config
-    subtree has local changes of its own — see
+    commit that was checked, so a merge is also refused when the live reviewed
+    files have local changes of their own — see
     :func:`_local_config_divergence`. ``changed`` reports whether the live tree
     actually moved; a refusal leaves it exactly where it was.
 
@@ -390,7 +402,7 @@ def _sync_workspace(
             ok=False, changed=False, old_rev=old, new_rev=new,
             validation_warnings=warnings,
             message=(
-                f"fetched {new[:8]} but the workspace config subtree has local "
+                f"fetched {new[:8]} but the workspace's reviewed files have local "
                 f"changes — not applying, because they would survive the "
                 f"fast-forward without ever having been validated: "
                 f"{_describe_paths(blocking)}. Commit, discard or push them."

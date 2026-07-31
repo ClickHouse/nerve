@@ -265,6 +265,43 @@ def workspace_config_dir(workspace: Path) -> Path:
     return Path(workspace) / "config"
 
 
+# The reviewed surface of a workspace: what a locked instance takes as
+# instruction rather than as data, and therefore what may only arrive as a
+# reviewed, merged commit.
+#
+# It is not one directory because the layout is not one directory. ``config/``
+# is the declarative half. ``skills/`` is executable policy in all but name: a
+# SKILL.md is model-invocable text carrying its own ``allowed-tools``
+# frontmatter, and ``SkillManager.discover`` indexes whatever is on disk at
+# startup and on every reload without consulting lockdown, so a file dropped
+# there is live on the next sync. The skill endpoints already refuse under
+# lockdown; refusing the endpoint and not the file it would have written is not
+# a refusal. The root instruction files are the system prompt itself — the
+# standing orders every turn starts from.
+#
+# Not a discovery list, and deliberately not derived from one:
+# ``nerve.agent.prompts.PROMPT_FILES`` also names TASK.md, which is runtime state
+# the agent maintains and has to go on being able to write.
+REVIEWED_DIRS = ("config", "skills")
+REVIEWED_ROOT_FILES = frozenset({
+    "AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md",
+})
+
+
+def workspace_reviewed_paths(workspace: Path) -> list[Path]:
+    """Every member of the reviewed surface of ``workspace``, subtrees first.
+
+    One list so the write guard and sync's dirty-state check ask about the same
+    files. They answer different questions — may this be written, has this been
+    edited locally — and when the two disagreed about what the surface *is*, a
+    skill the reviewer never saw was both writable and invisible to sync.
+    """
+    ws = Path(workspace)
+    return [ws / name for name in REVIEWED_DIRS] + [
+        ws / name for name in sorted(REVIEWED_ROOT_FILES)
+    ]
+
+
 def workspace_settings_file(workspace: Path) -> Path:
     """Shareable settings file inside a workspace (``<ws>/config/settings.yaml``)."""
     return workspace_config_dir(workspace) / "settings.yaml"
@@ -2639,23 +2676,25 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
 
 
 def lockdown_workspace_problems(workspace: Path) -> list[str]:
-    """Ways a locked instance's tracked config tree isn't the tree it claims.
+    """Ways a locked instance's reviewed subtrees aren't the trees they claim.
 
-    Everything else here judges a path against ``<workspace>/config``. That
-    settles whether a path stays inside the subtree, and says nothing about
-    whether the subtree is the one the config repo was reviewed in. If ``config``
-    is a symlink out of the workspace, every path under it is contained relative
-    to itself, every containment check passes, and the whole tracked layer —
-    settings.yaml, the cron files, the gate plugins the daemon imports — comes
-    from an untracked directory somewhere else on the box, with lockdown itself
-    read from there and reporting that all is well.
+    Everything else here judges a path against ``<workspace>/config`` or
+    ``<workspace>/skills``. That settles whether a path stays inside a subtree,
+    and says nothing about whether the subtree is the one the config repo was
+    reviewed in. If ``config`` is a symlink out of the workspace, every path
+    under it is contained relative to itself, every containment check passes, and
+    the whole tracked layer — settings.yaml, the cron files, the gate plugins the
+    daemon imports — comes from an untracked directory somewhere else on the box,
+    with lockdown itself read from there and reporting that all is well. A
+    redirected ``skills`` is the same arrangement one directory over: whatever is
+    there gets indexed as model-invocable skills on the next reload.
 
-    So the subtree is judged against the workspace instead, once, and a locked
-    instance that fails it does not start. The workspace *path* may still be
+    So each subtree is judged against the workspace instead, once, and a locked
+    instance that fails does not start. The workspace *path* may still be
     anything, including a symlink: where a machine keeps its workspace is a
     machine-local decision and the one thing lockdown never took away.
 
-    Two more ways the same claim fails, checked here for the same reason. The
+    Two more ways the same claim fails, checked here for the same reason. A
     subtree can stay inside the workspace and still not be the reviewed tree —
     ``config`` as a symlink to a sibling directory — and ``settings.yaml`` alone
     can leave it while everything around it stays put.
@@ -2666,30 +2705,31 @@ def lockdown_workspace_problems(workspace: Path) -> list[str]:
     """
     problems: list[str] = []
     config_root = workspace_config_dir(workspace)
-    if not _is_within(config_root, workspace):
-        problems.append(
-            f"lockdown is enabled but the tracked config subtree {config_root} "
-            f"resolves to {_resolved(config_root)}, outside the workspace "
-            f"{_resolved(workspace)} — so nothing it holds is part of the reviewed "
-            f"repo. A locked instance takes its config only from the workspace's own "
-            f"config/ directory."
-        )
-    elif config_root.is_symlink():
-        # Contained, and still not the reviewed tree. git does not descend into a
-        # symlinked directory, so `git status -- <ws>/config` reports nothing no
-        # matter what is under there: sync calls the workspace clean while the
-        # daemon reads settings.yaml, and imports cron/gates/*.py, from a
-        # directory the config repo has never seen a single file of. The
-        # arrangement is also writable by the agent through its real path, which
-        # the write guard judges against config/ and lets past.
-        problems.append(
-            f"lockdown is enabled but the tracked config subtree {config_root} is a "
-            f"symlink to {_resolved(config_root)}. git does not track anything "
-            f"through a symlinked directory, so no file under it is part of the "
-            f"reviewed repo and a sync would report the workspace clean regardless "
-            f"of what it holds. A locked instance's config/ must be a real "
-            f"directory."
-        )
+    for reviewed in (Path(workspace) / name for name in REVIEWED_DIRS):
+        if not _is_within(reviewed, workspace):
+            problems.append(
+                f"lockdown is enabled but the reviewed subtree {reviewed} resolves "
+                f"to {_resolved(reviewed)}, outside the workspace "
+                f"{_resolved(workspace)} — so nothing it holds is part of the "
+                f"reviewed repo. A locked instance reads {reviewed.name}/ only "
+                f"from the workspace itself."
+            )
+        elif reviewed.is_symlink():
+            # Contained, and still not the reviewed tree. git does not descend
+            # into a symlinked directory, so `git status -- <ws>/config` reports
+            # nothing whatever is under there: sync calls the workspace clean
+            # while the daemon reads settings.yaml, and imports cron/gates/*.py,
+            # from a directory the config repo has never seen a single file of.
+            # A redirected skills/ is the same arrangement, with the skill index
+            # reading whatever the link points at.
+            problems.append(
+                f"lockdown is enabled but the reviewed subtree {reviewed} is a "
+                f"symlink to {_resolved(reviewed)}. git does not track anything "
+                f"through a symlinked directory, so no file under it is part of "
+                f"the reviewed repo and a sync would report the workspace clean "
+                f"regardless of what it holds. A locked instance's "
+                f"{reviewed.name}/ must be a real directory."
+            )
 
     # The subtree can be the reviewed tree and this one file still not be part of
     # it. settings.yaml carries the lockdown flag itself, the auth secret and
@@ -2952,7 +2992,7 @@ def ensure_not_locked(action: str = "modify configuration") -> None:
 
 
 def ensure_path_not_tracked_config(path: Path, action: str = "write") -> None:
-    """Refuse, under lockdown, to touch a path inside the tracked config subtree.
+    """Refuse, under lockdown, to touch a path in the workspace's reviewed surface.
 
     The other guards sit in front of a specific operation — creating a skill,
     persisting a pairing — and know what they are about to change. This one is
@@ -2962,9 +3002,10 @@ def ensure_path_not_tracked_config(path: Path, action: str = "write") -> None:
     reachable through them, which means both ``settings.yaml`` (including the
     ``lockdown`` flag itself) and ``cron/gates/*.py``, which the daemon imports
     and runs. Either one turns lockdown off from inside the box it is meant to be
-    protecting.
+    protecting. ``skills/`` and the root instruction files are reachable the same
+    way and decide what the agent does next, so they are judged the same.
 
-    A path outside the subtree is none of lockdown's business — the workspace is
+    A path outside that surface is none of lockdown's business — the workspace is
     also the agent's working directory, and normal files there are the point.
     """
     reason = tracked_config_write_refusal(path)
@@ -2988,13 +3029,20 @@ def tracked_config_write_refusal(path: Path | str) -> str | None:
     that way costs a clear message and a retry, and erring the other way is the
     hole this exists to close.
 
+    Every member of :func:`workspace_reviewed_paths` is judged, not ``config/``
+    alone. ``skills/`` and the root instruction files are refused by the named
+    operations already — ``create_skill`` and friends — and leaving them writable
+    here left the whole point of those refusals reachable by the plainest tool
+    the agent has: write ``skills/x/SKILL.md``, wait for the reload that indexes
+    it, and no 403 was ever involved.
+
     Both views of the path are checked, because a symlink is the case where they
     disagree and each direction of the disagreement is a way through. Resolving
-    catches a path that arrives from outside and lands in the subtree — a link in
+    catches a path that arrives from outside and lands in the surface — a link in
     the workspace pointing at ``config/``, a directory link, a ``..`` climb. The
     lexical name catches the reverse: a symlink sitting *at* a reviewed path
     resolves elsewhere, and a guard that only resolved would decide the write was
-    outside the subtree and allow it, while the daemon goes on loading that name
+    outside the surface and allow it, while the daemon goes on loading that name
     as tracked config.
     """
     if not is_locked():
@@ -3003,15 +3051,14 @@ def tracked_config_write_refusal(path: Path | str) -> str | None:
     target = Path(path)
     if not target.is_absolute():
         target = workspace / target
-    config_root = workspace_config_dir(workspace)
-    if not (
-        _is_within(target, config_root) or _is_lexically_within(target, config_root)
-    ):
-        return None
-    return (
-        f"this instance is in lockdown (remote-only, read-only) and {target} is "
-        f"inside the tracked config subtree {config_root}, which only a reviewed, "
-        f"merged change to the workspace repo may alter. Open a pull request "
-        f"against that repo instead; the instance will pick the change up when it "
-        f"syncs. Everything outside {config_root} is still writable."
-    )
+    for reviewed in workspace_reviewed_paths(workspace):
+        if _is_within(target, reviewed) or _is_lexically_within(target, reviewed):
+            return (
+                f"this instance is in lockdown (remote-only, read-only) and "
+                f"{target} is part of {reviewed}, which only a reviewed, merged "
+                f"change to the workspace repo may alter. Open a pull request "
+                f"against that repo instead; the instance will pick the change up "
+                f"when it syncs. Memory, task files and the rest of the workspace "
+                f"are still writable."
+            )
+    return None
