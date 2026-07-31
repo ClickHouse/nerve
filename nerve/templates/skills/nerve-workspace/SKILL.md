@@ -36,8 +36,17 @@ belongs to this instance alone — that is what an ordinary install looks like.
 - **Locked instance** (lockdown / remote-only) — a PR is the *only* thing that
   works. Direct edits to tracked config are blocked, and would be overwritten by
   the next sync even if they weren't.
-- **Workspace has a remote, not locked** — prefer a PR. Nothing forces it, but a
-  reviewed change is the point of having the repo.
+- **Workspace has a remote, not locked** — route every change to the reviewed
+  surface through `propose_config_change`, even though nothing forces you to. A
+  direct write leaves the workspace diverged from the reviewed revision, and sync
+  refuses to merge while anything in that surface — `config/`, `skills/`, and the
+  root instruction files — has uncommitted local state (untracked, modified,
+  staged or deleted). So the edit also stops every later config change from
+  reaching this instance until someone commits or drops it.
+  `propose_config_change` stages in an isolated worktree, so it leaves the live
+  workspace clean — only a direct write dirties it. That covers every route that
+  writes those files, not just an editor: `skill_create` and `skill_update`, the
+  `POST`/`PUT`/`DELETE /api/skills` endpoints, and a shell command.
 - **No remote, not locked** — there is nothing to open a PR against and no
   review to route through. **Edit the files directly** and tell the user what you
   changed. `propose_config_change` will refuse, and it is right to.
