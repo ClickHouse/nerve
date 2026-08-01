@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import nerve.sync_service as sync
 from nerve.config import WorkspaceSyncConfig
+from nerve.config_reload import reload_failures
 from nerve.config_validate import ValidationResult
 from nerve.sync_service import sync_workspace
 
@@ -744,6 +746,17 @@ class TestApplySync:
         engine.reload_mcp_config.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_apply_reloads_sources_and_skills(self, tmp_path):
+        """Sync applies the SAME subsystems as a manual reload (sources+skills)."""
+        cron = AsyncMock()
+        engine = MagicMock()
+        engine.reload_mcp_config = AsyncMock(return_value=[])
+        engine._skill_manager.discover = AsyncMock(return_value=[])
+        await sync._apply_sync(engine, cron, tmp_path)
+        cron.reload_sources.assert_awaited_once()
+        engine._skill_manager.discover.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_apply_survives_reload_error(self, tmp_path):
         cron = AsyncMock()
         cron.reload.side_effect = RuntimeError("boom")
@@ -771,8 +784,8 @@ class TestApplySync:
         monkeypatch.setattr(sync, "_git", lambda args, cwd: _cp(stdout="origin\n"))
         monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
         assert not is_locked()
-        err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
-        assert err is None
+        summary = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
+        assert "config" not in reload_failures(summary)
         assert is_locked()  # the reloaded config engaged lockdown
 
     @pytest.mark.asyncio
@@ -796,8 +809,9 @@ class TestApplySync:
             encoding="utf-8",
         )
         monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
-        err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
-        assert err and "NO_SUCH_SECRET_HERE" in err
+        summary = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
+        failures = reload_failures(summary)
+        assert "NO_SUCH_SECRET_HERE" in failures["config"]
         assert not is_locked()  # still running the old config — which the caller must say
 
     @pytest.mark.asyncio
@@ -823,13 +837,50 @@ class TestApplySync:
         )
 
         async def _failing_apply(engine, cron_service, config_dir):
-            return "ConfigError: nope"
+            return {"config": "error: ConfigError: nope"}
 
         monkeypatch.setattr(sync, "_apply_sync", _failing_apply)
         body = await route_mod.sync_workspace_route(user={})
         assert body["ok"] is False
         assert body["changed"] is True and body["applied"] is False
         assert body["apply_error"] == "ConfigError: nope"
+
+    @pytest.mark.asyncio
+    async def test_route_reports_a_partly_applied_merge(self, tmp_path, monkeypatch):
+        """The config loaded, so the merged settings *are* live — but cron didn't
+        take it, so the daemon is on the merged config only in part. Reporting a
+        clean `applied` for that hides the one outcome an operator cannot see
+        from the outside.
+        """
+        import nerve.gateway.server as srv
+
+        import nerve.gateway.routes.config as route_mod
+        from nerve.sync_service import SyncResult
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace = str(tmp_path / "ws")
+        fake_cfg.config_dir = str(tmp_path / "cfg")
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        monkeypatch.setattr(
+            route_mod, "get_deps", lambda: type("D", (), {"engine": None})(),
+        )
+        monkeypatch.setattr(
+            sync, "sync_workspace",
+            lambda *a, **k: SyncResult(ok=True, changed=True, message="updated"),
+        )
+
+        async def _partial_apply(engine, cron_service, config_dir):
+            return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _partial_apply)
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["ok"] is True  # the merged config itself is in effect
+        assert body["applied"] is False  # ...but not everywhere
+        assert body["apply_error"] is None
+        assert body["reload_errors"] == {"cron": "bad jobs.yaml"}
 
 
 class TestNeverRaises:
@@ -950,16 +1001,23 @@ class _FakeClock:
     hands to ``asyncio.wait_for``, so that is recorded rather than inferred.
     ``cycles`` syncs run, then the stop event is set and the wait reports
     "stopped" exactly as the real one would.
+
+    ``hook`` is called with the wait's index each time, which is the point
+    *between* two cycles with the loop already started — the only place a test
+    can change the world the way an operator or another process does.
     """
 
-    def __init__(self, cycles: int, stop: asyncio.Event):
+    def __init__(self, cycles: int, stop: asyncio.Event, hook=None):
         self.cycles = cycles
         self.stop = stop
+        self.hook = hook
         self.timeouts: list[float] = []
 
     async def wait_for(self, coro, timeout=None):
         self.timeouts.append(timeout)
         coro.close()  # the loop passed stop_event.wait(); we never await it
+        if self.hook is not None:
+            self.hook(len(self.timeouts) - 1)
         if self.cycles <= 0:
             self.stop.set()
             return True
@@ -967,10 +1025,10 @@ class _FakeClock:
         raise asyncio.TimeoutError
 
 
-def _run_cycles(monkeypatch, cycles):
+def _run_cycles(monkeypatch, cycles, hook=None):
     """Wire a fake clock into the loop and return ``(stop_event, clock)``."""
     stop = asyncio.Event()
-    clock = _FakeClock(cycles, stop)
+    clock = _FakeClock(cycles, stop, hook)
     monkeypatch.setattr(sync.asyncio, "wait_for", clock.wait_for)
     return stop, clock
 
@@ -1022,17 +1080,16 @@ class TestPeriodicLoop:
         )
 
     @pytest.mark.asyncio
-    async def test_editing_config_on_disk_does_not_reach_the_loop(
+    async def test_editing_config_on_disk_does_not_reach_the_loop_on_its_own(
         self, tmp_path, monkeypatch,
     ):
-        """What actually happens today, and what the docs must therefore say.
+        """A file changing on disk is not a reload, and deliberately so.
 
-        The loop re-reads the process-wide config object every cycle, but nothing
-        refreshes that object after start-up, so an edited config.yaml is never
-        seen. If this test starts failing because something now reloads the
-        singleton, that is good news — update the loop's docstring and the
-        "workspace_sync changes need a restart" paragraph in docs/config.md,
-        which are written to this behavior.
+        The loop re-reads the process-wide config object every cycle, but only an
+        explicit reload replaces that object, so editing config.yaml on the box
+        and waiting achieves nothing. The companion test below covers what
+        happens once a reload is actually asked for; ``docs/config.md`` says the
+        same thing to operators, under "What triggers a reload".
         """
         import nerve.config as nerve_config
 
@@ -1056,6 +1113,52 @@ class TestPeriodicLoop:
 
         assert [k["branch"] for k in seen] == ["OLD", "OLD", "OLD"]
         assert nerve_config.get_config() is started_with
+
+    @pytest.mark.asyncio
+    async def test_a_reload_makes_the_loop_see_the_edited_file(
+        self, tmp_path, monkeypatch,
+    ):
+        """Drives the real config object, not a stand-in for it.
+
+        The loop's per-cycle re-read was correct in shape long before anything
+        replaced the object it reads, and a test that patched ``get_config``
+        would have passed throughout. So this one edits a real config.yaml, runs
+        a real reload, and checks the branch the next cycle actually pulls.
+        """
+        import nerve.config as nerve_config
+        from nerve.config_reload import reload_all
+
+        config_dir = tmp_path / "cfg"
+        _write_config(config_dir, tmp_path / "ws", enabled="true", branch="OLD")
+        monkeypatch.setattr(
+            nerve_config, "_config", nerve_config.load_config(config_dir),
+        )
+        started_with = nerve_config.get_config()
+
+        seen: list[dict] = []
+
+        def edit_then_reload():
+            """Stand in for a hand edit followed by POST /api/config/reload.
+
+            The loop hands ``sync_workspace`` to ``asyncio.to_thread``, so this
+            runs on a worker thread with no event loop of its own — which is what
+            lets it drive the real coroutine rather than a substitute for it.
+            """
+            if len(seen) > 1:
+                return
+            _write_config(
+                config_dir, tmp_path / "ws", enabled="true", branch="NEW",
+            )
+            asyncio.run(reload_all(None, None, config_dir))
+
+        monkeypatch.setattr(
+            sync, "sync_workspace", _sync_double(seen, then=edit_then_reload),
+        )
+        stop, _clock = _run_cycles(monkeypatch, 3)
+        await sync.run_periodic_sync(started_with, AsyncMock(), AsyncMock(), stop)
+
+        assert [k["branch"] for k in seen] == ["OLD", "NEW", "NEW"]
+        assert nerve_config.get_config() is not started_with
 
     @pytest.mark.asyncio
     async def test_loop_follows_the_current_config_object(self, monkeypatch):
@@ -1191,8 +1294,433 @@ class TestSyncRoute:
 
         async def _fake_apply(engine, cron_service, config_dir):
             applied.append(Path(config_dir))
+            return {"config": "reloaded"}
 
         monkeypatch.setattr(sync, "_apply_sync", _fake_apply)
         body = await route_mod.sync_workspace_route(user={})
-        assert body["ok"] and body["changed"]
+        assert body["ok"] and body["changed"] and body["applied"]
+        assert body["status"] == "applied"
         assert applied == [tmp_path / "cfg"]
+
+    @pytest.mark.asyncio
+    async def test_status_separates_the_two_reasons_applied_is_false(
+        self, tmp_path, monkeypatch,
+    ):
+        """``applied: false`` is the answer both when there was nothing to merge
+        and when the merge reached no subsystem, and a script cannot act on the
+        two the same way. ``status`` is what it reads instead.
+        """
+        import nerve.gateway.server as srv
+
+        import nerve.gateway.routes.config as route_mod
+        from nerve.sync_service import SyncResult
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace = str(tmp_path / "ws")
+        fake_cfg.config_dir = str(tmp_path / "cfg")
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        monkeypatch.setattr(
+            route_mod, "get_deps", lambda: type("D", (), {"engine": None})(),
+        )
+
+        monkeypatch.setattr(
+            sync, "sync_workspace",
+            lambda *a, **k: SyncResult(ok=True, changed=False, message="up to date"),
+        )
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["applied"] is False and body["status"] == "up-to-date"
+
+        monkeypatch.setattr(
+            sync, "sync_workspace",
+            lambda *a, **k: SyncResult(ok=True, changed=True, message="updated"),
+        )
+
+        async def _no_subsystem_took_it(engine, cron_service, config_dir):
+            return {"config": "error: ConfigError: nope"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _no_subsystem_took_it)
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["applied"] is False and body["status"] == "not-applied"
+
+        async def _cron_refused(engine, cron_service, config_dir):
+            return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _cron_refused)
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["applied"] is False and body["status"] == "partial"
+
+
+class _LoopAgainstRealGit(_RealGit):
+    """A real origin/clone pair driven by the real periodic loop.
+
+    The loop's whole subject here is what is on disk versus what this process
+    applied, so a scripted git double cannot answer it: the revisions have to be
+    real ones that move.
+    """
+
+    def _upstream_commit(self, origin, tz="Europe/Berlin"):
+        (origin / "config" / "settings.yaml").write_text(f"timezone: {tz}\n")
+        self._git("commit", "-am", "change tz", cwd=origin)
+
+    def _config(self, ws, tmp_path, **overrides):
+        (tmp_path / "cfg").mkdir(exist_ok=True)
+        return _loop_config(
+            workspace=str(ws), config_dir=str(tmp_path / "cfg"),
+            branch="main", validate=False, interval_minutes=60, **overrides,
+        )
+
+    def _head(self, ws):
+        return self._git("rev-parse", "HEAD", cwd=ws).stdout.strip()
+
+    async def _run(self, cfg, monkeypatch, cycles, engine=None, hook=None):
+        import nerve.config as nerve_config
+
+        monkeypatch.setattr(nerve_config, "_config", cfg)
+        stop, _clock = _run_cycles(monkeypatch, cycles, hook=hook)
+        await sync.run_periodic_sync(cfg, engine, None, stop)
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+class TestLoopAppliesWhatIsOnDisk(_LoopAgainstRealGit):
+    """HEAD says where the config is, not that anything read it.
+
+    It moves without this loop (`nerve config sync`, a bare `git pull`), and a
+    reload can fail for one subsystem after a merge that did happen. Applying
+    only when the loop's own pull merged something leaves both states reported as
+    "up to date" for as long as the daemon runs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_head_moved_out_of_band_is_applied_once(self, tmp_path, monkeypatch):
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        applied: list = []
+
+        async def _apply(engine, cron_service, config_dir):
+            applied.append(config_dir)
+            return {"config": "reloaded"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _apply)
+
+        def fast_forward_from_a_shell(i):
+            # Between cycles, with the daemon already running: the ordering
+            # matters, since a daemon started afterwards reads the new config
+            # from disk at start-up and has nothing to catch up on.
+            if i == 0:
+                sync_workspace(ws, tmp_path / "cfg", branch="main", validate=False)
+
+        await self._run(
+            self._config(ws, tmp_path), monkeypatch, 3,
+            hook=fast_forward_from_a_shell,
+        )
+        assert len(applied) == 1  # applied once, then nothing left to do
+
+    @pytest.mark.asyncio
+    async def test_a_subsystem_that_refused_is_retried(self, tmp_path, monkeypatch):
+        """The merge landed, cron did not take it, and the only trace was one
+        warning. Nothing retried it, so the daemon ran the merged config in part
+        until someone restarted it."""
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        attempts: list = []
+
+        async def _apply(engine, cron_service, config_dir):
+            attempts.append(config_dir)
+            return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _apply)
+        await self._run(self._config(ws, tmp_path), monkeypatch, 4)
+
+        assert len(attempts) == 4  # the merge, then a retry every cycle
+
+    @pytest.mark.asyncio
+    async def test_the_retry_stops_once_the_subsystem_takes_it(self, tmp_path, monkeypatch):
+        """The other half: retrying for good would reload every subsystem once a
+        minute forever."""
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        attempts: list = []
+
+        async def _apply(engine, cron_service, config_dir):
+            attempts.append(config_dir)
+            if len(attempts) == 1:
+                return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
+            return {"config": "reloaded", "cron": "reloaded"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _apply)
+        await self._run(self._config(ws, tmp_path), monkeypatch, 4)
+
+        assert len(attempts) == 2  # the merge, one retry, then quiet
+
+    @pytest.mark.asyncio
+    async def test_an_untouched_workspace_is_not_reapplied(self, tmp_path, monkeypatch):
+        """The loop seeds from HEAD: a daemon that starts on the current revision
+        has already read it, and must not reload on its first cycle."""
+        _origin, ws = self._pair(tmp_path)
+        applied: list = []
+
+        async def _apply(engine, cron_service, config_dir):
+            applied.append(config_dir)
+            return {"config": "reloaded"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _apply)
+        await self._run(self._config(ws, tmp_path), monkeypatch, 3)
+        assert applied == []
+
+
+class _ForgetsSyncState:
+    @pytest.fixture(autouse=True)
+    def _forget_previous_cycles(self, monkeypatch):
+        """The retained state is module-level, as the daemon's own is."""
+        monkeypatch.setattr(sync, "_last_sync", None)
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+class TestRetainedStateFollowsTheLoop(_ForgetsSyncState, _LoopAgainstRealGit):
+    @pytest.mark.asyncio
+    async def test_a_partly_applied_merge_is_visible(self, tmp_path, monkeypatch):
+        """The state a caller most needs and the log is worst at: the merge
+        landed, the config loaded, and one subsystem is still running the old
+        one."""
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        pinned = self._head(ws)
+
+        async def _apply(engine, cron_service, config_dir):
+            return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
+
+        monkeypatch.setattr(sync, "_apply_sync", _apply)
+        await self._run(self._config(ws, tmp_path), monkeypatch, 2)
+
+        state = sync.last_sync_state()
+        assert state.reload_errors == {"cron": "bad jobs.yaml"}
+        assert state.applied_rev == pinned          # not what the merge landed
+        assert state.fetched_rev == self._head(ws)  # ...which is this
+        assert state.ok and not state.blocked_paths
+
+
+class _Notifier:
+    """Records what the loop sends, with the notification service's signature."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send_notification(self, session_id, title, body="", priority="normal"):
+        self.sent.append({
+            "session_id": session_id, "title": title,
+            "body": body, "priority": priority,
+        })
+        return "notif-test"
+
+
+class _Engine:
+    def __init__(self, notification_service=None):
+        self.notification_service = notification_service
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+class TestBlockedSyncIsVisible(_ForgetsSyncState, _LoopAgainstRealGit):
+    """A refused merge used to leave nothing but a repeating WARNING.
+
+    The instance stays pinned to an old reviewed revision and every later config
+    change stops arriving — on a locked box, the deployment defeated — while it
+    answers every other question exactly like a healthy one.
+    """
+
+    def _dirty_a_skill(self, ws):
+        (ws / "skills" / "backdoor").mkdir(parents=True, exist_ok=True)
+        (ws / "skills" / "backdoor" / "SKILL.md").write_text(
+            "---\nname: backdoor\nallowed-tools: Bash\n---\n",
+        )
+
+    @pytest.mark.asyncio
+    async def test_entering_the_blocked_state_notifies_once(self, tmp_path, monkeypatch):
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        self._dirty_a_skill(ws)
+        pinned = self._head(ws)
+        notifier = _Notifier()
+
+        await self._run(
+            self._config(ws, tmp_path), monkeypatch, 3, engine=_Engine(notifier),
+        )
+
+        assert len(notifier.sent) == 1, notifier.sent  # not one per cycle
+        sent = notifier.sent[0]
+        assert sent["title"] == "Workspace sync blocked"
+        assert "SKILL.md" in sent["body"]
+        assert "propose_config_change" in sent["body"]
+        assert sent["priority"] == "high"
+        # ...and the merge really did not happen.
+        assert self._head(ws) == pinned
+        assert "Europe/Berlin" not in (ws / "config" / "settings.yaml").read_text()
+
+    @pytest.mark.asyncio
+    async def test_the_blocked_state_is_queryable(self, tmp_path, monkeypatch):
+        """A log line cannot be asked a question. `nerve doctor` and
+        GET /api/config/sync both read this."""
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        self._dirty_a_skill(ws)
+        pinned = self._head(ws)
+
+        await self._run(self._config(ws, tmp_path), monkeypatch, 2)
+
+        state = sync.last_sync_state()
+        assert state.blocked_paths and "SKILL.md" in state.blocked_paths[0]
+        assert state.applied_rev == pinned
+        assert state.fetched_rev != pinned  # what it would be running if it could
+        assert state.ok is False and state.checked_at > 0
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_block_notifies_once_more(self, tmp_path, monkeypatch):
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        self._dirty_a_skill(ws)
+        notifier = _Notifier()
+
+        def drop_the_local_change(i):
+            if i == 2:
+                shutil.rmtree(ws / "skills")
+
+        await self._run(
+            self._config(ws, tmp_path), monkeypatch, 4, engine=_Engine(notifier),
+            hook=drop_the_local_change,
+        )
+
+        assert [n["title"] for n in notifier.sent] == [
+            "Workspace sync blocked", "Workspace sync unblocked",
+        ]
+        assert notifier.sent[1]["priority"] == "low"
+        assert not sync.last_sync_state().blocked_paths
+        assert "Europe/Berlin" in (ws / "config" / "settings.yaml").read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_that_never_reached_the_check_reports_no_recovery(
+        self, tmp_path, monkeypatch,
+    ):
+        """A failed fetch establishes nothing about the local tree, and saying
+        "unblocked" there would retract a warning that still stands — and arm the
+        next block to notify all over again."""
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        self._dirty_a_skill(ws)
+        notifier = _Notifier()
+
+        def break_the_remote(i):
+            if i == 1:
+                self._git(
+                    "remote", "set-url", "origin", str(tmp_path / "gone"), cwd=ws,
+                )
+
+        await self._run(
+            self._config(ws, tmp_path), monkeypatch, 3, engine=_Engine(notifier),
+            hook=break_the_remote,
+        )
+
+        assert [n["title"] for n in notifier.sent] == ["Workspace sync blocked"]
+        assert sync.last_sync_state().blocked_paths
+
+    @pytest.mark.asyncio
+    async def test_a_later_failure_does_not_keep_reporting_the_old_block(
+        self, tmp_path, monkeypatch,
+    ):
+        """The other side of the rule above: committing the local change clears
+        the block *and* diverges the branch, so the merge fails for a new reason.
+        Holding on to the old paths would name files that are no longer the
+        problem, and no later block would ever be announced.
+        """
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        self._dirty_a_skill(ws)
+
+        def commit_it(i):
+            if i == 1:
+                self._git("add", "-A", cwd=ws)
+                self._git("commit", "-m", "add skill", cwd=ws)
+
+        await self._run(
+            self._config(ws, tmp_path), monkeypatch, 3, engine=_Engine(_Notifier()),
+            hook=commit_it,
+        )
+
+        state = sync.last_sync_state()
+        assert not state.blocked_paths
+        assert state.ok is False and "ff-only" in state.message
+
+    @pytest.mark.asyncio
+    async def test_no_notification_service_is_not_a_failure(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """Every other sender treats an absent service as "nothing to do here".
+        Filing it as a failed delivery instead would put a warning in the log
+        every time the CLI or a test crosses the transition, with nothing there
+        to deliver to."""
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        self._dirty_a_skill(ws)
+
+        with caplog.at_level(logging.WARNING, logger="nerve.sync_service"):
+            await self._run(self._config(ws, tmp_path), monkeypatch, 2, engine=None)
+            await self._run(
+                self._config(ws, tmp_path), monkeypatch, 1, engine=_Engine(None),
+            )
+        assert "notification failed" not in caplog.text
+        assert sync.last_sync_state().blocked_paths
+
+    def test_doctor_reports_a_blocked_workspace(self, tmp_path, monkeypatch):
+        """The CLI has no view of the daemon's record, and the shell is where an
+        operator asks why config stopped arriving — so doctor runs the check
+        itself."""
+        from nerve.cli import doctor_report
+        from nerve.config import NerveConfig
+
+        _origin, ws = self._pair(tmp_path)
+        config = NerveConfig(
+            workspace=ws, config_dir=tmp_path / "cfg",
+            workspace_sync=WorkspaceSyncConfig(enabled=True, branch="main"),
+        )
+        assert "Workspace sync: reviewed files clean" in doctor_report(config)
+
+        self._dirty_a_skill(ws)
+        report = doctor_report(config)
+        assert "Workspace sync BLOCKED" in report
+        assert "SKILL.md" in report
+        assert "propose_config_change" in report
+
+
+class TestSyncStatusRoute:
+    @pytest.mark.asyncio
+    async def test_reports_the_retained_state(self, monkeypatch):
+        import nerve.gateway.routes.config as route_mod
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True, branch="main")
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(sync, "_last_sync", sync.SyncState(
+            applied_rev="a" * 40, fetched_rev="b" * 40,
+            blocked_paths=["?? skills/backdoor/SKILL.md"],
+            reload_errors={"cron": "bad jobs.yaml"},
+            ok=False, message="fetched bbbbbbbb but ...", checked_at=time.time(),
+        ))
+        body = await route_mod.sync_status_route(user={})
+        assert body["checked"] is True and body["blocked"] is True
+        assert body["blocked_paths"] == ["?? skills/backdoor/SKILL.md"]
+        assert body["applied_rev"] == "a" * 40
+        assert body["reload_errors"] == {"cron": "bad jobs.yaml"}
+        assert body["checked_at"].startswith("20")
+
+    @pytest.mark.asyncio
+    async def test_no_cycle_yet_is_not_a_clean_bill_of_health(self, monkeypatch):
+        import nerve.gateway.routes.config as route_mod
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=False)
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(sync, "_last_sync", None)
+        body = await route_mod.sync_status_route(user={})
+        assert body["checked"] is False and body["enabled"] is False
+        assert "blocked" not in body  # no answer, rather than a false negative

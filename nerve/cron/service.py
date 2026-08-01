@@ -52,16 +52,20 @@ def _resolve_wakeup_prompt(prompt: str) -> str:
     return _WAKEUP_SENTINEL_PROMPT if prompt.strip() in _WAKEUP_SENTINELS else prompt
 
 
-def _drop_reserved(jobs: list[CronJob]) -> list[CronJob]:
-    """Drop jobs holding a reserved id, warning once per offender.
+def _drop_reserved(jobs: list[CronJob]) -> tuple[list[CronJob], list[str]]:
+    """Split *jobs* into the ones that may be scheduled and the reserved ids.
 
     Nothing but a hand-edited YAML file can produce one of these, and a job that
     simply never runs is near-impossible to diagnose from the outside, so the
-    warning has to name the job and the way out of it.
+    warning has to name the job and the way out of it — and the ids come back to
+    the caller so a reload can report the refusal instead of leaving the operator
+    to wonder why their job vanished.
     """
     kept: list[CronJob] = []
+    rejected: list[str] = []
     for job in jobs:
         if is_reserved_job_id(job.id):
+            rejected.append(job.id)
             logger.warning(
                 "Cron job '%s' (from %s) will not be scheduled: its id is "
                 "reserved by the daemon (%s). Rename the job to schedule it.",
@@ -71,7 +75,7 @@ def _drop_reserved(jobs: list[CronJob]) -> list[CronJob]:
             )
         else:
             kept.append(job)
-    return kept
+    return kept, rejected
 
 
 class NotCrontabError(ValueError):
@@ -251,10 +255,17 @@ class CronService:
         self.timezone = ZoneInfo(config.timezone)
         self.scheduler = AsyncIOScheduler(timezone=self.timezone)
         self._jobs: list[CronJob] = []
+        # Ids from the last load that were refused for being reserved. Reported
+        # by reload() so the operator hears about it through the same channel
+        # that told them the reload succeeded.
+        self._rejected_job_ids: list[str] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
-        # Serialize reload() so the file watcher, the sync loop, and the HTTP
-        # route can't interleave scheduler mutations.
+        # Set by the gateway before start() so freshly-(re)built source runners
+        # get wired to health-alert notifications, including after a reload.
+        self.notification_service = None
+        # Serialize reload() so the sync loop and the HTTP routes can't
+        # interleave scheduler mutations.
         self._reload_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -316,52 +327,7 @@ class CronService:
             logger.info("Scheduled job: %s (%s)", job.id, job.schedule)
 
         # Register source runners (pure ingestors — no engine needed)
-        try:
-            from nerve.sources.registry import build_source_runners
-
-            self._source_runners = build_source_runners(self.config, self.db)
-
-            for runner in self._source_runners:
-                source_name = runner.source.source_name
-                # Source names can be compound (e.g. "gmail:account@email.com").
-                # The config key is the base type before the colon.
-                config_key = source_name.split(":")[0]
-                source_config = getattr(self.config.sync, config_key, None)
-                if source_config is None:
-                    continue
-                schedule_str = getattr(source_config, "schedule", "*/15 * * * *")
-
-                try:
-                    trigger = _crontab_to_trigger(
-                        schedule_str, timezone=self.timezone,
-                    )
-                except NotCrontabError:
-                    seconds = _parse_interval(schedule_str)
-                    trigger = IntervalTrigger(
-                        seconds=seconds, timezone=self.timezone,
-                    )
-                except InvalidScheduleError as e:
-                    # Same call as the cron loop above, same answer — skip this
-                    # one, keep the rest. Letting it reach the enclosing
-                    # `except Exception` would abandon every source after it in
-                    # the list under a single "failed to register source
-                    # runners" warning that names the wrong problem.
-                    logger.error(
-                        "Source '%s' will not be scheduled: %s", source_name, e,
-                    )
-                    continue
-
-                self.scheduler.add_job(
-                    self._run_source_wrapper,
-                    trigger,
-                    args=[runner],
-                    id=runner.job_id,
-                    name=f"Source: {source_name}",
-                    replace_existing=True,
-                )
-                logger.info("Scheduled source: %s (%s)", source_name, schedule_str)
-        except Exception as e:
-            logger.warning("Failed to register source runners: %s", e, exc_info=True)
+        self._register_source_runners()
 
         # Daily cleanup of expired messages and consumer cursors
         self.scheduler.add_job(
@@ -421,14 +387,18 @@ class CronService:
         carry out raises with the running schedule exactly as it was. That
         covers the gate registry too; see :meth:`_reload_locked`.
 
-        Serialized via a lock so concurrent callers (file watcher, sync loop,
-        HTTP route) can't interleave scheduler mutations. The two properties are
+        Serialized via a lock so concurrent callers (sync loop, HTTP routes)
+        can't interleave scheduler mutations. The two properties are
         separate: the lock keeps two reloads from overlapping, and the planning
         pass keeps a single failing one from applying half of itself.
 
-        Returns a summary dict: ``{"added", "removed", "updated", "enabled"}``,
-        where "updated" is every enabled job that already had a trigger. It says
-        what the reload rescheduled, not which jobs the file changed.
+        Returns a summary dict: ``{"added", "removed", "updated", "enabled",
+        "rejected"}``. ``updated`` is every enabled job that already had a
+        trigger — it says what the reload rescheduled, not which jobs the file
+        changed. ``enabled`` counts jobs that are scheduled, not jobs whose YAML
+        says ``enabled: true``; ``rejected`` names the ids the loader refused
+        because the daemon reserves them, which would otherwise be the one class
+        of job that disappears from the reload without the reload mentioning it.
         """
         async with self._reload_lock:
             return await self._reload_locked()
@@ -555,17 +525,184 @@ class CronService:
         # Committed, so the gates that disappeared really are gone from the jobs
         # that are now live — say so (the loader was told to keep quiet above).
         warn_vanished_gates(gates_before)
+        # Every enabled job above either kept a trigger or was given one, so this
+        # count describes the scheduler and not just the file. Jobs the loader
+        # refused for holding a reserved id are not in new_by_id at all, and are
+        # reported separately rather than being silently absent.
         enabled = sum(1 for j in new_by_id.values() if j.enabled)
+        rejected = list(self._rejected_job_ids)
         logger.info(
-            "Cron reloaded: +%d added, ~%d updated, -%d removed (%d enabled)",
-            len(added), len(updated), len(removed), enabled,
+            "Cron reloaded: +%d added, ~%d updated, -%d removed (%d enabled, "
+            "%d rejected)",
+            len(added), len(updated), len(removed), enabled, len(rejected),
         )
         return {
             "added": added,
             "removed": removed,
             "updated": updated,
             "enabled": enabled,
+            "rejected": rejected,
         }
+
+    def _source_schedule(self, runner) -> str | None:
+        """The configured schedule for *runner*, or ``None`` if it has no config.
+
+        Source names can be compound (e.g. "gmail:account@email.com"). The
+        config key is the base type before the colon.
+        """
+        config_key = runner.source.source_name.split(":")[0]
+        source_config = getattr(self.config.sync, config_key, None)
+        if source_config is None:
+            return None
+        return getattr(source_config, "schedule", "*/15 * * * *")
+
+    def _plan_source_runners(
+        self, runners: list,
+    ) -> list[tuple["SourceRunner", CronTrigger | IntervalTrigger, str]]:
+        """Pair every runner with the trigger it is to be scheduled on.
+
+        The planning half of a source reload: nothing here touches the
+        scheduler, and anything that cannot be scheduled raises before the
+        caller has removed the running jobs.
+        :meth:`_schedule_source_runners` is the start-up counterpart, which
+        skips what this refuses.
+
+        Stricter than start-up on both counts. An interval string naming no
+        usable interval (``hourly``, ``@daily``) raises instead of taking
+        :func:`_parse_interval`'s 2h default: at boot a conservative cadence
+        beats a source that never runs, but on a reload it moves a source off
+        the cadence the operator wrote while the response reports success. A
+        runner whose source has no config section is dropped here rather than
+        at the scheduler, so the response can be built from what was scheduled.
+
+        Raises :class:`InvalidScheduleError`, naming the source.
+        """
+        planned: list[tuple[SourceRunner, CronTrigger | IntervalTrigger, str]] = []
+        for runner in runners:
+            schedule_str = self._source_schedule(runner)
+            if schedule_str is None:
+                continue
+            source_name = runner.source.source_name
+            try:
+                trigger = _crontab_to_trigger(schedule_str, timezone=self.timezone)
+            except NotCrontabError:
+                seconds = _interval_seconds(schedule_str)
+                if seconds is None:
+                    raise InvalidScheduleError(
+                        f"Source '{source_name}': schedule {schedule_str!r} is "
+                        "neither a crontab expression nor an interval",
+                    ) from None
+                trigger = IntervalTrigger(seconds=seconds, timezone=self.timezone)
+            except InvalidScheduleError as e:
+                raise InvalidScheduleError(f"Source '{source_name}': {e}") from e
+            planned.append((runner, trigger, schedule_str))
+        return planned
+
+    def _apply_source_runners(self, planned: list) -> None:
+        """Put planned runner/trigger pairs on the scheduler (wiring
+        notifications). No parsing, so nothing here can fail half-way."""
+        for runner, trigger, schedule_str in planned:
+            if self.notification_service is not None:
+                runner.set_notification_service(self.notification_service)
+            source_name = runner.source.source_name
+            self.scheduler.add_job(
+                self._run_source_wrapper,
+                trigger,
+                args=[runner],
+                id=runner.job_id,
+                name=f"Source: {source_name}",
+                replace_existing=True,
+            )
+            logger.info("Scheduled source: %s (%s)", source_name, schedule_str)
+
+    def _schedule_source_runners(self, runners: list) -> None:
+        """Schedule already-built source runners, skipping the unschedulable.
+
+        The start-up path, deliberately lenient: one source with a typo in its
+        schedule must not cost the daemon the others, and an interval string the
+        parser cannot use falls back to 2h rather than leaving the source
+        unscheduled. A reload plans first and refuses the whole change instead
+        (:meth:`_plan_source_runners`).
+        """
+        planned = []
+        for runner in runners:
+            schedule_str = self._source_schedule(runner)
+            if schedule_str is None:
+                continue
+            try:
+                trigger = _crontab_to_trigger(schedule_str, timezone=self.timezone)
+            except NotCrontabError:
+                seconds = _parse_interval(schedule_str)
+                trigger = IntervalTrigger(seconds=seconds, timezone=self.timezone)
+            except InvalidScheduleError as e:
+                # Same call as the cron loop, same answer — skip this one, keep
+                # the rest. Letting it reach the caller's `except Exception`
+                # would abandon every source after it in the list under a single
+                # "failed to register source runners" warning naming the wrong
+                # problem.
+                logger.error(
+                    "Source '%s' will not be scheduled: %s",
+                    runner.source.source_name, e,
+                )
+                continue
+            planned.append((runner, trigger, schedule_str))
+        self._apply_source_runners(planned)
+
+    def _register_source_runners(self) -> None:
+        """Build + schedule source runners at startup. Swallows errors so a bad
+        source config never crashes the daemon boot."""
+        try:
+            from nerve.sources.registry import build_source_runners
+
+            self._source_runners = build_source_runners(self.config, self.db)
+            self._schedule_source_runners(self._source_runners)
+        except Exception as e:  # noqa: BLE001 — boot must not fail on a bad source
+            logger.warning("Failed to register source runners: %s", e, exc_info=True)
+
+    async def reload_sources(self) -> dict:
+        """Rebuild source runners from config and reschedule them without a
+        restart (picks up added/removed sources and schedule changes).
+
+        All-or-nothing, like :meth:`reload`. Building the runners and planning
+        every trigger both happen before a single job is removed, so a build
+        failure or a schedule the scheduler will not take raises with the
+        running sources exactly as they were. Removing first and parsing the new
+        schedules afterwards is how a working ``*/15`` came to be destroyed by
+        the typo meant to replace it, with the source still named under
+        ``sources`` and the reload answering ``ok``.
+
+        The returned ``sources`` are the runners that are on the scheduler, not
+        the ones that were built: those are the same list only when nothing was
+        dropped, and the case where they differ is the one a caller needs told.
+
+        Runners schedule under ``source:<name>``, and the whole ``source:``
+        namespace is refused to cron jobs when they are loaded, so the
+        ``replace_existing=True`` below cannot take a user's job away from them.
+        The reservation has to cover the namespace rather than the runners that
+        happen to be live: otherwise a job could hold ``source:telegram`` while
+        telegram is switched off and lose its trigger — permanently, and while
+        every reload kept counting it as enabled — the moment it was switched
+        back on.
+        """
+        from nerve.sources.registry import build_source_runners
+
+        async with self._reload_lock:
+            # -- Plan: everything that can fail, before anything is applied ----
+            new_runners = build_source_runners(self.config, self.db)  # may raise → caller reports
+            planned = self._plan_source_runners(new_runners)
+
+            # -- Apply: scheduler bookkeeping only -----------------------------
+            old_ids = {r.job_id for r in self._source_runners}
+            for jid in old_ids:
+                if self.scheduler.get_job(jid) is not None:
+                    self.scheduler.remove_job(jid)
+            self._source_runners = new_runners
+            self._apply_source_runners(planned)
+            new_ids = {runner.job_id for runner, _, _ in planned}
+            return {
+                "sources": sorted(new_ids),
+                "removed": sorted(old_ids - new_ids),
+            }
 
     async def stop(self) -> None:
         """Stop the scheduler."""
@@ -897,7 +1034,8 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
-            return _drop_reserved(user_jobs)
+            kept, self._rejected_job_ids = _drop_reserved(user_jobs)
+            return kept
 
         # Tag sources for display in CLI
         for j in system_jobs:
@@ -918,7 +1056,8 @@ class CronService:
         for j in user_jobs:
             jobs_by_id[j.id] = j
 
-        return _drop_reserved(list(jobs_by_id.values()))
+        kept, self._rejected_job_ids = _drop_reserved(list(jobs_by_id.values()))
+        return kept
 
     async def _run_job_wrapper(self, job: CronJob) -> None:
         """Wrapper to run a cron job with logging and optional lock."""

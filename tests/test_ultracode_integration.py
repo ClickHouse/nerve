@@ -53,7 +53,7 @@ def _backend(
     external_mcp_servers: list[McpServerConfig] | None = None,
 ) -> CodexBackend:
     return CodexBackend(BackendDeps(
-        config=cfg,
+        config=lambda: cfg,
         db=None,
         registry=None,
         tool_ctx_factory=lambda sid: None,

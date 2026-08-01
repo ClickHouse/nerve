@@ -133,7 +133,8 @@ memory:
 # value wins outright, so it disables both the workspace location and the
 # fallback, and `nerve init` will keep regenerating a system.yaml nothing reads.
 #
-# Editing the cron files does not apply itself: POST /api/cron/reload does.
+# Editing the cron files does not apply itself: run `nerve reload`, or let the
+# next workspace sync do it.
 
 # Workflow runs — budget-capped multi-agent jobs (Claude Workflow tool or
 # Codex Ultracode) in dedicated tracked sessions. Nerve meters real dollar

@@ -19,7 +19,7 @@ def _client(tmp_path, **codex_overrides) -> CodexClient:
         "codex": {"home_dir": str(tmp_path / "home"), **codex_overrides},
     })
     deps = SimpleNamespace(
-        config=cfg,
+        config=lambda: cfg,
         external_mcp_servers=lambda: [],
         gateway_port=lambda: None,
         mint_session_token=None,

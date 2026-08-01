@@ -178,7 +178,7 @@ async def services(db, engine, tmp_path):
     """(runs service, review loop service) — started, torn down in order."""
     cfg = _make_config(tmp_path)
     runs = WorkflowRunService(cfg, db, engine)
-    rls = ReviewLoopService(cfg, db, engine, runs)
+    rls = ReviewLoopService(lambda: cfg, db, engine, runs)
     runs.add_completion_listener(rls._on_run_terminal)
     rls._worker_task = asyncio.create_task(rls._worker())
     yield runs, rls
@@ -571,7 +571,7 @@ class TestReviewLoopService:
         cfg = _make_config(tmp_path)
         cfg.workflows.review_loop.verifier.engine = "codex-ultracode"
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         engine._backends = {}  # codex not configured
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=None, autostart=False,
@@ -695,7 +695,7 @@ class TestProgressDetection:
 
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=None,
             cwd=str(repo), autostart=False,
@@ -759,7 +759,7 @@ class TestRecovery:
         advanced. Recovery must consume the result and dispatch the verifier."""
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         obs = await _mk_observer(db)
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=obs, autostart=False,
@@ -797,7 +797,7 @@ class TestRecovery:
         re-issues with the SAME pre-generated id."""
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         obs = await _mk_observer(db)
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=obs, autostart=False,
@@ -824,7 +824,7 @@ class TestRecovery:
     ):
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         obs = await _mk_observer(db)
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=obs, autostart=False,
@@ -862,7 +862,7 @@ class TestRecovery:
         the routing (dispatch the verifier), not skip the settled attempt."""
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         obs = await _mk_observer(db, "obs00r01")
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=obs, autostart=False,
@@ -895,7 +895,7 @@ class TestRecovery:
     async def test_recovery_recomputes_spend(self, db, engine, tmp_path):
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         loop = await rls.create_loop(
             goal="g", verifier="- a", session_id=None, autostart=False,
         )
@@ -986,7 +986,7 @@ class TestCreateLoopCwd:
     async def test_missing_cwd_is_created(self, db, engine, tmp_path):
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         target = tmp_path / "fresh" / "nested"
         assert not target.exists()
         loop = await rls.create_loop(
@@ -1003,7 +1003,7 @@ class TestCreateLoopCwd:
         occupied.write_text("not a directory")
         cfg = _make_config(tmp_path)
         runs = WorkflowRunService(cfg, db, engine)
-        rls = ReviewLoopService(cfg, db, engine, runs)
+        rls = ReviewLoopService(lambda: cfg, db, engine, runs)
         with pytest.raises(ReviewLoopError, match="invalid cwd"):
             await rls.create_loop(
                 goal="g", verifier="- a", session_id=None,

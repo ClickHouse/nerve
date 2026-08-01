@@ -908,6 +908,57 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         errors.append(f"[ERR] Workspace not found: {config.workspace}")
 
+    # Workspace sync. Two questions, because the answers come from different
+    # places: what the daemon's loop last did (retained in-process, so only the
+    # in-daemon /doctor sees it), and whether the reviewed files are clean right
+    # now (a git check any process can run, which is the one that matters from a
+    # shell — a blocked sync leaves the box pinned to an old revision with
+    # nothing but a log line to say so).
+    sync_cfg = getattr(config, "workspace_sync", None)
+    # Also when locked with the loop off: `nerve config sync` is still the only
+    # way config reaches that box, so a refusal is just as terminal there.
+    if sync_cfg is not None and (sync_cfg.enabled or config.lockdown):
+        try:
+            from nerve.sync_service import (
+                _describe_paths,
+                last_sync_state,
+                local_block_reasons,
+            )
+
+            state = last_sync_state()
+            if state is not None:
+                age = max(0, int(time.time() - state.checked_at))
+                if state.ok:
+                    lines.append(
+                        f"[OK] Workspace sync: applied "
+                        f"{state.applied_rev[:8] or '(unknown)'}, last checked "
+                        f"{age}s ago"
+                    )
+                else:
+                    # Covers the failures the local check below cannot see: a
+                    # dead remote, a diverged branch, an invalid bundle.
+                    warnings.append(
+                        f"[WARN] Workspace sync: last cycle ({age}s ago) failed "
+                        f"— {state.message}"
+                    )
+                for name, why in sorted(state.reload_errors.items()):
+                    warnings.append(
+                        f"[WARN] Workspace sync: {name} did not take the merged "
+                        f"config ({why}) — retried every cycle"
+                    )
+            blocking = local_block_reasons(config.workspace, config.lockdown)
+            if blocking:
+                warnings.append(
+                    f"[WARN] Workspace sync BLOCKED: the reviewed files have "
+                    f"local changes, so no merged config reaches this instance "
+                    f"— {_describe_paths(blocking)}. Commit them, discard them, "
+                    f"or re-propose them as a PR with propose_config_change"
+                )
+            else:
+                lines.append("[OK] Workspace sync: reviewed files clean")
+        except Exception as e:
+            warnings.append(f"[WARN] Workspace sync check failed: {e}")
+
     # Check proxy
     if config.proxy.enabled:
         binary = config.proxy.binary_path.expanduser()
@@ -1165,6 +1216,122 @@ def doctor(ctx: click.Context) -> None:
         ctx.exit(1)
 
 
+# Bind addresses that name no connectable destination, so a client on the same
+# box has to ask for loopback instead.
+_WILDCARD_BINDS = ("", "0.0.0.0", "::", "*")
+
+
+def _gateway_url(config, path: str) -> str:
+    """URL for a loopback call to this box's own gateway.
+
+    ``gateway.host`` is a *bind* address, not necessarily somewhere a client can
+    connect to; see :data:`_WILDCARD_BINDS`.
+    """
+    scheme = "https" if config.gateway.ssl.enabled else "http"
+    host = config.gateway.host
+    if host in _WILDCARD_BINDS:
+        host = "127.0.0.1"
+    return f"{scheme}://{host}:{config.gateway.port}{path}"
+
+
+@main.command()
+@click.pass_context
+def reload(ctx: click.Context) -> None:
+    """Apply config edits to the running daemon without restarting it.
+
+    Re-reads config.yaml, config.local.yaml and the workspace settings, then
+    reloads cron jobs, cron sources, MCP servers and skills. Anything that needs
+    a restart instead is listed rather than silently skipped; `docs/config.md`
+    has the full table.
+    """
+    import httpx
+
+    from nerve.gateway.auth import create_token
+
+    config = ctx.obj["config"]
+    if config is None:
+        raise click.ClickException(
+            f"Config could not be loaded ({ctx.obj.get('config_error')}); "
+            "run 'nerve config validate' to see why."
+        )
+    if not config.auth.jwt_secret and config.lockdown:
+        raise click.ClickException(
+            "No auth.jwt_secret in the config read here, and a locked gateway "
+            "never runs open, so nothing sent from this shell can be "
+            "authenticated. If the secret comes from ${ENV_VAR}, export it here "
+            "too; if the daemon has none either, it is refusing every request "
+            "and needs one before it can be reloaded."
+        )
+    url = _gateway_url(config, "/api/config/reload")
+    # Certificate verification stands except in the one case where it cannot
+    # hold: a wildcard bind means the request goes to 127.0.0.1, and the
+    # daemon's certificate is issued for a hostname, so checking it there would
+    # fail on exactly the setups that bothered to configure TLS. When
+    # gateway.host names a real host the certificate should match it, and a
+    # failure there is worth hearing about rather than skipping past.
+    verify = config.gateway.host not in _WILDCARD_BINDS
+    # A token when there is a secret to sign one with, and otherwise none: an
+    # unlocked gateway with no auth.jwt_secret does not ask for one (require_auth
+    # runs open there), so an empty secret is not a reason to refuse to call. The
+    # operator hand-editing config on a dev box is the likeliest caller of all.
+    headers = {}
+    if config.auth.jwt_secret:
+        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
+    try:
+        resp = httpx.post(
+            url,
+            headers=headers,
+            verify=verify,
+            # A reload re-reads config and rebuilds cron, sources, MCP and
+            # skills; MCP servers in particular can take a while to come up.
+            timeout=120,
+        )
+    except httpx.ConnectError:
+        raise click.ClickException(
+            f"No daemon answering at {url}, which is the address in the config "
+            "read here. If gateway.host, gateway.port or the SSL settings were "
+            "part of the edit, the running daemon is still bound to the old "
+            "address and only a restart moves it. Otherwise nothing is running, "
+            "and a stopped daemon reads config fresh when it starts "
+            "('nerve start')."
+        ) from None
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"Could not reach {url}: {e}") from None
+    if resp.status_code in (401, 403):
+        raise click.ClickException(
+            "The gateway rejected the request. The running daemon's "
+            "auth.jwt_secret is not the one read here — it either started with a "
+            "different value, or with one this config no longer supplies. Restart "
+            "it to pick up the current config."
+        )
+    if resp.status_code != 200:
+        raise click.ClickException(f"{url} returned {resp.status_code}: {resp.text[:400]}")
+
+    body = resp.json()
+    errors = body.get("errors") or {}
+    for name, outcome in (body.get("detail") or {}).items():
+        if name == "restart_required":
+            continue
+        if name in errors:
+            click.secho(f"  [ERR] {name}: {errors[name]}", fg="red")
+            continue
+        if isinstance(outcome, dict):
+            outcome = ", ".join(f"{k}={v}" for k, v in outcome.items())
+        click.echo(f"  {name}: {outcome}")
+    if body.get("restart_required"):
+        click.secho(
+            f"  [WARN] changed but needs a restart: {body['restart_required']}",
+            fg="yellow",
+        )
+    if body.get("ok"):
+        click.secho("Config reloaded", fg="green")
+    else:
+        # Partial by design: a bad settings.yaml must not block a valid cron
+        # edit. Non-zero so a script doesn't read this as a clean apply.
+        click.secho("Config reload incomplete — see the errors above", fg="red")
+        ctx.exit(1)
+
+
 @main.command()
 @click.option("--dry-run", is_flag=True, help="Show what would change without writing.")
 @click.pass_context
@@ -1238,8 +1405,10 @@ def config_sync(
     """Pull the workspace from its git remote (the shared config repo).
 
     Fast-forward only. This moves the files; it does not tell a running daemon
-    about them. The daemon applies them on its next sync cycle, or immediately
-    via POST /api/config/sync.
+    about them. The daemon applies them on its next sync cycle, because that loop
+    compares what is on disk against the revision it last applied. For that to
+    happen sooner, run `nerve reload`: POST /api/config/sync would find nothing
+    left to merge and reload nothing.
     """
     from nerve.sync_service import sync_workspace
 
@@ -1361,7 +1530,9 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
     )
 
     config = ctx.obj["config"]
-    backend = CodexBackend(SimpleNamespace(config=config))
+    # deps.config is a callable, not the object — see BackendDeps. Nothing
+    # reloads in a one-shot command, but the backend reads it as a callable.
+    backend = CodexBackend(SimpleNamespace(config=lambda: config))
     status = asyncio.run(backend.preflight(force=True))
     report = {
         "preflight": status,

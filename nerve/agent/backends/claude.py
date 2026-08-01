@@ -367,7 +367,18 @@ class ClaudeBackend:
 
     def __init__(self, deps: Any):
         self._deps = deps
-        self.config = deps.config
+
+    @property
+    def config(self):
+        """The live config, resolved per read rather than captured.
+
+        Everything below builds SDK options straight off this — the model, the
+        thinking budget, the 1M-context header, the sub-agent permission mode.
+        Holding a reference would freeze all of them at start-up while the
+        engine's own copy moved on with a reload, so the context bar could show
+        a 200k budget for sessions still being opened with the 1M header.
+        """
+        return self._deps.config()
 
     # -- policy -------------------------------------------------------- #
 

@@ -38,7 +38,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.agent.streaming import broadcaster
 from nerve.db.review_loops import (
@@ -52,7 +52,7 @@ from nerve.workflows.service import ENGINE_BACKENDS, ENGINE_CODEX, WorkflowRunEr
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
-    from nerve.config import NerveConfig
+    from nerve.config import NerveConfig, ReviewLoopConfig
     from nerve.db import Database
     from nerve.workflows.service import WorkflowRunService
 
@@ -231,22 +231,38 @@ class ReviewLoopService:
 
     def __init__(
         self,
-        config: NerveConfig,
+        config: Callable[[], NerveConfig],
         db: Database,
         engine: AgentEngine,
         runs: WorkflowRunService,
     ):
-        self.config = config
+        self._config = config
         self.db = db
         self.engine = engine
         self.runs = runs
-        self.rl = config.workflows.review_loop
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._tick_task: asyncio.Task | None = None
         self._locks: dict[str, asyncio.Lock] = {}
         self._detached: set[asyncio.Task] = set()
         self._stopping = False
+
+    @property
+    def config(self) -> NerveConfig:
+        """The live config, resolved per read rather than captured."""
+        return self._config()
+
+    @property
+    def rl(self) -> ReviewLoopConfig:
+        """The live ``workflows.review_loop`` section.
+
+        Resolved on every read, not bound once: this service is a lifespan
+        singleton, so a captured sub-object would still be answering with the
+        budget ceilings, iteration caps and sandbox mode the daemon booted with
+        long after a reload had reported them applied — and the dollar values
+        are read at the moment a leg is funded.
+        """
+        return self._config().workflows.review_loop
 
     # ------------------------------------------------------------------ #
     #  Lifespan                                                           #

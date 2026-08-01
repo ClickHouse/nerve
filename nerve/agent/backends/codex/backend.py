@@ -127,13 +127,29 @@ class CodexBackend:
 
     def __init__(self, deps: Any):
         self._deps = deps
-        self.config = deps.config
-        self.codex = deps.config.codex
         Path(self._home_dir()).mkdir(parents=True, exist_ok=True)
         self._preflight_cache: tuple[float, dict[str, Any]] | None = None
         self._preflight_lock = asyncio.Lock()
         self._live_models: set[str] = set()
         self._rate_limits: dict[str, Any] | None = None
+
+    @property
+    def config(self):
+        """The live config, resolved per read rather than captured."""
+        return self._deps.config()
+
+    @property
+    def codex(self):
+        """The live ``codex`` section.
+
+        A property and not an attribute for the same reason as :attr:`config`,
+        and more sharply: a sub-object caches one level deeper, so re-pointing
+        ``config`` alone would leave the sandbox mode, approval policy, effort
+        map and auth choice on their start-up values while everything read off
+        ``config`` had moved. Resolving through the deps callable means there is
+        no second place for the two to disagree.
+        """
+        return self._deps.config().codex
 
     # -- policy ---------------------------------------------------------- #
 

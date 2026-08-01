@@ -1,9 +1,10 @@
-"""Tests for cron hot-reload and the reserved job-id namespace (Story 5)."""
+"""Tests for cron hot-reload and the reserved job-id namespace."""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -84,6 +85,14 @@ def _gated_job(job_id: str, **kw) -> dict:
     return _job_dict(job_id, run_if=[{"type": "reload_test"}], **kw)
 
 
+def _source_runner(name: str):
+    return SimpleNamespace(
+        job_id=f"source:{name}",
+        source=SimpleNamespace(source_name=name),
+        set_notification_service=lambda *a, **k: None,
+    )
+
+
 class TestReload:
     @pytest.mark.asyncio
     async def test_add_job(self, svc):
@@ -158,6 +167,7 @@ class TestReload:
         result = await service.reload()  # identical file
         assert result == {
             "added": [], "removed": [], "updated": ["j1"], "enabled": 1,
+            "rejected": [],
         }
         assert service.scheduler.get_job("j1") is not None
 
@@ -168,7 +178,9 @@ class TestReloadSafety:
         service, jobs_file = svc
         _write_jobs(jobs_file, [_job_dict("j1", enabled=False)])
         result = await service.reload()
-        assert result == {"added": [], "removed": [], "updated": [], "enabled": 0}
+        assert result == {
+            "added": [], "removed": [], "updated": [], "enabled": 0, "rejected": [],
+        }
         assert service.scheduler.get_job("j1") is None
 
     @pytest.mark.asyncio
@@ -274,6 +286,69 @@ class TestReloadSafety:
         assert service.scheduler.get_job("source:github") is None
         # The daemon's own wakeup sweep is never displaced by a same-named job.
         assert service.scheduler.get_job("wakeup_sweep") is None
+
+    @pytest.mark.asyncio
+    async def test_reload_names_the_jobs_it_refused(self, svc):
+        """A refused job is missing from the schedule *and* from added/removed/
+        updated, so without this it disappears from the reload entirely and the
+        only trace is a log line on a box nobody is tailing.
+        """
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [
+            _job_dict("source:gmail", schedule="1h"),
+            _job_dict("cleanup", schedule="1h"),
+            _job_dict("legit", schedule="1h"),
+        ])
+        result = await service.reload()
+        assert result["rejected"] == ["source:gmail", "cleanup"]
+        assert result["enabled"] == 1  # only 'legit' — not 3
+
+        # Renaming the job clears the refusal on the next reload.
+        _write_jobs(jobs_file, [
+            _job_dict("my-gmail", schedule="1h"),
+            _job_dict("legit", schedule="1h"),
+        ])
+        result = await service.reload()
+        assert result["rejected"] == []
+        assert result["added"] == ["my-gmail"] and result["enabled"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_source_reload_cannot_take_a_colliding_job_off_the_schedule(
+        self, svc, monkeypatch,
+    ):
+        """Source runners schedule with ``replace_existing=True``, so before the
+        whole ``source:`` namespace was reserved, turning a source on removed a
+        user job's trigger while every later reload kept counting it as enabled —
+        unrecoverable short of a restart. Both halves are checked here: the job
+        never gets a trigger to lose, and the reload says so.
+        """
+        import nerve.sources.registry as registry
+
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [
+            _job_dict("source:gmail", schedule="1h"),
+            _job_dict("legit", schedule="1h"),
+        ])
+        result = await service.reload()
+        assert result["rejected"] == ["source:gmail"]
+        assert result["enabled"] == 1
+
+        runner = MagicMock()
+        runner.job_id = "source:gmail"
+        runner.source.source_name = "gmail"
+        service.config.sync.gmail.schedule = "5m"
+        monkeypatch.setattr(
+            registry, "build_source_runners", lambda config, db: [runner],
+        )
+        await service.reload_sources()
+
+        # The trigger under that id belongs to the source runner, and the reload
+        # after it still reports one enabled job — the one that is really live.
+        assert service.scheduler.get_job("source:gmail") is not None
+        result = await service.reload()
+        assert result["enabled"] == 1
+        assert result["rejected"] == ["source:gmail"]
+        assert service.scheduler.get_job("legit") is not None
 
     @pytest.mark.asyncio
     async def test_reserved_rejection_is_logged(self, svc, caplog):
@@ -578,8 +653,133 @@ class TestRefusedReloadRestoresGates:
         assert "reload_test" in caplog.text
 
 
+@pytest_asyncio.fixture
+async def sources(svc, monkeypatch):
+    """The service with a gmail (crontab) and a github (interval) source live.
+
+    ``sync`` is a plain namespace rather than the fixture's MagicMock, because a
+    source whose config section is absent has to read as absent.
+    """
+    import nerve.sources.registry as registry
+
+    service, _jobs_file = svc
+    service.config.sync = SimpleNamespace(
+        gmail=SimpleNamespace(schedule="*/15 * * * *"),
+        github=SimpleNamespace(schedule="30m"),
+    )
+    monkeypatch.setattr(
+        registry, "build_source_runners",
+        lambda config, db: [_source_runner("gmail"), _source_runner("github")],
+    )
+    service._register_source_runners()
+    return service, registry
+
+
+class TestSourceReloadIsAllOrNothing:
+    """A source reload the daemon cannot carry out must change nothing.
+
+    Every old source job was removed before a single new schedule had been
+    parsed, and the scheduling pass logged and skipped whatever it could not
+    build. One typo therefore destroyed that source's working trigger, moved
+    the others onto whatever their strings happened to parse to, and returned a
+    response naming sources that were never scheduled — which the reload route
+    rendered as ``ok: true``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_bad_crontab_refuses_the_whole_reload(self, sources):
+        service, _registry = sources
+        before = {
+            jid: str(service.scheduler.get_job(jid).trigger)
+            for jid in ("source:gmail", "source:github")
+        }
+        service.config.sync.gmail.schedule = "99 * * * *"
+
+        from nerve.config import ConfigError
+
+        with pytest.raises(ConfigError) as ei:
+            await service.reload_sources()
+
+        assert "gmail" in str(ei.value) and "99 * * * *" in str(ei.value)
+        assert {
+            jid: str(service.scheduler.get_job(jid).trigger) for jid in before
+        } == before
+
+    @pytest.mark.asyncio
+    async def test_an_unusable_interval_is_refused_not_defaulted(self, sources):
+        """``_parse_interval`` answers 'hourly' with its 2h default, so this
+        reload used to move the source from 30 minutes to 2 hours and report
+        success. The value nobody wrote down is not an outcome to return ok for.
+        """
+        service, _registry = sources
+        before = str(service.scheduler.get_job("source:github").trigger)
+        service.config.sync.github.schedule = "hourly"
+
+        from nerve.config import ConfigError
+
+        with pytest.raises(ConfigError) as ei:
+            await service.reload_sources()
+
+        assert "github" in str(ei.value) and "hourly" in str(ei.value)
+        assert str(service.scheduler.get_job("source:github").trigger) == before
+
+    @pytest.mark.asyncio
+    async def test_the_response_names_only_what_is_scheduled(
+        self, sources, monkeypatch,
+    ):
+        """A runner whose source has no config section is not scheduled. The
+        response was built from the runners that were built, so it named that
+        one under ``sources`` and left it out of ``removed``."""
+        service, registry = sources
+        monkeypatch.setattr(
+            registry, "build_source_runners",
+            lambda config, db: [_source_runner("gmail"), _source_runner("ghost")],
+        )
+
+        result = await service.reload_sources()
+
+        assert service.scheduler.get_job("source:ghost") is None
+        assert result["sources"] == ["source:gmail"]
+        assert result["removed"] == ["source:github"]
+
+    @pytest.mark.asyncio
+    async def test_a_reload_it_can_carry_out_still_applies(self, sources):
+        service, _registry = sources
+        service.config.sync.github.schedule = "45m"
+
+        result = await service.reload_sources()
+
+        assert result["sources"] == ["source:github", "source:gmail"]
+        assert result["removed"] == []
+        assert "0:45:00" in str(service.scheduler.get_job("source:github").trigger)
+
+
 class TestInvalidScheduleAtStartup:
     """Startup answers the same error differently from reload(), on purpose."""
+
+    @pytest.mark.asyncio
+    async def test_start_falls_back_rather_than_dropping_the_source(
+        self, svc, monkeypatch,
+    ):
+        """Boot keeps the lenient reading of an interval string it cannot use:
+        a source on a conservative 2h cadence beats one that never runs. Only
+        the reload path is strict, where an operator is waiting on an answer and
+        the old cadence is still running until they get one.
+        """
+        import nerve.sources.registry as registry
+
+        service, _jobs_file = svc
+        service.config.sync = SimpleNamespace(github=SimpleNamespace(schedule="hourly"))
+        monkeypatch.setattr(
+            registry, "build_source_runners",
+            lambda config, db: [_source_runner("github")],
+        )
+
+        service._register_source_runners()
+
+        job = service.scheduler.get_job("source:github")
+        assert job is not None
+        assert "2:00:00" in str(job.trigger)
 
     @pytest.mark.asyncio
     async def test_start_skips_only_the_offending_job(

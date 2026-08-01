@@ -94,6 +94,24 @@ class SyncService:
             conflict_policy=config.external_agents.conflict_policy,
         )
 
+    def update_config(self, config: NerveConfig) -> None:
+        """Adopt a freshly loaded config object after a config reload.
+
+        Both the target list and the sweep interval are read from the config on
+        every sweep, so re-pointing is enough for a change to either to take
+        effect on the next one. The conflict policy is the one value cached
+        away from the config object, so the writer is rebuilt alongside.
+
+        Necessary because the routes that add, remove or toggle a target edit
+        the *process* config object in place: after a reload replaced it, a
+        sweeper still holding the previous one would keep rendering the old
+        target list while every toggle reported success.
+        """
+        self._config = config
+        self._writer = ConfigWriter(
+            conflict_policy=config.external_agents.conflict_policy,
+        )
+
     # ---- Lifecycle -------------------------------------------------
 
     async def start(self) -> None:
@@ -141,11 +159,17 @@ class SyncService:
         self._task = None
 
     async def _loop(self) -> None:
-        interval = max(
-            _MIN_SWEEP_INTERVAL_SECONDS,
-            self._config.external_agents.sync_interval_minutes * 60,
-        )
+        # Read per cycle, not once: a config reload replaces the object this
+        # service points at, and an interval frozen before the loop would
+        # outlive it. The top-level external_agents.enabled flag is a different
+        # matter — it is only consulted where this service is created, so
+        # switching it either way needs a restart. Per-target enabled flags are
+        # read on every sweep and do follow a reload.
         while not self._stop_event.is_set():
+            interval = max(
+                _MIN_SWEEP_INTERVAL_SECONDS,
+                self._config.external_agents.sync_interval_minutes * 60,
+            )
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=interval,

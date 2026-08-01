@@ -46,7 +46,7 @@ def _config(tmp_path: Path, **codex_overrides) -> NerveConfig:
 
 def _deps(cfg: NerveConfig, *, gateway_port: int = 8900) -> BackendDeps:
     return BackendDeps(
-        config=cfg,
+        config=lambda: cfg,
         db=None,
         registry=None,
         tool_ctx_factory=lambda sid: None,

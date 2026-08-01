@@ -58,7 +58,9 @@ Notes:
   registered gates as they were, so a deleted plugin file only takes its gate
   away once a reload succeeds.
 - A job holding a [reserved id](#job-fields) is **skipped**, at reload and at
-  startup alike. The reload itself still succeeds; only that job is dropped.
+  startup alike. The reload itself still succeeds; only that job is dropped, and
+  its id comes back in the reload's `rejected` list, so a job that never runs is
+  visible from the API and not only in the log.
 - An **invalid schedule** (a crontab whose fields the scheduler rejects, e.g.
   `99 * * * *`) is refused the same way at reload: `400`, nothing applied.
   Startup is the one case that differs — the daemon logs an error naming the job
