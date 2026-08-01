@@ -74,9 +74,10 @@ def validate_config_bundle(
     ``portable_only`` drops the machine-local layers and judges the portable
     workspace config alone — the right question for a change headed to a shared
     repo, and the only way to get an answer that doesn't depend on the host
-    running the check. Pair it with ``workspace_override``: with no machine
-    config left to read the workspace location from, it falls back to the
-    default one.
+    running the check. It covers cron too: the loader's fallback to a legacy
+    ``~/.nerve/cron`` is suppressed, so only the bundle's own cron files count.
+    Pair it with ``workspace_override``: with no machine config left to read the
+    workspace location from, it falls back to the default one.
 
     ``assume_locked`` judges the locked view whatever the bundle's own
     ``lockdown`` flag resolves to here. A fleet repo states the flag as
@@ -299,6 +300,10 @@ def validate_config_bundle(
             ("jobs", base_cron / "jobs.yaml"),
         )
 
+    portable_root = cfg.workspace_config_dir(workspace)
+    if portable_only:
+        cron_files = _tracked_cron_only(cron_files, portable_root, result)
+
     _validate_cron(cron_files, result, strict_keys=strict_keys)
     if config is not None:
         # Source runners are scheduled from the same parser as cron jobs, so a
@@ -306,7 +311,6 @@ def validate_config_bundle(
         _validate_source_schedules(config, result)
     # Files of the bundle that were actually opened, so "it validated" can be
     # told from "it found nothing to validate".
-    portable_root = cfg.workspace_config_dir(workspace)
     read = [
         p for p in (cfg.workspace_settings_file(workspace), *(p for _, p in cron_files))
         if p.is_file() and p.is_relative_to(portable_root)
@@ -319,6 +323,34 @@ def validate_config_bundle(
         portable_read=read,
     )
     return result
+
+
+def _tracked_cron_only(cron_files, portable_root: Path, result: ValidationResult):
+    """Keep cron on the tracked bundle's own files, for ``portable_only``.
+
+    Cron resolution is file-aware: a workspace carrying no jobs falls back to the
+    machine-local ``~/.nerve/cron`` so an un-migrated install keeps working. That
+    fallback is right at load time and wrong here — it hands a run that was asked
+    to judge the shared bundle alone a file the bundle does not contain, and a
+    typo in it fails a config repo that has nothing wrong with it. Same substitution
+    the machine-local layers are skipped to prevent, one directory over.
+
+    An explicit ``cron.jobs_file`` pointing outside the tracked subtree goes the
+    same way: whatever it is, it isn't what the repo carries.
+    """
+    kept = []
+    for label, path in cron_files:
+        if path.is_relative_to(portable_root):
+            kept.append((label, path))
+            continue
+        tracked = portable_root / "cron" / f"{label}.yaml"
+        kept.append((label, tracked))
+        if path.exists():
+            result.info.append(
+                f"cron {label} was not read from {path}: it is outside the tracked "
+                f"config and this run judges the portable bundle alone"
+            )
+    return tuple(kept)
 
 
 def _read_layer(path: Path, result: ValidationResult) -> dict[str, Any] | None:
@@ -808,3 +840,105 @@ def _gate_spec_problem(spec) -> str | None:
     if not gate_type.strip():
         return "gate spec 'type' is blank"
     return None
+
+
+# -- Standalone entry point ------------------------------------------------
+#
+# ``python -m nerve.config_validate`` runs validation straight from a source
+# checkout. Everything above needs only the standard library plus PyYAML, so a
+# bundle can be checked by cloning nerve and setting PYTHONPATH — no install, no
+# dependency resolution of nerve's full runtime (boto3, telethon, ...). The
+# generated CI workflow installs nerve and runs ``nerve config validate``; this
+# path is for environments that cannot install it.
+#
+# Both are the same code, and they have to stay in step in both directions:
+# identical output, and the same set of flags — a flag the CLI has and this parser
+# doesn't is a documented invocation this path cannot run.
+# tests/test_config_validate.py asserts both.
+
+
+def render_result(result: ValidationResult) -> tuple[list[str], str]:
+    """Render ``result`` as (message lines, summary line).
+
+    Shared by this module's ``main`` and the ``nerve config validate`` CLI so
+    the installed and zero-install paths report identically.
+    """
+    lines = [f"[info] {m}" for m in result.info]
+    lines += [f"[WARN] {m}" for m in result.warnings]
+    lines += [f"[ERR] {m}" for m in result.errors]
+    summary = (
+        "Config OK" if result.ok else f"Config invalid: {len(result.errors)} error(s)"
+    )
+    return lines, summary
+
+
+def _build_parser():
+    """The standalone entry point's argument parser.
+
+    Separate from ``main`` so a test can compare its flags with the Click
+    command's without going through ``--help``.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m nerve.config_validate",
+        description="Validate a Nerve config bundle. Non-zero exit on any error.",
+    )
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace to validate (a checked-out config repo: --workspace .). "
+             "Defaults to the resolved workspace.",
+    )
+    parser.add_argument(
+        "--config-dir",
+        default=None,
+        help="Machine-local config dir supplying config.yaml/config.local.yaml. "
+             "Defaults to the resolved config dir; usually absent in CI.",
+    )
+    parser.add_argument(
+        "--strict-env", action="store_true",
+        help="Fail if any ${ENV_VAR} reference is unset (default: report as info).",
+    )
+    parser.add_argument(
+        "--strict-keys", action="store_true",
+        help="Fail on unknown/misspelled config keys (default: warn).",
+    )
+    parser.add_argument(
+        "--portable-only", action="store_true",
+        help="Ignore this machine's config.yaml/config.local.yaml and judge only "
+             "the portable workspace config — what a shared repo carries. Fails "
+             "if no file under the workspace's config/ was opened.",
+    )
+    parser.add_argument(
+        "--assume-lockdown", dest="assume_locked", action="store_true",
+        help="Validate the locked view whatever this bundle's lockdown flag "
+             "resolves to here. A fleet repo writes `lockdown: "
+             "${NERVE_LOCKDOWN:-false}`, so CI resolves it to false and checks a "
+             "config no locked box will run.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Validate a config bundle and print the result. Returns the exit code."""
+    args = _build_parser().parse_args(argv)
+
+    config_dir, _ = cfg.resolve_config_dir(args.config_dir)
+    result = validate_config_bundle(
+        config_dir,
+        workspace_override=args.workspace,
+        strict_env=args.strict_env,
+        strict_keys=args.strict_keys,
+        portable_only=args.portable_only,
+        assume_locked=args.assume_locked,
+    )
+    lines, summary = render_result(result)
+    for line in lines:
+        print(line)
+    print(summary)
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

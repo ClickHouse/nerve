@@ -1,0 +1,59 @@
+name: validate-config
+
+# Validates the Nerve config bundle on every PR so a broken change can't be
+# merged and then synced onto a live instance. See docs/config.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Backstop for the one thing review is worst at spotting: a credential
+      # pasted into a tracked file. Secrets belong in the environment and are
+      # referenced from settings.yaml as ${ENV_VAR}. Runs before anything else
+      # is fetched, so it scans this repo and nothing else, and needs no token
+      # of its own. The image is used directly because the marketplace action
+      # asks organizations for a license key.
+      #
+      # The tag is pinned because an argument renamed in a later gitleaks would
+      # fail every config repo at once, with no pull request anywhere to explain
+      # it. (From 8.19 this subcommand is spelled `gitleaks dir <path>`; bump the
+      # tag and the args together.) A false positive on a high-entropy string is
+      # silenced with a trailing `# gitleaks:allow`, or repo-wide in a
+      # .gitleaks.toml.
+      - name: Scan for committed secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.18.4
+        with:
+          args: detect --no-git --source=/github/workspace --redact
+
+      # nerve is not published to PyPI, so this installs from git; the bare name
+      # would fetch an unrelated project. Tracking the default branch keeps the
+      # validator at or ahead of the instance, which is the safe direction for
+      # --strict-keys below: a newer validator knows every key the instance
+      # reads. To check against one release instead, append a ref (nerve@v1.2.3).
+      - uses: astral-sh/setup-uv@v6
+      - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
+
+      # The config repo root IS the workspace (it holds config/ and skills/).
+      #
+      # --portable-only judges the tracked bundle on its own: no machine-local
+      # config.yaml, and no falling back to a machine-local cron directory when
+      # this repo carries no jobs. It fails outright if it opened no file under
+      # config/ at all, so a layout mistake cannot pass as clean.
+      # --strict-keys makes a misspelled key block the PR rather than warn.
+      #
+      # Unset ${ENV_VAR} secret refs are reported as info (CI has no secrets);
+      # add --strict-env to require them. If any instance served by this repo is
+      # locked through ${NERVE_LOCKDOWN}, add --assume-lockdown as well, or CI
+      # only ever checks the unlocked view that instance never loads.
+      - name: Validate config bundle
+        run: nerve config validate --workspace . --portable-only --strict-keys

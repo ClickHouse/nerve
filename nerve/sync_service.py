@@ -376,6 +376,12 @@ def _validate_rev(
     the bundle", and this process is the daemon, with the daemon's environment.
     An unset required reference means ``load_config`` will raise on the next
     restart, so it has to block the merge.
+
+    Key strictness goes the other way, and also on purpose: an unknown key is
+    left a warning here, where the config repo's CI makes it an error. A key this
+    nerve doesn't recognize is inert, and refusing an already-reviewed, merged
+    change over one would strand the instance on a stale config for a spelling
+    the next upgrade may well know.
     """
     from nerve.config_validate import ValidationResult, validate_config_bundle
 
