@@ -33,8 +33,14 @@ from nerve.config import NerveConfig
 from nerve.external_agents.registry import AGENT_REGISTRY, FileTarget
 from nerve.external_agents.renderers import get_renderer
 from nerve.external_agents.writer import ConfigWriter
+from nerve.utils.aio import GRACEFUL_STOP_SECONDS, stop_background_task
 
 logger = logging.getLogger(__name__)
+
+# Floor on the gap between sweeps. ``sync_interval_minutes`` is user-supplied
+# and unvalidated, and a 0 there would turn the loop into a hot spin re-reading
+# and re-hashing every target's source files.
+_MIN_SWEEP_INTERVAL_SECONDS = 60
 
 
 @dataclass
@@ -68,7 +74,8 @@ class SyncService:
     Lifecycle:
 
     - :meth:`start` spawns the background loop. Returns immediately.
-    - :meth:`stop` cancels the loop and waits for it to finish.
+    - :meth:`stop` asks the loop to finish the sweep it is in, then waits
+      for it.
     - :meth:`run_once` does one sweep synchronously — used by the
       manual ``/api/external-agents/sync`` route and by tests.
 
@@ -113,22 +120,29 @@ class SyncService:
             self._loop(), name="external-agents-sync-loop",
         )
 
-    async def stop(self) -> None:
-        """Stop the background loop and wait for the in-flight sweep."""
-        self._stop_event.set()
+    async def stop(self, timeout: float = GRACEFUL_STOP_SECONDS) -> None:
+        """Stop the background loop and wait for the in-flight sweep.
+
+        The loop only looks at ``_stop_event`` between sweeps, so cancelling
+        alongside setting it would deliver the CancelledError first and abandon
+        a sweep partway down its target list — some bundles rendered from the
+        current sources, some still from the previous ones, and no record of
+        which. Signal, then let it reach the boundary; cancellation is the
+        backstop for a sweep that wedges, not the mechanism.
+        """
         task = self._task
         if task is None:
+            # Never started, or already stopped.
+            self._stop_event.set()
             return
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await stop_background_task(
+            task, self._stop_event, "External-agents sync", timeout,
+        )
         self._task = None
 
     async def _loop(self) -> None:
         interval = max(
-            60,
+            _MIN_SWEEP_INTERVAL_SECONDS,
             self._config.external_agents.sync_interval_minutes * 60,
         )
         while not self._stop_event.is_set():
