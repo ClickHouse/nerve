@@ -955,7 +955,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
 
     # Check cron files (merge like the scheduler does: user jobs override system by ID)
     try:
-        from nerve.cron.jobs import load_jobs
+        from nerve.cron.jobs import describe_reserved_job_ids, is_reserved_job_id, load_jobs
 
         system_jobs = load_jobs(config.cron.system_file) if config.cron.system_file.exists() else []
         user_jobs = load_jobs(config.cron.jobs_file) if config.cron.jobs_file.exists() else []
@@ -965,6 +965,18 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         overridden = sum(1 for j in user_jobs if j.id in merged)
         for j in user_jobs:
             merged[j.id] = j
+
+        # Jobs on a reserved id are dropped by the scheduler, so counting them
+        # would report crons that can never fire. Call them out instead.
+        reserved_ids = sorted(jid for jid in merged if is_reserved_job_id(jid))
+        for jid in reserved_ids:
+            del merged[jid]
+        if reserved_ids:
+            warnings.append(
+                f"[WARN] Cron job(s) {', '.join(reserved_ids)} use ids reserved "
+                f"by the daemon ({describe_reserved_job_ids()}) and are never "
+                f"scheduled — rename them"
+            )
 
         all_jobs = list(merged.values())
         enabled = sum(1 for j in all_jobs if j.enabled)
@@ -1314,7 +1326,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
                 await cron_svc.run_job(job_id)
             else:
                 click.echo("Available jobs:")
-                from nerve.cron.jobs import load_jobs
+                from nerve.cron.jobs import is_reserved_job_id, load_jobs
 
                 # Load from both files, show provenance
                 system_jobs = load_jobs(config.cron.system_file)
@@ -1331,7 +1343,13 @@ def cron(ctx: click.Context, job_id: str) -> None:
                         all_jobs.append(("system", j))
 
                 for source, job in all_jobs:
-                    status = "enabled" if job.enabled else "disabled"
+                    # A reserved id is never scheduled by the daemon. Show the
+                    # job rather than hiding it — the reason it isn't running is
+                    # the whole thing the reader is here to find out.
+                    if is_reserved_job_id(job.id):
+                        status = "RESERVED ID — never scheduled, rename it"
+                    else:
+                        status = "enabled" if job.enabled else "disabled"
                     click.echo(
                         f"  [{source:6s}] {job.id}: "
                         f"{job.description or job.schedule} ({status})"

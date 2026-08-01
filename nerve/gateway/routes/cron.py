@@ -22,6 +22,22 @@ async def list_cron_jobs(user: dict = Depends(require_auth)):
     return {"jobs": jobs}
 
 
+@router.post("/api/cron/reload")
+async def reload_cron_jobs(user: dict = Depends(require_auth)):
+    """Re-read cron config and apply changes to the scheduler without a restart."""
+    from nerve.config import ConfigError
+    from nerve.gateway.server import _cron_service
+
+    if not _cron_service:
+        raise HTTPException(status_code=503, detail="Cron service not available")
+
+    try:
+        result = await _cron_service.reload()
+    except ConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"reloaded": True, **result}
+
+
 @router.post("/api/cron/jobs/{job_id}/trigger")
 async def trigger_cron_job(job_id: str, user: dict = Depends(require_auth)):
     """Manually trigger a specific cron job or source runner."""

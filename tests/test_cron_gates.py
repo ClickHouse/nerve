@@ -251,14 +251,27 @@ class TestBuildGate:
         with pytest.raises(GateConfigError):
             build_gate(["not", "a", "dict"])  # type: ignore[arg-type]
 
-    def test_build_gates_skips_invalid(self):
-        """An invalid spec is dropped; valid ones still build."""
+    def test_build_gates_refuses_an_invalid_spec(self):
+        """One unbuildable spec fails the lot, rather than being left out.
+
+        Silently dropping it would widen the job from "only when these hold" to
+        "whenever the schedule says", which is the opposite of what a gate is
+        for. The caller loses the job instead; see build_gates' docstring.
+        """
+        with pytest.raises(GateConfigError, match="bogus"):
+            build_gates([
+                {"type": "tasks", "status": "pending"},
+                {"type": "bogus"},
+            ])
+        with pytest.raises(GateConfigError):
+            build_gates([{"type": "messages"}])  # no sources → invalid
+
+    def test_build_gates_builds_every_valid_spec(self):
         gates = build_gates([
             {"type": "tasks", "status": "pending"},
-            {"type": "bogus"},
-            {"type": "messages"},  # no sources → invalid
+            {"type": "messages", "sources": ["gmail"]},
         ])
-        assert len(gates) == 1
+        assert len(gates) == 2
         assert isinstance(gates[0], TasksGate)
 
     def test_build_gates_empty(self):

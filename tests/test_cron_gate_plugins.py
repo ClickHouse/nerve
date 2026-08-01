@@ -8,10 +8,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from nerve.config import ConfigError
 from nerve.cron.gate_plugins import load_gate_plugins
 from nerve.cron.gates import (
     GATE_REGISTRY,
     CronGate,
+    GateConfigError,
     GateContext,
     build_gate,
     evaluate_gates,
@@ -22,22 +24,6 @@ from nerve.cron.jobs import CronJob
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
-
-@pytest.fixture
-def clean_registry():
-    """Snapshot GATE_REGISTRY and restore it after the test.
-
-    The loader mutates the process-global registry; without this, gates
-    registered by one test would leak into the others (and into
-    test_cron_gates.py, which asserts on the exact built-in set).
-    """
-    saved = dict(GATE_REGISTRY)
-    try:
-        yield
-    finally:
-        GATE_REGISTRY.clear()
-        GATE_REGISTRY.update(saved)
-
 
 # A valid plugin: a gate that is always satisfied, registered as "always_test".
 _VALID_PLUGIN = '''
@@ -174,16 +160,17 @@ class TestFailSafe:
         assert "always_test" in GATE_REGISTRY
         assert "half.py" in caplog.text
 
-    def test_abstract_gate_does_not_crash_job_build(self, tmp_path, clean_registry):
-        # The crash vector itself: a job referencing the abstract gate's type
-        # must build without raising (the unknown type is dropped, fail-open).
+    def test_abstract_gate_is_refused_at_job_build(self, tmp_path, clean_registry):
+        # The loader skips the abstract class, so nothing registers its type, and
+        # a job naming it is refused. Containment means the daemon survives a bad
+        # plugin — not that a job whose precondition is missing runs anyway.
         _write(tmp_path, "half.py", _ABSTRACT_PLUGIN)
         load_gate_plugins(tmp_path)
-        job = CronJob(
-            id="j", schedule="1h", prompt="p",
-            run_if=[{"type": "half_test"}],
-        )
-        assert job.gates == []
+        with pytest.raises(GateConfigError, match="half_test"):
+            CronJob(
+                id="j", schedule="1h", prompt="p",
+                run_if=[{"type": "half_test"}],
+            )
 
     def test_sys_exit_at_import_is_contained(
         self, tmp_path, clean_registry, caplog,
@@ -280,6 +267,312 @@ class TestNoOpDirs:
 
 
 # ---------------------------------------------------------------------------
+# Hot-reload (replace=True)
+# ---------------------------------------------------------------------------
+
+# Same type as _VALID_PLUGIN ("always_test") but the OPPOSITE behaviour: never
+# satisfied. Simulates an operator editing a plugin's code in place.
+_EDITED_PLUGIN = '''
+from nerve.cron.gates import CronGate
+
+
+class AlwaysGate(CronGate):
+    type = "always_test"
+
+    async def is_satisfied(self, ctx):
+        return False
+
+    def describe(self):
+        return "never (edited test plugin)"
+
+    @classmethod
+    def from_config(cls, spec):
+        return cls()
+'''
+
+
+class TestHotReloadReplace:
+    @pytest.mark.asyncio
+    async def test_edited_plugin_code_takes_effect_on_replace(
+        self, tmp_path, clean_registry,
+    ):
+        # Load v1 (always satisfied), then overwrite the file with v2 (never)
+        # and reload with replace=True — the new behaviour must win.
+        f = _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        gate = build_gate({"type": "always_test"})
+        assert (await evaluate_gates([gate], _ctx())).should_run is True
+
+        f.write_text(_EDITED_PLUGIN, encoding="utf-8")
+        assert load_gate_plugins(tmp_path, replace=True) == 1
+        gate = build_gate({"type": "always_test"})
+        assert (await evaluate_gates([gate], _ctx())).should_run is False
+
+    def test_without_replace_edit_is_ignored(self, tmp_path, clean_registry):
+        # The old (asymmetric) behaviour: without replace, a re-run keeps the
+        # incumbent class, so an edit does NOT take effect.
+        f = _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        original = GATE_REGISTRY["always_test"]
+        f.write_text(_EDITED_PLUGIN, encoding="utf-8")
+        assert load_gate_plugins(tmp_path) == 0        # collision → kept
+        assert GATE_REGISTRY["always_test"] is original
+
+    def test_deleted_plugin_unregisters_on_replace(
+        self, tmp_path, clean_registry, caplog,
+    ):
+        f = _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        assert "always_test" in GATE_REGISTRY
+        f.unlink()
+        with caplog.at_level(logging.WARNING):
+            assert load_gate_plugins(tmp_path, replace=True) == 0
+        assert "always_test" not in GATE_REGISTRY   # gate is gone
+        assert "always_test" in caplog.text          # and it was surfaced
+
+    def test_replace_when_dir_deleted_still_unregisters(
+        self, tmp_path, clean_registry,
+    ):
+        # The whole gates dir vanishing (not just a file) must still unregister.
+        import shutil
+
+        gates_dir = tmp_path / "gates"
+        gates_dir.mkdir()
+        _write(gates_dir, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(gates_dir)
+        assert "always_test" in GATE_REGISTRY
+        shutil.rmtree(gates_dir)
+        assert load_gate_plugins(gates_dir, replace=True) == 0
+        assert "always_test" not in GATE_REGISTRY
+
+    def test_replace_preserves_builtins(self, tmp_path, clean_registry):
+        _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        builtins_before = {
+            t: c for t, c in GATE_REGISTRY.items()
+            if not c.__module__.startswith("nerve_cron_gate_plugin_")
+        }
+        # A reload against an empty dir drops the plugin but keeps every built-in.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        load_gate_plugins(empty, replace=True)
+        assert "always_test" not in GATE_REGISTRY
+        for t, c in builtins_before.items():
+            assert GATE_REGISTRY[t] is c
+
+    def test_replace_swaps_type_across_files(self, tmp_path, clean_registry):
+        # Rename the gate's type by editing the file: old type gone, new present.
+        f = _write(tmp_path, "g.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        assert "always_test" in GATE_REGISTRY
+        f.write_text(
+            _VALID_PLUGIN.replace('"always_test"', '"renamed_test"'),
+            encoding="utf-8",
+        )
+        load_gate_plugins(tmp_path, replace=True)
+        assert "always_test" not in GATE_REGISTRY
+        assert "renamed_test" in GATE_REGISTRY
+
+    @pytest.mark.asyncio
+    async def test_edit_takes_effect_through_cron_reload(
+        self, tmp_path, clean_registry,
+    ):
+        """The real path: CronService.reload() re-reads edited plugin code."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from nerve.cron.service import CronService
+
+        gates_dir = tmp_path / "gates"
+        gates_dir.mkdir()
+        f = _write(gates_dir, "always.py", _VALID_PLUGIN)
+
+        config = MagicMock()
+        config.timezone = "UTC"
+        config.cron.gate_plugins_dir = gates_dir
+        config.cron.system_file = tmp_path / "system.yaml"
+        config.cron.jobs_file = tmp_path / "jobs.yaml"
+
+        svc = CronService(config, AsyncMock(), AsyncMock())
+        svc.scheduler.start(paused=True)
+        svc._load_merged_jobs = MagicMock(return_value=[])
+
+        try:
+            await svc.reload()
+            assert (
+                await evaluate_gates([build_gate({"type": "always_test"})], _ctx())
+            ).should_run is True
+            f.write_text(_EDITED_PLUGIN, encoding="utf-8")
+            await svc.reload()
+            assert (
+                await evaluate_gates([build_gate({"type": "always_test"})], _ctx())
+            ).should_run is False
+        finally:
+            svc.scheduler.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_edited_gate_reaches_the_scheduled_job(
+        self, tmp_path, clean_registry,
+    ):
+        """Registry-only isn't enough: the job APScheduler holds must be rebuilt.
+
+        Editing a .py gate changes nothing in jobs.yaml, and the scheduler fires
+        the CronJob object it was handed, whose gates were built when that object
+        was constructed. Re-registering the class without replacing the object
+        would leave the job gating on the pre-edit class forever, while the API
+        reported the new one.
+        """
+        import yaml
+        from unittest.mock import AsyncMock, MagicMock
+
+        from nerve.cron.service import CronService
+
+        gates_dir = tmp_path / "gates"
+        gates_dir.mkdir()
+        f = _write(gates_dir, "always.py", _VALID_PLUGIN)
+
+        jobs_file = tmp_path / "jobs.yaml"
+        jobs_file.write_text(yaml.safe_dump({"jobs": [{
+            "id": "j1", "schedule": "1h", "prompt": "x",
+            "run_if": [{"type": "always_test"}],
+        }]}), encoding="utf-8")
+
+        config = MagicMock()
+        config.timezone = "UTC"
+        config.cron.gate_plugins_dir = gates_dir
+        config.cron.system_file = tmp_path / "system.yaml"
+        config.cron.jobs_file = jobs_file
+
+        db = AsyncMock()
+        db.get_last_successful_cron_run = AsyncMock(return_value=None)
+        svc = CronService(config, AsyncMock(), db)
+        svc.scheduler.start(paused=True)
+
+        def scheduled_gates():
+            return svc.scheduler.get_job("j1").args[0].gates
+
+        try:
+            await svc.reload()
+            assert (await evaluate_gates(scheduled_gates(), _ctx())).should_run is True
+
+            f.write_text(_EDITED_PLUGIN, encoding="utf-8")
+            await svc.reload()
+
+            # The object the scheduler will actually run now holds the new gate.
+            assert [g.describe() for g in scheduled_gates()] == [
+                "never (edited test plugin)"
+            ]
+            assert (await evaluate_gates(scheduled_gates(), _ctx())).should_run is False
+            # ... and it agrees with what the API reports from _jobs.
+            assert [g.describe() for j in svc._jobs for g in j.gates] == [
+                "never (edited test plugin)"
+            ]
+        finally:
+            svc.scheduler.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    async def test_deleted_gate_stops_gating_the_scheduled_job(
+        self, tmp_path, clean_registry,
+    ):
+        """Deleting a plugin refuses the reload instead of ungating the job.
+
+        This is the case the whole vanished-gate apparatus exists for. A synced
+        pull that removes a gate file must not turn "only when the plugin says
+        so" into "every time" on a live daemon, so the job stops building and the
+        reload is refused with the running schedule intact.
+        """
+        import yaml
+        from unittest.mock import AsyncMock, MagicMock
+
+        from nerve.cron.service import CronService
+
+        gates_dir = tmp_path / "gates"
+        gates_dir.mkdir()
+        f = _write(gates_dir, "always.py", _EDITED_PLUGIN)  # gate says "no"
+
+        jobs_file = tmp_path / "jobs.yaml"
+        jobs_file.write_text(yaml.safe_dump({"jobs": [{
+            "id": "j1", "schedule": "1h", "prompt": "x",
+            "run_if": [{"type": "always_test"}],
+        }]}), encoding="utf-8")
+
+        config = MagicMock()
+        config.timezone = "UTC"
+        config.cron.gate_plugins_dir = gates_dir
+        config.cron.system_file = tmp_path / "system.yaml"
+        config.cron.jobs_file = jobs_file
+
+        db = AsyncMock()
+        db.get_last_successful_cron_run = AsyncMock(return_value=None)
+        svc = CronService(config, AsyncMock(), db)
+        svc.scheduler.start(paused=True)
+
+        try:
+            await svc.reload()
+            gates = svc.scheduler.get_job("j1").args[0].gates
+            assert (await evaluate_gates(gates, _ctx())).should_run is False
+
+            f.unlink()
+            with pytest.raises(ConfigError, match="always_test"):
+                await svc.reload()
+
+            # The running schedule is untouched, and the job it is still holding
+            # keeps the gate — so the job goes on being gated, not on firing.
+            gates = svc.scheduler.get_job("j1").args[0].gates
+            assert (await evaluate_gates(gates, _ctx())).should_run is False
+            # The registry was rolled back too, so the next load off disk works
+            # the moment the plugin is restored.
+            _write(gates_dir, "always.py", _EDITED_PLUGIN)
+            await svc.reload()
+            assert (await evaluate_gates(
+                svc.scheduler.get_job("j1").args[0].gates, _ctx(),
+            )).should_run is False
+        finally:
+            svc.scheduler.shutdown(wait=False)
+
+    def test_warn_vanished_can_be_deferred(self, tmp_path, clean_registry, caplog):
+        """The unregister still happens; only the announcement is held back.
+
+        A caller that may yet abandon the load asks for silence here and calls
+        warn_vanished_gates() itself once it has committed.
+        """
+        from nerve.cron.gate_plugins import warn_vanished_gates
+
+        f = _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        before = dict(GATE_REGISTRY)
+
+        f.unlink()
+        with caplog.at_level(logging.WARNING):
+            load_gate_plugins(tmp_path, replace=True, warn_vanished=False)
+        assert "always_test" not in GATE_REGISTRY   # dropped all the same
+        assert "always_test" not in caplog.text     # but not announced
+
+        with caplog.at_level(logging.WARNING):
+            warn_vanished_gates(before)
+        assert "always_test" in caplog.text
+
+    def test_deferred_warning_ignores_builtins_in_the_snapshot(
+        self, tmp_path, clean_registry, caplog,
+    ):
+        """The snapshot holds built-ins too, and they are never dropped.
+
+        warn_vanished_gates() takes the whole registry rather than the set the
+        loader removed, so it has to stay quiet about the built-ins in it.
+        """
+        from nerve.cron.gate_plugins import warn_vanished_gates
+
+        _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        before = dict(GATE_REGISTRY)
+        assert "tasks" in before, "expected a built-in in the snapshot"
+
+        load_gate_plugins(tmp_path, replace=True, warn_vanished=False)
+        with caplog.at_level(logging.WARNING):
+            warn_vanished_gates(before)
+        assert caplog.text == ""
+
+
+# ---------------------------------------------------------------------------
 # End-to-end via CronJob.run_if
 # ---------------------------------------------------------------------------
 
@@ -305,11 +598,14 @@ class TestEndToEndViaConfig:
         decision = await evaluate_gates(job.gates, _ctx())
         assert decision.should_run is True
 
-    def test_unknown_plugin_type_drops_gate_when_not_loaded(self, clean_registry):
-        # Without loading the plugin, an unknown type is dropped by build_gates
-        # (fail-open: the job ends up ungated) rather than raising.
-        job = CronJob(
-            id="j", schedule="1h", prompt="p",
-            run_if=[{"type": "never_loaded_gate"}],
-        )
-        assert job.gates == []
+    def test_unknown_plugin_type_refuses_the_job(self, clean_registry):
+        # Nothing registered the type — the plugin was never loaded, or never
+        # existed. Either way the job is refused, and the message names the job
+        # and the type so the YAML entry to fix is identifiable.
+        with pytest.raises(GateConfigError) as exc:
+            CronJob(
+                id="j", schedule="1h", prompt="p",
+                run_if=[{"type": "never_loaded_gate"}],
+            )
+        assert "'j'" in str(exc.value)
+        assert "never_loaded_gate" in str(exc.value)

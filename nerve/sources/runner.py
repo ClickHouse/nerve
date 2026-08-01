@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from nerve.cron.jobs import RESERVED_JOB_ID_PREFIX
 from nerve.sources.models import IngestResult, SourceRecord
 
 if TYPE_CHECKING:
@@ -110,7 +111,6 @@ class SourceRunner:
         source: The data source to fetch from.
         db: Database for cursor persistence and logging.
         batch_size: Max records per fetch.
-        job_id: Cron job ID for logging (default: "source:<name>").
         condense: Enable LLM condensation for long records.
         condense_model: Model name for condensation (e.g. "claude-haiku-4-5-20251001").
         condense_prompt: Custom system prompt for condensation (uses default if empty).
@@ -129,7 +129,6 @@ class SourceRunner:
         source: Source,
         db: Database,
         batch_size: int = 50,
-        job_id: str = "",
         condense: bool = False,
         condense_model: str = "",
         condense_prompt: str = "",
@@ -140,7 +139,10 @@ class SourceRunner:
         self.source = source
         self.db = db
         self.batch_size = batch_size
-        self.job_id = job_id or f"source:{source.source_name}"
+        # Always derived, never passed in: the scheduler reserves the whole
+        # `source:` namespace for these runners (see nerve/cron/jobs.py), and a
+        # runner sitting outside it could be displaced by a user cron job.
+        self.job_id = f"{RESERVED_JOB_ID_PREFIX}{source.source_name}"
         self.condense = condense
         self.condense_model = condense_model
         self.condense_prompt = condense_prompt
