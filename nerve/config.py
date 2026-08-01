@@ -2473,15 +2473,19 @@ class LangfuseConfig:
         # A bare ``redact_patterns:`` parses to None, which the shared list
         # handling reads as the empty list. That is the right answer for most
         # fields and the wrong one here, because it would turn secret redaction
-        # off on a blank line. An explicit ``[]`` still means off.
-        patterns = d.get("redact_patterns", _DEFAULT_LANGFUSE_REDACT_PATTERNS)
+        # off on a blank line. An explicit ``[]`` still means off. The default
+        # is materialized as a ``list`` so the field arrives as its declared
+        # type — handing the tuple through made ``coerce_scalars`` warn about
+        # a "non-list config value" on every load of a config that never
+        # mentions Langfuse.
+        patterns = d.get("redact_patterns")
+        if patterns is None:
+            patterns = list(_DEFAULT_LANGFUSE_REDACT_PATTERNS)
         return cls(
             public_key=d.get("public_key", ""),
             secret_key=d.get("secret_key", ""),
             host=d.get("host", "https://cloud.langfuse.com"),
-            redact_patterns=_str_list(
-                _DEFAULT_LANGFUSE_REDACT_PATTERNS if patterns is None else patterns
-            ),
+            redact_patterns=_str_list(patterns),
         )
 
 
