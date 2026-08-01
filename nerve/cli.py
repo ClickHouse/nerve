@@ -172,7 +172,7 @@ def _docker_compose(
 # Commands that must keep working when the config itself is broken -- they are
 # how an operator diagnoses or repairs it. They receive ctx.obj["config"] = None
 # and ctx.obj["config_error"], and are responsible for reporting.
-_SELF_DIAGNOSING_COMMANDS = frozenset({"config", "doctor", "init"})
+_SELF_DIAGNOSING_COMMANDS = frozenset({"config", "doctor", "init", "migrate"})
 
 
 @click.group()
@@ -275,6 +275,25 @@ def start(ctx: click.Context, foreground: bool) -> None:
     """Start the Nerve server."""
     config_dir = Path(ctx.obj["config_dir"])
     config = ctx.obj["config"]
+
+    # Migrate a legacy install to the workspace/config layout if needed
+    # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
+    if config is not None:
+        from nerve.migrate import maybe_migrate
+        report = maybe_migrate(config_dir, workspace=getattr(config, "workspace", None))
+        if report is not None and report.did_anything:
+            # The config in hand was loaded from the old locations, and migration
+            # has just moved the files out from under it — cron in particular now
+            # lives in the workspace, so the stale object resolves to job files
+            # that no longer exist and a --foreground run would schedule nothing.
+            try:
+                config = load_config(config_dir)
+            except Exception as e:
+                raise click.ClickException(
+                    f"Config could not be reloaded after migration: {e}"
+                ) from e
+            set_config(config)
+            ctx.obj["config"] = config
 
     # Detect fresh install — offer to run setup wizard
     from nerve.bootstrap import is_fresh_install
@@ -726,6 +745,47 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
         if rc != 0:
             raise click.ClickException("npm run build failed")
 
+    # Migrate a legacy config layout to workspace/config (idempotent).
+    if config is not None:
+        from nerve.migrate import maybe_migrate
+        report = maybe_migrate(
+            Path(ctx.obj["config_dir"]), workspace=getattr(config, "workspace", None)
+        )
+        if report and report.did_anything:
+            click.echo("\nMigrated config to the workspace layout:")
+            for action in report.actions:
+                click.echo(f"  - {action}")
+            if report.error:
+                # The steps above did apply. Saying so beats a bare success
+                # message, because the rest has to be finished by hand or by a
+                # re-run, and the tracked file already exists either way.
+                click.secho(
+                    f"  Migration did not finish: {report.error}\n"
+                    "  What is listed above was applied; re-run `nerve migrate` "
+                    "once the cause is fixed.",
+                    fg="yellow",
+                )
+            if report.secrets_moved:
+                click.echo(
+                    f"  (scrubbed {len(report.secrets_moved)} secret(s) into "
+                    "config.local.yaml; review workspace/config/settings.yaml "
+                    "before committing)"
+                )
+            if report.machine_local_kept:
+                click.echo(
+                    f"  ({len(report.machine_local_kept)} machine-local key(s) kept "
+                    "in config.yaml instead of published: "
+                    f"{', '.join(report.machine_local_kept)})"
+                )
+            if report.suspect_values:
+                click.secho(
+                    f"  ({len(report.suspect_values)} value(s) left in settings.yaml "
+                    f"still look like credentials: {', '.join(report.suspect_values)})",
+                    fg="yellow",
+                )
+            for warning in report.warnings:
+                click.secho(f"  Note: {warning}", fg="yellow")
+
     click.echo("\nUpgrade complete. Restart Nerve for changes to take effect:")
     click.echo("  nerve restart")
 
@@ -1090,6 +1150,56 @@ def doctor(ctx: click.Context) -> None:
     click.echo(report)
     if "[ERR]" in report:
         ctx.exit(1)
+
+
+@main.command()
+@click.option("--dry-run", is_flag=True, help="Show what would change without writing.")
+@click.pass_context
+def migrate(ctx: click.Context, dry_run: bool) -> None:
+    """Migrate a legacy config layout into the workspace/config subtree.
+
+    Splits config.yaml: shareable keys → workspace/config/settings.yaml (secrets
+    scrubbed into config.local.yaml as ${ENV_VAR} refs), machine-local keys stay
+    in config.yaml. Also moves ~/.nerve/cron → workspace/config/cron.
+    Non-destructive (originals kept as *.migrated) and idempotent.
+    """
+    from nerve.migrate import migrate as run_migrate
+
+    config = ctx.obj["config"]
+    config_dir = Path(ctx.obj["config_dir"])
+    workspace = getattr(config, "workspace", None) if config is not None else None
+    try:
+        report = run_migrate(config_dir, workspace=workspace, dry_run=dry_run)
+    except Exception as e:  # e.g. a malformed config.local.yaml
+        raise click.ClickException(f"Migration failed: {e}") from e
+
+    if not report.did_anything:
+        click.secho("Nothing to migrate — already on the workspace layout.", fg="green")
+        for warning in report.warnings:
+            click.secho(f"  Note: {warning}", fg="yellow")
+        return
+    prefix = "[dry-run] would " if dry_run else ""
+    for action in report.actions:
+        click.echo(f"  {prefix}{action}")
+    for warning in report.warnings:
+        click.secho(f"\n  Note: {warning}", fg="yellow")
+    if report.secrets_moved:
+        click.echo(f"\n  Secrets scrubbed to config.local.yaml: {', '.join(report.secrets_moved)}")
+    if report.machine_local_kept:
+        click.echo(
+            "\n  Machine-local keys kept in config.yaml: "
+            f"{', '.join(report.machine_local_kept)}"
+        )
+    if report.suspect_values:
+        click.secho(
+            f"\n  {len(report.suspect_values)} value(s) headed for settings.yaml still "
+            f"look like credentials — review: {', '.join(report.suspect_values)}",
+            fg="yellow",
+        )
+    if dry_run:
+        click.secho("\nDry run — no changes written.", fg="yellow")
+    else:
+        click.secho("\nMigration complete. Review workspace/config/settings.yaml before committing.", fg="green")
 
 
 @main.group(name="config")

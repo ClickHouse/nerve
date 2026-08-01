@@ -18,11 +18,12 @@ inside `settings.yaml` is ignored.
 
 ## Which layer a key belongs in
 
-`nerve init` splits its answers between the first two layers:
+The first two layers divide as below. `nerve init` writes its answers this way,
+and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -187,6 +188,73 @@ knows every key your instance reads. A key the validator accepts but the instanc
 is too old to read shows up as a startup warning on the instance and in `nerve
 doctor`. If a key is ever retired upstream, `--strict-keys` flags it here first;
 drop the key, or install the ref you deploy (`nerve @ git+...@v1.2.3`) instead.
+
+## Migrating an Existing Install
+
+Installs from before the workspace-config layout are migrated automatically and
+idempotently on `nerve upgrade` and daemon start. To run it by hand:
+
+```bash
+nerve migrate --dry-run   # show what would change
+nerve migrate             # apply
+```
+
+Nothing is deleted and the effective configuration does not change; values are
+only relocated. Originals are renamed to `*.migrated` breadcrumbs, and an existing
+breadcrumb is never overwritten.
+
+- `config.yaml` is split rather than copied. Shareable keys go to the git-tracked
+  `workspace/config/settings.yaml`; secret values go to machine-local
+  `config.local.yaml`, replaced with `${ENV_VAR}` placeholders; the machine-local
+  keys from the table above are rewritten into `config.yaml`, so a certificate
+  path or an AWS profile handle never travels with the workspace repo. The split
+  follows the table at whatever depth a key is listed, so `gateway.ssl.*` stays
+  local while `gateway.host`/`port` move across. Migration prints which keys it
+  kept. The `workspace` path is the exception that stays in `config.local.yaml`:
+  it is written before anything is consumed, so an interrupted migration cannot
+  leave the instance unable to find its workspace.
+- The legacy `~/.nerve/cron/*` moves to `workspace/config/cron/*`, including any
+  `prompts/` referenced by `prompt_file`.
+- `config.local.yaml`, the rewritten `config.yaml` and the breadcrumb can all hold
+  plaintext credentials, so all three are written `0600`. `settings.yaml` is
+  written normally, so a restrictive `umask` is honored.
+
+A value is treated as secret when any of these hold:
+
+- The key name looks like one: `*api_key*`, `*api_hash*`, `api_id`, `*token*`,
+  `*secret*`, `password*`, `jwt`, `authorization`, `bearer`, `oauth`,
+  `*access_key*`, `*private_key*`, `dsn`, `pw`, `pat`, `session_string`,
+  `webhook_url`. A public identifier is not a secret: `client_id` is left alone,
+  `client_secret` is not.
+- The value's shape is a credential whatever the key is called: `sk-…`, `ghp_…`,
+  `xox…`, `user:password@host`, `?token=…`, `Bearer …`. This fires only when the
+  whole value is the credential, so a category description that mentions
+  `postgres://user:pass@host` stays put.
+- It sits inside an `env` or `headers` block, including inside lists, where MCP
+  `headers` entries live.
+- It is the argument after a flag that names a credential, so both
+  `args: ["--token=abc123"]` and the split `args: ["--token", "abc123"]` are
+  caught. The split form is what `npx` and `uvx` MCP servers use, and the value
+  on its own is unrecognizable.
+
+If one item in a list is a secret, the whole list moves, because a merge replaces
+a list rather than combining it element-wise. Migration reports this, and the copy
+left in `settings.yaml` has no further effect.
+
+Secret detection is best-effort, so **review `workspace/config/settings.yaml`
+before committing it to a shared repo**, then run `nerve config validate` to
+confirm the bundle is well-formed. Migration also lists any value it left in the
+tracked file that still looks like a credential, for you to judge.
+
+Migration only runs on a pre-refactor `config.yaml`, meaning one that holds
+shareable settings rather than only this box's. A `config.yaml` written by
+`nerve init` — or left behind by an earlier migration — holds only machine-local
+keys (workspace, certificate paths, provider handles), so it is left in place even
+when the workspace has no `settings.yaml`. Migration is also a no-op once
+`settings.yaml` carries real keys; the `nerve init` scaffold is all comments and
+counts as empty. A `config.yaml` with shareable keys sitting next to a populated
+`settings.yaml` is reported, because it overrides the tracked file, and you move
+those keys across by hand.
 
 ## Config Directory Resolution
 
