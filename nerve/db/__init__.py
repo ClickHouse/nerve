@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from nerve import paths
 from nerve.db.base import SCHEMA_VERSION, Database
 
 # Global database instance
@@ -32,7 +33,7 @@ async def init_db(db_path: Path | None = None, workspace: Path | None = None) ->
     """
     global _db
     if db_path is None:
-        db_path = Path("~/.nerve/nerve.db").expanduser()
+        db_path = paths.db_path()
     _db = Database(db_path, workspace=workspace)
     await _db.connect()
     return _db

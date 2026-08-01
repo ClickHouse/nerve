@@ -14,6 +14,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from nerve import paths
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     CATEGORY_UPDATE_SCHEMA,
@@ -404,7 +405,7 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     memu_err: str | None = None
     memu_down = False  # transient backend outage (distinct from a genuine failure)
     try:
-        mem_dir = Path("~/.nerve/memu-manual").expanduser()
+        mem_dir = paths.nerve_path("memu-manual")
         mem_path = mem_dir / f"memorize-{int(time.time())}.txt"
 
         def _write_memorize_file() -> None:

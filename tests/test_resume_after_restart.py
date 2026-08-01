@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
 import pytest
 
-from nerve import cli
+from nerve import cli, paths
 from nerve.agent.engine import AgentEngine, _RESUME_AFTER_RESTART_PROMPT
 from nerve.agent.sessions import SessionStatus
 
@@ -128,15 +130,27 @@ async def test_one_failure_does_not_block_others(tmp_path):
 #  CLI side: `nerve restart --resume` writes the queue for all modes          #
 # --------------------------------------------------------------------------- #
 
-def _invoke_restart(tmp_path, resume_ids):
-    qf = tmp_path / "resume-after-restart"
-    logf = tmp_path / "nerve.log"
-    with patch("nerve.cli._is_docker_mode", return_value=False), \
-         patch("nerve.cli._is_systemd_managed", return_value=False), \
-         patch("nerve.cli._get_daemon_status", return_value=(False, None)), \
-         patch("nerve.cli.subprocess.Popen", MagicMock()), \
-         patch("nerve.cli.LOG_FILE", logf), \
-         patch("nerve.cli.RESUME_QUEUE_FILE", qf):
+def _invoke_restart(tmp_path, resume_ids, *, redirect_queue=True):
+    """Drive ``nerve restart`` with the daemon and its side effects stubbed out.
+
+    Returns the queue file the run should have written to. With
+    ``redirect_queue=False`` the CLI's own module-level constant is left in
+    place, so the write goes wherever the test-suite isolation put it.
+    """
+    with ExitStack() as stack:
+        for cm in (
+            patch("nerve.cli._is_docker_mode", return_value=False),
+            patch("nerve.cli._is_systemd_managed", return_value=False),
+            patch("nerve.cli._get_daemon_status", return_value=(False, None)),
+            patch("nerve.cli.subprocess.Popen", MagicMock()),
+            patch("nerve.paths.log_file", return_value=tmp_path / "nerve.log"),
+        ):
+            stack.enter_context(cm)
+        if redirect_queue:
+            qf = tmp_path / "resume-after-restart"
+            stack.enter_context(patch("nerve.cli.RESUME_QUEUE_FILE", qf))
+        else:
+            qf = cli.RESUME_QUEUE_FILE
         ctx = click.Context(cli.restart)
         ctx.obj = {
             "config": SimpleNamespace(deployment="server"),
@@ -161,4 +175,36 @@ def test_restart_resume_appends(tmp_path):
 
 def test_restart_without_resume_writes_nothing(tmp_path):
     qf = _invoke_restart(tmp_path, ())
+    assert not qf.exists()
+
+
+# --------------------------------------------------------------------------- #
+#  The queue file must never be the developer's real one                      #
+# --------------------------------------------------------------------------- #
+#
+# RESUME_QUEUE_FILE is a module-level Path, so it is resolved when nerve.config
+# is imported — which, under pytest, is during collection, before any fixture
+# has moved the state dir. nerve.cli and nerve.agent.engine each hold their own
+# imported copy of that value. The two tests below run *without* patching it, so
+# they fail unless the suite's isolation redirected every copy: the CLI appends
+# to the queue and the drainer deletes it, which on a live box means corrupting
+# and then destroying the real ~/.nerve/resume-after-restart.
+
+def test_cli_writes_the_queue_inside_the_isolated_state_dir(tmp_path):
+    qf = _invoke_restart(tmp_path, ("S1",), redirect_queue=False)
+    assert qf == paths.nerve_path("resume-after-restart")
+    assert paths.nerve_home() in qf.parents
+    assert (Path.home() / ".nerve") not in qf.parents
+    assert qf.read_text() == "S1\n"
+
+
+@pytest.mark.asyncio
+async def test_drainer_reads_and_deletes_only_the_isolated_queue():
+    qf = paths.nerve_path("resume-after-restart")
+    assert (Path.home() / ".nerve") not in qf.parents
+    qf.parent.mkdir(parents=True, exist_ok=True)
+    qf.write_text("S1\n")
+
+    engine = _engine_with({"S1": _session("S1")})
+    assert await engine.resume_enrolled_sessions() == 1
     assert not qf.exists()

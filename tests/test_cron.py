@@ -997,6 +997,25 @@ class TestPromptFile:
         job = CronJob(id="x", schedule="1h", prompt="inline", prompt_file=str(pf))
         assert job.resolve_prompt() == "file wins"
 
+    @pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t "])
+    def test_blank_prompt_file_is_unset_not_a_file_named_space(self, blank):
+        """``prompt_file: `` with a stray space must not beat the inline prompt.
+
+        Blank is truthy, so without the strip it wins the precedence above and
+        the job then tries to read a file whose name is a space — failing every
+        run, while the perfectly good inline prompt sits there unused.
+        """
+        job = CronJob.from_dict(
+            {"id": "x", "schedule": "1h", "prompt": "inline", "prompt_file": blank}
+        )
+        assert job.prompt_file == ""
+        assert job.resolve_prompt() == "inline"
+
+    def test_blank_prompt_file_with_no_prompt_fails_at_load(self):
+        """And with nothing to fall back on it fails loudly, naming the job."""
+        with pytest.raises(ValueError):
+            CronJob.from_dict({"id": "x", "schedule": "1h", "prompt_file": "  "})
+
     def test_prompt_file_read_fresh_each_run(self, tmp_path):
         pf = tmp_path / "prompt.md"
         pf.write_text("v1", encoding="utf-8")

@@ -92,7 +92,11 @@ Set `NERVE_USE_PROXY=1` in your environment (no `ANTHROPIC_API_KEY` required). T
 |-------|---------|
 | `.:/nerve` | Application code (bind mount) |
 | `nerve-data:/root/.nerve` | Databases, logs, PID, sessions |
-| `nerve-workspace:/root/nerve-workspace` | Workspace files (SOUL.md, tasks, skills) |
+| `nerve-workspace:/root/nerve-workspace` | Workspace files (SOUL.md, tasks, skills, `config/`) |
+
+The container paths are not conventions — the generated Dockerfile sets
+`NERVE_HOME=/root/.nerve` and `NERVE_WORKSPACE=/root/nerve-workspace`
+explicitly. Point them elsewhere and the mounts must follow.
 
 ## Re-running `nerve init`
 

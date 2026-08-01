@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from nerve import paths
+
 if TYPE_CHECKING:
     from nerve.config import NerveConfig
 
@@ -57,7 +59,7 @@ class ProxyService:
     def __init__(self, config: NerveConfig) -> None:
         self.config = config
         self._process: asyncio.subprocess.Process | None = None
-        self._config_path = Path("~/.nerve/cli-proxy-config.yaml").expanduser()
+        self._config_path = paths.nerve_path("cli-proxy-config.yaml")
 
     # ------------------------------------------------------------------ #
     #  Binary management                                                  #

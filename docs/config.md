@@ -8,6 +8,11 @@ Values in `config.local.yaml` are deep-merged on top of `config.yaml`.
 Unknown keys are ignored but logged as warnings at startup (and shown by
 `nerve doctor`) so typos don't fail silently.
 
+Keys typed `path` below expand `~` and any environment variables that are set.
+A blank value (`runs_dir:` with nothing after it, or `""`) means *unset*, so the
+documented default applies. That includes `gateway.ssl.cert`/`key`: blank means
+TLS is off, not TLS with an empty certificate path.
+
 ## Config Directory Resolution
 
 `nerve` commands locate the config directory via a waterfall, so they work

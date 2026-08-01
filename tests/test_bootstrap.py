@@ -119,10 +119,13 @@ class TestNonInteractiveSetup:
         assert (ws / "SOUL.md").exists()
         assert (ws / "AGENTS.md").exists()
 
-        # Cron jobs file exists
-        cron_file = Path("~/.nerve/cron/jobs.yaml").expanduser()
-        # Note: cron file is always written to ~/.nerve, not tmp_path
-        # We just verify it exists (it may have been created by a previous test/run)
+        # Cron jobs land under NERVE_HOME (the conftest tmpdir), not the real
+        # ~/.nerve — until this was fixed, running the suite rewrote the
+        # developer's own system.yaml.
+        from nerve import paths
+
+        assert (paths.cron_dir() / "jobs.yaml").exists()
+        assert (paths.cron_dir() / "system.yaml").exists()
 
     def test_worker_mode(self, tmp_path: Path) -> None:
         """Worker mode should create minimal workspace."""
@@ -319,9 +322,26 @@ class TestEnsureDockerFiles:
         assert "HEALTHCHECK" in content
         assert "NERVE_DOCKER=1" in content
         assert "nodejs" in content
+        # The GOG install line uses shell ${VAR} syntax — if the template is
+        # ever turned into a bare f-string it would swallow these.
+        assert "${GOG_VERSION}" in content
 
-    def test_compose_content(self, tmp_path: Path) -> None:
+    def test_dockerfile_sets_state_and_workspace_env(self, tmp_path: Path) -> None:
+        """/root/.nerve must be a deliberate NERVE_HOME, not an artifact of $HOME."""
+        from nerve.bootstrap import _DOCKER_NERVE_HOME, _DOCKER_WORKSPACE
+
+        wizard = SetupWizard(tmp_path)
+        wizard._ensure_docker_files()
+
+        content = (tmp_path / "Dockerfile").read_text()
+        assert f"ENV NERVE_HOME={_DOCKER_NERVE_HOME}" in content
+        assert f"ENV NERVE_WORKSPACE={_DOCKER_WORKSPACE}" in content
+        # The dirs the image pre-creates must be the ones it advertises.
+        assert f"mkdir -p {_DOCKER_NERVE_HOME} {_DOCKER_WORKSPACE}" in content
+
+    def test_compose_content(self, tmp_path: Path, monkeypatch) -> None:
         """docker-compose.yml should have correct service definition."""
+        monkeypatch.delenv("NERVE_HOME", raising=False)
         wizard = SetupWizard(tmp_path)
         wizard._ensure_docker_files()
 
@@ -334,6 +354,61 @@ class TestEnsureDockerFiles:
         volumes = compose["services"]["nerve"]["volumes"]
         assert ".:/nerve" in volumes
         assert "~/.nerve:/root/.nerve" in volumes
+
+    def test_compose_host_state_dir_follows_nerve_home(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Deriving only the container side gives host and container two DBs.
+
+        The operator relocated the state dir; if compose keeps mounting the
+        default ~/.nerve, `nerve sessions` on the host and the daemon in the
+        container read different databases with no sign anything is wrong.
+        """
+        monkeypatch.setenv("NERVE_HOME", "/opt/nerve-state")
+        wizard = SetupWizard(tmp_path)
+        wizard._ensure_docker_files()
+
+        compose = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())
+        volumes = compose["services"]["nerve"]["volumes"]
+        assert "/opt/nerve-state:/root/.nerve" in volumes
+        assert "/opt/nerve-state/claude:/root/.claude" in volumes
+        assert not any(v.startswith("~/.nerve") for v in volumes)
+
+    def test_compose_mounts_match_dockerfile_env(self, tmp_path: Path) -> None:
+        """A mount pointing somewhere the image doesn't use is a silent no-op."""
+        from nerve.bootstrap import _DOCKER_NERVE_HOME, _DOCKER_WORKSPACE
+
+        wizard = SetupWizard(tmp_path)
+        wizard._ensure_docker_files()
+
+        compose = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())
+        targets = {v.split(":", 1)[1] for v in compose["services"]["nerve"]["volumes"]}
+        assert _DOCKER_NERVE_HOME in targets
+        assert _DOCKER_WORKSPACE in targets
+
+    def test_entrypoint_clears_pid_under_nerve_home(self, tmp_path: Path) -> None:
+        """A hard-coded ~/.nerve here would miss the PID file if NERVE_HOME moves."""
+        wizard = SetupWizard(tmp_path)
+        wizard._ensure_docker_files()
+
+        content = (tmp_path / "docker-entrypoint.sh").read_text()
+        assert 'rm -f "${NERVE_HOME:-$HOME/.nerve}/nerve.pid"' in content
+
+    def test_agent_docs_locate_config_where_it_is_actually_written(self) -> None:
+        """This text is appended to TOOLS.md, so the agent reads it as fact.
+
+        In the container the entrypoint `cd /nerve`s before `nerve init`, and
+        resolve_config_dir() falls through to the cwd — so config.yaml and
+        config.local.yaml land in /nerve, not under NERVE_HOME. The doc used
+        to claim the opposite, which sends the agent to edit a file nothing
+        reads (and on a different bind mount than the one it meant).
+        """
+        from nerve.bootstrap import _DOCKER_NERVE_HOME, _DOCKER_TOOLS_SECTION
+
+        assert f"Config files live in `/nerve/`" in _DOCKER_TOOLS_SECTION
+        assert f"`{_DOCKER_NERVE_HOME}/config.local.yaml`" not in _DOCKER_TOOLS_SECTION
+        # Cron still lives under the machine-local state dir on this branch.
+        assert f"{_DOCKER_NERVE_HOME}/cron/" in _DOCKER_TOOLS_SECTION
 
     def test_entrypoint_executable(self, tmp_path: Path) -> None:
         """docker-entrypoint.sh should be executable."""
@@ -466,8 +541,11 @@ class TestDockerTemplateIntegrity:
         assert "services" in parsed
         assert "nerve" in parsed["services"]
 
-    def test_compose_bind_mounts(self) -> None:
+    def test_compose_bind_mounts(self, monkeypatch) -> None:
         """Compose should use host bind-mounts, not named volumes."""
+        # The conftest fixture points NERVE_HOME at a tmpdir; clear it so this
+        # exercises the default an ordinary operator gets.
+        monkeypatch.delenv("NERVE_HOME", raising=False)
         # Mock all optional dirs as existing so they appear in output
         with patch("nerve.bootstrap.os.path.isdir", return_value=True), \
              patch("nerve.bootstrap.os.path.expanduser", side_effect=lambda p: p):
@@ -484,8 +562,9 @@ class TestDockerTemplateIntegrity:
         # No named volumes section
         assert "volumes" not in parsed or parsed.get("volumes") is None
 
-    def test_compose_skips_missing_auth_dirs(self) -> None:
+    def test_compose_skips_missing_auth_dirs(self, monkeypatch) -> None:
         """Optional auth mounts should be excluded when host dirs don't exist."""
+        monkeypatch.delenv("NERVE_HOME", raising=False)
         with patch("nerve.bootstrap.os.path.isdir", return_value=False), \
              patch("nerve.bootstrap.os.path.expanduser", side_effect=lambda p: p):
             content = _build_docker_compose(workspace_path="~/ws")
@@ -499,8 +578,9 @@ class TestDockerTemplateIntegrity:
         assert "~/.config/gh:/root/.config/gh" not in volumes
         assert "~/.config/gog:/root/.config/gog" not in volumes
 
-    def test_compose_extra_mounts(self) -> None:
+    def test_compose_extra_mounts(self, monkeypatch) -> None:
         """Extra mounts should appear in the volumes list."""
+        monkeypatch.delenv("NERVE_HOME", raising=False)
         with patch("nerve.bootstrap.os.path.isdir", return_value=False), \
              patch("nerve.bootstrap.os.path.expanduser", side_effect=lambda p: p):
             content = _build_docker_compose(
@@ -851,11 +931,10 @@ class TestInitStatePersistence:
         assert _load_init_state() is None
 
     def test_state_file_permissions(self) -> None:
-        import nerve.bootstrap as bootstrap_mod
-        from nerve.bootstrap import _save_init_state
+        from nerve.bootstrap import _init_state_file, _save_init_state
 
         _save_init_state(SetupChoices(), {"mode"})
-        path = bootstrap_mod.INIT_STATE_FILE.expanduser()
+        path = _init_state_file()
         mode = stat.S_IMODE(os.stat(path).st_mode)
         assert mode == 0o600
 

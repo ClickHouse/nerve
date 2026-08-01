@@ -12,6 +12,7 @@ import pytest
 import pytest_asyncio
 import yaml
 
+from nerve import paths
 from nerve.config import NerveConfig, ProxyConfig, load_config
 
 
@@ -29,9 +30,11 @@ class TestProxyConfigDefaults:
         assert pc.port == 8317
         assert pc.host == "127.0.0.1"
         assert pc.api_key == "sk-nerve-local-proxy"
-        assert pc.binary_path == Path("~/.nerve/bin/cli-proxy-api")
-        assert pc.auth_dir == Path("~/.nerve/cli-proxy-auth")
-        assert pc.log_file == Path("~/.nerve/proxy.log")
+        # Defaults now resolve through nerve.paths (honoring NERVE_HOME) and are
+        # expanded eagerly — matching what from_dict already produced at runtime.
+        assert pc.binary_path == paths.nerve_path("bin", "cli-proxy-api")
+        assert pc.auth_dir == paths.nerve_path("cli-proxy-auth")
+        assert pc.log_file == paths.nerve_path("proxy.log")
 
     def test_from_dict_empty(self) -> None:
         pc = ProxyConfig.from_dict({})

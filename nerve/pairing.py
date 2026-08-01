@@ -25,15 +25,16 @@ import secrets
 import time
 from pathlib import Path
 
+from nerve import paths
+
 logger = logging.getLogger(__name__)
 
-PAIRING_FILE = Path("~/.nerve/telegram_pairing")
 CODE_TTL_SECONDS = 60 * 60  # 1 hour
 MAX_ATTEMPTS = 5
 
 
 def _pairing_path() -> Path:
-    return PAIRING_FILE.expanduser()
+    return paths.nerve_path("telegram_pairing")
 
 
 def _read_state() -> dict | None:

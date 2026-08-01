@@ -161,7 +161,10 @@ class CronJob:
             id=d["id"],
             schedule=d["schedule"],
             prompt=d.get("prompt", ""),
-            prompt_file=d.get("prompt_file", ""),
+            # Blank means unset: it is truthy, and it outranks ``prompt`` below,
+            # so a stray space would beat a perfectly good inline prompt and
+            # then fail every run trying to read a file named for a space.
+            prompt_file=str(d.get("prompt_file") or "").strip(),
             workflow=d.get("workflow"),
             description=d.get("description", ""),
             model=d.get("model", ""),

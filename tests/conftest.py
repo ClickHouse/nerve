@@ -1,13 +1,53 @@
 """Shared test fixtures for Nerve tests."""
 
 import asyncio
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
+import nerve.config  # noqa: F401  — imported so its constants can be re-pointed
+from nerve import paths
 from nerve.db import Database
+
+# Machine-local paths that are already materialized by the time a fixture runs,
+# keyed by attribute name -> location under the state dir.
+#
+# ``nerve.paths`` re-reads NERVE_HOME on every call, but a module-level
+# ``X = paths.nerve_path(...)`` is evaluated when its module is imported, and
+# pytest imports every test module (and everything it pulls in) before the first
+# fixture executes. The env override below therefore lands too late for such a
+# constant — and by then ``from nerve.config import X`` has copied the stale
+# Path into each importer's namespace, so patching the definition alone misses
+# them.
+#
+# Left alone they name the developer's live install: `nerve restart --resume`
+# appends to the real resume queue and the daemon-side drainer *unlinks* it. One
+# test that forgets one patch is enough to destroy state on the machine running
+# the suite, which is why isolation happens here instead of per test.
+_IMPORT_TIME_STATE_PATHS = {"RESUME_QUEUE_FILE": ("resume-after-restart",)}
+
+
+def _repoint_import_time_state_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rewrite every in-memory copy of the constants above to the temp state dir.
+
+    Sweeps the already-imported ``nerve`` modules rather than listing the known
+    importers, so a new consumer is covered the day it is added instead of the
+    day someone notices. A module imported later, inside a test body, picks up
+    the patched definition in ``nerve.config`` — which is why this file imports
+    it eagerly.
+    """
+    for attr, parts in _IMPORT_TIME_STATE_PATHS.items():
+        target = paths.nerve_path(*parts)
+        for name, module in list(sys.modules.items()):
+            if module is None or not (name == "nerve" or name.startswith("nerve.")):
+                continue
+            # Type check keeps an unrelated same-named attribute from being
+            # replaced with a Path behind its owner's back.
+            if isinstance(getattr(module, attr, None), Path):
+                monkeypatch.setattr(module, attr, target)
 
 
 @pytest.fixture(scope="session")
@@ -22,25 +62,20 @@ def event_loop():
 def _isolate_nerve_state_files(tmp_path, monkeypatch):
     """Keep tests away from the real ~/.nerve state files.
 
-    The config-dir pointer, wizard init-state, and Telegram pairing files
-    all live under ~/.nerve on a real install. Tests must never read or
-    mutate them (running the suite on a live box would otherwise repoint
-    the daemon's config discovery or leak pairing codes).
-    """
-    import nerve.bootstrap
-    import nerve.config
-    import nerve.pairing
+    The config-dir pointer, wizard init-state, Telegram pairing file, DB,
+    caches, etc. all live under ~/.nerve on a real install. Tests must never
+    read or mutate them (running the suite on a live box would otherwise
+    repoint the daemon's config discovery or leak pairing codes).
 
+    Every machine-local path now funnels through ``nerve.paths.nerve_home()``,
+    which honors the ``NERVE_HOME`` env var, so a single override isolates the
+    whole state directory instead of patching each constant individually — with
+    the exception of the paths already frozen at import time, which the second
+    step rewrites by hand.
+    """
     state_dir = tmp_path / "_nerve_state"
-    monkeypatch.setattr(
-        nerve.config, "CONFIG_POINTER_FILE", state_dir / "config_dir",
-    )
-    monkeypatch.setattr(
-        nerve.bootstrap, "INIT_STATE_FILE", state_dir / "init-state.json",
-    )
-    monkeypatch.setattr(
-        nerve.pairing, "PAIRING_FILE", state_dir / "telegram_pairing",
-    )
+    monkeypatch.setenv("NERVE_HOME", str(state_dir))
+    _repoint_import_time_state_paths(monkeypatch)
 
 
 @pytest_asyncio.fixture
