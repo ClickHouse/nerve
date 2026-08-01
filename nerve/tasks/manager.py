@@ -111,6 +111,10 @@ class TaskManager:
                 file_path=rel_path,
                 title=row["title"],
                 status="done",
+                source=row.get("source"),
+                source_url=row.get("source_url"),
+                deadline=row.get("deadline"),
+                tags=row.get("tags") or "",
                 content=content,
             )
 
