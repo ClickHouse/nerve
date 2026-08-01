@@ -502,7 +502,10 @@ class AgentEngine:
         Returns the list of McpServerConfig.
         """
         from nerve.config import load_claude_code_plugins, load_mcp_servers
-        self._mcp_servers_cache = load_mcp_servers()
+        # Read from the daemon's actual config dir (not the process cwd) so a
+        # reload sees the same config.yaml + workspace/config/settings.yaml that
+        # startup loaded.
+        self._mcp_servers_cache = load_mcp_servers(self.config.config_dir)
         self._claude_code_plugins = load_claude_code_plugins()
         await self._sync_mcp_servers_to_db()
         logger.info(

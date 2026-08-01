@@ -170,6 +170,12 @@ def _docker_compose(
     return result.returncode
 
 
+# Commands that must keep working when the config itself is broken -- they are
+# how an operator diagnoses or repairs it. They receive ctx.obj["config"] = None
+# and ctx.obj["config_error"], and are responsible for reporting.
+_SELF_DIAGNOSING_COMMANDS = frozenset({"doctor", "init"})
+
+
 @click.group()
 @click.option(
     "--config-dir", "-c", type=click.Path(), default=None,
@@ -186,16 +192,24 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     resolved_dir, config_source = resolve_config_dir(config_dir)
     if not resolved_dir.is_absolute():
         resolved_dir = resolved_dir.resolve()
+    config = None
+    config_error = None
     try:
         config = load_config(resolved_dir)
     except ConfigError as e:
-        # Render config errors (e.g. an unresolved required ${ENV_VAR}) as a
-        # clean message + non-zero exit instead of a raw traceback — this
-        # callback runs before every subcommand, including `nerve doctor`.
-        raise click.ClickException(str(e)) from e
-    set_config(config)
+        # This callback runs before *every* subcommand, so a config that won't
+        # load would otherwise take down the commands you reach for to fix it.
+        # The self-diagnosing ones get config=None and report the problem
+        # themselves; everything else gets a clean message and a non-zero exit
+        # rather than a raw traceback.
+        if ctx.invoked_subcommand not in _SELF_DIAGNOSING_COMMANDS:
+            raise click.ClickException(str(e)) from e
+        config_error = e
+    if config is not None:
+        set_config(config)
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
+    ctx.obj["config_error"] = config_error
     ctx.obj["config_dir"] = str(resolved_dir)
     ctx.obj["config_source"] = config_source
     ctx.obj["verbose"] = verbose
@@ -219,7 +233,14 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         if non_interactive:
             click.echo("Nerve is already configured. Skipping.")
             return
-        if not click.confirm("Nerve is already configured. Re-run setup? (Config files will be overwritten, workspace files won't.)"):
+        if not click.confirm(
+            "Nerve is already configured. Re-run setup? (config.yaml and "
+            "config.local.yaml are regenerated; workspace/config/settings.yaml "
+            "keeps any key the wizard doesn't generate; other workspace files "
+            "are untouched. Each of the three that holds any setting is copied "
+            "to *.bak first — an empty or comments-only file is skipped, since "
+            "there is nothing in it to lose.)"
+        ):
             return
 
     if non_interactive:
@@ -761,10 +782,14 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         suffix = f" (via {source_label})" if source_label else ""
         has_base = (Path(config_dir) / "config.yaml").exists()
         has_local = (Path(config_dir) / "config.local.yaml").exists()
-        if has_base or has_local:
+        from nerve.config import workspace_settings_file
+        has_settings = workspace_settings_file(config.workspace).exists()
+        if has_base or has_local or has_settings:
             present = " + ".join(
                 n for n, ok in (
-                    ("config.yaml", has_base), ("config.local.yaml", has_local),
+                    ("config.yaml", has_base),
+                    ("config.local.yaml", has_local),
+                    ("workspace/config/settings.yaml", has_settings),
                 ) if ok
             )
             lines.append(f"[OK] Config: {config_dir} ({present}){suffix}")
@@ -775,15 +800,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "-c/--config-dir or NERVE_CONFIG_DIR"
             )
 
-    # Unknown / misspelled config keys
+    # Unknown / misspelled config keys — validate the same merged view that
+    # load_config sees (workspace/config/settings.yaml + config.yaml +
+    # config.local.yaml), so typos in the shared settings layer are caught too.
     try:
-        from nerve.config import _deep_merge, validate_config_keys
-        merged: dict = {}
-        for name in ("config.yaml", "config.local.yaml"):
-            p = Path(config_dir or ".") / name
-            if p.exists():
-                import yaml as _yaml
-                merged = _deep_merge(merged, _yaml.safe_load(p.read_text()) or {})
+        from nerve.config import _read_config_sources, validate_config_keys
+        merged = _read_config_sources(Path(config_dir)) if config_dir else {}
         for w in validate_config_keys(merged):
             warnings.append(f"[WARN] config: {w}")
     except Exception:
@@ -1030,6 +1052,14 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
 def doctor(ctx: click.Context) -> None:
     """Check config, DB, API keys, and connectivity."""
     config = ctx.obj["config"]
+    if config is None:
+        # The config wouldn't load at all — that *is* the diagnosis.
+        click.secho("Nerve Doctor", bold=True)
+        click.echo("=" * 40)
+        click.secho(f"[ERR] Config could not be loaded: {ctx.obj['config_error']}",
+                    fg="red")
+        click.echo(f"      Config directory: {ctx.obj['config_dir']}")
+        ctx.exit(1)
     report = doctor_report(
         config,
         config_source=ctx.obj.get("config_source", ""),
