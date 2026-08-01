@@ -168,6 +168,11 @@ def _scalar_to_list(value: Any, base: type) -> list[Any] | None:
     A blank string yields the empty list rather than one empty entry, and a lone
     non-string scalar (``exclude_chats: 42``) is wrapped so it reaches the
     element coercion below.
+
+    A tuple is copied element-wise. YAML never parses to one, so a tuple can
+    only be a code-side default — a builder handing a module-level tuple
+    constant to a ``list[X]`` field — where the elements are already the
+    intended entries and only the container is wrong.
     """
     if value is None:
         return []
@@ -177,6 +182,8 @@ def _scalar_to_list(value: Any, base: type) -> list[Any] | None:
         return [part.strip() for part in value.split(",") if part.strip()]
     if isinstance(value, (bool, int, float)):
         return [value]
+    if isinstance(value, tuple):
+        return list(value)
     return None
 
 

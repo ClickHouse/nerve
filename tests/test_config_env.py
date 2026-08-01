@@ -587,3 +587,72 @@ class TestScalarCoercion:
                 f"{name} is list[{element}], which has no probe above — add one "
                 "rather than leaving the field unchecked"
             )
+
+    def test_defaults_arrive_as_lists_not_tuples(self):
+        """`from_dict({})` must hand every `list[X]` field an actual list.
+
+        The sweeps above feed values in; none of them ever checked what falls
+        out when a section is absent and the builder supplies its own default.
+        A default spelled as a module-level tuple (immutable, safe to share)
+        that a builder passes through unconverted reaches `coerce_scalars` as
+        a non-list — one "ignoring non-list config value" warning per config
+        load, on configs that never mention the section at all. That is how
+        `langfuse.redact_patterns` shipped. Tuples now normalize like any
+        other code-side scalar, and this sweep pins the container type of
+        every built default so the next tuple constant fails here instead of
+        warning in production.
+        """
+        import dataclasses
+        import inspect
+        import typing
+
+        import nerve.config as cfg
+
+        two_arg = {"McpServerConfig"}  # from_dict(cls, name, d)
+        broken, checked = [], 0
+        for _name, klass in sorted(vars(cfg).items()):
+            if not (inspect.isclass(klass) and dataclasses.is_dataclass(klass)):
+                continue
+            from_dict = getattr(klass, "from_dict", None)
+            if not callable(from_dict):
+                continue
+            hints = typing.get_type_hints(klass)
+            list_fields = [
+                f.name
+                for f in dataclasses.fields(klass)
+                if typing.get_origin(hints.get(f.name)) is list
+            ]
+            if not list_fields:
+                continue
+            built = from_dict("probe", {}) if klass.__name__ in two_arg \
+                else from_dict({})
+            for name in list_fields:
+                checked += 1
+                got = getattr(built, name)
+                if not isinstance(got, list):
+                    broken.append(
+                        f"{klass.__name__}.{name}: from_dict({{}}) built a "
+                        f"{type(got).__name__}: {got!r}"
+                    )
+        assert checked >= 19, f"probe reached only {checked} list fields — did it break?"
+        assert not broken, (
+            "list fields whose built defaults are not lists:\n" + "\n".join(broken)
+        )
+
+    def test_langfuse_default_redact_patterns_load_cleanly(self, caplog):
+        """An absent langfuse block keeps the default redact set, silently.
+
+        Regression: the defaults constant is a tuple, and `from_dict` used to
+        hand it through verbatim — the patterns still compiled (the consumer
+        `list()`s the field), but every single config load logged a
+        `nerve.coerce` warning about it.
+        """
+        import logging
+
+        from nerve.config import _DEFAULT_LANGFUSE_REDACT_PATTERNS, LangfuseConfig
+
+        with caplog.at_level(logging.WARNING, logger="nerve.coerce"):
+            lf = LangfuseConfig.from_dict({})
+        assert lf.redact_patterns == list(_DEFAULT_LANGFUSE_REDACT_PATTERNS)
+        coerce_records = [r for r in caplog.records if r.name == "nerve.coerce"]
+        assert not coerce_records, [r.getMessage() for r in coerce_records]
