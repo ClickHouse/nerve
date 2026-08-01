@@ -144,6 +144,54 @@ class TestStatusToolHandlers:
         await task_update_handler(ctx, {"task_id": task_id, "status": "in_progress"})
         assert (await db.get_task(task_id))["status"] == "in_progress"
 
+    async def test_update_deadline_syncs_database(self, db: Database, tmp_path):
+        ctx = self._ctx(db, tmp_path)
+        await task_create_handler(ctx, {"title": "Deadline task", "content": "x"})
+        task_id = (await db.list_tasks(status="all"))[0]["id"]
+
+        await task_update_handler(ctx, {"task_id": task_id, "deadline": "2026-08-01"})
+
+        task = await db.get_task(task_id)
+        assert task["deadline"] == "2026-08-01"
+        assert "**Deadline:** 2026-08-01" in (tmp_path / task["file_path"]).read_text(
+            encoding="utf-8",
+        )
+
+    async def test_update_note_refreshes_fts(self, db: Database, tmp_path):
+        ctx = self._ctx(db, tmp_path)
+        await task_create_handler(ctx, {"title": "Search task", "content": "x"})
+        task_id = (await db.list_tasks(status="all"))[0]["id"]
+
+        await task_update_handler(ctx, {"task_id": task_id, "note": "Investigated quasarflux"})
+
+        results = await db.search_tasks("quasarflux")
+        assert [task["id"] for task in results] == [task_id]
+
+    async def test_update_combined_fields_indexes_final_state(
+        self, db: Database, tmp_path,
+    ):
+        ctx = self._ctx(db, tmp_path)
+        await task_create_handler(ctx, {"title": "Original title", "content": "x"})
+        task_id = (await db.list_tasks(status="all"))[0]["id"]
+
+        await task_update_handler(
+            ctx,
+            {
+                "task_id": task_id,
+                "title": "Renamed task",
+                "status": "in_progress",
+                "deadline": "2026-08-01",
+                "tags": "ops,urgent",
+                "note": "Found nebularift",
+            },
+        )
+
+        task = await db.get_task(task_id)
+        assert (task["title"], task["status"], task["deadline"], task["tags"]) == (
+            "Renamed task", "in_progress", "2026-08-01", "ops,urgent",
+        )
+        assert [task["id"] for task in await db.search_tasks("nebularift")] == [task_id]
+
     async def test_status_create_handler(self, db: Database, tmp_path):
         ctx = self._ctx(db, tmp_path)
         result = await task_status_create_handler(
