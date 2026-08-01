@@ -777,10 +777,11 @@ class PromptRewriteConfig:
         )
 
 
-# Built-in fallback for the composer's Claude model picker when
-# ``agent.models`` is unset — the current-generation models Nerve itself
-# defaults to elsewhere in this file. Bare Anthropic API IDs: they do not
-# apply on Bedrock, where model IDs are region-prefixed.
+# Fallback for the composer's Claude model picker when ``agent.models`` is
+# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
+# — the current-generation models Nerve itself defaults to elsewhere in this
+# file. Bare Anthropic API IDs: they do not apply on Bedrock, where model IDs
+# are region-prefixed.
 DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
     "claude-opus-5",
     "claude-sonnet-4-6",
@@ -813,11 +814,19 @@ class AgentConfig:
     # Claude models selectable in the web composer's model picker
     # (GET /api/models). The configured `model` above is always offered
     # first; entries here extend the list (order-preserving, deduped).
-    # Empty → a built-in current-generation list (DEFAULT_CLAUDE_MODELS)
-    # on the direct Anthropic API; on Bedrock only the models named in
-    # config are offered (Bedrock IDs are region-prefixed, so the bare
-    # built-ins would not resolve there).
+    # Empty → the models the configured credentials actually expose, read
+    # from the Anthropic Models API (see `model_discovery` below), falling
+    # back to a built-in current-generation list (DEFAULT_CLAUDE_MODELS).
+    # On Bedrock only the models named in config are offered (Bedrock IDs
+    # are region-prefixed, so neither discovery nor the bare built-ins
+    # resolve there).
     models: list[str] = field(default_factory=list)
+    # Ask the Anthropic Models API (GET /v1/models) which models the
+    # configured credentials can reach, and offer those in the picker, so a
+    # newly released model needs no code change or config edit. Best-effort:
+    # ignored when `models` above is set explicitly, on Bedrock, without an
+    # API key, or when the API is unreachable — the built-in list applies.
+    model_discovery: bool = True
     max_turns: int = 100
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
@@ -883,6 +892,7 @@ class AgentConfig:
                 for k, v in (d.get("model_aliases") or {}).items()
             },
             models=_str_list(d.get("models"), clean=True),
+            model_discovery=d.get("model_discovery", True),
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
@@ -2588,25 +2598,41 @@ class NerveConfig:
         """
         return self.ollama.enabled and self.proxy.enabled
 
-    @property
-    def claude_models(self) -> list[str]:
+    def selectable_claude_models(
+        self, discovered: list[str] | None = None,
+    ) -> list[str]:
         """Selectable Claude chat models for the composer's model picker.
 
-        The configured default (``agent.model``) always leads; ``agent.models``
-        entries follow in config order (deduped). When ``agent.models`` is
-        unset, the built-in :data:`DEFAULT_CLAUDE_MODELS` list applies on the
-        direct Anthropic API. Bedrock model IDs are region-prefixed, so the
-        bare built-ins are skipped there — Bedrock offers only the models
-        named in config.
+        The configured default (``agent.model``) always leads; the rest come
+        from the first source that has anything to say:
+
+        1. ``agent.models`` — an explicit list always wins,
+        2. *discovered* — what the Anthropic Models API reports the
+           credentials can reach (see :mod:`nerve.models_catalog`),
+        3. the built-in :data:`DEFAULT_CLAUDE_MODELS` list.
+
+        Bedrock model IDs are region-prefixed, so neither discovery nor the
+        bare built-ins apply there — Bedrock offers only configured models.
         """
-        extras = self.agent.models or (
-            [] if self.provider.is_bedrock else list(DEFAULT_CLAUDE_MODELS)
-        )
+        if self.agent.models:
+            extras = list(self.agent.models)
+        elif discovered:
+            extras = list(discovered)
+        elif self.provider.is_bedrock:
+            extras = []
+        else:
+            extras = list(DEFAULT_CLAUDE_MODELS)
+
         ordered: list[str] = []
         for m in (self.agent.model, *extras):
             if m and m not in ordered:
                 ordered.append(m)
         return ordered
+
+    @property
+    def claude_models(self) -> list[str]:
+        """Config-only view of :meth:`selectable_claude_models` (no discovery)."""
+        return self.selectable_claude_models()
 
     def create_anthropic_client(self, timeout: float = 60.0) -> Any:
         """Create an Anthropic client based on the configured provider.

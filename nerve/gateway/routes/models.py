@@ -1,10 +1,17 @@
 """Model discovery routes — which chat models the UI can offer.
 
-Exposes the selectable Claude models (``config.claude_models`` — the
-configured default plus ``agent.models`` or a built-in current-generation
-list), the Codex app-server's advertised models, and any locally-installed
-Ollama models (auto-discovered from the running Ollama server). The web
-composer's model picker calls GET /api/models to populate its options.
+Exposes the selectable Claude models (the configured default plus
+``agent.models``, or the live Anthropic catalog, or a built-in
+current-generation list — see :meth:`NerveConfig.selectable_claude_models`),
+the Codex app-server's advertised models, and any locally-installed Ollama
+models (auto-discovered from the running Ollama server). The web composer's
+model picker calls GET /api/models to populate its options.
+
+The Claude catalog comes from :mod:`nerve.models_catalog`, which asks the
+Anthropic Models API which models the configured credentials can actually
+reach — so a newly released model appears in the picker without a code
+change. It is cached (primed at startup) and falls back to the built-in
+list whenever discovery is off or unavailable.
 
 Ollama models are only listed when they are actually routable
 (``config.ollama_routable`` — Ollama enabled *and* the proxy running),
@@ -18,6 +25,7 @@ import logging
 
 from fastapi import APIRouter, Depends
 
+from nerve import models_catalog
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -46,7 +54,14 @@ async def list_models(user: dict = Depends(require_auth)):
     config = get_config()
     deps = get_deps()
     default_model = config.agent.model
-    claude_models = config.claude_models
+    # Live catalog first (cached; empty when discovery is off/unavailable),
+    # then whatever config names — the fallback chain lives in the config.
+    discovered = (
+        await models_catalog.get_models(config)
+        if config.agent.model_discovery
+        else []
+    )
+    claude_models = config.selectable_claude_models(discovered)
 
     codex_backend = deps.engine._backends.get("codex")
     codex_preflight = (
