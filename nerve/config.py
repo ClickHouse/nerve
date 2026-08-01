@@ -1874,6 +1874,11 @@ class NotificationsConfig:
         "high": "⚠️ ",
         "urgent": "🚨 ",
     })
+    # Output language for <YYYY-MM-DD> / <dow:> placeholders rendered into
+    # notification text: "en" (default), "ru", "de". Placeholder *parsing*
+    # stays multilingual regardless, since the source a weekday was copied
+    # from may be in any language. Unknown values fall back to English.
+    date_locale: str = "en"
 
     @classmethod
     @_coerced
@@ -1887,6 +1892,7 @@ class NotificationsConfig:
                 "high": "⚠️ ",
                 "urgent": "🚨 ",
             }),
+            date_locale=str(d.get("date_locale", "en")),
         )
 
 
