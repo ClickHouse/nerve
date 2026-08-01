@@ -32,7 +32,6 @@ import click
 
 from nerve import paths
 from nerve.config import (
-    ConfigError,
     RESUME_QUEUE_FILE,
     load_config,
     resolve_config_dir,
@@ -173,7 +172,7 @@ def _docker_compose(
 # Commands that must keep working when the config itself is broken -- they are
 # how an operator diagnoses or repairs it. They receive ctx.obj["config"] = None
 # and ctx.obj["config_error"], and are responsible for reporting.
-_SELF_DIAGNOSING_COMMANDS = frozenset({"doctor", "init"})
+_SELF_DIAGNOSING_COMMANDS = frozenset({"config", "doctor", "init"})
 
 
 @click.group()
@@ -196,17 +195,27 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     config_error = None
     try:
         config = load_config(resolved_dir)
-    except ConfigError as e:
+        set_config(config)
+    except Exception as e:
         # This callback runs before *every* subcommand, so a config that won't
         # load would otherwise take down the commands you reach for to fix it.
-        # The self-diagnosing ones get config=None and report the problem
-        # themselves; everything else gets a clean message and a non-zero exit
-        # rather than a raw traceback.
+        # The self-diagnosing ones get config=None plus the message and report
+        # it themselves — for any failure at all, since a command whose job is to
+        # explain a broken config is the last place a traceback helps.
+        #
+        # Everything else gets a clean error and a non-zero exit, but only for
+        # the operator's own mistakes: ConfigError (malformed YAML, an
+        # unresolved required ${VAR}) and the plain ValueError that
+        # NerveConfig._validate_backend_config raises for a bad agent.backend or
+        # codex section — ConfigError subclasses ValueError, so one check covers
+        # both. Anything else means nerve itself is broken, not the config, and
+        # keeps its traceback: presenting an internal defect as "Error: <config
+        # problem>" sends the operator to edit a file that was never at fault.
         if ctx.invoked_subcommand not in _SELF_DIAGNOSING_COMMANDS:
-            raise click.ClickException(str(e)) from e
-        config_error = e
-    if config is not None:
-        set_config(config)
+            if isinstance(e, ValueError):
+                raise click.ClickException(str(e)) from e
+            raise
+        config_error = str(e)
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
     ctx.obj["config_error"] = config_error
@@ -1066,11 +1075,12 @@ def doctor(ctx: click.Context) -> None:
     config = ctx.obj["config"]
     if config is None:
         # The config wouldn't load at all — that *is* the diagnosis.
-        click.secho("Nerve Doctor", bold=True)
+        click.echo("Nerve Doctor")
         click.echo("=" * 40)
-        click.secho(f"[ERR] Config could not be loaded: {ctx.obj['config_error']}",
-                    fg="red")
-        click.echo(f"      Config directory: {ctx.obj['config_dir']}")
+        click.echo(f"Config dir: {ctx.obj.get('config_dir')}")
+        click.secho(
+            f"[ERR] config failed to load: {ctx.obj.get('config_error')}", fg="red"
+        )
         ctx.exit(1)
     report = doctor_report(
         config,
@@ -1079,6 +1089,60 @@ def doctor(ctx: click.Context) -> None:
     )
     click.echo(report)
     if "[ERR]" in report:
+        ctx.exit(1)
+
+
+@main.group(name="config")
+def config_group() -> None:
+    """Configuration commands."""
+
+
+@config_group.command("validate")
+@click.option(
+    "--workspace", "workspace", type=click.Path(), default=None,
+    help="Validate this workspace's config (e.g. a checked-out config repo: "
+         "--workspace .). Defaults to the resolved workspace.",
+)
+@click.option(
+    "--strict-env", is_flag=True,
+    help="Fail if any ${ENV_VAR} reference is unset. Default: allow (CI usually "
+         "has no secrets); unset refs are reported as info.",
+)
+@click.option(
+    "--strict-keys", is_flag=True,
+    help="Fail on unknown/misspelled config keys. Default: warn (a key from a "
+         "newer nerve shouldn't fail CI). Recommended in CI on a config repo, "
+         "where the validator is pinned to the deployed nerve version.",
+)
+@click.option(
+    "--portable-only", is_flag=True,
+    help="Ignore this machine's config.yaml / config.local.yaml and validate "
+         "only the portable workspace config — what a shared repo carries.",
+)
+@click.pass_context
+def config_validate(
+    ctx: click.Context, workspace: str | None, strict_env: bool, strict_keys: bool,
+    portable_only: bool,
+) -> None:
+    """Validate the configuration bundle. Non-zero exit on any error (CI-ready)."""
+    from nerve.config_validate import validate_config_bundle
+
+    config_dir = Path(ctx.obj["config_dir"])
+    result = validate_config_bundle(
+        config_dir, workspace_override=workspace,
+        strict_env=strict_env, strict_keys=strict_keys,
+        portable_only=portable_only,
+    )
+    for msg in result.info:
+        click.echo(f"[info] {msg}")
+    for msg in result.warnings:
+        click.secho(f"[WARN] {msg}", fg="yellow")
+    for msg in result.errors:
+        click.secho(f"[ERR] {msg}", fg="red")
+    if result.ok:
+        click.secho("Config OK", fg="green")
+    else:
+        click.secho(f"Config invalid: {len(result.errors)} error(s)", fg="red")
         ctx.exit(1)
 
 
