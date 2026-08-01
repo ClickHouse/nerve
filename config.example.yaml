@@ -107,6 +107,17 @@ sync:
     enabled: true
     accounts: []                 # Set in config.local.yaml
     schedule: "*/15 * * * *"
+  # Plain IMAP mailboxes — for providers the Gmail source can't reach.
+  # One source per account. Passwords go in config.local.yaml under
+  # sync.imap.passwords, keyed by username. See docs/sources.md for the
+  # optional pass that reads mail whose payload is only legible as an image.
+  # imap:
+  #   enabled: false
+  #   accounts:
+  #     - host: imap.example.net
+  #       username: me@example.net
+  #       label: mailbox           # source name becomes imap:mailbox
+  #   schedule: "*/30 * * * *"
   github:
     enabled: true
     schedule: "*/15 * * * *"

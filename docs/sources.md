@@ -72,6 +72,70 @@ A persistent cron job (`inbox-processor`) runs every 15 minutes:
 - **Two-step fetch:** Search returns metadata only; body + `internalDate` are fetched per-message via `gog gmail get` (up to 5 concurrent)
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 
+### IMAP
+- **Adapter:** `nerve/sources/imap.py` — plain `imaplib`, no CLI or provider API
+- **Scope:** Any IMAP mailbox the Gmail source cannot reach (that one goes through the `gog` CLI / Gmail API), e.g. GMX, Fastmail, a company server
+- **Instances:** One source per configured account (`imap:<label>`), each with an independent cursor
+- **Cursor:** `<UIDVALIDITY>:<max_uid>` — UIDs are only stable within a UIDVALIDITY, so a server-side reset is detected and re-baselined instead of trusted
+- **First run:** `SINCE` window of `initial_lookback_days` (default 1)
+- **Subsequent runs:** `UID SEARCH <last+1>:*`, filtered client-side (the `N:*` range always returns at least the highest UID)
+- **Blocking I/O:** the whole IMAP conversation runs in a worker thread via `asyncio.to_thread`
+- **Credentials:** passwords live in `sync.imap.passwords` keyed by username (put them in `config.local.yaml`); an account with no password is skipped with a warning instead of failing the sync
+- **Optional image pass:** see below
+- **Default schedule:** `*/30 * * * *` (every 30 min)
+- **Disabled by default**
+
+#### Reading mail that is only legible as an image
+
+Some senders put the part you actually care about in an inline image — a
+scan, a photo, a rendered document — so the body text is useless to an
+agent. `sync.imap.match` singles those messages out and `sync.imap.vision`
+runs a multimodal model over the image at ingest time, so the inbox
+consumer gets plain text.
+
+Both are inert by default: with no match rules, this is a plain mailbox
+source and no model is ever called.
+
+`vision.prompt` and `vision.answer_key` are a **matched pair** — the prompt
+tells the model which label to emit, and the parser reads the line after
+exactly that label. Change one without the other and every message silently
+comes back as `unknown_answer`, which looks like the model degrading rather
+than a config mistake. Leave `answer_key` empty to just take the first
+non-empty line.
+
+```yaml
+sync:
+  imap:
+    enabled: true
+    accounts:
+      - host: imap.example.net
+        username: me@example.net
+        label: scans              # source name becomes imap:scans
+    passwords:                    # config.local.yaml
+      me@example.net: "..."
+    match:
+      sender_contains: ["scans@example.net"]   # substrings of From:
+      attachment_contains: ["scan"]            # substrings of Content-ID / filename
+      only_matched: true                       # drop everything else at the source
+    vision:
+      enabled: true
+      model: ""                   # empty = memory.fast_model
+      prompt: |
+        Read the scan. Answer with EXACTLY one line:
+        Sender: <company or person, or "unreadable">
+      answer_key: "Sender:"
+      unknown_answer: "unreadable"
+      summary: "[{label}] scan from {answer}"
+      content: "{vision}\n\nSubject: {subject}\nDate: {date}"
+      summary_unknown: "[{label}] unreadable scan"
+      content_unknown: "The image could not be read.\n\nSubject: {subject}"
+```
+
+Wording templates accept `{label} {answer} {vision} {subject} {sender}
+{date} {body}`, where `{answer}` is the parsed line and `{vision}` the full
+model reply. An unknown placeholder logs a warning and leaves the template
+visible rather than failing the fetch.
+
 ### GitHub
 - **Adapter:** `nerve/sources/github.py` — uses `gh api notifications` CLI
 - **Cursor:** ISO 8601 timestamp of the newest notification's `updated_at`
@@ -130,6 +194,23 @@ sync:
     schedule: "*/15 * * * *"
     batch_size: 20
     condense: true                # Strip boilerplate + Haiku extraction for long emails
+
+  imap:
+    enabled: false                # Off by default
+    accounts:                     # One source per mailbox, each with own cursor
+      - host: imap.example.net
+        username: me@example.net
+        label: mailbox            # Source name becomes imap:mailbox
+        port: 993
+        mailbox: INBOX
+    passwords:                    # Keyed by username (in config.local.yaml)
+      me@example.net: "..."
+    schedule: "*/30 * * * *"
+    batch_size: 20
+    initial_lookback_days: 1
+    condense: false
+    match: {}                     # See "Reading mail that is only legible as an image"
+    vision: {}
 
   github:
     enabled: true

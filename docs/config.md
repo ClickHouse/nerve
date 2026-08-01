@@ -1095,6 +1095,23 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 | `sync.gmail.schedule` | cron | `*/15 * * * *` | Fetch frequency |
 | `sync.gmail.keyring_password` | string | - | gog keyring password |
 
+**IMAP-specific** (see [sources.md](sources.md) for the image pass):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sync.imap.enabled` | bool | `false` | Enable IMAP mailboxes |
+| `sync.imap.accounts` | list | `[]` | Mailboxes: `host`, `username`, `label`, `port`, `mailbox` |
+| `sync.imap.passwords` | dict | `{}` | Password per username — keep in `config.local.yaml` |
+| `sync.imap.schedule` | cron | `*/30 * * * *` | Fetch frequency |
+| `sync.imap.initial_lookback_days` | int | `1` | `SINCE` window on first run |
+| `sync.imap.match.sender_contains` | list | `[]` | Substrings matched against `From:` |
+| `sync.imap.match.attachment_contains` | list | `[]` | Substrings matched against an image's Content-ID / filename |
+| `sync.imap.match.only_matched` | bool | `false` | Drop everything that did not match |
+| `sync.imap.vision.enabled` | bool | `false` | Run a multimodal pass over a matched message's image |
+| `sync.imap.vision.model` | string | *(empty)* | Falls back to `memory.fast_model` |
+| `sync.imap.vision.prompt` | string | *(empty)* | What to ask about the image — required when vision is enabled |
+| `sync.imap.vision.answer_key` | string | *(empty)* | Label the prompt asks the model to emit; empty = first non-empty line |
+
 **GitHub-specific:**
 
 | Key | Type | Default | Description |
