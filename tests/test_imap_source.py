@@ -19,7 +19,13 @@ from email.message import EmailMessage
 
 import pytest
 
-from nerve.config import ImapMatchConfig, ImapVisionConfig
+from nerve.config import (
+    ImapAccountConfig,
+    ImapMatchConfig,
+    ImapSyncConfig,
+    ImapVisionConfig,
+    NerveConfig,
+)
 from nerve.sources.imap import (
     ImapSource,
     _decode_hdr,
@@ -30,6 +36,7 @@ from nerve.sources.imap import (
     _format,
     _parse_cursor,
 )
+from nerve.sources.registry import build_source_runners
 
 # 1x1 transparent PNG (valid, tiny) for the image tests.
 _PNG_BYTES = base64.b64decode(
@@ -435,3 +442,65 @@ async def test_mismatched_answer_key_degrades_to_unknown():
 
     summary, _ = await src._build_vision_record(_matched_msg())
     assert "unlesbar" in summary
+
+
+# ---------------------------------------------------------------------------
+# Config coercion — every value can arrive as a string via ${ENV_VAR}
+# ---------------------------------------------------------------------------
+
+def test_match_rules_survive_a_bare_string():
+    """``sender_contains: ${SENDER}`` is one rule, not one rule per character."""
+    match = ImapMatchConfig.from_dict({
+        "sender_contains": "alerts@bank.com",
+        "attachment_contains": "scan",
+        "only_matched": "true",
+    })
+    assert match.sender_contains == ["alerts@bank.com"]
+    assert match.attachment_contains == ["scan"]
+    assert match.only_matched is True
+
+
+def test_sync_config_survives_string_scalars():
+    """``bool("false")`` is ``True``, so the source must not cast eagerly."""
+    sync = ImapSyncConfig.from_dict({
+        "enabled": "false",
+        "batch_size": "50",
+        "initial_lookback_days": "7",
+        "condense": "0",
+        "vision": {"enabled": "false"},
+        "accounts": [{"host": "imap.example.com",
+                      "username": "me@example.com",
+                      "port": "993"}],
+    })
+    assert sync.enabled is False
+    assert sync.batch_size == 50
+    assert sync.initial_lookback_days == 7
+    assert sync.condense is False
+    assert sync.vision.enabled is False
+    assert sync.accounts[0].port == 993
+    # label defaults off the username's local part
+    assert sync.accounts[0].label == "me"
+
+
+def test_account_tolerates_a_half_written_entry():
+    """A missing key is dropped later, not raised at config load."""
+    account = ImapAccountConfig.from_dict({"port": 143})
+    assert account.host == ""
+    assert account.username == ""
+
+
+@pytest.mark.asyncio
+async def test_registry_skips_an_account_missing_its_host(db):
+    cfg = NerveConfig.from_dict({
+        "sync": {"imap": {
+            "enabled": True,
+            "accounts": [
+                {"username": "me@example.com"},                     # no host
+                {"host": "imap.example.com", "username": "you@example.com"},
+            ],
+            "passwords": {"me@example.com": "x", "you@example.com": "y"},
+        }},
+    })
+    runners = build_source_runners(cfg, db)
+    labels = [r.source.source_name for r in runners if r.source.source_name.startswith("imap")]
+    assert labels == ["imap:you"]
