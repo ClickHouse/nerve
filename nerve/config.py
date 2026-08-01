@@ -913,8 +913,39 @@ class MemoryConfig:
         )
 
 
+def _cron_dir_has_jobs(d: Path) -> bool:
+    """True if a cron dir actually holds job definitions (jobs.yaml or system.yaml)."""
+    return (d / "jobs.yaml").exists() or (d / "system.yaml").exists()
+
+
+def _resolve_cron_dir(workspace: Path | None) -> Path:
+    """Effective directory holding cron config (jobs/system/gates).
+
+    Prefers the git-syncable ``workspace/config/cron`` so cron definitions live
+    in the shared workspace. Resolution is **file-aware**: an empty
+    ``workspace/config/cron`` (e.g. a git checkout with only a ``gates/``
+    placeholder, or a partially-initialized workspace) must NOT silently shadow
+    a legacy ``~/.nerve/cron`` that still holds real jobs. So:
+
+      * If the workspace location has job files → use it.
+      * Else, if the legacy location has job files → use it (un-migrated install).
+      * Else → the workspace location (new install; may be about to be populated).
+    """
+    legacy = paths.cron_dir()
+    if workspace is None:
+        return legacy
+    ws_cron = workspace_config_dir(workspace) / "cron"
+    if _cron_dir_has_jobs(ws_cron):
+        return ws_cron
+    if _cron_dir_has_jobs(legacy):
+        return legacy
+    return ws_cron
+
+
 @dataclass
 class CronConfig:
+    # Bare defaults (no workspace context) point at the legacy machine-local
+    # location; from_dict resolves the workspace-aware location when it can.
     jobs_file: Path = field(default_factory=lambda: paths.cron_dir() / "jobs.yaml")
     system_file: Path = field(default_factory=lambda: paths.cron_dir() / "system.yaml")
     # Directory scanned at startup for drop-in custom gate plugins (.py files
@@ -923,11 +954,12 @@ class CronConfig:
 
     @classmethod
     @_coerced
-    def from_dict(cls, d: dict) -> CronConfig:
+    def from_dict(cls, d: dict, workspace: Path | None = None) -> CronConfig:
+        base = _resolve_cron_dir(workspace)
         return cls(
-            jobs_file=_expand_path(d.get("jobs_file")) or paths.cron_dir() / "jobs.yaml",
-            system_file=_expand_path(d.get("system_file")) or paths.cron_dir() / "system.yaml",
-            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir")) or paths.cron_dir() / "gates",
+            jobs_file=_expand_path(d.get("jobs_file")) or base / "jobs.yaml",
+            system_file=_expand_path(d.get("system_file")) or base / "system.yaml",
+            gate_plugins_dir=_expand_path(d.get("gate_plugins_dir")) or base / "gates",
         )
 
 
@@ -2043,8 +2075,11 @@ class NerveConfig:
 
     @classmethod
     def _build_from_dict(cls, d: dict) -> NerveConfig:
+        # Resolve the workspace once so workspace-aware sub-configs (e.g. cron,
+        # which now lives in workspace/config/cron) can be located relative to it.
+        workspace = _expand_path(d.get("workspace")) or paths.default_workspace()
         return cls(
-            workspace=_expand_path(d.get("workspace")) or paths.default_workspace(),
+            workspace=workspace,
             timezone=d.get("timezone", "America/New_York"),
             deployment=d.get("deployment", "server"),
             quiet_start=d.get("quiet_start", "02:00"),
@@ -2055,7 +2090,7 @@ class NerveConfig:
             telegram=TelegramConfig.from_dict(d.get("telegram", {})),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
-            cron=CronConfig.from_dict(d.get("cron", {})),
+            cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace),
             backup=BackupConfig.from_dict(d.get("backup", {})),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),

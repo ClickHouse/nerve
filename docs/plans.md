@@ -104,7 +104,7 @@ User reviews (via /plans UI or chat tools)
 
 ## Cron Job
 
-Defined in `~/.nerve/cron/jobs.yaml` as `task-planner`:
+Defined in `<workspace>/config/cron/jobs.yaml` as `task-planner`:
 
 - **Schedule:** Every 4 hours (`0 */4 * * *`)
 - **Session mode:** Persistent (keeps context for revisions)

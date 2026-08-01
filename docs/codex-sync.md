@@ -31,7 +31,7 @@ client metadata.
 ## Enabling
 
 ```yaml
-# config.yaml
+# <workspace>/config/settings.yaml
 sync:
   codex:
     enabled: true

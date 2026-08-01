@@ -6,12 +6,19 @@ Nerve uses APScheduler for in-process async job scheduling. Jobs can run in isol
 
 ## Two-File Layout
 
-Cron jobs live in two YAML files under `~/.nerve/cron/`:
+Cron jobs live in two YAML files under `<workspace>/config/cron/` (the
+git-syncable workspace subtree):
 
 | File | Purpose | Managed by |
 |------|---------|------------|
 | `system.yaml` | Built-in crons (core + productivity) | `nerve init` — safe to regenerate |
 | `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
+
+> **Location & migration.** New installs write cron config to
+> `<workspace>/config/cron/`. Installs that still have the legacy
+> `~/.nerve/cron/` keep working: if the workspace location doesn't exist yet,
+> Nerve reads from `~/.nerve/cron/` automatically. You can also pin the paths
+> explicitly with `cron.jobs_file` / `cron.system_file` / `cron.gate_plugins_dir`.
 
 Both files use the same format. On startup, CronService loads and merges both:
 - If a job ID appears in both files, the **user version wins** (with a warning in the log).
@@ -22,7 +29,7 @@ Running `nerve init` on an existing install regenerates `system.yaml` (e.g., to 
 ## Job Definition
 
 ```yaml
-# ~/.nerve/cron/jobs.yaml (or system.yaml — same format)
+# <workspace>/config/cron/jobs.yaml (or system.yaml — same format)
 jobs:
   - id: morning-briefing
     schedule: "30 11 * * *"        # 11:30 AM daily
@@ -65,7 +72,7 @@ prompt definition.
 
 - Relative paths resolve against the directory of the YAML file the job was
   loaded from (e.g. `prompts/repo-watch.md` next to `jobs.yaml` →
-  `~/.nerve/cron/prompts/repo-watch.md`). Absolute paths and `~` work too.
+  `<workspace>/config/cron/prompts/repo-watch.md`). Absolute paths and `~` work too.
 - The file is read fresh on **every run** — edits take effect on the next
   trigger without a restart.
 - If both `prompt` and `prompt_file` are set, the file wins; the inline
@@ -183,7 +190,7 @@ immediately. This is the right path for gates that ship with Nerve.
 ### Custom gate plugins (drop-in)
 
 To add your **own** gate without editing core source, drop a `.py` file into
-the gate-plugins directory — `~/.nerve/cron/gates/` by default (overridable via
+the gate-plugins directory — `<workspace>/config/cron/gates/` by default (overridable via
 the `cron.gate_plugins_dir` config key). On daemon startup Nerve imports each
 file and registers every `CronGate` subclass it defines with a non-empty
 `type`. After that, `run_if` can reference your gate by `type` exactly like a
@@ -191,7 +198,7 @@ built-in. Because this never touches `nerve/cron/gates.py`, your custom gates
 don't conflict when you pull Nerve upstream.
 
 ```python
-# ~/.nerve/cron/gates/stale_tasks.py
+# <workspace>/config/cron/gates/stale_tasks.py
 from nerve.cron.gates import CronGate, GateContext
 
 
@@ -214,7 +221,7 @@ class StaleTasksGate(CronGate):
 ```
 
 ```yaml
-# ~/.nerve/cron/jobs.yaml — reference it like any built-in gate
+# <workspace>/config/cron/jobs.yaml — reference it like any built-in gate
 run_if:
   - type: stale_tasks
     min_age_minutes: 60
@@ -302,13 +309,16 @@ nerve cron morning-briefing
 
 # Check cron status
 nerve doctor
-#   [OK] System crons: ~/.nerve/cron/system.yaml (3/5 enabled)
-#   [OK] User crons: ~/.nerve/cron/jobs.yaml (1 jobs)
+#   [OK] Cron jobs: 3/5 enabled, 1 overridden in jobs.yaml
+#
+# system.yaml and jobs.yaml are merged first (a user job overrides a system
+# job with the same id), so the counts are for the merged set. If either file
+# can't be parsed, doctor falls back to just listing the paths it found.
 ```
 
 ## Built-in System Crons
 
-These ship in `~/.nerve/cron/system.yaml` and are managed by `nerve init`. Running `nerve init` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
+These ship in `<workspace>/config/cron/system.yaml` and are managed by `nerve init`. Running `nerve init` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|

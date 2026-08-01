@@ -1705,11 +1705,11 @@ class SetupWizard:
         self._write_config_local_yaml()
         click.secho(" ✓", fg="green")
 
-        # 9. Create the machine-local state directory
+        # 9. Create the machine-local state directory. Cron config no longer
+        # lives here — it's in workspace/config/cron.
         click.echo(f"  Setting up {paths.home_label()}/...", nl=False)
         nerve_dir = paths.nerve_home()
         nerve_dir.mkdir(parents=True, exist_ok=True)
-        (nerve_dir / "cron").mkdir(parents=True, exist_ok=True)
         click.secho(" ✓", fg="green")
 
         # 10. Write cron jobs
@@ -2060,9 +2060,9 @@ class SetupWizard:
                     else _WORKER_MEMORY_CATEGORIES
                 ),
             },
-            # No "cron" block: CronConfig already defaults to paths.cron_dir().
-            # Pinning literal ~/.nerve paths here overrode NERVE_HOME and sent
-            # the daemon looking somewhere `nerve init` had not written.
+            # Cron config lives in workspace/config/cron (git-syncable); the
+            # loader resolves it from the workspace automatically, so no explicit
+            # cron paths are written here.
             "sessions": {
                 "sticky_period_minutes": 120,
                 "archive_after_days": 30,
@@ -2358,13 +2358,18 @@ class SetupWizard:
                     job["run_if"] = cron["run_if"]
                 jobs.append(job)
 
-        # Write system crons (managed by nerve init, safe to regenerate).
-        # Must go through paths.cron_dir() -- a literal ~/.nerve here ignores
-        # NERVE_HOME, so a relocated instance writes its jobs into the default
-        # state dir while the daemon reads them from the relocated one.
-        cron_dir = paths.cron_dir()
+        # Cron config lives in the git-syncable workspace/config/cron subtree.
+        # Via _workspace_dir for the reason spelled out there: expanding only
+        # `~` here sent a `workspace: ${VAR}` install's jobs to a literal
+        # "./${VAR}/config/cron" beside the process CWD, where nothing loads
+        # them, while settings.yaml landed correctly and the wizard reported
+        # success.
+        cron_dir = self._workspace_dir() / "config" / "cron"
+        cron_dir.mkdir(parents=True, exist_ok=True)
+        (cron_dir / "gates").mkdir(parents=True, exist_ok=True)
+
+        # Write system crons (managed by nerve init, safe to regenerate)
         system_file = cron_dir / "system.yaml"
-        system_file.parent.mkdir(parents=True, exist_ok=True)
 
         with open(system_file, "w", encoding="utf-8") as f:
             f.write("# Nerve — System Cron Jobs\n")
@@ -2372,14 +2377,24 @@ class SetupWizard:
             f.write("# To add custom crons, use jobs.yaml instead.\n\n")
             yaml.safe_dump({"jobs": jobs}, f, default_flow_style=False, sort_keys=False)
 
-        # Create empty jobs.yaml scaffold if it doesn't exist
+        # Create jobs.yaml scaffold if it doesn't exist. If this is an upgrade
+        # from a legacy install, preserve the user's existing custom crons by
+        # copying the legacy jobs.yaml rather than writing a blank placeholder
+        # (a blank one here would shadow the legacy jobs — see _resolve_cron_dir).
         jobs_file = cron_dir / "jobs.yaml"
         if not jobs_file.exists():
-            with open(jobs_file, "w", encoding="utf-8") as f:
-                f.write("# Nerve — Custom Cron Jobs\n")
-                f.write("# Add your own cron jobs here. Nerve will never overwrite this file.\n")
-                f.write("# Format is the same as system.yaml — see it for examples.\n\n")
-                f.write("jobs: []\n")
+            legacy_jobs = paths.cron_dir() / "jobs.yaml"
+            if legacy_jobs.exists():
+                shutil.copy2(legacy_jobs, jobs_file)
+                click.echo(
+                    f"\n    Migrated custom crons from {legacy_jobs} to {jobs_file}",
+                )
+            else:
+                with open(jobs_file, "w", encoding="utf-8") as f:
+                    f.write("# Nerve — Custom Cron Jobs\n")
+                    f.write("# Add your own cron jobs here. Nerve will never overwrite this file.\n")
+                    f.write("# Format is the same as system.yaml — see it for examples.\n\n")
+                    f.write("jobs: []\n")
 
     # --- Preflight ---
 
@@ -2894,8 +2909,9 @@ You are running inside a Docker container. Key paths:
 | Path | Contents | Writable | Notes |
 |------|----------|----------|-------|
 | `/nerve` | Nerve source code **and config** | ✓ (bind mount) | `pyproject.toml`, `nerve/` package, `web/` — the full repo. The config directory resolves to the working directory, so `config.yaml` and `config.local.yaml` live here. |
-| `{_DOCKER_NERVE_HOME}` | Machine-local state (`$NERVE_HOME`) | ✓ (bind mount) | Databases, logs, PID, caches, `cron/` jobs. Never synced. |
-| `{_DOCKER_WORKSPACE}` | Your workspace (`$NERVE_WORKSPACE`) | ✓ (bind mount) | AGENTS.md, SOUL.md, MEMORY.md, skills — where you live. |
+| `{_DOCKER_NERVE_HOME}` | Machine-local state (`$NERVE_HOME`) | ✓ (bind mount) | Databases, logs, PID, caches. Never synced. |
+| `{_DOCKER_WORKSPACE}` | Your workspace (`$NERVE_WORKSPACE`) | ✓ (bind mount) | AGENTS.md, SOUL.md, MEMORY.md, skills, and `config/` — where you live. |
+| `{_DOCKER_WORKSPACE}/config` | Shareable config | ✓ (bind mount) | `settings.yaml` and `cron/` — the git-syncable layer. |
 
 ### Working with Nerve source
 
@@ -2904,7 +2920,8 @@ You are running inside a Docker container. Key paths:
 - If you modify the web UI (`/nerve/web/`), rebuild with: `cd /nerve/web && npm run build`
 - Config files live in `/nerve/`, NOT in `{_DOCKER_NERVE_HOME}/` — the config
   directory is the working directory the daemon was started from.
-- Cron jobs live in `{_DOCKER_NERVE_HOME}/cron/` (`jobs.yaml`, `system.yaml`, `gates/`).
+- Cron jobs live in `{_DOCKER_WORKSPACE}/config/cron/` (`jobs.yaml`, `system.yaml`,
+  `gates/`), not under `$NERVE_HOME` — they are part of the syncable config.
 
 ### Credentials
 

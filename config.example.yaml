@@ -122,13 +122,16 @@ sync:
 
 # Memory (memU)
 memory:
-  chat_model: claude-sonnet-4-6
+  recall_model: claude-sonnet-4-6
   # embed_model: text-embedding-3-small  # Only needed with openai_api_key
 
-# Cron
-cron:
-  system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
-  jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
+# Cron — no keys needed. Cron config lives in <workspace>/config/cron/
+# (system.yaml, jobs.yaml, gates/) and is resolved from the workspace, with a
+# fallback to the legacy ~/.nerve/cron for un-migrated installs.
+#
+# Do NOT pin system_file/jobs_file here unless you really mean it: an explicit
+# value wins outright, so it disables both the workspace location and the
+# fallback, and `nerve init` will keep regenerating a system.yaml nothing reads.
 
 # Workflow runs — budget-capped multi-agent jobs (Claude Workflow tool or
 # Codex Ultracode) in dedicated tracked sessions. Nerve meters real dollar

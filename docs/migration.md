@@ -33,10 +33,18 @@ cp -r $OPENCLAW_WS/memory/* $NERVE_WS/memory/
 Convert OpenClaw's `~/.openclaw/cron/jobs.json` to Nerve's YAML format:
 
 ```bash
-mkdir -p ~/.nerve/cron
+mkdir -p $NERVE_WS/config/cron
 ```
 
-Create `~/.nerve/cron/jobs.yaml` from your existing jobs. The format changes from:
+Create `$NERVE_WS/config/cron/jobs.yaml` from your existing jobs — cron config
+lives in the workspace so it can be reviewed and synced like the rest of it.
+
+> Nerve still reads the legacy `~/.nerve/cron/` when the workspace location has
+> no job files, so an older guide that put them there is not broken. But once
+> you (or `nerve init`) create `$NERVE_WS/config/cron/jobs.yaml`, the fallback
+> stops firing — don't split jobs across both.
+
+The format changes from:
 
 ```json
 {
