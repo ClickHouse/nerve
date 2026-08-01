@@ -270,6 +270,18 @@ async def lifespan(app: FastAPI):
     # Wire up routes
     init_deps(_engine, db)
 
+    # Prime the Anthropic model catalog so the composer's model picker
+    # offers every model these credentials can reach (instead of a built-in
+    # list that goes stale on each release). Off the critical path and
+    # best-effort: until it lands — or if it fails — the picker falls back
+    # to the configured/built-in list. Runs after the proxy is up, since
+    # discovery goes through it when proxy.enabled.
+    models_prime_task = None
+    if config.agent.model_discovery:
+        from nerve import models_catalog
+
+        models_prime_task = asyncio.create_task(models_catalog.prime(config))
+
     # Initialize notification service. The engine has a setter so the
     # per-session ``ToolContext`` constructed inside ``engine.run()``
     # picks up the live reference. We also seed the legacy module
@@ -698,6 +710,8 @@ async def lifespan(app: FastAPI):
     idle_sweep_task.cancel()
     memorize_task.cancel()
     cleanup_task.cancel()
+    if models_prime_task is not None and not models_prime_task.done():
+        models_prime_task.cancel()
     await _engine.shutdown()
     # Flush Langfuse spans last — after the engine has reported its final
     # ResultMessage and any in-flight memU spans have completed. ``flush``

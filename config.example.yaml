@@ -52,12 +52,19 @@ agent:
   #   opus: claude-opus-5
   # Claude models selectable in the web composer's model picker. The
   # configured `model` above is always offered first; entries here extend
-  # the list. Unset → a built-in current-generation list (opus / sonnet /
-  # haiku). On Bedrock only models named in config are offered (Bedrock
-  # IDs are region-prefixed, so the bare built-ins would not resolve).
+  # the list. Unset → the models the Anthropic Models API reports for your
+  # credentials (see model_discovery below), falling back to a built-in
+  # current-generation list (opus / sonnet / haiku). On Bedrock only models
+  # named in config are offered (Bedrock IDs are region-prefixed, so
+  # neither discovery nor the bare built-ins would resolve).
   # models:
   #   - claude-opus-5
   #   - claude-sonnet-4-6
+  # Ask the Anthropic Models API (GET /v1/models) at startup which models
+  # the configured credentials can reach, so a newly released model shows up
+  # in the picker without a config edit. Ignored when `models` above is set,
+  # on Bedrock, or without an API key. false → always use the built-in list.
+  model_discovery: true
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
   background_agent_permissions: true  # Background sub-agents (Agent run_in_background) get the same tool permissions as foreground; false denies their Write/Edit/Bash
