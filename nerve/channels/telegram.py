@@ -1023,10 +1023,29 @@ class TelegramChannel(BaseChannel):
                 )
             return
 
+        # Refuse to pair under lockdown — allowed users must come from the
+        # tracked remote config, not a local runtime edit. Check BEFORE the
+        # in-memory add so lockdown isn't bypassed for the current run.
+        from nerve.config import LockdownError, is_locked
+
+        if is_locked():
+            await update.message.reply_text(
+                "This instance is locked (remote-only). Add your Telegram user "
+                "to telegram.allowed_users in the workspace config repo instead."
+            )
+            return
+
         # Success: authorize in memory and persist to config.local.yaml
         self._allowed_users.add(user_id)
         try:
             append_telegram_allowed_user(self.config.config_dir, user_id)
+        except LockdownError:
+            # Belt-and-suspenders: config was locked between the check and here.
+            self._allowed_users.discard(user_id)
+            await update.message.reply_text(
+                "This instance is locked (remote-only) — pairing is disabled."
+            )
+            return
         except Exception:
             logger.exception("Paired user %d but failed to persist to config", user_id)
             await update.message.reply_text(

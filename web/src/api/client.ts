@@ -369,7 +369,7 @@ export const api = {
   // Memory
   listMemoryFiles: () => request<{ files: any[] }>('/memory/files'),
   readMemoryFile: (path: string) =>
-    request<{ path: string; content: string }>(`/memory/file/${path}`),
+    request<{ path: string; content: string; read_only?: boolean }>(`/memory/file/${path}`),
   writeMemoryFile: (path: string, content: string) =>
     request<any>(`/memory/file/${path}`, {
       method: 'PUT',

@@ -1479,9 +1479,12 @@ class CodexClient(AgentClient):
                 "command_approval", self._approval_payload(params),
             )
         if method == "item/fileChange/requestApproval":
-            return await self._approval(
-                "file_approval", self._approval_payload(params),
-            )
+            payload = self._approval_payload(params)
+            refusal = self._lockdown_refusal(payload)
+            if refusal:
+                logger.warning("codex: declining file change — %s", refusal)
+                return {"decision": "decline"}
+            return await self._approval("file_approval", payload)
         if method == "item/permissions/requestApproval":
             # The response type requires a constructed GrantedPermissionProfile
             # — there is no decline variant to express. Unsupported in v1
@@ -1506,6 +1509,39 @@ class CodexClient(AgentClient):
             return {"decision": "decline"}
         logger.warning("codex: unknown server request %s — empty reply", method)
         return {}
+
+    def _lockdown_refusal(self, payload: dict) -> str | None:
+        """Why a locked instance declines this file change, if it does.
+
+        **This is a partial control and the shape of the gap matters.** Codex's
+        sandbox is a mode — ``read-only`` / ``workspace-write`` /
+        ``danger-full-access`` — not a path list, so there is no way to express
+        "everything except ``<workspace>/config/``" to the app-server. The one
+        in-band hook is this approval request, and it only fires when
+        ``approval_policy`` asks for approvals; nerve ships ``never`` with
+        ``danger-full-access``, so under the default configuration codex never
+        asks and this never runs. Wired up anyway, because an operator who does
+        run codex with approvals should get the same answer the Claude backend
+        gives, and because a control that exists is easier to reach for than one
+        that has to be invented later. Documented as a gap rather than presented
+        as a boundary.
+        """
+        from nerve.config import tracked_config_write_refusal
+
+        item = payload.get("item")
+        changes = self._changes(item) if isinstance(item, dict) else []
+        for change in changes:
+            path = str(change.get("path") or "")
+            if not path:
+                continue
+            try:
+                refusal = tracked_config_write_refusal(path)
+            except Exception as e:  # noqa: BLE001 — never break the turn
+                logger.warning("lockdown write check failed for %r: %s", path, e)
+                continue
+            if refusal:
+                return refusal
+        return None
 
     def _approval_payload(self, params: dict) -> dict:
         """Attach the originating item's context (the raw request carries

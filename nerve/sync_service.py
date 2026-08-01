@@ -111,17 +111,22 @@ def _rev(ref: str, cwd: Path) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _config_pathspec(workspace: Path) -> str:
-    """The git pathspec for the portable config subtree of ``workspace``."""
-    from nerve.config import workspace_config_dir
+def _reviewed_pathspec(workspace: Path) -> list[str]:
+    """The git pathspecs for the reviewed surface of ``workspace``.
 
-    return str(workspace_config_dir(workspace))
+    The same list the write guard refuses, so the two cannot disagree about what
+    a reviewed file is. A path this misses is one sync merges over without ever
+    reporting that the live copy differs from the one that passed validation.
+    """
+    from nerve.config import workspace_reviewed_paths
+
+    return [str(p) for p in workspace_reviewed_paths(workspace)]
 
 
 def _local_config_divergence(
-    workspace: Path, rev: str,
+    workspace: Path, rev: str, locked: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Local state in the config subtree that the validated rev does not contain.
+    """Local state in the reviewed surface that the validated rev does not contain.
 
     Validation runs against a clean detached checkout of ``rev``; the merge lands
     in the live working tree. ``git merge --ff-only`` only refuses when the
@@ -140,20 +145,30 @@ def _local_config_divergence(
     about what ends up on disk, and it cannot make that promise about a tree
     somebody else is also editing.
 
-    Scoped to the config subtree on purpose. A nerve workspace is also the
+    Scoped to the reviewed surface on purpose. A nerve workspace is also the
     agent's working directory, so uncommitted notes and scratch files elsewhere
     in it are normal and none of sync's business — and where they *would* break
     the fast-forward, git says so itself.
+
+    ``locked`` promotes ``.gitignore``d files inside the surface from a warning to
+    a refusal. On an ordinary box those files are the operator's own, kept
+    deliberately out of the shared repo, and refusing a merge over them would be
+    sync passing judgement on what a machine may hold locally. A locked instance
+    has already made that judgement: its stated contract is that only reviewed,
+    merged remote config runs there, and an ignored ``cron/gates/*.py`` is local
+    unreviewed code the daemon executes, invisible to both the reviewer and the
+    validator. Merging on top of it would report success over a bundle that is
+    not the one that passed.
 
     Returns ``(blocking, warnings)``.
     """
     blocking: list[str] = []
     warnings: list[str] = []
-    pathspec = _config_pathspec(workspace)
+    pathspec = _reviewed_pathspec(workspace)
 
     status = _git([
         *_QUOTEPATH_OFF, "status", "--porcelain",
-        "--untracked-files=all", "--ignored=matching", "--", pathspec,
+        "--untracked-files=all", "--ignored=matching", "--", *pathspec,
     ], workspace)
     if status.returncode != 0:
         # Fail closed: unable to establish that the tree is clean is not the
@@ -168,30 +183,43 @@ def _local_config_divergence(
             continue
         code, path = line[:2], line[3:]
         if code == "!!":
-            # An ignored file inside a *tracked config subtree* is a layout
-            # mistake — it is config the shared repo can never carry and no
-            # reviewer will ever see. Worth saying; not worth refusing a merge
-            # over, since refusing would be a policy decision about what the
-            # box is allowed to have locally rather than a statement about
-            # whether the merge is sound.
-            warnings.append(f"ignored file inside the tracked config subtree: {path}")
+            # An ignored file inside the *reviewed surface* is a layout mistake —
+            # it is config the shared repo can never carry and no reviewer will
+            # ever see. Worth saying; on an unlocked box not worth refusing a
+            # merge over, since refusing would be a policy decision about what
+            # the machine is allowed to have locally rather than a statement
+            # about whether the merge is sound. Under lockdown that policy
+            # decision has already been made.
+            if locked:
+                blocking.append(f"!! {path} (gitignored)")
+            else:
+                warnings.append(
+                    f"ignored file inside the reviewed surface: {path}"
+                )
         else:
             blocking.append(f"{code.strip() or '??'} {path}")
 
-    # A submodule under the config subtree is a third case: `git worktree add`
+    # A submodule inside the reviewed surface is a third case: `git worktree add`
     # does not initialize submodules, so validation saw an empty directory, and
     # the fast-forward leaves the live checkout on its old commit. Neither the
     # old contents nor the new ones were checked.
-    tree = _git([*_QUOTEPATH_OFF, "ls-tree", "-r", rev, "--", pathspec], workspace)
+    #
+    # ``locked`` promotes it for the same reason as an ignored file: unvalidated
+    # content the daemon reads anyway is exactly what a locked box says cannot be
+    # there, and the submodule case is the worse of the two, since the working
+    # copy is whatever the box happens to have checked out and no remote change
+    # ever moves it.
+    tree = _git([*_QUOTEPATH_OFF, "ls-tree", "-r", rev, "--", *pathspec], workspace)
     if tree.returncode == 0:
         for line in tree.stdout.splitlines():
             if line.startswith("160000 "):
                 sub = line.split("\t", 1)[-1]
-                warnings.append(
-                    f"submodule {sub!r} in the config subtree was not validated "
+                note = (
+                    f"submodule {sub!r} in the reviewed surface was not validated "
                     f"(a validation checkout does not initialize submodules) and "
                     f"a fast-forward does not update it"
                 )
+                (blocking if locked else warnings).append(note)
     return blocking, warnings
 
 
@@ -292,6 +320,7 @@ def sync_workspace(
     branch: str = "",
     validate: bool = True,
     strict_env: bool = True,
+    locked: bool = False,
 ) -> SyncResult:
     """Fetch the workspace remote, validate the fetched bundle, then ff-merge it.
 
@@ -301,8 +330,8 @@ def sync_workspace(
     :class:`SyncResult`.
 
     That guarantee is about the tree the daemon will read, not merely about the
-    commit that was checked, so a merge is also refused when the live config
-    subtree has local changes of its own — see
+    commit that was checked, so a merge is also refused when the live reviewed
+    files have local changes of their own — see
     :func:`_local_config_divergence`. ``changed`` reports whether the live tree
     actually moved; a refusal leaves it exactly where it was.
 
@@ -310,6 +339,9 @@ def sync_workspace(
     bundle as invalid — the merge would otherwise leave a checkout the daemon
     refuses to load on its next restart. Turn it off only when running somewhere
     that legitimately lacks the daemon's environment, e.g. an operator's shell.
+
+    ``locked`` tightens the local-changes check for an instance that has promised
+    to run only reviewed remote config — see :func:`_local_config_divergence`.
 
     "Never raises" is the whole contract, not an aspiration: the HTTP route
     turns anything that escapes into a 500 and the daemon's loop would report a
@@ -325,6 +357,7 @@ def sync_workspace(
         with _sync_lock:
             return _sync_workspace(
                 Path(workspace), Path(config_dir), branch, validate, strict_env,
+                locked,
             )
     except Exception as e:  # noqa: BLE001 — see the contract above
         logger.warning("Workspace sync failed unexpectedly: %s", e, exc_info=True)
@@ -337,6 +370,7 @@ def _sync_workspace(
     branch: str,
     validate: bool,
     strict_env: bool,
+    locked: bool = False,
 ) -> SyncResult:
     """The fetch → validate → merge sequence. See :func:`sync_workspace`."""
     if not is_git_repo(workspace):
@@ -362,13 +396,13 @@ def _sync_workspace(
     if new == old:
         return SyncResult(ok=True, changed=False, old_rev=old, new_rev=new, message="up to date")
 
-    blocking, warnings = _local_config_divergence(workspace, new)
+    blocking, warnings = _local_config_divergence(workspace, new, locked)
     if blocking:
         return SyncResult(
             ok=False, changed=False, old_rev=old, new_rev=new,
             validation_warnings=warnings,
             message=(
-                f"fetched {new[:8]} but the workspace config subtree has local "
+                f"fetched {new[:8]} but the workspace's reviewed files have local "
                 f"changes — not applying, because they would survive the "
                 f"fast-forward without ever having been validated: "
                 f"{_describe_paths(blocking)}. Commit, discard or push them."
@@ -384,6 +418,19 @@ def _sync_workspace(
         # gate type nothing recognizes is how a cron job quietly starts running
         # unconditionally, and the only place that is visible is here.
         warnings += report.warnings
+        if report.unresolved_env and not strict_env:
+            # With strict_env on this is already an error and the merge is
+            # refused. With it off the validator files it as *info*, which
+            # nothing here propagates — so the gate would see the one thing that
+            # predicts a failed post-merge reload and drop it on the floor. The
+            # merge still goes ahead: switching strict_env off is exactly a
+            # request to tolerate this. Saying so is not.
+            warnings.append(
+                f"the fetched bundle references unset environment variable(s): "
+                f"{', '.join(report.unresolved_env)} — workspace_sync.strict_env "
+                f"is off so the merge proceeds, but this daemon will refuse to "
+                f"load the merged config"
+            )
         if report.errors:
             return SyncResult(
                 ok=False, changed=False, old_rev=old, new_rev=new,
@@ -430,14 +477,13 @@ async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Ev
 
     Every cycle re-reads the process-wide config object rather than working from
     a reference captured before the loop, so the loop can never be the reason a
-    setting is stuck. **On its own that changes nothing today:** nothing refreshes
-    that object after start-up — it is loaded once and only replaced by the CLI
-    at process start — so editing ``workspace_sync`` still requires a restart to
-    take effect. Once something does refresh it, ``branch``, ``validate``,
+    setting is stuck. What refreshes that object is :func:`_apply_sync`, i.e. a
+    sync that actually merged something — after which ``branch``, ``validate``,
     ``strict_env``, ``interval_minutes``, the workspace location and turning sync
-    off will apply from the following cycle with no further work here. Turning
-    sync *on* will still need a restart regardless: this task is created at
-    start-up only when sync is already enabled, and nothing creates it later.
+    off all apply from the following cycle. Nothing *else* refreshes it, so a
+    hand-edited ``config.yaml`` on the box still needs a restart. Turning sync
+    *on* needs one regardless: this task is created at start-up only when sync is
+    already enabled, and nothing creates it later.
     """
     from nerve.config import get_config
 
@@ -471,6 +517,7 @@ async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Ev
                 sync_workspace, config.workspace,
                 config.config_dir or config.workspace,
                 branch=cfg.branch, validate=cfg.validate, strict_env=cfg.strict_env,
+                locked=config.lockdown,
             )
             for warning in result.validation_warnings:
                 logger.warning("Workspace sync: config warning: %s", warning)
@@ -481,21 +528,65 @@ async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Ev
                 continue
             if result.changed:
                 logger.info("Workspace sync: %s — applying", result.message)
-                await _apply_sync(engine, cron_service)
+                apply_error = await _apply_sync(
+                    engine, cron_service, config.config_dir or config.workspace,
+                )
+                if apply_error:
+                    # The merge landed but the daemon is still running the old
+                    # config. Logged at WARNING beside the INFO line above, which
+                    # otherwise reads as "applied".
+                    logger.warning(
+                        "Workspace sync: merged %s but the new config could not "
+                        "be loaded, so NOTHING was applied and this daemon is "
+                        "still running the previous configuration: %s",
+                        result.new_rev[:8], apply_error,
+                    )
         except Exception as e:  # noqa: BLE001 — never let the loop die
             logger.warning("Workspace sync cycle failed: %s", e)
             continue
 
 
-async def _apply_sync(engine, cron_service) -> None:
-    """Hot-reload the subsystems affected by a workspace pull."""
+async def _apply_sync(engine, cron_service, config_dir) -> str | None:
+    """Hot-reload the subsystems affected by a workspace pull.
+
+    Re-reads the typed config and re-points the singleton, so a synced settings
+    change engages here without a restart for everything that reads the singleton
+    per use: the lockdown write guards (``is_locked``), gateway authentication,
+    and — because it re-reads the singleton every cycle — the sync loop itself.
+    ``cron_service.config`` and ``engine.config`` are re-pointed too. What is
+    *not*: cron jobs and gates already built, which follow on the next
+    ``cron_service.reload()``, and anything captured in a closure or a dataclass
+    at start-up, which follows on a restart. This is also the only path that
+    refreshes any of it — a hand edit to a config file on the box is not picked
+    up, by design for a locked instance and by omission otherwise.
+
+    Returns the config-reload error, if any. A merge that lands config the daemon
+    cannot load has applied nothing, however well the merge itself went, and the
+    caller must not report success for it: the case that makes this concrete is a
+    pull that turns ``lockdown`` on, where reporting success tells the operator a
+    box is locked while its write guards are still open.
+    """
+    from nerve.config import load_config, set_config
+
+    config_error: str | None = None
+    try:
+        new_config = load_config(config_dir)
+        set_config(new_config)
+        if cron_service is not None:
+            cron_service.config = new_config
+        if engine is not None and hasattr(engine, "config"):
+            engine.config = new_config
+    except Exception as e:  # noqa: BLE001 — a bad reload must not kill the loop
+        config_error = f"{type(e).__name__}: {e}"
+        logger.warning("config reload after sync failed: %s", e, exc_info=True)
     if cron_service is not None:
         try:
             await cron_service.reload()
         except Exception as e:  # noqa: BLE001
-            logger.warning("cron reload after sync failed: %s", e)
+            logger.warning("cron reload after sync failed: %s", e, exc_info=True)
     if engine is not None:
         try:
             await engine.reload_mcp_config()
         except Exception as e:  # noqa: BLE001
-            logger.warning("MCP reload after sync failed: %s", e)
+            logger.warning("MCP reload after sync failed: %s", e, exc_info=True)
+    return config_error

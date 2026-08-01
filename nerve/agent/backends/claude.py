@@ -216,6 +216,42 @@ def _translate_tool_result(
     )
 
 
+def lockdown_denial(tool_name: str, tool_input: dict[str, Any]) -> str | None:
+    """Why a locked instance refuses this file-writing tool call, if it does.
+
+    A locked instance promises that the config it runs came from a reviewed,
+    merged change. The write guards on the REST and MCP surfaces enforce that for
+    callers coming in over the network; the agent's own ``Write``/``Edit`` did not
+    go through any of them, and every non-interactive tool here is auto-approved.
+    This is where that gap closes.
+
+    **Scope, precisely.** It covers the tools that name a path — ``Write``,
+    ``Edit``, ``NotebookEdit`` — and nothing else. It is emphatically not a
+    sandbox: ``Bash`` is auto-approved on the same code path, so an agent that
+    means to write ``<workspace>/config/`` can still do it through a shell. That
+    is a known and documented limitation. Filtering command strings is not the
+    answer — quoting, ``sh -c``, redirection, ``python -c``, ``tee`` and every
+    editor defeat it — and a filter that looks like a boundary without being one
+    is worse than a gap someone can read about. Real sandboxing is separate work.
+
+    What this does buy is that the ordinary way an agent edits a file no longer
+    silently rewrites the config the box is promising to run, and that the refusal
+    says what to do instead.
+    """
+    if tool_name not in FILE_MODIFY_TOOLS:
+        return None
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if not path:
+        return None
+    from nerve.config import tracked_config_write_refusal
+
+    try:
+        return tracked_config_write_refusal(path)
+    except Exception as e:  # noqa: BLE001 — a broken guard must not kill the turn
+        logger.warning("lockdown write check failed for %r: %s", path, e)
+        return None
+
+
 # ------------------------------------------------------------------ #
 #  can_use_tool adapter                                                #
 # ------------------------------------------------------------------ #
@@ -241,6 +277,18 @@ class ClaudeToolPermissions:
         context: ToolPermissionContext,
     ) -> PermissionResult:
         hub = self._hub
+        # Checked before the snapshot: a refused write has nothing to snapshot,
+        # and marking it snapshotted would suppress the snapshot of a later,
+        # allowed write to the same path.
+        denial = lockdown_denial(tool_name, tool_input)
+        if denial:
+            logger.info(
+                "Session %s: denying %s under lockdown (%s)",
+                hub.session_id, tool_name,
+                tool_input.get("file_path") or tool_input.get("notebook_path"),
+            )
+            return PermissionResultDeny(message=denial)
+
         # Capture pre-execution file snapshot for diff tracking
         # (also done via PreToolUse hook in the backend as primary path).
         if hub.snapshot_fn and tool_name in FILE_MODIFY_TOOLS:
@@ -712,10 +760,27 @@ class ClaudeBackend:
             approved via ``can_use_tool``, which never fires for them,
             so the exclusion protected nothing. The image validator
             still runs for Read and its deny wins over this allow.
+
+            The lockdown check is repeated here rather than left to
+            ``can_use_tool``: for a background sub-agent this hook is the only
+            thing that runs, so the allow issued here is the entire decision.
+            It only ever refuses the path-naming write tools, so the Read
+            parity above is unaffected by it.
             """
             tool_name = hook_input.get("tool_name", "")
             if tool_name in INTERACTIVE_TOOLS:
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+            denial = lockdown_denial(
+                tool_name, hook_input.get("tool_input", {}) or {},
+            )
+            if denial:
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": denial,
+                    }
+                }
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",

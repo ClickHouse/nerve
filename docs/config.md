@@ -95,6 +95,8 @@ type, including `int | None`, `list[int]` and `list[str]`. So `port: ${PORT}` an
 - An unrecognized value is logged with the field that owns it, and that field
   keeps its documented default. Integers are parsed with `int()`, so `"1.5"`
   and `"1e3"` are rejected rather than truncated.
+- [`lockdown`](#lockdown-remote-only-read-only) is the exception: its default is
+  "unprotected", so an unreadable or empty value there is a hard error instead.
 - Defaults are not re-scanned: `${A:-${B}}` yields the literal `${B}` when `A`
   is unset. Use a single reference instead.
 
@@ -104,11 +106,12 @@ type, including `int | None`, `list[int]` and `list[str]`. So `port: ${PORT}` an
 error, so it can gate a config repo in CI:
 
 ```bash
-nerve config validate                  # the active install's config
-nerve config validate --workspace .    # a checked-out config repo
-nerve config validate --portable-only  # ignore this machine's config.yaml layers
-nerve config validate --strict-keys    # unknown keys become errors
-nerve config validate --strict-env     # every ${ENV_VAR} must be set
+nerve config validate                   # the active install's config
+nerve config validate --workspace .     # a checked-out config repo
+nerve config validate --portable-only   # ignore this machine's config.yaml layers
+nerve config validate --strict-keys     # unknown keys become errors
+nerve config validate --strict-env      # every ${ENV_VAR} must be set
+nerve config validate --assume-lockdown # check the view a locked box loads
 ```
 
 It runs even when the config cannot otherwise load, so a missing secret does not
@@ -180,6 +183,9 @@ jobs:
       # nerve is not published to PyPI: the bare name is an unrelated project.
       - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
       - run: nerve config validate --workspace . --portable-only --strict-keys
+      # Add --assume-lockdown if any instance served by this repo is locked and
+      # the flag comes from the environment. Without it CI checks the unlocked
+      # view and the lockdown checks never run. See "Lockdown" below.
 ```
 
 Installing from the default branch keeps the validator at or ahead of your
@@ -222,17 +228,21 @@ config, so the merged change takes effect immediately. CI on the PR is still the
 first line of defense. The remote and credentials come from git itself, so
 configure `git remote` and auth in the workspace as usual.
 
-**Keep the config subtree clean.** Sync refuses to merge while
-`<workspace>/config/` has local changes: an edited or deleted tracked file, a
-staged change, or an untracked file. Validation judges a clean checkout of the
-fetched commit, but the merge lands in your working tree, and `--ff-only` only
-refuses when the incoming commit touches the same path. Anything else would survive
-the merge unchecked, leaving a bundle on disk that is not the one that passed. The
-case that matters most is an untracked `config/cron/gates/*.py`: the daemon imports
-and runs gate plugins and validation never loads them, so a box meant to run only
-reviewed config would be running local code. Commit, discard or push local edits;
-the failure message names the paths. Files matched by `.gitignore` inside `config/`
-are warnings rather than refusals, since the shared repo can never carry them.
+**Keep the reviewed files clean.** Sync refuses to merge while the workspace's
+reviewed files have local changes: an edited or deleted tracked file, a staged
+change, or an untracked file. That is `<workspace>/config/`, `<workspace>/skills/`
+and the root instruction files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`,
+`TOOLS.md`) — the same set lockdown's write guard refuses. Validation judges a clean
+checkout of the fetched commit, but the merge lands in your working tree, and
+`--ff-only` only refuses when the incoming commit touches the same path. Anything
+else would survive the merge unchecked, leaving a bundle on disk that is not the one
+that passed. The case that matters most is an untracked `config/cron/gates/*.py`:
+the daemon imports and runs gate plugins and validation never loads them, so a box
+meant to run only reviewed config would be running local code. Commit, discard or
+push local edits; the failure message names the paths. So a skill the agent created
+at runtime, or a locally edited `SOUL.md`, blocks the merge until it is committed or
+dropped. Files matched by `.gitignore` in there are warnings rather than refusals,
+since the shared repo can never carry them.
 
 Sync validates more strictly than CI: an unset required `${VAR}` blocks the merge.
 CI has no secrets, so it reports those as info, but the daemon does have them, and a
@@ -248,6 +258,225 @@ unknown key, or a skipped validation.
 config object every cycle, so it adds no staleness of its own, but nothing refreshes
 that object while the process runs. Turning `enabled` on needs a restart in any
 case, because the sync task is only created at startup.
+
+## Lockdown (remote-only, read-only)
+
+Lockdown guarantees that the configuration an instance runs came from the tracked
+workspace repo, and that the runtime cannot change it. The machine-local layers are
+dropped, the write paths refuse, and config changes arrive only as a reviewed,
+merged commit that sync pulls in.
+
+It is a config-integrity control, not a sandbox. It raises the bar against the
+agent rewriting its own configuration; it does not confine the agent. Read
+[What lockdown does not cover](#what-lockdown-does-not-cover) before relying on
+it.
+
+### Before you turn it on
+
+**Clone the config repo as the workspace first.** A locked instance takes config
+changes only as a merged commit that sync pulls in, so a workspace with no git
+remote has nowhere to receive one from and refuses to start. `git remote -v` in the
+workspace is the check.
+
+**Move any required secrets into the environment first.** `config.local.yaml` is
+ignored when locked, so a secret that lives only there stops being read, and the
+feature depending on it breaks on the next restart. Supply each one as `${ENV_VAR}`
+referenced from `settings.yaml` before you lock the box. The usual ones:
+`auth.jwt_secret`, `auth.password_hash`, `telegram.bot_token`,
+`anthropic_api_key`/`openai_api_key`, `xmemory.api_key`.
+
+`auth.jwt_secret` is the one to get right. A locked instance that ends up without
+it does not fall back to the unauthenticated dev mode an unlocked box would — the
+gateway refuses every request with a 503 and websockets are declined — so the box
+comes up unusable rather than open. Note also that a `${VAR}` left unresolved
+survives as its literal text, which is a perfectly usable signing key and one
+published in the config repo, so check that the variable is actually set on the box.
+
+### Turning it on
+
+Set `lockdown: true` in the tracked `workspace/config/settings.yaml`, so the
+remote is the authority:
+
+```yaml
+# workspace/config/settings.yaml
+lockdown: true
+```
+
+The value may be an environment reference, `lockdown: ${NERVE_LOCKDOWN}`, so one
+shared repo can serve a fleet where only some boxes are locked. Unlike every other
+boolean, this one is not lenient: a value that is neither true nor false is a hard
+error and the instance refuses to start, because the only default it could fall
+back to is "unlocked". An empty value counts as unreadable, so
+`${NERVE_LOCKDOWN}` with the variable unset or blank is refused rather than read
+as off. Write `${NERVE_LOCKDOWN:-false}` when you want an explicit unlocked
+default. `nerve config validate` reports the same error, so a bad value fails the
+PR instead of the box.
+
+### Better: set it in the environment
+
+Setting the flag in `settings.yaml` alone leaves a way around it. Which
+`settings.yaml` gets read is decided by `workspace:` in the machine-local
+`config.yaml`, so editing that one line repoints the instance at a tree that never
+mentions lockdown — the flag reads false and the machine-local layers come back,
+`auth.jwt_secret` included.
+
+Closing that means putting both values in the environment, set where the service is
+defined. That is the one place neither a config edit nor the agent can reach:
+
+```ini
+# /etc/systemd/system/nerve.service
+[Service]
+Environment=NERVE_LOCKDOWN=1
+Environment=NERVE_WORKSPACE=/srv/nerve-workspace
+```
+
+```bash
+docker run -e NERVE_LOCKDOWN=1 -e NERVE_WORKSPACE=/root/nerve-workspace ...
+```
+
+Set both, not just one. `NERVE_LOCKDOWN` without `NERVE_WORKSPACE` is refused at
+startup: it would lock the instance onto whatever tree `config.yaml` happens to
+name, which is worse than not locking it at all. Once `NERVE_WORKSPACE` is set,
+`workspace:` in `config.yaml` is ignored.
+
+Two things to know about `NERVE_LOCKDOWN`:
+
+- **It can only lock, never unlock.** The instance is locked if the variable says so
+  *or* the tracked `settings.yaml` does. `NERVE_LOCKDOWN=false`, empty, and unset
+  all mean the environment expresses no opinion; none of them force an unlock. So no
+  file arriving later can undo it, and equally you cannot use the environment to
+  escape a locked tracked config — unlocking takes a merged change. A value that is
+  neither true nor false is refused at startup rather than read as no opinion.
+- **It is the same switch as `lockdown: ${NERVE_LOCKDOWN}`.** With the variable set
+  you need not mention `lockdown` in the tracked file at all, and a fleet repo that
+  already writes `${NERVE_LOCKDOWN:-false}` gets the same protection, along with the
+  `NERVE_WORKSPACE` requirement on the boxes where it resolves true.
+
+### When locked
+
+- **Config is remote-only.** Only `workspace/config/` and `${ENV_VAR}` are used.
+  The machine-local `config.yaml` and `config.local.yaml` and the legacy
+  `~/.nerve/cron` are ignored, and secrets come from the environment.
+- **The lever is remote-owned.** Lockdown is read only from the tracked
+  `settings.yaml`, so a local edit to `config.yaml` or `config.local.yaml` cannot
+  unlock the instance or fake-lock it. With `NERVE_WORKSPACE` set, neither can
+  repointing `workspace:`.
+- **What lockdown protects is the workspace's *reviewed surface*.** That is
+  `config/`, `skills/`, and the root instruction files `AGENTS.md`, `SOUL.md`,
+  `IDENTITY.md`, `USER.md` and `TOOLS.md`. `config/` is the declarative half; a
+  `SKILL.md` is model-invocable text with its own `allowed-tools` frontmatter that
+  the skill index picks up on the next reload, and the root files are the system
+  prompt the agent starts every turn from. `memory/`, `tasks/`, `TASK.md` and
+  ordinary workspace files are outside it and stay writable.
+- **Runtime edits to the reviewed surface are blocked.** Creating, updating,
+  deleting or toggling a skill, Telegram pairing, writing a workspace file that
+  lands in that surface, and other config mutations fail with a "locked" error
+  (HTTP 403). Change config by opening a PR against the workspace repo and letting
+  sync apply the merge. The rest of the workspace is unaffected: it is also the
+  agent's working directory, and lockdown covers what the box was reviewed to run
+  rather than the whole box.
+- **The agent's own `Write`/`Edit` are refused across that surface.** Every
+  non-interactive tool is otherwise auto-approved, so without this the ordinary way
+  an agent edits a file would never meet the guards above — and the skill
+  endpoints' 403 would be beside the point, since the index picks up whatever is in
+  `skills/` on the next reload however it got there. The refusal names the PR flow,
+  so a capable agent routes to it instead of retrying. Writes elsewhere (memory,
+  task files, scratch files) are unaffected. `Bash` is not covered; see below.
+- **The workspace must be a git repository with a remote.** Every local change to
+  the reviewed surface is refused, so a merged commit that sync pulls in is the only
+  way a config change can arrive. A workspace that is not a repository, or is one
+  with no remote, has no route at all: the instance would keep the configuration it
+  happens to hold, and nothing would report it. A locked instance without one
+  refuses to start rather than running unlocked — removing a remote is a
+  machine-local change, and a machine-local change does not unlock a box. Any remote
+  counts, and `workspace_sync.enabled: false` is not part of this: sync follows the
+  branch's own upstream when `workspace_sync.branch` is unset, and `nerve config
+  sync` is a manual route that works with the periodic loop off.
+- **The reviewed subtrees must really be in the workspace.** `<workspace>/config`
+  and `<workspace>/skills` have to resolve inside `<workspace>`, and each has to be
+  a real directory rather than a symlink. If one is a symlink out, nothing under it
+  is part of the reviewed repo, `settings.yaml` included. If it is a symlink to a
+  sibling inside the workspace, git does not descend into it, so nothing under it is
+  tracked and sync reports the workspace clean whatever it holds. Either way the
+  instance refuses to start. Where the workspace itself lives stays a machine-local
+  decision, symlink included. The root instruction files get no such startup check:
+  a locked instance whose `SOUL.md` is a symlink starts. What covers that case is
+  the write guard, which resolves the link and refuses its target too, so the file
+  the prompt is built from is not writable under another name.
+- **`settings.yaml` must be inside that subtree.** `<workspace>/config/settings.yaml`
+  has to resolve inside `<workspace>/config/`, so a symlink there cannot source the
+  lockdown flag, the auth secret and the cron paths from a file no reviewer saw — an
+  ordinary workspace file the agent can write included. A link to another file
+  *within* the subtree is fine; both ends are tracked. The write guard refuses the
+  path `config/settings.yaml` by name as well as by where it resolves, so a symlink
+  cannot turn a reviewed name into an allowed write.
+- **Cron cannot be pointed out of the workspace.** `cron.jobs_file`,
+  `cron.system_file` and `cron.gate_plugins_dir` must resolve inside
+  `<workspace>/config/`. One that does not is ignored, with a warning, in favour of
+  the in-workspace default. `..`, absolute paths and symlinks out of the tree are
+  all caught, because the resolved path is what is checked. This matters most for
+  `gate_plugins_dir`, whose `.py` files the daemon imports: without the check, a
+  pure-YAML change to a reviewed file would be enough to get on-disk code executed.
+  When the in-workspace default is itself what escapes (`config/cron`, or
+  `config/cron/gates` committed as a symlink, which needs no config key at all)
+  there is nothing contained left to fall back to and the instance refuses to
+  start.
+- **Sync is stricter about local files.** [Workspace
+  sync](#git-backed-workspace-sync) already refuses to merge when the reviewed
+  surface has local changes; on a locked instance a `.gitignore`d file in there is
+  a refusal too rather than a warning, and so is a submodule, which a validation
+  checkout never initializes and a fast-forward never updates. An ignored
+  `config/cron/gates/*.py` is local code the daemon runs, invisible to both the
+  reviewer and the validator.
+
+Run `nerve config validate --workspace .` before merging; it validates the locked
+view when `lockdown: true`, which is where the checks above are decided. It also
+names the machine-local keys the bundle strands, so a key that quietly falls back
+to its default on every locked box is visible in the PR rather than at boot. The
+remote check is the one that judges the checkout the command runs in rather than
+the bundle: `actions/checkout` sets `origin`, but a run against an unpacked
+tarball reports it missing.
+
+**If the flag comes from the environment, add `--assume-lockdown` in CI.** With
+`lockdown: ${NERVE_LOCKDOWN:-false}` the validator resolves false wherever the
+variable is unset, which is every CI runner, so it checks the unlocked view and
+none of the checks above have anything to fire on — the only machine to find out is
+the locked one, at boot. `--assume-lockdown` forces the locked view. A plain run
+warns when it sees an env-controlled flag resolve to false, so the gap is at least
+visible.
+
+**Flipping the flag needs the config reloaded.** A sync does that, and so does
+`POST /api/config/reload`. The write guards, gateway authentication and the sync
+loop pick the change up immediately; cron jobs and gates already built follow on the
+next cron reload, and anything captured at startup needs a restart. A hand edit on
+the box refreshes nothing, and under lockdown it is ignored anyway. If a sync merges
+a config the daemon then cannot load, it reports `ok: false` with `apply_error`
+rather than claiming the change took.
+
+### What lockdown does not cover
+
+Lockdown is a config-integrity control, not a sandbox and not a permission system.
+
+**The agent can still reach the files through the shell.** `Bash` is auto-approved
+like every other non-interactive tool, so refusing `Write` and `Edit` closes the
+path an agent takes by default and by accident, not the one it takes deliberately.
+Nerve does not filter command strings — `sh -c`, redirection, `python -c` and every
+editor defeat such a filter, and a filter that looks like a boundary without being
+one is worse than a documented gap. If your threat model includes a deliberately
+hostile agent, run the daemon as a user that cannot write the workspace repo, or
+mount the reviewed subtrees read-only.
+
+**The codex backend is weaker still.** Codex's sandbox is a mode, not a path list,
+so "everything except the reviewed surface" cannot be expressed to it. Nerve
+declines a codex file change landing in that surface, but only through codex's
+approval request, and the shipped defaults (`sandbox: danger-full-access`,
+`approval_policy: never`) never ask. Treat the `Write`/`Edit` protection above as
+absent there unless you have configured approvals.
+
+**Operator CLI commands are out of scope.** `nerve init`, `nerve migrate` and
+`nerve restore` write config without consulting the flag: they are how an operator
+sets a box up or repairs one, and anyone who can run them can already edit the
+files directly.
 
 ## Migrating an Existing Install
 
@@ -336,6 +565,7 @@ from any working directory:
 |-----|------|---------|-------------|
 | `workspace` | path | `~/nerve-workspace` | Path to workspace directory |
 | `timezone` | string | `America/New_York` | Local timezone for scheduling |
+| `lockdown` | bool | `false` | [Remote-only, read-only mode](#lockdown-remote-only-read-only). Honored only in `workspace/config/settings.yaml`; an unreadable value is an error, not a default. |
 | `deployment` | string | `server` | `server` (bare metal) or `docker`. Set during `nerve init`; determines whether CLI commands run directly or proxy to `docker compose`. |
 
 > **Note:** The _mode_ (personal vs worker) is not a config field — it's determined at `nerve init` time and expressed through which workspace templates, cron jobs, and memory categories are active. There's no `mode` key in config.

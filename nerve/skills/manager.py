@@ -26,6 +26,7 @@ from typing import Any
 
 import yaml
 
+from nerve.config import ensure_not_locked
 from nerve.db import Database
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,41 @@ def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "", slug)
     slug = re.sub(r"-+", "-", slug).strip("-")
     return slug[:60] or "unnamed-skill"
+
+
+# One path component and nothing else: no separator, on either platform, and no
+# drive or UNC prefix. Deliberately wider than what _slugify emits, because the
+# filesystem is the source of truth here and discover() adopts whatever directory
+# names it finds — a pre-existing `My_Skill` must stay editable.
+_SKILL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
+
+
+class SkillIdError(ValueError):
+    """Raised for a skill id that could not name a directory under ``skills/``."""
+
+
+def _skill_id(skill_id: str) -> str:
+    """Validate a caller-supplied skill id before it is joined to a path.
+
+    ``_slugify`` runs on *create* only; every other entry point takes the id
+    straight from an HTTP path segment or a tool argument and joins it to
+    ``skills_dir``. That made ``..`` a working path component — and since delete
+    removes the whole directory tree it names, ``DELETE /api/skills/../config``
+    took out the workspace's tracked config subtree.
+
+    Checked as a *shape* rather than by containing the result afterwards: a skill
+    id names one directory directly under ``skills/``, so anything that is not a
+    single path component is not a skill id, whatever it would have resolved to.
+    A leading dot is refused too, which keeps ``.`` and ``..`` out without
+    special-casing them.
+    """
+    if not isinstance(skill_id, str) or not _SKILL_ID_RE.match(skill_id):
+        raise SkillIdError(
+            f"invalid skill id {skill_id!r}: a skill id names a single directory "
+            f"under skills/ — letters, digits, '.', '_', '+' and '-', not "
+            f"starting with a dot"
+        )
+    return skill_id
 
 
 def _parse_skill_md(raw: str) -> tuple[dict, str]:
@@ -219,7 +255,7 @@ class SkillManager:
 
     async def get_skill(self, skill_id: str) -> SkillContent | None:
         """Load full SKILL.md content + metadata for a skill."""
-        skill_dir = self.skills_dir / skill_id
+        skill_dir = self.skills_dir / _skill_id(skill_id)
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             return None
@@ -266,8 +302,9 @@ class SkillManager:
         version: str = "1.0.0",
     ) -> SkillMeta:
         """Create a new skill directory + SKILL.md and index in DB."""
+        ensure_not_locked("create a skill")
         skill_id = _slugify(name)
-        skill_dir = self.skills_dir / skill_id
+        skill_dir = self.skills_dir / _skill_id(skill_id)
 
         # Build SKILL.md
         raw = _build_skill_md(name, description, content, version)
@@ -293,7 +330,8 @@ class SkillManager:
 
     async def update_skill(self, skill_id: str, content: str) -> SkillMeta | None:
         """Update SKILL.md content (full raw file), re-parse frontmatter, sync DB."""
-        skill_dir = self.skills_dir / skill_id
+        ensure_not_locked("update a skill")
+        skill_dir = self.skills_dir / _skill_id(skill_id)
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             return None
@@ -325,7 +363,8 @@ class SkillManager:
 
     async def delete_skill(self, skill_id: str) -> bool:
         """Remove skill directory and DB record."""
-        skill_dir = self.skills_dir / skill_id
+        ensure_not_locked("delete a skill")
+        skill_dir = self.skills_dir / _skill_id(skill_id)
         if skill_dir.exists():
             await asyncio.to_thread(shutil.rmtree, skill_dir)
         await self.db.delete_skill_row(skill_id)
@@ -334,6 +373,7 @@ class SkillManager:
 
     async def toggle_skill(self, skill_id: str, enabled: bool) -> bool:
         """Enable or disable a skill."""
+        ensure_not_locked("toggle a skill")
         existing = await self.db.get_skill_row(skill_id)
         if not existing:
             return False
@@ -344,7 +384,7 @@ class SkillManager:
 
     async def list_references(self, skill_id: str) -> list[str]:
         """List reference files in a skill's references/ directory."""
-        refs_dir = self.skills_dir / skill_id / "references"
+        refs_dir = self.skills_dir / _skill_id(skill_id) / "references"
         if not refs_dir.is_dir():
             return []
 
@@ -359,7 +399,7 @@ class SkillManager:
 
     async def read_reference(self, skill_id: str, rel_path: str) -> str | None:
         """Read a reference file from a skill."""
-        ref_file = self.skills_dir / skill_id / "references" / rel_path
+        ref_file = self.skills_dir / _skill_id(skill_id) / "references" / rel_path
         # Prevent path traversal
         try:
             ref_file.resolve().relative_to((self.skills_dir / skill_id).resolve())
@@ -371,7 +411,7 @@ class SkillManager:
 
     async def run_script(self, skill_id: str, rel_path: str, args: str = "") -> str:
         """Execute a script from a skill's scripts/ directory."""
-        script_file = self.skills_dir / skill_id / "scripts" / rel_path
+        script_file = self.skills_dir / _skill_id(skill_id) / "scripts" / rel_path
         # Prevent path traversal
         try:
             script_file.resolve().relative_to((self.skills_dir / skill_id).resolve())
@@ -399,7 +439,7 @@ class SkillManager:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                cwd=str(self.skills_dir / skill_id),
+                cwd=str(self.skills_dir / _skill_id(skill_id)),
             )
             output = result.stdout
             if result.returncode != 0:

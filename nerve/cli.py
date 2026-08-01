@@ -955,6 +955,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             lines.append("[--] Anthropic API key not set (using proxy)")
     elif config.anthropic_api_key:
         lines.append(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
+    elif config.lockdown:
+        # The generic message names config.local.yaml, which a locked instance
+        # never reads. The cause is also often upstream of the key: if the
+        # provider block was only in config.yaml, this instance has already
+        # reverted to the Anthropic default and is failing for a key it would not
+        # otherwise need.
+        errors.append(
+            "[ERR] No Anthropic API key. Lockdown does not read "
+            "config.local.yaml, so supply it as ${ANTHROPIC_API_KEY} in "
+            "workspace/config/settings.yaml. If this box should be using "
+            "Bedrock, provider.type is absent from the tracked settings and this "
+            "instance has fallen back to 'anthropic'"
+        )
     else:
         errors.append("[ERR] Anthropic API key not set and proxy not enabled (config.local.yaml)")
 
@@ -1239,6 +1252,7 @@ def config_sync(
         config.workspace, ctx.obj["config_dir"], branch=branch,
         validate=not no_validate,
         strict_env=config.workspace_sync.strict_env and not no_strict_env,
+        locked=config.lockdown,
     )
     for warning in result.validation_warnings:
         click.secho(f"  [WARN] {warning}", fg="yellow")
@@ -1273,10 +1287,17 @@ def config_sync(
     help="Ignore this machine's config.yaml / config.local.yaml and validate "
          "only the portable workspace config — what a shared repo carries.",
 )
+@click.option(
+    "--assume-lockdown", "assume_locked", is_flag=True,
+    help="Validate the locked view whatever this bundle's lockdown flag resolves "
+         "to here. A fleet repo writes `lockdown: ${NERVE_LOCKDOWN:-false}`, so "
+         "CI resolves it to false and checks a config no locked box will run. Use "
+         "this in CI on any repo one of whose instances is locked.",
+)
 @click.pass_context
 def config_validate(
     ctx: click.Context, workspace: str | None, strict_env: bool, strict_keys: bool,
-    portable_only: bool,
+    portable_only: bool, assume_locked: bool,
 ) -> None:
     """Validate the configuration bundle. Non-zero exit on any error (CI-ready)."""
     from nerve.config_validate import validate_config_bundle
@@ -1285,7 +1306,7 @@ def config_validate(
     result = validate_config_bundle(
         config_dir, workspace_override=workspace,
         strict_env=strict_env, strict_keys=strict_keys,
-        portable_only=portable_only,
+        portable_only=portable_only, assume_locked=assume_locked,
     )
     for msg in result.info:
         click.echo(f"[info] {msg}")

@@ -345,7 +345,16 @@ def load_jobs(
 
 
 def save_jobs(jobs: list[CronJob], jobs_file: Path) -> None:
-    """Save cron jobs to a YAML file."""
+    """Save cron jobs to a YAML file.
+
+    Guarded even though nothing calls it today: the file it writes is
+    ``<workspace>/config/cron/jobs.yaml`` on a migrated install, which is tracked
+    config, and a guard added when the first caller appears is a guard that was
+    missing for however long the caller took to notice.
+    """
+    from nerve.config import ensure_path_not_tracked_config
+
+    ensure_path_not_tracked_config(jobs_file, "save cron jobs to")
     jobs_file.parent.mkdir(parents=True, exist_ok=True)
     data = {"jobs": []}
     for job in jobs:

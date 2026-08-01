@@ -30,6 +30,7 @@ from nerve.agent.tools.schemas import (
     TASK_UPDATE_SCHEMA,
     TASK_WRITE_SCHEMA,
 )
+from nerve.config import ensure_path_not_tracked_config
 from nerve.db.task_statuses import (
     DEFAULT_STATUS,
     STATUS_NAME_RE,
@@ -315,6 +316,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
         if ctx.workspace and (note or deadline or raw_tags or new_title):
             file_path = ctx.workspace / task["file_path"]
+            ensure_path_not_tracked_config(file_path, "write")
             if file_path.exists():
                 content = await asyncio.to_thread(
                     file_path.read_text, encoding="utf-8",
@@ -371,6 +373,11 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
         if ctx.workspace:
             file_path = ctx.workspace / task["file_path"]
+            # Deliberately unguarded. Lockdown makes the tracked config subtree
+            # unwritable, not unreadable — it arrives from a repo the agent can
+            # already read, and the HTTP GET for a task doesn't guard either.
+            # Guarding here would refuse a read with a "Cannot write" message
+            # the caller has no way to act on.
             if file_path.exists():
                 content = await asyncio.to_thread(
                     file_path.read_text, encoding="utf-8",
@@ -404,6 +411,7 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text("Workspace not configured.")
 
     file_path = ctx.workspace / task["file_path"]
+    ensure_path_not_tracked_config(file_path, "write")
     await asyncio.to_thread(file_path.write_text, new_content, encoding="utf-8")
 
     from nerve.tasks.models import (
@@ -440,6 +448,13 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         task = await ctx.db.get_task(task_id)
         if not task:
             return ToolResult.text(f"Task not found: {task_id}")
+
+        # Done is a write like any other — it copies the file into done/ and
+        # unlinks the source, so a stored ``file_path`` inside the tracked config
+        # subtree would delete config. Refuse before the status flip, or a
+        # refusal leaves a task marked done whose file never moved.
+        if ctx.workspace:
+            ensure_path_not_tracked_config(ctx.workspace / task["file_path"], "move")
 
         await ctx.db.update_task_status(task_id, "done")
 

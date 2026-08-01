@@ -116,13 +116,21 @@ class MemoryManager:
         return None
 
     def write_file(self, relative_path: str, content: str) -> bool:
-        """Write a file in the workspace by relative path."""
+        """Write a file in the workspace by relative path.
+
+        Raises :class:`~nerve.config.LockdownError` for a path inside the tracked
+        config subtree on a locked instance — the caller supplies the path, so
+        whether this is a config edit is a property of the argument.
+        """
+        from nerve.config import ensure_path_not_tracked_config
+
         full_path = self.workspace / relative_path
         try:
             full_path.resolve().relative_to(self.workspace.resolve())
         except ValueError:
             logger.warning("Attempted path traversal: %s", relative_path)
             return False
+        ensure_path_not_tracked_config(full_path, "write")
 
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")

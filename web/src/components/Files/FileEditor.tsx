@@ -1,25 +1,28 @@
 import { useState, useCallback } from 'react';
-import { Eye, Edit3, Save } from 'lucide-react';
+import { Eye, Edit3, Lock, Save } from 'lucide-react';
 import { MarkdownContent } from '../Chat/MarkdownContent';
 
 interface FileEditorProps {
   path: string;
   content: string;
   modified: boolean;
+  // Set for a file the server will refuse to write — a reviewed file on a
+  // locked instance. The save is offered nowhere it would come back a 403.
+  readOnly?: boolean;
   saving: boolean;
   onContentChange: (content: string) => void;
   onSave: () => void;
 }
 
-export function FileEditor({ path, content, modified, saving, onContentChange, onSave }: FileEditorProps) {
+export function FileEditor({ path, content, modified, readOnly, saving, onContentChange, onSave }: FileEditorProps) {
   const [mode, setMode] = useState<'edit' | 'preview'>('edit');
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
       e.preventDefault();
-      onSave();
+      if (!readOnly) onSave();
     }
-  }, [onSave]);
+  }, [onSave, readOnly]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -43,7 +46,13 @@ export function FileEditor({ path, content, modified, saving, onContentChange, o
               <Eye size={13} />
             </button>
           </div>
-          {modified && (
+          {readOnly && (
+            <span className="flex items-center gap-1.5 text-[12px] text-text-dim">
+              <Lock size={12} />
+              Read-only (lockdown)
+            </span>
+          )}
+          {modified && !readOnly && (
             <button
               onClick={onSave}
               disabled={saving}
@@ -62,6 +71,7 @@ export function FileEditor({ path, content, modified, saving, onContentChange, o
           value={content}
           onChange={(e) => onContentChange(e.target.value)}
           onKeyDown={handleKeyDown}
+          readOnly={readOnly}
           className="flex-1 p-4 bg-bg-sunken text-[14px] text-text outline-none resize-none editor-textarea"
           spellCheck={false}
         />

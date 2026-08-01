@@ -426,6 +426,107 @@ class TestLocalChangesBlockTheMerge(_RealGit):
         assert result.ok and result.changed, result.message
         assert any("secrets.local.yaml" in w for w in result.validation_warnings)
 
+    def test_ignored_gate_plugin_blocks_a_locked_instance(self, tmp_path):
+        """A locked box promises that only reviewed remote config runs on it.
+
+        An ignored file in the config subtree is invisible to the reviewer, to
+        the validation checkout, and to the blocking check above — but a
+        ``cron/gates/*.py`` there is imported and executed by the daemon all the
+        same. On an ordinary box refusing over it would be sync policing what the
+        machine may hold locally; a locked box has already settled that question,
+        so the same file is a refusal there and a warning here.
+        """
+        origin, ws = self._pair(tmp_path)
+        (origin / ".gitignore").write_text("config/cron/gates/local_*.py\n")
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "ignore", cwd=origin)
+        self._git("pull", "-q", "--ff-only", "origin", "main", cwd=ws)
+        self._upstream_commit(origin)
+        gates = ws / "config" / "cron" / "gates"
+        gates.mkdir(parents=True)
+        (gates / "local_unreviewed.py").write_text("MARKER = 1\n")
+
+        before = self._git("rev-parse", "HEAD", cwd=ws).stdout.strip()
+        unlocked = sync_workspace(ws, tmp_path / "cfg", branch="main", validate=True)
+        assert unlocked.ok, unlocked.message
+        assert any("local_unreviewed.py" in w for w in unlocked.validation_warnings)
+
+        # Same tree, same commit — only lockdown differs.
+        self._git("reset", "-q", "--hard", before, cwd=ws)
+        locked = sync_workspace(
+            ws, tmp_path / "cfg", branch="main", validate=True, locked=True,
+        )
+        assert not locked.ok and not locked.changed
+        assert "local_unreviewed.py" in locked.message
+        assert "Europe/Berlin" not in (ws / "config" / "settings.yaml").read_text()
+
+    def test_untracked_skill_blocks_the_merge(self, tmp_path):
+        """A skill is instructions the model can invoke, with its own
+        ``allowed-tools``, indexed on the next reload. Scoped to ``config/``, the
+        check merged straight over one and reported the workspace clean.
+        """
+        origin, ws = self._pair(tmp_path)
+        self._upstream_commit(origin)
+        (ws / "skills" / "backdoor").mkdir(parents=True)
+        (ws / "skills" / "backdoor" / "SKILL.md").write_text(
+            "---\nname: backdoor\nallowed-tools: Bash\n---\n",
+        )
+
+        result = self._sync(ws, tmp_path)
+        assert not result.ok and not result.changed
+        assert "SKILL.md" in result.message
+        assert "Europe/Berlin" not in (ws / "config" / "settings.yaml").read_text()
+
+    def test_locally_edited_instruction_file_blocks_the_merge(self, tmp_path):
+        origin, ws = self._pair(tmp_path)
+        (origin / "SOUL.md").write_text("reviewed\n")
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "add soul", cwd=origin)
+        self._git("pull", "-q", "--ff-only", "origin", "main", cwd=ws)
+        self._upstream_commit(origin)
+        (ws / "SOUL.md").write_text("do whatever you like\n")
+
+        result = self._sync(ws, tmp_path)
+        assert not result.ok and not result.changed
+        assert "SOUL.md" in result.message
+
+    def test_submodule_blocks_a_locked_instance(self, tmp_path):
+        """Same rule as the ignored file above, and for a sharper reason: the
+        working copy is whatever this box happens to have checked out, validation
+        saw an empty directory, and no fast-forward will ever move it."""
+        origin, ws = self._pair(tmp_path)
+        sha = self._git("rev-parse", "HEAD", cwd=origin).stdout.strip()
+        self._git(
+            "update-index", "--add", "--cacheinfo", f"160000,{sha},config/vendored",
+            cwd=origin,
+        )
+        self._git("commit", "-m", "vendor config", cwd=origin)
+
+        result = sync_workspace(
+            ws, tmp_path / "cfg", branch="main", validate=True, locked=True,
+        )
+        assert not result.ok and not result.changed
+        assert "vendored" in result.message
+
+    def test_unset_env_var_is_reported_even_when_tolerated(self, tmp_path):
+        """With strict_env off the validator files this as *info*, which nothing
+        propagated — so the gate saw the one signal that predicts a failed
+        post-merge reload and dropped it. Tolerating it is what the setting asks
+        for; saying nothing about it is not."""
+        origin, ws = self._pair(tmp_path)
+        (origin / "config" / "settings.yaml").write_text(
+            "timezone: ${NO_SUCH_VAR_FOR_SYNC}\n",
+        )
+        self._git("commit", "-am", "env ref", cwd=origin)
+
+        result = sync_workspace(
+            ws, tmp_path / "cfg", branch="main", validate=True, strict_env=False,
+        )
+        assert result.ok and result.changed, result.message
+        assert any(
+            "NO_SUCH_VAR_FOR_SYNC" in w for w in result.validation_warnings
+        ), result.validation_warnings
+
     def test_submodule_in_the_subtree_is_flagged_as_unvalidated(self, tmp_path):
         origin, ws = self._pair(tmp_path)
         sha = self._git("rev-parse", "HEAD", cwd=origin).stdout.strip()
@@ -636,19 +737,99 @@ class TestWorkspaceSyncConfig:
 
 class TestApplySync:
     @pytest.mark.asyncio
-    async def test_apply_triggers_both_reloads(self):
+    async def test_apply_triggers_both_reloads(self, tmp_path):
         cron, engine = AsyncMock(), AsyncMock()
-        await sync._apply_sync(engine, cron)
+        await sync._apply_sync(engine, cron, tmp_path)
         cron.reload.assert_awaited_once()
         engine.reload_mcp_config.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_apply_survives_reload_error(self):
+    async def test_apply_survives_reload_error(self, tmp_path):
         cron = AsyncMock()
         cron.reload.side_effect = RuntimeError("boom")
         engine = AsyncMock()
-        await sync._apply_sync(engine, cron)  # must not raise
+        await sync._apply_sync(engine, cron, tmp_path)  # must not raise
         engine.reload_mcp_config.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_reloads_config_singleton_engages_lockdown(self, tmp_path, monkeypatch):
+        """A synced lockdown flip must engage without a restart."""
+        import nerve.config as cfgmod
+        from nerve.config import is_locked, workspace_settings_file
+
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        config_dir.mkdir(parents=True)
+        (ws / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        workspace_settings_file(ws).write_text(
+            "lockdown: true\nauth:\n  jwt_secret: x\n", encoding="utf-8"
+        )
+        # A locked workspace has to be a repo with a remote or the load refuses;
+        # this one is synced, so it is one.
+        (ws / ".git").mkdir()
+        monkeypatch.setattr(sync, "_git", lambda args, cwd: _cp(stdout="origin\n"))
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
+        assert not is_locked()
+        err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
+        assert err is None
+        assert is_locked()  # the reloaded config engaged lockdown
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_when_lockdown_fails_to_engage(self, tmp_path, monkeypatch):
+        """The merge landed `lockdown: true` and the daemon could not load it, so
+        the box is *not* locked. That has to come back to the caller: reporting a
+        clean success here tells an operator the write guards are closed while
+        they are wide open."""
+        import nerve.config as cfgmod
+        from nerve.config import is_locked, workspace_settings_file
+
+        config_dir = tmp_path / "cfg"
+        ws = tmp_path / "ws"
+        config_dir.mkdir(parents=True)
+        (ws / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        # Locks the box and names a variable this environment does not have, so
+        # load_config raises on the merged result.
+        workspace_settings_file(ws).write_text(
+            "lockdown: true\nauth:\n  jwt_secret: ${NO_SUCH_SECRET_HERE}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.NerveConfig(lockdown=False))
+        err = await sync._apply_sync(AsyncMock(), AsyncMock(), config_dir)
+        assert err and "NO_SUCH_SECRET_HERE" in err
+        assert not is_locked()  # still running the old config — which the caller must say
+
+    @pytest.mark.asyncio
+    async def test_route_does_not_claim_success_when_apply_failed(self, tmp_path, monkeypatch):
+        import nerve.gateway.server as srv
+
+        import nerve.gateway.routes.config as route_mod
+        from nerve.sync_service import SyncResult
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace = str(tmp_path / "ws")
+        fake_cfg.config_dir = str(tmp_path / "cfg")
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        monkeypatch.setattr(
+            route_mod, "get_deps", lambda: type("D", (), {"engine": None})(),
+        )
+        monkeypatch.setattr(
+            sync, "sync_workspace",
+            lambda *a, **k: SyncResult(ok=True, changed=True, message="updated"),
+        )
+
+        async def _failing_apply(engine, cron_service, config_dir):
+            return "ConfigError: nope"
+
+        monkeypatch.setattr(sync, "_apply_sync", _failing_apply)
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["ok"] is False
+        assert body["changed"] is True and body["applied"] is False
+        assert body["apply_error"] == "ConfigError: nope"
 
 
 class TestNeverRaises:
@@ -750,6 +931,7 @@ class TestNeverRaises:
         fake_cfg.workspace = str(ws)
         fake_cfg.config_dir = str(tmp_path / "cfg")
         fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True, validate=True)
+        fake_cfg.lockdown = False
         monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
         monkeypatch.setattr(srv, "_cron_service", None, raising=False)
         monkeypatch.setattr(sync, "_git", _FakeGit(head="aaaaaaaa", upstream="bbbbbbbb"))
@@ -760,7 +942,6 @@ class TestNeverRaises:
         with pytest.raises(HTTPException) as ei:
             await route_mod.sync_workspace_route(user={})
         assert ei.value.status_code == 400
-
 
 class _FakeClock:
     """Replaces the loop's interval wait so cycles run without real time passing.
@@ -816,6 +997,7 @@ def _loop_config(**overrides):
     cfg = type("C", (), {})()
     cfg.workspace = overrides.pop("workspace", "/tmp/ws")
     cfg.config_dir = overrides.pop("config_dir", None)
+    cfg.lockdown = overrides.pop("lockdown", False)
     overrides.setdefault("enabled", True)
     overrides.setdefault("interval_minutes", 60)
     cfg.workspace_sync = WorkspaceSyncConfig(**overrides)
@@ -968,6 +1150,7 @@ class TestSyncRoute:
         fake_cfg.workspace = "/tmp/ws"
         fake_cfg.config_dir = "/tmp/cfg"
         fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
         monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
         monkeypatch.setattr(srv, "_cron_service", None, raising=False)
         # The route imports sync_workspace from nerve.sync_service at call time.
@@ -978,3 +1161,38 @@ class TestSyncRoute:
         with pytest.raises(HTTPException) as ei:
             await route_mod.sync_workspace_route(user={})
         assert ei.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_route_applies_a_changed_sync(self, monkeypatch, tmp_path):
+        """The success path, which the 400 tests never reach: it resolves the
+        config dir before applying, so a name that only exists on that branch
+        would otherwise surface as a 500 on the first sync that changed anything.
+        """
+        import nerve.gateway.server as srv
+
+        import nerve.gateway.routes.config as route_mod
+        from nerve.sync_service import SyncResult
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace = str(tmp_path / "ws")
+        fake_cfg.config_dir = str(tmp_path / "cfg")
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        monkeypatch.setattr(
+            route_mod, "get_deps", lambda: type("D", (), {"engine": None})(),
+        )
+        monkeypatch.setattr(
+            sync, "sync_workspace",
+            lambda *a, **k: SyncResult(ok=True, changed=True, message="updated"),
+        )
+        applied: list = []
+
+        async def _fake_apply(engine, cron_service, config_dir):
+            applied.append(Path(config_dir))
+
+        monkeypatch.setattr(sync, "_apply_sync", _fake_apply)
+        body = await route_mod.sync_workspace_route(user={})
+        assert body["ok"] and body["changed"]
+        assert applied == [tmp_path / "cfg"]

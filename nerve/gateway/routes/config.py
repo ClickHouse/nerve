@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
@@ -33,6 +35,7 @@ async def sync_workspace_route(user: dict = Depends(require_auth)):
         branch=config.workspace_sync.branch,
         validate=config.workspace_sync.validate,
         strict_env=config.workspace_sync.strict_env,
+        locked=config.lockdown,
     )
     if not result.ok:
         raise HTTPException(
@@ -43,12 +46,20 @@ async def sync_workspace_route(user: dict = Depends(require_auth)):
                 "warnings": result.validation_warnings,
             },
         )
+    apply_error = None
     if result.changed:
         deps = get_deps()
-        await _apply_sync(deps.engine, _cron_service)
+        config_dir = Path(config.config_dir) if config.config_dir else Path(config.workspace)
+        apply_error = await _apply_sync(deps.engine, _cron_service, config_dir)
+    # The merge is a real state change, so this is not a 4xx — but a merge whose
+    # config the daemon then refused to load has applied nothing, and reporting
+    # ok for it would tell an operator who just enabled lockdown that the box is
+    # locked while its write guards are still open.
     return {
-        "ok": True,
+        "ok": apply_error is None,
         "changed": result.changed,
+        "applied": result.changed and apply_error is None,
+        "apply_error": apply_error,
         "message": result.message,
         "old_rev": result.old_rev,
         "new_rev": result.new_rev,

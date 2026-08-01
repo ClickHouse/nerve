@@ -4,10 +4,13 @@ export interface FileNode {
   type: 'file' | 'directory';
   size?: number;
   modified?: string;
+  // The server's answer, not the client's guess: on a locked instance the
+  // reviewed files (SOUL.md, AGENTS.md, ...) are readable and not writable.
+  readOnly?: boolean;
   children?: FileNode[];
 }
 
-export function buildFileTree(files: { path: string; name: string; size: number; modified?: string }[]): FileNode[] {
+export function buildFileTree(files: { path: string; name: string; size: number; modified?: string; read_only?: boolean }[]): FileNode[] {
   const root: FileNode = { name: '', path: '', type: 'directory', children: [] };
 
   for (const file of files) {
@@ -31,6 +34,7 @@ export function buildFileTree(files: { path: string; name: string; size: number;
       type: 'file',
       size: file.size,
       modified: file.modified,
+      readOnly: file.read_only,
     });
   }
 

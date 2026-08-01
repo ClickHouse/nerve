@@ -18,7 +18,11 @@ git-syncable workspace subtree):
 > `<workspace>/config/cron/`. Installs that still have the legacy
 > `~/.nerve/cron/` keep working: if the workspace location doesn't exist yet,
 > Nerve reads from `~/.nerve/cron/` automatically. You can also pin the paths
-> explicitly with `cron.jobs_file` / `cron.system_file` / `cron.gate_plugins_dir`.
+> explicitly with `cron.jobs_file` / `cron.system_file` / `cron.gate_plugins_dir`
+> — except under [lockdown](config.md#lockdown-remote-only-read-only), where all
+> three must resolve inside `<workspace>/config/`. An escaping path is ignored in
+> favour of the in-workspace default; if the default is what escapes (a symlinked
+> `config/cron` or `config/cron/gates`) the instance refuses to start.
 
 Both files use the same format. On startup, CronService loads and merges both:
 - If a job ID appears in both files, the **user version wins** (with a warning in the log).
