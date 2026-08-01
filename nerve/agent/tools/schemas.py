@@ -849,3 +849,51 @@ MCP_RELOAD_SCHEMA = {
     "properties": {},
     "required": [],
 }
+
+# ----- Config self-modification -----
+
+PROPOSE_CONFIG_CHANGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "PR title — a concise summary of the config change.",
+        },
+        "body": {
+            "type": "string",
+            "description": "PR description: what changed and why (Markdown).",
+            "default": "",
+        },
+        "changes": {
+            "type": "array",
+            "description": (
+                "Files to write in the PR, each the FULL new file content. Paths "
+                "are relative to the workspace root (e.g. 'config/cron/jobs.yaml', "
+                "'skills/my-skill/SKILL.md') and must be reviewed configuration: "
+                "anything under 'config/' or 'skills/', or a workspace-root "
+                "instruction file (SOUL.md, IDENTITY.md, USER.md, AGENTS.md, "
+                "TOOLS.md). Runtime state (MEMORY.md, TASK.md, memory/) and the "
+                "rest of the repository are refused, as is any executable file "
+                "other than a cron gate plugin at 'config/cron/gates/<name>.py'. "
+                "A single refused path rejects the whole proposal — nothing is "
+                "dropped silently."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path relative to the workspace root, inside "
+                            "'config/', 'skills/', or a root instruction file."
+                        ),
+                    },
+                    "content": {"type": "string", "description": "Full new content of the file."},
+                },
+                "required": ["path", "content"],
+            },
+            "minItems": 1,
+        },
+    },
+    "required": ["title", "changes"],
+}
