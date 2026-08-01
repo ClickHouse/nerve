@@ -118,6 +118,38 @@ def validate_config_bundle(
     env_names = ", ".join(sorted(set(missing)))
     if missing:
         msg = f"references unset environment variable(s): {env_names}"
+        # Say which layer asked for them. The refs are collected from the merged
+        # config, so a variable named only by this host's config.yaml /
+        # config.local.yaml is otherwise indistinguishable from one the portable
+        # bundle needs — and when this runs as sync's gate, that reads as a defect
+        # in an incoming change that has nothing to do with it.
+        #
+        # Which is why the workspace layer is scanned separately rather than
+        # inferred from the machine one: a var both layers name would otherwise be
+        # reported as the machine's alone, sending the reader to a file whose only
+        # fault is that it also needs the variable, while the portable config that
+        # equally needs it goes unmentioned. Only claim exclusivity when the
+        # workspace config genuinely does not ask for the variable.
+        from_machine: list[str] = []
+        cfg._interpolate_env(machine, from_machine)
+        from_workspace: list[str] = []
+        cfg._interpolate_env(ws_settings, from_workspace)
+        unset = set(missing)
+        machine_only = sorted((set(from_machine) - set(from_workspace)) & unset)
+        both_layers = sorted(set(from_machine) & set(from_workspace) & unset)
+        clauses = []
+        if machine_only:
+            clauses.append(
+                f"{', '.join(machine_only)} referenced only by this machine's "
+                f"config.yaml/config.local.yaml, not by the workspace config"
+            )
+        if both_layers:
+            clauses.append(
+                f"{', '.join(both_layers)} referenced by both the workspace config "
+                f"and this machine's config.yaml/config.local.yaml"
+            )
+        if clauses:
+            msg += " — " + "; ".join(clauses)
         (result.errors if strict_env else result.info).append(msg)
 
     # Unknown / misspelled keys: warnings by default (forward-compat / example

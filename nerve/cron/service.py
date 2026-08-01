@@ -252,6 +252,9 @@ class CronService:
         self._jobs: list[CronJob] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
+        # Serialize reload() so the file watcher, the sync loop, and the HTTP
+        # route can't interleave scheduler mutations.
+        self._reload_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
@@ -405,23 +408,34 @@ class CronService:
         All-or-nothing: the complete change set — every trigger included — is
         built before the scheduler is touched, so a reload the daemon cannot
         carry out raises with the running schedule exactly as it was. That
-        covers the gate registry too; see :meth:`_reload_from_disk`.
+        covers the gate registry too; see :meth:`_reload_locked`.
+
+        Serialized via a lock so concurrent callers (file watcher, sync loop,
+        HTTP route) can't interleave scheduler mutations. The two properties are
+        separate: the lock keeps two reloads from overlapping, and the planning
+        pass keeps a single failing one from applying half of itself.
 
         Returns a summary dict: ``{"added", "removed", "updated", "enabled"}``,
         where "updated" is every enabled job that already had a trigger. It says
         what the reload rescheduled, not which jobs the file changed.
         """
+        async with self._reload_lock:
+            return await self._reload_locked()
+
+    async def _reload_locked(self) -> dict:
+        """Reload under the lock, undoing the one change that isn't local.
+
+        GATE_REGISTRY is process-global and has to be replaced *before* jobs are
+        rebuilt, because a CronJob builds its gates from it at construction time.
+        That puts it ahead of every check that can still refuse the reload, so it
+        needs undoing by hand — leaving the scheduler untouched is not enough when
+        a deleted plugin's gate has already been unregistered. The next CronJob
+        built from disk (run_job, rotate_session) would then fail to build for
+        want of a gate type, off a reload that returned 400: the instance would
+        lose jobs it had never agreed to change.
+        """
         from nerve.cron.gates import GATE_REGISTRY
 
-        # The one piece of reload state that isn't local: GATE_REGISTRY is
-        # process-global and has to be replaced *before* jobs are rebuilt,
-        # because a CronJob builds its gates from it at construction time. That
-        # puts it ahead of every check that can still refuse the reload, so it
-        # needs undoing by hand — leaving the scheduler untouched is not enough
-        # when a deleted plugin's gate has already been unregistered. The next
-        # CronJob built from disk (run_job, rotate_session) would then fail to
-        # build for want of a gate type, off a reload that returned 400: the
-        # instance would lose jobs it had never agreed to change.
         gates_before = dict(GATE_REGISTRY)
         try:
             return await self._reload_from_disk(gates_before)
@@ -435,7 +449,7 @@ class CronService:
     async def _reload_from_disk(
         self, gates_before: dict[str, type["CronGate"]],
     ) -> dict:
-        """The body of :meth:`reload`. Only call it through there.
+        """The body of :meth:`reload`. Only call it through :meth:`_reload_locked`.
 
         Takes the pre-reload registry snapshot so it can report which gates
         vanished once the change is committed, and so its caller can restore

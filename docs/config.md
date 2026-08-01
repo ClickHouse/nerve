@@ -189,6 +189,66 @@ is too old to read shows up as a startup warning on the instance and in `nerve
 doctor`. If a key is ever retired upstream, `--strict-keys` flags it here first;
 drop the key, or install the ref you deploy (`nerve @ git+...@v1.2.3`) instead.
 
+## Git-Backed Workspace Sync
+
+The workspace can be a git repository whose remote is a shared **config repo**.
+Config changes are proposed as PRs, reviewed and merged there; the instance pulls
+the merged result and reloads, with no restart and no editing on the box.
+
+```bash
+nerve config sync                 # git pull --ff-only the workspace, then validate
+nerve config sync --branch main
+nerve config sync --no-validate
+nerve config sync --no-strict-env # tolerate ${VAR}s your shell doesn't have
+```
+
+Enable periodic pulls in the daemon (opt-in):
+
+```yaml
+workspace_sync:
+  enabled: true          # off by default
+  branch: main           # empty = current tracking branch
+  interval_minutes: 1    # also the upper bound on how stale a box can be
+  validate: true         # validate the pulled bundle before applying
+  strict_env: true       # unset required ${VAR} in the bundle blocks the merge
+```
+
+Each sync is fetch, then validate, then fast-forward merge. The fetched bundle is
+validated in a throwaway git worktree and the live working tree is fast-forwarded
+only if that passes, so an invalid bundle never lands on disk and there is nothing
+for a later reload or restart to pick up (`POST /api/config/sync` returns 400 and
+leaves the workspace untouched). A pull that changed something reloads cron and MCP
+config, so the merged change takes effect immediately. CI on the PR is still the
+first line of defense. The remote and credentials come from git itself, so
+configure `git remote` and auth in the workspace as usual.
+
+**Keep the config subtree clean.** Sync refuses to merge while
+`<workspace>/config/` has local changes: an edited or deleted tracked file, a
+staged change, or an untracked file. Validation judges a clean checkout of the
+fetched commit, but the merge lands in your working tree, and `--ff-only` only
+refuses when the incoming commit touches the same path. Anything else would survive
+the merge unchecked, leaving a bundle on disk that is not the one that passed. The
+case that matters most is an untracked `config/cron/gates/*.py`: the daemon imports
+and runs gate plugins and validation never loads them, so a box meant to run only
+reviewed config would be running local code. Commit, discard or push local edits;
+the failure message names the paths. Files matched by `.gitignore` inside `config/`
+are warnings rather than refusals, since the shared repo can never carry them.
+
+Sync validates more strictly than CI: an unset required `${VAR}` blocks the merge.
+CI has no secrets, so it reports those as info, but the daemon does have them, and a
+bundle with an unresolved required variable is one it will refuse to load on its
+next restart. If a shared change adds a `${VAR}` this box legitimately does not set,
+use `workspace_sync.strict_env: false` rather than letting every sync fail.
+`nerve config sync` runs in your shell, which may not carry the daemon's environment
+(systemd `EnvironmentFile`, docker `--env-file`), so pass `--no-strict-env` there
+for a one-off. Warnings never block a merge: an unrecognized cron gate type, an
+unknown key, or a skipped validation.
+
+`workspace_sync` changes need a daemon restart. The sync loop reads the current
+config object every cycle, so it adds no staleness of its own, but nothing refreshes
+that object while the process runs. Turning `enabled` on needs a restart in any
+case, because the sync task is only created at startup.
+
 ## Migrating an Existing Install
 
 Installs from before the workspace-config layout are migrated automatically and

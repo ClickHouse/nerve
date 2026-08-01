@@ -1207,6 +1207,50 @@ def config_group() -> None:
     """Configuration commands."""
 
 
+@config_group.command("sync")
+@click.option("--branch", default="", help="Branch to pull (default: current tracking branch).")
+@click.option("--no-validate", is_flag=True, help="Skip validating the pulled bundle.")
+@click.option(
+    "--no-strict-env", is_flag=True,
+    help="Allow unset ${ENV_VAR} references in the pulled bundle. Normally they "
+         "block the merge, because the daemon refuses to load a config with an "
+         "unresolved required variable. Use this when your shell doesn't carry "
+         "the daemon's environment (systemd/docker). Otherwise follows "
+         "workspace_sync.strict_env.",
+)
+@click.pass_context
+def config_sync(
+    ctx: click.Context, branch: str, no_validate: bool, no_strict_env: bool,
+) -> None:
+    """Pull the workspace from its git remote (the shared config repo).
+
+    Fast-forward only. This moves the files; it does not tell a running daemon
+    about them. The daemon applies them on its next sync cycle, or immediately
+    via POST /api/config/sync.
+    """
+    from nerve.sync_service import sync_workspace
+
+    config = ctx.obj["config"]
+    if config is None:
+        raise click.ClickException("Config could not be loaded; run 'nerve doctor'.")
+    # Raw values, not Path(...): sync_workspace coerces inside its own
+    # never-raises guard, so a bad `workspace` reports instead of traceback.
+    result = sync_workspace(
+        config.workspace, ctx.obj["config_dir"], branch=branch,
+        validate=not no_validate,
+        strict_env=config.workspace_sync.strict_env and not no_strict_env,
+    )
+    for warning in result.validation_warnings:
+        click.secho(f"  [WARN] {warning}", fg="yellow")
+    if result.ok:
+        click.secho(result.message, fg="green")
+    else:
+        for err in result.validation_errors:
+            click.secho(f"  [ERR] {err}", fg="red")
+        click.secho(result.message, fg="red")
+        ctx.exit(1)
+
+
 @config_group.command("validate")
 @click.option(
     "--workspace", "workspace", type=click.Path(), default=None,

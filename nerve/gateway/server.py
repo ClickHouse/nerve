@@ -38,6 +38,7 @@ from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
 )
+from nerve.utils.aio import stop_background_task
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +222,8 @@ async def lifespan(app: FastAPI):
     # Start cron service
     global _cron_service
     cron_task = None
+    ws_sync_task = None
+    ws_sync_stop = None
     try:
         from nerve.cron.service import CronService
         cron = CronService(config, _engine, db)
@@ -338,6 +341,14 @@ async def lifespan(app: FastAPI):
             logger.info("houseofagents retired: deleted binary %s", hoa_binary)
     except Exception as e:
         logger.warning("houseofagents artifact cleanup failed: %s", e)
+
+    # Periodically pull the workspace from its git remote and apply (opt-in).
+    if config.workspace_sync.enabled:
+        from nerve.sync_service import run_periodic_sync
+        ws_sync_stop = asyncio.Event()
+        ws_sync_task = asyncio.create_task(
+            run_periodic_sync(config, _engine, _cron_service, ws_sync_stop)
+        )
 
     # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
     # it tightens to hourly only when the opt-in interactive idle auto-close
@@ -627,6 +638,14 @@ async def lifespan(app: FastAPI):
     # the telegram polling task before we get a chance to stop it cleanly.
     if telegram_channel:
         await telegram_channel.stop()
+    if ws_sync_task:
+        # Exit through the loop's own stop path rather than cancelling it where
+        # it stands: a cycle interrupted between the merge and the reload leaves
+        # the workspace on the new commit with the daemon still running the old
+        # config. The git phase runs in a worker thread and so is out of reach of
+        # cancellation either way; the bounded wait is for the reload that
+        # follows it. Cancellation is the backstop, not the mechanism.
+        await stop_background_task(ws_sync_task, ws_sync_stop, "Workspace sync")
     if cron_task:
         await cron_task.stop()
     if _review_loop_service is not None:
