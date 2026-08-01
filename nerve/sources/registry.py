@@ -106,6 +106,15 @@ def build_source_runners(
             vision = dataclasses.replace(vision, enabled=False)
 
         for account in imap.accounts:
+            # A half-written entry is dropped here rather than at config load,
+            # so one bad account cannot stop the daemon from starting.
+            if not account.host or not account.username:
+                logger.warning(
+                    "Skipping IMAP account %s: an entry in sync.imap.accounts "
+                    "needs both a host and a username",
+                    account.label or account.host or "<unnamed>",
+                )
+                continue
             password = imap.passwords.get(account.username, "")
             if not password:
                 logger.warning(

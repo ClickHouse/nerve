@@ -1053,11 +1053,12 @@ class ImapMatchConfig:
     only_matched: bool = False
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ImapMatchConfig:
         return cls(
-            sender_contains=[str(s) for s in d.get("sender_contains", [])],
-            attachment_contains=[str(s) for s in d.get("attachment_contains", [])],
-            only_matched=bool(d.get("only_matched", False)),
+            sender_contains=d.get("sender_contains", []),
+            attachment_contains=d.get("attachment_contains", []),
+            only_matched=d.get("only_matched", False),
         )
 
 
@@ -1102,10 +1103,11 @@ class ImapVisionConfig:
     )
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ImapVisionConfig:
         base = cls()
         return cls(
-            enabled=bool(d.get("enabled", base.enabled)),
+            enabled=d.get("enabled", base.enabled),
             model=str(d.get("model", base.model)),
             prompt=str(d.get("prompt", base.prompt)),
             answer_key=str(d.get("answer_key", base.answer_key)),
@@ -1128,12 +1130,17 @@ class ImapAccountConfig:
     mailbox: str = "INBOX"
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ImapAccountConfig:
+        # No key is required here: a half-written account entry must not stop
+        # the daemon from starting. The registry skips an account whose host
+        # or username is empty, the same way it skips one with no password.
+        username = str(d.get("username", ""))
         return cls(
-            host=str(d["host"]),
-            username=str(d["username"]),
-            label=str(d.get("label") or d["username"].split("@")[0]),
-            port=int(d.get("port", 993)),
+            host=str(d.get("host", "")),
+            username=username,
+            label=str(d.get("label") or username.split("@")[0]),
+            port=d.get("port", 993),
             mailbox=str(d.get("mailbox", "INBOX")),
         )
 
@@ -1152,15 +1159,16 @@ class ImapSyncConfig:
     vision: ImapVisionConfig = field(default_factory=ImapVisionConfig)
 
     @classmethod
+    @_coerced
     def from_dict(cls, d: dict) -> ImapSyncConfig:
         return cls(
-            enabled=bool(d.get("enabled", False)),
+            enabled=d.get("enabled", False),
             accounts=[ImapAccountConfig.from_dict(a) for a in d.get("accounts", [])],
             passwords=dict(d.get("passwords", {})),
             schedule=str(d.get("schedule", "*/30 * * * *")),
-            batch_size=int(d.get("batch_size", 20)),
-            initial_lookback_days=int(d.get("initial_lookback_days", 1)),
-            condense=bool(d.get("condense", False)),
+            batch_size=d.get("batch_size", 20),
+            initial_lookback_days=d.get("initial_lookback_days", 1),
+            condense=d.get("condense", False),
             condense_prompt=str(d.get("condense_prompt", "")),
             match=ImapMatchConfig.from_dict(d.get("match", {})),
             vision=ImapVisionConfig.from_dict(d.get("vision", {})),
