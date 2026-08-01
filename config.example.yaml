@@ -1,5 +1,12 @@
 # Nerve — Personal AI Assistant Configuration
 # Copy to config.yaml and customize. Secrets go in config.local.yaml (gitignored).
+#
+# Any string value may reference an environment variable — the recommended way
+# to keep secrets out of committed/shared config:
+#   key: ${MY_VAR}             # required — load fails if MY_VAR is unset
+#   key: ${MY_VAR:-default}    # optional — uses default when unset/empty
+# Only the braced ${...} form is interpolated; a bare "$" is left untouched
+# (so bcrypt hashes / jwt secrets are safe). Use $$ for a literal "$".
 
 # Core
 workspace: ~/nerve-workspace    # Path to workspace with SOUL.md, MEMORY.md, etc.

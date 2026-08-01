@@ -32,6 +32,7 @@ import click
 
 from nerve import paths
 from nerve.config import (
+    ConfigError,
     RESUME_QUEUE_FILE,
     load_config,
     resolve_config_dir,
@@ -185,7 +186,13 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     resolved_dir, config_source = resolve_config_dir(config_dir)
     if not resolved_dir.is_absolute():
         resolved_dir = resolved_dir.resolve()
-    config = load_config(resolved_dir)
+    try:
+        config = load_config(resolved_dir)
+    except ConfigError as e:
+        # Render config errors (e.g. an unresolved required ${ENV_VAR}) as a
+        # clean message + non-zero exit instead of a raw traceback — this
+        # callback runs before every subcommand, including `nerve doctor`.
+        raise click.ClickException(str(e)) from e
     set_config(config)
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
