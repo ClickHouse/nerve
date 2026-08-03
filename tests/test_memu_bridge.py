@@ -1282,19 +1282,25 @@ class TestEmbeddingCallTimeout:
         assert client.embed_calls == 1, "original reached more than once per call"
 
     @pytest.mark.asyncio
-    async def test_t5_no_embeddings_install_is_a_noop(self, tmp_path):
-        """T5: without an embedding provider the method does nothing.
+    async def test_t5_no_provider_install_is_still_bounded(self, tmp_path):
+        """T5: a no-provider install must be bounded, not skipped.
 
-        The ``_has_embeddings`` gate (not a swallowed exception) is what makes
-        this safe, so the service must never be consulted at all.
+        memU synthesizes "embedding" from "default" whenever the caller omits
+        it (memu/app/settings.py:286), so the profile exists even with no
+        openai_api_key and its embed calls are reachable through memU's update
+        workflow. Gating on ``_has_embeddings`` would leave them unbounded.
         """
         client = _FastEmbedClient()
         bridge = _make_embed_bridge(tmp_path, client, has_embeddings=False)
-        bridge._service._get_llm_base_client = MagicMock(side_effect=KeyError("embedding"))
 
-        assert bridge._has_embeddings is False
-        bridge._instrument_embedding_timeout()          # must not raise
-        bridge._service._get_llm_base_client.assert_not_called()
+        assert bridge._has_embeddings is False, "fixture is not a no-provider install"
+
+        bridge._instrument_embedding_timeout()
+
+        bridge._service._get_llm_base_client.assert_called_once_with("embedding")
+        assert getattr(client.embed, "_nerve_timeout_wrapped", False), \
+            "a no-provider install was left with an unbounded embed"
+        assert client.client.timeout != "untouched", "Layer 1 timeout was not set"
 
     @pytest.mark.asyncio
     async def test_t6_instrument_llm_timeouts_covers_the_embedding_profile(self, tmp_path):
@@ -1374,11 +1380,27 @@ class TestEmbeddingCallTimeout:
                 timeline.append(("evict", key))
                 super().__delitem__(key)
 
-        bridge._service._llm_clients = _RecordingClients(clients)
-        bridge._service._get_llm_base_client = MagicMock(
-            side_effect=lambda p: (timeline.append(("lookup", p)), clients[p])[1],
-        )
+        cache = _RecordingClients(clients)
+        bridge._service._llm_clients = cache
+
+        def _factory(profile):
+            """Stand in for memU's _get_llm_base_client: cache, else create.
+
+            Writing the fresh object back into ``cache`` (not the original
+            ``clients`` dict) is what makes the post-reset assertions observe
+            production behaviour rather than a stale copy.
+            """
+            timeline.append(("lookup", profile))
+            if profile in cache:
+                return cache[profile]
+            fresh = MagicMock()
+            fresh.client._client.aclose = AsyncMock()
+            cache[profile] = fresh
+            return fresh
+
+        bridge._service._get_llm_base_client = MagicMock(side_effect=_factory)
         bridge._probe_api_health = AsyncMock(return_value="ok")
+        before_embedding = clients["embedding"]
 
         real_instrument = bridge._instrument_llm_timeouts
 
@@ -1395,7 +1417,17 @@ class TestEmbeddingCallTimeout:
 
         assert ("evict", "embedding") in timeline, \
             "the embedding client was not evicted on reset"
-        assert "embedding" not in bridge._service._llm_clients
+
+        # Production truth: the re-instrumentation that follows the eviction
+        # re-resolves the profile through the factory, so the cache is
+        # repopulated with a FRESH, wrapped client - it does not stay empty.
+        assert "embedding" in bridge._service._llm_clients, \
+            "the embedding client was not re-created after the eviction"
+        after_embedding = bridge._service._llm_clients["embedding"]
+        assert after_embedding is not before_embedding, \
+            "the evicted client was reused instead of re-created"
+        assert getattr(after_embedding.embed, "_nerve_timeout_wrapped", False), \
+            "the fresh embedding client was left unbounded"
 
         i_begin = timeline.index(("instrument", "begin"))
         i_end = timeline.index(("instrument", "end"))
@@ -1484,3 +1516,106 @@ class TestEmbeddingCallTimeout:
         bridge._service.retrieve = MagicMock(side_effect=ValueError("bad payload"))
 
         assert await bridge.recall("anything") == []
+
+    @pytest.mark.asyncio
+    async def test_t14_no_key_update_path_is_bounded(self, tmp_path):
+        """T14: the no-provider update workflow is bounded end to end.
+
+        memU's update workflow embeds changed content through the "embedding"
+        profile (memu/app/crud.py:431 declares embed_llm_profile), reached from
+        nerve via update_item. Nothing on that route imposes a timeout, so the
+        instrumentation is the only bound - and it must apply with no
+        openai_api_key, which is the install shape that used to be skipped.
+        """
+        from memu.llm.wrapper import LLMClientWrapper, LLMInterceptorRegistry
+
+        client = _HangingEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client, has_embeddings=False)
+        # built BEFORE instrumentation, exactly as memU builds it at startup
+        wrapper = LLMClientWrapper(client, registry=LLMInterceptorRegistry())
+
+        bridge._instrument_embedding_timeout()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await _bounded(wrapper.embed(["a changed fact"]))
+        assert client.embed_calls == 1
+
+    def test_t15_startup_instrumentation_failure_leaves_the_bridge_unavailable(self, tmp_path):
+        """T15: edit (c) is uncaught, so a failure there must fail closed.
+
+        Runs the REAL _initialize_impl in a fresh interpreter: only one
+        MemoryService may exist per process (a second raises ArgumentError on
+        a re-declared column), which is why T8 settles for source order. A
+        call-site try/except would leave the bridge available with an
+        unbounded client, and no in-process arm can observe that.
+        """
+        import os
+        import subprocess
+        import sys
+
+        script = (
+            "import asyncio, json, sqlite3, sys\n"
+            "from unittest.mock import AsyncMock\n"
+            "from nerve.config import MemoryCategoryConfig, MemoryConfig, NerveConfig\n"
+            "from nerve.memory import memu_bridge as mb\n"
+            "db = sys.argv[1]\n"
+            "if sys.argv[2] == 'break':\n"
+            "    def _boom(self):\n"
+            "        raise RuntimeError('instrumentation exploded')\n"
+            "    mb.MemUBridge._instrument_embedding_timeout = _boom\n"
+            "async def main():\n"
+            "    c = NerveConfig()\n"
+            "    c.memory = MemoryConfig(sqlite_dsn='sqlite:///' + db)\n"
+            "    c.memory.categories = [MemoryCategoryConfig(name='probes', description='d')]\n"
+            "    c.anthropic_api_key = 'k'\n"
+            # unroutable local port, so the warmup never reaches a real endpoint
+            "    c.proxy.enabled = True\n"
+            "    c.proxy.host = '127.0.0.1'\n"
+            "    c.proxy.port = 1\n"
+            "    b = mb.MemUBridge(c)\n"
+            "    b._audit = AsyncMock()\n"
+            "    rc = await b.initialize()\n"
+            "    rows = -1\n"
+            "    try:\n"
+            "        con = sqlite3.connect(db)\n"
+            "        rows = list(con.execute("
+            "'select count(*) from memu_memory_categories'))[0][0]\n"
+            "    except sqlite3.OperationalError:\n"
+            "        rows = 0\n"          # table never created at all
+            "    print('NERVE_RESULT ' + json.dumps("
+            "{'rc': bool(rc), 'available': bool(b.available), 'rows': rows}))\n"
+            "    await b.shutdown()\n"
+            "asyncio.run(main())\n"
+        )
+
+        def run(mode):
+            db = tmp_path / f"memu-{mode}.sqlite"
+            proc = subprocess.run(
+                [sys.executable, "-c", script, str(db), mode],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                env={**os.environ, "NERVE_HOME": str(tmp_path / f"home-{mode}")},
+            )
+            marker = [ln for ln in proc.stdout.splitlines()
+                      if ln.startswith("NERVE_RESULT ")]
+            assert marker, (
+                f"no result marker from the {mode} run\n"
+                f"stdout tail:\n{proc.stdout[-2000:]}\n"
+                f"stderr tail:\n{proc.stderr[-2000:]}"
+            )
+            return json.loads(marker[-1][len("NERVE_RESULT "):])
+
+        # Control first: a later False must not be the fixture failing for an
+        # unrelated reason.
+        ok = run("intact")
+        assert ok["rc"] is True, f"control startup failed: {ok}"
+        assert ok["available"] is True
+        assert ok["rows"] >= 1, "control persisted no category, so rows==0 proves nothing"
+
+        broken = run("break")
+        assert broken["rc"] is False, \
+            "startup succeeded despite the instrumentation raising - it is caught somewhere"
+        assert broken["available"] is False, \
+            "the bridge advertised itself as usable with an unbounded embedding client"
+        assert broken["rows"] == 0, \
+            "a category row was persisted after the bound failed to install"

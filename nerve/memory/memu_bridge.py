@@ -2100,27 +2100,13 @@ class MemUBridge:
     def _instrument_embedding_timeout(self) -> None:
         """Bound calls on the "embedding" LLM profile (same two layers).
 
-        The ``_instrument_llm_timeouts`` loop deliberately excludes this
-        profile: its Layer 2 wraps ``.chat`` (embeddings go through
-        ``.embed``) and its Layer 1 sets ``max_retries = 0``, which is only
-        safe for chat because ``_timeout_chat`` supplies its own transient
-        retry ladder.  Without this method every ``embed()`` call runs under
-        the bare OpenAI SDK default (600s read, 2 retries), so a hung
-        embeddings endpoint stalls category seeding and ``recall`` for up to
-        ~30 minutes.
-
-        SDK ``max_retries`` is left at its default on purpose: a transient
-        429 on embeddings should still ride out, and the Layer 2 wait_for
-        fires at the bound regardless of retries in flight.
-
-        Deliberately does NOT catch: per-site failure policy lives at the
-        call sites.  The startup call must fail closed (leave the bridge
-        unavailable rather than publish it with an unbounded client), and
-        ``_initialize_impl``'s own handler already provides that.
+        ``_instrument_llm_timeouts`` cannot cover it: that loop wraps ``.chat``
+        and zeroes ``max_retries``, safe only for chat's own retry ladder, so
+        SDK retries stay here.  Ungated because memU synthesizes "embedding"
+        from "default" when omitted (``memu/app/settings.py:286``), so even a
+        no-provider install reaches ``embed`` via memU's update workflow.
+        Uncaught, so startup fails closed via ``_initialize_impl``'s handler.
         """
-        if not self._has_embeddings:
-            return  # no embedding profile exists; nothing to bound
-
         import httpx as _httpx
 
         client = self._service._get_llm_base_client("embedding")
