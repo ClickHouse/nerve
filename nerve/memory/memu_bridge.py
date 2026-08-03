@@ -123,6 +123,34 @@ def _category_breadcrumb(name: str, description: str, summary: str) -> str:
     return text
 
 
+def _memu_cat_name(name: str) -> str:
+    """The display name memU advertises and stores: ``name.strip() or "Untitled"``.
+
+    ``memu/app/memorize.py:930-938`` (prompt) and ``:663-665`` (persist).  Not
+    lowercased: lowercasing happens only at lookup.
+    """
+    return name.strip() or "Untitled"
+
+
+def _memu_cat_key(name: str) -> str:
+    """The key memU's own resolver computes: ``name.strip().lower()``.
+
+    ``memu/app/memorize.py:682``.  The name-to-id rebuild in ``_initialize_impl``
+    does NOT strip, so occupancy is judged in the rebuild's domain, not here.
+    """
+    return _memu_cat_name(name).lower()
+
+
+def _memu_cat_embed_text(name: str, description: str) -> str:
+    """memU's ``_category_embedding_text`` (``memu/app/memorize.py:670-673``).
+
+    One copy, so seeds and repairs share the space ``cosine_topk`` ranks in.
+    """
+    desc = (description or "").strip()
+    name = _memu_cat_name(name)
+    return f"{name}: {desc}" if desc else name
+
+
 class _VectorIndex:
     """Incremental brute-force vector index over memU item embeddings.
 
@@ -1881,53 +1909,111 @@ class MemUBridge:
         # Unconditional, and read failures propagate: this call also warms the
         # repo cache that _initialize_impl's name-to-ID rebuild reads, and an
         # ``existing`` left empty by a swallowed error would re-seed every name.
-        existing = {getattr(cat, "name", "") for cat in repo.list_categories().values()}
+        rows = list(repo.list_categories().values())
 
+        # Group by the LOOKUP key, not the display name: the name-to-id rebuild in
+        # _initialize_impl and memU's own resolver agree on it up to stripping, so
+        # a rename that is free among display names can still collapse two live
+        # rows onto one map entry.
+        key_owners: dict[str, list[Any]] = {}
+        for cat in rows:
+            key_owners.setdefault(_memu_cat_key(getattr(cat, "name", "")), []).append(cat)
+
+        # Repair rows persisted under a non-normalized name so their rebuild key
+        # becomes the one memU computes.  Two live sources: an upgrade from the
+        # pre-fix code, which stored the raw configured name, and
+        # ``_create_category_impl``, the runtime path this change leaves alone.
+        # The row id survives the rename, so its category_items stay linked.
+        # A key owned by more than one row is left entirely alone -- renaming
+        # either would make them indistinguishable to every lookup, and merging
+        # would have to discard one row's items.  Read from the whole set, not
+        # the rows walked so far: list_categories() applies no ORDER BY.
+        repairs: list[tuple[Any, str]] = []
+        for cat in rows:
+            raw = getattr(cat, "name", "")
+            norm = _memu_cat_name(raw)
+            if norm != raw and len(key_owners[_memu_cat_key(raw)]) == 1:
+                repairs.append((cat, norm))
+
+        # Occupancy must be judged in the domain the REBUILD keys on -- cat.name.lower()
+        # at the name-to-id rebuild in _initialize_impl, which does NOT strip -- and
+        # over the names the rows will carry AFTER the repairs above.  A key that only
+        # exists as a _memu_cat_key of some padded row is not one any consumer computes,
+        # so treating it as taken suppresses the seed that would supply it.
+        renamed = {id(row): new for row, new in repairs}
+        existing = {renamed.get(id(cat), getattr(cat, "name", "")).lower() for cat in rows}
         # Snapshot: never iterate the advertised list while seeding from it.
-        missing = [c for c in list(self._service.category_configs) if c.name not in existing]
-        await self._seed_categories(missing)
+        missing = [
+            c for c in list(self._service.category_configs)
+            if _memu_cat_name(c.name).lower() not in existing
+        ]
+        await self._seed_categories(missing, repairs)
 
-    async def _seed_categories(self, cat_cfgs: list[Any]) -> None:
-        """Persist startup seed categories WITHOUT touching the advertised set.
+    async def _seed_categories(
+        self, cat_cfgs: list[Any], repairs: list[tuple[Any, str]] | None = None,
+    ) -> None:
+        """Write the planned repairs and seeds, embedding once before any write.
 
-        memU built ``category_configs`` / ``category_config_map`` /
-        ``_category_prompt_str`` from these same entries before this runs, so
-        appending to them here (what ``_create_category_impl`` does for runtime
-        creation of a category memU does *not* yet advertise) would list every
-        category twice in the memorize prompt.
+        Seeds go through the repository rather than ``_create_category_impl``,
+        which also appends a ``CategoryConfig``: memU built ``category_configs`` /
+        ``category_config_map`` / ``_category_prompt_str`` from those entries
+        before this runs, so appending here would advertise every category twice.
         """
-        if not self._service or not cat_cfgs:
+        repairs = list(repairs or ())
+        if not self._service or (not cat_cfgs and not repairs):
             return
 
-        # Embed before any write.  A row persisted with a null embedding is never
-        # repaired by a later boot (get_or_create_category returns an existing row
-        # untouched) and both category rankers skip null vectors, so an embed
-        # failure must propagate instead of falling back to None.  One batched
-        # call, matching memU's own category initializer.
-        embeddings: list[Any] = [None] * len(cat_cfgs)
+        # Embed before any write, in ONE batched call covering repairs and seeds
+        # alike.  A row persisted with a null embedding is never repaired by a
+        # later boot (get_or_create_category returns an existing row untouched)
+        # and both rankers skip null vectors, so a failure must propagate rather
+        # than fall back to None -- and it must not leave a partial migration behind.
+        # A repaired row is re-embedded from its NORMALIZED text for the same
+        # reason its name is normalized: the stored vector is what cosine_topk
+        # ranks, so seeds and repairs have to share one space.
+        plan: list[tuple[str, Any]] = (
+            [("repair", r) for r in repairs] + [("seed", c) for c in cat_cfgs]
+        )
+        texts: list[str] = []
+        for kind, item in plan:
+            src = item[0] if kind == "repair" else item
+            texts.append(_memu_cat_embed_text(
+                getattr(src, "name", ""), getattr(src, "description", "") or "",
+            ))
+        embeddings: list[Any] = [None] * len(plan)
         if self._has_embeddings:
-            texts = [
-                f"{c.name}: {c.description}" if c.description else c.name
-                for c in cat_cfgs
-            ]
             embeddings = list(await self._service._get_llm_client("embedding").embed(texts))
 
         # Pair up front, so a provider returning the wrong number of vectors fails
         # before the first write rather than part-way through the loop.
-        pairs = list(zip(cat_cfgs, embeddings, strict=True))
+        pairs = list(zip(plan, embeddings, strict=True))
 
         repo = self._service.database.memory_category_repo
-        for cat_cfg, embedding in pairs:
+        for (kind, item), embedding in pairs:
+            if kind == "repair":
+                row, name = item
+                repo.update_category(category_id=row.id, name=name, embedding=embedding)
+                logger.info("Repaired category name: %r -> %s", getattr(row, "name", ""), name)
+                await self._audit(
+                    "category_updated", "category", row.id, "bridge",
+                    {"name_before": getattr(row, "name", ""), "name_after": name},
+                )
+                continue
+            # Store memU's normalized form: it is the name the memorize prompt
+            # shows the LLM and the only one its reverse lookups can resolve.
+            name = _memu_cat_name(item.name)
+            description = item.description.strip()
             repo.get_or_create_category(
-                name=cat_cfg.name,
-                description=cat_cfg.description,
+                name=name,
+                description=description,
                 embedding=embedding,
                 user_data={},
             )
-            logger.info("Seeded category: %s", cat_cfg.name)
+            # Audit the STORED name, so target_id identifies what was written.
+            logger.info("Seeded category: %s", name)
             await self._audit(
-                "category_created", "category", cat_cfg.name, "bridge",
-                {"description": cat_cfg.description},
+                "category_created", "category", name, "bridge",
+                {"description": description},
             )
 
     # Maximum time (seconds) for a single memorize operation before cancellation.

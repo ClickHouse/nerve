@@ -1198,7 +1198,15 @@ class _StubService:
 
     @staticmethod
     def _format_categories_for_prompt(cfgs) -> str:
-        return "\n".join(f"- {c.name}: {c.description}" for c in cfgs)
+        # Verbatim memU (memu/app/memorize.py:930-938): the advertised name is
+        # normalized even though the CategoryConfig keeps the raw one, which is
+        # exactly the asymmetry the seeding path has to match.
+        lines = []
+        for c in cfgs:
+            name = c.name.strip() or "Untitled"
+            desc = c.description.strip()
+            lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+        return "\n".join(lines)
 
     def _get_context(self):
         return self._context
@@ -1249,6 +1257,9 @@ async def main():
     tmp = Path(sys.argv[1])
     configured = json.loads(sys.argv[2])
     fail_load = sys.argv[3] == "fail-load"
+    # Rows a PREVIOUS nerve left on disk, written by _PRE_STORE_PROBE in its own
+    # interpreter (memU allows one store per process) and passed in as name->id.
+    pre_ids = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
     cfg = NerveConfig()
     cfg.memory = MemoryConfig(
         sqlite_dsn=f"sqlite:///{tmp / 'memu.sqlite'}",
@@ -1291,27 +1302,94 @@ async def main():
         ctx = svc._get_context()
         advertised = [c.name for c in svc.category_configs]
         out["advertised"] = advertised
-        out["prompt_lines"] = [ln for ln in svc._category_prompt_str.splitlines() if ln.strip()]
+        lines = [ln for ln in svc._category_prompt_str.splitlines() if ln.strip()]
+        out["prompt_lines"] = lines
+        # The names the LLM is actually TOLD, read back out of memU's own prompt
+        # string ("- <name>: <desc>" / "- <name>", memu/app/memorize.py:930-938).
+        # Those, not the raw config names, are what it emits and what must resolve.
+        out["prompt_names"] = [ln[2:].split(": ", 1)[0] for ln in lines]
         out["map"] = dict(ctx.category_name_to_id)
         out["resolved"] = svc._map_category_names_to_ids(advertised, ctx)
-        out["rows"] = sorted(c.name for c in
-                             svc.database.memory_category_repo.list_categories().values())
+        out["resolved_prompt"] = svc._map_category_names_to_ids(out["prompt_names"], ctx)
+        rows = svc.database.memory_category_repo.list_categories().values()
+        out["rows"] = sorted(c.name for c in rows)
+        # name -> id, so an upgrade arm can prove a repaired row kept its id
+        # (category_items link on the id, and a fresh row would orphan them).
+        out["row_ids"] = {c.name: c.id for c in rows}
+        out["pre_ids"] = pre_ids
     print("PROBE_JSON " + json.dumps(out))
 
 asyncio.run(main())
 """
 
 
-def _run_init(tmp_path, configured=(), mode="normal"):
+_PRE_STORE_PROBE = """
+import json, sys
+from pathlib import Path
+import memu.app.service  # imported first: avoids a circular import in the patcher
+from nerve.memory.memu_bridge import MemUBridge
+
+# Rows a PREVIOUS nerve left behind: the pre-fix seed path persisted the raw
+# configured name, so an upgrade finds rows whose lookup key is not the one memU
+# computes.  Written through memU's own repo, so the rows are genuine.
+#
+# Its own process because memU permits one store per interpreter: the patched
+# model factory clears the model cache and rebuilds the tables, so a second
+# build in the initialize() probe raises "Column object 'url' already assigned".
+#
+# Patch FIRST, then read the factory off the MODULE -- _patch_sqlite_bugs rebinds
+# get_sqlite_sqlalchemy_models (memu-py names its tables ``sqlite_*``, a prefix
+# SQLite reserves), so a ``from ... import`` above the call captures the
+# unpatched factory and cannot create tables.
+MemUBridge._patch_sqlite_bugs()
+import memu.database.sqlite.schema as schema
+from memu.database.sqlite.sqlite import SQLiteStore
+
+# The SAME scope model MemoryService uses (memu/app/settings.py: UserConfig
+# defaults to DefaultUserModel), so the tables written here carry the scope
+# columns initialize() will later select -- a bare BaseModel scope omits
+# ``user_id`` and the bridge's own read then fails "no such column".
+from memu.app.settings import DefaultUserModel as Scope
+
+store = SQLiteStore(dsn=f"sqlite:///{Path(sys.argv[1]) / 'memu.sqlite'}", scope_model=Scope,
+                    sqla_models=schema.get_sqlite_sqlalchemy_models(scope_model=Scope))
+ids = {n: store.memory_category_repo.get_or_create_category(
+    name=n, description="A", embedding=None, user_data={}).id
+    for n in json.loads(sys.argv[2])}
+print("PRE_JSON " + json.dumps(ids))
+"""
+
+
+def _run_init(tmp_path, configured=(), mode="normal", pre_store=()):
     """Run a full MemUBridge.initialize() in a subprocess and return its report.
 
     Out of process because memU allows exactly one MemoryService per interpreter.
+    ``pre_store`` names rows to persist before initialize() runs, modelling a store
+    written by an earlier nerve; it needs its OWN process for the same reason.
     """
     import subprocess
 
+    pre_ids: dict[str, str] = {}
+    if pre_store:
+        pre = subprocess.run(
+            [sys.executable, "-c", _PRE_STORE_PROBE, str(tmp_path),
+             json.dumps(list(pre_store))],
+            capture_output=True, text=True, timeout=300,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        pre_line = next((ln for ln in pre.stdout.splitlines()
+                         if ln.startswith("PRE_JSON ")), None)
+        assert pre_line is not None, (
+            f"pre-store probe produced no report\nstdout:\n{pre.stdout}\nstderr:\n{pre.stderr}"
+        )
+        pre_ids = json.loads(pre_line[len("PRE_JSON "):])
+        # The rows must really be there, or the upgrade arm would silently
+        # degenerate into the ordinary cold-start case it is meant to contrast.
+        assert sorted(pre_ids) == sorted(pre_store), pre_ids
+
     proc = subprocess.run(
         [sys.executable, "-c", _INIT_PROBE, str(tmp_path),
-         json.dumps([list(c) for c in configured]), mode],
+         json.dumps([list(c) for c in configured]), mode, json.dumps(pre_ids)],
         capture_output=True, text=True, timeout=300,
         cwd=str(Path(__file__).resolve().parent.parent),
     )
@@ -1343,7 +1421,11 @@ class TestEnsureCategoriesSeeding:
 
     @pytest.mark.asyncio
     async def test_configured_path_rows_and_map_unchanged(self, tmp_path):
-        """Seeding from the effective set does not change what a configured install gets."""
+        """Seeding from the effective set does not change what a configured install gets.
+
+        A no-regression guard that must hold on BOTH trees, not a defect reproducer:
+        it passes at base by design.
+        """
         configured = [("task_domain", "Domain knowledge"), ("patterns", "Recurring patterns")]
         bridge = _seed_bridge(tmp_path, configured, configured=configured)
 
@@ -1468,6 +1550,11 @@ class TestEnsureCategoriesSeeding:
 
     @pytest.mark.asyncio
     async def test_seeds_are_audited_on_the_configured_path_too(self, tmp_path):
+        """A no-regression guard that must hold on BOTH trees, not a defect reproducer.
+
+        The configured path already audited its seeds at base; this pins that the
+        rewrite kept it.
+        """
         configured = [("task_domain", "Domain")]
         bridge = _seed_bridge(tmp_path, configured, configured=configured)
         bridge._audit = AsyncMock()
@@ -1543,6 +1630,474 @@ class TestEnsureCategoriesSeeding:
 
         assert bridge._service.database.memory_category_repo.list_categories() == {}
 
+    @pytest.mark.parametrize("returned", [1, 3], ids=["too-few", "too-many"])
+    @pytest.mark.asyncio
+    async def test_wrong_embedding_count_writes_nothing_with_a_repair_too(
+        self, tmp_path, returned,
+    ):
+        """The strict pairing covers the COMBINED plan: one repair plus one seed = 2.
+
+        The batch now spans repairs as well as seeds, so a wrong vector count must
+        still raise before the first write -- including before the rename.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        legacy = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="A", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A"), ("beta", "B")],
+                              configured=(), has_embeddings=True)
+        embed = AsyncMock(return_value=[[0.1]] * returned)
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        with pytest.raises(ValueError, match="zip"):
+            await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["  alpha  "]
+        assert rows[legacy.id].name == "  alpha  "
+
+    @pytest.mark.asyncio
+    async def test_padded_name_is_not_seeded_twice(self, tmp_path):
+        """The already-exists skip compares memU's normalized name, not the raw one.
+
+        A row stored as ``alpha`` and a config entry ``"  alpha  "`` are the same
+        category, so a second boot must add nothing.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        store.memory_category_repo.get_or_create_category(
+            name="alpha", description="A", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A")], configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["alpha"]
+        assert sorted(_rebuild_map(bridge)) == ["alpha"]
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_raw_row_is_repaired_not_duplicated(self, tmp_path):
+        """A row stored under a raw name is RENAMED to memU's form, not duplicated.
+
+        Reachable two ways, both live: an upgrade from the pre-fix code, which
+        persisted the raw configured name, and ``_create_category_impl``, the runtime
+        creation path this change deliberately leaves alone.  Seeding a second row
+        instead would give two rows for one logical category; recognising the row but
+        leaving it raw would keep its rebuild key raw, so the advertised name still
+        would not resolve.  ``nerve``'s own ``update_category`` wrapper cannot rename
+        (it forwards summary/description only), but the repo layer can, so the seed
+        path renames -- keeping ONE row, with its id, and therefore its items.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        before = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="A", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A")], configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["alpha"]
+        assert sorted(_rebuild_map(bridge)) == ["alpha"]
+        # ONE row, and it is the SAME row: renaming must not orphan its
+        # category_items, which link on the id.
+        assert len(rows) == 1
+        assert [c.id for c in rows.values()] == [before.id]
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_row_is_not_repaired_onto_a_taken_name(self, tmp_path):
+        """The repair must not produce two rows with the SAME name.
+
+        A store holding BOTH the raw and the normalized row is reachable from base
+        (base seeds the normalized configured name beside an existing raw row), and
+        ``list_categories()`` applies no ORDER BY -- so a guard that only remembered
+        the rows walked so far would rename the raw one onto the taken name whenever
+        it came first.  Every lookup keys on the name, so the two rows would then be
+        indistinguishable.  Asserted in BOTH insertion orders.
+        """
+        for tag, order in (("raw-first", ["  alpha  ", "alpha"]),
+                           ("norm-first", ["alpha", "  alpha  "])):
+            store = _memu_store(tmp_path / f"memu-{tag}.sqlite")
+            ids = {
+                n: store.memory_category_repo.get_or_create_category(
+                    name=n, description="A", embedding=None, user_data={},
+                ).id
+                for n in order
+            }
+            bridge = _seed_bridge(tmp_path, [("  alpha  ", "A")], configured=(),
+                                  db_name=f"memu-{tag}.sqlite")
+
+            await bridge._ensure_categories()
+
+            rows = bridge._service.database.memory_category_repo.list_categories()
+            names = sorted(c.name for c in rows.values())
+            assert names == ["  alpha  ", "alpha"], tag
+            assert len(names) == len(set(names)), tag
+            # Both pre-existing rows survive untouched, so no items are orphaned.
+            assert {c.id for c in rows.values()} == set(ids.values()), tag
+            # The advertised name still resolves, via the already-normalized row.
+            assert "alpha" in _rebuild_map(bridge), tag
+
+    @pytest.mark.asyncio
+    async def test_a_blank_legacy_row_is_repaired_to_untitled(self, tmp_path):
+        """The repair uses memU's normalization, so a blank name becomes ``Untitled``.
+
+        memU advertises a nameless category as ``Untitled``; a row stored as ``'   '``
+        resolves under no advertised key until it carries that name.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        before = store.memory_category_repo.get_or_create_category(
+            name="   ", description="B", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("   ", "B")], configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["Untitled"]
+        assert [c.id for c in rows.values()] == [before.id]
+        assert sorted(_rebuild_map(bridge)) == ["untitled"]
+
+    @pytest.mark.asyncio
+    async def test_case_only_duplicate_rows_are_left_alone(self, tmp_path):
+        """Case-only pairs are deliberately OUT of scope, and must stay untouched.
+
+        ``Alpha`` and ``alpha`` are both already normalized, so neither is a legacy
+        raw row; base produces the same two rows, and merging them would have to
+        discard one row's items.  Pinned so a later change does not quietly widen
+        the repair into a destructive merge.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        ids = {
+            n: store.memory_category_repo.get_or_create_category(
+                name=n, description="A", embedding=None, user_data={},
+            ).id
+            for n in ("Alpha", "alpha")
+        }
+        bridge = _seed_bridge(tmp_path, [("alpha", "A")], configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert sorted(c.name for c in rows.values()) == ["Alpha", "alpha"]
+        assert {c.id for c in rows.values()} == set(ids.values())
+
+    @pytest.mark.parametrize(
+        "order",
+        [["  Alpha  ", "alpha"], ["alpha", "  Alpha  "]],
+        ids=["padded-first", "normalized-first"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_padded_row_is_not_repaired_onto_another_rows_lookup_key(
+        self, tmp_path, order,
+    ):
+        """Occupancy is judged on the LOOKUP key, so a rename cannot collapse two rows.
+
+        ``'  Alpha  '`` normalizes to ``Alpha``, which is free among display names but
+        shares the rebuild key ``alpha`` with the second row -- so renaming it would
+        leave two live rows sharing ONE ``category_name_to_id`` entry, and which one
+        wins depends on ``repo.categories`` order (``list_categories()`` applies no
+        ORDER BY).  Both rows must therefore be left exactly as base leaves them.
+        Asserted on the map-key COUNT, not just membership: membership alone cannot
+        see a collapse.  Both insertion orders, for the same missing-ORDER-BY reason.
+        """
+        db = f"memu-{'-'.join(order)}.sqlite".replace(" ", "_")
+        store = _memu_store(tmp_path / db)
+        ids = {
+            n: store.memory_category_repo.get_or_create_category(
+                name=n, description="A", embedding=None, user_data={},
+            ).id
+            for n in order
+        }
+        bridge = _seed_bridge(tmp_path, [("alpha", "A")], configured=(), db_name=db)
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert sorted(c.name for c in rows.values()) == ["  Alpha  ", "alpha"]
+        assert {c.id for c in rows.values()} == set(ids.values())
+        # Two live rows, so two addressable keys.  One key here is the regression.
+        assert len(_rebuild_map(bridge)) == 2
+        assert "alpha" in _rebuild_map(bridge)
+
+    @pytest.mark.parametrize(
+        "order",
+        [["  alpha  ", "alpha "], ["alpha ", "  alpha  "]],
+        ids=["wider-first", "narrower-first"],
+    )
+    @pytest.mark.asyncio
+    async def test_two_raw_rows_sharing_a_lookup_key_still_get_an_addressable_row(
+        self, tmp_path, order,
+    ):
+        """When NO row already owns the advertised key, one must still be seeded.
+
+        Both stored rows are raw, so the multi-owner guard correctly declines to rename
+        either -- but neither is addressable, because the name-to-id rebuild keys on
+        ``cat.name.lower()`` without stripping.  Judging occupancy on ``_memu_cat_key``
+        instead marks ``alpha`` taken by a key no consumer computes and suppresses the
+        seed, leaving the advertised name unresolvable -- exactly what base avoids, by
+        seeding a third row.  Both insertion orders: ``list_categories()`` applies no
+        ORDER BY.
+        """
+        db = f"memu-raw-{'-'.join(order)}.sqlite".replace(" ", "_")
+        store = _memu_store(tmp_path / db)
+        ids = {
+            n: store.memory_category_repo.get_or_create_category(
+                name=n, description="A", embedding=None, user_data={},
+            ).id
+            for n in order
+        }
+        bridge = _seed_bridge(tmp_path, [("alpha", "A")], configured=(), db_name=db)
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        # Three rows: both raw rows untouched, plus the addressable seed.
+        assert sorted(c.name for c in rows.values()) == ["  alpha  ", "alpha", "alpha "], order
+        assert set(ids.values()) <= {c.id for c in rows.values()}, order
+        assert {c.name for c in rows.values() if c.id in set(ids.values())} == set(order), order
+        mapping = _rebuild_map(bridge)
+        assert "alpha" in mapping, order
+        # A key COUNT assertion: membership alone cannot see a collapse.
+        assert len(mapping) == 3, order
+
+    @pytest.mark.parametrize(
+        "order",
+        [["  Alpha  ", " alpha"], [" alpha", "  Alpha  "]],
+        ids=["padded-first", "narrower-first"],
+    )
+    @pytest.mark.asyncio
+    async def test_case_differing_raw_rows_sharing_a_key_still_get_an_addressable_row(
+        self, tmp_path, order,
+    ):
+        """The same gap reached through a case difference, where no rename is free.
+
+        ``'  Alpha  '`` and ``' alpha'`` share the ``_memu_cat_key`` ``alpha`` and
+        neither is already normalized, so both are correctly left alone -- and neither
+        answers to the advertised ``alpha`` under the rebuild's own key.
+        """
+        db = f"memu-case-{'-'.join(order)}.sqlite".replace(" ", "_")
+        store = _memu_store(tmp_path / db)
+        ids = {
+            n: store.memory_category_repo.get_or_create_category(
+                name=n, description="A", embedding=None, user_data={},
+            ).id
+            for n in order
+        }
+        bridge = _seed_bridge(tmp_path, [("alpha", "A")], configured=(), db_name=db)
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert sorted(c.name for c in rows.values()) == ["  Alpha  ", " alpha", "alpha"], order
+        assert set(ids.values()) <= {c.id for c in rows.values()}, order
+        assert {c.name for c in rows.values() if c.id in set(ids.values())} == set(order), order
+        mapping = _rebuild_map(bridge)
+        assert "alpha" in mapping, order
+        assert len(mapping) == 3, order
+
+    @pytest.mark.asyncio
+    async def test_a_padded_config_entry_matches_a_case_differing_row(self, tmp_path):
+        """The already-exists test compares lookup keys, so no second row is seeded.
+
+        A row stored as ``Alpha`` and an advertised ``  alpha  `` are one category to
+        every memU lookup; seeding a second row would put both behind one rebuild key.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        before = store.memory_category_repo.get_or_create_category(
+            name="Alpha", description="A", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A")], configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["Alpha"]
+        assert [c.id for c in rows.values()] == [before.id]
+        assert sorted(_rebuild_map(bridge)) == ["alpha"]
+
+    @pytest.mark.asyncio
+    async def test_seeded_name_and_description_are_normalized(self, tmp_path):
+        """The stored row carries the name the prompt advertises, so lookups resolve."""
+        advertised = [("  alpha  ", "  A  "), ("   ", "B")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert {c.name: c.description for c in rows.values()} == {"alpha": "A", "Untitled": "B"}
+        # The map is keyed on what memU looks up: name.strip().lower().
+        assert sorted(_rebuild_map(bridge)) == ["alpha", "untitled"]
+        # A second pass finds both and adds nothing.
+        await bridge._ensure_categories()
+        assert len(bridge._service.database.memory_category_repo.list_categories()) == 2
+
+    @pytest.mark.asyncio
+    async def test_embed_text_is_normalized_like_memu(self, tmp_path):
+        """Seed vectors must be embedded from memU's own _category_embedding_text.
+
+        A vector built from the padded text lands elsewhere in the space cosine_topk
+        ranks in, so category ranking would degrade silently.
+        """
+        advertised = [("  alpha  ", "  A  "), ("  beta  ", "   ")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=(), has_embeddings=True)
+        embed = AsyncMock(return_value=[[0.1, 0.2], [0.3, 0.4]])
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        await bridge._ensure_categories()
+
+        # "beta" has a whitespace-only description, so it takes the desc-less form.
+        assert embed.await_args.args[0] == ["alpha: A", "beta"]
+
+    @pytest.mark.asyncio
+    async def test_a_repaired_row_is_re_embedded_from_its_normalized_text(self, tmp_path):
+        """A renamed row must not keep the vector embedded from its raw name.
+
+        Both category rankers read the stored vector directly, and seeds are
+        deliberately embedded from the normalized text -- so a repair that updated
+        only ``name`` would leave that one row ranked in a different space.  One
+        batched call covers the repair and the seed together.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        legacy = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="A", embedding=[9.0, 9.0], user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A"), ("beta", "B")],
+                              configured=(), has_embeddings=True)
+        embed = AsyncMock(return_value=[[0.1, 0.2], [0.3, 0.4]])
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        await bridge._ensure_categories()
+
+        # ONE call, carrying the repair's NORMALIZED text alongside the seed's.
+        assert embed.await_count == 1
+        assert embed.await_args.args[0] == ["alpha: A", "beta: B"]
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        stored = {c.name: list(c.embedding) for c in rows.values()}
+        # approx, not ==: a re-read vector comes back through _patch_sqlite_bugs'
+        # numpy float32 embeddings (Fix 6), unlike a freshly created row's cached
+        # list.  The point is WHICH vector is stored, not its dtype.
+        assert stored["alpha"] == pytest.approx([0.1, 0.2], abs=1e-6)
+        assert stored["beta"] == pytest.approx([0.3, 0.4], abs=1e-6)
+        # And emphatically not the vector embedded from the raw name.
+        assert stored["alpha"] != pytest.approx([9.0, 9.0], abs=1e-6)
+        assert rows[legacy.id].name == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_no_embed_call_leaves_a_repaired_rows_vector_alone(self, tmp_path):
+        """With no provider the rename passes ``embedding=None``, which is a no-op write.
+
+        ``update_category`` skips ``embedding_json`` when the argument is None, so the
+        existing vector survives -- the correct outcome when nothing can be embedded.
+        A no-regression guard that must hold on BOTH trees, not a defect reproducer.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        legacy = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="A", embedding=[9.0, 9.0], user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A")], configured=(),
+                              has_embeddings=False)
+        embed = AsyncMock(return_value=[[0.1]])
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        await bridge._ensure_categories()
+
+        assert embed.await_count == 0
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert rows[legacy.id].name == "alpha"
+        assert list(rows[legacy.id].embedding) == [9.0, 9.0]
+
+    @pytest.mark.asyncio
+    async def test_embed_failure_commits_no_rename(self, tmp_path):
+        """Embed-before-write covers repairs too, so a failure migrates nothing.
+
+        With the rename written before the embedding batch, an outage left the row
+        renamed and the missing category unseeded: a partially migrated store.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        legacy = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="A", embedding=[9.0], user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A"), ("beta", "B")],
+                              configured=(), has_embeddings=True)
+        embed = AsyncMock(side_effect=RuntimeError("embedding provider down"))
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        with pytest.raises(RuntimeError, match="embedding provider down"):
+            await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["  alpha  "]
+        assert rows[legacy.id].name == "  alpha  "
+
+    @pytest.mark.asyncio
+    async def test_a_repair_is_audited_as_category_updated(self, tmp_path):
+        """Every other category mutation in this file is audited; the repair must be too.
+
+        ``category_updated`` with the row id, matching ``_update_category_impl``.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        legacy = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="A", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "A")], configured=())
+        bridge._audit = AsyncMock()
+
+        await bridge._ensure_categories()
+
+        assert [c.args[:4] for c in bridge._audit.await_args_list] == [
+            ("category_updated", "category", legacy.id, "bridge"),
+        ]
+        assert bridge._audit.await_args.args[4] == {
+            "name_before": "  alpha  ", "name_after": "alpha",
+        }
+        # A boot with nothing to repair emits no update.
+        bridge._audit.reset_mock()
+        await bridge._ensure_categories()
+        assert bridge._audit.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_repaired_row_keeps_its_own_description(self, tmp_path):
+        """The repair renames ONLY.  Pinned so a later change cannot flip it silently.
+
+        A stored description may have been edited through the API or the UI, and the
+        rename is not a reconciliation point: overwriting it with the config text
+        would discard that edit, and resolution does not depend on it.  A BEHAVIOUR
+        PIN that holds on both trees, not a defect reproducer -- its value is that a
+        future widening of the repair has to change this arm deliberately.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        legacy = store.memory_category_repo.get_or_create_category(
+            name="  alpha  ", description="edited by the user", embedding=None, user_data={},
+        )
+        bridge = _seed_bridge(tmp_path, [("  alpha  ", "config text")], configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert rows[legacy.id].name == "alpha"
+        assert rows[legacy.id].description == "edited by the user"
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_blank_name_is_seeded_once_as_untitled(self, tmp_path):
+        """memU shows a nameless category as ``Untitled``; the row must match."""
+        bridge = _seed_bridge(tmp_path, [("   ", "B")], configured=())
+        bridge._audit = AsyncMock()
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.name for c in rows.values()] == ["Untitled"]
+        # The audit target_id names the row that was written, not the blank config.
+        assert [c.args[:4] for c in bridge._audit.await_args_list] == [
+            ("category_created", "category", "Untitled", "bridge"),
+        ]
+        bridge._audit.reset_mock()
+        await bridge._ensure_categories()
+        assert len(bridge._service.database.memory_category_repo.list_categories()) == 1
+        assert bridge._audit.await_count == 0
+
 
 class TestInitializeCategoryInvariant:
     """End-to-end: a full initialize() in its own process (one MemoryService each)."""
@@ -1567,6 +2122,67 @@ class TestInitializeCategoryInvariant:
         assert len(report["prompt_lines"]) == 2
         assert len(report["resolved"]) == 2
         assert sorted(report["rows"]) == ["patterns", "task_domain"]
+
+    def test_padded_and_blank_configured_names_still_all_resolve(self, tmp_path):
+        """End-to-end: every name the PROMPT advertises resolves, however it was written.
+
+        Unfixed, initialize() reports success with rows/map keyed on the raw
+        ``'  alpha  '`` / ``'   '`` while the prompt says ``alpha`` / ``Untitled``,
+        so resolved_prompt is empty and every LLM assignment is dropped.
+        Asserting against report["advertised"] would NOT see this: the raw
+        ``'  alpha  '`` key happens to match itself, giving 1 of 2 even unfixed.
+        """
+        report = _run_init(tmp_path, configured=[("  alpha  ", "A"), ("   ", "B")])
+
+        assert report["offline"] is True
+        assert report["initialize"] is True
+        assert report["prompt_names"] == ["alpha", "Untitled"]
+        assert len(report["resolved_prompt"]) == len(report["prompt_names"])
+        assert sorted(report["rows"]) == ["Untitled", "alpha"]
+        assert sorted(report["map"]) == ["alpha", "untitled"]
+
+    def test_upgrade_from_a_raw_stored_row_still_resolves_everything(self, tmp_path):
+        """End-to-end upgrade: rows left by the pre-fix seed path are repaired.
+
+        The post-upgrade shape: the row on disk carries the raw configured name the
+        old code stored, while the config has since been cleaned up.  Unfixed, the
+        row keys as ``'  alpha  '`` and the prompt says ``alpha``, so resolved_prompt
+        is short and every LLM assignment to it is dropped.  Asserts the repair
+        keeps ONE row and the SAME row, so its category_items stay linked.
+        """
+        report = _run_init(tmp_path, configured=[("alpha", "A")],
+                           pre_store=["  alpha  "])
+
+        assert report["offline"] is True
+        assert report["initialize"] is True
+        assert report["prompt_names"] == ["alpha"]
+        assert len(report["resolved_prompt"]) == len(report["prompt_names"])
+        assert report["rows"] == ["alpha"]
+        assert sorted(report["map"]) == ["alpha"]
+        assert report["row_ids"]["alpha"] == report["pre_ids"]["  alpha  "]
+
+    def test_upgrade_from_two_raw_rows_sharing_a_key_still_resolves(self, tmp_path):
+        """End-to-end: two raw rows share the advertised key, so neither can be renamed.
+
+        Reachable as an upgrade from a config that once carried both ``'  alpha  '``
+        and ``'alpha '``, or a pre-fix boot plus one ``_create_category_impl`` call.
+        Judging occupancy on the strip-and-lower key marks ``alpha`` present and skips
+        the seed, so ``resolved_prompt`` is empty while ``initialize()`` reports
+        success -- the very "advertised but unresolvable" state this branch removes.
+        Both pre-existing rows must survive, and one row must answer to ``alpha``.
+        """
+        pre = ["  alpha  ", "alpha "]
+        report = _run_init(tmp_path, configured=[("alpha", "A")], pre_store=pre)
+
+        assert report["offline"] is True
+        assert report["initialize"] is True
+        assert report["available"] is True
+        assert report["prompt_names"] == ["alpha"]
+        assert len(report["resolved_prompt"]) == len(report["prompt_names"])
+        assert sorted(report["rows"]) == ["  alpha  ", "alpha", "alpha "]
+        # Both raw rows keep their ids, so their category_items stay linked.
+        assert set(report["pre_ids"].values()) <= set(report["row_ids"].values())
+        assert sorted(report["map"]) == ["  alpha  ", "alpha", "alpha "]
 
     def test_availability_is_not_published_when_init_fails(self, tmp_path):
         """_available is the only failure signal the agent sees: engine.py drops the return."""
