@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import logging
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1499,30 +1501,67 @@ class TestUpdatePreservesCategories:
             assert after == before
             assert set(out["category_updates"].values()) == {("a fact", "revised")}
 
-    def test_incomplete_map_raises_and_changes_nothing(self, tmp_path):
-        """Fail closed: refusing the update beats silently dropping links.
+    def test_incomplete_map_preserves_every_link(self, tmp_path):
+        """An incomplete ctx map must be harmless, not merely detected.
 
-        ctx.category_name_to_id is rebuilt from every DB category on bridge
-        init, so this should be unreachable in nerve; the raise is a tripwire.
+        The earlier design round-tripped the links through
+        ctx.category_name_to_id and raised when a link did not map back, because
+        an unmapped link would have been silently dropped. Membership is no
+        longer mutated at all, so the map is not consulted and the STRONGER
+        property holds: every link survives even when the map cannot name it.
         """
         with _MemuPatchFixture(tmp_path) as fx:
             store, cats = fx.setup(3)
             item = fx.add_item(store)
             fx.link_all(store, item.id, cats)
+            before = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
             partial = {k: v for k, v in cats.items() if k != "decisions"}
             ctx = fx.ctx(partial)
             snapshot = dict(ctx.category_name_to_id)
 
-            with pytest.raises(ValueError, match="do not round-trip"):
-                fx.run_update(store, cats, item.id, content="revised", ctx=ctx)
+            out = fx.run_update(store, cats, item.id, content="revised", ctx=ctx)
 
-            assert len(store.category_item_repo.get_item_categories(item.id)) == 3
-            # Service-lifetime state (shared with memorize) must not be mutated.
-            assert ctx.category_name_to_id == snapshot
+            after = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+            # Same relation rows, including the one `partial` cannot name.
+            assert after == before
+            assert len(after) == 3
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 3
+            # Every surviving link is reported as updated, unmapped one included.
+            assert set(out["category_updates"]) == set(cats.values())
+            assert set(out["category_updates"].values()) == {("a fact", "revised")}
+            # The update really happened, or the assertions above are free.
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_memory_items WHERE id = ? AND summary = ?",
-                item.id, "a fact",
+                item.id, "revised",
             ) == 1
+            # Service-lifetime state (shared with memorize) must not be mutated.
+            assert ctx.category_name_to_id == snapshot
+
+    def test_no_category_name_lookup_is_performed(self, tmp_path):
+        """Preservation must not depend on the name->id map at all.
+
+        A ctx whose category_name_to_id raises on access proves the block reads
+        it nowhere; that is what makes an incomplete map structurally harmless
+        rather than harmless-by-luck.
+        """
+        class _ExplodingCtx:
+            category_ids: list = []
+
+            @property
+            def category_name_to_id(self):
+                raise AssertionError("category_name_to_id must not be read")
+
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+
+            fx.run_update(store, cats, item.id, content="revised",
+                          ctx=_ExplodingCtx())
+
+            assert len(store.category_item_repo.get_item_categories(item.id)) == 2
 
     def test_item_with_no_links_is_a_noop(self, tmp_path):
         with _MemuPatchFixture(tmp_path) as fx:
@@ -1548,10 +1587,14 @@ class TestUpdatePreservesCategories:
             before = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
             assert len(before) == 2
 
-            fx.run_update(store, cats, item.id, memory_type="profile")
+            out = fx.run_update(store, cats, item.id, memory_type="profile")
 
             after = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
             assert after == before
+            # No content changed, so there is nothing for the summary step to
+            # patch: reporting (old, old) pairs would re-summarise every category
+            # of every type-only edit.
+            assert out["category_updates"] == {}
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
             ) == 2
@@ -1561,19 +1604,17 @@ class TestUpdatePreservesCategories:
                 item.id, "profile",
             ) == 1
 
-    def test_a_link_added_between_the_two_reads_is_still_removed(self, tmp_path):
-        """KNOWN residual window, pinned deliberately rather than by accident.
+    def test_a_link_added_between_the_two_reads_is_preserved(self, tmp_path):
+        """The former residual window is CLOSED, and pinned so it stays closed.
 
-        Preservation works by rewriting the payload with the names of the links
-        _category_preserving_update sees, which memU's own handler then re-reads
-        to build its diff. A link inserted between those two reads is missing
-        from the payload, so the diff removes it.
+        The earlier design synthesized a categories payload from the links it
+        saw, which memU then re-read to diff: a link inserted between those two
+        reads was absent from the payload, so the diff removed it. Membership is
+        no longer mutated at all, so a racing insert survives.
 
-        Closing it means reimplementing memU's diff, which would bypass
-        category_updates and therefore the LLM category-summary step. Base is
-        worse in every arm measured - it loses a link in this same race AND
-        loses every link when there is no race - so this asserts the current
-        behaviour to make a future narrowing a deliberate test change.
+        The race MUST be inserted by raw SQL. Going through
+        rel.link_item_category would be swallowed by the no-op stub this fix
+        installs for the delegated call, and the test would pass vacuously.
         """
         with _MemuPatchFixture(tmp_path) as fx:
             store, cats = fx.setup(2)
@@ -1583,29 +1624,131 @@ class TestUpdatePreservesCategories:
 
             real_get = repo.get_item_categories
             calls = []
+            landed = []
 
             def counting_get(iid):
                 calls.append(iid)
                 out = real_get(iid)
                 if len(calls) == 1:
-                    repo.link_item_category(
-                        item.id, cats["patterns"], user_data={},
+                    con = sqlite3.connect(fx.path)
+                    con.execute(
+                        "INSERT INTO memu_category_items"
+                        " (id, item_id, category_id, created_at, updated_at)"
+                        " VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+                        (str(uuid.uuid4()), item.id, cats["patterns"]),
                     )
+                    con.commit()
+                    con.close()
+                    # The race is real only if the row is in the DB already.
+                    landed.append(fx.raw_count(
+                        "SELECT count(*) FROM memu_category_items"
+                        " WHERE item_id = ? AND category_id = ?",
+                        item.id, cats["patterns"],
+                    ))
                 return out
 
             repo.get_item_categories = counting_get
             try:
-                fx.run_update(store, cats, item.id, content="revised")
+                out = fx.run_update(store, cats, item.id, content="revised")
             finally:
                 repo.get_item_categories = real_get
 
             # Both reads happened, or the window was never opened.
             assert len(calls) == 2
-            links = {r.category_id for r in real_get(item.id)}
-            # The pre-existing link is preserved (that is Fix 8 working) ...
+            # The raw insert landed before the second read, or there was no race.
+            assert landed == [1]
+            links = {
+                r[0] for r in sqlite3.connect(fx.path).execute(
+                    "SELECT category_id FROM memu_category_items WHERE item_id = ?",
+                    (item.id,),
+                ).fetchall()
+            }
             assert cats["procedures"] in links
-            # ... and the one added inside the window is not (the residual).
-            assert cats["patterns"] not in links
+            # The link added inside the window survives: the window is closed.
+            assert cats["patterns"] in links
+            # ... and it is reported to the summary step, not silently dropped.
+            assert out["category_updates"][cats["patterns"]] == ("a fact", "revised")
+
+    def test_both_membership_mutators_are_neutralised(self, tmp_path):
+        """Pin the claim directly: BOTH mutators are no-ops in the delegation.
+
+        Measured on the delegated handler, ``link_item_category`` is unreachable
+        when ``categories`` is omitted (mapped_new_cat_ids is [], so cats_to_add
+        is always empty) - so stubbing it changes no OUTCOME today and no
+        outcome-level test can distinguish it. It is stubbed anyway, because
+        "no membership mutation at all" must hold by construction rather than by
+        memU's current diff arithmetic. This observes that property where it is
+        made, so a future memU that does link here stays neutralised.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+            repo = store.category_item_repo
+            seen = {}
+
+            real_get = repo.get_item_categories
+
+            def probing_get(iid):
+                # Runs inside the delegated call, so it sees the stubs in place.
+                seen.setdefault("link", repo.link_item_category)
+                seen.setdefault("unlink", repo.unlink_item_category)
+                return real_get(iid)
+
+            repo.get_item_categories = probing_get
+            try:
+                fx.run_update(store, cats, item.id, content="revised")
+            finally:
+                repo.get_item_categories = real_get
+
+            # The probe ran inside the delegation, or it observed nothing.
+            assert set(seen) == {"link", "unlink"}
+            # Neither mutator is the real repo method during the delegation.
+            assert seen["unlink"] is not real_get.__self__.__class__.unlink_item_category
+            for name in ("link", "unlink"):
+                assert seen[name].__name__ == "_keep_noop", name
+                # A no-op really is a no-op: it must not touch the DB.
+                assert seen[name](item.id, next(iter(cats.values()))) is None
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+
+    def test_the_mutator_stubs_are_always_restored(self, tmp_path):
+        """A leaked no-op unlink/link would break every later caller.
+
+        The stubs are installed on the repo INSTANCE for the delegated call
+        only; the finally must remove them even when the delegation raises.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+            repo = store.category_item_repo
+            names = ("unlink_item_category", "link_item_category")
+            assert not any(n in repo.__dict__ for n in names)
+
+            fx.run_update(store, cats, item.id, content="revised")
+            assert not any(n in repo.__dict__ for n in names)
+
+            # Same guarantee on the failing path.
+            boom = store.memory_item_repo.update_item
+
+            def exploding_update(**kwargs):
+                raise RuntimeError("delegation failed")
+
+            store.memory_item_repo.update_item = exploding_update
+            try:
+                with pytest.raises(RuntimeError, match="delegation failed"):
+                    fx.run_update(store, cats, item.id, content="again")
+            finally:
+                store.memory_item_repo.update_item = boom
+            assert not any(n in repo.__dict__ for n in names)
+
+            # The real mutators still work after the stubs are withdrawn.
+            repo.unlink_item_category(item.id, cats["procedures"])
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 1
 
 
 class TestUpdateRefreshesContentHash:
@@ -1939,7 +2082,59 @@ class TestUpdateRefreshesContentHash:
             assert repo.items[item.id].extra == row_extra
             assert result.extra == row_extra
 
-    def test_a_failing_hash_writeback_does_not_fail_the_update(self, tmp_path):
+    def test_a_decode_failure_after_the_cas_still_syncs_the_cache(self, tmp_path, caplog):
+        """A failure AFTER the CAS commits must not leave cache and row apart.
+
+        Everything after the commit used to sit under the one best-effort
+        handler, so a decode failure returned early and left the cache and the
+        returned item on the OLD hash while the row already held the new one -
+        the same divergence class as the declined-writeback and concurrent-key
+        cases, entered from the other side. The reconstruction is sound on this
+        path only: the CAS bound summary/memory_type and set content_hash alone.
+        """
+        caplog.set_level(logging.WARNING, logger="nerve.memory.memu_bridge")
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+            hash_before = fx.raw_extra(item.id)["content_hash"]
+            want = _content_hash("my new text", "knowledge")
+            assert want != hash_before
+            decoded = []
+
+            def exploding_loads(payload, *args, **kwargs):
+                decoded.append(payload)
+                raise ValueError("injected decode failure")
+
+            # Resolve through the MODULE, and patch the decode the refresh path
+            # actually calls. Measured: update_item performs exactly ONE
+            # json.loads, so a single injection cannot hit anything else.
+            import nerve.memory.memu_bridge as bridge_mod
+
+            with patch.object(bridge_mod.json, "loads", exploding_loads):
+                result = repo.update_item(item_id=item.id, summary="my new text")
+
+            # The injection really fired, on the RETURNING payload.
+            assert len(decoded) == 1
+            assert "content_hash" in str(decoded[0])
+            row_extra = fx.raw_extra(item.id)
+            # The CAS committed: the row carries the NEW hash.
+            assert row_extra["content_hash"] == want
+            # The call returned normally - this phase is best-effort.
+            assert result is not None
+            # CACHE_EQUALS_DB: neither the cache nor the returned item is stale.
+            assert repo.items[item.id].extra["content_hash"] == want
+            assert result.extra["content_hash"] == want
+            # The swallowed decode is visible, not silent.
+            warnings = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING
+                and "could not be decoded" in r.getMessage()
+            ]
+            assert len(warnings) == 1
+            assert item.id in warnings[0].getMessage()
+
+    def test_a_failing_hash_writeback_does_not_fail_the_update(self, tmp_path, caplog):
         """The hash refresh is derived work: it must never fail a landed update.
 
         It runs after memU's content write has committed, so letting an
@@ -1947,7 +2142,11 @@ class TestUpdateRefreshesContentHash:
         the update failed - and with the categories undiffed and the vector index
         on the old embedding. A stale hash is base's unconditional behaviour, so
         degrading to it is the strictly safer failure.
+
+        The WARNING is the only thing separating "degrade" from "discard
+        silently", so it is asserted here rather than assumed.
         """
+        caplog.set_level(logging.WARNING, logger="nerve.memory.memu_bridge")
         with _MemuPatchFixture(tmp_path) as fx:
             store, _ = fx.setup(1)
             item = fx.add_item(store, summary="orig")
@@ -1991,6 +2190,17 @@ class TestUpdateRefreshesContentHash:
             assert fx.raw_extra(item.id)["content_hash"] == hash_before
             # The cache must not claim a refresh that did not happen.
             assert repo.items[item.id].extra["content_hash"] == hash_before
+            # Swallowed is not silent: exactly one WARNING naming the item and
+            # the underlying error, so a persistently failing refresh is visible.
+            warnings = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING
+                and "content_hash refresh skipped" in r.getMessage()
+            ]
+            assert len(warnings) == 1
+            message = warnings[0].getMessage()
+            assert item.id in message
+            assert "database is locked" in message
 
     def test_a_failing_delegation_still_propagates(self, tmp_path):
         """The delegation stays OUTSIDE the best-effort guard.
@@ -2001,7 +2211,6 @@ class TestUpdateRefreshesContentHash:
         with _MemuPatchFixture(tmp_path) as fx:
             store, _ = fx.setup(1)
             item = fx.add_item(store, summary="orig")
-            repo = store.memory_item_repo
             memu_update = fx.Repo._nerve_memu_update_item
 
             def _boom(self, **kwargs):

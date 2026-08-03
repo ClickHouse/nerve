@@ -1170,10 +1170,27 @@ class MemUBridge:
                         # reinforcement_count, which Fix 3's salience ranking
                         # reads.  The JSON column may hand back either a string
                         # or an already-decoded dict.
+                        #
+                        # The CAS has already COMMITTED here, so a decode failure
+                        # must not skip the cache assignments below: that would
+                        # leave the cache and the returned item on the OLD hash
+                        # while the row holds the new one.  Only the decode is
+                        # guarded, and the fallback IS the row's content on this
+                        # path, because the CAS bound summary/memory_type and the
+                        # only key it set is content_hash.
                         written = returned[0][0]
-                        if isinstance(written, str):
-                            written = json.loads(written)
-                        written = dict(written or {})
+                        try:
+                            if isinstance(written, str):
+                                written = json.loads(written)
+                            written = dict(written or {})
+                        except Exception as decode_exc:  # noqa: BLE001
+                            logger.warning(
+                                "content_hash refresh committed but its RETURNING "
+                                "extra could not be decoded for memU item %s: %s; "
+                                "rebuilding the cache from the pre-write snapshot",
+                                item_id, decode_exc,
+                            )
+                            written = {**current, "content_hash": want}
 
                     # Keep the cache consistent with what was written, like the
                     # Fix 7 writeback does.
@@ -1505,53 +1522,60 @@ class MemUBridge:
             # returns [] for a falsy list), so cats_to_remove becomes the item's
             # ENTIRE current set and each link is unlinked.
             #
-            # Supply the sentinel memU cannot express: when `categories` is None,
-            # rewrite the payload with the NAMES of the item's current links so
-            # memU's own diff computes cats_to_remove == {} and unlinks nothing.
-            # Going through the name channel (rather than reimplementing the diff)
-            # keeps category_updates -- and therefore the LLM category-summary
-            # patch step -- correct.
+            # An omitted `categories` therefore performs NO membership mutation at
+            # all: the delegated handler runs with link/unlink neutralised, so no
+            # link can be removed by a diff it never should have computed.  The
+            # (old, new) pairs the LLM category-summary step consumes are rebuilt
+            # here from the links that actually survive.
             from memu.app.crud import CRUDMixin as _CRUDMixin
 
             if not getattr(_CRUDMixin._patch_update_memory_item, "_nerve_keeps_categories", False):
                 _pre_keep_update_handler = _CRUDMixin._patch_update_memory_item
                 _CRUDMixin._nerve_memu_update_handler = _pre_keep_update_handler
+                _KEEP_MISSING = object()
+                _KEEP_MUTATORS = ("unlink_item_category", "link_item_category")
 
                 async def _category_preserving_update(self, state, step_context):
                     payload = state.get("memory_payload") or {}
-                    if payload.get("categories") is None:
-                        store = state["store"]
-                        ctx = state["ctx"]
-                        existing = [
-                            rel.category_id
-                            for rel in store.category_item_repo.get_item_categories(
-                                state["memory_id"]
-                            )
-                        ]
-                        if existing:
-                            # Invert the existing map read-only; never mutate ctx
-                            # (service-lifetime state shared with memorize()).
-                            id_to_name = {
-                                cid: name
-                                for name, cid in (ctx.category_name_to_id or {}).items()
-                            }
-                            names = [id_to_name[cid] for cid in existing if cid in id_to_name]
-                            # Fail closed: an incomplete round-trip would silently
-                            # drop the unmapped links, which is the bug we are
-                            # fixing.  Late-bound self. call so the MRO decides
-                            # which _map_category_names_to_ids runs.
-                            if set(self._map_category_names_to_ids(names, ctx)) != set(existing):
-                                msg = (
-                                    f"Cannot preserve category links for item {state['memory_id']}: "
-                                    f"{len(existing)} link(s) do not round-trip through "
-                                    "ctx.category_name_to_id; refusing the update rather than "
-                                    "unlinking them"
-                                )
-                                raise ValueError(msg)
-                            payload = {**payload, "categories": names}
-                            state = {**state, "memory_payload": payload}
+                    # An explicit list still replaces; an explicit [] still clears.
+                    if payload.get("categories") is not None:
+                        return await _pre_keep_update_handler(self, state, step_context)
 
-                    return await _pre_keep_update_handler(self, state, step_context)
+                    store = state["store"]
+                    memory_id = state["memory_id"]
+                    rel_repo = store.category_item_repo
+                    item_before = store.memory_item_repo.get_item(memory_id)
+                    old_content = getattr(item_before, "summary", None)
+
+                    def _keep_noop(*_args, **_kwargs):
+                        return None
+
+                    saved = {
+                        name: rel_repo.__dict__.get(name, _KEEP_MISSING)
+                        for name in _KEEP_MUTATORS
+                    }
+                    for name in _KEEP_MUTATORS:
+                        setattr(rel_repo, name, _keep_noop)
+                    try:
+                        out = await _pre_keep_update_handler(self, state, step_context)
+                    finally:
+                        for name, prev in saved.items():
+                            if prev is _KEEP_MISSING:
+                                rel_repo.__dict__.pop(name, None)
+                            else:
+                                rel_repo.__dict__[name] = prev
+
+                    # memU diffed against a no-op, so its pairs are wrong: a live
+                    # link marked (old, None) renders as "content is discarded".
+                    if payload.get("content"):
+                        new_content = getattr(out.get("memory_item"), "summary", None)
+                        out["category_updates"] = {
+                            rel.category_id: (old_content, new_content)
+                            for rel in rel_repo.get_item_categories(memory_id)
+                        }
+                    else:
+                        out["category_updates"] = {}
+                    return out
 
                 _category_preserving_update._nerve_keeps_categories = True  # type: ignore[attr-defined]
                 _CRUDMixin._patch_update_memory_item = _category_preserving_update
