@@ -82,3 +82,35 @@ class PlanStore:
             "SELECT DISTINCT task_id FROM plans WHERE status IN ('pending', 'implementing')"
         ) as cursor:
             return [row[0] async for row in cursor]
+
+    async def get_implementing_plans(self) -> list[dict]:
+        """All ``implementing`` plans, oldest first -- the restart-recovery input.
+
+        Deliberately not ``list_plans(status="implementing")``: that helper caps
+        at ``limit=100``, so a larger backlog would silently under-recover. A
+        recovery pass must see every row, hence a dedicated unlimited query (the
+        same reason ``get_active_workflow_runs`` exists alongside
+        ``list_workflow_runs``).
+        """
+        async with self.db.execute(
+            """SELECT * FROM plans WHERE status = 'implementing'
+               ORDER BY created_at ASC, id ASC"""
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def fail_orphaned_plan(self, plan_id: str) -> bool:
+        """CAS a plan ``implementing -> failed``; True only if this call flipped it.
+
+        The predicate is status-only on purpose. Keying it on ``impl_session_id``
+        would never match the rows ``PATCH /api/plans/{id}`` can create, which
+        take an arbitrary status with no whitelist and so can be ``implementing``
+        with a NULL owner -- SQL ``= ?`` bound to NULL matches nothing, so exactly
+        those rows would stay wedged forever. Status-only is sound because no
+        path moves a plan ``implementing -> implementing``: the writers of
+        ``implementing`` require ``pending`` first.
+        """
+        result = await self._write(
+            "UPDATE plans SET status = 'failed' WHERE id = ? AND status = 'implementing'",
+            (plan_id,),
+        )
+        return (result.rowcount or 0) == 1

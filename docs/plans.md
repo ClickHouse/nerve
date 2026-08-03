@@ -101,6 +101,16 @@ User reviews (via /plans UI or chat tools)
 | `implementing` | Implementation session is running |
 | `declined` | Rejected by user |
 | `superseded` | Replaced by a newer version |
+| `failed` | Implementation did not complete (the run raised, or a daemon restart interrupted it) |
+
+**Restarts.** Plans do **not** survive a daemon restart. `implementing` asserts a
+live in-process implementation run, so on startup a recovery pass marks any
+orphaned `implementing` plan `failed` ("interrupted by nerve restart") and sends
+a high-priority notification. Nothing resumes on its own: the work may be
+partially done, so review the task and propose a fresh version if it is still
+needed. Plans whose implementation session was enrolled via
+`nerve restart --resume` are left `implementing`, because that session resumes
+and closes its own plan.
 
 ## Cron Job
 

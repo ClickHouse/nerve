@@ -344,6 +344,20 @@ async def lifespan(app: FastAPI):
         await telegram_channel.start()
         logger.info("Telegram bot started")
 
+    # Reconcile plans orphaned by a restart. Like workflow runs, a plan hands
+    # its liveness to an in-process task, so 'implementing' rows survive a
+    # restart with no obligation behind them. Placed after notification wiring
+    # and the Telegram channel (so the alert can actually be delivered) and
+    # BEFORE cron starts: cron's catch-up pass can dispatch a planner run whose
+    # plan_propose would read a stale 'implementing' row and permanently skip
+    # the task.
+    try:
+        from nerve.agent.plan_service import recover_orphaned_plans
+
+        await recover_orphaned_plans(db, notification_service)
+    except Exception as e:
+        logger.error("Plan recovery failed: %s", e)
+
     # Start cron service
     global _cron_service
     cron_task = None
