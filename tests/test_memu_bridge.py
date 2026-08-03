@@ -1134,3 +1134,330 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Embedding-call boundedness (_instrument_embedding_timeout)
+# ---------------------------------------------------------------------------
+
+
+class _HangingEmbedClient:
+    """Base-client stand-in whose .embed() never completes.
+
+    Awaits an Event that is never set, so it hangs without touching a real
+    endpoint and without a sleep the test has to outwait.
+    """
+
+    def __init__(self):
+        self.client = MagicMock()          # stands in for AsyncOpenAI
+        self.client.timeout = "untouched"
+        self.client.max_retries = 7        # sentinel: must survive (T7)
+        self.gate = asyncio.Event()
+        self.embed_calls = 0
+
+    async def embed(self, inputs, *args, **kwargs):
+        self.embed_calls += 1
+        await self.gate.wait()             # never set
+        return ([[0.0]], None)             # pragma: no cover - unreachable
+
+    async def chat(self, prompt, **kwargs):  # pragma: no cover - not exercised
+        return "ok"
+
+
+class _FastEmbedClient(_HangingEmbedClient):
+    """Same shape, but .embed() returns memU's real 2-tuple immediately."""
+
+    async def embed(self, inputs, *args, **kwargs):
+        self.embed_calls += 1
+        return ([[0.1, 0.2]], {"raw": 1})
+
+
+def _make_embed_bridge(tmp_path, client, *, has_embeddings=True):
+    """Bridge with a mocked service handing out ``client`` for "embedding"."""
+    config = _make_config(tmp_path)
+    if has_embeddings:
+        config.openai_api_key = "test-embed-key"
+    bridge = MemUBridge(config)
+    bridge._available = True
+    bridge._service = MagicMock()
+    bridge._service._get_llm_base_client = MagicMock(return_value=client)
+    bridge._LLM_CALL_TIMEOUT = 0.25       # keep the arms fast
+    return bridge
+
+
+class TestEmbeddingCallTimeout:
+    """The "embedding" LLM profile must be bounded like every other call."""
+
+    @pytest.mark.asyncio
+    async def test_t1_hanging_embed_is_bounded(self, tmp_path):
+        """T1: a hung embed raises TimeoutError instead of stalling."""
+        client = _HangingEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+
+        bridge._instrument_embedding_timeout()
+
+        t0 = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await client.embed(["query"])
+        elapsed = asyncio.get_running_loop().time() - t0
+        assert elapsed < 5.0, f"took {elapsed:.2f}s - not bounded"
+        assert client.embed_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_t2_bound_fires_through_the_real_memu_wrapper(self, tmp_path):
+        """T2: the bound survives memU's LLMClientWrapper delegation.
+
+        This pins the load-bearing mechanism: the wrapper resolves
+        ``self._client.embed`` at CALL time, so patching the base client's
+        instance attribute is observed even by a wrapper built earlier.
+        """
+        from memu.llm.wrapper import LLMClientWrapper, LLMInterceptorRegistry
+
+        client = _HangingEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+        # built BEFORE patching - the delegation is resolved at call time
+        wrapper = LLMClientWrapper(client, registry=LLMInterceptorRegistry())
+
+        bridge._instrument_embedding_timeout()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await wrapper.embed(["query"])
+        assert client.embed_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_t3_return_shape_is_preserved(self, tmp_path):
+        """T3: the 2-tuple embed contract is untouched by the wrapper."""
+        from memu.llm.wrapper import LLMClientWrapper, LLMInterceptorRegistry
+
+        client = _FastEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+        bridge._instrument_embedding_timeout()
+
+        result = await client.embed(["q"])
+        assert isinstance(result, tuple) and len(result) == 2
+        vecs, raw = result
+        assert vecs[0] == [0.1, 0.2]
+        assert raw is not None
+
+        # ...and through the wrapper, which unpacks to the vectors.
+        wrapper = LLMClientWrapper(client, registry=LLMInterceptorRegistry())
+        via_wrapper = await wrapper.embed(["q"])
+        assert via_wrapper[0] == [0.1, 0.2]
+
+    @pytest.mark.asyncio
+    async def test_t4_instrumenting_twice_does_not_double_wrap(self, tmp_path):
+        """T4: the sentinel makes repeat instrumentation idempotent."""
+        client = _FastEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+
+        bridge._instrument_embedding_timeout()
+        wrapped_once = client.embed
+        bridge._instrument_embedding_timeout()
+
+        assert client.embed is wrapped_once, "embed was wrapped twice"
+        await client.embed(["q"])
+        assert client.embed_calls == 1, "original reached more than once per call"
+
+    @pytest.mark.asyncio
+    async def test_t5_no_embeddings_install_is_a_noop(self, tmp_path):
+        """T5: without an embedding provider the method does nothing.
+
+        The ``_has_embeddings`` gate (not a swallowed exception) is what makes
+        this safe, so the service must never be consulted at all.
+        """
+        client = _FastEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client, has_embeddings=False)
+        bridge._service._get_llm_base_client = MagicMock(side_effect=KeyError("embedding"))
+
+        assert bridge._has_embeddings is False
+        bridge._instrument_embedding_timeout()          # must not raise
+        bridge._service._get_llm_base_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_t6_instrument_llm_timeouts_covers_the_embedding_profile(self, tmp_path):
+        """T6: regression arm for the enumeration that silently rots.
+
+        Asserted behaviourally (the method IS invoked), not by grepping the
+        ("memorize","fast","default") tuple.
+        """
+        client = _FastEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+        bridge._service._get_llm_base_client = MagicMock(side_effect=KeyError("chat"))
+
+        with patch.object(bridge, "_instrument_embedding_timeout") as spy:
+            bridge._instrument_llm_timeouts()
+
+        spy.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_t7_sdk_max_retries_is_left_alone(self, tmp_path):
+        """T7: Layer 1 sets timeout but must NOT copy chat's max_retries=0.
+
+        Embeddings have no compensating retry ladder, so dropping SDK retries
+        would make a transient 429 fail immediately.
+        """
+        client = _HangingEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+        before = client.client.max_retries
+
+        bridge._instrument_embedding_timeout()
+
+        assert client.client.max_retries == before == 7
+        assert client.client.timeout != "untouched", "Layer 1 timeout was not set"
+
+    def test_t8_startup_call_precedes_availability_and_seeding(self):
+        """T8: ordering + availability-window guard, by source order.
+
+        Cannot run ``_initialize_impl`` (it builds a real MemoryService, and
+        only one may exist per process), so assert on its source text.
+        """
+        import inspect
+
+        src = inspect.getsource(MemUBridge._initialize_impl)
+        i_bound = src.index("self._instrument_embedding_timeout()")
+        i_avail = src.index("self._available = True")
+        i_seed = src.index("await self._ensure_categories()")
+
+        assert i_bound < i_avail, "availability is published before the bound is installed"
+        assert i_avail < i_seed, "unexpected ordering: seeding moved above availability"
+        assert i_bound < i_seed, "category seeding embeds before the bound is installed"
+
+    @pytest.mark.asyncio
+    async def test_t9_reset_evicts_the_embedding_client_but_never_warms_it(self, tmp_path):
+        """T9: (d) recycles the transport that actually timed out.
+
+        Also pins the negative: the post-reset warmup loop must NOT touch
+        "embedding", since warming it means a real billed request per reset.
+        """
+        config = _make_config(tmp_path)
+        config.openai_api_key = "test-embed-key"
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+
+        clients = {p: MagicMock() for p in ("memorize", "fast", "default", "embedding")}
+        for c in clients.values():
+            c.client._client.aclose = AsyncMock()
+
+        # One ordered timeline, so "was it evicted", "was re-instrumentation
+        # after the eviction" and "did the WARMUP loop touch it" are three
+        # independent reads rather than one conflated lookup count. A bare
+        # lookup list cannot separate the warmup loop from the
+        # re-instrumentation call, which legitimately resolves "embedding".
+        timeline: list[tuple[str, str]] = []
+
+        class _RecordingClients(dict):
+            def __delitem__(self, key):
+                timeline.append(("evict", key))
+                super().__delitem__(key)
+
+        bridge._service._llm_clients = _RecordingClients(clients)
+        bridge._service._get_llm_base_client = MagicMock(
+            side_effect=lambda p: (timeline.append(("lookup", p)), clients[p])[1],
+        )
+        bridge._probe_api_health = AsyncMock(return_value="ok")
+
+        real_instrument = bridge._instrument_llm_timeouts
+
+        def _tracking_instrument():
+            timeline.append(("instrument", "begin"))
+            try:
+                return real_instrument()
+            finally:
+                timeline.append(("instrument", "end"))
+
+        bridge._instrument_llm_timeouts = _tracking_instrument
+
+        await bridge._reset_llm_clients_impl()
+
+        assert ("evict", "embedding") in timeline, \
+            "the embedding client was not evicted on reset"
+        assert "embedding" not in bridge._service._llm_clients
+
+        i_begin = timeline.index(("instrument", "begin"))
+        i_end = timeline.index(("instrument", "end"))
+        last_evict = max(i for i, ev in enumerate(timeline) if ev[0] == "evict")
+        assert last_evict < i_begin, \
+            "re-instrumentation ran before eviction - the fresh client would not be wrapped"
+
+        # Everything after instrumentation ends is the warmup loop.
+        warmed = [p for kind, p in timeline[i_end + 1:] if kind == "lookup"]
+        assert warmed == ["memorize", "fast"], f"unexpected warmup set: {warmed}"
+        assert "embedding" not in warmed, \
+            "the post-reset warmup issued an embeddings request"
+
+    @pytest.mark.asyncio
+    async def test_t10_startup_instrumentation_fails_closed(self, tmp_path):
+        """T10: the method must NOT swallow its own failure.
+
+        The startup call site relies on propagation to leave the bridge
+        unavailable; an internal try/except would silently reintroduce an
+        unbounded client behind ``_available = True``.
+        """
+        client = _FastEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+        bridge._service._get_llm_base_client = MagicMock(
+            side_effect=RuntimeError("profile exploded"),
+        )
+
+        with pytest.raises(RuntimeError, match="profile exploded"):
+            bridge._instrument_embedding_timeout()
+
+    @pytest.mark.asyncio
+    async def test_t11_reset_path_stays_best_effort(self, tmp_path):
+        """T11: an embedding failure cannot break chat re-instrumentation."""
+        client = _FastEmbedClient()
+        bridge = _make_embed_bridge(tmp_path, client)
+
+        chat_clients = {}
+
+        def _by_profile(profile):
+            if profile == "embedding":
+                raise RuntimeError("embedding profile exploded")
+            c = MagicMock()
+            c.chat = AsyncMock(return_value="ok")
+            chat_clients[profile] = c
+            return c
+
+        bridge._service._get_llm_base_client = MagicMock(side_effect=_by_profile)
+
+        bridge._instrument_llm_timeouts()          # must NOT raise
+
+        assert set(chat_clients) == {"memorize", "fast", "default"}
+        for profile, c in chat_clients.items():
+            assert getattr(c.chat, "_nerve_timeout_wrapped", False), \
+                f"chat profile {profile} was left un-instrumented"
+
+    @pytest.mark.asyncio
+    async def test_t12_recall_timeout_is_backend_down_not_empty(self, tmp_path):
+        """T12: a bounded-but-failed recall must not answer "no memories".
+
+        Both layers: asyncio.TimeoutError (our wait_for) and
+        openai.APITimeoutError (the httpx transport).
+        """
+        from openai import APITimeoutError
+        import httpx
+
+        for exc in (
+            asyncio.TimeoutError(),
+            APITimeoutError(request=httpx.Request("POST", "http://embeddings.invalid")),
+        ):
+            config = _make_config(tmp_path)
+            bridge = MemUBridge(config)
+            bridge._available = True
+            bridge._service = MagicMock()
+            bridge._service.retrieve = MagicMock(side_effect=exc)
+
+            with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+                await bridge.recall("anything")
+
+    @pytest.mark.asyncio
+    async def test_t13_recall_still_returns_empty_for_logic_errors(self, tmp_path):
+        """T13: (e) must not over-reach - a genuine error still yields []."""
+        config = _make_config(tmp_path)
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+        bridge._service.retrieve = MagicMock(side_effect=ValueError("bad payload"))
+
+        assert await bridge.recall("anything") == []

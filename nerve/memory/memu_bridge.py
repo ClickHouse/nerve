@@ -1564,6 +1564,14 @@ class MemUBridge:
                        if not self.config.openai_api_key else {}),
                 },
             )
+            # Bound the embedding client BEFORE publishing availability, and
+            # therefore before _ensure_categories() embeds below: the regular
+            # _instrument_llm_timeouts() call happens much later. Uncaught on
+            # purpose: a failure here rides the outer handler and leaves the
+            # bridge unavailable rather than advertising it as usable with an
+            # unbounded embedding client.
+            self._instrument_embedding_timeout()
+
             self._available = True
             self._metrics.service_available = True
             self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
@@ -2081,6 +2089,69 @@ class MemUBridge:
             except Exception as e:
                 logger.warning("Could not configure LLM client %s: %s", profile, e)
 
+        # The loop above cannot cover "embedding": its body wraps .chat and
+        # sets max_retries=0, neither of which is right for embeddings.
+        # Best-effort here so an embedding failure can't break chat.
+        try:
+            self._instrument_embedding_timeout()
+        except Exception as e:
+            logger.warning("Could not configure embedding LLM client: %s", e)
+
+    def _instrument_embedding_timeout(self) -> None:
+        """Bound calls on the "embedding" LLM profile (same two layers).
+
+        The ``_instrument_llm_timeouts`` loop deliberately excludes this
+        profile: its Layer 2 wraps ``.chat`` (embeddings go through
+        ``.embed``) and its Layer 1 sets ``max_retries = 0``, which is only
+        safe for chat because ``_timeout_chat`` supplies its own transient
+        retry ladder.  Without this method every ``embed()`` call runs under
+        the bare OpenAI SDK default (600s read, 2 retries), so a hung
+        embeddings endpoint stalls category seeding and ``recall`` for up to
+        ~30 minutes.
+
+        SDK ``max_retries`` is left at its default on purpose: a transient
+        429 on embeddings should still ride out, and the Layer 2 wait_for
+        fires at the bound regardless of retries in flight.
+
+        Deliberately does NOT catch: per-site failure policy lives at the
+        call sites.  The startup call must fail closed (leave the bridge
+        unavailable rather than publish it with an unbounded client), and
+        ``_initialize_impl``'s own handler already provides that.
+        """
+        if not self._has_embeddings:
+            return  # no embedding profile exists; nothing to bound
+
+        import httpx as _httpx
+
+        client = self._service._get_llm_base_client("embedding")
+
+        # --- Layer 1: httpx transport timeout (no max_retries change) ---
+        inner = getattr(client, "client", None)  # OpenAISDKClient.client = AsyncOpenAI
+        if inner is not None:
+            inner.timeout = _httpx.Timeout(self._LLM_CALL_TIMEOUT, connect=10.0)
+
+        # --- Layer 2: asyncio.wait_for wrapper on .embed ---
+        # Needed in addition to Layer 1 because embed_batch_size defaults to 1,
+        # so one embed() call can be N sequential requests and a per-request
+        # timeout does not bound the call.
+        if not callable(getattr(client, "embed", None)):
+            return
+        if getattr(client.embed, "_nerve_timeout_wrapped", False):
+            return  # already wrapped (idempotent across startup/reset calls)
+        original_embed = client.embed
+
+        async def _timeout_embed(inputs, *args, _orig=original_embed, **kwargs):
+            return await asyncio.wait_for(
+                _orig(inputs, *args, **kwargs),
+                timeout=self._LLM_CALL_TIMEOUT,
+            )
+
+        _timeout_embed._nerve_timeout_wrapped = True  # type: ignore[attr-defined]
+        client.embed = _timeout_embed  # type: ignore[method-assign]
+        logger.info(
+            "Configured %ds timeout on embedding LLM client", self._LLM_CALL_TIMEOUT,
+        )
+
     @staticmethod
     def _is_llm_timeout(exc: Exception) -> bool:
         """Check if exception is an LLM-level timeout (not a logic error).
@@ -2156,7 +2227,11 @@ class MemUBridge:
         health = await self._probe_api_health("fast")
         logger.info("API health probe before reset: %s", health)
 
-        for profile in ("memorize", "fast", "default"):
+        # "embedding" included: an embed timeout reaches this path, and without
+        # it the offending transport was the one client NOT recycled. The
+        # post-reset warmup loop below deliberately still excludes it: warming
+        # an embedding client means a real (billed) embeddings request.
+        for profile in ("memorize", "fast", "default", "embedding"):
             try:
                 client = self._service._llm_clients.get(profile)
                 if client is None:
@@ -2848,8 +2923,10 @@ class MemUBridge:
             self._metrics.end_op(op_id, success=False, error=str(e))
             # A transient backend outage must not masquerade as "no results" —
             # surface it so the caller can flag amnesia instead of trusting the
-            # empty list.
-            if _is_transient_llm_error(e):
+            # empty list. Timeouts count: the query embedding is bounded now,
+            # so a hung embeddings endpoint fails here instead of stalling, and
+            # _is_transient_llm_error keys on HTTP status only (never a timeout).
+            if isinstance(e, TimeoutError) or self._is_llm_timeout(e) or _is_transient_llm_error(e):
                 raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
             return []
 
