@@ -1492,6 +1492,24 @@ class TestEnsureCategoriesSeeding:
 
         assert bridge._service.database.memory_category_repo.list_categories() == {}
 
+    @pytest.mark.parametrize("returned", [1, 3], ids=["too-few", "too-many"])
+    @pytest.mark.asyncio
+    async def test_wrong_embedding_count_writes_nothing(self, tmp_path, returned):
+        """A provider returning the wrong number of vectors must not half-seed.
+
+        The pairing is materialized before the write loop, so the length mismatch
+        is raised before the first row instead of part-way through.
+        """
+        advertised = [("alpha", "A"), ("beta", "B")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=(), has_embeddings=True)
+        embed = AsyncMock(return_value=[[0.1]] * returned)
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        with pytest.raises(ValueError, match="zip"):
+            await bridge._ensure_categories()
+
+        assert bridge._service.database.memory_category_repo.list_categories() == {}
+
 
 class TestInitializeCategoryInvariant:
     """End-to-end: a full initialize() in its own process (one MemoryService each)."""

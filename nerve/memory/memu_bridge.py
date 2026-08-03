@@ -1912,8 +1912,12 @@ class MemUBridge:
             ]
             embeddings = list(await self._service._get_llm_client("embedding").embed(texts))
 
+        # Pair up front, so a provider returning the wrong number of vectors fails
+        # before the first write rather than part-way through the loop.
+        pairs = list(zip(cat_cfgs, embeddings, strict=True))
+
         repo = self._service.database.memory_category_repo
-        for cat_cfg, embedding in zip(cat_cfgs, embeddings, strict=True):
+        for cat_cfg, embedding in pairs:
             repo.get_or_create_category(
                 name=cat_cfg.name,
                 description=cat_cfg.description,
