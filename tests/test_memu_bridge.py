@@ -1207,8 +1207,8 @@ class _EmbedSpy:
 class _CategoryFixture:
     """Isolated memU stores over one temp file, with the patches applied.
 
-    All patching happens inside the fixture and nothing is left applied on exit,
-    so these tests cannot silently break their neighbours.
+    The SQLiteMemoryItemRepo methods are restored on exit; the other globals
+    _patch_sqlite_bugs() installs are not, so do not rely on full isolation.
     """
 
     def __init__(self, tmp_path):
@@ -1377,7 +1377,7 @@ class TestCategoryNameNormalization:
     """nerve's name-to-id keys must match memU's strip().lower() contract."""
 
     def test_fixture_restores_the_item_repo_on_exit(self, tmp_path):
-        """The fixture must not leak _patch_sqlite_bugs() to its neighbours.
+        """The fixture must not leak its SQLiteMemoryItemRepo patches to its neighbours.
 
         TestIndexedUpdateItemForwarding introspects update_item's signature, so a
         leaked wrapper turns it red from ~200 lines away. Order-independent: the
@@ -1411,8 +1411,8 @@ class TestCategoryNameNormalization:
                 "the patch is meant to be applied inside the fixture"
             )
 
-        # Every name the patch reassigns, not just the one the neighbour reads:
-        # a restore list narrowed to update_item must not pass this.
+        # Every SQLiteMemoryItemRepo name the patch reassigns, not just the one
+        # the neighbour reads: a restore list narrowed to update_item must fail here.
         leaked = sorted(n for n, fn in methods().items() if fn is not before[n])
         assert not leaked, f"_CategoryFixture leaked on exit: {leaked}"
         assert keyword_only(), "_CategoryFixture leaked _patch_sqlite_bugs() on exit"
