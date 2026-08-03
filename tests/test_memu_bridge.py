@@ -1153,8 +1153,8 @@ def _semantic_reinforce_store(tmp_path, name, *, _models_cache={}):
     from memu.database.sqlite.sqlite import SQLiteStore
     from pydantic import BaseModel as _PydBaseModel
 
-    MemUBridge._patch_sqlite_bugs()
     if "models" not in _models_cache:
+        MemUBridge._patch_sqlite_bugs()
         _models_cache["models"] = schema_mod.get_sqlite_sqlalchemy_models(
             scope_model=_PydBaseModel,
         )
@@ -1199,21 +1199,8 @@ def _delete_row_externally(db_path, item_id):
 
 
 class TestSemanticReinforceStaleCacheHit:
-    """A semantic-dedup cache hit whose DB row was deleted by another process
-    used to be reported as "reinforced" while nothing was persisted.
-
-    ``_semantic_sqlite_reinforce`` decided from the in-memory cache but wrote to
-    the DB, and its ``return matched`` sat OUTSIDE the ``if row:`` write guard.
-    So a cross-connection delete produced an item with
-    ``reinforcement_count == 2`` for a row that no longer existed, and memU's
-    pipeline (``memu/app/memorize.py:614``:
-    ``if reinforce and item.extra.get("reinforcement_count", 1) > 1: continue``)
-    reads that as "already persisted" and skips both creation and category
-    linking -- silently dropping the memory, with no exception and no log.
-
-    Worse, the stale cache entry was not evicted, so it stayed a dedup magnet:
-    every later semantically-similar memorize kept matching it and kept being
-    dropped.
+    """A semantic-dedup hit on a row another process deleted must evict the stale
+    cache/index entry and actually persist the memory, not report a ghost.
     """
 
     # Cosine ~0.999 between the two, i.e. far above _SEMANTIC_DEDUP_THRESHOLD,
