@@ -1134,3 +1134,189 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+# --- Semantic-dedup reinforce: a stale cache hit must not report success ------
+
+
+def _semantic_reinforce_store(tmp_path, name, *, _models_cache={}):
+    """Build an isolated SQLiteStore with the real _patch_sqlite_bugs() applied.
+
+    The scoped SQLA models are built once per process and shared: nerve's
+    _patched_get_models clears memu's model cache and rebuilds, and SQLAlchemy
+    refuses to reassign a Column object to a second Table, so a second bare
+    SQLiteStore(dsn=...) in one process raises "Column object 'url' already
+    assigned to Table 'memu_resources'". Each store still gets its own DB file.
+    """
+    import memu.app  # noqa: F401 -- FIRST, breaks a circular import in memu.database
+    import memu.database.sqlite.schema as schema_mod
+    from memu.database.sqlite.sqlite import SQLiteStore
+    from pydantic import BaseModel as _PydBaseModel
+
+    MemUBridge._patch_sqlite_bugs()
+    if "models" not in _models_cache:
+        _models_cache["models"] = schema_mod.get_sqlite_sqlalchemy_models(
+            scope_model=_PydBaseModel,
+        )
+
+    db_path = tmp_path / f"{name}.sqlite"
+    store = SQLiteStore(dsn=f"sqlite:///{db_path}", sqla_models=_models_cache["models"])
+    resource = store.resource_repo.create_resource(
+        url="mem://test", modality="text", local_path=str(tmp_path / "src.txt"),
+        caption=None, embedding=None, user_data={},
+    )
+    return store, resource, str(db_path)
+
+
+def _item_row_count(db_path):
+    db = sqlite3.connect(db_path)
+    try:
+        return db.execute("SELECT COUNT(*) FROM memu_memory_items").fetchone()[0]
+    finally:
+        db.close()
+
+
+def _item_extra_in_db(db_path, item_id):
+    """Read extra straight from the file -- proves persistence, not caching."""
+    db = sqlite3.connect(db_path)
+    try:
+        row = db.execute(
+            "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,),
+        ).fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+    finally:
+        db.close()
+
+
+def _delete_row_externally(db_path, item_id):
+    """Delete the row over a SECOND connection -- what another process does."""
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute("DELETE FROM memu_memory_items WHERE id = ?", (item_id,))
+        db.commit()
+    finally:
+        db.close()
+
+
+class TestSemanticReinforceStaleCacheHit:
+    """A semantic-dedup cache hit whose DB row was deleted by another process
+    used to be reported as "reinforced" while nothing was persisted.
+
+    ``_semantic_sqlite_reinforce`` decided from the in-memory cache but wrote to
+    the DB, and its ``return matched`` sat OUTSIDE the ``if row:`` write guard.
+    So a cross-connection delete produced an item with
+    ``reinforcement_count == 2`` for a row that no longer existed, and memU's
+    pipeline (``memu/app/memorize.py:614``:
+    ``if reinforce and item.extra.get("reinforcement_count", 1) > 1: continue``)
+    reads that as "already persisted" and skips both creation and category
+    linking -- silently dropping the memory, with no exception and no log.
+
+    Worse, the stale cache entry was not evicted, so it stayed a dedup magnet:
+    every later semantically-similar memorize kept matching it and kept being
+    dropped.
+    """
+
+    # Cosine ~0.999 between the two, i.e. far above _SEMANTIC_DEDUP_THRESHOLD,
+    # so the second write is guaranteed to take the semantic-dedup branch.
+    EMB_SEED = [1.0, 0.0, 0.0, 0.0]
+    EMB_SIMILAR = [0.999, 0.0447, 0.0, 0.0]
+
+    def _seed_then_delete_externally(self, tmp_path, name):
+        """Seed one item, warm the vector index, delete the row externally."""
+        from nerve.memory.memu_bridge import _vec_index_for
+
+        store, resource, db_path = _semantic_reinforce_store(tmp_path, name)
+        repo = store.memory_item_repo
+
+        seeded = repo.create_item_reinforce(
+            resource_id=resource.id, memory_type="knowledge",
+            summary="the alpha fact about widgets",
+            embedding=self.EMB_SEED, user_data={},
+        )
+        assert _item_row_count(db_path) == 1, "seeding did not persist"
+        _vec_index_for(repo)  # make the cached entry searchable
+
+        _delete_row_externally(db_path, seeded.id)
+        assert _item_row_count(db_path) == 0, "external delete did not take"
+        # Precondition of the whole bug: the cache still serves the dead id.
+        assert seeded.id in repo.items
+
+        return repo, resource, db_path, seeded.id
+
+    def _reinforce_similar(self, repo, resource):
+        return repo.create_item_reinforce(
+            resource_id=resource.id, memory_type="knowledge",
+            summary="alpha fact regarding widgets",
+            embedding=self.EMB_SIMILAR, user_data={},
+        )
+
+    def test_a_stale_cache_hit_creates_a_new_persisted_row(self, tmp_path):
+        repo, resource, db_path, dead_id = self._seed_then_delete_externally(
+            tmp_path, "stale-creates",
+        )
+
+        returned = self._reinforce_similar(repo, resource)
+
+        assert returned.id != dead_id, (
+            "returned the deleted id -- the ghost reinforce is back"
+        )
+        assert (returned.extra or {}).get("reinforcement_count", 1) == 1, (
+            "reinforcement_count > 1 makes memu/app/memorize.py:614 skip "
+            "creation and category linking, silently dropping the memory"
+        )
+        assert _item_row_count(db_path) == 1, "the memory was not stored"
+
+    def test_a_stale_cache_hit_evicts_the_cache_and_index_entry(self, tmp_path):
+        from nerve.memory.memu_bridge import _vec_index_for
+
+        repo, resource, db_path, dead_id = self._seed_then_delete_externally(
+            tmp_path, "stale-evicts",
+        )
+
+        self._reinforce_similar(repo, resource)
+
+        assert dead_id not in repo.items, "stale cache entry survived"
+        assert dead_id not in _vec_index_for(repo).id_to_row, (
+            "stale vector-index entry survived -- still a dedup magnet"
+        )
+        assert dead_id not in repo.list_items(), (
+            "list_items() still serves the deleted id"
+        )
+
+    def test_the_returned_item_is_never_a_row_that_does_not_exist(self, tmp_path):
+        """The invariant, stated directly."""
+        repo, resource, db_path, _dead_id = self._seed_then_delete_externally(
+            tmp_path, "stale-invariant",
+        )
+
+        returned = self._reinforce_similar(repo, resource)
+
+        assert _item_extra_in_db(db_path, returned.id) is not None, (
+            f"returned item {returned.id} has no row in the database"
+        )
+
+    def test_reinforce_still_dedups_when_the_row_exists(self, tmp_path):
+        """Control: the row-present path must be completely untouched."""
+        from nerve.memory.memu_bridge import _vec_index_for
+
+        store, resource, db_path = _semantic_reinforce_store(tmp_path, "row-present")
+        repo = store.memory_item_repo
+
+        seeded = repo.create_item_reinforce(
+            resource_id=resource.id, memory_type="knowledge",
+            summary="the alpha fact about widgets",
+            embedding=self.EMB_SEED, user_data={},
+        )
+        _vec_index_for(repo)
+
+        returned = self._reinforce_similar(repo, resource)
+
+        assert returned.id == seeded.id, "semantic dedup stopped deduplicating"
+        assert (returned.extra or {}).get("reinforcement_count") == 2
+        assert _item_row_count(db_path) == 1, "dedup created a duplicate row"
+        # The bump must be PERSISTED, not merely cached.
+        db_extra = _item_extra_in_db(db_path, seeded.id)
+        assert db_extra["reinforcement_count"] == 2, (
+            "the reinforcement bump was not written to the database"
+        )
+        assert "last_reinforced_at" in db_extra

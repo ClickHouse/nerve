@@ -1192,8 +1192,11 @@ class MemUBridge:
                 threshold = _SEMANTIC_DEDUP_THRESHOLD
                 if threshold > 0 and embedding is not None and self.items:
                     # Type-filtered top-1 via the persistent matrix index —
-                    # no per-item corpus rebuild.
-                    hits = _vec_index_for(self).search(
+                    # no per-item corpus rebuild. Bind the index once: calling
+                    # _vec_index_for again after popping from self.items would
+                    # see the size drift and force an O(n) rebuild.
+                    idx = _vec_index_for(self)
+                    hits = idx.search(
                         embedding, k=1, memory_type=str(memory_type),
                     )
                     if hits:
@@ -1210,6 +1213,7 @@ class MemUBridge:
                             extra = dict(matched.extra or {})
                             extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
                             extra["last_reinforced_at"] = now.isoformat()
+                            row_written = False
                             with self._sessions.session() as session:
                                 row = session.exec(
                                     _sel(self._memory_item_model).where(
@@ -1221,10 +1225,26 @@ class MemUBridge:
                                     row.updated_at = now
                                     session.add(row)
                                     session.commit()
-                            # Update in-memory cache
-                            matched.extra = extra
-                            matched.updated_at = now
-                            return matched
+                                    row_written = True
+                            if row_written:
+                                # Update in-memory cache
+                                matched.extra = extra
+                                matched.updated_at = now
+                                return matched
+                            # The row is gone (deleted by another process), so
+                            # the cache hit is stale, not authoritative. Evict it
+                            # -- otherwise it stays a dedup magnet that silently
+                            # drops every similar memorize -- and fall through to
+                            # the real create path so this memory is stored.
+                            logger.warning(
+                                "Semantic dedup: cached %s item %s has no DB row "
+                                "(deleted concurrently); evicting the stale entry "
+                                "and creating instead",
+                                memory_type, match_id,
+                            )
+                            self.items.pop(match_id, None)
+                            idx.remove(match_id)
+                            idx.seen_items_len = len(self.items)
 
                 return _original_sqlite_reinforce(
                     self,
