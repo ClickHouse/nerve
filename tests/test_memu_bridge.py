@@ -1267,7 +1267,10 @@ class TestSemanticReinforceStaleCacheHit:
         assert _item_row_count(db_path) == 1, "the memory was not stored"
 
     def test_a_stale_cache_hit_evicts_the_cache_and_index_entry(self, tmp_path):
-        from nerve.memory.memu_bridge import _vec_index_for
+        # _vec_index_note, NOT _vec_index_for: the latter REBUILDS whenever it
+        # sees the cache size drift, which silently repairs a missing
+        # idx.remove() and would make this assertion vacuous.
+        from nerve.memory.memu_bridge import _vec_index_note
 
         repo, resource, db_path, dead_id = self._seed_then_delete_externally(
             tmp_path, "stale-evicts",
@@ -1276,12 +1279,42 @@ class TestSemanticReinforceStaleCacheHit:
         self._reinforce_similar(repo, resource)
 
         assert dead_id not in repo.items, "stale cache entry survived"
-        assert dead_id not in _vec_index_for(repo).id_to_row, (
+        index = _vec_index_note(repo)
+        assert index is not None, "the vector index was never built"
+        assert dead_id not in index.id_to_row, (
             "stale vector-index entry survived -- still a dedup magnet"
         )
         assert dead_id not in repo.list_items(), (
             "list_items() still serves the deleted id"
         )
+
+    def test_after_a_stale_hit_the_new_item_is_visible_to_later_dedup(self, tmp_path):
+        """The eviction must leave the index in a REBUILDABLE state.
+
+        ``_vec_index_for`` rebuilds only when ``seen_items_len`` differs from
+        ``len(items)``. Evicting without resyncing ``seen_items_len`` leaves
+        them equal (1 == 1) while the index itself is empty, so no rebuild ever
+        fires and the item created by the fall-through stays invisible to
+        semantic dedup for the rest of the process -- turning one silent drop
+        into permanently duplicated memories.
+        """
+        repo, resource, db_path, _dead_id = self._seed_then_delete_externally(
+            tmp_path, "stale-then-visible",
+        )
+
+        created = self._reinforce_similar(repo, resource)
+
+        # A third, still-similar memorize must dedup ONTO the new item.
+        third = repo.create_item_reinforce(
+            resource_id=resource.id, memory_type="knowledge",
+            summary="alpha facts on widgets now",
+            embedding=[0.998, 0.0632, 0.0, 0.0], user_data={},
+        )
+
+        assert third.id == created.id, (
+            "the item created after a stale hit is invisible to semantic dedup"
+        )
+        assert _item_row_count(db_path) == 1, "dedup created a duplicate row"
 
     def test_the_returned_item_is_never_a_row_that_does_not_exist(self, tmp_path):
         """The invariant, stated directly."""
