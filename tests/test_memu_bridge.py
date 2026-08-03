@@ -1172,6 +1172,29 @@ class _FastEmbedClient(_HangingEmbedClient):
         return ([[0.1, 0.2]], {"raw": 1})
 
 
+# Wall-clock ceiling for the hang arms. Well above the 0.25s bound they
+# assert, so a passing arm never waits on it.
+_ARM_CEILING = 5.0
+
+
+async def _bounded(awaitable):
+    """Await ``awaitable``, converting a HANG into a distinguishable failure.
+
+    Without this an un-bounded embed (e.g. a mutant that deletes the wait_for)
+    would hang the arm forever instead of failing it. The escape raises
+    ``AssertionError``, never ``TimeoutError``, so it can never be mistaken
+    for the bound firing - i.e. it cannot make T1/T2 pass vacuously.
+    """
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=_ARM_CEILING)
+    if not done:
+        task.cancel()
+        raise AssertionError(
+            f"embed did not complete within {_ARM_CEILING}s - the call is NOT bounded",
+        )
+    return task.result()
+
+
 def _make_embed_bridge(tmp_path, client, *, has_embeddings=True):
     """Bridge with a mocked service handing out ``client`` for "embedding"."""
     config = _make_config(tmp_path)
@@ -1198,9 +1221,9 @@ class TestEmbeddingCallTimeout:
 
         t0 = asyncio.get_running_loop().time()
         with pytest.raises(asyncio.TimeoutError):
-            await client.embed(["query"])
+            await _bounded(client.embed(["query"]))
         elapsed = asyncio.get_running_loop().time() - t0
-        assert elapsed < 5.0, f"took {elapsed:.2f}s - not bounded"
+        assert elapsed < _ARM_CEILING, f"took {elapsed:.2f}s - not bounded"
         assert client.embed_calls == 1
 
     @pytest.mark.asyncio
@@ -1221,7 +1244,7 @@ class TestEmbeddingCallTimeout:
         bridge._instrument_embedding_timeout()
 
         with pytest.raises(asyncio.TimeoutError):
-            await wrapper.embed(["query"])
+            await _bounded(wrapper.embed(["query"]))
         assert client.embed_calls == 1
 
     @pytest.mark.asyncio
