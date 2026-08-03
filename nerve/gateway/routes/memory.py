@@ -167,9 +167,13 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
                 "created_at": row["created_at"],
             })
 
-        # Category-item links
+        # Category-item links. The link table has no foreign key, so join the
+        # item table to skip relations whose item is gone.
         cat_items: dict[str, list[str]] = {}
-        for row in db.execute("SELECT category_id, item_id FROM memu_category_items"):
+        for row in db.execute(
+            "SELECT ci.category_id, ci.item_id FROM memu_category_items ci "
+            "JOIN memu_memory_items i ON i.id = ci.item_id"
+        ):
             cat_items.setdefault(row["category_id"], []).append(row["item_id"])
     finally:
         db.close()

@@ -8,6 +8,7 @@ and the drill-down path that replaces the lost detail.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -21,6 +22,7 @@ from nerve.agent.tools.handlers.memory import (
 )
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import MemoryConfig, NerveConfig
+from nerve.gateway.routes.memory import _read_memu_snapshot_sync
 from nerve.memory.memu_bridge import MemUBridge, _category_breadcrumb
 
 
@@ -157,18 +159,25 @@ async def test_recall_caps_items_and_categories(tmp_path) -> None:
 
 
 def _create_category_schema(db_path: str) -> None:
+    # Covers both consumers: the bridge reads items/categories/links, the gateway
+    # snapshot additionally reads resource_id, happened_at and memu_resources.
     db = sqlite3.connect(db_path)
     db.executescript(
         """
         CREATE TABLE memu_memory_items (
             id TEXT PRIMARY KEY, memory_type TEXT, summary TEXT,
-            created_at TEXT, updated_at TEXT
+            created_at TEXT, updated_at TEXT,
+            resource_id TEXT, happened_at TEXT
         );
         CREATE TABLE memu_memory_categories (
             id TEXT PRIMARY KEY, name TEXT, description TEXT, summary TEXT
         );
         CREATE TABLE memu_category_items (
             id TEXT PRIMARY KEY, item_id TEXT, category_id TEXT
+        );
+        CREATE TABLE memu_resources (
+            id TEXT PRIMARY KEY, url TEXT, modality TEXT, caption TEXT,
+            created_at TEXT
         );
         """
     )
@@ -201,6 +210,24 @@ def _seed_category(db_path: str) -> None:
     db.close()
 
 
+def _seed_dangling_relations(db_path: str) -> list[str]:
+    """Add membership rows whose item_id has no memu_memory_items row.
+
+    The link table has no foreign key, so delete-side writers strand rows here.
+    Returns the dead item ids.
+    """
+    dead = ["it-gone-1", "it-gone-2"]
+    db = sqlite3.connect(db_path)
+    for iid in dead:
+        db.execute(
+            "INSERT INTO memu_category_items (id, item_id, category_id) VALUES (?,?,?)",
+            (f"link-{iid}", iid, "cat-pref"),
+        )
+    db.commit()
+    db.close()
+    return dead
+
+
 @pytest.mark.asyncio
 async def test_expand_category_returns_recent_items(tmp_path) -> None:
     config = _make_config(tmp_path)
@@ -228,6 +255,45 @@ async def test_expand_category_keyword_filter(tmp_path) -> None:
     bridge = _stub_bridge(config)
     result = await bridge.expand_category("cat-pref", query="coffee", limit=10)
     assert [i["id"] for i in result["items"]] == ["it-3"]
+
+
+@pytest.mark.asyncio
+async def test_expand_category_total_excludes_dangling_relations(tmp_path) -> None:
+    """total must equal what the store can actually return, not raw link rows."""
+    config = _make_config(tmp_path)
+    db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+    _create_category_schema(db_path)
+    _seed_category(db_path)
+    _seed_dangling_relations(db_path)
+
+    bridge = _stub_bridge(config)
+    result = await bridge.expand_category("cat:cat-pref", limit=10)
+
+    # 5 link rows exist, only 3 resolve to a live item.
+    assert result["total"] == 3
+    # The invariant: unpaged, the advertised total is exactly what is listed.
+    assert result["total"] == len(result["items"])
+
+
+@pytest.mark.asyncio
+async def test_memu_snapshot_category_items_excludes_dangling(tmp_path) -> None:
+    """The gateway snapshot must not export links to deleted items."""
+    config = _make_config(tmp_path)
+    db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+    _create_category_schema(db_path)
+    _seed_category(db_path)
+    dead = _seed_dangling_relations(db_path)
+
+    payload = json.loads(_read_memu_snapshot_sync(db_path))
+    ids = payload["category_items"]["cat-pref"]
+
+    assert len(ids) == 3
+    for dead_id in dead:
+        assert dead_id not in ids
+    # Cross-site agreement: the web badge and the agent's total must match.
+    bridge = _stub_bridge(config)
+    result = await bridge.expand_category("cat-pref", limit=10)
+    assert len(ids) == result["total"]
 
 
 @pytest.mark.asyncio

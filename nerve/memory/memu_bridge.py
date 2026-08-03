@@ -2887,8 +2887,12 @@ class MemUBridge:
                 ).fetchone()
                 if not crow:
                     return {"name": None, "total": 0, "items": []}
+                # Same join as the listing below: the link table has no foreign
+                # key, so relations to deleted items must not be counted.
                 total = db.execute(
-                    "SELECT count(*) FROM memu_category_items WHERE category_id = ?",
+                    "SELECT count(*) FROM memu_category_items ci "
+                    "JOIN memu_memory_items i ON i.id = ci.item_id "
+                    "WHERE ci.category_id = ?",
                     (cat_id,),
                 ).fetchone()[0]
                 sql = (
