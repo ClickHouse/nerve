@@ -1388,12 +1388,15 @@ class TestEmbeddingCallTimeout:
 
             Writing the fresh object back into ``cache`` (not the original
             ``clients`` dict) is what makes the post-reset assertions observe
-            production behaviour rather than a stale copy.
+            production behaviour rather than a stale copy. The fresh object is
+            a real client stand-in, NOT a MagicMock: a MagicMock auto-creates
+            ``embed._nerve_timeout_wrapped`` as a truthy child mock, so the
+            "is it wrapped" assertion below could never fail against one.
             """
             timeline.append(("lookup", profile))
             if profile in cache:
                 return cache[profile]
-            fresh = MagicMock()
+            fresh = _FastEmbedClient()
             fresh.client._client.aclose = AsyncMock()
             cache[profile] = fresh
             return fresh
