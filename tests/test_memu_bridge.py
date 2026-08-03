@@ -317,6 +317,150 @@ class TestResolveEventDatesSync:
         assert "mentioned_at" in json.loads(items["newer"]["extra"])
         assert "mentioned_at" not in json.loads(items["oldest"]["extra"])
 
+    def test_sweep_preserves_a_concurrent_extra_write(self, tmp_path):
+        """Keys another writer sets in ``extra`` during the LLM await survive
+        the sweep's own writeback."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        _insert_items(db_path, [
+            {"id": "evt-1", "memory_type": "event", "summary": "Some event",
+             "extra": {"content_hash": "OLDHASH", "reinforcement_count": 3}},
+        ])
+
+        def _llm_then_concurrent_write(items, conv_date):
+            writer = sqlite3.connect(db_path, timeout=30)
+            writer.execute(
+                "UPDATE memu_memory_items SET extra = ? WHERE id = 'evt-1'",
+                (json.dumps({
+                    "content_hash": "NEWHASH",
+                    "reinforcement_count": 9,
+                    "last_reinforced_at": "2026-02-27T00:00:00",
+                    "ref_id": "r7",
+                }),),
+            )
+            writer.commit()
+            writer.close()
+            return {"evt-1": "2026-02-05"}
+
+        bridge = MemUBridge(config)
+        with patch.object(bridge, "_resolve_dates_via_llm",
+                          side_effect=_llm_then_concurrent_write):
+            bridge._resolve_event_dates_sync("2026-02-27T10:00:00+00:00")
+
+        item = _read_items(db_path)["evt-1"]
+        extra = json.loads(item["extra"])
+        assert extra["content_hash"] == "NEWHASH"
+        assert extra["reinforcement_count"] == 9
+        assert extra["last_reinforced_at"] == "2026-02-27T00:00:00"
+        assert extra["ref_id"] == "r7"
+        # ... and the sweep still does its own job.
+        assert extra["mentioned_at"] == "2026-02-27"
+        assert item["happened_at"] == "2026-02-05"
+
+    def test_sweep_does_not_overwrite_a_concurrent_happened_at(self, tmp_path):
+        """The ``happened_at IS NULL`` predicate is re-asserted at write time,
+        so a concurrent backfill during the LLM await is not overwritten."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        _insert_items(db_path, [
+            {"id": "evt-1", "memory_type": "event", "summary": "Some event"},
+            {"id": "evt-2", "memory_type": "event", "summary": "Other event"},
+        ])
+
+        def _llm_then_concurrent_backfill(items, conv_date):
+            writer = sqlite3.connect(db_path, timeout=30)
+            writer.execute(
+                "UPDATE memu_memory_items SET happened_at = '2020-01-01' "
+                "WHERE id = 'evt-1'"
+            )
+            writer.commit()
+            writer.close()
+            return {"evt-1": "2026-02-05", "evt-2": "2026-02-06"}
+
+        bridge = MemUBridge(config)
+        with patch.object(bridge, "_resolve_dates_via_llm",
+                          side_effect=_llm_then_concurrent_backfill):
+            bridge._resolve_event_dates_sync("2026-02-27T10:00:00+00:00")
+
+        items = _read_items(db_path)
+        assert items["evt-1"]["happened_at"] == "2020-01-01"
+        # Unraced control: the guarded UPDATE must still execute, so a test
+        # that only checks evt-1 cannot pass by the write never running.
+        assert items["evt-2"]["happened_at"] == "2026-02-06"
+
+    def test_sweep_keeps_the_first_mentioned_at_stamp_under_a_concurrent_sweep(
+        self, tmp_path
+    ):
+        """The first ``mentioned_at`` stamp wins. The racing writer is a SECOND
+        sweep, since the sweep is the only writer of that key."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        _insert_items(db_path, [
+            {"id": "evt-1", "memory_type": "event", "summary": "Some event"},
+            {"id": "prof-2", "memory_type": "profile", "summary": "A fact"},
+        ])
+
+        def _llm_then_concurrent_sweep_stamp(items, conv_date):
+            writer = sqlite3.connect(db_path, timeout=30)
+            writer.execute(
+                "UPDATE memu_memory_items SET extra = ? WHERE id = 'evt-1'",
+                (json.dumps({"mentioned_at": "2026-02-20"}),),
+            )
+            writer.commit()
+            writer.close()
+            return {}
+
+        bridge = MemUBridge(config)
+        with patch.object(bridge, "_resolve_dates_via_llm",
+                          side_effect=_llm_then_concurrent_sweep_stamp):
+            bridge._resolve_event_dates_sync("2026-02-27T10:00:00+00:00")
+
+        items = _read_items(db_path)
+        assert json.loads(items["evt-1"]["extra"])["mentioned_at"] == "2026-02-20"
+        # Unraced control: the extra UPDATE must still execute, so a test that
+        # only checks evt-1 cannot pass by the write never running.
+        assert json.loads(items["prof-2"]["extra"])["mentioned_at"] == "2026-02-27"
+
+    @pytest.mark.parametrize("raw_extra", [None, ""])
+    def test_sweep_stamps_an_empty_extra_row_once(self, tmp_path, raw_extra):
+        """An empty ``extra`` (SQL NULL or ``''``) becomes a real JSON object
+        carrying the stamp, so a later sweep no longer selects the row.
+
+        Passes at base by design; it guards the fix's own empty-value
+        normalisation, where ``''`` -- not NULL -- discriminates ``NULLIF``."""
+        config = _make_config(tmp_path)
+        db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
+        _create_memu_schema(db_path)
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "INSERT INTO memu_memory_items "
+            "(id, resource_id, memory_type, summary, extra) "
+            "VALUES ('prof-1', 'res-1', 'profile', 'A fact', ?)",
+            (raw_extra,),
+        )
+        db.commit()
+        db.close()
+
+        bridge = MemUBridge(config)
+        bridge._resolve_event_dates_sync("2026-02-27T10:00:00+00:00")
+
+        raw = _read_items(db_path)["prof-1"]["extra"]
+        assert raw is not None
+        assert json.loads(raw)["mentioned_at"] == "2026-02-27"
+
+        # The row must not be picked up by a later sweep.
+        db = sqlite3.connect(db_path)
+        resweep = db.execute(
+            "SELECT count(*) FROM memu_memory_items "
+            "WHERE happened_at IS NULL "
+            "  AND (extra IS NULL OR instr(extra, '\"mentioned_at\"') = 0)"
+        ).fetchone()[0]
+        db.close()
+        assert resweep == 0
+
 
 def _mock_anthropic(response_text: str) -> tuple[MagicMock, MagicMock]:
     """Create a mock anthropic module and client that returns the given text.

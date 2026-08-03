@@ -2498,7 +2498,7 @@ class MemUBridge:
                 - timedelta(hours=self._DATE_SWEEP_WINDOW_HOURS)
             ).strftime("%Y-%m-%d %H:%M:%S")
             rows = db.execute(
-                "SELECT id, memory_type, summary, extra "
+                "SELECT id, memory_type, summary "
                 "FROM memu_memory_items "
                 "WHERE happened_at IS NULL "
                 "  AND (created_at IS NULL OR created_at >= ?) "
@@ -2549,8 +2549,11 @@ class MemUBridge:
 
             for item_id, summary in event_items:
                 happened_at = resolved_dates.get(item_id) or conv_date
+                # Re-assert the SELECT's predicate: a concurrent backfill may
+                # have set happened_at while we were awaiting the LLM.
                 db.execute(
-                    "UPDATE memu_memory_items SET happened_at = ? WHERE id = ?",
+                    "UPDATE memu_memory_items SET happened_at = ? "
+                    "WHERE id = ? AND happened_at IS NULL",
                     (happened_at, item_id),
                 )
                 pending += 1
@@ -2559,11 +2562,15 @@ class MemUBridge:
             # Set mentioned_at on ALL swept items (events + non-events)
             for row in rows:
                 item_id = row["id"]
-                extra = json.loads(row["extra"]) if row["extra"] else {}
-                extra["mentioned_at"] = conv_date
+                # json_set against the LIVE column, so keys another writer added
+                # during the LLM await survive; inner COALESCE keeps the first stamp.
                 db.execute(
-                    "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
-                    (json.dumps(extra, ensure_ascii=False), item_id),
+                    "UPDATE memu_memory_items SET extra = json_set("
+                    "  COALESCE(NULLIF(extra, ''), '{}'), '$.mentioned_at',"
+                    "  COALESCE(json_extract(COALESCE(NULLIF(extra, ''), '{}'),"
+                    "                        '$.mentioned_at'), ?)"
+                    ") WHERE id = ?",
+                    (conv_date, item_id),
                 )
                 pending += 1
                 _commit_batch()
