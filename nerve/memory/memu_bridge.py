@@ -37,11 +37,15 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryBackendUnavailable(RuntimeError):
-    """Raised when a memU operation fails because the LLM backend (the shared
-    proxy route) is transiently unavailable — HTTP 429/5xx or an auth blip
-    (``auth_unavailable`` / revoked OAuth) — rather than because the query
-    genuinely had no results. The tool layer surfaces this LOUDLY so a session
-    never mistakes "memory is DOWN" for "no relevant memories"."""
+    """Raised when a memU operation could not complete because the backend was
+    unavailable, rather than because the query genuinely had no results. The
+    tool layer surfaces this LOUDLY so a session never mistakes "memory is
+    DOWN" for "no relevant memories".
+
+    Deliberately described by OUTCOME, not by cause: the raising sites already
+    cover an HTTP 429/5xx or auth blip, an LLM-call timeout, a transport-level
+    failure with no HTTP response, SQLite write-lock contention, and a bridge
+    that never initialized. Enumerating causes here goes stale."""
 
 
 def _is_transient_llm_error(exc: BaseException) -> bool:
@@ -70,6 +74,34 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
     # Belt-and-suspenders: the proxy's stuck-cooldown signature regardless of
     # how the status surfaced.
     return "auth_unavailable" in low
+
+
+def _is_llm_transport_failure(exc: BaseException) -> bool:
+    """True if ``exc`` is a transport-level LLM failure: the call failed at the
+    connection layer rather than with an HTTP status (DNS, refused, reset,
+    closed transport; possibly mid-response).
+
+    Disjoint from :func:`_is_transient_llm_error`, which keys on an HTTP
+    *status*. Both mean the call produced no usable result, so recall must not
+    report "no results".
+
+    Both SDK families are needed and neither subsumes the other: memU's own
+    client raises ``openai.APIConnectionError``, ``_BedrockLLMClient`` raises
+    ``anthropic.APIConnectionError``. Imports are guarded so the module stays
+    importable without a given provider. Each SDK's ``APITimeoutError``
+    subclasses its ``APIConnectionError``, so the base-class test covers
+    timeouts; raw ``httpx`` errors need no arm because both SDKs wrap them."""
+    for _mod, _name in (
+        ("openai", "APIConnectionError"),
+        ("anthropic", "APIConnectionError"),
+    ):
+        try:
+            _exc_type = getattr(__import__(_mod), _name)
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(exc, _exc_type):
+            return True
+    return False
 
 
 def _is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -2786,9 +2818,14 @@ class MemUBridge:
         Args:
             limit: max item hits to return (full content).
             category_limit: max category breadcrumbs to return.
+
+        Raises:
+            MemoryBackendUnavailable: the backend could not be reached, or the
+                bridge never initialized. Any other exception propagates.
+                An empty list therefore means retrieval returned nothing.
         """
         if not self._available or not self._service:
-            return []
+            raise MemoryBackendUnavailable("memory backend is not initialized")
         op_id = self._metrics.begin_op("recall", query[:80])
         try:
             # Retrieve runs vector search (numpy) and possibly SQLite reads
@@ -2846,12 +2883,13 @@ class MemUBridge:
         except Exception as e:
             logger.error("memU recall failed: %s", e)
             self._metrics.end_op(op_id, success=False, error=str(e))
-            # A transient backend outage must not masquerade as "no results" —
-            # surface it so the caller can flag amnesia instead of trusting the
-            # empty list.
-            if _is_transient_llm_error(e):
+            # Infrastructure failures get the dedicated type; anything else
+            # propagates instead of being swallowed. (memU can still absorb a
+            # malformed ranking reply below this level and return a real `[]`.)
+            if (isinstance(e, TimeoutError) or _is_transient_llm_error(e)
+                    or _is_llm_transport_failure(e)):
                 raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
-            return []
+            raise
 
     async def expand_category(
         self, category_id: str, query: str = "", limit: int = 20,

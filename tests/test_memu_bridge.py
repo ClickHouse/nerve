@@ -7,9 +7,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import openai
 import pytest
 import pytest_asyncio
 
+from nerve.agent.tools.handlers.memory import memory_recall_handler
+from nerve.agent.tools.registry import ToolContext
 from nerve.config import MemoryConfig, NerveConfig
 from nerve.memory.memu_bridge import (
     MemoryBackendUnavailable,
@@ -1134,3 +1138,329 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+def _make_recall_bridge(tmp_path: Path) -> MemUBridge:
+    """Bridge wired for recall() tests: available, mocked service, no memU loop
+    (so _submit awaits inline)."""
+    bridge = MemUBridge(_make_config(tmp_path))
+    bridge._available = True
+    bridge._service = MagicMock()
+    return bridge
+
+
+def _recall_ctx(bridge) -> ToolContext:
+    return ToolContext(
+        session_id="s-recall",
+        workspace=Path("/tmp/ws"),
+        db=None,
+        memory_bridge=bridge,
+        config=None,
+    )
+
+
+_REQ = httpx.Request("POST", "http://embeddings.invalid/v1/embeddings")
+
+
+def _conn_error(cause: BaseException | None = None) -> openai.APIConnectionError:
+    """The exception the OpenAI SDK raises when the call never got a response."""
+    exc = openai.APIConnectionError(request=_REQ)
+    if cause is not None:
+        exc.__cause__ = cause
+    return exc
+
+
+class TestRecallTransportFailureClassification:
+    """recall() must never report a FAILURE as "no results".
+
+    A transport-level LLM failure carries no HTTP status, so
+    _is_transient_llm_error cannot match it by construction; before this class
+    existed such a failure returned [] and the tool layer rendered it as
+    "Recalled 0 memories" -- a confident wrong answer. An empty list from
+    recall() now means retrieval genuinely returned nothing.
+    """
+
+    # --- infrastructure failures => MemoryBackendUnavailable ---------------
+
+    @pytest.mark.asyncio
+    async def test_t1_connection_error_raises_backend_unavailable(self, tmp_path):
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error())
+
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.recall("q")
+
+    @pytest.mark.asyncio
+    async def test_t2_closed_transport_raises_backend_unavailable(self, tmp_path):
+        """The reset window: _reset_llm_clients_impl closed the transport under
+        an in-flight call."""
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error(
+            RuntimeError("Cannot send a request, as the client has been closed."),
+        ))
+
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.recall("q")
+
+    @pytest.mark.asyncio
+    async def test_t3_refused_connection_raises_backend_unavailable(self, tmp_path):
+        """The shape the SDK actually produces for a refused connection -- the
+        27+ production occurrences. A BARE httpx.ConnectError is deliberately
+        NOT classified (no carrier: nerve sets client_backend="sdk"), so this
+        arm uses the wrapped form the SDK really raises."""
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error(
+            httpx.ConnectError("[Errno 111] Connection refused"),
+        ))
+
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.recall("q")
+
+    @pytest.mark.asyncio
+    async def test_t7_anthropic_connection_error_raises_backend_unavailable(self, tmp_path):
+        """The Bedrock family. anthropic.APIConnectionError is NOT a subclass of
+        openai's, so a single-SDK predicate would miss nerve's own
+        _BedrockLLMClient -- this arm is what pins two-family coverage."""
+        anthropic = pytest.importorskip("anthropic")
+        assert not issubclass(
+            anthropic.APIConnectionError, openai.APIConnectionError,
+        ), "families are expected to be disjoint; the predicate needs both arms"
+
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(
+            side_effect=anthropic.APIConnectionError(request=_REQ),
+        )
+
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.recall("q")
+
+    @pytest.mark.asyncio
+    async def test_t10_plain_asyncio_timeout_raises_backend_unavailable(self, tmp_path):
+        """asyncio.wait_for expiry is builtins.TimeoutError, matched by none of
+        the SDK predicates. _instrument_llm_timeouts wraps .chat() in
+        asyncio.wait_for for the "fast" profile, which is the profile recall's
+        LLM ranker uses, so this is reachable on recall's own path."""
+        assert asyncio.TimeoutError is TimeoutError
+
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=TimeoutError("timed out"))
+
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.recall("q")
+
+    @pytest.mark.asyncio
+    async def test_t11_api_timeout_error_raises_backend_unavailable(self, tmp_path):
+        """APITimeoutError is a SUBCLASS of APIConnectionError, which is why the
+        arm does not need to call _is_llm_timeout. If a future SDK reparents it,
+        this arm fails loudly instead of silently losing coverage."""
+        assert issubclass(openai.APITimeoutError, openai.APIConnectionError)
+
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(
+            side_effect=openai.APITimeoutError(request=_REQ),
+        )
+
+        with pytest.raises(MemoryBackendUnavailable, match="unavailable"):
+            await bridge.recall("q")
+
+    # --- everything else propagates unchanged -----------------------------
+
+    @pytest.mark.asyncio
+    async def test_t4_logic_error_re_raises_as_itself(self, tmp_path):
+        """A logic error is neither disguised as a backend outage nor as an
+        empty result: it propagates to the caller's generic error path.
+
+        NOTE this deliberately INVERTS the memorize_file control shape
+        (test_non_transient_error_still_fails_fast asserts ok is False):
+        memorize_file returns a bool, recall returns results, and [] is a
+        meaningful value there."""
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=ValueError("bad payload"))
+
+        with pytest.raises(ValueError, match="bad payload"):
+            await bridge.recall("q")
+
+    @pytest.mark.asyncio
+    async def test_t14_genuine_miss_still_returns_empty(self, tmp_path):
+        """The arm that keeps the inversion honest: [] must still be reachable
+        for a successful retrieval with no hits, else every miss would look
+        like an outage."""
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(
+            return_value={"items": [], "categories": []},
+        )
+
+        assert await bridge.recall("q") == []
+        assert bridge._service.retrieve.await_count == 1, (
+            "retrieval was skipped: [] would not prove a genuine miss"
+        )
+        assert bridge._service.retrieve.await_args.kwargs["queries"] == [
+            {"role": "user", "content": "q"},
+        ]
+
+    # --- the uninitialized-bridge guard -----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_t12_uninitialized_bridge_raises_backend_unavailable(self, tmp_path):
+        """The same lie by a different route: a bridge that never initialized
+        used to answer [] with no exception involved at all."""
+        bridge = MemUBridge(_make_config(tmp_path))
+        bridge._available = False
+
+        with pytest.raises(MemoryBackendUnavailable, match="not initialized"):
+            await bridge.recall("q")
+
+    # --- the rendered artifact (what the agent actually reads) -------------
+
+    @pytest.mark.asyncio
+    async def test_t6_handler_renders_unavailable_not_a_count(self, tmp_path):
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error())
+
+        result = await memory_recall_handler(_recall_ctx(bridge), {"query": "q"})
+        text = result.content[0]["text"]
+
+        assert "MEMORY RECALL UNAVAILABLE" in text
+        assert "Recalled 0" not in text
+        assert "No relevant memories found" not in text
+
+    @pytest.mark.asyncio
+    async def test_t8_handler_message_claims_no_false_cause(self, tmp_path):
+        """The message must describe the OUTCOME only. Every phrase below was
+        false for some case the same arm covers: "transient" (a misconfigured
+        endpoint is permanent), "proxy/auth error" and "BACKEND DOWN" (a
+        self-closed local transport leaves the remote blameless), "did not
+        respond" / "never reached" (429/5xx ARE responses, and a read failure
+        can happen mid-response)."""
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error())
+
+        result = await memory_recall_handler(_recall_ctx(bridge), {"query": "q"})
+        text = result.content[0]["text"]
+
+        for false_claim in (
+            "transient proxy/auth error",
+            "BACKEND DOWN",
+            "did not respond",
+            "never reached",
+            "memory is down",
+        ):
+            assert false_claim not in text, f"false cause claim in message: {false_claim}"
+        assert "MEMORY RECALL UNAVAILABLE" in text
+        assert "NOT an empty result" in text
+
+    @pytest.mark.asyncio
+    async def test_t9_rate_limit_still_renders_unavailable(self, tmp_path):
+        """The PRE-EXISTING 429 arm. Pins that rewording the message did not
+        break the case it already had to cover, and that a 429 -- which IS a
+        response -- is not mis-described by the new text."""
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=openai.RateLimitError(
+            "Error code: 429 - rate limit exceeded",
+            response=httpx.Response(429, request=_REQ),
+            body=None,
+        ))
+
+        result = await memory_recall_handler(_recall_ctx(bridge), {"query": "q"})
+        text = result.content[0]["text"]
+
+        assert "MEMORY RECALL UNAVAILABLE" in text
+        assert "Recalled 0" not in text
+
+    @pytest.mark.asyncio
+    async def test_t13_uninitialized_bridge_renders_unavailable(self, tmp_path):
+        """End-to-end artifact for T12: the guard's raise must reach the agent
+        as an unavailability notice, not as "No relevant memories found."."""
+        bridge = MemUBridge(_make_config(tmp_path))
+        bridge._available = False
+        # `available` is a read-only property; the handler gates only on the bridge
+        # being present (handlers/memory.py:67), so the guard is what fires here.
+
+        result = await memory_recall_handler(_recall_ctx(bridge), {"query": "q"})
+        text = result.content[0]["text"]
+
+        assert "MEMORY RECALL UNAVAILABLE" in text
+        assert "No relevant memories found" not in text
+
+    @pytest.mark.asyncio
+    async def test_t15_session_context_surfaces_the_error(self, tmp_path):
+        """The second production caller. It has its own broad `except`
+        (handlers/memory.py:253), so a raising recall must render the error text
+        rather than the pre-existing "(none -- fresh topic or empty memU)"."""
+        from nerve.agent.tools.handlers.memory import session_context_handler
+
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error())
+        # session_context gates on `.available`, which is a read-only property
+        # backed by _available (already True via _make_recall_bridge).
+        ctx = _recall_ctx(bridge)
+
+        result = await session_context_handler(ctx, {"topic": "t", "include_skills": False})
+        text = result.content[0]["text"]
+
+        assert "recall error" in text
+        assert "fresh topic or empty memU" not in text
+
+    # --- the caller that must not crash -----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_t5_pre_recall_caller_does_not_freeze_a_failure(self, tmp_path, db):
+        """Drives the REAL engine caller (`_get_or_create_client`), not a copy.
+
+        `meta_updates` is set only on the success path, so a failed recall is NOT
+        frozen into session metadata -- `engine.py:1140` replays a frozen value on
+        every rebuild of the session. Session creation must also survive."""
+        from nerve.agent.backends.base import BackendCapabilities
+        from nerve.agent.engine import AgentEngine
+
+        cfg = _make_config(tmp_path)
+        cfg.workspace = tmp_path / "ws"
+        engine = AgentEngine(cfg, db)
+        await db.create_session("s-prerecall", source="web")
+
+        bridge = _make_recall_bridge(tmp_path)
+        bridge._service.retrieve = AsyncMock(side_effect=_conn_error())
+        engine._memory_bridge = bridge
+
+        class _StubClient:
+            resume_dropped = False
+            native_session_id = None
+            model = "claude-opus-5"
+
+            def is_alive(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+        class _StubBackend:
+            name = "claude"
+            capabilities = BackendCapabilities(
+                cost_is_cumulative=False, supports_idle_stream=False,
+                supports_cache_ttl=False, interactive_builtins=False,
+                reports_context_window=True,
+            )
+
+            def default_model(self, source):
+                return "claude-opus-5"
+
+            def excluded_tools(self):
+                return set()
+
+            def validate_resume_target(self, native_id, cwd):
+                return True
+
+            async def create_client(self, spec):
+                return _StubClient()
+
+        engine._backends["claude"] = _StubBackend()
+
+        client = await engine._get_or_create_client("s-prerecall", "web", None)
+        assert client is not None, "session creation must not break"
+
+        assert bridge._service.retrieve.await_count == 1, (
+            "pre-recall never ran: the test would pass even if the branch were skipped"
+        )
+        session = await db.get_session("s-prerecall")
+        meta = json.loads(session.get("metadata") or "{}")
+        assert "recalled_memories" not in meta, f"failed recall was FROZEN: {meta}"

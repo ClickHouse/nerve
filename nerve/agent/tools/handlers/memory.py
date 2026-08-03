@@ -107,9 +107,9 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
     except MemoryBackendUnavailable as e:
         logger.warning("Memory recall: backend unavailable: %s", e)
         memu_block = (
-            "⚠️ MEMORY BACKEND DOWN (transient proxy/auth error) — recall is UNAVAILABLE right now, "
-            "NOT empty. Do NOT conclude 'no relevant memories'. Reconstruct context from other "
-            "sources (git history, your own notes) and alert the operator that memory is down."
+            "⚠️ MEMORY RECALL UNAVAILABLE — this recall did not complete, so this is NOT an "
+            "empty result. Do NOT conclude 'no relevant memories'. Reconstruct context from other "
+            "sources (git history, your own notes) and alert the operator that this recall failed."
         )
     except Exception as e:
         logger.error("Memory recall failed: %s", e)
