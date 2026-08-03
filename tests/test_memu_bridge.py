@@ -1588,8 +1588,220 @@ class TestUpdateRefreshesContentHash:
                 "the text", "behavior",
             )
 
+    def test_summary_and_type_changed_together_hash_from_both(self, tmp_path):
+        """The combined shape. Changing summary and memory_type in one call must
+        hash from BOTH new values: an implementation that keeps the old type
+        whenever a summary is supplied satisfies the summary-only and type-only
+        cases above while hashing a combined update wrongly.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig", memory_type="knowledge")
+
+            store.memory_item_repo.update_item(
+                item_id=item.id, summary="new text", memory_type="behavior",
+            )
+
+            assert fx.raw_extra(item.id)["content_hash"] == _content_hash(
+                "new text", "behavior",
+            )
+            # Neither half may have been a no-op, or the assertion is free.
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items"
+                " WHERE id = ? AND summary = ? AND memory_type = ?",
+                item.id, "new text", "behavior",
+            ) == 1
+
+    def test_a_racing_type_change_is_not_hashed_from_the_argument(self, tmp_path):
+        """The type half of the same property as the summary case below.
+
+        Taking the type from the ARGUMENT rather than from the row passes every
+        non-racing case (after the delegation commits they are equal), yet
+        produces a hash for a type the row no longer holds - and the conditional
+        write cannot catch it, because that predicate binds the row's own value.
+        Only reading BOTH halves off the row is correct.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig", memory_type="knowledge")
+            repo = store.memory_item_repo
+
+            sessions = repo._sessions
+            original_session = sessions.session
+            raced = []
+
+            def racing_session():
+                session = original_session()
+                real_commit = session.commit
+
+                def _commit():
+                    real_commit()
+                    if raced:
+                        return
+                    conn = sqlite3.connect(fx.path)
+                    landed = conn.execute(
+                        "SELECT memory_type FROM memu_memory_items WHERE id = ?",
+                        (item.id,),
+                    ).fetchone()
+                    if landed and landed[0] == "behavior":
+                        conn.execute(
+                            "UPDATE memu_memory_items SET memory_type = ? WHERE id = ?",
+                            ("profile", item.id),
+                        )
+                        conn.commit()
+                        raced.append(True)
+                    conn.close()
+
+                session.commit = _commit
+                return session
+
+            sessions.session = racing_session
+            try:
+                repo.update_item(item_id=item.id, memory_type="behavior")
+            finally:
+                sessions.session = original_session
+
+            assert raced == [True]
+            final_type = sqlite3.connect(fx.path).execute(
+                "SELECT memory_type FROM memu_memory_items WHERE id = ?", (item.id,),
+            ).fetchone()[0]
+            assert final_type == "profile"
+
+            stored = fx.raw_extra(item.id)["content_hash"]
+            assert stored in (
+                _content_hash("orig", final_type),
+                _content_hash("orig", "knowledge"),
+            )
+            assert stored != _content_hash("orig", "behavior")
+
+    def test_a_writer_outside_the_memu_loop_cannot_leave_a_stale_hash(self, tmp_path):
+        """The hash must come from the row the write LEFT BEHIND.
+
+        A pre-read snapshot closes its session before memU's write transaction,
+        so a writer outside the memU loop thread (the date sweep runs on
+        _blocking_pool with its own connection; `nerve memory` is a second
+        process) can land in between and leave a hash of text the row does not
+        hold. Here a second connection rewrites the summary the instant memU's
+        write commits - which is AFTER the pre-read snapshot but BEFORE a
+        post-write read, so the hook is shape-agnostic and lands in the window
+        either implementation exposes.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+
+            sessions = repo._sessions
+            original_session = sessions.session
+            raced = []
+
+            def racing_session():
+                session = original_session()
+                real_commit = session.commit
+
+                def _commit():
+                    real_commit()
+                    if raced:
+                        return
+                    conn = sqlite3.connect(fx.path)
+                    landed = conn.execute(
+                        "SELECT summary FROM memu_memory_items WHERE id = ?",
+                        (item.id,),
+                    ).fetchone()
+                    if landed and landed[0] == "my new text":
+                        conn.execute(
+                            "UPDATE memu_memory_items SET summary = ? WHERE id = ?",
+                            ("text from the other writer", item.id),
+                        )
+                        conn.commit()
+                        raced.append(True)
+                    conn.close()
+
+                session.commit = _commit
+                return session
+
+            sessions.session = racing_session
+            try:
+                repo.update_item(item_id=item.id, summary="my new text")
+            finally:
+                sessions.session = original_session
+
+            # The race really happened, or the test proves nothing.
+            assert raced == [True]
+            final_summary = sqlite3.connect(fx.path).execute(
+                "SELECT summary FROM memu_memory_items WHERE id = ?", (item.id,),
+            ).fetchone()[0]
+            assert final_summary == "text from the other writer"
+
+            stored = fx.raw_extra(item.id)["content_hash"]
+            # Never a hash of text the row does not hold: either it is
+            # consistent with the row's final summary, or it was left alone.
+            assert stored in (
+                _content_hash(final_summary, "knowledge"),
+                _content_hash("orig", "knowledge"),
+            )
+            assert stored != _content_hash("my new text", "knowledge")
+
+    def test_a_declined_writeback_leaves_the_cache_agreeing_with_the_row(self, tmp_path):
+        """When the conditional write does not land, the cache must not claim it did.
+
+        The writeback is a no-op if another writer moved summary/memory_type
+        between the read and the write. Stamping the refreshed hash into
+        repo.items anyway would leave recall serving a hash the row does not
+        hold - the same cache/DB divergence class as the delete failure paths.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+
+            sessions = repo._sessions
+            original_session = sessions.session
+            raced = []
+
+            def racing_session():
+                session = original_session()
+                real_execute = session.execute
+
+                def _execute(stmt, *args, **kwargs):
+                    # Only the conditional hash write; memU's own update_item
+                    # goes through exec/add/commit, so this lands in exactly the
+                    # read -> write window.
+                    if "json_set" in str(stmt) and not raced:
+                        raced.append(True)
+                        conn = sqlite3.connect(fx.path)
+                        conn.execute(
+                            "UPDATE memu_memory_items SET summary = ? WHERE id = ?",
+                            ("text from the other writer", item.id),
+                        )
+                        conn.commit()
+                        conn.close()
+                    return real_execute(stmt, *args, **kwargs)
+
+                session.execute = _execute
+                return session
+
+            sessions.session = racing_session
+            try:
+                result = repo.update_item(item_id=item.id, summary="my new text")
+            finally:
+                sessions.session = original_session
+
+            assert raced == [True]
+            row_hash = fx.raw_extra(item.id)["content_hash"]
+            # Nothing was written, so the row keeps the hash it already had.
+            assert row_hash == _content_hash("orig", "knowledge")
+            # ... and neither the cache nor the returned item may disagree.
+            assert repo.items[item.id].extra["content_hash"] == row_hash
+            assert result.extra["content_hash"] == row_hash
+
     def test_item_without_a_hash_is_not_enrolled(self, tmp_path):
-        """Adding a hash where there was none is a behaviour change, not a fix."""
+        """Adding a hash where there was none is a behaviour change, not a fix.
+
+        The cache and the returned item must not be enrolled either: memorize()
+        and recall read them, so a hash present only in memory is still a hash
+        the store never agreed to.
+        """
         with _MemuPatchFixture(tmp_path) as fx:
             store, _ = fx.setup(1)
             item = fx.add_item(store, summary="t")
@@ -1601,9 +1813,40 @@ class TestUpdateRefreshesContentHash:
             db.commit()
             db.close()
 
-            fx.store().memory_item_repo.update_item(item_id=item.id, summary="t2")
+            restarted = fx.store().memory_item_repo
+            result = restarted.update_item(item_id=item.id, summary="t2")
 
             assert "content_hash" not in fx.raw_extra(item.id)
+            assert "content_hash" not in (result.extra or {})
+            assert "content_hash" not in (restarted.items[item.id].extra or {})
+
+    def test_a_present_but_empty_hash_is_not_enrolled(self, tmp_path):
+        """The only input where the guard and the SQL predicate disagree.
+
+        `json_extract(extra, '$.content_hash') IS NOT NULL` is TRUE for an empty
+        string, so the SQL alone would enroll a row whose hash is present but
+        blank. The Python guard is what keeps "no usable hash" out of hash-dedup,
+        and this is the case that proves it is load-bearing rather than a
+        duplicate of the SQL.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="t")
+            extra = fx.raw_extra(item.id)
+            extra["content_hash"] = ""
+            db = sqlite3.connect(fx.path)
+            db.execute(
+                "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+                (json.dumps(extra), item.id),
+            )
+            db.commit()
+            db.close()
+
+            restarted = fx.store().memory_item_repo
+            result = restarted.update_item(item_id=item.id, summary="t2")
+
+            assert fx.raw_extra(item.id)["content_hash"] == ""
+            assert (result.extra or {}).get("content_hash") == ""
 
     def test_salience_fields_survive_the_extra_merge(self, tmp_path):
         with _MemuPatchFixture(tmp_path) as fx:
@@ -1619,6 +1862,9 @@ class TestUpdateRefreshesContentHash:
             assert after["reinforcement_count"] == 2
             assert after["last_reinforced_at"] == before["last_reinforced_at"]
             assert after["content_hash"] == _content_hash("t2", "knowledge")
+            # The cache and the returned item are read by memorize()/recall, so
+            # they must carry the SAME merged extra - not just the new hash.
+            assert store.memory_item_repo.items[item.id].extra == after
 
     def test_a_callers_own_extra_is_not_dropped(self, tmp_path):
         """The refreshed hash must be MERGED into the caller's extra, not
@@ -1845,11 +2091,22 @@ class TestCascadeDeleteItem:
         failure - strictly worse than the dangling rows it set out to fix.
         SQLiteSessionManager.session() returns a fresh Session per call, so one
         session for both deletes is the only way to get this.
+
+        The cache assertions matter as much as the DB ones: Fix 5 serves
+        self.items unfiltered, so evicting before (or despite) a rolled-back
+        transaction makes the SURVIVING row invisible to recall.
         """
         with _MemuPatchFixture(tmp_path) as fx:
             store, cats = fx.setup(2)
             item = fx.add_item(store, summary="t")
             fx.link_all(store, item.id, cats)
+            # A bystander keeps the cache non-empty so Fix 5 serves the CACHE:
+            # with an empty cache list_items() falls through to the DB and the
+            # cache assertion below would be free.
+            other = fx.add_item(store, summary="bystander")
+            store.category_item_repo.link_item_category(
+                other.id, next(iter(cats.values())), user_data={},
+            )
 
             class _Boom(Exception):
                 pass
@@ -1877,6 +2134,12 @@ class TestCascadeDeleteItem:
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
             ) == 1
+            # The caches must match the rolled-back DB, or the surviving row is
+            # unreachable through recall.
+            assert item.id in store.memory_item_repo.items
+            assert len([r for r in store.category_item_repo.relations
+                        if r.item_id == item.id]) == 2
+            assert item.id in store.memory_item_repo.list_items()
 
     def test_a_failed_relations_delete_rolls_the_item_back(self, tmp_path):
         """The other direction, and the one that pins the ordering.
@@ -1890,12 +2153,22 @@ class TestCascadeDeleteItem:
             store, cats = fx.setup(2)
             item = fx.add_item(store, summary="t")
             fx.link_all(store, item.id, cats)
+            # As in the sibling case: a bystander keeps the cache non-empty so
+            # the list_items() assertion exercises Fix 5's cached path.  It is
+            # created BEFORE the interceptor is installed, and `raised` below
+            # PROVES the extra item did not change which statement raises rather
+            # than assuming the statement-text predicate is unaffected.
+            other = fx.add_item(store, summary="bystander")
+            store.category_item_repo.link_item_category(
+                other.id, next(iter(cats.values())), user_data={},
+            )
 
             class _Boom(Exception):
                 pass
 
             sessions = store.memory_item_repo._sessions
             original_session = sessions.session
+            raised = []
 
             def failing_session():
                 session = original_session()
@@ -1906,6 +2179,7 @@ class TestCascadeDeleteItem:
                     # Only the relations DELETE; everything else must really run
                     # or the row lookup fails and the test proves nothing.
                     if text.startswith("delete") and "category_items" in text:
+                        raised.append(text)
                         raise _Boom("forced")
                     return real_exec(stmt, *args, **kwargs)
 
@@ -1919,6 +2193,11 @@ class TestCascadeDeleteItem:
             finally:
                 sessions.session = original_session
 
+            # Exactly one statement raised, and it was the relations DELETE:
+            # the bystander did not move the failure point.
+            assert len(raised) == 1
+            assert "category_items" in raised[0]
+
             # BOTH rolled back: the item survives with its links intact.
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
@@ -1926,6 +2205,11 @@ class TestCascadeDeleteItem:
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
             ) == 2
+            # ... and so must the caches, or recall cannot see the survivor.
+            assert item.id in store.memory_item_repo.items
+            assert len([r for r in store.category_item_repo.relations
+                        if r.item_id == item.id]) == 2
+            assert item.id in store.memory_item_repo.list_items()
 
     def test_cache_is_evicted_when_the_row_is_already_gone(self, tmp_path):
         """The row can vanish underneath us (another process deleted it).

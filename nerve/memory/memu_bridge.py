@@ -1055,10 +1055,22 @@ class MemUBridge:
             # re-memorizing the old wording reinforces the corrected row instead
             # of being recognised as different content.
             #
-            # Read the effective values from the DB ROW, never from get_item():
-            # read paths build MemoryItem without extra=, so a cached item has
-            # extra == {} and a cache-based version would silently refresh
-            # nothing in any long-lived process.
+            # The hash is written from the row memU's write LEFT BEHIND, never
+            # from a pre-read snapshot: a pre-read closes its session before that
+            # write, so any writer outside the memU loop thread (the date sweep
+            # runs on _blocking_pool with its own connection; `nerve memory` is a
+            # second process) could land in between and leave a hash of text the
+            # row does not hold.  Reading the row afterwards also removes the
+            # need to guess the effective summary/type - the row IS the answer.
+            #
+            # The writeback is a single conditional UPDATE, so it is a no-op
+            # unless summary and memory_type still hold what was just written:
+            # if another writer moved them, we leave THEIR value alone rather
+            # than stamping a hash for text that is already gone.  json_set
+            # merges into the row's current extra, so a concurrent writer's keys
+            # survive.  Never from get_item(): read paths build MemoryItem
+            # without extra=, so a cached item has extra == {} and a cache-based
+            # version would silently refresh nothing in any long-lived process.
             #
             # Installed BEFORE Fix 3, like Fix 10.  memU's own update_item is
             # stashed on the class the first time, so a repeated
@@ -1066,6 +1078,7 @@ class MemUBridge:
             # stacking.  A marker on the outermost function cannot achieve that:
             # Fix 3 re-wraps whatever it finds, hiding our marker.
             from memu.database.models import compute_content_hash as _content_hash
+            from sqlalchemy import text as _sql_text
             from sqlmodel import select as _sel_upd
 
             _memu_update_item = getattr(
@@ -1078,30 +1091,69 @@ class MemUBridge:
                 self, *, item_id, memory_type=None, summary=None,
                 embedding=None, extra=None, tool_record=None,
             ):
-                if memory_type is not None or summary is not None:
-                    with self._sessions.session() as session:
-                        row = session.exec(
-                            _sel_upd(self._memory_item_model).where(
-                                self._memory_item_model.id == item_id
-                            )
-                        ).first()
-                        if row is not None:
-                            current = dict(row.extra or {})
-                            eff_summary = summary if summary is not None else row.summary
-                            eff_type = memory_type if memory_type is not None else row.memory_type
-                        else:
-                            current, eff_summary, eff_type = {}, None, None
-                    # Only refresh a hash that already exists: an item created
-                    # without one must not be newly enrolled into hash-dedup.
-                    if current.get("content_hash") and eff_summary is not None and eff_type is not None:
-                        extra = {**(extra or {}),
-                                 "content_hash": _content_hash(eff_summary, str(eff_type))}
-
-                return _memu_update_item(
+                # Delegate first, unchanged, and return what it returns: callers
+                # depend on the MemoryItem, and the caller's own `extra` must
+                # flow through this call (memorize() passes extra={"ref_id": ...}
+                # with no summary/type, which skips the refresh entirely).
+                result = _memu_update_item(
                     self, item_id=item_id, memory_type=memory_type,
                     summary=summary, embedding=embedding, extra=extra,
                     tool_record=tool_record,
                 )
+
+                if memory_type is None and summary is None:
+                    return result
+
+                with self._sessions.session() as session:
+                    row = session.exec(
+                        _sel_upd(self._memory_item_model).where(
+                            self._memory_item_model.id == item_id
+                        )
+                    ).first()
+                    if row is None:
+                        return result
+                    current = dict(row.extra or {})
+                    # Only refresh a hash that already exists: an item created
+                    # without one must not be newly enrolled into hash-dedup.
+                    if not current.get("content_hash"):
+                        return result
+                    want = _content_hash(row.summary, str(row.memory_type))
+                    # The only interpolation is the model's own __tablename__
+                    # (Fix 6 renames memu's tables, so it cannot be a literal);
+                    # every value is a bound parameter.
+                    updated = session.execute(
+                        _sql_text(
+                            f"UPDATE {self._memory_item_model.__tablename__} "
+                            "SET extra = json_set("
+                            "coalesce(extra, '{}'), '$.content_hash', :want) "
+                            "WHERE id = :item_id "
+                            "AND json_extract(extra, '$.content_hash') IS NOT NULL "
+                            "AND summary = :summary AND memory_type = :memory_type"
+                        ),
+                        {
+                            "want": want,
+                            "item_id": item_id,
+                            "summary": row.summary,
+                            "memory_type": str(row.memory_type),
+                        },
+                    ).rowcount
+                    session.commit()
+                    if not updated:
+                        # The CAS declined: another writer moved summary/type, or
+                        # removed the hash, between the read above and this
+                        # statement.  Nothing was written, so claiming a refreshed
+                        # hash in the cache would make it disagree with the row.
+                        return result
+                    written = {**current, "content_hash": want}
+
+                # Keep the cache consistent with what was written, like the
+                # Fix 7 writeback does.
+                cached = self.items.get(item_id)
+                if cached is not None:
+                    cached.extra = written
+                if getattr(result, "id", None) == item_id:
+                    result.extra = written
+                return result
 
             _hash_refreshing_update_item._nerve_hash_refresh = True  # type: ignore[attr-defined]
             SQLiteMemoryItemRepo.update_item = _hash_refreshing_update_item
