@@ -93,6 +93,25 @@ _SEMANTIC_DEDUP_THRESHOLD = 0.85
 _CATEGORY_BREADCRUMB_MAXLEN = 200
 
 
+def _norm_category_name(name: str) -> str:
+    """Normalize a category name to memU's lookup key: ``strip().lower()``.
+
+    memU's contract is *strip at creation, strip+lowercase at lookup*: it strips
+    before writing a row, and all three consumer copies of the reverse lookup key
+    on ``name.strip().lower()`` (``memu/app/crud.py``, ``patch.py``,
+    ``memorize.py``). ``ctx.category_name_to_id`` is the only name-to-id channel
+    between nerve and memU, so every nerve site that writes a key into it must
+    derive that key the same way, or the id is unreachable. Keep ``.lower()``:
+    ``.casefold()`` is a *different* function (``'ss'`` vs ``'ß'``) and would
+    silently desync nerve from memU again.
+
+    Because the map holds at most one id per normalized key, a *distinct*
+    category sharing a key is unrepresentable -- which is why creation resolves
+    against this key instead of the raw name.
+    """
+    return name.strip().lower()
+
+
 def _category_breadcrumb(name: str, description: str, summary: str) -> str:
     """Build a short one-line breadcrumb for a category recall hit.
 
@@ -1564,9 +1583,6 @@ class MemUBridge:
                        if not self.config.openai_api_key else {}),
                 },
             )
-            self._available = True
-            self._metrics.service_available = True
-            self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
             logger.info("memU service initialized with SQLite at %s", sqlite_dsn)
 
             # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
@@ -1578,6 +1594,13 @@ class MemUBridge:
             # (warmup, category sync, etc.).
             if is_bedrock:
                 self._inject_bedrock_clients()
+
+            # Hydrate the category cache BEFORE seeding: _ensure_categories and
+            # the rebuild below both read repo.categories, which starts empty in
+            # a fresh process. Call for the side effect only -- the returned dict
+            # is a snapshot that get_or_create_category never updates, so the
+            # live repo.categories is the collection to read.
+            self._service.database.memory_category_repo.list_categories()
 
             await self._ensure_categories()
 
@@ -1595,7 +1618,7 @@ class MemUBridge:
             ctx.category_name_to_id = {}
             for cat_id, cat in self._service.database.memory_category_repo.categories.items():
                 ctx.category_ids.append(cat.id)
-                ctx.category_name_to_id[cat.name.lower()] = cat.id
+                ctx.category_name_to_id[_norm_category_name(cat.name)] = cat.id
             if ctx.category_name_to_id:
                 logger.info(
                     "Populated category mapping: %d categories",
@@ -1851,6 +1874,12 @@ class MemUBridge:
                 _numpy_create_item._nerve_numpy_wrapped = True  # type: ignore[attr-defined]
                 SQLiteMemoryItemRepo.create_item = _numpy_create_item
 
+            # Publish success state only on success: an exception above must not
+            # leave a half-initialized bridge reporting itself available, since
+            # the primary caller ignores this return value.
+            self._available = True
+            self._metrics.service_available = True
+            self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
             return True
 
         except ImportError:
@@ -1865,17 +1894,11 @@ class MemUBridge:
         if not self._service or not self.config.memory.categories:
             return
 
-        existing: set[str] = set()
-        try:
-            cats = self._service.database.memory_category_repo.list_categories()
-            for _, cat in cats.items():
-                existing.add(getattr(cat, "name", ""))
-        except Exception:
-            pass
-
+        # No pre-filter: the impl resolves create-vs-reuse itself, on the
+        # normalized name. An exact-match skip here shadow-creates a second row
+        # for any case or whitespace variant, and skips the config registration
+        # the variant needs. Reuse is cheap (it returns before embedding).
         for cat_cfg in self.config.memory.categories:
-            if cat_cfg.name in existing:
-                continue
             try:
                 # Already on the memU loop (called from _initialize_impl) —
                 # invoke the impl directly instead of re-submitting.
@@ -3008,11 +3031,99 @@ class MemUBridge:
             return False
         return await self._submit(self._create_category_impl(name, description, source))
 
+    def _find_category_by_norm_name(self, name: str) -> Any | None:
+        """Return the cached category whose normalized name matches, else None.
+
+        ``get_or_create_category`` filters on the *exact* name and the table has
+        no unique index on it, so it cannot do this itself.
+
+        Tie-break: on a store that ALREADY holds several rows sharing one
+        normalized key (written before this fix, or by another writer), prefer the
+        row ``ctx.category_name_to_id`` currently points at. The rebuild above
+        assigns that key row-by-row, so the LAST matching row wins there; a plain
+        first-match scan here would disagree, and registering its answer would
+        silently flip the mapping to a different row -- orphaning every item
+        linked to the one that just lost the key. Resolution must therefore agree
+        with the rebuild rather than race it. Do not "simplify" this back to a
+        bare scan. The scan remains the fallback for the two cases with no
+        mapping yet: a fresh process before the rebuild, and seeding.
+        """
+        key = _norm_category_name(name)
+        cats = self._service.database.memory_category_repo.categories
+        ctx = self._service._get_context()
+        mapped_id = (getattr(ctx, "category_name_to_id", None) or {}).get(key)
+        if mapped_id is not None:
+            mapped = cats.get(mapped_id)
+            # The name re-check only ever narrows: all three writers key on the
+            # row's own normalized name, so a live mapping always agrees. It costs
+            # nothing and stops a hypothetically stale entry from redirecting a
+            # create onto an unrelated row, which would be worse than the flip.
+            if mapped is not None and _norm_category_name(
+                getattr(mapped, "name", "")
+            ) == key:
+                return mapped
+        for cat in cats.values():
+            if _norm_category_name(getattr(cat, "name", "")) == key:
+                return cat
+        return None
+
+    def _register_category(self, cat: Any, description: str) -> None:
+        """Point nerve's name-keyed channels at ``cat``, keyed on its STORED name.
+
+        memU reads ``category_config_map`` by the stored row's name
+        (``memorize.py``), while ``MemoryService.__init__`` pre-keys it by the
+        *config* names -- so a row stored under a different spelling is never a key
+        unless registered here.
+
+        ``category_configs`` (the LLM prompt's offered set) is seeded only from
+        ``config.memory.categories`` at ``MemoryService`` construction, and the
+        create path below appends to it precisely "so new memorizations can assign
+        to this category". A reuse returns before reaching that append, so a
+        persisted row with no configured counterpart -- exactly the web-UI case --
+        would get both maps and still never be offered to the LLM, making it
+        unassignable. Registering it here restores the repair the unconditional
+        base create always performed. The membership test is on the NORMALIZED
+        name, not the exact one: a configured ``procedures`` and a stored
+        ``PROCEDURES`` are one category, and appending both would advertise it
+        twice.
+        """
+        from memu.app.service import CategoryConfig
+        cfg = CategoryConfig(name=cat.name, description=description)
+        self._service.category_config_map[cat.name] = cfg
+        key = _norm_category_name(cat.name)
+        if not any(
+            _norm_category_name(getattr(existing, "name", "")) == key
+            for existing in self._service.category_configs
+        ):
+            self._service.category_configs.append(cfg)
+            self._service._category_prompt_str = self._service._format_categories_for_prompt(
+                self._service.category_configs
+            )
+        ctx = self._service._get_context()
+        if getattr(ctx, "category_name_to_id", None) is not None:
+            ctx.category_name_to_id[key] = cat.id
+
     async def _create_category_impl(self, name: str, description: str, source: str = "bridge") -> bool:
         """Create a category — repo write + context mutation (memU loop)."""
         if not self._service:
             return False
         try:
+            name = name.strip()
+
+            # Resolve BEFORE embedding, not after: seeding calls this once per
+            # configured category on every start, so resolving below the embed
+            # would cost one embedding API call per category per restart -- the
+            # cost categories_ready=True exists to avoid. Returning here is also
+            # what keeps the create-only side effects below untouched.
+            existing = self._find_category_by_norm_name(name)
+            if existing is not None:
+                if existing.name != name:
+                    logger.info(
+                        "Reusing category %r for requested name %r", existing.name, name,
+                    )
+                self._register_category(existing, description)
+                return True
+
             # Generate embedding for the category (requires OpenAI key)
             embedding = None
             if self._has_embeddings:
@@ -3023,6 +3134,14 @@ class MemUBridge:
                 except Exception as e:
                     logger.warning("Could not embed category %s: %s", name, e)
 
+            # Re-check after the embed's await: the memU loop runs each create as
+            # its own coroutine with no lock, so a concurrent create of the same
+            # normalized name can have inserted the row while we were suspended.
+            existing = self._find_category_by_norm_name(name)
+            if existing is not None:
+                self._register_category(existing, description)
+                return True
+
             # Create in the DB repo
             cat = self._service.database.memory_category_repo.get_or_create_category(
                 name=name, description=description, embedding=embedding, user_data={},
@@ -3030,9 +3149,9 @@ class MemUBridge:
 
             # Update in-memory config so new memorizations can assign to this category
             from memu.app.service import CategoryConfig
-            cfg = CategoryConfig(name=name, description=description)
+            cfg = CategoryConfig(name=cat.name, description=description)
             self._service.category_configs.append(cfg)
-            self._service.category_config_map[name] = cfg
+            self._service.category_config_map[cat.name] = cfg
             self._service._category_prompt_str = self._service._format_categories_for_prompt(
                 self._service.category_configs
             )
@@ -3042,7 +3161,7 @@ class MemUBridge:
             if hasattr(ctx, 'category_ids') and ctx.category_ids is not None:
                 ctx.category_ids.append(cat.id)
             if hasattr(ctx, 'category_name_to_id') and ctx.category_name_to_id is not None:
-                ctx.category_name_to_id[name.lower()] = cat.id
+                ctx.category_name_to_id[_norm_category_name(cat.name)] = cat.id
 
             logger.info("Created category: %s", name)
             await self._audit("category_created", "category", name, source, {"description": description})

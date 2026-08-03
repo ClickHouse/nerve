@@ -1419,7 +1419,19 @@ class MemoryCategoryConfig:
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> MemoryCategoryConfig:
-        return cls(name=d["name"], description=d.get("description", ""))
+        # Strip at the origin: this name becomes a persistent category row and a
+        # lookup key, and memU strips before writing the row. Reject a blank or a
+        # non-string rather than coercing it: a bare ``name:`` in YAML parses as
+        # None, and str() would turn that typo into a category literally named
+        # "None". A non-str name has never worked (both nerve and memU call str
+        # methods on it), so rejecting it removes no reachable behaviour.
+        raw = d["name"]
+        if not isinstance(raw, str):
+            raise ValueError("memory category name must be a string")
+        name = raw.strip()
+        if not name:
+            raise ValueError("memory category name must not be blank")
+        return cls(name=name, description=d.get("description", ""))
 
 
 @dataclass

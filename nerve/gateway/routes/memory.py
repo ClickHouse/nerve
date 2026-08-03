@@ -223,10 +223,15 @@ class CategoryUpdateRequest(BaseModel):
 async def create_memu_category(req: CategoryCreateRequest, user: dict = Depends(require_auth)):
     """Create a new memU memory category at runtime."""
     bridge = _require_memu()
-    success = await bridge.create_category(req.name, req.description, source="web_ui")
+    # Checked here rather than on the model: a pydantic validator fails with 422
+    # before the body runs, and this route reports bad input as 400.
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Category name must not be blank")
+    success = await bridge.create_category(name, req.description, source="web_ui")
     if not success:
         raise HTTPException(status_code=500, detail="Failed to create category")
-    return {"name": req.name, "created": True}
+    return {"name": name, "created": True}
 
 
 @router.patch("/api/memory/memu/items/{item_id}")
