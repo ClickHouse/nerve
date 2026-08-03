@@ -895,8 +895,9 @@ class MemUBridge:
            key another writer added.
         8. A content-only memory_update unlinks EVERY category: memU maps a
            missing `categories` to [], so its diff removes the item's whole
-           current set.  Fix: when `categories` is None, rewrite the payload
-           with the names of the item's current links.
+           current set.  Fix: neutralise membership for that one call through a
+           relation-repo proxy passed down in `state` (nothing process-wide is
+           mutated), then rebuild the (old, new) pairs from the surviving links.
         9. update_item never refreshes extra.content_hash, which
            create_item_reinforce dedups on, so an updated item keeps its old
            text's hash.  Fix: recompute it from the DB row when summary or

@@ -2532,6 +2532,89 @@ class TestUpdateRefreshesContentHash:
             assert again.id != item.id
             assert fx.raw_count("SELECT count(*) FROM memu_memory_items") == 2
 
+    def test_a_writer_between_the_two_phases_leaves_the_objects_mismatched(
+        self, tmp_path,
+    ):
+        """Pin the residual window this fix narrows but does not close.
+
+        A writer landing strictly between the delegated update returning and the
+        wrapper's post-read session moves the row's summary, so the CAS binds -
+        and correctly writes - the hash of the THIRD PARTY's text. That hash is
+        then stamped onto the cache entry and the returned item without
+        re-reading either, so both carry a hash that does not belong to their own
+        .summary.
+
+        Harmless, and deliberately not closed here: the only SQLite-path consumer
+        of extra.content_hash is create_item_reinforce, which reads the DB column
+        and never self.items, so dedup on the row's own current text still finds
+        the row (asserted below - it is the property a later round must not lose).
+        Base is worse: it stamps a hash of text the ROW does not hold, in every
+        arm including the no-writer control. Closing it means making memU's
+        content write and this refresh atomic, which was built and measured to
+        store a WRONG hash on two correctness paths.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+
+            sessions = repo._sessions
+            original_session = sessions.session
+            opens = []
+            injected = []
+
+            def counting_session():
+                opens.append(1)
+                # Session 1 is memU's own content write; session 2 is the
+                # wrapper's post-read.  Firing here is strictly between them.
+                if len(opens) == 2 and not injected:
+                    conn = sqlite3.connect(fx.path)
+                    conn.execute(
+                        "UPDATE memu_memory_items SET summary = ? WHERE id = ?",
+                        ("third party text", item.id),
+                    )
+                    conn.commit()
+                    injected.append(
+                        conn.execute(
+                            "SELECT summary FROM memu_memory_items WHERE id = ?",
+                            (item.id,),
+                        ).fetchone()[0]
+                    )
+                    conn.close()
+                return original_session()
+
+            sessions.session = counting_session
+            try:
+                result = repo.update_item(item_id=item.id, summary="my new text")
+            finally:
+                sessions.session = original_session
+
+            # The writer really landed inside the window, or this proves nothing.
+            assert injected == ["third party text"]
+
+            row_summary, row_type = sqlite3.connect(fx.path).execute(
+                "SELECT summary, memory_type FROM memu_memory_items WHERE id = ?",
+                (item.id,),
+            ).fetchone()
+            assert row_summary == "third party text"
+            row_hash = fx.raw_extra(item.id)["content_hash"]
+            # The ROW is self-consistent: the CAS bound its own summary/type.
+            assert row_hash == _content_hash(row_summary, str(row_type))
+
+            # The measured residue: the cache entry and the returned item carry
+            # the row's hash on top of the CALLER's summary.
+            cached = repo.items[item.id]
+            assert cached.summary == "my new text"
+            assert cached.extra["content_hash"] == row_hash
+            assert result.summary == "my new text"
+            assert result.extra["content_hash"] == row_hash
+
+            # Why it is harmless: dedup reads the COLUMN, so the row's own
+            # current text still finds the row rather than duplicating it.
+            again = fx.add_item(store, summary=row_summary)
+            assert again.id == item.id
+            assert fx.raw_count("SELECT count(*) FROM memu_memory_items") == 1
+
 
 class TestReinforceWritebackReadsTheRow:
     """Fix 7 correction: the semantic-dedup writeback must seed ``extra`` from
