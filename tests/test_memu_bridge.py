@@ -1227,11 +1227,23 @@ def _rebuild_map(bridge) -> dict[str, str]:
 
 
 _INIT_PROBE = """
-import asyncio, sys, json
+import asyncio, sys, json, socket
 from pathlib import Path
 import memu.app.service  # imported first: avoids a circular import in the patcher
 from nerve.config import MemoryCategoryConfig, MemoryConfig, NerveConfig
 from nerve.memory.memu_bridge import MemUBridge
+
+# This probe must stay offline: httpx dials through socket.socket.connect
+# (measured -- socket.create_connection is never called on this path).
+# Record as well as raise: the warmup's ``except Exception`` swallows the raise,
+# so only the record proves nothing dialled out.
+_dialled = []
+
+def _blocked(self, address, *args, **kwargs):
+    _dialled.append(address)
+    raise AssertionError(f"probe attempted an outbound connection to {address!r}")
+
+socket.socket.connect = _blocked
 
 async def main():
     tmp = Path(sys.argv[1])
@@ -1250,9 +1262,30 @@ async def main():
             raise RuntimeError("category load exploded")
         bridge._ensure_categories = _boom
         del real_ensure
+    # _initialize_impl warms up three LLM profiles against the live endpoint.
+    # Make the sole client factory it calls raise; the loop already swallows it.
+    real_init = bridge._initialize_impl
+
+    async def _init_without_warmup():
+        from memu.app.service import MemoryService
+        orig = MemoryService._get_llm_base_client
+
+        def _no_warmup(self, profile=None):
+            raise RuntimeError("LLM warmup disabled: this probe must stay offline")
+
+        MemoryService._get_llm_base_client = _no_warmup
+        try:
+            return await real_init()
+        finally:
+            MemoryService._get_llm_base_client = orig
+
+    bridge._initialize_impl = _init_without_warmup
+
     ok = await bridge.initialize()
     out = {"initialize": ok, "available": bridge._available,
-           "service_available": bridge._metrics.service_available}
+           "service_available": bridge._metrics.service_available,
+           "offline": not _dialled and socket.socket.connect is _blocked,
+           "dialled": [str(a) for a in _dialled]}
     if bridge._service is not None:
         svc = bridge._service
         ctx = svc._get_context()
@@ -1517,6 +1550,7 @@ class TestInitializeCategoryInvariant:
     def test_empty_config_every_advertised_category_resolves(self, tmp_path):
         report = _run_init(tmp_path, configured=())
 
+        assert report["offline"] is True
         assert report["initialize"] is True
         assert report["available"] is True
         assert len(report["advertised"]) == 10  # memU's defaults
@@ -1528,6 +1562,7 @@ class TestInitializeCategoryInvariant:
         configured = [("task_domain", "Domain"), ("patterns", "Recurring")]
         report = _run_init(tmp_path, configured=configured)
 
+        assert report["offline"] is True
         assert report["advertised"] == ["task_domain", "patterns"]
         assert len(report["prompt_lines"]) == 2
         assert len(report["resolved"]) == 2
@@ -1537,6 +1572,7 @@ class TestInitializeCategoryInvariant:
         """_available is the only failure signal the agent sees: engine.py drops the return."""
         report = _run_init(tmp_path, configured=(), mode="fail-load")
 
+        assert report["offline"] is True
         assert report["initialize"] is False
         assert report["available"] is False
         assert report["service_available"] is False

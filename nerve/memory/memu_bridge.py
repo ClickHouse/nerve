@@ -1792,7 +1792,7 @@ class MemUBridge:
             try:
                 self._service.database.memory_item_repo.list_items()
                 # Categories are already cached: _ensure_categories loads them
-                # unconditionally, before the name-to-ID rebuild above.
+                # whenever a service exists, which _initialize_impl guarantees.
 
                 # Convert cached embeddings from list[float] to numpy float32.
                 # Pydantic coerces numpy → list during model construction, so we
