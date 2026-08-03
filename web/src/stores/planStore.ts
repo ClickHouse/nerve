@@ -30,7 +30,7 @@ interface PlanState {
   loadPlans: () => Promise<void>;
   setFilter: (f: string) => void;
   loadPlan: (id: string) => Promise<void>;
-  updatePlan: (id: string, status: string, feedback?: string) => Promise<void>;
+  updatePlan: (id: string, status: string, feedback?: string) => Promise<boolean>;
   approvePlan: (id: string) => Promise<{ impl_session_id: string } | null>;
   revisePlan: (id: string, feedback: string) => Promise<boolean>;
   clearActionError: () => void;
@@ -93,7 +93,7 @@ export const usePlanStore = create<PlanState>((set, get) => ({
   },
 
   updatePlan: async (id: string, status: string, feedback?: string) => {
-    set({ actionLoading: true });
+    set({ actionLoading: true, actionError: null });
     try {
       await api.updatePlan(id, { status, feedback });
       // Refresh
@@ -102,8 +102,13 @@ export const usePlanStore = create<PlanState>((set, get) => ({
         set({ selectedPlan: { ...sel, status, ...(feedback ? { feedback } : {}) } });
       }
       get().loadPlans();
+      return true;
     } catch (e) {
+      // The route refuses a non-pending decline with 409. Surface it so the
+      // caller can keep the form and the typed reason instead of clearing them.
       console.error('Failed to update plan:', e);
+      set({ actionError: extractErrorMessage(e, 'Failed to update plan') });
+      return false;
     } finally {
       set({ actionLoading: false });
     }

@@ -61,10 +61,14 @@ export function PlanDetailPage() {
     }
   };
 
-  const handleDecline = () => {
-    updatePlan(plan.id, 'declined', declineFeedback.trim() || undefined);
-    setDeclineFeedback('');
-    setShowDeclineFeedback(false);
+  const handleDecline = async () => {
+    // Keep the form and the typed reason on failure: the route refuses a
+    // decline once the plan is no longer pending (409).
+    const ok = await updatePlan(plan.id, 'declined', declineFeedback.trim() || undefined);
+    if (ok) {
+      setDeclineFeedback('');
+      setShowDeclineFeedback(false);
+    }
   };
 
   const handleRevise = async () => {
@@ -165,6 +169,15 @@ export function PlanDetailPage() {
                 </button>
               </div>
 
+              {/* Shared action error: serves decline and revision alike, so a
+                  refusal is visible whichever form triggered it. */}
+              {actionError && (
+                <div className="flex gap-0">
+                  <div className="w-1 bg-red-500/40 rounded-full shrink-0" />
+                  <div className="pl-3 py-1 text-[12px] text-hue-red">{actionError}</div>
+                </div>
+              )}
+
               {showDeclineFeedback && (
                 <div className="space-y-2">
                   <div className="flex gap-0">
@@ -172,7 +185,10 @@ export function PlanDetailPage() {
                     <div className="flex-1 pl-3">
                       <textarea
                         value={declineFeedback}
-                        onChange={e => setDeclineFeedback(e.target.value)}
+                        onChange={e => {
+                          setDeclineFeedback(e.target.value);
+                          if (actionError) clearActionError();
+                        }}
                         placeholder="Optional: why is this plan being declined? (leave empty to close without a reason)"
                         className="w-full p-3 text-[13px] bg-surface-raised border border-border-subtle rounded-lg text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-red-500/50 resize-none"
                         rows={3}
@@ -210,12 +226,6 @@ export function PlanDetailPage() {
                       />
                     </div>
                   </div>
-                  {actionError && (
-                    <div className="flex gap-0">
-                      <div className="w-1 bg-red-500/40 rounded-full shrink-0" />
-                      <div className="pl-3 py-1 text-[12px] text-hue-red">{actionError}</div>
-                    </div>
-                  )}
                   <div className="flex justify-end">
                     <button
                       onClick={handleRevise}

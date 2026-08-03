@@ -64,6 +64,14 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, user: dict = Depends
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
+    # Guard: only pending plans can be declined. It precedes both the write
+    # and the task_done invocation below, so a refused decline changes nothing.
+    if req.status == "declined" and plan["status"] != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Plan is '{plan['status']}', only 'pending' plans can be declined",
+        )
+
     fields = {}
     if req.status:
         fields["status"] = req.status
