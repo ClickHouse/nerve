@@ -1177,6 +1177,103 @@ class MemUBridge:
 
             logger.info("Patched embeddings to use numpy float32 (saves ~170 MB on 4K items)")
 
+            # Fix 7a: upstream's content-hash reinforce arm replaces the whole
+            # `extra` column from a value read before the write, so every key
+            # another connection commits in that window is silently dropped.
+            # Merge server-side instead. Installed BEFORE Fix 7 binds the
+            # original, so the order stays semantic -> this arm -> upstream
+            # create; a hash-first arm would change dedup precedence.
+            from memu.database.models import compute_content_hash as _content_hash
+
+            _upstream_hash_reinforce = SQLiteMemoryItemRepo.create_item_reinforce
+
+            def _atomic_hash_reinforce(
+                self, *, resource_id, memory_type, summary, embedding, user_data,
+            ):
+                from sqlalchemy import func, select, update
+
+                model = self._memory_item_model
+                now = self._now()
+                filters = [
+                    func.json_extract(model.extra, "$.content_hash")
+                    == _content_hash(summary, memory_type)
+                ]
+                filters.extend(self._build_filters(model, user_data))
+                # NULLIF is required, not defensive: coalesce alone lets an
+                # empty-string extra reach json_set, which raises "malformed JSON".
+                live = func.coalesce(func.nullif(model.extra, ""), "{}")
+                extra_expr = func.json_set(
+                    func.json_set(
+                        live,
+                        "$.reinforcement_count",
+                        # json_extract on the same column in the same statement,
+                        # so the increment is atomic too.
+                        func.coalesce(
+                            func.json_extract(live, "$.reinforcement_count"), 1
+                        )
+                        + 1,
+                    ),
+                    "$.last_reinforced_at",
+                    now.isoformat(),
+                )
+                with self._sessions.session() as session:
+                    # content_hash has no uniqueness index, so resolve ONE target
+                    # id: a bare hash-filtered UPDATE would bump every duplicate
+                    # where upstream's .first() reinforces exactly one.
+                    target_id = session.execute(
+                        select(model.id).where(*filters).limit(1)
+                    ).scalars().first()
+                    if target_id is None:
+                        session.rollback()
+                        return _upstream_hash_reinforce(
+                            self,
+                            resource_id=resource_id,
+                            memory_type=memory_type,
+                            summary=summary,
+                            embedding=embedding,
+                            user_data=user_data,
+                        )
+                    # The UPDATE promotes this to a write transaction, so the
+                    # SELECT that follows cannot observe an interleaved write.
+                    result = session.execute(
+                        update(model)
+                        .where(model.id == target_id)
+                        .values(extra=extra_expr, updated_at=now)
+                    )
+                    if not result.rowcount:
+                        # The row was deleted between the two statements.
+                        session.rollback()
+                        return _upstream_hash_reinforce(
+                            self,
+                            resource_id=resource_id,
+                            memory_type=memory_type,
+                            summary=summary,
+                            embedding=embedding,
+                            user_data=user_data,
+                        )
+                    row = session.execute(
+                        select(model).where(model.id == target_id)
+                    ).scalars().first()
+                    raw = row.extra
+                    item = MemoryItem(
+                        id=row.id,
+                        resource_id=row.resource_id,
+                        memory_type=row.memory_type,
+                        summary=row.summary,
+                        embedding=self._normalize_embedding(row.embedding_json),
+                        created_at=row.created_at,
+                        updated_at=row.updated_at,
+                        # Rebuild from the MERGED value, never from a
+                        # reconstructed dict.
+                        extra=json.loads(raw) if isinstance(raw, str) else dict(raw),
+                        **self._scope_kwargs_from(row),
+                    )
+                    session.commit()
+                self.items[item.id] = item
+                return item
+
+            SQLiteMemoryItemRepo.create_item_reinforce = _atomic_hash_reinforce
+
             # Fix 7: Semantic deduplication in create_item_reinforce.
             # The default dedup is content-hash only (exact text after normalization).
             # This adds cosine similarity check against the in-memory item cache so

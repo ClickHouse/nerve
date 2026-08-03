@@ -1134,3 +1134,437 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+def _build_hash_reinforce_env():
+    """Patch memU once per process and build the SQLA models once.
+
+    _patch_sqlite_bugs() MUST run before get_sqlite_sqlalchemy_models(), or the
+    MRO fix has not been applied and model construction raises TypeError.
+    get_sqlite_sqlalchemy_models() is NOT re-entrant: a second call in the same
+    interpreter raises "Column object 'url' already assigned to Table", so it is
+    module-scoped, not per test.
+    """
+    import importlib.util
+
+    import memu.app.service  # noqa: F401  initialize the package graph first
+    import memu.database.sqlite.repositories.memory_item_repo as repo_mod
+    import memu.database.sqlite.schema as schema_mod
+    from memu.database.sqlite.repositories.memory_item_repo import (
+        SQLiteMemoryItemRepo as Repo,
+    )
+
+    MemUBridge._patch_sqlite_bugs()
+    models = schema_mod.get_sqlite_sqlalchemy_models()
+    from memu.database.sqlite.sqlite import SQLiteStore
+
+    # A pristine copy of the upstream module, so a test can compare our arm
+    # against unpatched memu without reimplementing either.
+    spec = importlib.util.spec_from_file_location("_pristine_repo", repo_mod.__file__)
+    pristine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pristine)
+
+    return {
+        "Repo": Repo,
+        "module": repo_mod,
+        "models": models,
+        "store_cls": SQLiteStore,
+        # Held in a dict, not on a class: a plain function stored as a class
+        # attribute becomes a bound method on attribute access.
+        "shipped": Repo.__dict__["create_item_reinforce"],
+        "upstream": pristine.SQLiteMemoryItemRepo.create_item_reinforce,
+    }
+
+
+@pytest.fixture(scope="module")
+def hash_reinforce_env():
+    return _build_hash_reinforce_env()
+
+
+@pytest.fixture
+def hash_reinforce_store(tmp_path, hash_reinforce_env):
+    """A real SQLiteStore with the full _patch_sqlite_bugs() stack installed."""
+    env = hash_reinforce_env
+    Repo = env["Repo"]
+    repo_mod = env["module"]
+    models = env["models"]
+    SQLiteStore = env["store_cls"]
+    arms = {"shipped": env["shipped"], "upstream": env["upstream"]}
+
+    names = (
+        "update_item", "delete_item", "clear_items", "list_items",
+        "create_item", "create_item_reinforce", "vector_search_items",
+    )
+    saved = {n: Repo.__dict__.get(n) for n in names}
+    saved_now = Repo.__dict__.get("_now")
+
+    db_path = str(tmp_path / "memu.sqlite")
+    sqlite3.connect(db_path).execute("PRAGMA journal_mode=WAL").fetchone()
+
+    class Harness:
+        path = db_path
+        repo_cls = Repo
+        module = repo_mod
+
+        @property
+        def shipped(self):
+            return arms["shipped"]
+
+        def install(self, *, fixed):
+            fn = arms["shipped"] if fixed else arms["upstream"]
+            self.module.SQLiteMemoryItemRepo.create_item_reinforce = fn
+            self.repo_cls.create_item_reinforce = fn
+
+        def open(self):
+            return SQLiteStore(dsn=f"sqlite:///{db_path}", sqla_models=models)
+
+        def extra(self, item_id):
+            raw = sqlite3.connect(db_path).execute(
+                "SELECT extra FROM memu_memory_items WHERE id=?", (item_id,),
+            ).fetchone()[0]
+            return json.loads(raw or "{}")
+
+        def reinforce(self, repo, summary, embedding):
+            return repo.create_item_reinforce(
+                resource_id=None, memory_type="knowledge",
+                summary=summary, embedding=embedding, user_data={},
+            )
+
+    try:
+        yield Harness()
+    finally:
+        for name, fn in saved.items():
+            if fn is None:
+                if name in Repo.__dict__:
+                    delattr(Repo, name)
+            else:
+                setattr(Repo, name, fn)
+        if saved_now is None:
+            if "_now" in Repo.__dict__:
+                delattr(Repo, "_now")
+        else:
+            Repo._now = saved_now
+
+
+class TestAtomicHashReinforce:
+    """memu-py 1.4.0's content-hash reinforce arm read `extra`, mutated a dict
+    copy and flushed the whole column, so any key another connection committed
+    in that window was silently dropped. Our arm computes the merge server-side
+    with json_set and reads it back inside the same write transaction.
+
+    Every test opens a SECOND store so the item cache is cold, which is what
+    forces the semantic arm to miss and the hash arm to run.
+    """
+
+    def test_preserves_a_concurrent_extra_write(self, hash_reinforce_store):
+        """The window test: unpatched memu LOSES the concurrent key, ours keeps it."""
+        results = {}
+        for label, fixed in (("base", False), ("fixed", True)):
+            hash_reinforce_store.install(fixed=fixed)
+            store = hash_reinforce_store.open()
+            seeded = hash_reinforce_store.reinforce(
+                store.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+            )
+            store.close()
+
+            second = hash_reinforce_store.open()
+            repo = second.memory_item_repo
+            assert not repo.items, "cache must be cold so the hash arm runs"
+
+            # _now() is called after the row lookup and before the commit, so a
+            # write issued from here lands inside the read -> write window.
+            real_now = hash_reinforce_store.repo_cls._now
+            fired = []
+
+            def inject(self, _real=real_now, _path=hash_reinforce_store.path,
+                       _id=seeded.id):
+                if not fired:
+                    fired.append(True)
+                    writer = sqlite3.connect(_path, timeout=30)
+                    writer.execute(
+                        "UPDATE memu_memory_items SET extra=json_set("
+                        "COALESCE(NULLIF(extra,''),'{}'),'$.mentioned_at','2026-08-03')"
+                        " WHERE id=?", (_id,),
+                    )
+                    writer.commit()
+                    writer.close()
+                return _real(self)
+
+            hash_reinforce_store.repo_cls._now = inject
+            try:
+                out = hash_reinforce_store.reinforce(repo, "same text", [1.0, 0.0, 0.0])
+            finally:
+                hash_reinforce_store.repo_cls._now = real_now
+                second.close()
+
+            assert fired, f"{label}: the concurrent write never fired"
+            assert out.id == seeded.id, f"{label}: expected a reinforce, not a create"
+            results[label] = {
+                "row": hash_reinforce_store.extra(seeded.id),
+                # The RETURNED item feeds the caller and the item cache, so a
+                # reconstructed dict here would put the lost view back one layer
+                # up even with a correct row.
+                "returned": dict(out.extra or {}),
+                "cached": dict((repo.items.get(seeded.id) or out).extra or {}),
+            }
+            sqlite3.connect(hash_reinforce_store.path).execute(
+                "DELETE FROM memu_memory_items",
+            ).connection.commit()
+
+        # Both arms must actually reinforce, so the only difference measured is
+        # whether the concurrent key survived.
+        assert results["base"]["row"]["reinforcement_count"] == 2
+        assert results["fixed"]["row"]["reinforcement_count"] == 2
+        assert "mentioned_at" not in results["base"]["row"], (
+            "the defect is gone upstream: revisit whether this patch is still needed"
+        )
+        assert results["fixed"]["row"]["mentioned_at"] == "2026-08-03"
+        # The row, the returned item and the cache must all agree.
+        assert results["fixed"]["returned"] == results["fixed"]["row"]
+        assert results["fixed"]["cached"] == results["fixed"]["row"]
+
+    def test_tolerates_an_empty_extra_written_into_the_window(self, hash_reinforce_store):
+        """NULLIF is required, not defensive.
+
+        Our arm resolves a target id, then UPDATEs it. A writer can blank that
+        row's `extra` in between, and coalesce alone would then feed '' to
+        json_set, which raises "malformed JSON".
+        """
+        from sqlalchemy.orm import Session
+
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        seeded = hash_reinforce_store.reinforce(
+            store.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        store.close()
+
+        second = hash_reinforce_store.open()
+        repo = second.memory_item_repo
+        assert not repo.items
+
+        real_execute = Session.execute
+        fired = []
+
+        def blank_before_update(self, statement, *args, **kwargs):
+            if not fired and str(statement).lstrip().upper().startswith("UPDATE"):
+                fired.append(True)
+                writer = sqlite3.connect(hash_reinforce_store.path, timeout=30)
+                writer.execute(
+                    "UPDATE memu_memory_items SET extra='' WHERE id=?", (seeded.id,),
+                )
+                writer.commit()
+                writer.close()
+            return real_execute(self, statement, *args, **kwargs)
+
+        Session.execute = blank_before_update
+        try:
+            hash_reinforce_store.reinforce(repo, "same text", [1.0, 0.0, 0.0])
+        finally:
+            Session.execute = real_execute
+            second.close()
+
+        assert fired, "the blanking write never fired"
+        merged = hash_reinforce_store.extra(seeded.id)
+        assert merged["reinforcement_count"] == 2
+        assert "last_reinforced_at" in merged
+
+    def test_increments_from_the_live_count_not_a_constant(self, hash_reinforce_store):
+        """The count must come from json_extract on the live column.
+
+        A fixture starting at 1 cannot tell "increment" from "set to 2", so seed
+        a higher count first.
+        """
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        seeded = hash_reinforce_store.reinforce(
+            store.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        store.close()
+
+        con = sqlite3.connect(hash_reinforce_store.path)
+        con.execute(
+            "UPDATE memu_memory_items SET extra=json_set("
+            "extra,'$.reinforcement_count',7) WHERE id=?", (seeded.id,),
+        )
+        con.commit()
+        assert hash_reinforce_store.extra(seeded.id)["reinforcement_count"] == 7
+
+        second = hash_reinforce_store.open()
+        assert not second.memory_item_repo.items
+        out = hash_reinforce_store.reinforce(
+            second.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        second.close()
+        assert out.id == seeded.id
+        assert hash_reinforce_store.extra(seeded.id)["reinforcement_count"] == 8
+        assert (out.extra or {})["reinforcement_count"] == 8
+
+    def test_creates_when_the_row_vanishes_inside_the_window(self, hash_reinforce_store):
+        """rowcount 0 after a successful id read is a real state.
+
+        The row can be deleted between the id resolve and the UPDATE, and that
+        must fall through to a create rather than silently no-op.
+        """
+        from sqlalchemy.orm import Session
+
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        seeded = hash_reinforce_store.reinforce(
+            store.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        store.close()
+
+        second = hash_reinforce_store.open()
+        repo = second.memory_item_repo
+        assert not repo.items
+
+        real_execute = Session.execute
+        fired = []
+
+        def delete_before_update(self, statement, *args, **kwargs):
+            if not fired and str(statement).lstrip().upper().startswith("UPDATE"):
+                fired.append(True)
+                writer = sqlite3.connect(hash_reinforce_store.path, timeout=30)
+                writer.execute(
+                    "DELETE FROM memu_memory_items WHERE id=?", (seeded.id,),
+                )
+                writer.commit()
+                writer.close()
+            return real_execute(self, statement, *args, **kwargs)
+
+        Session.execute = delete_before_update
+        try:
+            out = hash_reinforce_store.reinforce(repo, "same text", [1.0, 0.0, 0.0])
+        finally:
+            Session.execute = real_execute
+            second.close()
+
+        assert fired, "the deleting write never fired"
+        rows = dict(sqlite3.connect(hash_reinforce_store.path).execute(
+            "SELECT id, json_extract(extra,'$.reinforcement_count') "
+            "FROM memu_memory_items",
+        ).fetchall())
+        assert seeded.id not in rows, "the deleted row came back"
+        assert out.id in rows, "the vanished row did not fall through to a create"
+        assert rows[out.id] == 1, "a fresh create must start at 1"
+
+    def test_does_not_change_dedup_precedence(self, hash_reinforce_store):
+        """Our arm must stay BEHIND the semantic arm.
+
+        Fixture: row A carries the query's text with an orthogonal embedding,
+        row B unrelated text with the query's embedding. Semantic-first picks B;
+        a hash-first arm would pick A.
+        """
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        repo = store.memory_item_repo
+        row_a = hash_reinforce_store.reinforce(repo, "same text", [0.0, 0.0, 1.0])
+        row_b = hash_reinforce_store.reinforce(
+            repo, "an entirely unrelated sentence", [1.0, 0.0, 0.0],
+        )
+        store.close()
+
+        # Assert the fixture: without this the two rows dedup into one at build
+        # time and the test passes vacuously.
+        rows = sqlite3.connect(hash_reinforce_store.path).execute(
+            "SELECT count() FROM memu_memory_items",
+        ).fetchone()[0]
+        assert row_a.id != row_b.id and rows == 2, "fixture degenerate"
+
+        second = hash_reinforce_store.open()
+        second.memory_item_repo.list_items()  # warm the cache so semantic can fire
+        out = hash_reinforce_store.reinforce(
+            second.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        second.close()
+        assert out.id == row_b.id, "dedup precedence changed: hash won over semantic"
+
+    def test_bumps_exactly_one_of_several_hash_duplicates(self, hash_reinforce_store):
+        """`content_hash` has no uniqueness index, so a bare hash-filtered
+        UPDATE would bump every duplicate where upstream reinforces exactly one.
+        """
+        import uuid
+
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        seeded = hash_reinforce_store.reinforce(
+            store.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        store.close()
+
+        con = sqlite3.connect(hash_reinforce_store.path)
+        # Derive the column list from the live schema; a hardcoded one drifts.
+        cols = [c[1] for c in con.execute("PRAGMA table_info(memu_memory_items)")]
+        others = ", ".join(c for c in cols if c != "id")
+        for _ in range(2):
+            con.execute(
+                f"INSERT INTO memu_memory_items (id, {others}) "
+                f"SELECT ?, {others} FROM memu_memory_items WHERE id=?",
+                (str(uuid.uuid4()), seeded.id),
+            )
+        con.execute(
+            "UPDATE memu_memory_items SET extra=json_set(extra,'$.reinforcement_count',1)",
+        )
+        con.commit()
+        before = dict(con.execute(
+            "SELECT id, json_extract(extra,'$.reinforcement_count') FROM memu_memory_items",
+        ).fetchall())
+        assert len(before) == 3
+
+        second = hash_reinforce_store.open()
+        assert not second.memory_item_repo.items
+        hash_reinforce_store.reinforce(
+            second.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        second.close()
+
+        after = dict(con.execute(
+            "SELECT id, json_extract(extra,'$.reinforcement_count') FROM memu_memory_items",
+        ).fetchall())
+        bumped = [i for i in after if after[i] != before[i]]
+        assert bumped == [seeded.id], f"expected only the first match bumped, got {bumped}"
+
+    def test_a_genuine_miss_still_creates(self, hash_reinforce_store):
+        """The fall-through to upstream's create arm must stay intact."""
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        repo = store.memory_item_repo
+        first = hash_reinforce_store.reinforce(repo, "alpha one", [1.0, 0.0, 0.0])
+        second = hash_reinforce_store.reinforce(repo, "beta two three", [0.0, 1.0, 0.0])
+        store.close()
+
+        rows = sqlite3.connect(hash_reinforce_store.path).execute(
+            "SELECT count() FROM memu_memory_items",
+        ).fetchone()[0]
+        assert first.id != second.id
+        assert rows == 2
+
+    def test_semantic_hit_does_not_double_count(self, hash_reinforce_store):
+        """Fix 7 returns inside its own hit branch, so a semantic hit must move
+        `reinforcement_count` by exactly one and never reach our arm.
+        """
+        hash_reinforce_store.install(fixed=True)
+        store = hash_reinforce_store.open()
+        repo = store.memory_item_repo
+        seeded = hash_reinforce_store.reinforce(repo, "same text", [1.0, 0.0, 0.0])
+        repo.list_items()  # warm the cache so the semantic arm can hit
+        before = hash_reinforce_store.extra(seeded.id)["reinforcement_count"]
+        hash_reinforce_store.reinforce(repo, "same text", [1.0, 0.0, 0.0])
+        after = hash_reinforce_store.extra(seeded.id)["reinforcement_count"]
+        store.close()
+        assert after == before + 1
+
+    def test_installed_before_the_semantic_arm(self, hash_reinforce_store):
+        """Patch-order guard: the semantic wrapper must close over our arm.
+
+        If ours landed after Fix 7 instead, semantic dedup would be shadowed and
+        silently stop working.
+        """
+        outer = hash_reinforce_store.shipped
+        assert outer.__qualname__.endswith("_semantic_sqlite_reinforce")
+        inner = dict(zip(
+            outer.__code__.co_freevars,
+            (cell.cell_contents for cell in outer.__closure__),
+        ))["_original_sqlite_reinforce"]
+        assert inner.__qualname__.endswith("_atomic_hash_reinforce")
