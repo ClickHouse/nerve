@@ -2880,6 +2880,9 @@ class MemUBridge:
             dsn = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
             db = sqlite3.connect(dsn)
             db.row_factory = sqlite3.Row
+            # One snapshot for all three statements, so `total` cannot describe
+            # a different state than `items`. Deferred: starts at the first read.
+            db.execute("BEGIN")
             try:
                 crow = db.execute(
                     "SELECT name FROM memu_memory_categories WHERE id = ?",
@@ -2910,6 +2913,7 @@ class MemUBridge:
                 ]
                 return {"name": crow["name"], "total": total, "items": items}
             finally:
+                db.rollback()
                 db.close()
 
         try:
@@ -3257,15 +3261,22 @@ class MemUBridge:
         try:
             db = _sqlite3.connect(db_path, timeout=10)
             db.row_factory = _sqlite3.Row
-            stats["total_items"] = db.execute("SELECT COUNT(*) FROM memu_memory_items").fetchone()[0]
-            stats["total_categories"] = db.execute("SELECT COUNT(*) FROM memu_memory_categories").fetchone()[0]
-            stats["total_resources"] = db.execute("SELECT COUNT(*) FROM memu_resources").fetchone()[0]
-            for row in db.execute("SELECT memory_type, COUNT(*) as cnt FROM memu_memory_items GROUP BY memory_type"):
-                stats["type_distribution"][row["memory_type"]] = row["cnt"]
-            stats["events_missing_happened_at"] = db.execute(
-                "SELECT COUNT(*) FROM memu_memory_items WHERE happened_at IS NULL AND memory_type = 'event'"
-            ).fetchone()[0]
-            db.close()
+            # One snapshot for all five statements, so the type distribution
+            # always sums to `total_items`. `finally` also releases the
+            # transaction on the error path below.
+            db.execute("BEGIN")
+            try:
+                stats["total_items"] = db.execute("SELECT COUNT(*) FROM memu_memory_items").fetchone()[0]
+                stats["total_categories"] = db.execute("SELECT COUNT(*) FROM memu_memory_categories").fetchone()[0]
+                stats["total_resources"] = db.execute("SELECT COUNT(*) FROM memu_resources").fetchone()[0]
+                for row in db.execute("SELECT memory_type, COUNT(*) as cnt FROM memu_memory_items GROUP BY memory_type"):
+                    stats["type_distribution"][row["memory_type"]] = row["cnt"]
+                stats["events_missing_happened_at"] = db.execute(
+                    "SELECT COUNT(*) FROM memu_memory_items WHERE happened_at IS NULL AND memory_type = 'event'"
+                ).fetchone()[0]
+            finally:
+                db.rollback()
+                db.close()
         except Exception as e:
             logger.warning("Failed to query memU DB stats: %s", e)
 

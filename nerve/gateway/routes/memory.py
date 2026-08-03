@@ -136,6 +136,9 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
     """
     db = sqlite3.connect(db_path, timeout=10)
     db.row_factory = sqlite3.Row
+    # One snapshot for all four scans, so the exported parts describe the same
+    # committed state instead of four different ones. Released before json.dumps.
+    db.execute("BEGIN")
     try:
         categories = []
         for row in db.execute("SELECT id, name, description, summary FROM memu_memory_categories ORDER BY name"):
@@ -172,6 +175,7 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
         for row in db.execute("SELECT category_id, item_id FROM memu_category_items"):
             cat_items.setdefault(row["category_id"], []).append(row["item_id"])
     finally:
+        db.rollback()
         db.close()
 
     return json.dumps({
