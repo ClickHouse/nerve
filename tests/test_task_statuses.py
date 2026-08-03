@@ -133,9 +133,41 @@ class TestStatusToolHandlers:
         await task_create_handler(ctx, {"title": "Some task", "content": "x"})
         task_id = (await db.list_tasks(status="all"))[0]["id"]
         result = await task_update_handler(ctx, {"task_id": task_id, "status": "nope"})
+        # Text is the model-facing reminder and must not move.
         assert "Invalid task status: 'nope'" in _text(result)
+        # is_error is the only field a programmatic caller can test.
+        assert result.is_error is True
         # Status unchanged.
         assert (await db.get_task(task_id))["status"] == "pending"
+
+    async def test_update_missing_task_is_flagged(self, db: Database, tmp_path):
+        ctx = self._ctx(db, tmp_path)
+        result = await task_update_handler(
+            ctx, {"task_id": "no-such-task", "status": "in_progress", "note": "n"},
+        )
+        assert "Task not found: no-such-task" in _text(result)
+        assert result.is_error is True
+
+    async def test_update_missing_task_done_routed_is_flagged(
+        self, db: Database, tmp_path,
+    ):
+        # status == "done" delegates to task_done_handler, a separate return site.
+        ctx = self._ctx(db, tmp_path)
+        result = await task_update_handler(
+            ctx, {"task_id": "no-such-task", "status": "done", "note": "n"},
+        )
+        assert "Task not found: no-such-task" in _text(result)
+        assert result.is_error is True
+
+    async def test_update_success_is_not_flagged(self, db: Database, tmp_path):
+        ctx = self._ctx(db, tmp_path)
+        await task_create_handler(ctx, {"title": "Happy path", "content": "x"})
+        task_id = (await db.list_tasks(status="all"))[0]["id"]
+        result = await task_update_handler(
+            ctx, {"task_id": task_id, "status": "in_progress"},
+        )
+        assert result.is_error is False
+        assert (await db.get_task(task_id))["status"] == "in_progress"
 
     async def test_update_accepts_valid_status(self, db: Database, tmp_path):
         ctx = self._ctx(db, tmp_path)

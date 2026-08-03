@@ -284,7 +284,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if status:
         err = await _validate_status(ctx, status)
         if err:
-            return ToolResult.text(err)
+            return ToolResult.text(err, is_error=True)
 
     # Route done transitions through task_done to ensure file move + FTS sync
     if status == TERMINAL_STATUS:
@@ -293,7 +293,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if ctx.db:
         task = await ctx.db.get_task(task_id)
         if not task:
-            return ToolResult.text(f"Task not found: {task_id}")
+            return ToolResult.text(f"Task not found: {task_id}", is_error=True)
 
         new_tags_str = ""
         if raw_tags:
@@ -454,7 +454,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if ctx.db:
         task = await ctx.db.get_task(task_id)
         if not task:
-            return ToolResult.text(f"Task not found: {task_id}")
+            return ToolResult.text(f"Task not found: {task_id}", is_error=True)
 
         # Done is a write like any other — it copies the file into done/ and
         # unlinks the source, so a stored ``file_path`` inside the tracked config
