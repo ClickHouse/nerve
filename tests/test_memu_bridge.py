@@ -1212,6 +1212,19 @@ class _CategoryFixture:
     """
 
     def __init__(self, tmp_path):
+        # Snapshot before _category_models(), which patches too -- a snapshot
+        # taken in __enter__ would already hold the patched methods.
+        import memu.app.service  # noqa: F401 - import-order circularity
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo,
+        )
+
+        self._repo = SQLiteMemoryItemRepo
+        self._saved = {
+            n: SQLiteMemoryItemRepo.__dict__.get(n)
+            for n in ("update_item", "delete_item", "clear_items", "list_items",
+                      "create_item", "create_item_reinforce", "vector_search_items")
+        }
         self.models = _category_models()
         self.path = str(tmp_path / "memu.sqlite")
         self._stores = []
@@ -1226,6 +1239,12 @@ class _CategoryFixture:
                 store.close()
             except Exception:
                 pass
+        for name, fn in self._saved.items():
+            if fn is None:
+                if name in self._repo.__dict__:
+                    delattr(self._repo, name)
+            else:
+                setattr(self._repo, name, fn)
         return False
 
     def store(self):
@@ -1356,6 +1375,47 @@ def _unreachable_ids(store, ctx):
 
 class TestCategoryNameNormalization:
     """nerve's name-to-id keys must match memU's strip().lower() contract."""
+
+    def test_fixture_restores_the_item_repo_on_exit(self, tmp_path):
+        """The fixture must not leak _patch_sqlite_bugs() to its neighbours.
+
+        TestIndexedUpdateItemForwarding introspects update_item's signature, so a
+        leaked wrapper turns it red from ~200 lines away. Order-independent: the
+        leak is observable within one test body.
+        """
+        import inspect
+
+        import memu.app.service  # noqa: F401 - import-order circularity
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        names = (
+            "update_item", "delete_item", "clear_items", "list_items",
+            "create_item", "create_item_reinforce", "vector_search_items",
+        )
+
+        def methods():
+            return {n: Repo.__dict__.get(n) for n in names}
+
+        def keyword_only():
+            param = inspect.signature(Repo.update_item).parameters.get("item_id")
+            return param is not None and param.kind is inspect.Parameter.KEYWORD_ONLY
+
+        before = methods()
+        assert keyword_only(), "precondition: update_item unpatched on entry"
+
+        with _CategoryFixture(tmp_path) as fx:
+            fx.store()
+            assert "item_id" not in inspect.signature(Repo.update_item).parameters, (
+                "the patch is meant to be applied inside the fixture"
+            )
+
+        # Every name the patch reassigns, not just the one the neighbour reads:
+        # a restore list narrowed to update_item must not pass this.
+        leaked = sorted(n for n, fn in methods().items() if fn is not before[n])
+        assert not leaked, f"_CategoryFixture leaked on exit: {leaked}"
+        assert keyword_only(), "_CategoryFixture leaked _patch_sqlite_bugs() on exit"
 
     @pytest.mark.asyncio
     async def test_padded_category_name_is_reachable_by_its_stripped_key(
