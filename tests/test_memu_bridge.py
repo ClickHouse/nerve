@@ -3,14 +3,16 @@
 import asyncio
 import json
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 
-from nerve.config import MemoryConfig, NerveConfig
+from nerve.config import MemoryCategoryConfig, MemoryConfig, NerveConfig
 from nerve.memory.memu_bridge import (
     MemoryBackendUnavailable,
     MemUBridge,
@@ -1134,3 +1136,508 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# The advertised category view (_rebuild_category_view)
+# ---------------------------------------------------------------------------
+
+# memU's SQLModel table classes are process-global: building a second set raises
+# "Column object 'url' already assigned to Table 'memu_resources'".  Build them
+# once and inject them, so each test still gets a real store on a fresh file.
+_CATEGORY_SQLA: dict[str, object] = {}
+
+
+def _category_store(db_path: Path):
+    """A genuine memU SQLite store, safe to build repeatedly in one process."""
+    import memu.app.service  # noqa: F401 - first, else the patcher hits a circular import
+
+    MemUBridge._patch_sqlite_bugs()  # required before the first store is built
+    from memu.database.sqlite.schema import get_sqlite_sqlalchemy_models
+    from memu.database.sqlite.sqlite import SQLiteStore
+    from pydantic import BaseModel
+
+    class _Scope(BaseModel):
+        pass
+
+    if "models" not in _CATEGORY_SQLA:
+        _CATEGORY_SQLA["scope"] = _Scope
+        _CATEGORY_SQLA["models"] = get_sqlite_sqlalchemy_models(scope_model=_Scope)
+    return SQLiteStore(
+        dsn=f"sqlite:///{db_path}",
+        scope_model=_CATEGORY_SQLA["scope"],
+        sqla_models=_CATEGORY_SQLA["models"],
+    )
+
+
+class _ViewService:
+    """Stand-in for MemoryService's category state over a REAL store.
+
+    Mirrors service.py exactly: ``category_configs`` is a *copy* of
+    ``memorize_config.memory_categories``, and the prompt is memU's own
+    formatter, so a run against unfixed code shows its true behaviour.
+    """
+
+    def __init__(self, store, effective):
+        from memu.app.memorize import MemorizeMixin
+        from memu.app.service import CategoryConfig
+
+        self.memorize_config = MagicMock()
+        self.memorize_config.memory_categories = [
+            CategoryConfig(name=n, description=d) for n, d in effective
+        ]
+        self.category_configs = list(self.memorize_config.memory_categories)
+        self.category_config_map = {c.name: c for c in self.category_configs}
+        self._format_categories_for_prompt = (
+            lambda cfgs: MemorizeMixin._format_categories_for_prompt(self, cfgs)
+        )
+        self._category_prompt_str = self._format_categories_for_prompt(self.category_configs)
+        self.database = store
+        self._context = SimpleNamespace(
+            category_ids=[], category_name_to_id={}, categories_ready=False,
+        )
+
+    def _get_context(self):
+        return self._context
+
+
+def _view_bridge(tmp_path, effective, *, configured=None, rows=(), db_name="memu.sqlite"):
+    """A bridge wired for the view helper only: stub service, real store, real rows."""
+    config = _make_config(tmp_path)
+    config.memory.categories = [
+        MemoryCategoryConfig(name=n, description=d)
+        for n, d in (configured if configured is not None else effective)
+    ]
+    bridge = MemUBridge(config, audit_db=None)
+    store = _category_store(tmp_path / db_name)
+    for name, desc in rows:
+        store.memory_category_repo.get_or_create_category(
+            name=name, description=desc, embedding=[], user_data={},
+        )
+    bridge._service = _ViewService(store, effective)
+    # The rows above were created through the same store the service holds, so
+    # they are already in its cache -- what _initialize_impl's hydration does.
+    return bridge
+
+
+def _advertised(bridge):
+    return [c.name for c in bridge._service.category_configs]
+
+
+def _prompt_lines(bridge):
+    return [ln for ln in bridge._service._category_prompt_str.splitlines() if ln.strip()]
+
+
+_VIEW_INIT_PROBE = """
+import asyncio, json, sqlite3, sys
+from pathlib import Path
+import memu.app.service  # first: avoids a circular import in the patcher
+from nerve.config import MemoryCategoryConfig, MemoryConfig, NerveConfig
+from nerve.memory.memu_bridge import MemUBridge
+
+async def main():
+    tmp = Path(sys.argv[1]); configured = json.loads(sys.argv[2]); mode = sys.argv[3]
+    db = tmp / "memu.sqlite"
+    cfg = NerveConfig()
+    cfg.memory = MemoryConfig(
+        sqlite_dsn=f"sqlite:///{db}",
+        categories=[MemoryCategoryConfig(name=n, description=d) for n, d in configured],
+    )
+    cfg.anthropic_api_key = "test-key"
+    if mode == "preseed":
+        # A previous process: nerve's own init, then web-UI-style creates.
+        bridge = MemUBridge(cfg, audit_db=None)
+        ok = await bridge.initialize()
+        for name, desc in json.loads(sys.argv[4]):
+            if not any(name == n for n, _ in configured):
+                await bridge.create_category(name, desc, source="web_ui")
+        await bridge.shutdown()
+        print("PROBE_JSON " + json.dumps({"initialize": ok}))
+        return
+    MemUBridge._patch_sqlite_bugs()
+    import memu.database.sqlite.repositories.memory_category_repo as m
+    if mode == "fail-load":
+        def _boom(self, where=None):
+            raise RuntimeError("list_categories exploded")
+        m.SQLiteMemoryCategoryRepo.list_categories = _boom
+    else:
+        # Record busy_timeout as seen BY EACH category read, in order.  A
+        # timeout read after init cannot discriminate the pragma ordering,
+        # because dispose() fixes every later connection; only the connection
+        # the read itself uses can.
+        _timeouts = []
+        _real_list = m.SQLiteMemoryCategoryRepo.list_categories
+        def _watched(self, where=None):
+            try:
+                with self._sessions.engine.connect() as conn:
+                    _timeouts.append(conn.exec_driver_sql("PRAGMA busy_timeout").scalar())
+            except Exception as exc:
+                _timeouts.append("error: %s" % exc)
+            return _real_list(self, where)
+        m.SQLiteMemoryCategoryRepo.list_categories = _watched
+    bridge = MemUBridge(cfg, audit_db=None)
+    ok = await bridge.initialize()
+    out = {"initialize": ok, "available": bridge._available,
+           "service_available": bridge._metrics.service_available}
+    if mode != "fail-load":
+        out["busy_timeout_per_category_read"] = _timeouts
+    if bridge._service is not None:
+        svc = bridge._service
+        out["advertised"] = [c.name for c in svc.category_configs]
+        out["prompt_lines"] = [l for l in svc._category_prompt_str.splitlines() if l.strip()]
+        out["descs"] = {c.name: c.description for c in svc.category_configs}
+        await bridge.shutdown()
+    con = sqlite3.connect(db)
+    try:
+        out["file_rows"] = sorted(r[0] for r in
+                                  con.execute("select name from memu_memory_categories"))
+    except Exception:
+        out["file_rows"] = []
+    con.close()
+    print("PROBE_JSON " + json.dumps(out))
+
+asyncio.run(main())
+"""
+
+
+def _run_view_init(tmp_path, configured=(), mode="normal", preseed=()):
+    """Run full MemUBridge.initialize() runs in subprocesses and report the view.
+
+    Out of process because memU allows exactly one MemoryService per
+    interpreter; the preseed is its own process precisely so it is a genuine
+    "previous run" rather than a warm cache in this one.
+    """
+    import subprocess
+
+    root = str(Path(__file__).resolve().parent.parent)
+    conf = json.dumps([list(c) for c in configured])
+
+    def _run(*args):
+        proc = subprocess.run(
+            [sys.executable, "-c", _VIEW_INIT_PROBE, str(tmp_path), conf, *args],
+            capture_output=True, text=True, timeout=300, cwd=root,
+        )
+        line = next((ln for ln in proc.stdout.splitlines()
+                     if ln.startswith("PROBE_JSON ")), None)
+        assert line is not None, (
+            f"probe produced no report\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+        return json.loads(line[len("PROBE_JSON "):])
+
+    if preseed:
+        assert _run("preseed", json.dumps([list(p) for p in preseed]))["initialize"] is True
+    return _run(mode)
+
+
+class TestRebuildCategoryView:
+    """``category_configs`` is the ONLY set memU advertises to the memorize LLM.
+
+    nerve filled it from config once and then only ever appended, so a category
+    persisted by an earlier process was never advertised (it could not receive
+    new memories) while a configured one was advertised twice.
+    """
+
+    def test_a_persisted_runtime_category_is_advertised(self, tmp_path):
+        """Defect A: a web-created category must survive a restart."""
+        bridge = _view_bridge(
+            tmp_path, [("procedures", "cfg desc")],
+            rows=[("procedures", "cfg desc"), ("my_topic", "user made this")],
+        )
+
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == ["procedures", "my_topic"]
+        assert "- my_topic: user made this" in _prompt_lines(bridge)
+        assert bridge._service.category_config_map["my_topic"].description == "user made this"
+
+    def test_the_config_description_wins_over_the_persisted_row(self, tmp_path):
+        """Precedence: get_or_create_category ignores description on a name hit,
+        so a row keeps its original text forever.  Letting the row win would
+        make a config.yaml edit stop reaching the prompt."""
+        bridge = _view_bridge(
+            tmp_path, [("procedures", "NEW config desc")],
+            rows=[("procedures", "OLD db desc")],
+        )
+
+        bridge._rebuild_category_view()
+
+        assert _prompt_lines(bridge) == ["- procedures: NEW config desc"]
+        assert bridge._service.category_config_map["procedures"].description == "NEW config desc"
+
+    def test_rebuilding_repeatedly_does_not_grow_the_advertised_set(self, tmp_path):
+        """Defect B: idempotence is what replaces an is-it-present predicate."""
+        bridge = _view_bridge(
+            tmp_path, [("procedures", "p")], rows=[("procedures", "p"), ("my_topic", "u")],
+        )
+
+        for _ in range(5):
+            bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == ["procedures", "my_topic"]
+        assert len(_prompt_lines(bridge)) == 2
+
+    def test_a_case_variant_row_is_not_dropped(self, tmp_path):
+        """Names are compared EXACTLY, as memU stores and matches them.
+
+        The base schema has a non-unique name index and get_or_create_category
+        matches exactly, so ``procedures`` and ``PROCEDURES`` are distinct rows;
+        deduping on a normalized name would silently omit one of them.
+        """
+        bridge = _view_bridge(
+            tmp_path, [("procedures", "cfg")],
+            rows=[("procedures", "cfg"), ("PROCEDURES", "upper")],
+        )
+
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == ["procedures", "PROCEDURES"]
+        assert len(_prompt_lines(bridge)) == 2
+
+    def test_the_persisted_tail_is_name_sorted(self, tmp_path):
+        """list_categories issues no ORDER BY, so without a sort the prompt
+        would vary run to run; the configured prefix keeps its config order."""
+        bridge = _view_bridge(
+            tmp_path, [("zzz_configured", "c"), ("aaa_configured", "c")],
+            rows=[("zeta", "z"), ("alpha", "a"), ("mid", "m")],
+        )
+
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == [
+            "zzz_configured", "aaa_configured", "alpha", "mid", "zeta",
+        ]
+
+    def test_an_empty_nerve_config_keeps_memus_own_defaults(self, tmp_path):
+        """The baseline is memU's EFFECTIVE list, not nerve's config.
+
+        With no configured categories memU substitutes its own defaults and
+        advertises them; reading nerve's (empty) config here would wipe them and
+        leave the LLM with 'No categories provided.'
+        """
+        defaults = [(f"memu_default_{i}", f"d{i}") for i in range(10)]
+        bridge = _view_bridge(tmp_path, defaults, configured=[])
+
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == [n for n, _ in defaults]
+        assert len(_prompt_lines(bridge)) == 10
+
+    def test_an_empty_nerve_config_also_advertises_a_persisted_row(self, tmp_path):
+        """Both properties on that path: memU's defaults AND the persisted row."""
+        defaults = [(f"memu_default_{i}", f"d{i}") for i in range(10)]
+        bridge = _view_bridge(tmp_path, defaults, configured=[], rows=[("my_topic", "u")])
+
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == [n for n, _ in defaults] + ["my_topic"]
+        assert len(_prompt_lines(bridge)) == 11
+
+    def test_a_configured_deployment_gets_no_extra_defaults(self, tmp_path):
+        """Reverse control: never 'just always use memU's 10 defaults'."""
+        bridge = _view_bridge(
+            tmp_path, [("task_domain", "d"), ("patterns", "p")], rows=[("my_topic", "u")],
+        )
+
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == ["task_domain", "patterns", "my_topic"]
+
+    def test_a_persisted_row_never_becomes_part_of_the_baseline(self, tmp_path):
+        """The baseline is memU's immutable effective list, never the view's own
+        output: promoting a row into it would make a row that later leaves the
+        DB impossible to drop from the prompt."""
+        bridge = _view_bridge(tmp_path, [("procedures", "p")], rows=[("my_topic", "u")])
+        repo = bridge._service.database.memory_category_repo
+
+        for _ in range(3):
+            bridge._rebuild_category_view()
+        assert "my_topic" in _advertised(bridge)
+
+        repo.categories.clear()
+        bridge._rebuild_category_view()
+
+        assert _advertised(bridge) == ["procedures"]
+
+
+class TestCreateCategoryKeepsTheViewIdempotent:
+    """A repeated create on an existing name used to append forever: nothing
+    rebuilt the view after init, and get_or_create_category returns the
+    existing row rather than failing."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_create_does_not_grow_the_advertised_set(self, tmp_path):
+        bridge = _view_bridge(tmp_path, [("procedures", "p")], rows=[("procedures", "p")])
+        bridge._audit = AsyncMock()
+        repo = bridge._service.database.memory_category_repo
+
+        for _ in range(3):
+            assert await bridge._create_category_impl("procedures", "p") is True
+
+        assert _advertised(bridge) == ["procedures"]
+        assert len(_prompt_lines(bridge)) == 1
+        assert len(repo.list_categories()) == 1
+
+    @pytest.mark.asyncio
+    async def test_repeated_create_does_not_duplicate_the_context_id(self, tmp_path):
+        """``ctx.category_ids`` is guarded on the ID, NOT on config presence:
+        the two invariants are independent (see the reverse-direction test)."""
+        bridge = _view_bridge(tmp_path, [("procedures", "p")], rows=[("procedures", "p")])
+        bridge._audit = AsyncMock()
+        ctx = bridge._service._get_context()
+
+        for _ in range(3):
+            await bridge._create_category_impl("procedures", "p")
+
+        assert len(ctx.category_ids) == 1
+        assert len(ctx.category_ids) == len(set(ctx.category_ids))
+
+    @pytest.mark.asyncio
+    async def test_the_context_id_is_appended_when_only_the_name_is_known(self, tmp_path):
+        """Reverse direction, and the arm that rejects sharing R1's predicate:
+        on first boot the name is already in ``category_configs`` (memU put it
+        there) while its ID is not yet in ``ctx`` -- so a config-presence gate
+        would wrongly suppress a needed append."""
+        bridge = _view_bridge(tmp_path, [("procedures", "p")], rows=[("procedures", "p")])
+        bridge._audit = AsyncMock()
+        ctx = bridge._service._get_context()
+        assert "procedures" in _advertised(bridge)
+        assert ctx.category_ids == []
+
+        await bridge._create_category_impl("procedures", "p")
+
+        assert len(ctx.category_ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_new_category_still_reaches_the_prompt(self, tmp_path):
+        """Control against over-suppression: a real create must still land."""
+        bridge = _view_bridge(tmp_path, [("procedures", "p")], rows=[("procedures", "p")])
+        bridge._audit = AsyncMock()
+        ctx = bridge._service._get_context()
+        repo = bridge._service.database.memory_category_repo
+
+        assert await bridge._create_category_impl("brand_new", "fresh") is True
+
+        assert _advertised(bridge) == ["procedures", "brand_new"]
+        assert "- brand_new: fresh" in _prompt_lines(bridge)
+        assert len(_prompt_lines(bridge)) == 2
+        assert sorted(c.name for c in repo.list_categories().values()) == [
+            "brand_new", "procedures",
+        ]
+        new_id = next(c.id for c in repo.categories.values() if c.name == "brand_new")
+        assert new_id in ctx.category_ids
+
+    @pytest.mark.asyncio
+    async def test_the_view_rebuild_makes_no_embedding_call(self, tmp_path):
+        """memU's own category producer is dead here (nerve sets
+        categories_ready=True and nothing ever sets it False), so surfacing
+        persisted rows costs zero embedding calls.  Asserted, not assumed: a
+        change that revived that producer would add N API calls per restart."""
+        bridge = _view_bridge(tmp_path, [("procedures", "p")], rows=[("my_topic", "u")])
+        embed = AsyncMock(side_effect=AssertionError("unexpected embedding call"))
+        bridge._service._get_llm_client = lambda _p: SimpleNamespace(embed=embed)
+
+        bridge._rebuild_category_view()
+
+        assert "my_topic" in _advertised(bridge)
+        assert embed.await_count == 0
+
+
+class TestUpdateCategoryRefreshesTheView:
+    """``_update_category_impl`` wrote the row and re-embedded but left the
+    advertised description stale for the rest of the process."""
+
+    @pytest.mark.asyncio
+    async def test_a_description_edit_reaches_the_prompt(self, tmp_path):
+        bridge = _view_bridge(
+            tmp_path, [("procedures", "cfg desc")],
+            rows=[("procedures", "cfg desc"), ("my_topic", "original")],
+        )
+        bridge._audit = AsyncMock()
+        bridge._rebuild_category_view()
+        repo = bridge._service.database.memory_category_repo
+        cid = next(c.id for c in repo.categories.values() if c.name == "my_topic")
+
+        assert await bridge._update_category_impl(cid, description="EDITED") is True
+
+        assert "- my_topic: EDITED" in _prompt_lines(bridge)
+        assert bridge._service.category_config_map["my_topic"].description == "EDITED"
+
+    @pytest.mark.asyncio
+    async def test_an_edit_does_not_override_a_configured_description(self, tmp_path):
+        """The precedence half, end to end: config still wins after a UI edit."""
+        bridge = _view_bridge(
+            tmp_path, [("procedures", "cfg desc")], rows=[("procedures", "cfg desc")],
+        )
+        bridge._audit = AsyncMock()
+        repo = bridge._service.database.memory_category_repo
+        cid = next(c.id for c in repo.categories.values() if c.name == "procedures")
+
+        assert await bridge._update_category_impl(cid, description="EDITED") is True
+
+        assert _prompt_lines(bridge) == ["- procedures: cfg desc"]
+        assert repo.categories[cid].description == "EDITED"
+
+
+class TestInitializeHydratesPersistedCategories:
+    """End-to-end over a real MemoryService: the view must reflect the DB, and
+    the load must happen on a tuned connection before availability is published."""
+
+    def test_a_category_from_an_earlier_process_is_advertised(self, tmp_path):
+        report = _run_view_init(
+            tmp_path, configured=[("procedures", "cfg desc")],
+            preseed=[("my_topic", "user made this")],
+        )
+
+        assert report["initialize"] is True
+        assert report["file_rows"] == ["my_topic", "procedures"]
+        assert report["advertised"] == ["procedures", "my_topic"]
+        assert "- my_topic: user made this" in report["prompt_lines"]
+
+    def test_a_first_boot_does_not_advertise_a_configured_category_twice(self, tmp_path):
+        report = _run_view_init(tmp_path, configured=[("procedures", "p")])
+
+        assert report["initialize"] is True
+        assert report["advertised"] == ["procedures"]
+        assert report["prompt_lines"] == ["- procedures: p"]
+
+    def test_an_empty_config_advertises_defaults_and_persisted_rows(self, tmp_path):
+        """The injection-free discriminator for the early hydration: on this path
+        nothing else ever reads the category table (``_ensure_categories``
+        early-returns), so without it the persisted row is invisible."""
+        report = _run_view_init(tmp_path, configured=[], preseed=[("my_topic", "u")])
+
+        assert report["initialize"] is True
+        assert report["file_rows"] == ["my_topic"]
+        assert len(report["advertised"]) == 11
+        assert report["advertised"][-1] == "my_topic"
+        assert report["descs"]["my_topic"] == "u"
+
+    def test_the_load_runs_on_a_tuned_connection(self, tmp_path):
+        """The pragmas are attached before the load, not after: dispose() fixes
+        future connections but cannot re-run a completed read, so the load would
+        otherwise run without the 30s busy_timeout that stops
+        'database is locked' under concurrent writers.
+
+        The observable has to be the timeout seen by the FIRST category read.
+        A timeout read after init passes either way (dispose() already recycled
+        that connection), so it would not discriminate the ordering at all.
+        """
+        report = _run_view_init(
+            tmp_path, configured=[("procedures", "p")], preseed=[("my_topic", "u")],
+        )
+
+        seen = report["busy_timeout_per_category_read"]
+        assert seen, "no category read was observed"
+        assert seen[0] == 30000, f"the load ran untuned: {seen}"
+        assert set(seen) == {30000}
+        assert "my_topic" in report["advertised"]
+
+    def test_availability_is_not_published_when_the_load_fails(self, tmp_path):
+        """The load precedes the availability flags, so a failure cannot leave
+        the bridge advertising a service it could not initialize."""
+        report = _run_view_init(tmp_path, configured=[("procedures", "p")], mode="fail-load")
+
+        assert report["initialize"] is False
+        assert report["available"] is False
+        assert report["service_available"] is False
+        assert report["file_rows"] == []

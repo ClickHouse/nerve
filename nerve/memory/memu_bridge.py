@@ -1564,13 +1564,23 @@ class MemUBridge:
                        if not self.config.openai_api_key else {}),
                 },
             )
+            # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
+            # Attached before the first read below, so that read gets the 30s
+            # busy_timeout: dispose() recycles pooled connections but cannot
+            # re-run a read that already completed.
+            self._attach_engine_pragmas()
+
+            # Load persisted categories while the repo cache is guaranteed
+            # cold: Fix 5 short-circuits list_categories on a warm cache, so a
+            # later call would not see rows this process did not create.
+            # Runs before the flags below, so a failure cannot leave the bridge
+            # advertising availability.
+            self._service.database.memory_category_repo.list_categories()
+
             self._available = True
             self._metrics.service_available = True
             self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
             logger.info("memU service initialized with SQLite at %s", sqlite_dsn)
-
-            # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
-            self._attach_engine_pragmas()
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
@@ -1580,6 +1590,11 @@ class MemUBridge:
                 self._inject_bedrock_clients()
 
             await self._ensure_categories()
+
+            # Rebuild the advertised set from config + persisted rows, so a
+            # category created in an earlier process reaches the prompt and a
+            # seeded one is not listed twice.
+            self._rebuild_category_view()
 
             # Mark categories as ready so memU's _initialize_categories
             # doesn't re-embed all default categories on every memorize().
@@ -1882,6 +1897,51 @@ class MemUBridge:
                 await self._create_category_impl(cat_cfg.name, cat_cfg.description)
             except Exception as e:
                 logger.warning("Failed to seed category %s: %s", cat_cfg.name, e)
+
+    def _rebuild_category_view(self) -> None:
+        """Recompute the category set memU advertises to the memorize LLM.
+
+        memU derives that set from ``category_configs`` alone
+        (``_category_prompt_str`` is built from it), and nerve populates it
+        from config at construction and then only ever appends.  So a category
+        persisted by an earlier process is never advertised, and a configured
+        one gets appended again on every create.  Recomputing from
+        ``(effective config, persisted rows)`` makes all three derived fields
+        idempotent.
+
+        Baseline is memU's *effective* ``memory_categories``, not
+        ``self.config.memory.categories``: the two differ on a deployment with
+        no configured categories, where memU substitutes its own defaults and
+        reading nerve's config would wipe them from the prompt.
+
+        Config entries stay authoritative and keep their order (a DB row keeps
+        whatever description it was created with, because
+        ``get_or_create_category`` ignores ``description`` on a name hit, so
+        letting the row win would make config edits stop reaching the prompt).
+        Names are compared exactly, as memU stores and matches them; rows are
+        appended name-sorted because ``list_categories`` is unordered.
+        """
+        if not self._service:
+            return
+        from memu.app.service import CategoryConfig
+
+        # The validated effective list; MemoryService only ever holds a copy of
+        # it, so it is a stable baseline no matter what we do to that copy.
+        configs = list(self._service.memorize_config.memory_categories or [])
+        seen = {cfg.name for cfg in configs}
+        rows = self._service.database.memory_category_repo.categories.values()
+        for cat in sorted(rows, key=lambda c: getattr(c, "name", "")):
+            name = getattr(cat, "name", "")
+            if name in seen:
+                continue
+            seen.add(name)
+            configs.append(CategoryConfig(name=name, description=cat.description or ""))
+
+        self._service.category_configs = configs
+        self._service.category_config_map = {cfg.name: cfg for cfg in configs}
+        self._service._category_prompt_str = (
+            self._service._format_categories_for_prompt(configs)
+        )
 
     # Maximum time (seconds) for a single memorize operation before cancellation.
     # Try to load malloc_trim for returning freed arenas to the OS.
@@ -3028,18 +3088,16 @@ class MemUBridge:
                 name=name, description=description, embedding=embedding, user_data={},
             )
 
-            # Update in-memory config so new memorizations can assign to this category
-            from memu.app.service import CategoryConfig
-            cfg = CategoryConfig(name=name, description=description)
-            self._service.category_configs.append(cfg)
-            self._service.category_config_map[name] = cfg
-            self._service._category_prompt_str = self._service._format_categories_for_prompt(
-                self._service.category_configs
-            )
+            # Update in-memory config so new memorizations can assign to this
+            # category.  A full rebuild rather than an append: this runs on an
+            # existing name too (get_or_create_category returns the existing
+            # row), and nothing rebuilds the view after init.
+            self._rebuild_category_view()
 
             # Update context category mappings
             ctx = self._service._get_context()
-            if hasattr(ctx, 'category_ids') and ctx.category_ids is not None:
+            if (hasattr(ctx, 'category_ids') and ctx.category_ids is not None
+                    and cat.id not in ctx.category_ids):
                 ctx.category_ids.append(cat.id)
             if hasattr(ctx, 'category_name_to_id') and ctx.category_name_to_id is not None:
                 ctx.category_name_to_id[name.lower()] = cat.id
@@ -3101,6 +3159,9 @@ class MemUBridge:
                 summary=new_summary if summary is not None else None,
                 embedding=embedding,
             )
+            # Refresh the advertised set: the row changed, so the prompt would
+            # otherwise keep the old description for the rest of the process.
+            self._rebuild_category_view()
             logger.info("Updated category: %s", category_id)
             await self._audit("category_updated", "category", category_id, source, {
                 "summary_changed": summary is not None,
