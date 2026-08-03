@@ -1257,7 +1257,22 @@ class TestAtomicHashReinforce:
     """
 
     def test_preserves_a_concurrent_extra_write(self, hash_reinforce_store):
-        """The window test: unpatched memu LOSES the concurrent key, ours keeps it."""
+        """The window test: unpatched memu LOSES the concurrent key, ours keeps it.
+
+        The two arms need DIFFERENT injection points, and that asymmetry is the
+        whole reason a single hook is wrong here. Upstream calls `_now()` AFTER
+        its entity SELECT (`memory_item_repo.py:320` then `:329`), so a `_now`
+        hook lands inside its read -> write window. Our arm calls `_now()` at
+        `memu_bridge.py:1196`, above the session open and above the id resolve,
+        so the same hook would commit BEFORE the arm's first statement and the
+        test would pass even for a plain Python read-modify-write. Hook the
+        first `UPDATE` instead, which is the point our window actually opens at
+        (and the shape the two sibling window tests in this class already use).
+        Upstream flushes via `session.add`/`commit` rather than an explicit
+        `session.execute("UPDATE ...")`, so that hook would never fire there.
+        """
+        from sqlalchemy.orm import Session
+
         results = {}
         for label, fixed in (("base", False), ("fixed", True)):
             hash_reinforce_store.install(fixed=fixed)
@@ -1271,30 +1286,41 @@ class TestAtomicHashReinforce:
             repo = second.memory_item_repo
             assert not repo.items, "cache must be cold so the hash arm runs"
 
-            # _now() is called after the row lookup and before the commit, so a
-            # write issued from here lands inside the read -> write window.
-            real_now = hash_reinforce_store.repo_cls._now
             fired = []
 
-            def inject(self, _real=real_now, _path=hash_reinforce_store.path,
-                       _id=seeded.id):
+            def write_concurrently(_path=hash_reinforce_store.path, _id=seeded.id):
+                fired.append(True)
+                writer = sqlite3.connect(_path, timeout=30)
+                writer.execute(
+                    "UPDATE memu_memory_items SET extra=json_set("
+                    "COALESCE(NULLIF(extra,''),'{}'),'$.mentioned_at','2026-08-03')"
+                    " WHERE id=?", (_id,),
+                )
+                writer.commit()
+                writer.close()
+
+            real_now = hash_reinforce_store.repo_cls._now
+            real_execute = Session.execute
+
+            def inject_at_now(self, _real=real_now):
                 if not fired:
-                    fired.append(True)
-                    writer = sqlite3.connect(_path, timeout=30)
-                    writer.execute(
-                        "UPDATE memu_memory_items SET extra=json_set("
-                        "COALESCE(NULLIF(extra,''),'{}'),'$.mentioned_at','2026-08-03')"
-                        " WHERE id=?", (_id,),
-                    )
-                    writer.commit()
-                    writer.close()
+                    write_concurrently()
                 return _real(self)
 
-            hash_reinforce_store.repo_cls._now = inject
+            def inject_before_update(self, statement, *args, **kwargs):
+                if not fired and str(statement).lstrip().upper().startswith("UPDATE"):
+                    write_concurrently()
+                return real_execute(self, statement, *args, **kwargs)
+
+            if fixed:
+                Session.execute = inject_before_update
+            else:
+                hash_reinforce_store.repo_cls._now = inject_at_now
             try:
                 out = hash_reinforce_store.reinforce(repo, "same text", [1.0, 0.0, 0.0])
             finally:
                 hash_reinforce_store.repo_cls._now = real_now
+                Session.execute = real_execute
                 second.close()
 
             assert fired, f"{label}: the concurrent write never fired"
@@ -1324,12 +1350,17 @@ class TestAtomicHashReinforce:
         assert results["fixed"]["cached"] == results["fixed"]["row"]
 
     def test_tolerates_an_empty_extra_written_into_the_window(self, hash_reinforce_store):
-        """NULLIF is required, not defensive.
+        """NULLIF is required, not defensive, and `content_hash` must survive.
 
         Our arm resolves a target id, then UPDATEs it. A writer can blank that
         row's `extra` in between, and coalesce alone would then feed '' to
-        json_set, which raises "malformed JSON".
+        json_set, which raises "malformed JSON". The blanked row must also come
+        back out carrying `content_hash`: upstream re-wrote it as a side effect
+        of the whole-column flush this arm removes, so it has to be asserted
+        server-side or the row permanently stops matching the arm's own hash
+        filter and the next reinforce creates a duplicate.
         """
+        from memu.database.models import compute_content_hash
         from sqlalchemy.orm import Session
 
         hash_reinforce_store.install(fixed=True)
@@ -1368,6 +1399,22 @@ class TestAtomicHashReinforce:
         merged = hash_reinforce_store.extra(seeded.id)
         assert merged["reinforcement_count"] == 2
         assert "last_reinforced_at" in merged
+        assert merged["content_hash"] == compute_content_hash("same text", "knowledge")
+
+        # Reachability, not just a field check: without content_hash the row no
+        # longer satisfies the arm's hash filter, so a third cold reinforce of
+        # the same text creates a second row instead of dedup'ing.
+        third = hash_reinforce_store.open()
+        assert not third.memory_item_repo.items
+        again = hash_reinforce_store.reinforce(
+            third.memory_item_repo, "same text", [1.0, 0.0, 0.0],
+        )
+        third.close()
+        rows = sqlite3.connect(hash_reinforce_store.path).execute(
+            "SELECT count() FROM memu_memory_items",
+        ).fetchone()[0]
+        assert again.id == seeded.id, "the blanked row stopped dedup'ing"
+        assert rows == 1, f"a duplicate was created, rows={rows}"
 
     def test_increments_from_the_live_count_not_a_constant(self, hash_reinforce_store):
         """The count must come from json_extract on the live column.

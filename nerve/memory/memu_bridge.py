@@ -1204,7 +1204,16 @@ class MemUBridge:
                 live = func.coalesce(func.nullif(model.extra, ""), "{}")
                 extra_expr = func.json_set(
                     func.json_set(
-                        live,
+                        # Re-assert the hash. Upstream rewrote it as a side
+                        # effect of the whole-column flush this arm removes, so
+                        # a writer blanking the chosen target inside the window
+                        # would leave the row unmatchable by the filter above
+                        # and the next reinforce would create a duplicate.
+                        func.json_set(
+                            live,
+                            "$.content_hash",
+                            _content_hash(summary, memory_type),
+                        ),
                         "$.reinforcement_count",
                         # json_extract on the same column in the same statement,
                         # so the increment is atomic too.
