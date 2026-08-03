@@ -74,6 +74,7 @@ from nerve import paths
 from nerve.config import (
     _deep_merge,
     _expand_path,
+    _is_within,
     _read_yaml_mapping,
     workspace_config_dir,
     workspace_settings_file,
@@ -229,6 +230,16 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # path that exists on exactly one of them.
     "workflows.runs_dir",
 })
+
+
+# Cron settings naming a *file or directory* that :func:`_migrate_cron` is about
+# to move. They are dropped rather than rewritten: the whole point of the
+# workspace layout is that cron config resolves to ``<workspace>/config/cron``
+# (see :func:`nerve.config._resolve_cron_dir`), and a rewritten absolute path
+# would be a machine-local location baked into the file the docs say to commit —
+# wrong on the next box to sync it, and exactly what the config repo exists to
+# avoid.
+_MIGRATED_CRON_PATH_KEYS = ("jobs_file", "system_file", "gate_plugins_dir")
 
 
 @dataclass
@@ -533,7 +544,7 @@ def migrate(
     legacy_cron = Path(legacy_cron_dir) if legacy_cron_dir is not None else paths.cron_dir()
     report = MigrationReport(dry_run=dry_run) if report is None else report
 
-    _migrate_config_yaml(config_dir, workspace, report)
+    _migrate_config_yaml(config_dir, workspace, legacy_cron, report)
     _migrate_cron(workspace, legacy_cron, report)
     return report
 
@@ -557,7 +568,55 @@ def _settings_has_content(settings: Path) -> bool:
         return True
 
 
-def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationReport) -> None:
+def _drop_migrated_cron_paths(
+    raw: dict, legacy_cron: Path, report: MigrationReport
+) -> None:
+    """Drop cron path settings that point into the directory being migrated.
+
+    A legacy monolith that spelled its cron locations out —
+
+    .. code-block:: yaml
+
+        cron:
+          system_file: ~/.nerve/cron/system.yaml
+          jobs_file: ~/.nerve/cron/jobs.yaml
+
+    — is naming files that :func:`_migrate_cron` moves into the workspace,
+    leaving ``*.migrated`` breadcrumbs behind. Carried across unchanged, those
+    keys outlive the files they name and the daemon starts with **no jobs at
+    all**: nothing raises, because an absent cron file is a normal state for an
+    install that has none, so the only symptom is a log line nobody is watching
+    for and every scheduled job silently not running.
+
+    Dropping them restores the default, which is the workspace cron directory
+    the files just landed in. Only paths *inside* ``legacy_cron`` are dropped: a
+    pointer somewhere else is a deliberate choice about a location this
+    migration does not touch, and stays exactly as it was.
+
+    Note this is decided per key rather than from whether the copy went ahead.
+    When a workspace file already shadows a legacy one, :func:`_migrate_cron`
+    leaves the legacy copy in place and warns that the workspace's wins — so the
+    pointer is stale in that case too, just for the other reason.
+    """
+    cron = raw.get("cron")
+    if not isinstance(cron, dict):
+        return
+    for key in _MIGRATED_CRON_PATH_KEYS:
+        configured = _expand_path(cron.get(key))
+        if configured is None or not _is_within(configured, legacy_cron):
+            continue
+        cron.pop(key)
+        report.actions.append(
+            f"dropped cron.{key} ({configured}): it named a file this migration "
+            f"moved, so cron now resolves to the workspace config/cron/"
+        )
+    if not cron:
+        raw.pop("cron", None)
+
+
+def _migrate_config_yaml(
+    config_dir: Path, workspace: Path, legacy_cron: Path, report: MigrationReport
+) -> None:
     config_yaml = config_dir / "config.yaml"
     settings = workspace_settings_file(workspace)
 
@@ -603,6 +662,9 @@ def _migrate_config_yaml(config_dir: Path, workspace: Path, report: MigrationRep
             f"is honored only in {settings}, where it also stops the machine-local "
             "layers from being read. Set it there deliberately to lock this instance"
         )
+
+    # Before the split, so a stale pointer cannot land in either half.
+    _drop_migrated_cron_paths(raw, legacy_cron, report)
 
     # Split before scrubbing, so a machine-local value never reaches the tracked
     # file even as a ${VAR} placeholder. The machine half is left unscrubbed:

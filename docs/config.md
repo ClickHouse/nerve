@@ -185,7 +185,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
       # nerve is not published to PyPI: the bare name is an unrelated project.
-      - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
+      # `uv tool install` because the runner's system interpreter is externally
+      # managed (PEP 668) and only the CLI is needed here.
+      - run: uv tool install "nerve @ git+https://github.com/ClickHouse/nerve"
       # Add --assume-lockdown if any instance served by this repo is locked and
       # the flag comes from the environment. Without it CI checks the unlocked
       # view and the lockdown checks never run. See "Lockdown" below.
@@ -359,7 +361,12 @@ This writes four files, never overwriting an existing one:
 - `.github/workflows/validate-config.yml`: the CI check, shown below.
 - `.gitignore`: keeps `config.local.yaml`, `.env`, `*.migrated`, databases and the
   like out of the shared repo. Secrets belong in the environment, referenced as
-  `${ENV_VAR}`.
+  `${ENV_VAR}`. It also excludes the agent's own runtime state — `MEMORY.md`,
+  `TASK.md`, `memory/` — which every workspace has and which the instance
+  rewrites for itself; the reviewed instruction files (`SOUL.md`, `IDENTITY.md`,
+  `USER.md`, `AGENTS.md`, `TOOLS.md`) are tracked. **A workspace that is also a
+  working directory may hold more than config**, so read `git status` before the
+  `git add -A` below rather than after the push.
 - `README.md`: a short explainer of the PR-based flow.
 - `config/settings.yaml`: the commented portable settings scaffold, if the
   workspace has none. An instance's workspace already has one; a bare directory
@@ -422,8 +429,15 @@ jobs:
       # validator at or ahead of the instance, which is the safe direction for
       # --strict-keys below: a newer validator knows every key the instance
       # reads. To check against one release instead, append a ref (nerve@v1.2.3).
+      #
+      # `uv tool install`, not `uv pip install --system`: the runner's system
+      # interpreter is externally managed (PEP 668), so --system is refused
+      # outright ("The interpreter at /usr is externally managed"). Only the
+      # `nerve` CLI is needed here, never an importable library, so a tool
+      # install in its own environment is both the idiomatic spelling and
+      # independent of what Python the runner image happens to ship.
       - uses: astral-sh/setup-uv@v6
-      - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
+      - run: uv tool install "nerve @ git+https://github.com/ClickHouse/nerve"
 
       # The config repo root IS the workspace (it holds config/ and skills/).
       #

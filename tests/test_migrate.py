@@ -1077,6 +1077,32 @@ class TestMigrateCron:
         # stopped running: the workspace copy wins and the legacy dir is dropped.
         assert any("still holds cron jobs" in w for w in report.warnings)
 
+    def test_keeps_a_cron_path_outside_the_migrated_directory(self, tmp_path):
+        """Only the paths this migration invalidates are dropped.
+
+        A cron file somewhere else entirely is a deliberate choice about a
+        location migration never touches, so it still resolves afterwards and
+        must survive. Dropping it too would silently move that instance's jobs
+        to a directory it never chose.
+        """
+        legacy_cron = paths.cron_dir()
+        legacy_cron.mkdir(parents=True, exist_ok=True)
+        (legacy_cron / "jobs.yaml").write_text("jobs: []\n", encoding="utf-8")
+        elsewhere = tmp_path / "elsewhere" / "jobs.yaml"
+        elsewhere.parent.mkdir(parents=True)
+        elsewhere.write_text(
+            "jobs:\n  - id: kept\n    schedule: 1h\n    prompt: hi\n", encoding="utf-8"
+        )
+        config_dir, workspace = _legacy_install(
+            tmp_path, f"cron:\n  jobs_file: {elsewhere}\n"
+        )
+
+        migrate(config_dir, workspace=workspace)
+
+        config = load_config(config_dir)
+        assert config.cron.jobs_file == elsewhere
+        assert [j.id for j in load_jobs(config.cron.jobs_file)] == ["kept"]
+
     def test_gates_and_prompts_migrate_past_the_files_nerve_init_wrote(self, tmp_path):
         """``nerve init`` writes ``system.yaml`` and an empty ``gates/`` into the
         workspace and copies only ``jobs.yaml`` across. A directory-level "the
@@ -1230,5 +1256,48 @@ class TestStartAfterMigration:
 
         assert result.exit_code == 0, result.output
         config = served["config"]
+        assert config.cron.jobs_file == workspace / "config" / "cron" / "jobs.yaml"
+        assert [j.id for j in load_jobs(config.cron.jobs_file)] == ["mine"]
+
+    def test_cron_paths_naming_the_legacy_dir_do_not_outlive_it(self, tmp_path):
+        """The same silence, for a config that spelled its cron paths out.
+
+        The test above covers a config that never named them, where resolution
+        follows the workspace on its own. A monolith that *did* name them
+        carries absolute ``~/.nerve/cron`` paths into the migrated settings,
+        where they keep pointing at files migration has moved and renamed to
+        ``*.migrated``. Reloading is not enough to recover: the pointers are in
+        the config now, so every subsequent start schedules nothing too.
+
+        Nothing raises, here or in production — an absent cron file is a normal
+        state for an install with no jobs — so the only trace is one INFO line
+        per file and a daemon that quietly never runs anything again.
+        """
+        legacy_cron = paths.cron_dir()
+        legacy_cron.mkdir(parents=True, exist_ok=True)
+        (legacy_cron / "jobs.yaml").write_text(
+            "jobs:\n  - id: mine\n    schedule: 1h\n    prompt: hi\n", encoding="utf-8"
+        )
+        config_dir, workspace = _legacy_install(
+            tmp_path,
+            "timezone: UTC\n"
+            "cron:\n"
+            f"  jobs_file: {legacy_cron / 'jobs.yaml'}\n"
+            f"  system_file: {legacy_cron / 'system.yaml'}\n",
+        )
+
+        migrate(config_dir, workspace=workspace)
+
+        # Nothing machine-local reached the file the docs say to commit, so the
+        # next box to sync this repo does not inherit one box's ~/.nerve either.
+        settings = yaml.safe_load(
+            workspace_settings_file(workspace).read_text(encoding="utf-8")
+        )
+        assert "cron" not in (settings or {}), (
+            "paths naming the files migration just moved were published to the "
+            f"tracked settings: {(settings or {}).get('cron')!r}"
+        )
+
+        config = load_config(config_dir)
         assert config.cron.jobs_file == workspace / "config" / "cron" / "jobs.yaml"
         assert [j.id for j in load_jobs(config.cron.jobs_file)] == ["mine"]
