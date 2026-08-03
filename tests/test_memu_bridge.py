@@ -1241,6 +1241,14 @@ class TestIndexedUpdateItemForwarding:
         # behind hands the NEXT test this spy as "memU's own implementation".
         names = _PATCHED_ITEM_REPO_ATTRS
         saved = {n: Repo.__dict__.get(n) for n in names}
+        # Fix 8 installs on CRUDMixin, not on Repo, so those two attributes leak
+        # out of this class unless they are snapshotted here as well.
+        from memu.app.crud import CRUDMixin
+
+        saved_crud = {
+            n: CRUDMixin.__dict__.get(n)
+            for n in ("_patch_update_memory_item", "_nerve_memu_update_handler")
+        }
 
         Repo.update_item = spy_update
         try:
@@ -1269,6 +1277,7 @@ class TestIndexedUpdateItemForwarding:
                         delattr(Repo, name)
                 else:
                     setattr(Repo, name, fn)
+            _restore_attrs(CRUDMixin, saved_crud)
 
 
 class TestSqliteLockedClassifier:
@@ -1481,6 +1490,33 @@ class TestUpdatePreservesCategories:
 
             assert store.category_item_repo.get_item_categories(item.id) == []
             assert out["category_updates"] == {}
+
+    def test_type_only_update_keeps_links(self, tmp_path):
+        """Preservation must not depend on `content` being supplied.
+
+        bridge.update_item allows a type-only change (memory_type set, content
+        None) from both the tool handler and the web route, and that shape
+        reaches memU's diff exactly like a content-only one.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+            before = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+            assert len(before) == 2
+
+            fx.run_update(store, cats, item.id, memory_type="profile")
+
+            after = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+            assert after == before
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+            # The update must not have been a no-op, or the assertion above is free.
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ? AND memory_type = ?",
+                item.id, "profile",
+            ) == 1
 
 
 class TestUpdateRefreshesContentHash:
@@ -1841,6 +1877,83 @@ class TestCascadeDeleteItem:
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
             ) == 1
+
+    def test_a_failed_relations_delete_rolls_the_item_back(self, tmp_path):
+        """The other direction, and the one that pins the ordering.
+
+        session.delete (the ITEM row) is the first statement to raise in BOTH
+        the one-transaction form and an item-first split, so the sibling case
+        above cannot see a split.  Failing only the RELATIONS delete can: under
+        a split the item is already committed and gone, leaving 2 dangling rows.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store, summary="t")
+            fx.link_all(store, item.id, cats)
+
+            class _Boom(Exception):
+                pass
+
+            sessions = store.memory_item_repo._sessions
+            original_session = sessions.session
+
+            def failing_session():
+                session = original_session()
+                real_exec = session.exec
+
+                def _exec(stmt, *args, **kwargs):
+                    text = str(stmt).lower().strip()
+                    # Only the relations DELETE; everything else must really run
+                    # or the row lookup fails and the test proves nothing.
+                    if text.startswith("delete") and "category_items" in text:
+                        raise _Boom("forced")
+                    return real_exec(stmt, *args, **kwargs)
+
+                session.exec = _exec
+                return session
+
+            sessions.session = failing_session
+            try:
+                with pytest.raises(_Boom):
+                    store.memory_item_repo.delete_item(item.id)
+            finally:
+                sessions.session = original_session
+
+            # BOTH rolled back: the item survives with its links intact.
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
+            ) == 1
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+
+    def test_cache_is_evicted_when_the_row_is_already_gone(self, tmp_path):
+        """The row can vanish underneath us (another process deleted it).
+
+        Returning early on a missing row would keep the id in self.items, and
+        Fix 5 serves that cache unfiltered, so list_items() would go on
+        returning a deleted item while Fix 3 removed it from the vector index.
+        memU's own delete_item pops the cache unconditionally.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(1)
+            item = fx.add_item(store, summary="doomed")
+            fx.link_all(store, item.id, cats)
+            assert item.id in store.memory_item_repo.items
+
+            # Another connection removes the row underneath us.
+            conn = sqlite3.connect(fx.path)
+            conn.execute("DELETE FROM memu_memory_items WHERE id = ?", (item.id,))
+            conn.commit()
+            conn.close()
+
+            store.memory_item_repo.delete_item(item.id)
+
+            assert item.id not in store.memory_item_repo.items
+            assert [r for r in store.category_item_repo.relations
+                    if r.item_id == item.id] == []
+            # list_items() returns the cache dict itself (keyed by id).
+            assert item.id not in store.memory_item_repo.list_items()
 
     def test_fix_3_index_hook_stays_outermost(self, tmp_path):
         """Fix 10 REPLACES the base implementation, so it must be installed

@@ -1032,12 +1032,16 @@ class MemUBridge:
                             self._memory_item_model.id == item_id
                         )
                     ).first()
-                    if row is None:
-                        return
-                    session.exec(_del(rel_model).where(rel_model.item_id == item_id))
-                    session.delete(row)
-                    session.commit()
+                    if row is not None:
+                        session.exec(_del(rel_model).where(rel_model.item_id == item_id))
+                        session.delete(row)
+                        session.commit()
 
+                # Evict on BOTH paths, like memU's own delete_item.  When the row
+                # is already gone (another process removed it) returning early
+                # would leave the id in self.items, and Fix 5 serves that cache
+                # unfiltered, so list_items() would keep returning a deleted item.
+                # No DB write is attempted for an absent row.
                 self.items.pop(item_id, None)
                 relations = self._state.relations
                 relations[:] = [r for r in relations if r.item_id != item_id]
