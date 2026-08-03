@@ -888,6 +888,22 @@ class MemUBridge:
            Fix: use stored category embeddings.
         5. list_items/list_categories bypass the vector cache.
            Fix: return cache when populated and unfiltered.
+        7. Semantic dedup in create_item_reinforce (nerve addition, not a memU
+           bug fix).  Its writeback seeds `extra` from the ROW inside the write
+           transaction, because read paths build MemoryItem without extra= and
+           writing a cache-derived extra back would drop content_hash and any
+           key another writer added.
+        8. A content-only memory_update unlinks EVERY category: memU maps a
+           missing `categories` to [], so its diff removes the item's whole
+           current set.  Fix: when `categories` is None, rewrite the payload
+           with the names of the item's current links.
+        9. update_item never refreshes extra.content_hash, which
+           create_item_reinforce dedups on, so an updated item keeps its old
+           text's hash.  Fix: recompute it from the DB row when summary or
+           memory_type changes (only when a hash already exists).
+        10. delete_item leaves the item's memu_category_items rows behind (no FK
+           / cascade).  Fix: delete relations and the item in ONE transaction,
+           installed before Fix 3 so its index hook still wraps it.
         """
         try:
             from pydantic import BaseModel
@@ -985,14 +1001,113 @@ class MemUBridge:
 
             SQLiteStore._create_tables = _safe_create_tables
 
+            from memu.database.sqlite.repositories.memory_item_repo import SQLiteMemoryItemRepo
+            from memu.database.inmemory.vector import cosine_topk, cosine_topk_salience
+
+            # Fix 10: delete_item deletes the item row and leaves its
+            # memu_category_items rows behind (there is no FK / ON DELETE
+            # CASCADE), so every memory_delete orphans that item's category
+            # relations.  Replace the BASE implementation with one that deletes
+            # relations and the item in ONE transaction, so a failure can never
+            # leave a surviving item stripped of its links.
+            #
+            # Installed BEFORE Fix 3 so Fix 3's _indexed_delete_item wraps this
+            # and the vector-index hook still fires.  Needs no idempotency guard:
+            # this is a full replacement that calls no captured original, so a
+            # repeated _patch_sqlite_bugs() cannot stack it (unlike the
+            # wrapper-style fixes).  A marker attribute is kept for tests.
+            from sqlmodel import delete as _del, select as _sel_del
+
+            # Stash memU's own implementation the first time, symmetrically with
+            # Fix 9: it documents what was replaced and gives tests a pristine
+            # reference to compare against.
+            if not hasattr(SQLiteMemoryItemRepo, "_nerve_memu_delete_item"):
+                SQLiteMemoryItemRepo._nerve_memu_delete_item = SQLiteMemoryItemRepo.delete_item
+
+            def _cascade_delete_item(self, item_id):
+                rel_model = self._sqla_models.CategoryItem
+                with self._sessions.session() as session:
+                    row = session.exec(
+                        _sel_del(self._memory_item_model).where(
+                            self._memory_item_model.id == item_id
+                        )
+                    ).first()
+                    if row is None:
+                        return
+                    session.exec(_del(rel_model).where(rel_model.item_id == item_id))
+                    session.delete(row)
+                    session.commit()
+
+                self.items.pop(item_id, None)
+                relations = self._state.relations
+                relations[:] = [r for r in relations if r.item_id != item_id]
+
+            _cascade_delete_item._nerve_cascade_delete = True  # type: ignore[attr-defined]
+            SQLiteMemoryItemRepo.delete_item = _cascade_delete_item
+
+            # Fix 9: update_item rewrites summary/memory_type but never refreshes
+            # extra.content_hash, which create_item_reinforce dedups on.  An
+            # updated item therefore keeps its OLD text's hash forever, so
+            # re-memorizing the old wording reinforces the corrected row instead
+            # of being recognised as different content.
+            #
+            # Read the effective values from the DB ROW, never from get_item():
+            # read paths build MemoryItem without extra=, so a cached item has
+            # extra == {} and a cache-based version would silently refresh
+            # nothing in any long-lived process.
+            #
+            # Installed BEFORE Fix 3, like Fix 10.  memU's own update_item is
+            # stashed on the class the first time, so a repeated
+            # _patch_sqlite_bugs() re-derives the SAME one-deep chain instead of
+            # stacking.  A marker on the outermost function cannot achieve that:
+            # Fix 3 re-wraps whatever it finds, hiding our marker.
+            from memu.database.models import compute_content_hash as _content_hash
+            from sqlmodel import select as _sel_upd
+
+            _memu_update_item = getattr(
+                SQLiteMemoryItemRepo, "_nerve_memu_update_item", None)
+            if _memu_update_item is None:
+                _memu_update_item = SQLiteMemoryItemRepo.update_item
+                SQLiteMemoryItemRepo._nerve_memu_update_item = _memu_update_item
+
+            def _hash_refreshing_update_item(
+                self, *, item_id, memory_type=None, summary=None,
+                embedding=None, extra=None, tool_record=None,
+            ):
+                if memory_type is not None or summary is not None:
+                    with self._sessions.session() as session:
+                        row = session.exec(
+                            _sel_upd(self._memory_item_model).where(
+                                self._memory_item_model.id == item_id
+                            )
+                        ).first()
+                        if row is not None:
+                            current = dict(row.extra or {})
+                            eff_summary = summary if summary is not None else row.summary
+                            eff_type = memory_type if memory_type is not None else row.memory_type
+                        else:
+                            current, eff_summary, eff_type = {}, None, None
+                    # Only refresh a hash that already exists: an item created
+                    # without one must not be newly enrolled into hash-dedup.
+                    if current.get("content_hash") and eff_summary is not None and eff_type is not None:
+                        extra = {**(extra or {}),
+                                 "content_hash": _content_hash(eff_summary, str(eff_type))}
+
+                return _memu_update_item(
+                    self, item_id=item_id, memory_type=memory_type,
+                    summary=summary, embedding=embedding, extra=extra,
+                    tool_record=tool_record,
+                )
+
+            _hash_refreshing_update_item._nerve_hash_refresh = True  # type: ignore[attr-defined]
+            SQLiteMemoryItemRepo.update_item = _hash_refreshing_update_item
+
             # Fix 3: vector_search_items calls list_items() on every query,
             # re-reading and JSON-parsing all embeddings from SQLite (~2s for 3K items).
             # Worse, cosine_topk re-stacks every embedding into a brand-new
             # (n, dim) float32 matrix per call (~130 MB with 20K items).
             # Use the persistent incremental _VectorIndex instead: one
             # mat-vec per query, rows appended as items are created.
-            from memu.database.sqlite.repositories.memory_item_repo import SQLiteMemoryItemRepo
-            from memu.database.inmemory.vector import cosine_topk, cosine_topk_salience
 
             _original_vector_search = SQLiteMemoryItemRepo.vector_search_items
 
@@ -1204,24 +1319,33 @@ class MemUBridge:
                                 "Semantic dedup: reinforcing %s item %s (%.3f) instead of creating '%s'",
                                 memory_type, match_id, score, summary[:80],
                             )
-                            # Update DB row
+                            # Update DB row.  Seed `extra` from the ROW, not from
+                            # the cache: read paths build MemoryItem without
+                            # extra=, so a cached extra is {} in any process that
+                            # did not itself write the item, and writing that back
+                            # would drop content_hash and every key another writer
+                            # added (e.g. mentioned_at, ref_id).
                             from sqlmodel import select as _sel
                             now = self._now()
-                            extra = dict(matched.extra or {})
-                            extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
-                            extra["last_reinforced_at"] = now.isoformat()
+                            extra: dict[str, Any] = {}
                             with self._sessions.session() as session:
                                 row = session.exec(
                                     _sel(self._memory_item_model).where(
                                         self._memory_item_model.id == match_id
                                     )
                                 ).first()
-                                if row:
+                                if row is not None:
+                                    extra = dict(row.extra or {})
+                                elif matched.extra:
+                                    extra = dict(matched.extra)
+                                extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
+                                extra["last_reinforced_at"] = now.isoformat()
+                                if row is not None:
                                     row.extra = extra
                                     row.updated_at = now
                                     session.add(row)
                                     session.commit()
-                            # Update in-memory cache
+                            # Keep the cache consistent with what was written
                             matched.extra = extra
                             matched.updated_at = now
                             return matched
@@ -1280,6 +1404,65 @@ class MemUBridge:
                 "Patched create_item_reinforce with semantic dedup (threshold=%.2f)",
                 _SEMANTIC_DEDUP_THRESHOLD,
             )
+
+            # Fix 8: a content-only memory_update destroys every category link.
+            # memU has one sentinel for two meanings: _patch_update_memory_item
+            # maps a missing `categories` to [] (crud.py _map_category_names_to_ids
+            # returns [] for a falsy list), so cats_to_remove becomes the item's
+            # ENTIRE current set and each link is unlinked.
+            #
+            # Supply the sentinel memU cannot express: when `categories` is None,
+            # rewrite the payload with the NAMES of the item's current links so
+            # memU's own diff computes cats_to_remove == {} and unlinks nothing.
+            # Going through the name channel (rather than reimplementing the diff)
+            # keeps category_updates -- and therefore the LLM category-summary
+            # patch step -- correct.
+            from memu.app.crud import CRUDMixin as _CRUDMixin
+
+            if not getattr(_CRUDMixin._patch_update_memory_item, "_nerve_keeps_categories", False):
+                _pre_keep_update_handler = _CRUDMixin._patch_update_memory_item
+                _CRUDMixin._nerve_memu_update_handler = _pre_keep_update_handler
+
+                async def _category_preserving_update(self, state, step_context):
+                    payload = state.get("memory_payload") or {}
+                    if payload.get("categories") is None:
+                        store = state["store"]
+                        ctx = state["ctx"]
+                        existing = [
+                            rel.category_id
+                            for rel in store.category_item_repo.get_item_categories(
+                                state["memory_id"]
+                            )
+                        ]
+                        if existing:
+                            # Invert the existing map read-only; never mutate ctx
+                            # (service-lifetime state shared with memorize()).
+                            id_to_name = {
+                                cid: name
+                                for name, cid in (ctx.category_name_to_id or {}).items()
+                            }
+                            names = [id_to_name[cid] for cid in existing if cid in id_to_name]
+                            # Fail closed: an incomplete round-trip would silently
+                            # drop the unmapped links, which is the bug we are
+                            # fixing.  Late-bound self. call so the MRO decides
+                            # which _map_category_names_to_ids runs.
+                            if set(self._map_category_names_to_ids(names, ctx)) != set(existing):
+                                msg = (
+                                    f"Cannot preserve category links for item {state['memory_id']}: "
+                                    f"{len(existing)} link(s) do not round-trip through "
+                                    "ctx.category_name_to_id; refusing the update rather than "
+                                    "unlinking them"
+                                )
+                                raise ValueError(msg)
+                            payload = {**payload, "categories": names}
+                            state = {**state, "memory_payload": payload}
+
+                    return await _pre_keep_update_handler(self, state, step_context)
+
+                _category_preserving_update._nerve_keeps_categories = True  # type: ignore[attr-defined]
+                _CRUDMixin._patch_update_memory_item = _category_preserving_update
+
+            logger.info("Patched memU write paths (category preservation, hash refresh, cascade delete)")
 
         except Exception as e:
             logger.error(

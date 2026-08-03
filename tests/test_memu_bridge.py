@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 import pytest_asyncio
 
@@ -975,6 +976,227 @@ class TestSqlitePragmas:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# memU write-path integrity (Fixes 7-correction, 8, 9, 10)
+# ---------------------------------------------------------------------------
+
+
+_MEMU_MODELS_CACHE = {}
+
+
+def _memu_models():
+    """Build the SQLAlchemy models ONCE per process.
+
+    nerve's Fix 6 (_patched_get_models) clears memu's _MODEL_CACHE on every
+    call, so a second SQLiteStore(dsn=...) that rebuilds them raises
+    ArgumentError("Column object 'url' already assigned"). Sharing one build
+    across stores is what lets these tests use several isolated stores.
+    """
+    if "models" in _MEMU_MODELS_CACHE:
+        return _MEMU_MODELS_CACHE["models"]
+
+    import memu.app.service  # noqa: F401 - initialize the package graph
+    import memu.database.sqlite.schema as schema_mod
+    from memu.app.crud import CRUDMixin
+    from memu.database.sqlite.repositories.memory_item_repo import (
+        SQLiteMemoryItemRepo as Repo,
+    )
+
+    # Building the models needs the patches applied (Fix 6 renames memu's own
+    # "sqlite_*" tables, which SQLite reserves), but this helper must leave
+    # global state exactly as it found it: leaking a patched Repo out of a
+    # module-level helper is how one test silently breaks its neighbours.
+    saved_repo = {n: Repo.__dict__.get(n) for n in _PATCHED_ITEM_REPO_ATTRS}
+    saved_handler = CRUDMixin.__dict__.get("_patch_update_memory_item")
+    saved_stash = CRUDMixin.__dict__.get("_nerve_memu_update_handler")
+    try:
+        MemUBridge._patch_sqlite_bugs()
+        # Resolve through the MODULE, never a from-import: Fix 6 replaces this
+        # attribute.
+        models = schema_mod.get_sqlite_sqlalchemy_models(scope_model=None)
+    finally:
+        _restore_attrs(Repo, saved_repo)
+        _restore_attrs(CRUDMixin, {
+            "_patch_update_memory_item": saved_handler,
+            "_nerve_memu_update_handler": saved_stash,
+        })
+
+    _MEMU_MODELS_CACHE["models"] = models
+    return models
+
+
+def _restore_attrs(cls, saved):
+    """Put class attributes back, deleting those that did not exist before."""
+    for name, value in saved.items():
+        if value is None:
+            if name in cls.__dict__:
+                delattr(cls, name)
+        else:
+            setattr(cls, name, value)
+
+
+def _content_hash(summary, memory_type):
+    """memu's compute_content_hash, imported safely.
+
+    ``from memu.database.models import ...`` FIRST triggers a circular import
+    inside memu itself (database/__init__ -> factory -> app/__init__ -> service
+    -> factory), so memu.app.service must be imported before it. Going through
+    this helper is what lets a single test in these classes run alone.
+    """
+    import memu.app.service  # noqa: F401
+    from memu.database.models import compute_content_hash
+
+    return compute_content_hash(summary, memory_type)
+
+
+# Every memu-py class attribute the patches reassign, so each test can restore
+# global state and never leak into another test (or another suite: a module that
+# mutates shared globals at import time breaks its neighbours invisibly, so all
+# patching happens INSIDE tests).
+class _NoRowSessions:
+    """Session manager whose queries return no row.
+
+    Lets a bare ``object.__new__(Repo)`` stub satisfy the hash-refresh wrapper's
+    row lookup: with no row there is nothing to recompute a hash from, so it
+    delegates straight through - which is what the forwarding test measures.
+    """
+
+    class _Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def exec(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return None
+
+    def session(self):
+        return self._Session()
+
+
+_PATCHED_ITEM_REPO_ATTRS = (
+    "update_item", "delete_item", "clear_items", "list_items",
+    "create_item", "create_item_reinforce", "vector_search_items",
+    "_nerve_memu_update_item", "_nerve_memu_delete_item",
+)
+
+
+class _MemuPatchFixture:
+    """Isolated memU stores over a temp file with _patch_sqlite_bugs() applied."""
+
+    def __init__(self, tmp_path):
+        self.models = _memu_models()
+        self.path = str(tmp_path / "memu.sqlite")
+        self._stores = []
+        self.saved_item_repo = {}
+        self.saved_handler = None
+
+    def __enter__(self):
+        import memu.app.service  # noqa: F401
+        from memu.app.crud import CRUDMixin
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        self.Repo = Repo
+        self.CRUDMixin = CRUDMixin
+        self.saved_item_repo = {
+            n: Repo.__dict__.get(n) for n in _PATCHED_ITEM_REPO_ATTRS
+        }
+        self.saved_handler = CRUDMixin.__dict__.get("_patch_update_memory_item")
+        self.saved_handler_stash = CRUDMixin.__dict__.get("_nerve_memu_update_handler")
+        MemUBridge._patch_sqlite_bugs()
+        return self
+
+    def __exit__(self, *exc):
+        for store in self._stores:
+            try:
+                store.close()
+            except Exception:
+                pass
+        _restore_attrs(self.Repo, self.saved_item_repo)
+        _restore_attrs(self.CRUDMixin, {
+            "_patch_update_memory_item": self.saved_handler,
+            "_nerve_memu_update_handler": self.saved_handler_stash,
+        })
+        return False
+
+    def store(self):
+        """A fresh store over the same file (a simulated process restart)."""
+        from memu.database.sqlite.sqlite import SQLiteStore
+
+        store = SQLiteStore(dsn=f"sqlite:///{self.path}", sqla_models=self.models)
+        self._stores.append(store)
+        return store
+
+    def setup(self, n_categories=2):
+        store = self.store()
+        cats = {}
+        for name in ("procedures", "patterns", "decisions")[:n_categories]:
+            cat = store.memory_category_repo.get_or_create_category(
+                name=name, description="d", embedding=None, user_data={},
+            )
+            cats[name] = cat.id
+        return store, cats
+
+    def add_item(self, store, summary="a fact", memory_type="knowledge", embedding=None):
+        return store.memory_item_repo.create_item_reinforce(
+            resource_id=None, memory_type=memory_type, summary=summary,
+            embedding=embedding, user_data={},
+        )
+
+    def link_all(self, store, item_id, cats):
+        for cid in cats.values():
+            store.category_item_repo.link_item_category(item_id, cid, user_data={})
+
+    def raw_extra(self, item_id):
+        row = sqlite3.connect(self.path).execute(
+            "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,),
+        ).fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+
+    def raw_count(self, sql, *params):
+        return sqlite3.connect(self.path).execute(sql, params).fetchone()[0]
+
+    def run_update(self, store, cats, item_id, *, content=None, memory_type=None,
+                   categories=None, ctx=None):
+        """Drive the REAL memU update workflow handler (no mock of it)."""
+        class _Ctx:
+            def __init__(self, mapping):
+                self.category_name_to_id = dict(mapping)
+                self.category_ids = list(mapping.values())
+
+        class _Embed:
+            async def embed(self, payload):
+                return [None]
+
+        svc = object.__new__(self.CRUDMixin)
+        svc._get_step_embedding_client = lambda step_ctx: _Embed()
+        state = {
+            "memory_id": item_id,
+            "memory_payload": {"content": content, "type": memory_type,
+                               "categories": categories},
+            "ctx": ctx if ctx is not None else _Ctx(cats),
+            "store": store,
+            "user": {},
+        }
+        return asyncio.run(
+            self.CRUDMixin._patch_update_memory_item(svc, state, None),
+        )
+
+    def ctx(self, mapping):
+        class _Ctx:
+            def __init__(self, m):
+                self.category_name_to_id = dict(m)
+                self.category_ids = list(m.values())
+
+        return _Ctx(mapping)
+
+
 class TestIndexedUpdateItemForwarding:
     """Regression: the _indexed_update_item monkeypatch must forward item_id
     by keyword.
@@ -1013,12 +1235,11 @@ class TestIndexedUpdateItemForwarding:
             calls.append(item_id)
             return "spy-result"
 
-        # Snapshot the item-repo methods _patch_sqlite_bugs() reassigns so the
-        # test restores global state and does not leak into other tests.
-        names = (
-            "update_item", "delete_item", "clear_items", "list_items",
-            "create_item", "create_item_reinforce", "vector_search_items",
-        )
+        # Snapshot every item-repo attribute _patch_sqlite_bugs() reassigns so
+        # the test restores global state and does not leak into other tests.
+        # The _nerve_memu_* stashes matter as much as the methods: leaving one
+        # behind hands the NEXT test this spy as "memU's own implementation".
+        names = _PATCHED_ITEM_REPO_ATTRS
         saved = {n: Repo.__dict__.get(n) for n in names}
 
         Repo.update_item = spy_update
@@ -1029,6 +1250,11 @@ class TestIndexedUpdateItemForwarding:
             assert Repo.update_item is not spy_update
 
             stub = object.__new__(Repo)  # no _nerve_vec_index → index hook skipped
+            # The hash-refresh wrapper reads the item's current row, so the stub
+            # needs the two attributes that read uses.  Returning no row makes it
+            # skip the refresh and delegate, which is what this test measures.
+            stub._memory_item_model = _memu_models().MemoryItem
+            stub._sessions = _NoRowSessions()
             # Exactly how memu's crud layer calls it (all keyword) — used to raise.
             result = Repo.update_item(
                 stub, item_id="mem-123", memory_type=None,
@@ -1134,3 +1360,616 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+class TestUpdatePreservesCategories:
+    """Fix 8: a content-only memory_update must not unlink every category.
+
+    memU has ONE sentinel for two meanings: _patch_update_memory_item maps a
+    missing ``categories`` to ``[]`` (_map_category_names_to_ids returns [] for
+    a falsy list), so ``cats_to_remove`` becomes the item's ENTIRE current set.
+    Measured on the live store before the fix: 154 of 154 items ever updated
+    without a categories argument held ZERO category links.
+    """
+
+    def test_content_only_update_keeps_links_and_rows(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+            before = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+
+            out = fx.run_update(store, cats, item.id, content="a corrected fact")
+
+            after = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+            assert len(after) == 2
+            # Same relation row ids: preserved, not deleted and re-created.
+            assert after == before
+            # The summary-patch step must see "updated", never "discarded":
+            # (old, None) renders as "This memory content is discarded" and
+            # would make the LLM drop an item whose link still exists.
+            assert sorted(out["category_updates"].values()) == [
+                ("a fact", "a corrected fact"),
+            ] * 2
+
+    def test_unpatched_handler_loses_every_link(self, tmp_path):
+        """The control arm: without Fix 8 the same call unlinks everything."""
+        with _MemuPatchFixture(tmp_path) as fx:
+            # Use memU's own handler from the stash, not fx.saved_handler:
+            # a previous test in this process may already have patched the class,
+            # so the snapshot is not guaranteed to be the pristine original.
+            fx.CRUDMixin._patch_update_memory_item = (
+                fx.CRUDMixin._nerve_memu_update_handler
+            )
+
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+
+            out = fx.run_update(store, cats, item.id, content="a corrected fact")
+
+            assert store.category_item_repo.get_item_categories(item.id) == []
+            assert sorted(out["category_updates"].values()) == [("a fact", None)] * 2
+
+    def test_explicit_list_still_replaces(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+
+            fx.run_update(store, cats, item.id, content="y", categories=["patterns"])
+
+            links = [r.category_id for r in
+                     store.category_item_repo.get_item_categories(item.id)]
+            assert links == [cats["patterns"]]
+
+    def test_explicit_empty_list_still_clears(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+
+            fx.run_update(store, cats, item.id, content="y", categories=[])
+
+            assert store.category_item_repo.get_item_categories(item.id) == []
+
+    def test_three_links_preserved(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(3)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+            before = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+
+            out = fx.run_update(store, cats, item.id, content="revised")
+
+            after = {r.id for r in store.category_item_repo.get_item_categories(item.id)}
+            assert len(after) == 3
+            assert after == before
+            assert set(out["category_updates"].values()) == {("a fact", "revised")}
+
+    def test_incomplete_map_raises_and_changes_nothing(self, tmp_path):
+        """Fail closed: refusing the update beats silently dropping links.
+
+        ctx.category_name_to_id is rebuilt from every DB category on bridge
+        init, so this should be unreachable in nerve; the raise is a tripwire.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(3)
+            item = fx.add_item(store)
+            fx.link_all(store, item.id, cats)
+            partial = {k: v for k, v in cats.items() if k != "decisions"}
+            ctx = fx.ctx(partial)
+            snapshot = dict(ctx.category_name_to_id)
+
+            with pytest.raises(ValueError, match="do not round-trip"):
+                fx.run_update(store, cats, item.id, content="revised", ctx=ctx)
+
+            assert len(store.category_item_repo.get_item_categories(item.id)) == 3
+            # Service-lifetime state (shared with memorize) must not be mutated.
+            assert ctx.category_name_to_id == snapshot
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ? AND summary = ?",
+                item.id, "a fact",
+            ) == 1
+
+    def test_item_with_no_links_is_a_noop(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+
+            out = fx.run_update(store, cats, item.id, content="y")
+
+            assert store.category_item_repo.get_item_categories(item.id) == []
+            assert out["category_updates"] == {}
+
+
+class TestUpdateRefreshesContentHash:
+    """Fix 9: update_item must refresh extra.content_hash.
+
+    create_item_reinforce dedups on json_extract(extra,'$.content_hash'), but
+    update_item rewrites summary/memory_type without touching it, so an updated
+    item keeps its OLD text's hash. Measured before the fix: 149 of 149 updated
+    items were hash-stale against a 400/400 fresh never-updated baseline.
+    """
+
+    def test_hash_matches_new_summary(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="original text")
+
+            store.memory_item_repo.update_item(item_id=item.id, summary="corrected text")
+
+            assert fx.raw_extra(item.id)["content_hash"] == _content_hash(
+                "corrected text", "knowledge",
+            )
+
+    def test_hash_refreshed_after_a_restart(self, tmp_path):
+        """The discriminating arm: the refresh must read the DB ROW.
+
+        get_item()/list_items() build MemoryItem WITHOUT extra=, so a cached
+        item has extra == {}. A cache-based implementation finds no
+        content_hash here and refreshes nothing, while still passing the
+        create-path test above.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="original text")
+            store.close()
+
+            restarted = fx.store()
+            restarted.memory_item_repo.list_items()
+            assert restarted.memory_item_repo.items[item.id].extra == {}
+
+            restarted.memory_item_repo.update_item(
+                item_id=item.id, summary="corrected text",
+            )
+
+            assert fx.raw_extra(item.id)["content_hash"] == _content_hash(
+                "corrected text", "knowledge",
+            )
+
+    def test_unpatched_update_leaves_the_hash_stale(self, tmp_path):
+        """Control arm: memU's own update_item keeps the old text's hash."""
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="original text")
+            memu_update = fx.Repo._nerve_memu_update_item
+
+            memu_update(store.memory_item_repo, item_id=item.id, summary="corrected text")
+
+            assert fx.raw_extra(item.id)["content_hash"] == _content_hash(
+                "original text", "knowledge",
+            )
+
+    def test_type_change_alone_recomputes_from_the_row(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="the text")
+
+            store.memory_item_repo.update_item(item_id=item.id, memory_type="behavior")
+
+            assert fx.raw_extra(item.id)["content_hash"] == _content_hash(
+                "the text", "behavior",
+            )
+
+    def test_item_without_a_hash_is_not_enrolled(self, tmp_path):
+        """Adding a hash where there was none is a behaviour change, not a fix."""
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="t")
+            db = sqlite3.connect(fx.path)
+            db.execute(
+                "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+                (json.dumps({"reinforcement_count": 1}), item.id),
+            )
+            db.commit()
+            db.close()
+
+            fx.store().memory_item_repo.update_item(item_id=item.id, summary="t2")
+
+            assert "content_hash" not in fx.raw_extra(item.id)
+
+    def test_salience_fields_survive_the_extra_merge(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="t")
+            fx.add_item(store, summary="t")  # exact-hash reinforce -> rc = 2
+            before = fx.raw_extra(item.id)
+            assert before["reinforcement_count"] == 2
+
+            store.memory_item_repo.update_item(item_id=item.id, summary="t2")
+
+            after = fx.raw_extra(item.id)
+            assert after["reinforcement_count"] == 2
+            assert after["last_reinforced_at"] == before["last_reinforced_at"]
+            assert after["content_hash"] == _content_hash("t2", "knowledge")
+
+    def test_a_callers_own_extra_is_not_dropped(self, tmp_path):
+        """The refreshed hash must be MERGED into the caller's extra, not
+        substituted for it: update_item(summary=..., extra={"ref_id": ...}) must
+        keep ref_id, which list_items_by_ref_ids filters on.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="t")
+
+            store.memory_item_repo.update_item(
+                item_id=item.id, summary="t2", extra={"ref_id": "abc"},
+            )
+
+            after = fx.raw_extra(item.id)
+            assert after["ref_id"] == "abc"
+            assert after["content_hash"] == _content_hash("t2", "knowledge")
+
+    def test_stale_hash_reinforces_the_corrected_row(self, tmp_path):
+        """The user-visible consequence, both directions in one test."""
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="original text")
+            memu_update = fx.Repo._nerve_memu_update_item
+
+            # Unpatched: correcting the wording, then re-memorizing the OLD
+            # text, reinforces the corrected row under its new summary.
+            memu_update(store.memory_item_repo, item_id=item.id, summary="corrected text")
+            again = fx.add_item(store, summary="original text")
+            assert again.id == item.id
+            assert fx.raw_count("SELECT count(*) FROM memu_memory_items") == 1
+            assert again.summary == "corrected text"
+
+        with _MemuPatchFixture(tmp_path / "b") as fx:
+            (tmp_path / "b").mkdir()
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="original text")
+
+            # Patched: the same sequence recognises the old text as different.
+            store.memory_item_repo.update_item(item_id=item.id, summary="corrected text")
+            again = fx.add_item(store, summary="original text")
+            assert again.id != item.id
+            assert fx.raw_count("SELECT count(*) FROM memu_memory_items") == 2
+
+
+class TestReinforceWritebackReadsTheRow:
+    """Fix 7 correction: the semantic-dedup writeback must seed ``extra`` from
+    the ROW inside its transaction, not from the item cache.
+
+    Read paths build MemoryItem without extra=, so a cache entry is {} in any
+    process that did not itself create the item; writing that back replaced the
+    row's whole extra with just the two salience keys. Measured before the fix:
+    all 6,473 rows with no content_hash carried reinforcement_count > 1, none
+    carried rc == 1, and the store holds 0 items of type "tool" (the only
+    create path that legitimately writes no hash).
+    """
+
+    @staticmethod
+    def _similar_pair():
+        return (
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.001, 0.0], dtype=np.float32),
+        )
+
+    def _cold_cache_reinforce(self, fx, extra_writer=None):
+        first, second = self._similar_pair()
+        store, _ = fx.setup(1)
+        item = fx.add_item(store, summary="cold cache subject", embedding=first)
+        if extra_writer is not None:
+            extra_writer(item.id)
+        store.close()
+
+        # Simulated restart: a fresh store whose cache is filled by a READ.
+        restarted = fx.store()
+        restarted.memory_item_repo.list_items()
+        assert restarted.memory_item_repo.items[item.id].extra == {}
+
+        restarted.memory_item_repo.create_item_reinforce(
+            resource_id=None, memory_type="knowledge",
+            summary="cold cache subject!!", embedding=second, user_data={},
+        )
+        return item, restarted
+
+    def test_content_hash_survives_a_cold_cache_reinforce(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            item, _ = self._cold_cache_reinforce(fx)
+
+            after = fx.raw_extra(item.id)
+            assert "content_hash" in after
+            assert after["reinforcement_count"] == 2
+
+    def test_a_third_party_writers_key_survives(self, tmp_path):
+        """The arm that distinguishes this from hydrating the read paths.
+
+        _resolve_event_dates_sync adds extra.mentioned_at with raw SQL and never
+        refreshes the cache, so hydrating reads cannot keep the cache canonical:
+        with read-path hydration installed, content_hash survived here but
+        mentioned_at was still destroyed. Reading the row inside the write
+        transaction is correct for every writer, present and future.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            def write_mentioned_at(item_id):
+                db = sqlite3.connect(fx.path)
+                extra = fx.raw_extra(item_id)
+                extra["mentioned_at"] = "2026-01-01"
+                db.execute(
+                    "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+                    (json.dumps(extra), item_id),
+                )
+                db.commit()
+                db.close()
+
+            item, _ = self._cold_cache_reinforce(fx, write_mentioned_at)
+
+            after = fx.raw_extra(item.id)
+            assert after["mentioned_at"] == "2026-01-01"
+            assert "content_hash" in after
+
+    def test_cache_matches_the_row_afterwards(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            item, restarted = self._cold_cache_reinforce(fx)
+
+            assert restarted.memory_item_repo.items[item.id].extra == fx.raw_extra(item.id)
+
+    def test_reinforce_return_value_still_signals_rc_gt_1(self, tmp_path):
+        """memorize() skips category linking when the returned item's
+        extra.reinforcement_count > 1. The correction changes what that extra
+        holds, so pin the DECISION: if it flipped, a reinforced item would stop
+        getting its category links, i.e. a new orphan source.
+        """
+        first, second = self._similar_pair()
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            fresh = fx.add_item(store, summary="subject", embedding=first)
+            assert fresh.extra.get("reinforcement_count", 1) == 1
+            store.close()
+
+            restarted = fx.store()
+            restarted.memory_item_repo.list_items()
+            reinforced = restarted.memory_item_repo.create_item_reinforce(
+                resource_id=None, memory_type="knowledge", summary="subject!!",
+                embedding=second, user_data={},
+            )
+
+            assert reinforced.extra.get("reinforcement_count", 1) > 1
+
+    def test_read_paths_still_omit_extra(self, tmp_path):
+        """Pin the deliberate scope boundary: the read-path hydration gap is
+        DOCUMENTED, not fixed here. With the writeback reading the row, an
+        empty cached extra is no longer destructive, so hydration is a separate
+        change. If a future PR hydrates the reads, this test should be updated,
+        not silently kept passing by accident.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="t")
+            store.close()
+
+            restarted = fx.store()
+            assert restarted.memory_item_repo.get_item(item.id).extra == {}
+            restarted.memory_item_repo.items.clear()
+            assert restarted.memory_item_repo.list_items()[item.id].extra == {}
+
+
+class TestCascadeDeleteItem:
+    """Fix 10: delete_item must not leave the item's category relations behind.
+
+    There is no FK and no ON DELETE CASCADE on memu_category_items, and no
+    layer owns the dependent rows: _patch_delete_memory_item reads the item's
+    categories only to build category_updates, then deletes the item row.
+    Measured before the fix: 6,455 dangling relations, every one of the 5,611
+    distinct dangling item_ids present in the item_deleted audit log. They also
+    inflate memory_expand_category's reported total (which counts relations
+    while listing through a JOIN) by 3.5-4.4 percent on every category.
+    """
+
+    def test_relations_and_caches_are_removed(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store, summary="doomed")
+            fx.link_all(store, item.id, cats)
+
+            store.memory_item_repo.delete_item(item.id)
+
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 0
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
+            ) == 0
+            assert item.id not in store.memory_item_repo.items
+            # DatabaseState.relations is read directly by memu's retrieve path.
+            assert [r for r in store.category_item_repo.relations
+                    if r.item_id == item.id] == []
+
+    def test_unpatched_delete_orphans_the_relations(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            memu_delete = fx.Repo._nerve_memu_delete_item
+
+            store, cats = fx.setup(2)
+            item = fx.add_item(store, summary="doomed")
+            fx.link_all(store, item.id, cats)
+
+            memu_delete(store.memory_item_repo, item.id)
+
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
+            ) == 0
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+
+    def test_missing_id_and_unlinked_item_are_noops(self, tmp_path):
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            store.memory_item_repo.delete_item("no-such-id")
+            item = fx.add_item(store, summary="t")
+            store.memory_item_repo.delete_item(item.id)
+            assert fx.raw_count("SELECT count(*) FROM memu_memory_items") == 0
+
+    def test_a_failed_item_delete_rolls_the_relations_back(self, tmp_path):
+        """Atomicity. Deleting relations in their own transaction and then
+        delegating would leave a SURVIVING item stripped of its links on a
+        failure - strictly worse than the dangling rows it set out to fix.
+        SQLiteSessionManager.session() returns a fresh Session per call, so one
+        session for both deletes is the only way to get this.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store, summary="t")
+            fx.link_all(store, item.id, cats)
+
+            class _Boom(Exception):
+                pass
+
+            sessions = store.memory_item_repo._sessions
+            original_session = sessions.session
+
+            def failing_session():
+                session = original_session()
+                def _raise(_obj):
+                    raise _Boom("forced")
+                session.delete = _raise
+                return session
+
+            sessions.session = failing_session
+            try:
+                with pytest.raises(_Boom):
+                    store.memory_item_repo.delete_item(item.id)
+            finally:
+                sessions.session = original_session
+
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ?", item.id,
+            ) == 1
+
+    def test_fix_3_index_hook_stays_outermost(self, tmp_path):
+        """Fix 10 REPLACES the base implementation, so it must be installed
+        BEFORE Fix 3 (the opposite order from the wrapper-style fixes) or the
+        vector-index remove() hook would be buried and stop firing.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            assert fx.Repo.delete_item.__qualname__.endswith("_indexed_delete_item")
+
+            store, _ = fx.setup(1)
+            item = fx.add_item(
+                store, summary="t", embedding=np.array([1.0, 0.0], dtype=np.float32),
+            )
+            removed = []
+
+            class _Index:
+                dirty = False
+                seen_items_len = 0
+
+                def remove(self, item_id):
+                    removed.append(item_id)
+
+            store.memory_item_repo._nerve_vec_index = _Index()
+            store.memory_item_repo.delete_item(item.id)
+
+            assert removed == [item.id]
+
+
+class TestWritePathPatchStructure:
+    """Structural tripwires for the assumptions the three fixes rest on."""
+
+    def test_patching_twice_does_not_stack(self, tmp_path):
+        def chain(fn):
+            names = []
+            while fn is not None and hasattr(fn, "__closure__"):
+                names.append(fn.__qualname__.rsplit(".", 1)[-1])
+                nxt = None
+                for cell in (fn.__closure__ or ()):
+                    value = cell.cell_contents
+                    if callable(value) and getattr(value, "__qualname__", "").endswith(
+                        ("update_item", "delete_item"),
+                    ):
+                        nxt = value
+                        break
+                fn = nxt
+            return names
+
+        with _MemuPatchFixture(tmp_path) as fx:
+            first_update = chain(fx.Repo.update_item)
+            first_delete = chain(fx.Repo.delete_item)
+            handler = fx.CRUDMixin._patch_update_memory_item
+
+            MemUBridge._patch_sqlite_bugs()
+            MemUBridge._patch_sqlite_bugs()
+
+            assert chain(fx.Repo.update_item) == first_update
+            assert chain(fx.Repo.delete_item) == first_delete
+            assert fx.CRUDMixin._patch_update_memory_item is handler
+
+    def test_the_handler_the_service_resolves_is_the_one_patched(self, tmp_path):
+        """Fix 8 patches a class attribute, and PipelineManager captures the
+        BOUND method during MemoryService.__init__ - which runs AFTER
+        _patch_sqlite_bugs() in _initialize_impl, so the patch is picked up.
+        """
+        with _MemuPatchFixture(tmp_path):
+            from memu.app.crud import CRUDMixin
+            from memu.app.service import MemoryService
+
+            assert (MemoryService._patch_update_memory_item
+                    is CRUDMixin._patch_update_memory_item)
+
+    def test_map_category_names_to_ids_copies_agree(self):
+        """_map_category_names_to_ids exists in BOTH CRUDMixin and
+        MemorizeMixin, and the MRO resolves MemorizeMixin's copy. Fix 8 calls it
+        late-bound via self. so it follows the MRO; this pins that the two
+        copies cannot silently diverge.
+        """
+        import inspect
+
+        import memu.app.service  # noqa: F401
+        from memu.app.crud import CRUDMixin
+        from memu.app.memorize import MemorizeMixin
+        from memu.app.service import MemoryService
+
+        assert (MemoryService._map_category_names_to_ids
+                is MemorizeMixin._map_category_names_to_ids)
+        assert (inspect.getsource(CRUDMixin._map_category_names_to_ids)
+                == inspect.getsource(MemorizeMixin._map_category_names_to_ids))
+
+    def test_patch_mixin_duplicates_are_dead_code(self):
+        """memu.app.patch.PatchMixin holds byte-equivalent duplicates of both
+        workflow handlers. Nothing inherits or instantiates it, so it needs no
+        patch - assert that, so a future memU version wiring it up fails here.
+        """
+        import memu.app.patch as patch_mod
+        from memu.app.service import MemoryService
+
+        assert patch_mod.PatchMixin.__subclasses__() == []
+        assert patch_mod.PatchMixin not in MemoryService.__mro__
+
+    def test_clear_items_remains_unreachable_from_nerve(self):
+        """clear_items also leaves dangling relations, but its only memU caller
+        is CRUDMixin.clear_memory, which nerve never calls. Fixing bulk-delete
+        semantics is a separate concern; this pins the exemption so it cannot
+        rot silently.
+        """
+        from pathlib import Path
+
+        package_root = Path(nerve_memory_bridge_file()).parents[1]
+        assert package_root.name == "nerve", package_root
+        hits = sorted(
+            str(path.relative_to(package_root))
+            for path in package_root.rglob("*.py")
+            if "clear_memory" in path.read_text(encoding="utf-8", errors="ignore")
+        )
+        assert hits == []
+
+    def test_salience_ranking_branch_is_unreachable_today(self):
+        """_fast_vector_search's salience branch reads extra from the cache.
+        It is not a live defect either way, because ranking defaults to
+        "similarity" and nerve never sets it - assert that rather than claiming
+        this PR fixes or regresses salience ranking.
+        """
+        from memu.app.settings import RetrieveItemConfig
+
+        assert RetrieveItemConfig().ranking == "similarity"
+
+
+def nerve_memory_bridge_file():
+    from nerve.memory import memu_bridge
+
+    return memu_bridge.__file__
