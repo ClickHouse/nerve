@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from nerve.config import MemoryConfig, NerveConfig
+from nerve.config import MemoryCategoryConfig, MemoryConfig, NerveConfig
 from nerve.memory.memu_bridge import (
     MemoryBackendUnavailable,
     MemUBridge,
@@ -1134,3 +1135,390 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Category seeding (_ensure_categories / _seed_categories)
+# ---------------------------------------------------------------------------
+
+# memU's SQLModel table classes are process-global: a second set raises
+# "Column object 'url' already assigned to Table 'memu_resources'".  Build them
+# once and inject them, so each test still gets a real store on a fresh file.
+_SQLA_MODELS: dict[str, object] = {}
+
+
+def _memu_store(db_path: Path):
+    """A genuine memU SQLite store, safe to build repeatedly in one process."""
+    import memu.app.service  # noqa: F401  - first, else the patcher hits a circular import
+
+    MemUBridge._patch_sqlite_bugs()  # required before the first store is built
+    from memu.database.sqlite.schema import get_sqlite_sqlalchemy_models
+    from memu.database.sqlite.sqlite import SQLiteStore
+    from pydantic import BaseModel
+
+    class _Scope(BaseModel):
+        pass
+
+    if "models" not in _SQLA_MODELS:
+        _SQLA_MODELS["scope"] = _Scope
+        _SQLA_MODELS["models"] = get_sqlite_sqlalchemy_models(scope_model=_Scope)
+    return SQLiteStore(
+        dsn=f"sqlite:///{db_path}",
+        scope_model=_SQLA_MODELS["scope"],
+        sqla_models=_SQLA_MODELS["models"],
+    )
+
+
+class _StubCategoryConfig:
+    """Stands in for memu.app.service.CategoryConfig (name + description)."""
+
+    def __init__(self, name: str, description: str = ""):
+        self.name = name
+        self.description = description
+
+
+class _StubService:
+    """Stand-in for MemoryService: the advertised set, a real store, a real context.
+
+    Mirrors every attribute the seeding path touches on either branch, so a run
+    against unfixed code exercises its true behaviour (``_create_category_impl``
+    appending to the advertised set) instead of tripping over a missing stub
+    attribute and failing for the wrong reason.
+    """
+
+    def __init__(self, store, advertised: list[tuple[str, str]]):
+        from memu.app.service import Context
+
+        self.database = store
+        self.category_configs = [_StubCategoryConfig(n, d) for n, d in advertised]
+        self.category_config_map = {c.name: c for c in self.category_configs}
+        self._category_prompt_str = self._format_categories_for_prompt(self.category_configs)
+        self._context = Context()
+        self._embed_client = None
+
+    @staticmethod
+    def _format_categories_for_prompt(cfgs) -> str:
+        return "\n".join(f"- {c.name}: {c.description}" for c in cfgs)
+
+    def _get_context(self):
+        return self._context
+
+    def _get_llm_client(self, _profile):
+        return self._embed_client
+
+
+def _seed_bridge(tmp_path, advertised, *, configured=(), has_embeddings=False, db_name="memu.sqlite"):
+    """A bridge wired for _ensure_categories only: stub service, real store."""
+    config = _make_config(tmp_path)
+    config.memory.categories = [
+        MemoryCategoryConfig(name=n, description=d) for n, d in configured
+    ]
+    bridge = MemUBridge(config, audit_db=None)
+    bridge._service = _StubService(_memu_store(tmp_path / db_name), advertised)
+    # _has_embeddings reads config.openai_api_key; set it so no network is touched.
+    config.openai_api_key = "test-embed-key" if has_embeddings else ""
+    return bridge
+
+
+def _rebuild_map(bridge) -> dict[str, str]:
+    """The name->ID rebuild _initialize_impl runs after _ensure_categories."""
+    repo = bridge._service.database.memory_category_repo
+    return {cat.name.lower(): cat.id for cat in repo.categories.values()}
+
+
+_INIT_PROBE = """
+import asyncio, sys, json
+from pathlib import Path
+import memu.app.service  # imported first: avoids a circular import in the patcher
+from nerve.config import MemoryCategoryConfig, MemoryConfig, NerveConfig
+from nerve.memory.memu_bridge import MemUBridge
+
+async def main():
+    tmp = Path(sys.argv[1])
+    configured = json.loads(sys.argv[2])
+    fail_load = sys.argv[3] == "fail-load"
+    cfg = NerveConfig()
+    cfg.memory = MemoryConfig(
+        sqlite_dsn=f"sqlite:///{tmp / 'memu.sqlite'}",
+        categories=[MemoryCategoryConfig(name=n, description=d) for n, d in configured],
+    )
+    cfg.anthropic_api_key = "test-key"
+    bridge = MemUBridge(cfg, audit_db=None)
+    if fail_load:
+        real_ensure = bridge._ensure_categories
+        async def _boom():
+            raise RuntimeError("category load exploded")
+        bridge._ensure_categories = _boom
+        del real_ensure
+    ok = await bridge.initialize()
+    out = {"initialize": ok, "available": bridge._available,
+           "service_available": bridge._metrics.service_available}
+    if bridge._service is not None:
+        svc = bridge._service
+        ctx = svc._get_context()
+        advertised = [c.name for c in svc.category_configs]
+        out["advertised"] = advertised
+        out["prompt_lines"] = [ln for ln in svc._category_prompt_str.splitlines() if ln.strip()]
+        out["map"] = dict(ctx.category_name_to_id)
+        out["resolved"] = svc._map_category_names_to_ids(advertised, ctx)
+        out["rows"] = sorted(c.name for c in
+                             svc.database.memory_category_repo.list_categories().values())
+    print("PROBE_JSON " + json.dumps(out))
+
+asyncio.run(main())
+"""
+
+
+def _run_init(tmp_path, configured=(), mode="normal"):
+    """Run a full MemUBridge.initialize() in a subprocess and return its report.
+
+    Out of process because memU allows exactly one MemoryService per interpreter.
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-c", _INIT_PROBE, str(tmp_path),
+         json.dumps([list(c) for c in configured]), mode],
+        capture_output=True, text=True, timeout=300,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("PROBE_JSON ")), None)
+    assert line is not None, f"probe produced no report\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    return json.loads(line[len("PROBE_JSON "):])
+
+
+class TestEnsureCategoriesSeeding:
+    """Every category advertised to the LLM must resolve through the name->ID map."""
+
+    @pytest.mark.asyncio
+    async def test_empty_config_seeds_the_advertised_defaults(self, tmp_path):
+        """The filed defect: no configured categories -> memU's defaults are advertised.
+
+        Fails before the fix with map=0 / resolvable=0 of 10.
+        """
+        advertised = [(f"cat_{i}", f"desc {i}") for i in range(4)]
+        bridge = _seed_bridge(tmp_path, advertised, configured=())
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        mapping = _rebuild_map(bridge)
+        assert sorted(c.name for c in rows.values()) == sorted(n for n, _ in advertised)
+        assert [n for n, _ in advertised if n.lower() not in mapping] == []
+        # Descriptions carry through, so category summaries keep meaningful text.
+        assert {c.name: c.description for c in rows.values()} == dict(advertised)
+
+    @pytest.mark.asyncio
+    async def test_configured_path_rows_and_map_unchanged(self, tmp_path):
+        """Seeding from the effective set does not change what a configured install gets."""
+        configured = [("task_domain", "Domain knowledge"), ("patterns", "Recurring patterns")]
+        bridge = _seed_bridge(tmp_path, configured, configured=configured)
+
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert sorted(c.name for c in rows.values()) == ["patterns", "task_domain"]
+        assert {c.name: c.description for c in rows.values()} == dict(configured)
+        assert sorted(_rebuild_map(bridge)) == ["patterns", "task_domain"]
+
+    @pytest.mark.asyncio
+    async def test_configured_cold_start_does_not_inflate_advertised_set(self, tmp_path):
+        """A cold start must not list every category twice in the memorize prompt.
+
+        Seeding via _create_category_impl appends a CategoryConfig for a name memU
+        already advertises: 3 configured categories became 6 advertised entries.
+        """
+        configured = [("task_domain", "Domain"), ("patterns", "Recurring"), ("procedures", "How to")]
+        bridge = _seed_bridge(tmp_path, configured, configured=configured)
+        svc = bridge._service
+        before = [c.name for c in svc.category_configs]
+
+        await bridge._ensure_categories()
+
+        after = [c.name for c in svc.category_configs]
+        assert after == before
+        assert len(after) == len(set(after))
+        assert len(svc._category_prompt_str.splitlines()) == len(configured)
+
+    @pytest.mark.asyncio
+    async def test_empty_config_does_not_inflate_advertised_set(self, tmp_path):
+        """Same guard on the empty-config path, where the advertised set is memU's own.
+
+        Pins the seeding primitive: routing this through _create_category_impl
+        duplicates all 10 default names (or loops, if the live list is iterated).
+        """
+        advertised = [(f"cat_{i}", f"desc {i}") for i in range(4)]
+        bridge = _seed_bridge(tmp_path, advertised, configured=())
+        svc = bridge._service
+        before = [c.name for c in svc.category_configs]
+
+        await bridge._ensure_categories()
+
+        after = [c.name for c in svc.category_configs]
+        assert after == before
+        assert len(after) == len(set(after))
+        assert len(svc._category_prompt_str.splitlines()) == len(advertised)
+
+    @pytest.mark.asyncio
+    async def test_reinit_creates_no_duplicates(self, tmp_path):
+        """"Only missing ones are created": a second boot adds nothing."""
+        advertised = [("alpha", "A"), ("beta", "B")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=())
+
+        await bridge._ensure_categories()
+        first = {c.id for c in bridge._service.database.memory_category_repo.list_categories().values()}
+        await bridge._ensure_categories()
+
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert sorted(c.name for c in rows.values()) == ["alpha", "beta"]
+        assert {c.id for c in rows.values()} == first
+        assert sorted(_rebuild_map(bridge)) == ["alpha", "beta"]
+
+    @pytest.mark.asyncio
+    async def test_persisted_row_is_remapped_when_no_categories_configured(self, tmp_path):
+        """A row created at runtime is resolvable again after a restart.
+
+        Only the map half: the advertised set is rebuilt by memU from config at
+        construction, so the LLM is still not told this category exists.  That
+        remaining half is out of scope here.
+        """
+        store = _memu_store(tmp_path / "memu.sqlite")
+        store.memory_category_repo.get_or_create_category(
+            name="work", description="Work stuff", embedding=None, user_data={},
+        )
+
+        config = _make_config(tmp_path)
+        config.memory.categories = []
+        config.openai_api_key = ""
+        bridge = MemUBridge(config, audit_db=None)
+        # A fresh store over the same file: a restart starts with a cold cache.
+        bridge._service = _StubService(_memu_store(tmp_path / "memu.sqlite"), [("alpha", "A")])
+
+        await bridge._ensure_categories()
+
+        mapping = _rebuild_map(bridge)
+        assert "work" in mapping
+        # Pinned residual: the persisted row is resolvable but still not advertised.
+        assert "work" not in [c.name for c in bridge._service.category_configs]
+        assert "work" not in bridge._service._category_prompt_str
+
+    @pytest.mark.asyncio
+    async def test_category_load_failure_propagates(self, tmp_path):
+        """A read error must surface, not leave ``existing`` empty and re-seed everything."""
+        bridge = _seed_bridge(tmp_path, [("alpha", "A")], configured=())
+        repo = bridge._service.database.memory_category_repo
+        repo.list_categories = MagicMock(side_effect=RuntimeError("db read failed"))
+
+        with pytest.raises(RuntimeError, match="db read failed"):
+            await bridge._ensure_categories()
+
+        assert repo.categories == {}
+
+    @pytest.mark.asyncio
+    async def test_seeds_are_audited_as_category_created(self, tmp_path):
+        """Seeded categories keep the documented ``category_created`` audit record."""
+        advertised = [("alpha", "A"), ("beta", "B")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=())
+        bridge._audit = AsyncMock()
+
+        await bridge._ensure_categories()
+
+        actions = [(c.args[0], c.args[1], c.args[2], c.args[3]) for c in bridge._audit.await_args_list]
+        assert actions == [
+            ("category_created", "category", "alpha", "bridge"),
+            ("category_created", "category", "beta", "bridge"),
+        ]
+        # Nothing new on a re-init, so no further audit records.
+        bridge._audit.reset_mock()
+        await bridge._ensure_categories()
+        assert bridge._audit.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_seeds_are_audited_on_the_configured_path_too(self, tmp_path):
+        configured = [("task_domain", "Domain")]
+        bridge = _seed_bridge(tmp_path, configured, configured=configured)
+        bridge._audit = AsyncMock()
+
+        await bridge._ensure_categories()
+
+        assert [c.args[:4] for c in bridge._audit.await_args_list] == [
+            ("category_created", "category", "task_domain", "bridge"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_embeddings_are_batched_when_a_provider_is_configured(self, tmp_path):
+        """Category ranking is vector-based on RAG installs, so seeds must carry vectors."""
+        advertised = [("alpha", "A desc"), ("beta", "")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=(), has_embeddings=True)
+        embed = AsyncMock(return_value=[[0.1, 0.2], [0.3, 0.4]])
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        await bridge._ensure_categories()
+
+        # One batched call, not one per category.
+        assert embed.await_count == 1
+        assert embed.await_args.args[0] == ["alpha: A desc", "beta"]
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        stored = {c.name: list(c.embedding) for c in rows.values()}
+        assert stored == {"alpha": [0.1, 0.2], "beta": [0.3, 0.4]}
+
+    @pytest.mark.asyncio
+    async def test_no_embed_call_without_a_provider(self, tmp_path):
+        bridge = _seed_bridge(tmp_path, [("alpha", "A")], configured=(), has_embeddings=False)
+        embed = AsyncMock(return_value=[[0.1]])
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        await bridge._ensure_categories()
+
+        assert embed.await_count == 0
+        rows = bridge._service.database.memory_category_repo.list_categories()
+        assert [c.embedding for c in rows.values()] == [None]
+
+    @pytest.mark.asyncio
+    async def test_embed_failure_writes_nothing(self, tmp_path):
+        """No null-embedding row may be written when a provider IS configured.
+
+        get_or_create_category returns an existing row untouched, so such a row is
+        never repaired: a later boot sees the name and skips it, while both category
+        rankers drop null vectors.  Assert the ABSENCE of rows, not just the error.
+        """
+        advertised = [("alpha", "A"), ("beta", "B")]
+        bridge = _seed_bridge(tmp_path, advertised, configured=(), has_embeddings=True)
+        embed = AsyncMock(side_effect=RuntimeError("embedding provider down"))
+        bridge._service._embed_client = MagicMock(embed=embed)
+
+        with pytest.raises(RuntimeError, match="embedding provider down"):
+            await bridge._ensure_categories()
+
+        assert bridge._service.database.memory_category_repo.list_categories() == {}
+
+
+class TestInitializeCategoryInvariant:
+    """End-to-end: a full initialize() in its own process (one MemoryService each)."""
+
+    def test_empty_config_every_advertised_category_resolves(self, tmp_path):
+        report = _run_init(tmp_path, configured=())
+
+        assert report["initialize"] is True
+        assert report["available"] is True
+        assert len(report["advertised"]) == 10  # memU's defaults
+        assert len(report["resolved"]) == len(report["advertised"])
+        assert sorted(report["rows"]) == sorted(report["advertised"])
+        assert len(report["prompt_lines"]) == len(report["advertised"])
+
+    def test_configured_cold_start_prompt_lists_each_category_once(self, tmp_path):
+        configured = [("task_domain", "Domain"), ("patterns", "Recurring")]
+        report = _run_init(tmp_path, configured=configured)
+
+        assert report["advertised"] == ["task_domain", "patterns"]
+        assert len(report["prompt_lines"]) == 2
+        assert len(report["resolved"]) == 2
+        assert sorted(report["rows"]) == ["patterns", "task_domain"]
+
+    def test_availability_is_not_published_when_init_fails(self, tmp_path):
+        """_available is the only failure signal the agent sees: engine.py drops the return."""
+        report = _run_init(tmp_path, configured=(), mode="fail-load")
+
+        assert report["initialize"] is False
+        assert report["available"] is False
+        assert report["service_available"] is False

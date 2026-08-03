@@ -1564,10 +1564,10 @@ class MemUBridge:
                        if not self.config.openai_api_key else {}),
                 },
             )
-            self._available = True
-            self._metrics.service_available = True
-            self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
-            logger.info("memU service initialized with SQLite at %s", sqlite_dsn)
+            # Availability is published at the end of this method, not here:
+            # ~290 further lines of init follow (category seeding, interceptors,
+            # vector preload), and engine.py discards initialize()'s return value,
+            # so _available is the only failure signal the running agent sees.
 
             # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
             self._attach_engine_pragmas()
@@ -1791,7 +1791,8 @@ class MemUBridge:
             # recall doesn't pay the 2s JSON-parse cost.
             try:
                 self._service.database.memory_item_repo.list_items()
-                self._service.database.memory_category_repo.list_categories()
+                # Categories are already cached: _ensure_categories loads them
+                # unconditionally, before the name-to-ID rebuild above.
 
                 # Convert cached embeddings from list[float] to numpy float32.
                 # Pydantic coerces numpy → list during model construction, so we
@@ -1851,6 +1852,11 @@ class MemUBridge:
                 _numpy_create_item._nerve_numpy_wrapped = True  # type: ignore[attr-defined]
                 SQLiteMemoryItemRepo.create_item = _numpy_create_item
 
+            self._available = True
+            self._metrics.service_available = True
+            self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
+            logger.info("memU service initialized with SQLite at %s", sqlite_dsn)
+
             return True
 
         except ImportError:
@@ -1861,27 +1867,64 @@ class MemUBridge:
             return False
 
     async def _ensure_categories(self) -> None:
-        """Create seed categories from config that don't already exist in the DB."""
-        if not self._service or not self.config.memory.categories:
+        """Create the categories memU advertises that don't already exist in the DB.
+
+        Seeds from ``self._service.category_configs``, the *effective* set memU
+        formats into the memorize prompt, not ``config.memory.categories``.  When
+        Nerve configures none, memU falls back to its own defaults, so the two sets
+        differ and every advertised name would be left with no row to resolve to.
+        """
+        if not self._service:
             return
 
-        existing: set[str] = set()
-        try:
-            cats = self._service.database.memory_category_repo.list_categories()
-            for _, cat in cats.items():
-                existing.add(getattr(cat, "name", ""))
-        except Exception:
-            pass
+        repo = self._service.database.memory_category_repo
+        # Unconditional, and read failures propagate: this call also warms the
+        # repo cache that _initialize_impl's name-to-ID rebuild reads, and an
+        # ``existing`` left empty by a swallowed error would re-seed every name.
+        existing = {getattr(cat, "name", "") for cat in repo.list_categories().values()}
 
-        for cat_cfg in self.config.memory.categories:
-            if cat_cfg.name in existing:
-                continue
-            try:
-                # Already on the memU loop (called from _initialize_impl) —
-                # invoke the impl directly instead of re-submitting.
-                await self._create_category_impl(cat_cfg.name, cat_cfg.description)
-            except Exception as e:
-                logger.warning("Failed to seed category %s: %s", cat_cfg.name, e)
+        # Snapshot: never iterate the advertised list while seeding from it.
+        missing = [c for c in list(self._service.category_configs) if c.name not in existing]
+        await self._seed_categories(missing)
+
+    async def _seed_categories(self, cat_cfgs: list[Any]) -> None:
+        """Persist startup seed categories WITHOUT touching the advertised set.
+
+        memU built ``category_configs`` / ``category_config_map`` /
+        ``_category_prompt_str`` from these same entries before this runs, so
+        appending to them here (what ``_create_category_impl`` does for runtime
+        creation of a category memU does *not* yet advertise) would list every
+        category twice in the memorize prompt.
+        """
+        if not self._service or not cat_cfgs:
+            return
+
+        # Embed before any write.  A row persisted with a null embedding is never
+        # repaired by a later boot (get_or_create_category returns an existing row
+        # untouched) and both category rankers skip null vectors, so an embed
+        # failure must propagate instead of falling back to None.  One batched
+        # call, matching memU's own category initializer.
+        embeddings: list[Any] = [None] * len(cat_cfgs)
+        if self._has_embeddings:
+            texts = [
+                f"{c.name}: {c.description}" if c.description else c.name
+                for c in cat_cfgs
+            ]
+            embeddings = list(await self._service._get_llm_client("embedding").embed(texts))
+
+        repo = self._service.database.memory_category_repo
+        for cat_cfg, embedding in zip(cat_cfgs, embeddings, strict=True):
+            repo.get_or_create_category(
+                name=cat_cfg.name,
+                description=cat_cfg.description,
+                embedding=embedding,
+                user_data={},
+            )
+            logger.info("Seeded category: %s", cat_cfg.name)
+            await self._audit(
+                "category_created", "category", cat_cfg.name, "bridge",
+                {"description": cat_cfg.description},
+            )
 
     # Maximum time (seconds) for a single memorize operation before cancellation.
     # Try to load malloc_trim for returning freed arenas to the OS.
