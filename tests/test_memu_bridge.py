@@ -1134,3 +1134,811 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Semantic-reinforce writeback: the extra column must be MERGED, not replaced.
+# ---------------------------------------------------------------------------
+
+_MEMU_MODELS_CACHE = {}
+
+# Every memu-py class attribute _patch_sqlite_bugs() reassigns, so each test can
+# restore global state and never leak into another test. A module that mutates
+# shared globals at import time breaks its neighbours invisibly, so all patching
+# happens INSIDE tests.
+_PATCHED_ITEM_REPO_ATTRS = (
+    "update_item", "delete_item", "clear_items", "list_items",
+    "create_item", "create_item_reinforce", "vector_search_items",
+)
+
+
+def _restore_attrs(cls, saved):
+    """Put class attributes back, deleting those that did not exist before."""
+    for name, value in saved.items():
+        if value is None:
+            if name in cls.__dict__:
+                delattr(cls, name)
+        else:
+            setattr(cls, name, value)
+
+
+def _memu_models():
+    """Build the SQLAlchemy models ONCE per process.
+
+    nerve's Fix 6 (_patched_get_models) clears memu's _MODEL_CACHE on every
+    call, so a second SQLiteStore(dsn=...) that rebuilds them raises
+    ArgumentError("Column object 'url' already assigned"). Sharing one build
+    across stores is what lets these tests use several isolated stores.
+    """
+    if "models" in _MEMU_MODELS_CACHE:
+        return _MEMU_MODELS_CACHE["models"]
+
+    import memu.app.service  # noqa: F401 - initialize the package graph
+    import memu.database.sqlite.schema as schema_mod
+    from memu.database.sqlite.repositories.memory_item_repo import (
+        SQLiteMemoryItemRepo as Repo,
+    )
+
+    # Building the models needs the patches applied (Fix 6 renames memu's own
+    # "sqlite_*" tables, which SQLite reserves), but this helper must leave
+    # global state exactly as it found it: leaking a patched Repo out of a
+    # module-level helper is how one test silently breaks its neighbours.
+    saved = {n: Repo.__dict__.get(n) for n in _PATCHED_ITEM_REPO_ATTRS}
+    try:
+        MemUBridge._patch_sqlite_bugs()
+        # Resolve through the MODULE, never a from-import: Fix 6 replaces this
+        # attribute.
+        models = schema_mod.get_sqlite_sqlalchemy_models(scope_model=None)
+    finally:
+        _restore_attrs(Repo, saved)
+
+    _MEMU_MODELS_CACHE["models"] = models
+    return models
+
+
+class _ReinforceFixture:
+    """Isolated memU stores over a temp file with _patch_sqlite_bugs() applied."""
+
+    # Cosine ~0.999 apart: above _SEMANTIC_DEDUP_THRESHOLD, so the semantic arm
+    # fires while the content hashes differ (the delegate's hash dedup must not
+    # be what handles these).
+    VEC_A = [1.0, 0.0, 0.0]
+    VEC_B = [0.999, 0.0447, 0.0]
+
+    def __init__(self, tmp_path):
+        self.models = _memu_models()
+        self.path = str(tmp_path / "memu.sqlite")
+        # WAL is what production runs (_setup_sqlite_pragmas); it makes the race
+        # MORE likely, since writers no longer serialise behind readers.
+        sqlite3.connect(self.path).execute("PRAGMA journal_mode=WAL").fetchone()
+        self._stores = []
+        self.saved_item_repo = {}
+
+    def __enter__(self):
+        import memu.app.service  # noqa: F401
+        from memu.database.sqlite.repositories.memory_item_repo import (
+            SQLiteMemoryItemRepo as Repo,
+        )
+
+        self.Repo = Repo
+        self.saved_item_repo = {
+            n: Repo.__dict__.get(n) for n in _PATCHED_ITEM_REPO_ATTRS
+        }
+        MemUBridge._patch_sqlite_bugs()
+        return self
+
+    def __exit__(self, *exc):
+        for store in self._stores:
+            try:
+                store.close()
+            except Exception:
+                pass
+        _restore_attrs(self.Repo, self.saved_item_repo)
+        return False
+
+    def store(self):
+        """A fresh store over the same file (a simulated process restart)."""
+        from memu.database.sqlite.sqlite import SQLiteStore
+
+        store = SQLiteStore(dsn=f"sqlite:///{self.path}", sqla_models=self.models)
+        self._stores.append(store)
+        return store
+
+    def add_item(self, store, summary="a fact", embedding=None, memory_type="knowledge"):
+        return store.memory_item_repo.create_item_reinforce(
+            resource_id=None, memory_type=memory_type, summary=summary,
+            embedding=embedding if embedding is not None else self.VEC_A,
+            user_data={},
+        )
+
+    def reinforce(self, repo, summary="a fact restated", embedding=None,
+                  memory_type="knowledge"):
+        return repo.create_item_reinforce(
+            resource_id=None, memory_type=memory_type, summary=summary,
+            embedding=embedding if embedding is not None else self.VEC_B,
+            user_data={},
+        )
+
+    def raw_extra(self, item_id):
+        row = sqlite3.connect(self.path).execute(
+            "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,),
+        ).fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+
+    def raw_extra_text(self, item_id):
+        """The column's stored TEXT, undecoded.
+
+        raw_extra() json.loads()es, so it cannot tell '"{}"' (a JSON text
+        scalar) from '{}' (an object) and cannot prove byte preservation.
+        """
+        return sqlite3.connect(self.path).execute(
+            "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,),
+        ).fetchone()[0]
+
+    def raw_updated_at(self, item_id):
+        return sqlite3.connect(self.path).execute(
+            "SELECT updated_at FROM memu_memory_items WHERE id = ?", (item_id,),
+        ).fetchone()[0]
+
+    def raw_count(self):
+        return sqlite3.connect(self.path).execute(
+            "SELECT count() FROM memu_memory_items",
+        ).fetchone()[0]
+
+    def write_extra(self, item_id, extra):
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+            (extra if isinstance(extra, str) else json.dumps(extra), item_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def write_extra_raw_null(self, item_id):
+        """Store a genuine SQL NULL, which write_extra cannot express.
+
+        write_extra json.dumps() anything that is not already a str, so
+        write_extra(None) stores the TEXT 'null' (JSON null) and leaves the
+        COALESCE half of the guard unobserved.
+        """
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "UPDATE memu_memory_items SET extra = NULL WHERE id = ?", (item_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    def write_extra_json_null(self, item_id):
+        """Store the JSON-null DOCUMENT (TEXT 'null'), not a SQL NULL.
+
+        Distinct from write_extra_raw_null: COALESCE/NULLIF both pass this
+        value straight through, and json_set returns a JSON-null document
+        unchanged, so only this shape observes the json_type guard.
+        """
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "UPDATE memu_memory_items SET extra = 'null' WHERE id = ?", (item_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    def raw_json_type(self, item_id):
+        return sqlite3.connect(self.path).execute(
+            "SELECT json_type(extra) FROM memu_memory_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()[0]
+
+    def delete_row(self, item_id):
+        conn = sqlite3.connect(self.path)
+        conn.execute("DELETE FROM memu_memory_items WHERE id = ?", (item_id,))
+        conn.commit()
+        conn.close()
+
+
+def _race_extra_in_the_reinforce_window(fx, repo, item_id, mutate_extra, **kwargs):
+    """Land ``mutate_extra`` on the row's extra strictly inside the window.
+
+    Hooks ``session.execute`` and fires once on the json_set merge, so the
+    concurrent commit lands between the merge's read of the column and its
+    commit. Returns ``(result, raced)`` so the caller can assert the race really
+    happened: a test that silently misses the window passes against unfixed code.
+    """
+    sessions = repo._sessions
+    original_session = sessions.session
+    raced = []
+
+    def racing_session():
+        session = original_session()
+        real_execute = session.execute
+        real_exec = session.exec
+
+        def _fire():
+            raced.append(True)
+            conn = sqlite3.connect(fx.path, timeout=30)
+            row = conn.execute(
+                "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,),
+            ).fetchone()
+            extra = json.loads(row[0]) if row and row[0] else {}
+            mutate_extra(extra)
+            conn.execute(
+                "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+                (json.dumps(extra), item_id),
+            )
+            conn.commit()
+            conn.close()
+
+        def _execute(stmt, *args, **kw):
+            # The fixed path issues the merge via session.execute(update(...)).
+            if "json_set" in str(stmt) and not raced:
+                _fire()
+            return real_execute(stmt, *args, **kw)
+
+        def _exec(stmt, *args, **kw):
+            # The UNFIXED path reads via session.exec(select(...)); firing after
+            # its row materialises puts the write in that window too, so one
+            # helper drives both arms of the both-directions proof.
+            result = real_exec(stmt, *args, **kw)
+            if raced:
+                return result
+
+            class _FireOnFirst:
+                def first(self_inner):
+                    row = result.first()
+                    if row is not None and not raced:
+                        _fire()
+                    return row
+
+                def __getattr__(self_inner, name):
+                    return getattr(result, name)
+
+            return _FireOnFirst()
+
+        session.execute = _execute
+        session.exec = _exec
+        return session
+
+    sessions.session = racing_session
+    try:
+        return fx.reinforce(repo, **kwargs), raced
+    finally:
+        sessions.session = original_session
+
+
+def _race_a_writer_just_before_the_readback(fx, repo, item_id, key, **kwargs):
+    """Start a competing writer after the merge ran, just before the readback.
+
+    Unlike ``_race_extra_in_the_reinforce_window`` (which fires BEFORE the merge
+    and so proves only json_set's semantics), the intruder here meets the write
+    reservation the UPDATE took.
+
+    Hooked at the ENGINE, not the session: SQLModel's ``exec`` resolves
+    ``super().execute`` as an unbound class lookup, so an instance patch on
+    ``session.execute`` misses a readback issued through ``exec``, while
+    ``before_cursor_execute`` sits below every session-level read API.
+
+    Fires between the merge and the readback STATEMENT, not right after the
+    UPDATE returns: at that earlier instant a commit-then-read implementation
+    still holds the lock, so the intruder is blocked on every tree.
+
+    Returns ``(result, raced, intruder_error, merged_stmts)``. ``raced`` proves
+    the hook fired, so a missed window cannot pass silently; ``merged_stmts``
+    carries the UPDATE's text so the caller can require that an implementation
+    issuing NO readback is a RETURNING one rather than an unsafe
+    commit-then-read.
+    """
+    from sqlalchemy import event
+
+    engine = repo._sessions.engine
+    raced = []
+    errors = []
+    merged_ran = []
+
+    def _fire():
+        raced.append(True)
+        # A SHORT timeout so a blocked write fails fast instead of stalling the
+        # suite for the sqlite3 default of 5s.
+        conn = sqlite3.connect(fx.path, timeout=0.5)
+        try:
+            conn.execute(
+                "UPDATE memu_memory_items SET extra = "
+                "json_set(coalesce(nullif(extra, ''), '{}'), '$." + key + "', ?) "
+                "WHERE id = ?",
+                ("intruder", item_id),
+            )
+            conn.commit()
+            errors.append(None)
+        except Exception as exc:  # noqa: BLE001 - the outcome IS the assertion
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    def _before_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany,
+    ):
+        text = statement.lstrip().upper()
+        # Keyed on statement KIND, never on json_set: keying on the merge
+        # function would pin the SQL shape this test must not pin.
+        if text.startswith("UPDATE") and not merged_ran:
+            merged_ran.append(text)
+        elif merged_ran and not raced and text.startswith("SELECT"):
+            _fire()
+
+    event.listen(engine, "before_cursor_execute", _before_cursor_execute)
+    try:
+        result = fx.reinforce(repo, **kwargs)
+    finally:
+        event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+    return result, raced, (errors[0] if errors else None), merged_ran
+
+
+class TestSemanticReinforceMergesExtra:
+    """The semantic reinforce writeback must merge into the row's live extra.
+
+    A read-modify-write replaces the whole column from a snapshot taken in an
+    earlier statement, so every key another writer commits in the read -> write
+    window is silently dropped. The only third-party writer that exists today is
+    the event-date sweep's ``mentioned_at``, so nothing is destroyed permanently
+    in the store right now; the defect is that the NEXT writer added is lossy
+    from day one and its author has no reason to suspect this path.
+    """
+
+    def test_a_concurrent_extra_write_inside_the_window_survives(self, tmp_path):
+        """The load-bearing one: a key committed inside the window must survive.
+
+        Two keys are asserted. ``mentioned_at`` is the real writer's, and
+        ``nerve_test_only_key`` is synthetic so the assertion cannot be satisfied
+        by a live writer re-adding its own stamp. Deliberately NOT ``ref_id``:
+        memu's _persist_item_references writes exactly that key and is dormant
+        only because enable_item_references defaults to False, so a fixture whose
+        isolation rests on an upstream default loses its meaning the day the
+        default moves.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+
+            def land_two_keys(extra):
+                extra["mentioned_at"] = "2026-08-03"
+                extra["nerve_test_only_key"] = "sentinel"
+
+            # Captured BEFORE the reinforce: comparing the post-reinforce column
+            # against a re-read of itself cannot fail on any implementation,
+            # including one that wipes the key.
+            hash_before = fx.raw_extra(item.id)["content_hash"]
+
+            result, raced = _race_extra_in_the_reinforce_window(
+                fx, repo, item.id, land_two_keys,
+            )
+
+            assert raced == [True], "the race never entered the window"
+            row_extra = fx.raw_extra(item.id)
+            assert row_extra["mentioned_at"] == "2026-08-03"
+            assert row_extra["nerve_test_only_key"] == "sentinel"
+            # The reinforce itself still landed.
+            assert row_extra["reinforcement_count"] == 2
+            assert row_extra["content_hash"] == hash_before
+            # Neither the cache nor the returned item may disagree with the row.
+            assert repo.items[item.id].extra == row_extra
+            assert result.extra == row_extra
+
+    def test_the_count_increments_from_the_row_not_a_snapshot(self, tmp_path):
+        """The increment is computed server-side, so both bumps are kept.
+
+        This distinguishes "merges other keys" from "computes the increment
+        atomically": a json_set of a count read into Python earlier passes the
+        test above and fails this one.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            assert fx.raw_extra(item.id)["reinforcement_count"] == 1
+
+            def bump_count(extra):
+                extra["reinforcement_count"] = 9
+
+            result, raced = _race_extra_in_the_reinforce_window(
+                fx, repo, item.id, bump_count,
+            )
+
+            assert raced == [True], "the race never entered the window"
+            # 9 (the concurrent writer's) + 1 (ours, read from the row) = 10.
+            # A snapshot-based increment would store 2 and lose the other write.
+            assert fx.raw_extra(item.id)["reinforcement_count"] == 10
+            assert result.extra["reinforcement_count"] == 10
+
+    def test_an_empty_string_extra_does_not_raise(self, tmp_path):
+        """NULLIF is required, not defensive: json_set('') raises malformed JSON."""
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            fx.write_extra(item.id, "")
+
+            result = fx.reinforce(repo)
+
+            row_extra = fx.raw_extra(item.id)
+            assert isinstance(row_extra, dict)
+            assert row_extra["reinforcement_count"] == 2
+            assert result.extra == row_extra
+
+    def test_updated_at_keeps_the_microsecond_representation(self, tmp_path):
+        """updated_at is bound through Core so the dialect formats it.
+
+        The column is TZDateTime; its bind processor always writes microseconds,
+        while a hand-written isoformat(sep=" ") DROPS them when microsecond == 0,
+        making this row's timestamp text differ from every other writer's.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+
+            import pendulum
+
+            frozen = pendulum.datetime(2026, 8, 3, 12, 0, 0, tz="UTC")
+            assert frozen.microsecond == 0
+            with patch.object(type(repo), "_now", lambda self: frozen):
+                fx.reinforce(repo)
+
+            assert fx.raw_updated_at(item.id) == "2026-08-03 12:00:00.000000"
+
+    def test_the_returned_item_still_signals_rc_gt_1(self, tmp_path):
+        """memorize skips category linking on a reinforce by reading this.
+
+        If the returned item stopped signalling a count above 1, every reinforce
+        would be treated as a fresh memory and linked again as a new source.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+
+            result = fx.reinforce(repo)
+
+            assert result.id == item.id
+            assert result.extra.get("reinforcement_count", 1) > 1
+
+    def test_the_cache_matches_the_row_afterwards(self, tmp_path):
+        """The cache is rebuilt from the merged value, not from a snapshot."""
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            # A key only the row knows about: a snapshot-rebuilt cache omits it.
+            fx.write_extra(item.id, {**fx.raw_extra(item.id), "mentioned_at": "2026-07-01"})
+
+            result = fx.reinforce(repo)
+
+            row_extra = fx.raw_extra(item.id)
+            assert repo.items[item.id].extra == row_extra
+            assert result.extra == row_extra
+            assert row_extra["mentioned_at"] == "2026-07-01"
+
+    def test_content_hash_survives_a_cold_cache_reinforce(self, tmp_path):
+        """Merging server-side also fixes the cold-cache variant of the same bug.
+
+        Every read path builds MemoryItem without extra, so after a restart the
+        cached extra is {} and a snapshot-built column wipes content_hash (which
+        the delegate's own hash dedup depends on) along with mentioned_at.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            hash_before = fx.raw_extra(item.id)["content_hash"]
+            fx.write_extra(item.id, {**fx.raw_extra(item.id), "mentioned_at": "2026-07-01"})
+            store.close()
+
+            # A simulated restart: fresh store, cache hydrated with no extra.
+            repo = fx.store().memory_item_repo
+            repo.list_items()
+            assert repo.items[item.id].extra == {}
+
+            result = fx.reinforce(repo)
+
+            row_extra = fx.raw_extra(item.id)
+            assert row_extra["content_hash"] == hash_before
+            assert row_extra["mentioned_at"] == "2026-07-01"
+            assert row_extra["reinforcement_count"] == 2
+            assert result.extra == row_extra
+
+    def test_a_zero_row_reinforce_evicts_the_stale_entry(self, tmp_path):
+        """A cache hit on a deleted row must not be reported as a reinforce.
+
+        The merge UPDATE makes a missing row DETECTABLE (rowcount 0) where a
+        snapshot writeback silently skipped the write and returned the ghost
+        anyway, dropping the memory. Evicting the stale entry closes the
+        residual: otherwise it keeps winning top-1, so every later near-duplicate
+        burns another zero-row UPDATE and the real row is never reinforced.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            fx.delete_row(item.id)
+            assert item.id in repo.items  # the cache hit is now stale
+
+            out = fx.reinforce(repo, summary="the original text restated")
+
+            assert item.id not in repo.items
+            # The memory was persisted, and the caller did not get the ghost.
+            assert fx.raw_count() == 1
+            assert out.id != item.id
+            assert out.extra["reinforcement_count"] == 1
+
+            # The replacement must stay dedup-visible: this is the observable
+            # oracle for the seen_items_len resync (a counter-identity assertion
+            # would be FALSE for the correct implementation, because the
+            # delegate's create adds to items without touching the index).
+            again = fx.reinforce(repo, summary="the original text restated once more")
+
+            assert fx.raw_count() == 1
+            assert again.id == out.id
+            assert again.extra["reinforcement_count"] == 2
+
+    def test_a_writer_starting_after_the_update_cannot_land_before_readback(
+        self, tmp_path,
+    ):
+        """The readback runs inside the write transaction the UPDATE opened.
+
+        The racing branch asserts only the OBSERVABLE outcome. The no-readback
+        branch keys on RETURNING, which is the PROPERTY (the value is read in
+        the write statement itself), not on our json_set/CASE shape, so an
+        equivalent RETURNING implementation still satisfies this unchanged.
+        See ``_race_a_writer_just_before_the_readback`` for the mechanism.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+
+            (
+                result, raced, intruder_error, merged_stmts,
+            ) = _race_a_writer_just_before_the_readback(
+                fx, repo, item.id, "nerve_test_late_writer",
+            )
+
+            if not raced:
+                # No engine-visible read followed the UPDATE. That is safe ONLY
+                # for a RETURNING implementation, which never releases the write
+                # reservation; commit-then-read-off-the-engine issues no read
+                # either and must FAIL here rather than skip.
+                assert merged_stmts, "no UPDATE statement was issued at all"
+                # The keyword alone is not the property: RETURNING id also
+                # satisfies a substring check while the value is still read on
+                # another connection after the commit. Require the returned
+                # projection to BE extra, and require the cache to carry the
+                # row's real merged value. Matched on the relationship, not on
+                # our json_set/CASE shape, so an equivalent
+                # .returning(model.extra) still satisfies this unchanged.
+                _ret = merged_stmts[0].partition("RETURNING")
+                assert _ret[1], (
+                    "the merge issued no readback and no RETURNING, so nothing "
+                    "keeps a writer from landing before the value is read"
+                )
+                assert "EXTRA" in _ret[2], (
+                    "RETURNING does not project extra, so the merged value is "
+                    "still read outside the write statement: " + merged_stmts[0]
+                )
+                _row_extra = fx.raw_extra(item.id)
+                assert result.extra == _row_extra, (
+                    "the returned item does not carry the row's merged value"
+                )
+                assert repo.items[item.id].extra == _row_extra, (
+                    "the cache does not carry the row's merged value"
+                )
+                pytest.skip("RETURNING implementation: no readback to race")
+            assert raced == [True], "the hook never fired after the merge"
+            assert intruder_error is not None, (
+                "a writer starting after the merge committed, so the readback "
+                "was not inside the UPDATE's write transaction"
+            )
+            assert "locked" in str(intruder_error)
+            row_extra = fx.raw_extra(item.id)
+            assert "nerve_test_late_writer" not in row_extra
+            assert row_extra["reinforcement_count"] == 2
+            # The cache may not carry a value the row does not have.
+            assert result.extra == row_extra
+            assert repo.items[item.id].extra == row_extra
+
+    def test_a_sql_null_extra_normalises_to_an_object(self, tmp_path):
+        """COALESCE is required too: json_set(NULL, ...) yields NULL.
+
+        The other half of the same guard. write_extra cannot express this state
+        (it json.dumps() a None into the TEXT 'null'), so only the empty-string
+        arm had a live test. The cached count is left DIVERGENT from the column
+        on purpose: with the row at SQL NULL the live default is 1, so a merge
+        that reads the column stores exactly 2 while a snapshot path reading the
+        cache would store the cached value + 1.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            # The cache still holds the seeded count; the column no longer does.
+            assert repo.items[item.id].extra["reinforcement_count"] == 1
+            repo.items[item.id].extra = {**repo.items[item.id].extra,
+                                         "reinforcement_count": 7}
+            fx.write_extra_raw_null(item.id)
+
+            result = fx.reinforce(repo)
+
+            row_extra = fx.raw_extra(item.id)
+            assert isinstance(row_extra, dict)
+            # 1 (the column's absent-key default) + 1, NOT the cached 7 + 1.
+            assert row_extra["reinforcement_count"] == 2
+            assert "last_reinforced_at" in row_extra
+            assert result.extra == row_extra
+
+    def test_a_json_null_extra_normalises_to_an_object(self, tmp_path):
+        """The third arm of the guard: json_set leaves JSON null UNCHANGED.
+
+        COALESCE and NULLIF both pass TEXT 'null' straight through, and
+        json_set('null', ...) returns 'null', so the UPDATE reports rowcount 1
+        and COMMITS while the readback decodes to None. Without the json_type
+        normalisation the cache rebuild then raises TypeError with the
+        transaction already committed. Base HEALS this state (it does
+        dict(matched.extra or {})), so leaving it unhandled is a regression
+        rather than merely an uncovered shape.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            fx.write_extra_json_null(item.id)
+            assert fx.raw_json_type(item.id) == "null"
+
+            result = fx.reinforce(repo)
+
+            row_extra = fx.raw_extra(item.id)
+            assert isinstance(row_extra, dict)
+            # The live default is 1, so a merge that reads the column stores 2.
+            assert row_extra["reinforcement_count"] == 2
+            assert "last_reinforced_at" in row_extra
+            assert repo.items[item.id].extra == row_extra
+            assert result.extra == row_extra
+
+    def test_an_orm_assigned_none_extra_survives_a_reinforce(self, tmp_path):
+        """Reachability: the state above needs no raw SQL to occur.
+
+        SQLAlchemy's JSON type defaults to none_as_null=False, so an assigned
+        None is serialised to the TEXT 'null' document rather than a SQL NULL.
+        Any code path that clears extra through the ORM therefore produces
+        exactly the shape above. Without this test the one above reads as a
+        synthetic-state test that production cannot reach.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+
+            from sqlmodel import select as _sel
+
+            # The same attribute the production path resolves the model through.
+            model = repo._memory_item_model
+            with repo._sessions.session() as session:
+                row = session.exec(
+                    _sel(model).where(model.id == item.id)
+                ).first()
+                row.extra = None
+                session.add(row)
+                session.commit()
+            # The ORM stored a JSON-null DOCUMENT, not a SQL NULL.
+            assert fx.raw_json_type(item.id) == "null"
+
+            result = fx.reinforce(repo)
+
+            row_extra = fx.raw_extra(item.id)
+            assert isinstance(row_extra, dict)
+            assert row_extra["reinforcement_count"] == 2
+            assert result.extra == row_extra
+
+    # The pair arrays and [] are the load-bearing shapes: dict() SUCCEEDS on
+    # them, so without an explicit isinstance check they are cached as a
+    # plausible object the row does not have.
+    @pytest.mark.parametrize("stored", [
+        "[1,2]",
+        "[]",
+        '[["mentioned_at","2026-07-01"]]',
+        '[["a",1],["b",2]]',
+    ])
+    def test_a_non_object_extra_is_left_unchanged(self, tmp_path, stored):
+        """The normalisation is json-null only; every other shape raises.
+
+        json_set returns a non-object document unchanged, so the merge no-ops
+        while the UPDATE still reports rowcount 1. Two properties are pinned:
+        the cache rebuild must RAISE rather than report a reinforce that was
+        never stored, and the column must be left non-object (a guard widened
+        to json_type != 'object' would rewrite it and destroy the value). main
+        heals this shape from its cached dict instead, so the raise is a
+        disclosed behaviour difference, not a fixed bug.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            fx.write_extra(item.id, stored)
+            assert fx.raw_json_type(item.id) == "array"
+            # Captured BEFORE the call: comparing the column against a re-read
+            # of itself afterwards cannot fail.
+            updated_at_before = fx.raw_updated_at(item.id)
+
+            with pytest.raises(TypeError):
+                fx.reinforce(repo)
+
+            assert fx.raw_json_type(item.id) == "array"
+            # The UPDATE set extra AND updated_at. json_set left extra alone,
+            # but updated_at is a plain bound value, so a commit before the
+            # readback is validated still advances it on a REFUSED reinforce.
+            assert fx.raw_updated_at(item.id) == updated_at_before
+
+    # A JSON text scalar is the shape whose SECOND decode yields a dict: the
+    # driver already decoded '"{}"' to the str '{}', so decoding again produces
+    # an object the row does not have and the reinforce reports success.
+    @pytest.mark.parametrize("stored", [
+        '"{}"',
+        '"{\\"a\\": 1}"',
+        '"hello"',
+    ])
+    def test_a_text_scalar_extra_is_left_unchanged(self, tmp_path, stored):
+        """A stored JSON text scalar must raise, exactly like the arrays.
+
+        json_set returns it unchanged, so the merge no-ops. The first two cases
+        are load-bearing: their second decode yields a dict, which passes an
+        isinstance check on a doubly-decoded value and caches a fabricated
+        object while reinforcement_count never moved.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+            fx.write_extra(item.id, stored)
+            assert fx.raw_json_type(item.id) == "text"
+            text_before = fx.raw_extra_text(item.id)
+            updated_at_before = fx.raw_updated_at(item.id)
+            cache_before = dict(repo.items[item.id].extra or {})
+
+            with pytest.raises(TypeError):
+                fx.reinforce(repo)
+
+            assert fx.raw_json_type(item.id) == "text"
+            assert fx.raw_extra_text(item.id) == text_before
+            assert fx.raw_updated_at(item.id) == updated_at_before
+            assert repo.items[item.id].extra == cache_before
+
+    def test_an_orm_assigned_string_extra_is_left_unchanged(self, tmp_path):
+        """Reachability: the shape above needs no raw SQL either.
+
+        The twin of test_an_orm_assigned_none_extra_survives_a_reinforce.
+        Column(JSON) validates nothing, so assigning a str through the ORM
+        serialises it to a JSON text scalar just as an assigned None becomes
+        the 'null' document.
+        """
+        with _ReinforceFixture(tmp_path) as fx:
+            store = fx.store()
+            item = fx.add_item(store, summary="the original text")
+            repo = store.memory_item_repo
+
+            from sqlmodel import select as _sel
+
+            # The same attribute the production path resolves the model through.
+            model = repo._memory_item_model
+            with repo._sessions.session() as session:
+                row = session.exec(
+                    _sel(model).where(model.id == item.id)
+                ).first()
+                row.extra = "{}"
+                session.add(row)
+                session.commit()
+            assert fx.raw_json_type(item.id) == "text"
+            text_before = fx.raw_extra_text(item.id)
+            updated_at_before = fx.raw_updated_at(item.id)
+            cache_before = dict(repo.items[item.id].extra or {})
+
+            with pytest.raises(TypeError):
+                fx.reinforce(repo)
+
+            assert fx.raw_extra_text(item.id) == text_before
+            assert fx.raw_updated_at(item.id) == updated_at_before
+            assert repo.items[item.id].extra == cache_before

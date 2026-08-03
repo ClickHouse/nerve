@@ -1192,8 +1192,11 @@ class MemUBridge:
                 threshold = _SEMANTIC_DEDUP_THRESHOLD
                 if threshold > 0 and embedding is not None and self.items:
                     # Type-filtered top-1 via the persistent matrix index —
-                    # no per-item corpus rebuild.
-                    hits = _vec_index_for(self).search(
+                    # no per-item corpus rebuild. Bind the index ONCE: the
+                    # zero-row branch below leaves a deliberate size drift, and
+                    # re-fetching would observe it and rebuild early.
+                    idx = _vec_index_for(self)
+                    hits = idx.search(
                         embedding, k=1, memory_type=str(memory_type),
                     )
                     if hits:
@@ -1204,27 +1207,107 @@ class MemUBridge:
                                 "Semantic dedup: reinforcing %s item %s (%.3f) instead of creating '%s'",
                                 memory_type, match_id, score, summary[:80],
                             )
-                            # Update DB row
-                            from sqlmodel import select as _sel
+                            # Merge into the row's LIVE extra server-side. A
+                            # read-modify-write here would replace the whole
+                            # column from a snapshot, dropping every key another
+                            # writer commits in the read -> write window.
+                            from sqlalchemy import (
+                                Text, case, cast, func, literal, select, update,
+                            )
+
                             now = self._now()
-                            extra = dict(matched.extra or {})
-                            extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
-                            extra["last_reinforced_at"] = now.isoformat()
-                            with self._sessions.session() as session:
-                                row = session.exec(
-                                    _sel(self._memory_item_model).where(
-                                        self._memory_item_model.id == match_id
+                            model = self._memory_item_model
+                            # NULLIF is required, not defensive: coalesce alone
+                            # lets an empty-string extra reach json_set, which
+                            # raises "malformed JSON".
+                            _raw = func.coalesce(func.nullif(model.extra, ""), "{}")
+                            # json_set leaves a JSON-null document unchanged, so
+                            # the readback would decode to None and the cache
+                            # rebuild would raise after the UPDATE committed.
+                            live = case(
+                                (func.json_type(_raw) == "null", literal("{}")),
+                                else_=_raw,
+                            )
+                            extra_expr = func.json_set(
+                                func.json_set(
+                                    live,
+                                    "$.reinforcement_count",
+                                    # json_extract on the same column in the same
+                                    # statement, so the increment is atomic too.
+                                    func.coalesce(
+                                        func.json_extract(
+                                            live, "$.reinforcement_count",
+                                        ),
+                                        1,
                                     )
-                                ).first()
-                                if row:
-                                    row.extra = extra
-                                    row.updated_at = now
-                                    session.add(row)
+                                    + 1,
+                                ),
+                                "$.last_reinforced_at",
+                                now.isoformat(),
+                            )
+                            with self._sessions.session() as session:
+                                # The UPDATE promotes this to a write
+                                # transaction, so the SELECT that follows cannot
+                                # observe an interleaved write.
+                                result = session.execute(
+                                    update(model)
+                                    .where(model.id == match_id)
+                                    .values(extra=extra_expr, updated_at=now)
+                                )
+                                if result.rowcount:
+                                    # CAST to text so no JSON result processor
+                                    # runs. Projecting the JSON column decodes
+                                    # once already, and decoding that again
+                                    # turns a stored text scalar into an object
+                                    # the row does not have.
+                                    merged = session.execute(
+                                        select(cast(model.extra, Text)).where(
+                                            model.id == match_id
+                                        )
+                                    ).fetchall()
+                                else:
+                                    merged = []
+                                if merged:
+                                    raw = merged[0][0]
+                                    # Rebuild the cache from the MERGED value,
+                                    # never from a reconstructed dict, which
+                                    # would put the lost view back one layer up.
+                                    decoded = (
+                                        json.loads(raw)
+                                        if isinstance(raw, str)
+                                        else raw
+                                    )
+                                    if not isinstance(decoded, dict):
+                                        # json_set returns a non-object document
+                                        # UNCHANGED, so the merge no-opped -- but
+                                        # updated_at is a plain bound value and
+                                        # WOULD land, so validate before the
+                                        # commit. dict() would also succeed for
+                                        # [] and for an array of pairs, caching a
+                                        # value the row does not have.
+                                        session.rollback()
+                                        raise TypeError(
+                                            "extra is not a JSON object: %r"
+                                            % (raw,)
+                                        )
                                     session.commit()
-                            # Update in-memory cache
-                            matched.extra = extra
-                            matched.updated_at = now
-                            return matched
+                                else:
+                                    session.rollback()
+                            if merged:
+                                matched.extra = decoded
+                                matched.updated_at = now
+                                return matched
+                            # rowcount 0: the row is gone, so the cache hit was
+                            # stale rather than authoritative. Drop it and fall
+                            # through to a real create instead of reporting a
+                            # reinforce that never happened.
+                            self.items.pop(match_id, None)
+                            idx.remove(match_id)
+                            # Deliberate drift: the delegate's create adds to
+                            # self.items WITHOUT touching the index, so this is
+                            # what makes the next _vec_index_for rebuild and the
+                            # replacement row dedup-visible.
+                            idx.seen_items_len = len(self.items)
 
                 return _original_sqlite_reinforce(
                     self,
