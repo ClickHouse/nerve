@@ -1257,6 +1257,9 @@ async def main():
     tmp = Path(sys.argv[1])
     configured = json.loads(sys.argv[2])
     fail_load = sys.argv[3] == "fail-load"
+    # "fail-late": a step AFTER seeding raises, so the report shows seeding
+    # already done while availability must still be withheld.
+    fail_late = sys.argv[3] == "fail-late"
     # Rows a PREVIOUS nerve left on disk, written by _PRE_STORE_PROBE in its own
     # interpreter (memU allows one store per process) and passed in as name->id.
     pre_ids = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
@@ -1280,15 +1283,26 @@ async def main():
     async def _init_without_warmup():
         from memu.app.service import MemoryService
         orig = MemoryService._get_llm_base_client
+        orig_step = MemoryService.intercept_before_workflow_step
 
         def _no_warmup(self, profile=None):
             raise RuntimeError("LLM warmup disabled: this probe must stay offline")
 
+        def _late_boom(self, fn, *, name=None):
+            raise RuntimeError("late init step exploded")
+
         MemoryService._get_llm_base_client = _no_warmup
+        if fail_late:
+            # Interceptor registration (memu_bridge.py:1815) runs AFTER seeding
+            # (:1610) and after _instrument_llm_timeouts() (:1795), and is not
+            # inside the swallowing try that opens at :1820, so the raise reaches
+            # _initialize_impl's outer except and initialize() returns False.
+            MemoryService.intercept_before_workflow_step = _late_boom
         try:
             return await real_init()
         finally:
             MemoryService._get_llm_base_client = orig
+            MemoryService.intercept_before_workflow_step = orig_step
 
     bridge._initialize_impl = _init_without_warmup
 
@@ -1495,7 +1509,9 @@ class TestEnsureCategoriesSeeding:
 
         Only the map half: the advertised set is rebuilt by memU from config at
         construction, so the LLM is still not told this category exists.  That
-        remaining half is out of scope here.
+        remaining half is out of scope here.  Asserts through the test-local
+        _rebuild_map; test_a_persisted_unadvertised_row_is_mapped_by_a_full_init
+        is the arm that exercises the production rebuild.
         """
         store = _memu_store(tmp_path / "memu.sqlite")
         store.memory_category_repo.get_or_create_category(
@@ -2185,10 +2201,56 @@ class TestInitializeCategoryInvariant:
         assert sorted(report["map"]) == ["  alpha  ", "alpha", "alpha "]
 
     def test_availability_is_not_published_when_init_fails(self, tmp_path):
-        """_available is the only failure signal the agent sees: engine.py drops the return."""
+        """_available is the only failure signal the agent sees: engine.py drops the return.
+
+        Fails inside _ensure_categories, so it passes at either _available position;
+        the fail-late arm below is what pins the move.
+        """
         report = _run_init(tmp_path, configured=(), mode="fail-load")
 
         assert report["offline"] is True
         assert report["initialize"] is False
         assert report["available"] is False
         assert report["service_available"] is False
+
+    def test_availability_is_not_published_when_a_late_step_fails(self, tmp_path):
+        """This arm, not fail-load, pins _available's position at the END of init.
+
+        Injects at the interceptor registration (memu_bridge.py:1815): after seeding
+        succeeds and before _available is published, so seeding rows in the report is
+        what distinguishes it from the fail-load arm.
+        """
+        report = _run_init(tmp_path, configured=(), mode="fail-late")
+
+        assert report["offline"] is True
+        assert report["initialize"] is False
+        assert report["available"] is False
+        assert report["service_available"] is False
+        # Discriminating: seeding had already SUCCEEDED when the failure hit, so this
+        # is genuinely a post-seed failure and not another fail-load in disguise.
+        assert sorted(report["rows"]) == sorted(report["advertised"])
+        assert len(report["rows"]) == 10  # memU's defaults, advertised for configured=()
+
+    def test_a_persisted_unadvertised_row_is_mapped_by_a_full_init(self, tmp_path):
+        """End-to-end restart: a runtime-created row is remapped by the REAL rebuild.
+
+        Unlike the stub-level arm, this drives _initialize_impl's own name-to-ID
+        rebuild, the half that makes the persisted row addressable again.  Unfixed,
+        the list_categories() warming that rebuild's cache sits behind the empty-config
+        early return, so the map has no ``work``.
+        """
+        report = _run_init(tmp_path, configured=(), pre_store=["work"])
+
+        assert report["offline"] is True
+        assert report["initialize"] is True
+        assert report["available"] is True
+        # Through the REAL ctx.category_name_to_id, which is the point of this arm.
+        assert "work" in report["map"]
+        # Pinned residual: resolvable, but memU still builds the advertised set from
+        # config, so the LLM is never told this category exists.
+        assert "work" not in report["advertised"]
+        assert "work" not in report["prompt_names"]
+        # Mapped, not re-created: category_items link on the id.
+        assert report["row_ids"]["work"] == report["pre_ids"]["work"]
+        # The extra unadvertised row does not disturb seeding.
+        assert len(report["resolved_prompt"]) == len(report["prompt_names"])
