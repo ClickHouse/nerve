@@ -1233,6 +1233,31 @@ class _MemuPatchFixture:
             self.CRUDMixin._patch_update_memory_item(svc, state, None),
         )
 
+    def update_coro(self, store, cats, item_id, *, content=None, memory_type=None,
+                    categories=None, ctx=None, embed=None):
+        """Same call as run_update, but returns the coroutine unawaited.
+
+        ``embed`` lets a test suspend the delegated handler mid-flight (its only
+        await is the embedding call), which is what makes two updates genuinely
+        interleave rather than run back to back.
+        """
+        class _Embed:
+            async def embed(self, payload):
+                return [None]
+
+        svc = object.__new__(self.CRUDMixin)
+        client = embed if embed is not None else _Embed()
+        svc._get_step_embedding_client = lambda step_ctx: client
+        state = {
+            "memory_id": item_id,
+            "memory_payload": {"content": content, "type": memory_type,
+                               "categories": categories},
+            "ctx": ctx if ctx is not None else self.ctx(cats),
+            "store": store,
+            "user": {},
+        }
+        return self.CRUDMixin._patch_update_memory_item(svc, state, None)
+
     def ctx(self, mapping):
         class _Ctx:
             def __init__(self, m):
@@ -1669,86 +1694,243 @@ class TestUpdatePreservesCategories:
             # ... and it is reported to the summary step, not silently dropped.
             assert out["category_updates"][cats["patterns"]] == ("a fact", "revised")
 
-    def test_both_membership_mutators_are_neutralised(self, tmp_path):
-        """Pin the claim directly: BOTH mutators are no-ops in the delegation.
+    def test_the_stubs_never_reach_the_shared_repo_under_overlap(self, tmp_path):
+        """The load-bearing item-1 test: two omitted-``categories`` updates that
+        genuinely interleave must not neutralise each other's repo.
 
-        Measured on the delegated handler, ``link_item_category`` is unreachable
-        when ``categories`` is omitted (mapped_new_cat_ids is [], so cats_to_add
-        is always empty) - so stubbing it changes no OUTCOME today and no
-        outcome-level test can distinguish it. It is stubbed anyway, because
-        "no membership mutation at all" must hold by construction rather than by
-        memU's current diff arithmetic. This observes that property where it is
-        made, so a future memU that does link here stays neutralised.
+        The neutralisation lives on a per-call proxy, so it is reachable only
+        through the ``store`` mapping one call passes down.  An instance-level
+        ``setattr`` on ``store.category_item_repo`` would instead be in force for
+        every coroutine on the memU loop for the whole duration of the delegated
+        ``await`` (crud.py's embed call), and its restore is not reentrant: with A
+        entering, B entering, then A finishing first, B's ``finally`` puts A's
+        stub back permanently.
         """
         with _MemuPatchFixture(tmp_path) as fx:
             store, cats = fx.setup(2)
-            item = fx.add_item(store)
+            first = fx.add_item(store, summary="first fact")
+            second = fx.add_item(store, summary="second fact")
+            fx.link_all(store, first.id, cats)
+            fx.link_all(store, second.id, cats)
+            repo = store.category_item_repo
+            names = ("unlink_item_category", "link_item_category")
+            snapshots = []
+
+            gate = None
+
+            class _GatedEmbed:
+                """First caller parks inside the delegated handler until released."""
+
+                def __init__(self):
+                    self.entered = asyncio.Event()
+
+                async def embed(self, payload):
+                    # Observe the SHARED repo from inside the window: this is
+                    # where an instance stub would be visible.
+                    snapshots.append(
+                        {n: n in repo.__dict__ for n in names},
+                    )
+                    if not self.entered.is_set():
+                        self.entered.set()
+                        await gate.wait()
+                    return [None]
+
+            embed = _GatedEmbed()
+
+            async def drive():
+                nonlocal gate
+                gate = asyncio.Event()
+                a = asyncio.ensure_future(
+                    fx.update_coro(store, cats, first.id,
+                                   content="first revised", embed=embed),
+                )
+                # B must enter A's window, or the arms never overlap.  BOUNDED:
+                # a handler that raises before reaching embed never sets this,
+                # and an unbounded wait would hang the whole suite instead of
+                # failing -- which is exactly how a broken mutant stalls a
+                # mutation matrix rather than being reported.
+                try:
+                    await asyncio.wait_for(embed.entered.wait(), timeout=10)
+                except TimeoutError:  # pragma: no cover - diagnostic path
+                    gate.set()
+                    exc = a.exception() if a.done() else None
+                    msg = ("the first update never reached its embed step, so the "
+                           f"overlap window never opened (task exception: {exc!r})")
+                    raise AssertionError(msg) from exc
+                b = asyncio.ensure_future(
+                    fx.update_coro(store, cats, second.id,
+                                   content="second revised", embed=embed),
+                )
+                # Let B reach its own embed before A is allowed to finish, so
+                # both are inside the window at the same time.
+                for _ in range(50):
+                    if len(snapshots) >= 2:
+                        break
+                    await asyncio.sleep(0)
+                gate.set()
+                return await asyncio.wait_for(asyncio.gather(a, b), timeout=30)
+
+            out_a, out_b = asyncio.run(drive())
+
+            # Both arms really were inside the window together.
+            assert len(snapshots) >= 2, snapshots
+            # (b) the shared repo never carried either stub, at any point.
+            assert all(s == {n: False for n in names} for s in snapshots), snapshots
+            assert not any(n in repo.__dict__ for n in names)
+
+            # (a) both items keep all their links.
+            for item in (first, second):
+                assert fx.raw_count(
+                    "SELECT count(*) FROM memu_category_items WHERE item_id = ?",
+                    item.id,
+                ) == 2
+            assert set(out_a["category_updates"]) == set(cats.values())
+            assert set(out_b["category_updates"]) == set(cats.values())
+
+            # (c) the real mutator still works afterwards.
+            repo.unlink_item_category(first.id, cats["procedures"])
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", first.id,
+            ) == 1
+
+    def test_a_concurrent_link_inside_the_window_still_lands(self, tmp_path):
+        """The cross-pipeline victim: another caller's membership write must work.
+
+        An instance-level stub silently swallows every ``link_item_category`` on
+        the shared repo while one content-only update is parked in its
+        ``await`` - including an explicit-list update from another coroutine,
+        which then reports success having changed nothing.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store, summary="a fact")
+            victim = fx.add_item(store, summary="another fact")
             fx.link_all(store, item.id, cats)
             repo = store.category_item_repo
-            seen = {}
+            target = cats["patterns"]
 
-            real_get = repo.get_item_categories
+            class _GatedEmbed:
+                def __init__(self):
+                    self.entered = asyncio.Event()
+                    self.release = asyncio.Event()
 
-            def probing_get(iid):
-                # Runs inside the delegated call, so it sees the stubs in place.
-                seen.setdefault("link", repo.link_item_category)
-                seen.setdefault("unlink", repo.unlink_item_category)
-                return real_get(iid)
+                async def embed(self, payload):
+                    self.entered.set()
+                    await self.release.wait()
+                    return [None]
 
-            repo.get_item_categories = probing_get
-            try:
-                fx.run_update(store, cats, item.id, content="revised")
-            finally:
-                repo.get_item_categories = real_get
+            embed = _GatedEmbed()
 
-            # The probe ran inside the delegation, or it observed nothing.
-            assert set(seen) == {"link", "unlink"}
-            # Neither mutator is the real repo method during the delegation.
-            assert seen["unlink"] is not real_get.__self__.__class__.unlink_item_category
-            for name in ("link", "unlink"):
-                assert seen[name].__name__ == "_keep_noop", name
-                # A no-op really is a no-op: it must not touch the DB.
-                assert seen[name](item.id, next(iter(cats.values()))) is None
+            async def drive():
+                task = asyncio.ensure_future(
+                    fx.update_coro(store, cats, item.id,
+                                   content="revised", embed=embed),
+                )
+                # BOUNDED, like the overlap test above: a handler that raises
+                # before reaching embed must FAIL this test, never hang it.
+                try:
+                    await asyncio.wait_for(embed.entered.wait(), timeout=10)
+                except TimeoutError:  # pragma: no cover - diagnostic path
+                    embed.release.set()
+                    exc = task.exception() if task.done() else None
+                    msg = ("the update never reached its embed step, so the window "
+                           f"never opened (task exception: {exc!r})")
+                    raise AssertionError(msg) from exc
+                # Issued from INSIDE the first update's window, on the SHARED repo.
+                repo.link_item_category(victim.id, target, user_data={})
+                landed = fx.raw_count(
+                    "SELECT count(*) FROM memu_category_items"
+                    " WHERE item_id = ? AND category_id = ?",
+                    victim.id, target,
+                )
+                embed.release.set()
+                await asyncio.wait_for(task, timeout=30)
+                return landed
+
+            landed_inside = asyncio.run(drive())
+
+            # The write took effect immediately, not after the window closed.
+            assert landed_inside == 1
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?",
+                victim.id,
+            ) == 1
+            # ... and the parked update still preserved its own links.
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
             ) == 2
 
-    def test_the_mutator_stubs_are_always_restored(self, tmp_path):
-        """A leaked no-op unlink/link would break every later caller.
+    def test_the_proxy_does_not_escape_the_delegated_call(self, tmp_path):
+        """run_steps threads the returned mapping into the LATER steps.
 
-        The stubs are installed on the repo INSTANCE for the delegated call
-        only; the finally must remove them even when the delegation raises.
+        ``step.run`` returns ``dict(result)`` and ``run_steps`` assigns it to
+        ``state``, so whatever ``store`` the returned mapping carries flows into
+        persist_index and build_response.  Leaking a proxy past its window is the
+        class of defect the per-call design exists to remove, so the mapping must
+        hand back the REAL store.
         """
         with _MemuPatchFixture(tmp_path) as fx:
             store, cats = fx.setup(2)
             item = fx.add_item(store)
             fx.link_all(store, item.id, cats)
-            repo = store.category_item_repo
-            names = ("unlink_item_category", "link_item_category")
-            assert not any(n in repo.__dict__ for n in names)
 
-            fx.run_update(store, cats, item.id, content="revised")
-            assert not any(n in repo.__dict__ for n in names)
+            out = fx.run_update(store, cats, item.id, content="revised")
 
-            # Same guarantee on the failing path.
-            boom = store.memory_item_repo.update_item
-
-            def exploding_update(**kwargs):
-                raise RuntimeError("delegation failed")
-
-            store.memory_item_repo.update_item = exploding_update
-            try:
-                with pytest.raises(RuntimeError, match="delegation failed"):
-                    fx.run_update(store, cats, item.id, content="again")
-            finally:
-                store.memory_item_repo.update_item = boom
-            assert not any(n in repo.__dict__ for n in names)
-
-            # The real mutators still work after the stubs are withdrawn.
-            repo.unlink_item_category(item.id, cats["procedures"])
+            assert out["store"] is store
+            assert out["store"].category_item_repo is store.category_item_repo
+            # The delegated call must have SEEN a proxy, or the assertion above
+            # would hold for a build that never neutralised anything.
+            assert store.category_item_repo.__class__.__name__ != "_KeepRelRepoProxy"
             assert fx.raw_count(
                 "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+
+    def test_a_dangling_relation_row_is_kept_out_of_category_updates(self, tmp_path):
+        """Item 2: memU's build_response subscripts the category dict UNGUARDED.
+
+        ``_patch_build_response`` does ``memory_category_repo.categories[c]`` for
+        every key of ``category_updates``, and patch_update runs it AFTER the
+        content write has committed - so an id it cannot resolve raises
+        ``KeyError`` post-commit and ``bridge.update_item`` reports False for an
+        update that fully applied.  memU could not reach that state (it derived
+        ids through ``_map_category_names_to_ids``); rebuilding from raw relation
+        rows can, so the rebuild filters to resolvable ids.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(1)
+            item = fx.add_item(store)
+            known = cats["procedures"]
+            store.category_item_repo.link_item_category(item.id, known, user_data={})
+
+            unknown = "no-such-category-" + uuid.uuid4().hex[:8]
+            con = sqlite3.connect(fx.path)
+            con.execute(
+                "INSERT INTO memu_category_items"
+                " (id, item_id, category_id, created_at, updated_at)"
+                " VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+                (str(uuid.uuid4()), item.id, unknown),
+            )
+            con.commit()
+            con.close()
+            assert unknown not in store.memory_category_repo.categories
+
+            out = fx.run_update(store, cats, item.id, content="revised")
+
+            # The content write landed and the call returned normally.
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_memory_items WHERE id = ? AND summary = ?",
+                item.id, "revised",
             ) == 1
+            assert known in out["category_updates"]
+            assert unknown not in out["category_updates"]
+            # The dangling row itself is left alone: this fix filters the
+            # REPORT, it does not delete relations.
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 2
+            # And what build_response would subscript is now resolvable.
+            for cid in out["category_updates"]:
+                assert cid in store.memory_category_repo.categories
 
 
 class TestUpdateRefreshesContentHash:
@@ -2424,6 +2606,75 @@ class TestReinforceWritebackReadsTheRow:
             assert after["mentioned_at"] == "2026-01-01"
             assert "content_hash" in after
 
+    def test_a_key_written_inside_the_writeback_window_is_still_lost(self, tmp_path):
+        """Pin the window the sibling test does NOT reach.
+
+        test_a_third_party_writers_key_survives writes BEFORE the reinforce, so
+        it exercises cold-cache seeding. The writeback itself is SELECT -> mutate
+        -> add -> commit with no CAS, so a writer landing between the SELECT and
+        the flush is overwritten. This is NOT this fix's creation: base does the
+        same read-modify-write, and seeding from the row shrinks the loss (base
+        loses every key, including content_hash) rather than introducing it. The
+        residual window is pinned here so a later round cannot mistake it for a
+        closed one, and a CAS for it is tracked separately.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            first, second = self._similar_pair()
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="cold cache subject", embedding=first)
+            store.close()
+
+            restarted = fx.store()
+            restarted.memory_item_repo.list_items()
+            repo = restarted.memory_item_repo
+            sessions = repo._sessions
+            original_session = sessions.session
+            fired = []
+
+            def spying_session():
+                session = original_session()
+                real_add = session.add
+
+                def add(obj):
+                    # Fires after the writeback's SELECT and before its flush.
+                    if not fired and getattr(obj, "id", None) == item.id:
+                        db = sqlite3.connect(fx.path)
+                        extra = fx.raw_extra(item.id)
+                        extra["mentioned_at"] = "2026-01-01"
+                        db.execute(
+                            "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+                            (json.dumps(extra), item.id),
+                        )
+                        db.commit()
+                        db.close()
+                        # The race is real only if the key is in the DB already.
+                        fired.append(fx.raw_extra(item.id).get("mentioned_at"))
+                    return real_add(obj)
+
+                session.add = add
+                return session
+
+            sessions.session = spying_session
+            try:
+                repo.create_item_reinforce(
+                    resource_id=None, memory_type="knowledge",
+                    summary="cold cache subject!!", embedding=second, user_data={},
+                )
+            finally:
+                sessions.session = original_session
+
+            # The write landed INSIDE the window, or this test proves nothing.
+            assert fired == ["2026-01-01"]
+
+            after = fx.raw_extra(item.id)
+            # Measured outcome: the in-window key is lost (the writeback has no
+            # CAS). What the fix DOES guarantee still holds on this path.
+            assert "mentioned_at" not in after
+            assert "content_hash" in after
+            assert after["reinforcement_count"] == 2
+            # And the cache does not claim otherwise.
+            assert repo.items[item.id].extra == after
+
     def test_cache_matches_the_row_afterwards(self, tmp_path):
         with _MemuPatchFixture(tmp_path) as fx:
             item, restarted = self._cold_cache_reinforce(fx)
@@ -2679,6 +2930,13 @@ class TestCascadeDeleteItem:
                     if r.item_id == item.id] == []
             # list_items() returns the cache dict itself (keyed by id).
             assert item.id not in store.memory_item_repo.list_items()
+            # The DB too, not just the caches: an absent item row is exactly
+            # when its memu_category_items rows ARE the dangling rows this fix
+            # exists to prevent, so conditioning the relation delete on the row
+            # would leave the changelog contract half-kept.
+            assert fx.raw_count(
+                "SELECT count(*) FROM memu_category_items WHERE item_id = ?", item.id,
+            ) == 0
 
     def test_fix_3_index_hook_stays_outermost(self, tmp_path):
         """Fix 10 REPLACES the base implementation, so it must be installed

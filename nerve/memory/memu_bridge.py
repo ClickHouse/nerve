@@ -1032,16 +1032,22 @@ class MemUBridge:
                             self._memory_item_model.id == item_id
                         )
                     ).first()
+                    # Relations are deleted on BOTH paths: when the item row is
+                    # already gone (another process removed it) its
+                    # memu_category_items rows are exactly the dangling rows
+                    # this fix exists to prevent, so skipping them there would
+                    # leave the changelog contract half-kept.  Deleting the
+                    # item is still conditional -- an unknown id stays a
+                    # no-op, since the relation DELETE matches nothing.
+                    session.exec(_del(rel_model).where(rel_model.item_id == item_id))
                     if row is not None:
-                        session.exec(_del(rel_model).where(rel_model.item_id == item_id))
                         session.delete(row)
-                        session.commit()
+                    session.commit()
 
                 # Evict on BOTH paths, like memU's own delete_item.  When the row
                 # is already gone (another process removed it) returning early
                 # would leave the id in self.items, and Fix 5 serves that cache
                 # unfiltered, so list_items() would keep returning a deleted item.
-                # No DB write is attempted for an absent row.
                 self.items.pop(item_id, None)
                 relations = self._state.relations
                 relations[:] = [r for r in relations if r.item_id != item_id]
@@ -1522,18 +1528,59 @@ class MemUBridge:
             # returns [] for a falsy list), so cats_to_remove becomes the item's
             # ENTIRE current set and each link is unlinked.
             #
-            # An omitted `categories` therefore performs NO membership mutation at
-            # all: the delegated handler runs with link/unlink neutralised, so no
-            # link can be removed by a diff it never should have computed.  The
-            # (old, new) pairs the LLM category-summary step consumes are rebuilt
-            # here from the links that actually survive.
+            # An omitted `categories` therefore performs no membership mutation:
+            # the delegated call sees a relation repo whose link/unlink are
+            # no-ops, so no link can be removed by a diff it never should have
+            # computed.  The shared repo is never modified -- the no-ops live on
+            # a proxy built per call and reachable only through the `store` this
+            # call passes down, so a concurrent coroutine on the same memU loop
+            # keeps the real mutators.  The (old, new) pairs the LLM
+            # category-summary step consumes are rebuilt here from the links
+            # that actually survive.
             from memu.app.crud import CRUDMixin as _CRUDMixin
 
             if not getattr(_CRUDMixin._patch_update_memory_item, "_nerve_keeps_categories", False):
                 _pre_keep_update_handler = _CRUDMixin._patch_update_memory_item
                 _CRUDMixin._nerve_memu_update_handler = _pre_keep_update_handler
-                _KEEP_MISSING = object()
-                _KEEP_MUTATORS = ("unlink_item_category", "link_item_category")
+
+                class _KeepRelRepoProxy:
+                    """Per-call relation repo whose membership mutators are no-ops.
+
+                    Every other attribute is forwarded to the real repo, so the
+                    delegated handler's reads (get_item_categories) see live
+                    data.  Instantiated inside the call, so nothing shared is
+                    written and there is no restore to get wrong.
+                    """
+
+                    __slots__ = ("_nerve_real",)
+
+                    def __init__(self, real):
+                        object.__setattr__(self, "_nerve_real", real)
+
+                    def unlink_item_category(self, *_args, **_kwargs):
+                        return None
+
+                    def link_item_category(self, *_args, **_kwargs):
+                        return None
+
+                    def __getattr__(self, name):
+                        return getattr(object.__getattribute__(self, "_nerve_real"), name)
+
+                class _KeepStoreProxy:
+                    """Per-call store serving the relation proxy, nothing else changed."""
+
+                    __slots__ = ("_nerve_real", "_nerve_rel")
+
+                    def __init__(self, real, rel_proxy):
+                        object.__setattr__(self, "_nerve_real", real)
+                        object.__setattr__(self, "_nerve_rel", rel_proxy)
+
+                    @property
+                    def category_item_repo(self):
+                        return object.__getattribute__(self, "_nerve_rel")
+
+                    def __getattr__(self, name):
+                        return getattr(object.__getattribute__(self, "_nerve_real"), name)
 
                 async def _category_preserving_update(self, state, step_context):
                     payload = state.get("memory_payload") or {}
@@ -1547,31 +1594,34 @@ class MemUBridge:
                     item_before = store.memory_item_repo.get_item(memory_id)
                     old_content = getattr(item_before, "summary", None)
 
-                    def _keep_noop(*_args, **_kwargs):
-                        return None
+                    # Neutralise membership for THIS call only.  The delegated
+                    # handler reads store.memory_item_repo and
+                    # store.category_item_repo; the proxies serve both.
+                    store_proxy = _KeepStoreProxy(store, _KeepRelRepoProxy(rel_repo))
+                    out = await _pre_keep_update_handler(
+                        self, {**state, "store": store_proxy}, step_context,
+                    )
 
-                    saved = {
-                        name: rel_repo.__dict__.get(name, _KEEP_MISSING)
-                        for name in _KEEP_MUTATORS
-                    }
-                    for name in _KEEP_MUTATORS:
-                        setattr(rel_repo, name, _keep_noop)
-                    try:
-                        out = await _pre_keep_update_handler(self, state, step_context)
-                    finally:
-                        for name, prev in saved.items():
-                            if prev is _KEEP_MISSING:
-                                rel_repo.__dict__.pop(name, None)
-                            else:
-                                rel_repo.__dict__[name] = prev
+                    # run_steps threads the returned mapping into persist_index
+                    # and build_response, so the proxy must not escape its
+                    # window: hand the REAL store back.
+                    out = dict(out)
+                    out["store"] = store
 
                     # memU diffed against a no-op, so its pairs are wrong: a live
                     # link marked (old, None) renders as "content is discarded".
                     if payload.get("content"):
                         new_content = getattr(out.get("memory_item"), "summary", None)
+                        # Keep only ids the response step can resolve:
+                        # _patch_build_response subscripts
+                        # memory_category_repo.categories UNGUARDED, so a
+                        # dangling relation row would raise KeyError after the
+                        # content write has already committed.
+                        known = store.memory_category_repo.categories
                         out["category_updates"] = {
                             rel.category_id: (old_content, new_content)
                             for rel in rel_repo.get_item_categories(memory_id)
+                            if rel.category_id in known
                         }
                     else:
                         out["category_updates"] = {}
