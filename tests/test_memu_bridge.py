@@ -1468,12 +1468,17 @@ class TestEmbeddingCallTimeout:
         bridge = _make_embed_bridge(tmp_path, client)
 
         chat_clients = {}
+        originals = {}
 
         def _by_profile(profile):
             if profile == "embedding":
                 raise RuntimeError("embedding profile exploded")
-            c = MagicMock()
-            c.chat = AsyncMock(return_value="ok")
+            # A concrete fake, not a MagicMock: a mock auto-creates
+            # ``chat._nerve_timeout_wrapped`` as a truthy child, which makes
+            # production skip wrapping at its sentinel guard AND makes the
+            # assertion below pass anyway.
+            c = _FastEmbedClient()
+            originals[profile] = c.chat
             chat_clients[profile] = c
             return c
 
@@ -1483,6 +1488,10 @@ class TestEmbeddingCallTimeout:
 
         assert set(chat_clients) == {"memorize", "fast", "default"}
         for profile, c in chat_clients.items():
+            assert not getattr(originals[profile], "_nerve_timeout_wrapped", False), \
+                "fixture pre-carried the sentinel, so the assertion below is vacuous"
+            assert c.chat is not originals[profile], \
+                f"chat profile {profile} method was never replaced"
             assert getattr(c.chat, "_nerve_timeout_wrapped", False), \
                 f"chat profile {profile} was left un-instrumented"
 
@@ -1530,6 +1539,8 @@ class TestEmbeddingCallTimeout:
         instrumentation is the only bound - and it must apply with no
         openai_api_key, which is the install shape that used to be skipped.
         """
+        from memu.app.crud import CRUDMixin
+        from memu.app.service import MemoryService
         from memu.llm.wrapper import LLMClientWrapper, LLMInterceptorRegistry
 
         client = _HangingEmbedClient()
@@ -1542,6 +1553,25 @@ class TestEmbeddingCallTimeout:
         with pytest.raises(asyncio.TimeoutError):
             await _bounded(wrapper.embed(["a changed fact"]))
         assert client.embed_calls == 1
+
+        # Link 1: nerve still forwards the content memU embeds.
+        bridge._service.update_memory_item = AsyncMock(return_value={})
+        bridge._audit = AsyncMock()
+        assert await bridge.update_item("id-1", content="a changed fact") is True
+        kwargs = bridge._service.update_memory_item.await_args.kwargs
+        assert kwargs["memory_content"] == "a changed fact", \
+            "update_item no longer forwards the content memU would embed"
+
+        # Link 2: memU's update step still embeds on the bounded profile.
+        # Declaration only, so no MemoryService.__init__ and no per-process cost.
+        svc = object.__new__(MemoryService)
+        steps = CRUDMixin._build_update_memory_item_workflow(svc)
+        step = next(s for s in steps if s.step_id == "update_memory_item")
+        profile = MemoryService._llm_profile_from_context(
+            {"step_config": step.config}, task="embedding",
+        )
+        assert profile == "embedding", \
+            f"memU's update step no longer embeds on the bounded profile: {profile}"
 
     def test_t15_startup_instrumentation_failure_leaves_the_bridge_unavailable(self, tmp_path):
         """T15: edit (c) is uncaught, so a failure there must fail closed.

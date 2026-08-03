@@ -2100,12 +2100,10 @@ class MemUBridge:
     def _instrument_embedding_timeout(self) -> None:
         """Bound calls on the "embedding" LLM profile (same two layers).
 
-        ``_instrument_llm_timeouts`` cannot cover it: that loop wraps ``.chat``
-        and zeroes ``max_retries``, safe only for chat's own retry ladder, so
-        SDK retries stay here.  Ungated because memU synthesizes "embedding"
-        from "default" when omitted (``memu/app/settings.py:286``), so even a
-        no-provider install reaches ``embed`` via memU's update workflow.
-        Uncaught, so startup fails closed via ``_initialize_impl``'s handler.
+        Not covered by ``_instrument_llm_timeouts``' loop (that wraps ``.chat``
+        and zeroes ``max_retries``; embeddings have no retry ladder, so SDK
+        retries stay). Ungated: memU synthesizes "embedding" from "default"
+        when omitted (``memu/app/settings.py:286``). Uncaught by design.
         """
         import httpx as _httpx
 
