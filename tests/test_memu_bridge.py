@@ -1049,6 +1049,49 @@ def _content_hash(summary, memory_type):
     return compute_content_hash(summary, memory_type)
 
 
+def _race_extra_in_the_write_window(fx, repo, item_id, mutate_extra):
+    """Land ``mutate_extra`` on the row's extra between the hash read and write.
+
+    Hooks ``session.execute`` and fires once on the conditional hash write, so
+    the concurrent commit lands strictly inside the read -> write window; memU's
+    own update_item goes through exec/add/commit and is not intercepted. Returns
+    ``(result, raced)`` so the caller can assert the race really happened.
+    """
+    sessions = repo._sessions
+    original_session = sessions.session
+    raced = []
+
+    def racing_session():
+        session = original_session()
+        real_execute = session.execute
+
+        def _execute(stmt, *args, **kwargs):
+            if "json_set" in str(stmt) and not raced:
+                raced.append(True)
+                conn = sqlite3.connect(fx.path)
+                row = conn.execute(
+                    "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,),
+                ).fetchone()
+                extra = json.loads(row[0]) if row and row[0] else {}
+                mutate_extra(extra)
+                conn.execute(
+                    "UPDATE memu_memory_items SET extra = ? WHERE id = ?",
+                    (json.dumps(extra), item_id),
+                )
+                conn.commit()
+                conn.close()
+            return real_execute(stmt, *args, **kwargs)
+
+        session.execute = _execute
+        return session
+
+    sessions.session = racing_session
+    try:
+        return repo.update_item(item_id=item_id, summary="my new text"), raced
+    finally:
+        sessions.session = original_session
+
+
 # Every memu-py class attribute the patches reassign, so each test can restore
 # global state and never leak into another test (or another suite: a module that
 # mutates shared globals at import time breaks its neighbours invisibly, so all
@@ -1518,6 +1561,52 @@ class TestUpdatePreservesCategories:
                 item.id, "profile",
             ) == 1
 
+    def test_a_link_added_between_the_two_reads_is_still_removed(self, tmp_path):
+        """KNOWN residual window, pinned deliberately rather than by accident.
+
+        Preservation works by rewriting the payload with the names of the links
+        _category_preserving_update sees, which memU's own handler then re-reads
+        to build its diff. A link inserted between those two reads is missing
+        from the payload, so the diff removes it.
+
+        Closing it means reimplementing memU's diff, which would bypass
+        category_updates and therefore the LLM category-summary step. Base is
+        worse in every arm measured - it loses a link in this same race AND
+        loses every link when there is no race - so this asserts the current
+        behaviour to make a future narrowing a deliberate test change.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, cats = fx.setup(2)
+            item = fx.add_item(store)
+            repo = store.category_item_repo
+            repo.link_item_category(item.id, cats["procedures"], user_data={})
+
+            real_get = repo.get_item_categories
+            calls = []
+
+            def counting_get(iid):
+                calls.append(iid)
+                out = real_get(iid)
+                if len(calls) == 1:
+                    repo.link_item_category(
+                        item.id, cats["patterns"], user_data={},
+                    )
+                return out
+
+            repo.get_item_categories = counting_get
+            try:
+                fx.run_update(store, cats, item.id, content="revised")
+            finally:
+                repo.get_item_categories = real_get
+
+            # Both reads happened, or the window was never opened.
+            assert len(calls) == 2
+            links = {r.category_id for r in real_get(item.id)}
+            # The pre-existing link is preserved (that is Fix 8 working) ...
+            assert cats["procedures"] in links
+            # ... and the one added inside the window is not (the residual).
+            assert cats["patterns"] not in links
+
 
 class TestUpdateRefreshesContentHash:
     """Fix 9: update_item must refresh extra.content_hash.
@@ -1794,6 +1883,149 @@ class TestUpdateRefreshesContentHash:
             # ... and neither the cache nor the returned item may disagree.
             assert repo.items[item.id].extra["content_hash"] == row_hash
             assert result.extra["content_hash"] == row_hash
+
+    def test_a_concurrent_extra_key_survives_in_the_cache(self, tmp_path):
+        """The refreshed extra must come from the WRITE, not a pre-read snapshot.
+
+        json_set merges into the row's current extra while the conditional write
+        binds only summary/memory_type, so a writer that changes any OTHER key in
+        the read -> write window commits and the write still lands. Rebuilding the
+        cache from the pre-write snapshot would silently revert that key in
+        memory while the row keeps it - the same cache/DB divergence class as the
+        declined-writeback case above, one window later.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+            result, raced = _race_extra_in_the_write_window(
+                fx, repo, item.id,
+                lambda extra: extra.__setitem__("mentioned_at", "2026-08-03"),
+            )
+
+            assert raced == [True]
+            row_extra = fx.raw_extra(item.id)
+            # The write landed AND the concurrent key survived in the row.
+            assert row_extra["content_hash"] == _content_hash("my new text", "knowledge")
+            assert row_extra["mentioned_at"] == "2026-08-03"
+            # ... and neither the cache nor the returned item may disagree.
+            assert repo.items[item.id].extra == row_extra
+            assert result.extra == row_extra
+
+    def test_a_concurrent_reinforce_is_not_reverted_in_the_cache(self, tmp_path):
+        """The same property for a field that is actually CONSUMED.
+
+        Fix 3's salience ranking reads reinforcement_count and
+        last_reinforced_at off the cached item, so reverting them in memory
+        changes recall order, not just bookkeeping.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            fx.add_item(store, summary="orig")  # exact-hash reinforce -> rc = 2
+            repo = store.memory_item_repo
+            assert fx.raw_extra(item.id)["reinforcement_count"] == 2
+
+            def bump(extra):
+                extra["reinforcement_count"] = 9
+                extra["last_reinforced_at"] = "2030-01-01T00:00:00+00:00"
+
+            result, raced = _race_extra_in_the_write_window(fx, repo, item.id, bump)
+
+            assert raced == [True]
+            row_extra = fx.raw_extra(item.id)
+            assert row_extra["reinforcement_count"] == 9
+            assert row_extra["last_reinforced_at"] == "2030-01-01T00:00:00+00:00"
+            assert repo.items[item.id].extra == row_extra
+            assert result.extra == row_extra
+
+    def test_a_failing_hash_writeback_does_not_fail_the_update(self, tmp_path):
+        """The hash refresh is derived work: it must never fail a landed update.
+
+        It runs after memU's content write has committed, so letting an
+        exception escape would leave the content written while the caller is told
+        the update failed - and with the categories undiffed and the vector index
+        on the old embedding. A stale hash is base's unconditional behaviour, so
+        degrading to it is the strictly safer failure.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+            hash_before = fx.raw_extra(item.id)["content_hash"]
+
+            sessions = repo._sessions
+            original_session = sessions.session
+            raised_on = []
+
+            def racing_session():
+                session = original_session()
+                real_execute = session.execute
+
+                def _execute(stmt, *args, **kwargs):
+                    # Only the conditional hash write; memU's own update_item
+                    # goes through exec/add/commit.
+                    if "json_set" in str(stmt):
+                        raised_on.append(True)
+                        raise sqlite3.OperationalError("database is locked")
+                    return real_execute(stmt, *args, **kwargs)
+
+                session.execute = _execute
+                return session
+
+            sessions.session = racing_session
+            try:
+                result = repo.update_item(item_id=item.id, summary="my new text")
+            finally:
+                sessions.session = original_session
+
+            # The injection really fired, or the test proves nothing.
+            assert raised_on == [True]
+            row = sqlite3.connect(fx.path).execute(
+                "SELECT summary FROM memu_memory_items WHERE id = ?", (item.id,),
+            ).fetchone()
+            # The content write is intact and the call returned normally.
+            assert row[0] == "my new text"
+            assert result is not None
+            # The row keeps its old hash: base's behaviour, not a new state.
+            assert fx.raw_extra(item.id)["content_hash"] == hash_before
+            # The cache must not claim a refresh that did not happen.
+            assert repo.items[item.id].extra["content_hash"] == hash_before
+
+    def test_a_failing_delegation_still_propagates(self, tmp_path):
+        """The delegation stays OUTSIDE the best-effort guard.
+
+        Swallowing memU's own update failure would report success for an update
+        that never landed, which is the opposite error to the one above.
+        """
+        with _MemuPatchFixture(tmp_path) as fx:
+            store, _ = fx.setup(1)
+            item = fx.add_item(store, summary="orig")
+            repo = store.memory_item_repo
+            memu_update = fx.Repo._nerve_memu_update_item
+
+            def _boom(self, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            fx.Repo._nerve_memu_update_item = _boom
+            try:
+                MemUBridge._patch_sqlite_bugs()
+                with pytest.raises(sqlite3.OperationalError):
+                    store.memory_item_repo.update_item(
+                        item_id=item.id, summary="my new text",
+                    )
+            finally:
+                fx.Repo._nerve_memu_update_item = memu_update
+                MemUBridge._patch_sqlite_bugs()
+
+            # Nothing was written by the delegation, so the row is untouched.
+            row = sqlite3.connect(fx.path).execute(
+                "SELECT summary FROM memu_memory_items WHERE id = ?", (item.id,),
+            ).fetchone()
+            assert row[0] == "orig"
+            assert fx.raw_extra(item.id)["content_hash"] == _content_hash(
+                "orig", "knowledge",
+            )
 
     def test_item_without_a_hash_is_not_enrolled(self, tmp_path):
         """Adding a hash where there was none is a behaviour change, not a fix.
