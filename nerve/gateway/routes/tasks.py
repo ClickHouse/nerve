@@ -139,7 +139,12 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
                 file_path.write_text, req.content, encoding="utf-8",
             )
             # Re-sync title from markdown to SQLite
-            from nerve.tasks.models import parse_task_title, parse_task_frontmatter
+            from nerve.tasks.models import (
+                parse_task_frontmatter,
+                parse_task_title,
+                parse_tags_string,
+                tags_to_string,
+            )
             new_title = parse_task_title(req.content)
             fields = parse_task_frontmatter(req.content)
             await deps.db.upsert_task(
@@ -150,7 +155,7 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
                 source=task.get("source"),
                 source_url=task.get("source_url"),
                 deadline=fields.get("deadline") or task.get("deadline"),
-                tags=fields.get("tags") or task.get("tags", ""),
+                tags=tags_to_string(parse_tags_string(fields.get("tags") or task.get("tags", ""))),
                 content=req.content,
             )
 

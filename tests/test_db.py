@@ -870,6 +870,83 @@ class TestTagParsing:
         assert tags_to_string(parse_tags_string(original)) == original
 
 
+@pytest.mark.asyncio
+class TestPatchRouteTagCanonicalization:
+    """``PATCH /api/tasks/{id}`` must store the frontmatter tags canonically.
+
+    The route re-syncs the markdown's ``**Tags:**`` line into the row. Written
+    verbatim, the display form (``Alpha, beta``) leaves a leading space on every
+    key after the first, and the exact-tag predicate
+    ``',' || tags || ',' LIKE '%,<tag>,%'`` then matches only the first key, so
+    a tag set through the web editor is silently unfindable by tag-filtered
+    listing and counting. Both sibling writers (``task_create_handler``,
+    ``task_write_handler``) normalize through ``tags_to_string(parse_tags_string(...))``.
+
+    Assertions must be PER KEY. A first-key-only variant passes against the
+    unfixed route, and ``search_tasks`` strategy 1 (exact task-id) filters in
+    Python via ``_row_matches_filters``, which strips each element and therefore
+    tolerates the display form, so a test routed through either is vacuous.
+    """
+
+    async def _patch(self, db, tmp_path, monkeypatch, content, initial_tags="old"):
+        """PATCH task ``t1``'s content through the real route, return its row."""
+        from nerve import config as cfg
+        from nerve.config import NerveConfig
+        from nerve.gateway.routes import tasks as tasks_route
+
+        ws = tmp_path / "ws"
+        rel = "memory/tasks/active/t1.md"
+        (ws / "memory" / "tasks" / "active").mkdir(parents=True, exist_ok=True)
+        (ws / rel).write_text(f"# T\n\n**Tags:** {initial_tags}\n\nbody\n", encoding="utf-8")
+        monkeypatch.setattr(cfg, "_config", NerveConfig(workspace=ws))
+        await db.upsert_task(
+            task_id="t1", file_path=rel, title="T", status="pending",
+            tags=initial_tags, content="body",
+        )
+        monkeypatch.setattr(tasks_route, "get_deps", lambda: type("D", (), {"db": db})())
+        await tasks_route.update_task(
+            "t1", tasks_route.TaskUpdateRequest(content=content), user={},
+        )
+        return await db.get_task("t1")
+
+    async def test_display_form_is_stored_canonically(self, db: Database, tmp_path, monkeypatch):
+        row = await self._patch(
+            db, tmp_path, monkeypatch, "# T\n\n**Tags:** Alpha, beta, Gamma\n\nbody\n",
+        )
+        assert row["tags"] == "alpha,beta,gamma"
+
+    async def test_every_key_is_findable_by_exact_tag_filter(
+        self, db: Database, tmp_path, monkeypatch,
+    ):
+        row = await self._patch(
+            db, tmp_path, monkeypatch, "# T\n\n**Tags:** Alpha, beta, Gamma\n\nbody\n",
+        )
+        for tag in ("alpha", "beta", "gamma"):
+            found = [r["id"] for r in await db.list_tasks(tag=tag, status="all")]
+            assert "t1" in found, f"tag {tag!r} not findable; stored={row['tags']!r}"
+            assert await db.count_tasks(tag=tag, status="all") == 1
+
+    async def test_value_is_sorted_and_deduplicated(
+        self, db: Database, tmp_path, monkeypatch,
+    ):
+        """The stored form is the project normalizer's full output, not just
+        despaced and lowercased text. An already-sorted fixture cannot see this:
+        a hand-rolled ``.replace(", ", ",").lower()`` reproduces it exactly, and
+        would then diverge on any real tag line whose keys are out of order or
+        repeated. Ordering and dedup are what make the column comparable.
+        """
+        row = await self._patch(
+            db, tmp_path, monkeypatch, "# T\n\n**Tags:** Gamma, beta, Alpha, beta\n\nbody\n",
+        )
+        assert row["tags"] == "alpha,beta,gamma"
+
+    async def test_already_canonical_value_is_unchanged(
+        self, db: Database, tmp_path, monkeypatch,
+    ):
+        row = await self._patch(
+            db, tmp_path, monkeypatch, "# T\n\n**Tags:** alpha,beta\n\nbody\n",
+        )
+        assert row["tags"] == "alpha,beta"
 class TestFrontmatterParsing:
     """The frontmatter value is line-bounded, so a blank field parses as empty.
 
