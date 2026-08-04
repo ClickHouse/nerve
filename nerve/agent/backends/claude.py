@@ -1025,7 +1025,13 @@ class ClaudeClient(AgentClient):
                     else:
                         message = await response_iter.__anext__()
                 except StopAsyncIteration:
-                    return
+                    # The stream ended with no result and no error, which
+                    # means the runtime already exited (a non-zero exit
+                    # raises instead). base.py requires a terminal event,
+                    # so report the death rather than a silent success.
+                    raise TransportDiedError(
+                        "claude runtime ended the turn without a result",
+                    ) from None
                 except asyncio.TimeoutError:
                     logger.warning(
                         "CLI idle timeout (%ds) for session %s — no SDK "

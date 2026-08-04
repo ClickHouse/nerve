@@ -2,14 +2,16 @@
 helpers (no SDK subprocess)."""
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from nerve.agent.backends.base import SessionSpec
+from nerve.agent.backends import events as ev
+from nerve.agent.backends.base import SessionSpec, TransportDiedError
 from nerve.agent.backends.claude import ClaudeBackend, ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
 from nerve.config import AgentConfig, NerveConfig
@@ -196,10 +198,24 @@ def _translated(messages: list) -> list:
     return [event for m in messages for event in translate_message(m)]
 
 
+def _result_msg(session_id: str = "sdk-1") -> ResultMessage:
+    """A terminal ResultMessage: translates to one TurnCompleted."""
+    return ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=session_id,
+        total_cost_usd=0.5, usage={"input_tokens": 1},
+    )
+
+
 @pytest.mark.asyncio
 async def test_receive_turn_yields_events_normally():
-    """Fast SDK stream completes without timing out."""
-    messages = [_text_msg("a"), _text_msg("b"), _text_msg("c")]
+    """Fast SDK stream completes without timing out.
+
+    The stream ends with a ResultMessage: that terminal event is what
+    makes the turn complete, so ``receive_turn`` returns rather than
+    reporting the exhausted stream as a transport death.
+    """
+    messages = [_text_msg("a"), _text_msg("b"), _text_msg("c"), _result_msg()]
     sdk = _StubClient(messages)
     client = _turn_client(sdk, "sess-1", idle_timeout=5.0)
     seen = []
@@ -247,15 +263,287 @@ async def test_receive_turn_disabled_when_timeout_zero():
 
 
 @pytest.mark.asyncio
-async def test_receive_turn_handles_empty_stream():
-    """Empty receive_response (e.g. CLI exits immediately) returns cleanly."""
+async def test_receive_turn_raises_on_empty_stream():
+    """An exhausted stream with no result is a dead runtime, not a turn.
+
+    Previously this returned silently with no events, which the engine's
+    receive loop could not tell apart from a completed turn. base.py
+    requires every turn to end in a terminal event, so a pre-result EOF
+    now raises. The stream can only end this way after the subprocess
+    exited zero (a non-zero exit raises inside the SDK), so the
+    transport really is gone.
+    """
     sdk = _StubClient([])
     client = _turn_client(sdk, "sess-4", idle_timeout=5.0)
     seen = []
+    with pytest.raises(TransportDiedError):
+        async for event in client.receive_turn():
+            seen.append(event)
+    assert seen == []
+    # Kept from the test this replaces. It counts the stub generator's own
+    # finally, which runs on exhaustion regardless of receive_turn's cleanup;
+    # test_receive_turn_closes_the_iterator_when_eof_raises pins that.
+    assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_raises_when_stream_ends_after_content():
+    """A stream that streams text then dies without a result also raises."""
+    messages = [_text_msg("half an answer")]
+    sdk = _StubClient(messages)
+    client = _turn_client(sdk, "sess-4b", idle_timeout=5.0)
+    seen = []
+    with pytest.raises(TransportDiedError):
+        async for event in client.receive_turn():
+            seen.append(event)
+    # The partial content arrived before the death was reported.
+    assert seen == _translated(messages)
+    assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_completes_on_result_without_raising():
+    """A stream ending in a ResultMessage yields exactly one TurnCompleted."""
+    messages = [_text_msg("a"), _result_msg("sdk-xyz")]
+    sdk = _StubClient(messages)
+    client = _turn_client(sdk, "sess-4c", idle_timeout=5.0)
+    seen = []
     async for event in client.receive_turn():
         seen.append(event)
-    assert seen == []
+    terminal = [e for e in seen if isinstance(e, ev.TurnCompleted)]
+    assert len(terminal) == 1
+    assert terminal[0].status == "completed"
     assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_idle_timeout_is_not_a_transport_death():
+    """A hung (but live) CLI must stay distinguishable from a dead one.
+
+    A caller that handles only TransportDiedError must not swallow an
+    idle timeout, so assert the timeout is NOT a TransportDiedError.
+    """
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=2.0)
+    client = _turn_client(sdk, "sess-4d", idle_timeout=0.05)
+    with pytest.raises(asyncio.TimeoutError) as excinfo:
+        async for _event in client.receive_turn():
+            pass
+    assert not isinstance(excinfo.value, TransportDiedError)
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_propagates_other_errors_unchanged():
+    """A real error from the stream is not relabelled a transport death."""
+
+    class _BoomClient:
+        def __init__(self):
+            self.aclose_calls = 0
+
+        def receive_response(self):
+            outer = self
+
+            async def _gen():
+                try:
+                    raise RuntimeError("boom from the stream")
+                    yield  # pragma: no cover - unreachable, makes this a generator
+                finally:
+                    outer.aclose_calls += 1
+
+            return _gen()
+
+    sdk = _BoomClient()
+    client = _turn_client(sdk, "sess-4e", idle_timeout=5.0)
+    with pytest.raises(RuntimeError, match="boom from the stream"):
+        async for _event in client.receive_turn():
+            pass
+    assert sdk.aclose_calls == 1
+
+
+class _AcloseCountingClient:
+    """Counts explicit ``aclose()`` calls, not the generator's own finally.
+
+    ``_StubClient.aclose_calls`` counts its generator's ``finally``, which
+    also runs on plain exhaustion and on cancellation, so it stays 1 even
+    with ``receive_turn``'s own ``finally`` deleted and cannot pin the
+    cleanup. Delegating through a wrapper counts only the real call.
+    """
+
+    def __init__(self, messages):
+        self._messages = messages
+        self.explicit_aclose = 0
+
+    def receive_response(self):
+        outer = self
+
+        async def _gen():
+            for msg in outer._messages:
+                yield msg
+
+        class _Counting:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __anext__(self):
+                return self._inner.__anext__()
+
+            async def aclose(self):
+                outer.explicit_aclose += 1
+                return await self._inner.aclose()
+
+        return _Counting(_gen())
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_closes_the_iterator_when_eof_raises():
+    """The EOF raise still closes the SDK iterator exactly once."""
+    sdk = _AcloseCountingClient([])
+    client = _turn_client(sdk, "sess-4f", idle_timeout=5.0)
+    with pytest.raises(TransportDiedError):
+        async for _event in client.receive_turn():
+            pass
+    assert sdk.explicit_aclose == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_closes_the_iterator_on_a_completed_turn():
+    """The normal path closes it exactly once too, via the same finally."""
+    sdk = _AcloseCountingClient([_text_msg("a"), _result_msg()])
+    client = _turn_client(sdk, "sess-4g", idle_timeout=5.0)
+    async for _event in client.receive_turn():
+        pass
+    assert sdk.explicit_aclose == 1
+
+
+# ---------------------------------------------------------------------------
+# Engine receive loop: what a pre-result EOF does to a turn.
+#
+# These drive the REAL retry loop (engine.py) with a scripted client, so they
+# pin both sides of its "retry only if no content arrived yet" gate.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedClient:
+    """Minimal AgentClient whose receive_turn follows a script.
+
+    Script items: ``("text", str)``, ``("result", session_id)``,
+    ``("raise",)`` -> TransportDiedError, as a pre-result EOF produces.
+    """
+
+    def __init__(self, script: list[tuple], label: str):
+        self._script = script
+        self.label = label
+        self.model = "claude-test"
+        self.disconnect_calls = 0
+
+    @property
+    def native_session_id(self) -> str:
+        return f"native-{self.label}"
+
+    async def connect(self) -> None:
+        pass
+
+    async def start_turn(self, turn) -> None:
+        pass
+
+    async def receive_turn(self):
+        for item in self._script:
+            if item[0] == "raise":
+                raise TransportDiedError("claude runtime ended the turn without a result")
+            msg = _text_msg(item[1]) if item[0] == "text" else _result_msg(item[1])
+            for event in translate_message(msg):
+                yield event
+
+    async def interrupt(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return True
+
+    async def disconnect(self, timeout: float = 5.0) -> None:
+        self.disconnect_calls += 1
+
+    # Sync, like the real client's: the idle drain calls it without await.
+    def try_receive_idle_events(self):
+        return None
+
+    def buffer_used(self) -> int:
+        return 0
+
+
+async def _engine_with_scripted_clients(db, tmp_path, session_id, scripts):
+    """An AgentEngine that serves one _ScriptedClient per script, in order."""
+    workspace = tmp_path / f"ws-{session_id}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    cfg = NerveConfig.from_dict({
+        "workspace": str(workspace), "agent": {"backend": "claude"},
+    })
+    engine = AgentEngine(cfg, db)
+    await engine.sessions.get_or_create(
+        session_id, title="t", source="web", backend="claude",
+    )
+    made: list[_ScriptedClient] = []
+
+    async def _fake_get_or_create(sid, source, model, **kw):
+        script = scripts[min(len(made), len(scripts) - 1)]
+        client = _ScriptedClient(script, f"c{len(made)}")
+        made.append(client)
+        engine.sessions.set_client(sid, client)
+        return client
+
+    engine._get_or_create_client = _fake_get_or_create
+    return engine, made
+
+
+@pytest.mark.asyncio
+async def test_engine_retries_fresh_client_when_eof_precedes_content(db, tmp_path):
+    """No content yet: the dead client is replaced and the turn retried.
+
+    This is the pre-existing hung/dead-client path: the EOF raise simply
+    routes into it instead of being read as an empty success.
+    """
+    engine, made = await _engine_with_scripted_clients(
+        db, tmp_path, "eof-no-content",
+        [[("raise",)], [("text", "recovered"), ("result", "sdk-ok")]],
+    )
+    out = await engine.run("eof-no-content", "hello", source="web", channel="web")
+    assert out == "recovered"
+    # Exactly one retry: the dead client was disconnected, the fresh one kept.
+    assert [c.label for c in made] == ["c0", "c1"]
+    assert made[0].disconnect_calls == 1
+    assert made[1].disconnect_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_fails_turn_when_eof_follows_content(db, tmp_path):
+    """Content already streamed: the turn fails instead of retrying.
+
+    Retrying would duplicate output, so the engine re-raises to its error
+    handler. Two consequences are asserted deliberately: the live view and
+    the return value carry the error while the stored row keeps the partial
+    text in ``blocks``, and the native session id survives for resume.
+    """
+    engine, made = await _engine_with_scripted_clients(
+        db, tmp_path, "eof-after-content",
+        [[("text", "half an answer"), ("raise",)]],
+    )
+    out = await engine.run("eof-after-content", "hello", source="web", channel="web")
+    # No retry: the return value carries the error, not the partial text.
+    assert [c.label for c in made] == ["c0"]
+    assert out.startswith("Agent error:")
+    assert "half an answer" not in out
+    # Resume is preserved: the id is read off the client before removal.
+    row = await db.get_session("eof-after-content")
+    assert row["sdk_session_id"] == "native-c0"
+    # The dead client is replaced, not returned to the pool: this is what
+    # makes a spent stream unreusable.
+    assert made[0].disconnect_calls == 1
+    assert engine.sessions.get_client("eof-after-content") is None
+    # The durable split: the error is the message content, while the partial
+    # text survives in `blocks` (the error path never clears ordered_blocks).
+    rows = await db.get_messages("eof-after-content")
+    asst = [r for r in rows if r["role"] == "assistant"][-1]
+    assert asst["content"].startswith("Agent error:")
+    assert json.dumps(asst["blocks"] or []).count("half an answer") == 1
 
 
 # ---------------------------------------------------------------------------
