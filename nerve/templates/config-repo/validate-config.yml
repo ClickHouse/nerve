@@ -40,8 +40,15 @@ jobs:
       # validator at or ahead of the instance, which is the safe direction for
       # --strict-keys below: a newer validator knows every key the instance
       # reads. To check against one release instead, append a ref (nerve@v1.2.3).
+      #
+      # `uv tool install`, not `uv pip install --system`: the runner's system
+      # interpreter is externally managed (PEP 668), so --system is refused
+      # outright ("The interpreter at /usr is externally managed"). Only the
+      # `nerve` CLI is needed here, never an importable library, so a tool
+      # install in its own environment is both the idiomatic spelling and
+      # independent of what Python the runner image happens to ship.
       - uses: astral-sh/setup-uv@v6
-      - run: uv pip install --system "nerve @ git+https://github.com/ClickHouse/nerve"
+      - run: uv tool install "nerve @ git+https://github.com/ClickHouse/nerve"
 
       # The config repo root IS the workspace (it holds config/ and skills/).
       #
