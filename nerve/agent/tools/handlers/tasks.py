@@ -429,7 +429,9 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     )
     new_title = parse_task_title(new_content) or task["title"]
     frontmatter = parse_task_frontmatter(new_content)
-    new_deadline = frontmatter.get("deadline", task.get("deadline", ""))
+    # The deadline column is a pure projection of the file's Deadline line, so it
+    # comes from the content we just wrote, never from the pre-write snapshot.
+    new_deadline = frontmatter.get("deadline", "")
     new_tags = tags_to_string(parse_tags_string(frontmatter.get("tags", task.get("tags", ""))))
 
     await ctx.db.upsert_task(
