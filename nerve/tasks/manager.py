@@ -9,7 +9,14 @@ from pathlib import Path
 
 from nerve.config import ensure_path_not_tracked_config
 from nerve.db import Database
-from nerve.tasks.models import Task, TaskStatus, parse_task_frontmatter, parse_task_title
+from nerve.tasks.models import (
+    Task,
+    TaskStatus,
+    parse_tags_string,
+    parse_task_frontmatter,
+    parse_task_title,
+    tags_to_string,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +33,24 @@ class TaskManager:
         self.done_dir.mkdir(parents=True, exist_ok=True)
 
     async def reindex(self) -> int:
-        """Scan task files and rebuild the SQLite + FTS index."""
+        """Scan task files and rebuild the SQLite + FTS index.
+
+        ``upsert_task`` replaces the whole row, so every column this loop does
+        not supply is written back as its signature default. Values that live
+        only in the DB (status) are carried from the stored row. For values the
+        file may carry, the rule is per column, each matching the save path that
+        already writes it: ``tags`` takes the file whenever the field is
+        present, so a present-but-empty field is an explicit clear;
+        ``source_url`` and ``deadline`` take any non-empty file value and
+        otherwise keep the stored row.
+        """
         await self.db.rebuild_fts()
         count = 0
 
-        for directory, status in [(self.active_dir, "pending"), (self.done_dir, "done")]:
+        for directory, default_status in [
+            (self.active_dir, "pending"),
+            (self.done_dir, "done"),
+        ]:
             md_files = await asyncio.to_thread(lambda d=directory: sorted(d.glob("*.md")))
             for md_file in md_files:
                 try:
@@ -39,15 +59,36 @@ class TaskManager:
                     fields = parse_task_frontmatter(content)
                     task_id = md_file.stem
                     rel_path = str(md_file.relative_to(self.workspace))
+                    stored = await self.db.get_task(task_id) or {}
+
+                    if default_status == "done":
+                        # A file under done/ is terminal by definition, so the
+                        # directory wins: a nonterminal row here is an orphan.
+                        status = "done"
+                    else:
+                        # No writer emits a **Status:** line, so the stored row
+                        # is the only source. A stored "done" on an active/ file
+                        # is the orphan state docs/tasks.md forbids, so reset it.
+                        prev = stored.get("status")
+                        status = prev if prev and prev != "done" else default_status
 
                     await self.db.upsert_task(
                         task_id=task_id,
                         file_path=rel_path,
                         title=title,
-                        status=fields.get("status", status),
-                        source=fields.get("source"),
-                        source_url=fields.get("source"),
-                        deadline=fields.get("deadline"),
+                        status=status,
+                        # **Source:** carries the URL (handlers/tasks.py writes
+                        # source_url there); `source` is a DB-only vocabulary.
+                        source=stored.get("source"),
+                        source_url=fields.get("source") or stored.get("source_url"),
+                        deadline=fields.get("deadline") or stored.get("deadline"),
+                        # Presence, not truthiness: a present-but-empty field is
+                        # an explicit clear, an absent one is "no information".
+                        tags=(
+                            tags_to_string(parse_tags_string(fields["tags"]))
+                            if "tags" in fields
+                            else (stored.get("tags") or "")
+                        ),
                         content=content,
                     )
                     count += 1
