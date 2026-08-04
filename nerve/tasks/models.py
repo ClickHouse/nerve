@@ -115,9 +115,13 @@ def parse_task_frontmatter(content: str) -> dict[str, str]:
     """Parse frontmatter fields from a task markdown file.
 
     Looks for **Key:** Value patterns.
+
+    The value is line-bounded and may be empty. ``[ \\t]*`` cannot cross a
+    newline, so a field written with no value registers its key with ``''``
+    rather than swallowing the blank line and capturing the next non-empty one.
     """
     fields = {}
-    for match in re.finditer(r"\*\*(\w+):\*\*\s*(.+)", content):
+    for match in re.finditer(r"\*\*(\w+):\*\*[ \t]*(.*)", content):
         key = match.group(1).lower()
         value = match.group(2).strip()
         fields[key] = value
