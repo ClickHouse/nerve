@@ -161,6 +161,18 @@ interface ChatState {
   // Background tasks (run_in_background)
   backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout'; startedAt: number }[];
 
+  // Archived sessions — lazily loaded: nothing is fetched until the sidebar
+  // Archived group is expanded. null = never loaded. archivedCount rides on
+  // every GET /api/sessions so the collapsed group shows a badge for free.
+  archivedSessions: Session[] | null;
+  archivedCount: number;
+  archivedLoading: boolean;
+  // System sessions (cron/hook) — lazily loaded, mirror of archived. Moved out
+  // of the main feed so cron traffic no longer crowds the conversation list.
+  systemSessions: Session[] | null;
+  systemCount: number;
+  systemLoading: boolean;
+
   // Session search
   searchQuery: string;
   searchResults: Session[] | null;  // null = not searching
@@ -197,6 +209,13 @@ interface ChatState {
   setDraft: (sessionId: string, text: string) => void;
   deleteSession: (id: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
+  unarchiveSession: (id: string) => Promise<void>;
+  /** Lazily fetch archived sessions (called when the Archived group opens). */
+  loadArchivedSessions: () => Promise<void>;
+  /** Lazily fetch system sessions (called when the System group opens). */
+  loadSystemSessions: () => Promise<void>;
+  /** Star an archived session: unarchive + star in one PATCH (hook fires). */
+  starArchivedSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
@@ -238,6 +257,12 @@ interface ChatState {
 
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
+  archivedSessions: null,
+  archivedCount: 0,
+  archivedLoading: false,
+  systemSessions: null,
+  systemCount: 0,
+  systemLoading: false,
   activeSession: '',
   virtualSession: null,
   // Rehydrated from localStorage so unsent composer text survives a reload.
@@ -448,8 +473,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadSessions: async () => {
     try {
-      const { sessions } = await api.listSessions();
-      set({ sessions });
+      const { sessions, archived_count, system_count } = await api.listSessions();
+      set({ sessions, archivedCount: archived_count ?? 0, systemCount: system_count ?? 0 });
+      // Keep the lazy groups fresh if the user has them open (archive/unarchive/
+      // delete all funnel through here); leave them untouched (lazy) otherwise.
+      if (get().archivedSessions !== null) {
+        get().loadArchivedSessions();
+      }
+      if (get().systemSessions !== null) {
+        get().loadSystemSessions();
+      }
       // Reclaim persisted drafts whose session no longer exists (deleted or
       // archived elsewhere) — but never the chat you're in or an unsent one.
       const keep = new Set(sessions.map(s => s.id));
@@ -715,6 +748,62 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }));
     } catch (e) {
       console.error('Failed to toggle star:', e);
+    }
+  },
+
+  loadArchivedSessions: async () => {
+    // Show the spinner only on the very first open; later refreshes (after an
+    // archive / unarchive / delete) swap in silently.
+    const firstLoad = get().archivedSessions === null;
+    if (firstLoad) set({ archivedLoading: true });
+    try {
+      const { sessions } = await api.listArchivedSessions();
+      set({ archivedSessions: sessions, archivedCount: sessions.length, archivedLoading: false });
+    } catch (e) {
+      console.error('Failed to load archived sessions:', e);
+      set({ archivedLoading: false });
+    }
+  },
+
+  loadSystemSessions: async () => {
+    const firstLoad = get().systemSessions === null;
+    if (firstLoad) set({ systemLoading: true });
+    try {
+      const { sessions } = await api.listSystemSessions();
+      set({ systemSessions: sessions, systemCount: sessions.length, systemLoading: false });
+    } catch (e) {
+      console.error('Failed to load system sessions:', e);
+      set({ systemLoading: false });
+    }
+  },
+
+  unarchiveSession: async (id: string) => {
+    try {
+      await api.unarchiveSession(id);
+      // Drop from the archived list right away; loadSessions() then brings it
+      // back into its normal group and refreshes the count.
+      set(s => ({
+        archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
+        archivedCount: Math.max(0, s.archivedCount - 1),
+      }));
+      await get().loadSessions();
+    } catch (e) {
+      console.error('Failed to unarchive session:', e);
+    }
+  },
+
+  starArchivedSession: async (id: string) => {
+    try {
+      // Backend composites this: starring an archived session unarchives it
+      // first, then stars, firing the star->project hook on a live session.
+      await api.updateSession(id, { starred: true });
+      set(s => ({
+        archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
+        archivedCount: Math.max(0, s.archivedCount - 1),
+      }));
+      await get().loadSessions();
+    } catch (e) {
+      console.error('Failed to star archived session:', e);
     }
   },
 

@@ -270,7 +270,9 @@ export const api = {
     }>('/models'),
 
   // Sessions
-  listSessions: () => request<{ sessions: any[] }>('/sessions'),
+  listSessions: () => request<{ sessions: any[]; archived_count: number; system_count: number }>('/sessions'),
+  listArchivedSessions: () => request<{ sessions: any[] }>('/sessions/archived'),
+  listSystemSessions: () => request<{ sessions: any[] }>('/sessions/system'),
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
@@ -319,6 +321,8 @@ export const api = {
     request<any>(`/sessions/${id}/resume`, { method: 'POST' }),
   archiveSession: (id: string) =>
     request<any>(`/sessions/${id}/archive`, { method: 'POST' }),
+  unarchiveSession: (id: string) =>
+    request<any>(`/sessions/${id}/unarchive`, { method: 'POST' }),
   getSessionStatus: (id: string) =>
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>

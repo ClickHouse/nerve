@@ -669,6 +669,44 @@ class SessionManager:
         await self.db.log_session_event(session_id, "archived", {})
         logger.info("Archived session %s", session_id)
 
+    async def unarchive_session(self, session_id: str) -> None:
+        """Restore an archived session to ``idle`` so it's resumable again.
+
+        Inverse of :meth:`archive_session`: clears ``archived_at`` and flips
+        the status back to idle. ``sdk_session_id`` stays cleared (archive
+        dropped it) — the next open resumes with fresh context, like any
+        idle session.
+        """
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        await self.db.update_session_fields(session_id, {
+            "status": SessionStatus.IDLE.value,
+            "archived_at": None,
+        })
+        await self.db.log_session_event(session_id, "unarchived", {})
+        logger.info("Unarchived session %s", session_id)
+
+    async def list_archived_sessions(self, limit: int = 200) -> list[dict]:
+        """Archived sessions for the sidebar's lazily-loaded Archived group."""
+        return await self.db.list_archived_sessions(limit=limit)
+
+    async def count_archived_sessions(self) -> int:
+        """Number of archived sessions (cheap badge count)."""
+        return await self.db.count_archived_sessions()
+
+    async def list_active_sessions(self) -> list[dict]:
+        """Main sidebar feed — non-archived, non-system sessions, unbounded."""
+        return await self.db.list_active_sessions()
+
+    async def list_system_sessions(self, limit: int = 200) -> list[dict]:
+        """System (cron/hook) sessions for the sidebar's lazy System group."""
+        return await self.db.list_system_sessions(limit=limit)
+
+    async def count_system_sessions(self) -> int:
+        """Number of non-archived system sessions (cheap badge count)."""
+        return await self.db.count_system_sessions()
+
     async def run_cleanup(
         self,
         archive_after_days: int = DEFAULT_ARCHIVE_AFTER_DAYS,

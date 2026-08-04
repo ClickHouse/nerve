@@ -443,6 +443,93 @@ class TestArchiveAndCleanup:
         assert session["status"] == "archived"
         assert session["archived_at"] is not None
 
+    async def test_unarchive_session(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("unarch-1")
+        await sm.archive_session("unarch-1")
+        await sm.unarchive_session("unarch-1")
+        session = await db.get_session("unarch-1")
+        assert session["status"] == "idle"
+        assert session["archived_at"] is None
+
+    async def test_unarchive_logs_event(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("unarch-ev")
+        await sm.archive_session("unarch-ev")
+        await sm.unarchive_session("unarch-ev")
+        events = await db.get_session_events("unarch-ev")
+        assert any(e["event_type"] == "unarchived" for e in events)
+
+    async def test_unarchive_missing_raises(self, sm: SessionManager):
+        with pytest.raises(ValueError):
+            await sm.unarchive_session("does-not-exist")
+
+    async def test_list_archived_only_archived(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("keep-live")
+        await db.update_session_fields("keep-live", {"status": "idle"})
+        await sm.get_or_create("arch-listed")
+        await sm.archive_session("arch-listed")
+        archived_ids = {s["id"] for s in await sm.list_archived_sessions()}
+        assert "arch-listed" in archived_ids
+        assert "keep-live" not in archived_ids
+        # The default sidebar feed (list_sessions) must still exclude archived.
+        live_ids = {s["id"] for s in await sm.list_sessions()}
+        assert "arch-listed" not in live_ids
+
+    async def test_count_archived_sessions(self, sm: SessionManager):
+        assert await sm.count_archived_sessions() == 0
+        await sm.get_or_create("cnt-1")
+        await sm.archive_session("cnt-1")
+        await sm.get_or_create("cnt-2")
+        await sm.archive_session("cnt-2")
+        assert await sm.count_archived_sessions() == 2
+
+    async def test_star_archived_field_write_restores(self, sm: SessionManager, db: Database):
+        """The update_session route composites star+unarchive by writing these
+        fields together; verify that write restores the row to a live, starred
+        state (status idle, archived_at cleared)."""
+        await sm.get_or_create("star-arch")
+        await sm.archive_session("star-arch")
+        await db.update_session_fields(
+            "star-arch", {"starred": 1, "status": "idle", "archived_at": None},
+        )
+        session = await db.get_session("star-arch")
+        assert session["starred"] == 1
+        assert session["status"] == "idle"
+        assert session["archived_at"] is None
+
+    async def test_list_active_excludes_system_and_archived(self, sm: SessionManager):
+        await sm.get_or_create("feed-web", source="web")
+        await sm.get_or_create("feed-cron", source="cron")
+        await sm.get_or_create("feed-arch", source="web")
+        await sm.archive_session("feed-arch")
+        ids = {s["id"] for s in await sm.list_active_sessions()}
+        assert "feed-web" in ids
+        assert "feed-cron" not in ids   # system source excluded from main feed
+        assert "feed-arch" not in ids   # archived excluded
+
+    async def test_list_active_is_unbounded(self, sm: SessionManager):
+        # Regression: the old sidebar feed capped non-starred sessions at 50.
+        for i in range(55):
+            await sm.get_or_create(f"many-{i}", source="web")
+        active = await sm.list_active_sessions()
+        assert len([s for s in active if s["id"].startswith("many-")]) == 55
+
+    async def test_list_system_only_system(self, sm: SessionManager):
+        await sm.get_or_create("sys-cron", source="cron")
+        await sm.get_or_create("sys-hook", source="hook")
+        await sm.get_or_create("sys-web", source="web")
+        ids = {s["id"] for s in await sm.list_system_sessions()}
+        assert {"sys-cron", "sys-hook"} <= ids
+        assert "sys-web" not in ids
+
+    async def test_count_system_sessions(self, sm: SessionManager):
+        assert await sm.count_system_sessions() == 0
+        await sm.get_or_create("c-cron", source="cron")
+        await sm.get_or_create("c-hook", source="hook")
+        await sm.get_or_create("c-web", source="web")
+        await sm.get_or_create("c-arch", source="cron")
+        await sm.archive_session("c-arch")
+        assert await sm.count_system_sessions() == 2   # archived cron excluded
+
     async def test_archive_disconnects_client(self, sm: SessionManager):
         await sm.get_or_create("arch-2")
         # Simulate a client
