@@ -947,6 +947,61 @@ class TestPatchRouteTagCanonicalization:
             db, tmp_path, monkeypatch, "# T\n\n**Tags:** alpha,beta\n\nbody\n",
         )
         assert row["tags"] == "alpha,beta"
+class TestFrontmatterParsing:
+    """The frontmatter value is line-bounded, so a blank field parses as empty.
+
+    A value pattern that can cross the newline captures the next non-empty line
+    instead, which readers then store as that field's value.
+    """
+
+    def test_blank_field_followed_by_body_is_empty(self):
+        from nerve.tasks.models import parse_task_frontmatter
+        fields = parse_task_frontmatter("# T\n\n**Tags:** \n\nBody text here.\n")
+        assert "tags" in fields
+        assert fields["tags"] == ""
+
+    def test_blank_field_followed_by_another_field_is_empty(self):
+        from nerve.tasks.models import parse_task_frontmatter
+        fields = parse_task_frontmatter(
+            "# T\n\n**Tags:** \n**Deadline:** 2026-09-01\n\nBody.\n"
+        )
+        assert fields["tags"] == ""
+        assert fields["deadline"] == "2026-09-01"
+
+    def test_blank_field_at_end_of_file_is_empty(self):
+        from nerve.tasks.models import parse_task_frontmatter
+        assert parse_task_frontmatter("# T\n\nBody.\n\n**Tags:**   \n")["tags"] == ""
+
+    def test_blank_field_without_a_trailing_space_is_empty(self):
+        """The value is optional, not just line-bounded.
+
+        A pattern that is line-bounded but still demands a character leaves the
+        key unregistered for this shape, which readers cannot distinguish from an
+        absent field. 71 live task files carry a blank field written this way.
+        """
+        from nerve.tasks.models import parse_task_frontmatter
+        for content in (
+            "# T\n\n**Tags:**\n\nBody text here.\n",
+            "# T\n\n**Tags:**\n**Deadline:** 2026-09-01\n\nBody.\n",
+            "# T\n\nBody.\n\n**Tags:**\n",
+        ):
+            fields = parse_task_frontmatter(content)
+            assert "tags" in fields, content
+            assert fields["tags"] == "", content
+
+    def test_normal_value_still_parses(self):
+        from nerve.tasks.models import parse_task_frontmatter
+        fields = parse_task_frontmatter("# T\n\n**Tags:** ci, p0\n**Source:** manual\n")
+        assert fields == {"tags": "ci, p0", "source": "manual"}
+
+    def test_value_with_internal_spaces_still_parses(self):
+        from nerve.tasks.models import parse_task_frontmatter
+        content = "# T\n\n**Title:** a  b   c\n\nBody.\n"
+        assert parse_task_frontmatter(content)["title"] == "a  b   c"
+
+    def test_absent_field_is_not_registered(self):
+        from nerve.tasks.models import parse_task_frontmatter
+        assert "tags" not in parse_task_frontmatter("# T\n\nBody only.\n")
 
 
 # --- Plan lifecycle ---

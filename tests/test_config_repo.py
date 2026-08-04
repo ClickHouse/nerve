@@ -14,6 +14,7 @@ from click.testing import CliRunner
 
 import nerve
 from nerve import config_repo
+from nerve.config_pr import _ALLOWED_ROOT_FILES
 from nerve.config_repo import _SCAFFOLD, _template_dir, scaffold_config_repo
 
 _WORKFLOW = ".github/workflows/validate-config.yml"
@@ -35,8 +36,13 @@ def _validate_step(ws: Path) -> dict:
 
 
 def _install_step(ws: Path) -> dict:
-    """The step that installs the nerve the validator comes from."""
-    return next(s for s in _steps(ws) if "pip install" in str(s.get("run", "")))
+    """The step that installs the nerve the validator comes from.
+
+    Matched on the package spec rather than the installer, so swapping how it
+    is installed does not silently match no step and skip the assertions that
+    depend on this.
+    """
+    return next(s for s in _steps(ws) if "nerve @ git+" in str(s.get("run", "")))
 
 
 def _run_ci_validation(ws: Path) -> subprocess.CompletedProcess:
@@ -126,6 +132,37 @@ class TestScaffold:
         assert not ignored("config/config.yaml"), "tracked config must stay committable"
         assert not ignored("config/settings.yaml")
 
+    def test_agent_runtime_state_is_ignored_but_instructions_are_tracked(self, tmp_path):
+        """`nerve init` writes MEMORY.md into every workspace, and the agent
+        rewrites it and TASK.md as it works, so the runbook's `git add -A` would
+        commit a scratchpad the instance then fights the repo over on each pull.
+
+        The same line nerve draws for the agent's own proposals, where these are
+        refused as runtime state while the instruction files are reviewable —
+        so this pins both halves, not just the exclusion. Asked of git for the
+        anchoring reason above: unanchored, `MEMORY.md` would also swallow a
+        skill's own MEMORY.md inside the tracked subtree.
+        """
+        import shutil
+        import subprocess
+
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+        scaffold_config_repo(tmp_path)
+        subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True,
+                       capture_output=True)
+
+        def ignored(rel: str) -> bool:
+            return subprocess.run(
+                ["git", "check-ignore", "-q", rel], cwd=str(tmp_path),
+            ).returncode == 0
+
+        for rel in ("MEMORY.md", "TASK.md", "memory/entity.md"):
+            assert ignored(rel), f"{rel} is runtime state and must not be staged"
+        for rel in _ALLOWED_ROOT_FILES:
+            assert not ignored(rel), f"{rel} is reviewed instruction and must stay committable"
+        assert not ignored("skills/x/MEMORY.md"), "the exclusion must be root-anchored"
+
     def test_gitignore_covers_backup_secret_members(self, tmp_path):
         # If the workspace doubles as the state dir, `git add -A` (which the
         # runbook tells operators to run) must not sweep up nerve's credentials.
@@ -207,6 +244,17 @@ class TestScaffoldedWorkflow:
         run = _install_step(tmp_path)["run"]
         assert "git+https://github.com/ClickHouse/nerve" in run
         assert "install nerve\n" not in run and not run.endswith("install nerve")
+
+    def test_the_validator_is_not_installed_into_the_system_interpreter(self, tmp_path):
+        """`--system` is refused on the runner: its Python is externally managed.
+
+        This failed every scaffolded repo on its first push, at the step after
+        the secret scan, with "The interpreter at /usr is externally managed"
+        (PEP 668). Only the CLI is needed, so it goes in its own environment.
+        """
+        scaffold_config_repo(tmp_path)
+        run = _install_step(tmp_path)["run"]
+        assert "--system" not in run, run
 
     def test_the_validate_step_runs_the_installed_cli(self, tmp_path):
         scaffold_config_repo(tmp_path)

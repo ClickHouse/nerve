@@ -28,6 +28,20 @@ config.local.yaml
 mcp-token
 certs/
 
+# The agent's own runtime state. Unlike the files above these are in *every*
+# workspace — `nerve init` writes MEMORY.md from the template manifest, and the
+# agent creates memory/ and rewrites MEMORY.md and TASK.md as it works — so the
+# runbook's `git add -A` would commit them on the very first push, and every
+# subsequent pull would fight the instance over its own scratchpad.
+#
+# This is the same line nerve draws for the agent's own proposals, where these
+# paths are refused as runtime state (_ALLOWED_ROOT_FILES in nerve/config_pr.py):
+# reviewing them would mean a pull request per thought. The reviewed instruction
+# files — SOUL.md, IDENTITY.md, USER.md, AGENTS.md, TOOLS.md — are tracked.
+/MEMORY.md
+/TASK.md
+/memory/
+
 # The nerve source checkout used by the CI validation workflow
 .nerve-src/
 
