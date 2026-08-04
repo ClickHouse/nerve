@@ -252,6 +252,104 @@ class TestResumeDroppedEnginePath:
         assert session.get("backend") == "codex"
 
 
+class TestPreRecallFreeze:
+    """The first successful pre-recall is persisted to session metadata and
+    reused verbatim on every later rebuild instead of re-recalled."""
+
+    @pytest.mark.asyncio
+    async def test_first_recall_is_frozen_and_reused_on_rebuild(
+        self, tmp_path, db,
+    ):
+        """Phase A pins the metadata write; phase B pins that a rebuild
+        renders the stored priors, not a fresh recall."""
+        import json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from nerve.agent.backends.base import BackendCapabilities
+
+        first = ["prior-alpha-9f1", "prior-beta-9f2"]
+        second = ["rearmed-gamma-7c1", "rearmed-delta-7c2"]
+
+        engine = _engine(tmp_path, db)
+        await db.create_session("s-freeze", source="web", backend="codex")
+
+        bridge = MagicMock(available=True)
+        bridge.recall = AsyncMock(
+            return_value=[{"summary": m} for m in first],
+        )
+        engine._memory_bridge = bridge
+
+        prompts: list[str] = []
+
+        class StubClient:
+            model = "gpt-5.6-sol"
+
+            def is_alive(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+        class StubBackend:
+            name = "codex"
+            capabilities = BackendCapabilities(
+                cost_is_cumulative=False,
+                supports_idle_stream=False,
+                supports_cache_ttl=False,
+                interactive_builtins=False,
+                reports_context_window=True,
+            )
+
+            def default_model(self, source):
+                return "gpt-5.6-sol"
+
+            def excluded_tools(self):
+                return set()
+
+            def validate_resume_target(self, native_id, cwd):
+                return True
+
+            async def create_client(self, spec):
+                prompts.append(spec.system_prompt)
+                return StubClient()
+
+        engine._backends["codex"] = StubBackend()
+
+        # Phase A: the write under test.
+        await engine._get_or_create_client("s-freeze", "web", None)
+        session = await db.get_session("s-freeze")
+        meta = json.loads(session.get("metadata") or "{}")
+        assert meta.get("recalled_memories") == first, meta
+        assert len(prompts) == 1
+        for m in first:
+            assert f"- {m}" in prompts[0]
+
+        # Phase B: evict the cached client so the rebuild re-enters the
+        # freeze block (a live client returns before metadata is parsed),
+        # and rearm recall so a live re-recall would be visible.
+        engine.sessions.remove_client("s-freeze")
+        bridge.recall.return_value = [{"summary": m} for m in second]
+
+        await engine._get_or_create_client("s-freeze", "web", None)
+
+        # Precondition: the rebuild really happened.
+        assert len(prompts) == 2, prompts
+        # The frozen priors are what the second prompt carries.
+        for m in first:
+            assert f"- {m}" in prompts[1]
+        for m in second:
+            assert m not in prompts[1]
+        # Verbatim means byte-identical: order and multiplicity are prompt
+        # bytes (prompts.py:167), and byte-identity is the cache property.
+        assert prompts[1] == prompts[0]
+        # Corroborating: nothing re-recalled, nothing overwrote the store.
+        assert bridge.recall.await_count == 1
+        after = await db.get_session("s-freeze")
+        assert json.loads(after.get("metadata") or "{}").get(
+            "recalled_memories",
+        ) == first
+
+
 class TestCreateSessionRoute:
     """POST /api/sessions with the new-chat backend selector's param."""
 
