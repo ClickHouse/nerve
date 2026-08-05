@@ -317,6 +317,26 @@ class StreamBroadcaster:
             "workflow": workflow,
         })
 
+    async def broadcast_task_event(self, task: dict[str, Any], event: str) -> None:
+        """A task row changed — ``created``/``updated``/``moved``/``done``.
+
+        Fanned out on ``__global__`` rather than a session channel because
+        the task board is a global view: a card has to move whether the
+        mutation came from the HTTP API, another browser tab, or the agent
+        working in some unrelated session. ``session_id`` is None for the
+        same reason — the frontend drops view-scoped events addressed to a
+        session the client isn't looking at, and this one is for everyone.
+
+        The whole row travels with the event so a client can upsert it
+        without a follow-up fetch (same shape as ``workflow_run_update``).
+        """
+        await self.broadcast("__global__", {
+            "type": "task_updated",
+            "session_id": None,
+            "event": event,
+            "task": task,
+        })
+
     async def broadcast_error(self, session_id: str, error: str) -> None:
         await self.broadcast(session_id, {"type": "error", "session_id": session_id, "error": error})
 
@@ -338,3 +358,19 @@ class StreamBroadcaster:
 
 # Global broadcaster instance
 broadcaster = StreamBroadcaster()
+
+
+async def emit_task_event(task: dict[str, Any] | None, event: str) -> None:
+    """Best-effort task broadcast — never let the UI break a mutation.
+
+    Every task write site calls this, including ones that run with no
+    websocket listeners at all (CLI, cron, tests). A broadcast failure is
+    a cosmetic problem — a stale card until the next refresh — so it is
+    logged at debug and swallowed rather than propagated into the write.
+    """
+    if not task:
+        return
+    try:
+        await broadcaster.broadcast_task_event(task, event)
+    except Exception:  # noqa: BLE001
+        logger.debug("task event broadcast failed", exc_info=True)

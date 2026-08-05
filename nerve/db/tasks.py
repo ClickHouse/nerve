@@ -6,6 +6,16 @@ import re
 from datetime import datetime, timezone
 
 
+# Spacing between task ranks (``tasks.position``). Wide enough that a
+# midpoint insert has ~50 levels of headroom before float precision runs
+# out, so renormalization is a theoretical path rather than a routine one.
+POSITION_GAP = 1024.0
+
+# Two neighbours closer than this can't yield a meaningful midpoint, so a
+# move between them re-spaces the lane first.
+_MIN_POSITION_GAP = 1e-6
+
+
 class _Keep:
     """Type of the :data:`KEEP` sentinel."""
 
@@ -49,25 +59,28 @@ class TaskStore:
         deadline: str | None | _Keep = KEEP,
         tags: str | _Keep = KEEP,
         content: str = "",
+        position: float | None = None,
     ) -> None:
         """Insert or update a task row and its FTS entry.
 
         ``file_path``, ``title``, ``status`` and ``content`` are a full
         replace. Every caller rebuilds them from the markdown file.
 
-        ``source``, ``source_url``, ``deadline`` and ``tags`` are
-        preserve-on-omit. An omitted column keeps its stored value. To clear
-        one, pass it: ``None`` for the nullable columns, ``""`` for ``tags``.
+        ``source``, ``source_url``, ``deadline``, ``tags`` and ``position``
+        are preserve-on-omit. An omitted column keeps its stored value. To
+        clear one, pass it: ``None`` for the nullable columns, ``""`` for
+        ``tags``.
 
-        Those four columns need that rule because a markdown file carries
-        them only while it has the frontmatter for them. Under a full
-        replace, every caller has to read the row and pass all four back,
-        and a caller that forgets one deletes user data. That happened
-        twice. ``TaskManager.reindex`` dropped ``tags`` after v018 added the
-        column, and ``task_done`` nulled all four when it moved a file into
-        done/. ``test_task_upsert_preserve.py`` holds the rule itself;
-        ``test_task_reindex.py`` and ``test_task_completion.py`` hold the
-        caller-level regressions.
+        These five columns need that rule because a markdown file does not
+        always carry them. No file carries ``position``: board order lives
+        only in this column. A file carries the other four only while it has
+        the frontmatter for them. Under a full replace, every caller must
+        read the row and pass all five back, and a caller that forgets one
+        deletes user data. That happened twice. ``TaskManager.reindex``
+        dropped ``tags`` after v018 added the column, and ``task_done``
+        nulled the other four when it moved a file into done/.
+        ``test_task_position.py``, ``test_task_reindex.py`` and
+        ``test_task_completion.py`` hold the regression coverage.
         """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
@@ -79,14 +92,17 @@ class TaskStore:
             source_url = _resolve_kept(source_url, stored, "source_url", None)
             deadline = _resolve_kept(deadline, stored, "deadline", None)
             tags = _resolve_kept(tags, stored, "tags", "")
+            if position is None:
+                position = await self._resolve_upsert_position(stored, status)
             await self.db.execute(
-                """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, position, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        file_path=excluded.file_path, title=excluded.title, status=excluded.status,
                        source=excluded.source, source_url=excluded.source_url,
-                       deadline=excluded.deadline, tags=excluded.tags, updated_at=?""",
-                (task_id, file_path, title, status, source, source_url, deadline, tags, now, now, now),
+                       deadline=excluded.deadline, tags=excluded.tags,
+                       position=excluded.position, updated_at=?""",
+                (task_id, file_path, title, status, source, source_url, deadline, tags, position, now, now, now),
             )
             # Sync FTS index — include tags and content so they're all searchable.
             # The join key is the RAW task_id; readers join on `f.task_id = t.id`.
@@ -105,14 +121,166 @@ class TaskStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    # ── Board ordering (tasks.position) ──────────────────────────────────
+    #
+    # Lanes sort by ``position ASC``, so a *lower* rank is *higher* in the
+    # lane. Every helper below assumes it is running inside ``_atomic()``:
+    # they read on the shared connection between the caller's writes, which
+    # is only consistent while the caller holds the write lock.
+
+    async def _lane_top_position(self, status: str) -> float:
+        """A rank that lands above everything currently in ``status``."""
+        async with self.db.execute(
+            "SELECT MIN(position) FROM tasks WHERE status = ?", (status,),
+        ) as cursor:
+            lane_min = (await cursor.fetchone())[0]
+        # Going negative is fine: this is an ordering key, not a count.
+        return POSITION_GAP if lane_min is None else float(lane_min) - POSITION_GAP
+
     async def _stored_task_columns(self, task_id: str) -> dict | None:
         """The columns an upsert can preserve, or ``None`` for a new task."""
         async with self.db.execute(
-            "SELECT source, source_url, deadline, tags FROM tasks WHERE id = ?",
+            "SELECT status, position, source, source_url, deadline, tags "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ) as cursor:
             row = await cursor.fetchone()
         return dict(row) if row else None
+
+    async def _resolve_upsert_position(
+        self, stored: dict | None, status: str,
+    ) -> float:
+        """Rank for an upsert that supplied none: keep it, or mint one.
+
+        A rank is preserved only *within* a lane. A row whose status is
+        changing gets re-ranked to the top of its destination, because a
+        rank carried across lanes lands the card at an arbitrary depth of a
+        list it was never ordered against — the same rule
+        :meth:`update_task_status` applies, kept here so it also holds for
+        the callers that flip status through a full-row upsert instead
+        (``task_update`` with a note, the PATCH route saving content).
+        """
+        if stored is not None and stored["status"] == status:
+            return float(stored["position"])
+        # Brand new task, or one changing lanes — surface it at the top,
+        # where whoever just created or moved it is looking.
+        return await self._lane_top_position(status)
+
+    async def _neighbour_position(
+        self, neighbour_id: str | None, lane: str, moving_id: str,
+    ) -> float | None:
+        """Rank of an anchor card, or None if it can't anchor this move.
+
+        An anchor is ignored when it is missing, is the moved card itself,
+        or has since left the lane — all of which happen routinely when a
+        drag lands against a board the client rendered moments ago.
+        """
+        if not neighbour_id or neighbour_id == moving_id:
+            return None
+        async with self.db.execute(
+            "SELECT position FROM tasks WHERE id = ? AND status = ?",
+            (neighbour_id, lane),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0]) if row else None
+
+    async def _renormalize_lane(self, lane: str) -> None:
+        """Re-space a lane at ``POSITION_GAP`` intervals, order preserved."""
+        async with self.db.execute(
+            "SELECT id FROM tasks WHERE status = ? "
+            "ORDER BY position ASC, created_at DESC, id DESC",
+            (lane,),
+        ) as cursor:
+            ids = [row[0] async for row in cursor]
+        if ids:
+            await self.db.executemany(
+                "UPDATE tasks SET position = ? WHERE id = ?",
+                [((i + 1) * POSITION_GAP, tid) for i, tid in enumerate(ids)],
+            )
+
+    async def _compute_move_position(
+        self, task_id: str, lane: str,
+        before_id: str | None, after_id: str | None,
+    ) -> float:
+        """Resolve "between these two cards" into a concrete rank."""
+        for attempt in (0, 1):
+            above = await self._neighbour_position(before_id, lane, task_id)
+            below = await self._neighbour_position(after_id, lane, task_id)
+
+            if above is not None and below is not None:
+                gap = below - above
+                if gap >= _MIN_POSITION_GAP:
+                    return (above + below) / 2.0
+                if gap >= 0 and attempt == 0:
+                    # Ranks have converged after many midpoint inserts.
+                    # Re-space once, then take a real midpoint on the retry.
+                    await self._renormalize_lane(lane)
+                    continue
+                # gap < 0 means the anchors arrived swapped; re-spacing
+                # preserves order so it can't help. Fall through to the tail.
+            elif above is not None:
+                return above + POSITION_GAP
+            elif below is not None:
+                return below - POSITION_GAP
+            break
+
+        # No usable anchor: append to the end of the lane.
+        async with self.db.execute(
+            "SELECT MAX(position) FROM tasks WHERE status = ? AND id != ?",
+            (lane, task_id),
+        ) as cursor:
+            tail = (await cursor.fetchone())[0]
+        return POSITION_GAP if tail is None else float(tail) + POSITION_GAP
+
+    async def move_task(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        before_id: str | None = None,
+        after_id: str | None = None,
+    ) -> dict | None:
+        """Place a task at an explicit slot in a lane; return the new row.
+
+        The client sends *intent* — "put this between A and B" — instead of
+        a computed rank. Lanes are paginated, so the client may not be
+        holding the neighbours' true ranks, and resolving them server-side
+        means two people dragging at once converge on a sane order rather
+        than overwriting each other with stale absolute values.
+
+        ``before_id`` is the card that ends up directly **above** the moved
+        task, ``after_id`` the one directly **below**; either may be None
+        for "top of lane" / "bottom of lane". Returns None if the task does
+        not exist.
+
+        Note this writes ``status`` directly rather than going through
+        :meth:`update_task_status` — a move already carries an explicit
+        rank, so it must not be re-ranked to the top of the lane on top of
+        it. Callers are responsible for any *file* movement a status change
+        implies (see ``task_done`` / ``task_reopen``).
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+
+            lane = status or row[0]
+            position = await self._compute_move_position(
+                task_id, lane, before_id, after_id,
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            await self.db.execute(
+                "UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?",
+                (lane, position, now, task_id),
+            )
+            async with self.db.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,),
+            ) as cursor:
+                moved = await cursor.fetchone()
+            return dict(moved) if moved else None
 
     # Supported sort keys → ORDER BY clause. Keep deterministic with a
     # secondary key so equal timestamps don't flicker between pages.
@@ -120,6 +288,10 @@ class TaskStore:
         "deadline": "deadline ASC NULLS LAST, created_at DESC, id DESC",
         "updated_at": "updated_at DESC, id DESC",
         "created_at": "created_at DESC, id DESC",
+        # Board order. Rows predating v043's backfill (or written by a
+        # caller that never set a rank) share position 0, so the tiebreak
+        # keeps them in the list view's familiar newest-first order.
+        "position": "position ASC, created_at DESC, id DESC",
     }
 
     async def list_tasks(
@@ -197,11 +369,33 @@ class TaskStore:
             return row[0] if row else 0
 
     async def update_task_status(self, task_id: str, status: str) -> None:
+        """Move a task to another status, re-ranking it into the new lane.
+
+        A rank only means anything relative to its own lane, so carrying
+        the old one across a status change would drop the card at an
+        arbitrary depth of its destination — the agent marking something
+        in_progress would land it in the middle of the lane rather than
+        somewhere a person would look. Same-lane calls skip the re-rank so
+        a redundant update doesn't reshuffle the board.
+        """
         now = datetime.now(timezone.utc).isoformat()
-        await self._write(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-            (status, now, task_id),
-        )
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return
+            if row[0] == status:
+                await self.db.execute(
+                    "UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id),
+                )
+                return
+            position = await self._lane_top_position(status)
+            await self.db.execute(
+                "UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?",
+                (status, position, now, task_id),
+            )
 
     async def update_task_tags(self, task_id: str, tags: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -209,6 +403,34 @@ class TaskStore:
             "UPDATE tasks SET tags = ?, updated_at = ? WHERE id = ?",
             (tags, now, task_id),
         )
+
+    async def count_tasks_by_status(self) -> dict[str, int]:
+        """Task counts keyed by status — one query for every board lane."""
+        async with self.db.execute(
+            "SELECT status, COUNT(*) FROM tasks GROUP BY status",
+        ) as cursor:
+            return {row[0]: row[1] async for row in cursor}
+
+    async def distinct_task_tags(self, include_done: bool = False) -> list[dict]:
+        """Every distinct tag with its task count, most-used first.
+
+        ``tags`` is a comma-separated TEXT column, so the split happens in
+        Python rather than in a recursive CTE: the table is small (hundreds
+        of rows), and the SQL version would be both slower to run and much
+        harder to read for no benefit at this scale.
+        """
+        where = "" if include_done else " WHERE status != 'done'"
+        counts: dict[str, int] = {}
+        async with self.db.execute(f"SELECT tags FROM tasks{where}") as cursor:
+            async for row in cursor:
+                for raw in (row[0] or "").split(","):
+                    tag = raw.strip().lower()
+                    if tag:
+                        counts[tag] = counts.get(tag, 0) + 1
+        return [
+            {"name": name, "count": count}
+            for name, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
 
     # ── FTS query building ───────────────────────────────────────────────
 
