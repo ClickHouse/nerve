@@ -35,17 +35,33 @@ import { X } from 'lucide-react';
  */
 const modalStack: string[] = [];
 
-/** Body scroll lock, refcounted so stacked dialogs don't unlock early. */
+/**
+ * Body scroll lock, refcounted so stacked dialogs don't unlock early.
+ *
+ * The count is deliberately its own thing rather than a read of
+ * `modalStack.length`. React runs effect cleanups in declaration order, so
+ * this cleanup fires while the dialog is still in the stack — reading the
+ * stack here would see a length of 1 on the last dialog out and never
+ * restore scrolling at all.
+ */
+let scrollLockCount = 0;
+let scrollLockPrevious = '';
+
 function useScrollLock(active: boolean) {
   useEffect(() => {
     if (!active) return;
-    const { body } = document;
-    const previous = body.style.overflow;
-    body.style.overflow = 'hidden';
+    if (scrollLockCount === 0) {
+      scrollLockPrevious = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+    }
+    scrollLockCount += 1;
     return () => {
+      scrollLockCount -= 1;
       // Only the last dialog out restores the original value — an inner
       // dialog closing must not re-enable scrolling under an outer one.
-      if (modalStack.length === 0) body.style.overflow = previous;
+      if (scrollLockCount === 0) {
+        document.body.style.overflow = scrollLockPrevious;
+      }
     };
   }, [active]);
 }
