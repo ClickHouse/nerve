@@ -42,6 +42,8 @@ beforeEach(() => {
     ],
     selectedTask: null,
     boardError: null,
+    viewMode: 'board',
+    searchQuery: '',
   });
 });
 
@@ -211,5 +213,67 @@ describe('handleTaskEvent', () => {
     // The broadcast carries the row, not the file — merging must not blank
     // the markdown the detail view already fetched.
     expect(sel.content).toBe('# loaded markdown');
+  });
+});
+
+describe('setSearch', () => {
+  it('refreshes the board when the board is on screen', async () => {
+    // The bug this pins: setSearch called loadTasks(), which only fills
+    // tasks[] — the list's state. The board renders from lanes[], so
+    // typing in the search box filtered an array nothing was reading.
+    useTaskStore.setState({ viewMode: 'board' });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({
+      statuses: [], lanes: [],
+    });
+
+    useTaskStore.getState().setSearch('encoder');
+
+    await vi.waitFor(() => expect(api.getTaskBoard).toHaveBeenCalled());
+    expect(api.listTasks).not.toHaveBeenCalled();
+  });
+
+  it('sends the query to the board endpoint', async () => {
+    useTaskStore.setState({ viewMode: 'board' });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({
+      statuses: [], lanes: [],
+    });
+
+    useTaskStore.getState().setSearch('  encoder  ');
+
+    await vi.waitFor(() =>
+      expect(api.getTaskBoard).toHaveBeenCalledWith(
+        expect.objectContaining({ q: 'encoder' }),
+      ),
+    );
+  });
+
+  it('omits the query entirely once search is cleared', async () => {
+    useTaskStore.setState({ viewMode: 'board', searchQuery: 'encoder' });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({
+      statuses: [], lanes: [],
+    });
+
+    useTaskStore.getState().setSearch('');
+
+    // undefined, not '' — an empty q would make the server run a search
+    // that matches nothing instead of listing the lane.
+    await vi.waitFor(() =>
+      expect(api.getTaskBoard).toHaveBeenCalledWith(
+        expect.objectContaining({ q: undefined }),
+      ),
+    );
+  });
+
+  it('still refreshes the list in list view', async () => {
+    useTaskStore.setState({ viewMode: 'list' });
+    // A non-empty query routes through searchTasks, not listTasks.
+    vi.mocked(api.searchTasks).mockResolvedValue({
+      tasks: [], total: 0, limit: 0, offset: 0,
+    });
+
+    useTaskStore.getState().setSearch('encoder');
+
+    await vi.waitFor(() => expect(api.searchTasks).toHaveBeenCalled());
+    expect(api.getTaskBoard).not.toHaveBeenCalled();
   });
 });

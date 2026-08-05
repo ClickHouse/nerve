@@ -132,6 +132,85 @@ class TestTaskBoardRoutes:
         tags = setup.client.get("/api/tasks/tags").json()
         assert "tags" in tags, "GET /api/tasks/tags resolved to the detail route"
 
+    # ── Board search ─────────────────────────────────────────────────────
+
+    async def test_board_search_filters_every_lane(self, setup):
+        await self._create(setup, "Fix the widget encoder")
+        await self._create(setup, "Unrelated chore")
+
+        body = setup.client.get("/api/tasks/board?q=encoder").json()
+        titles = [t["title"] for lane in body["lanes"] for t in lane["tasks"]]
+
+        assert titles == ["Fix the widget encoder"]
+
+    async def test_board_search_reports_matching_totals(self, setup):
+        await self._create(setup, "Fix the widget encoder")
+        await self._create(setup, "Unrelated chore")
+
+        body = setup.client.get("/api/tasks/board?q=encoder").json()
+        pending = next(l for l in body["lanes"] if l["status"] == "pending")
+
+        # A stale total would offer "+N more" for tasks the search excluded.
+        assert pending["total"] == 1
+
+    async def test_board_search_spans_lanes(self, setup):
+        keep = await self._create(setup, "Encoder work in progress")
+        setup.client.patch(f"/api/tasks/{keep}", json={"status": "in_progress"})
+        await self._create(setup, "Encoder work pending")
+
+        body = setup.client.get("/api/tasks/board?q=encoder").json()
+        by_lane = {l["status"]: len(l["tasks"]) for l in body["lanes"]}
+
+        # Search narrows lanes; it does not collapse them into one list.
+        assert by_lane["pending"] == 1
+        assert by_lane["in_progress"] == 1
+
+    async def test_board_search_keeps_lane_order_not_relevance_order(self, setup):
+        first = await self._create(setup, "Encoder alpha")
+        second = await self._create(setup, "Encoder beta")
+        # Put them in an order relevance ranking would not produce.
+        setup.client.post(f"/api/tasks/{second}/move", json={"before_id": first})
+
+        body = setup.client.get("/api/tasks/board?q=encoder").json()
+        pending = next(l for l in body["lanes"] if l["status"] == "pending")
+
+        assert [t["id"] for t in pending["tasks"]] == [first, second]
+
+    async def test_board_search_finds_a_task_beyond_the_lane_page(self, setup):
+        """Why this is server-side rather than a client-side filter.
+
+        The board holds one page per lane, so filtering what the client
+        already has would silently miss anything deeper and report no
+        results for a task that exists.
+        """
+        for i in range(4):
+            await self._create(setup, f"Filler task {i}")
+        await self._create(setup, "Buried encoder task")
+
+        body = setup.client.get("/api/tasks/board?limit=2&q=encoder").json()
+        titles = [t["title"] for lane in body["lanes"] for t in lane["tasks"]]
+
+        assert titles == ["Buried encoder task"]
+
+    async def test_board_search_with_no_matches_returns_empty_lanes(self, setup):
+        await self._create(setup, "Something else entirely")
+
+        body = setup.client.get("/api/tasks/board?q=nonexistentterm").json()
+
+        # Lanes still present, just empty — the client needs the columns to
+        # render its "no matches" state in the right shape.
+        assert body["lanes"]
+        assert all(len(l["tasks"]) == 0 for l in body["lanes"])
+
+    async def test_board_search_combines_with_a_tag_filter(self, setup):
+        await self._create(setup, "Encoder backend work", tags="backend")
+        await self._create(setup, "Encoder frontend work", tags="frontend")
+
+        body = setup.client.get("/api/tasks/board?q=encoder&tag=backend").json()
+        titles = [t["title"] for lane in body["lanes"] for t in lane["tasks"]]
+
+        assert titles == ["Encoder backend work"]
+
     # ── Tag facets ───────────────────────────────────────────────────────
 
     async def test_tags_endpoint_counts_and_ranks(self, setup):

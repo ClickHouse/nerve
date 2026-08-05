@@ -130,6 +130,7 @@ async def search_tasks(q: str, status: str = "", user: dict = Depends(require_au
 async def task_board(
     limit: int = _BOARD_LANE_LIMIT,
     tag: str = "",
+    q: str = "",
     user: dict = Depends(require_auth),
 ):
     """Every lane in one round trip: statuses + their ordered tasks.
@@ -139,15 +140,25 @@ async def task_board(
     keeps the lanes consistent with each other (a task that moves mid-load
     can't appear in two lanes or neither) and keeps the client from having
     to know the status list before it can start fetching.
+
+    ``q`` searches server-side, per lane. It has to happen here rather than
+    as a client-side filter over the loaded cards: a lane is paginated, so
+    filtering what the client holds would silently miss matches deeper in
+    the lane and report "no results" for tasks that exist. Hits keep their
+    lane order rather than FTS relevance order — the board is spatial, and
+    reordering cards under a search would move them away from where the
+    person looking already knows they are.
     """
     deps = get_deps()
     limit = max(1, min(limit, 200))
     tag_filter = tag.strip().lower() or None
 
+    query = q.strip()
+
     statuses = await deps.db.list_task_statuses()
-    # One GROUP BY covers every lane's total; only a tag filter (which the
-    # grouped count can't express) needs the per-lane fallback.
-    counts = {} if tag_filter else await deps.db.count_tasks_by_status()
+    # One GROUP BY covers every lane's total; a tag filter (which the grouped
+    # count can't express) or a search needs the per-lane path instead.
+    counts = {} if (tag_filter or query) else await deps.db.count_tasks_by_status()
 
     lanes = []
     for status_def in statuses:
@@ -155,14 +166,24 @@ async def task_board(
         lane_limit = (
             min(limit, _BOARD_DONE_LANE_LIMIT) if name == TERMINAL_STATUS else limit
         )
-        tasks = await deps.db.list_tasks(
-            status=name, tag=tag_filter, sort="position", limit=lane_limit,
-        )
-        total = (
-            await deps.db.count_tasks(status=name, tag=tag_filter)
-            if tag_filter
-            else counts.get(name, 0)
-        )
+        if query:
+            tasks = await deps.db.search_tasks(
+                query=query, status=name, tag=tag_filter, limit=lane_limit,
+            )
+            # search_tasks ranks by relevance; the board wants lane order.
+            tasks.sort(key=lambda t: (t.get("position") or 0.0, t["id"]))
+            # No count query for a search: the lane holds every hit unless it
+            # hit the cap, in which case "+N more" would be a guess anyway.
+            total = len(tasks)
+        else:
+            tasks = await deps.db.list_tasks(
+                status=name, tag=tag_filter, sort="position", limit=lane_limit,
+            )
+            total = (
+                await deps.db.count_tasks(status=name, tag=tag_filter)
+                if tag_filter
+                else counts.get(name, 0)
+            )
         lanes.append({"status": name, "total": total, "tasks": tasks})
 
     return {"statuses": statuses, "lanes": lanes}

@@ -367,9 +367,10 @@ export const api = {
     );
   },
   /** Every board lane in one round trip. */
-  getTaskBoard: (params?: { tag?: string; limit?: number }) => {
+  getTaskBoard: (params?: { tag?: string; limit?: number; q?: string }) => {
     const qs = new URLSearchParams();
     if (params?.tag) qs.set('tag', params.tag);
+    if (params?.q) qs.set('q', params.q);
     if (params?.limit !== undefined) qs.set('limit', String(params.limit));
     const q = qs.toString();
     return request<{

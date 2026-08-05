@@ -44,6 +44,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   const boardError = useTaskStore((s) => s.boardError);
   const moveTask = useTaskStore((s) => s.moveTask);
   const setShowCreateDialog = useTaskStore((s) => s.setShowCreateDialog);
+  const searchQuery = useTaskStore((s) => s.searchQuery);
   const statuses = useTaskStatusStore((s) => s.statuses);
 
   const [activeTask, setActiveTask] = useState<Task | null>(null);
@@ -99,6 +100,17 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
 
   if (lanes.length === 0) {
     return <div className="text-text-faint text-center py-10">No statuses configured.</div>;
+  }
+
+  // Every lane empty under an active search means no matches — say that
+  // once, rather than repeating "No tasks" in each column as if the board
+  // itself were empty.
+  if (searchQuery.trim() && lanes.every((lane) => lane.tasks.length === 0)) {
+    return (
+      <div className="text-text-faint text-center py-10 text-[13px]">
+        No tasks matching &ldquo;{searchQuery.trim()}&rdquo;
+      </div>
+    );
   }
 
   return (

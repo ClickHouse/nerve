@@ -190,8 +190,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // explaining what just went wrong before it could be read.
     if (!quiet) set({ boardLoading: true, boardError: null });
     try {
-      const { tagFilter } = get();
-      const { lanes } = await api.getTaskBoard({ tag: tagFilter || undefined });
+      const { tagFilter, searchQuery } = get();
+      const { lanes } = await api.getTaskBoard({
+        tag: tagFilter || undefined,
+        q: searchQuery.trim() || undefined,
+      });
       set({ lanes, boardLoading: false });
     } catch (e) {
       console.error('Failed to load board:', e);
@@ -325,7 +328,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
 
   setSearch: (q: string) => {
     set({ searchQuery: q, page: 1 });
-    get().loadTasks();
+    // Board and list read different state, so a search has to refresh
+    // whichever is on screen — the list's tasks[] and the board's lanes[]
+    // are populated by different calls. Quiet on the board: the input is
+    // debounced, and blanking the lanes on each keystroke reads as a
+    // flicker rather than as progress.
+    if (get().viewMode === 'board') void get().loadBoard({ quiet: true });
+    else get().loadTasks();
   },
 
   setSort: (s: TaskSort) => {
