@@ -204,11 +204,17 @@ async def create_task(req: TaskCreateRequest, user: dict = Depends(require_auth)
         # The duplicate guard is a refusal, not a success — say so with a
         # status code instead of a 200 carrying an apology. The body keeps
         # the near-matches so the client can offer "create anyway".
+        #
+        # An unknown status is the other way this refuses, and it is a bad
+        # field rather than a collision: offering "create anyway" cannot fix
+        # it. Give it the 422 that /move already returns for the same
+        # mistake, so a client can tell the two apart by status code.
+        reason = outcome.get("reason", "refused")
         raise HTTPException(
-            status_code=409,
+            status_code=422 if reason == "invalid_status" else 409,
             detail={
                 "message": message,
-                "reason": outcome.get("reason", "refused"),
+                "reason": reason,
                 "duplicates": outcome.get("duplicates", []),
             },
         )

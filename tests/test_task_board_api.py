@@ -269,6 +269,26 @@ class TestTaskBoardRoutes:
 
         assert resp.status_code == 200
 
+    async def test_create_rejects_an_unknown_status_as_422(self, setup):
+        """A bad field is not a collision, and must not answer like one.
+
+        Both refusals arrive as ``created: false``, so a client that only
+        reads the status code would be told to offer "create anyway" for a
+        status that does not exist — a retry that cannot succeed. ``/move``
+        already answers 422 for the same mistake; this keeps the two routes
+        saying the same thing.
+        """
+        resp = setup.client.post("/api/tasks", json={
+            "title": "Task in a status that does not exist",
+            "content": "details",
+            "status": "nope",
+        })
+
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "invalid_status"
+        assert "nope" in detail["message"]
+
     # ── Patch ────────────────────────────────────────────────────────────
 
     async def test_patch_returns_the_full_row(self, setup):

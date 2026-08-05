@@ -87,7 +87,9 @@ The inverse matters because the disagreement is silent rather than loud.
 `reindex()` treats a file under `done/` as terminal by definition, so a row
 pointing there with an active status is an orphan it force-resets back to
 `done` — a status change that appeared to work would quietly undo itself the
-next time anything reindexed.
+next time anything reindexed. A *missing* file is worse: `reindex()` only
+walks files that exist, so it never sees that row to repair it. Hence the
+reopen refuses outright when the file is already gone.
 
 ### Ordering (`position`)
 

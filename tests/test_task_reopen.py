@@ -180,6 +180,28 @@ class TestReopenGuardOrdering:
 
         assert (await db.get_task(task_id))["status"] == "done"
 
+    async def test_a_missing_file_is_refused_before_the_status_flip(
+        self, ctx, workspace, db,
+    ):
+        """No file to move means there is no move to make.
+
+        Flipping anyway strands the row in exactly the shape this module
+        exists to prevent — an active status whose ``file_path`` still
+        points into ``done/`` — and this is the one way of reaching it that
+        ``reindex()`` cannot repair, because it only walks files that exist.
+        """
+        task_id = await _completed_task(ctx)
+        (workspace / "memory" / "tasks" / "done" / f"{task_id}.md").unlink()
+
+        result = await task_reopen_handler(
+            ctx, {"task_id": task_id, "status": "in_progress"},
+        )
+
+        assert result.is_error
+        row = await db.get_task(task_id)
+        assert row["status"] == "done"
+        assert row["file_path"] == f"memory/tasks/done/{task_id}.md"
+
 
 @pytest.mark.asyncio
 class TestTaskUpdateRoutesToReopen:

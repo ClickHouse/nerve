@@ -190,12 +190,15 @@ Response: { "tags": [{ "name": "backend", "count": 7 }] }
 
 #### `POST /api/tasks`
 Create a task. Returns the created row; **409** if the duplicate guard refuses
-(retry with `confirm_duplicate: true` to override).
+(retry with `confirm_duplicate: true` to override), **422** if `status` names a
+status that does not exist — a retry cannot fix that one, so it is kept
+distinct from the collision.
 
 ```json
 Request:  { "title": "Fix bug", "content": "Details...", "deadline": "2026-03-01", "tags": "backend,urgent" }
 Response: { "task": { "id": "2026-03-01-fix-bug", ... }, "message": "Task created: ..." }
 409:      { "detail": { "reason": "duplicate", "duplicates": [ ... ], "message": "..." } }
+422:      { "detail": { "reason": "invalid_status", "duplicates": [], "message": "..." } }
 ```
 
 #### `GET /api/tasks/{id}`
