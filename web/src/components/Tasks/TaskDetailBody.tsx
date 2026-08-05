@@ -82,6 +82,7 @@ export function TaskDetailBody({ task }: { task: Task }) {
             onClick={() => setShowHistory((v) => !v)}
             aria-pressed={showHistory}
             title="Status history"
+            aria-label="Status history"
             className={`flex items-center gap-1 px-2 py-1 rounded-md cursor-pointer transition-colors
               ${showHistory ? 'text-accent' : 'text-text-dim hover:text-text-muted'}`}
           >

@@ -80,6 +80,23 @@ class TestRecording:
         await _add(db, "t1")
         assert (await db.list_task_events("t1"))[0]["actor"] == "system"
 
+    async def test_a_real_creation_is_told_apart_by_actor_not_from_status(
+        self, db: Database,
+    ):
+        """The one thing separating a real origin from a seeded one.
+
+        v044 backfills an origin row per pre-existing task with
+        ``actor='backfill'``, and both that row and a genuine creation carry
+        a NULL ``from_status`` — so anything reading NULL as "synthesized"
+        is wrong. docs/tasks.md documents ``backfill`` as the marker; this
+        pins the half of that contract the code owns.
+        """
+        await _add(db, "t1")
+
+        origin = (await db.list_task_events("t1"))[0]
+        assert origin["from_status"] is None
+        assert origin["actor"] == "system"
+
     async def test_history_is_ordered_oldest_first(self, db: Database):
         await _add(db, "t1")
         for status in ("in_progress", "deferred", "in_progress", "done"):

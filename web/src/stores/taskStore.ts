@@ -243,6 +243,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // Snapshot before the optimistic write so a failure can restore the
     // exact prior order rather than approximating it.
     const snapshot = get().lanes;
+    const priorStatus = snapshot.find((l) => l.tasks.some((t) => t.id === taskId))?.status;
     get().applyLocalMove(taskId, intent);
 
     try {
@@ -259,6 +260,16 @@ export const useTaskStore = create<TaskState>((set, get) => ({
           ...lane,
           tasks: lane.tasks.map((t) => (t.id === task.id ? { ...t, ...task } : t)),
         })),
+        // The server recorded a transition, so this card's clock restarted.
+        // Without resetting it the aging badge keeps counting from the lane
+        // the card has just left, which reads as "stalled" on the one card
+        // the user is actively working — and nothing polls the board, so it
+        // would stay wrong until the next reload. A reorder inside a lane
+        // records no transition, so it must not reset. `updated_at` is the
+        // server's own stamp, written in the same breath as the event.
+        statusSince: task.status === priorStatus
+          ? get().statusSince
+          : { ...get().statusSince, [task.id]: task.updated_at },
         // A move that lands clears any stale failure banner.
         boardError: null,
       });
@@ -330,6 +341,14 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     // Insert by rank so a card from elsewhere lands where the server would
     // have put it, rather than at whichever end is convenient.
     set({
+      // Same reasoning as moveTask: a card we watched change lanes entered
+      // its new status now, and leaving the old entry time in place would
+      // age it from a lane it no longer sits in. A card the board has never
+      // seen gets no entry — absent keeps the indicator silent, which beats
+      // inventing a time we don't have.
+      ...(currentLane
+        ? { statusSince: { ...get().statusSince, [task.id]: task.updated_at } }
+        : {}),
       lanes: pruned.map((lane) => {
         if (lane.status !== task.status) return lane;
         const tasks = [...lane.tasks];

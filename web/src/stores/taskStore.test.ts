@@ -45,6 +45,7 @@ beforeEach(() => {
     viewMode: 'board',
     searchQuery: '',
     tagFilter: '',
+    statusSince: {},
   });
 });
 
@@ -109,6 +110,37 @@ describe('moveTask', () => {
     // anchors from a position that never existed.
     expect(moved.position).toBe(512);
     expect(moved.updated_at).toBe('2026-08-05T09:00:00Z');
+  });
+
+  it('restarts the aging clock when the card changes lane', async () => {
+    // Otherwise the badge keeps counting from the lane the card just left,
+    // so the card you are actively working reads as the most stalled one on
+    // the board — and nothing polls, so it stays wrong until a reload.
+    useTaskStore.setState({ statusSince: { a: '2026-07-28T00:00:00Z' } });
+    vi.mocked(api.moveTask).mockResolvedValue({
+      task: { ...task('a', 'in_progress', 512), updated_at: '2026-08-05T09:00:00Z' },
+    });
+
+    await useTaskStore.getState().moveTask('a', {
+      status: 'in_progress', beforeId: null, afterId: null,
+    });
+
+    expect(useTaskStore.getState().statusSince.a).toBe('2026-08-05T09:00:00Z');
+  });
+
+  it('leaves the aging clock alone on a reorder within a lane', async () => {
+    // A reorder records no transition server-side, so resetting here would
+    // let anyone clear an aging badge by nudging the card.
+    useTaskStore.setState({ statusSince: { c: '2026-07-28T00:00:00Z' } });
+    vi.mocked(api.moveTask).mockResolvedValue({
+      task: { ...task('c', 'pending', 512), updated_at: '2026-08-05T09:00:00Z' },
+    });
+
+    await useTaskStore.getState().moveTask('c', {
+      status: 'pending', beforeId: null, afterId: 'a',
+    });
+
+    expect(useTaskStore.getState().statusSince.c).toBe('2026-07-28T00:00:00Z');
   });
 
   it('rolls back to the exact prior order when the request fails', async () => {
@@ -176,6 +208,24 @@ describe('handleTaskEvent', () => {
     expect(laneTotal('in_progress')).toBe(2);
   });
 
+  it('restarts the aging clock for a card it watched change lane', () => {
+    useTaskStore.setState({ statusSince: { a: '2026-07-28T00:00:00Z' } });
+
+    useTaskStore.getState().handleTaskEvent({
+      ...task('a', 'in_progress', 2048), updated_at: '2026-08-05T09:00:00Z',
+    });
+
+    expect(useTaskStore.getState().statusSince.a).toBe('2026-08-05T09:00:00Z');
+  });
+
+  it('invents no entry time for a card it has never seen', () => {
+    // An absent entry renders no badge, which is the right answer when we
+    // genuinely don't know how long the card has been where it is.
+    useTaskStore.getState().handleTaskEvent(task('new', 'pending', 0));
+
+    expect(useTaskStore.getState().statusSince.new).toBeUndefined();
+  });
+
   it('inserts a task the board has never seen', () => {
     useTaskStore.getState().handleTaskEvent(task('new', 'pending', 0));
 
@@ -195,7 +245,9 @@ describe('handleTaskEvent', () => {
         { status: 'in_progress', total: 1, tasks: [task('x', 'in_progress', 1024)] },
       ],
     });
-    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({
+      statuses: [], lanes: [], status_since: {},
+    });
 
     useTaskStore.getState().handleTaskEvent(task('deep', 'pending', 9999));
 
@@ -209,7 +261,9 @@ describe('handleTaskEvent', () => {
     // from them may simply not match. Inserting it puts a card on the board
     // that contradicts the filter the user set.
     useTaskStore.setState({ tagFilter: 'urgent' });
-    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({
+      statuses: [], lanes: [], status_since: {},
+    });
 
     useTaskStore.getState().handleTaskEvent(task('chore', 'pending', 0));
 
@@ -222,7 +276,9 @@ describe('handleTaskEvent', () => {
     // search the server sets total to the match count, so the lane never
     // looks truncated.
     useTaskStore.setState({ searchQuery: 'encoder' });
-    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({
+      statuses: [], lanes: [], status_since: {},
+    });
 
     useTaskStore.getState().handleTaskEvent(task('unrelated', 'pending', 0));
 

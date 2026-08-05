@@ -132,7 +132,10 @@ reindex *does* change a status, resetting an orphaned row to match its
 directory, is a real correction and gets a row.
 
 `actor` is the session id for agent-driven changes, `web` for the HTTP API,
-`system` otherwise.
+`backfill` on the origin rows v044 seeded for tasks that predate the table,
+and `system` otherwise. `backfill` is load-bearing rather than cosmetic: a
+real creation also records a NULL `from_status`, so the actor is the only
+thing distinguishing a synthesized origin from one that actually happened.
 
 This powers the aging indicator on board cards and the timeline in the task
 detail view. Tasks whose last transition predates v044 report no entry time

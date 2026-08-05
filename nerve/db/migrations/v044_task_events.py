@@ -15,8 +15,11 @@ Rows are append-only. ``from_status`` is NULL for the row recording a
 task's creation, so a task's first event is its birth rather than an
 implicit gap before the first transition.
 
-Timestamps are TEXT written Python-side with fixed-width UTC ISO strings,
-matching every other table here — lexicographic order == chronological.
+Timestamps are TEXT written Python-side as UTC ISO strings, matching every
+other table here. They are not fixed width — ``isoformat()`` drops the
+fractional part on an exact second — but lexicographic order is still
+chronological, because the only characters that can follow the seconds
+field are ``+`` (0x2B) and ``.`` (0x2E), and both sort below every digit.
 """
 
 from __future__ import annotations
@@ -53,8 +56,8 @@ async def up(db: aiosqlite.Connection) -> None:
     # Seed one event per existing task so history has a floor rather than
     # starting mid-air. created_at (not updated_at) is the honest stamp:
     # we know when the task appeared, not when it reached its current
-    # status. from_status NULL marks these as synthesized origins, so an
-    # aging calculation can tell "created here" from "moved here".
+    # status. The `backfill` actor is what marks these as synthesized — not
+    # the NULL from_status, which a genuine creation records too.
     await db.execute(
         """
         INSERT INTO task_events (task_id, from_status, to_status, actor, created_at)
