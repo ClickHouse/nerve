@@ -22,8 +22,13 @@ export function TaskDetailBody({ task }: { task: Task }) {
   const [localContent, setLocalContent] = useState('');
   const [dirty, setDirty] = useState(false);
 
-  // Adopt the loaded markdown, but never clobber unsaved edits — a
-  // task_updated broadcast can land mid-typing.
+  // Adopt the loaded markdown, but never clobber unsaved edits.
+  //
+  // Defensive rather than a fix for something reachable today: the only
+  // writers of `content` are the initial fetch and the user's own save,
+  // because a task_updated broadcast carries the `tasks` row and that table
+  // has no content column. The guard is here so that stops being a thing
+  // anyone has to know before adding one.
   useEffect(() => {
     if (task.content != null && !dirty) {
       setLocalContent(task.content);

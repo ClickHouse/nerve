@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
+import { modalStack } from './modalStack';
 
 /**
  * The app's one dialog primitive.
@@ -28,12 +29,6 @@ import { X } from 'lucide-react';
  * the user left it, or keyboard navigation restarts from the top of the
  * document.
  */
-
-/**
- * Open dialogs, oldest first. Module-level rather than context so a dialog
- * rendered anywhere in the tree participates without a provider.
- */
-const modalStack: string[] = [];
 
 /**
  * Body scroll lock, refcounted so stacked dialogs don't unlock early.

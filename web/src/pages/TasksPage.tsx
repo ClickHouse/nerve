@@ -10,6 +10,7 @@ import { TaskStatusManager } from '../components/Tasks/TaskStatusManager';
 import { TaskBoard } from '../components/Tasks/Board/TaskBoard';
 import { BoardFilterBar } from '../components/Tasks/Board/BoardFilterBar';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
+import { isModalOpen } from '../components/ui/modalStack';
 import type { ShortcutDef } from '../utils/keyboard';
 
 const SORT_OPTIONS: { value: TaskSort; label: string }[] = [
@@ -78,6 +79,13 @@ export function TasksPage() {
     navigate(`/tasks/${task.id}`, { state: { background: location } });
   }, [navigate, location]);
 
+  // A dialog on top owns the keyboard. This page stays mounted behind one —
+  // always behind the task modal, which is the whole point of the background
+  // location, and behind every other dialog too. Ungated, `n` opens a second
+  // dialog over the first and `/` moves focus out of an aria-modal dialog
+  // into a search box hidden behind the backdrop.
+  const noDialogOpen = useCallback(() => !isModalOpen(), []);
+
   // Page-scoped, like ChatPage's — they only bind while /tasks is mounted.
   // Card-level navigation is dnd-kit's (Tab to a card, Space to pick up,
   // arrows to move), so these cover only what the page itself owns.
@@ -87,6 +95,7 @@ export function TasksPage() {
       combo: { key: 'b' },
       description: 'Board view',
       section: 'tasks',
+      when: noDialogOpen,
       action: () => setViewMode('board'),
     },
     {
@@ -94,6 +103,7 @@ export function TasksPage() {
       combo: { key: 'l' },
       description: 'List view',
       section: 'tasks',
+      when: noDialogOpen,
       action: () => setViewMode('list'),
     },
     {
@@ -101,6 +111,7 @@ export function TasksPage() {
       combo: { key: 'n' },
       description: 'New task',
       section: 'tasks',
+      when: noDialogOpen,
       action: () => setShowCreateDialog(true),
     },
     {
@@ -108,9 +119,10 @@ export function TasksPage() {
       combo: { key: '/' },
       description: 'Focus task search',
       section: 'tasks',
+      when: noDialogOpen,
       action: () => searchRef.current?.focus(),
     },
-  ], [setViewMode, setShowCreateDialog]);
+  ], [setViewMode, setShowCreateDialog, noDialogOpen]);
 
   useKeyboardShortcuts(shortcuts);
 
