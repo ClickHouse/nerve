@@ -75,13 +75,16 @@ const FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-export type ModalSize = 'sm' | 'md' | 'lg' | 'xl';
+export type ModalSize = 'sm' | 'md' | 'lg' | 'xl' | 'wide';
 
 const SIZES: Record<ModalSize, string> = {
   sm: 'w-[360px] max-w-[90vw]',
   md: 'w-[480px] max-w-[90vw]',
   lg: 'w-[520px] max-w-[90vw]',
   xl: 'w-[620px] max-w-[92vw]',
+  // For dialogs holding a document rather than a form — a markdown editor
+  // at 620px wraps prose into a column too narrow to read or edit.
+  wide: 'w-[min(1100px,94vw)]',
 };
 
 export interface ModalProps {

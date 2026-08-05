@@ -113,7 +113,7 @@ export function TaskDetailBody({ task }: { task: Task }) {
           placeholder="Task content..."
         />
       ) : (
-        <div className="flex-1 min-h-0 overflow-y-auto p-5">
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
           {localContent
             ? <MarkdownContent content={localContent} />
             : <span className="text-text-faint italic">No content</span>}

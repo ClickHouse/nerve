@@ -59,10 +59,11 @@ export function TaskDetailModal() {
           )}
         </span>
       }
-      size="xl"
+      // The task body is a document, not a form — it needs room to read.
+      size="wide"
       // Markdown editing behind a backdrop click is too much to lose.
       closeOnBackdrop={false}
-      className="h-[80vh]"
+      className="h-[85vh] max-h-[85vh]"
     >
       {detailLoading && (
         <div className="p-8 text-center text-text-faint text-[13px]">Loading...</div>
