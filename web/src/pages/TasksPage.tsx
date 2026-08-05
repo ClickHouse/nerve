@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { ChevronLeft, ChevronRight, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
-import { useTaskStore, TASKS_PAGE_SIZE, type TaskSort } from '../stores/taskStore';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { ChevronLeft, ChevronRight, Columns3, List, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
+import { useTaskStore, TASKS_PAGE_SIZE, type TaskSort, type TaskViewMode } from '../stores/taskStore';
 import { useTaskStatusStore } from '../stores/taskStatusStore';
 import { TaskFilters } from '../components/Tasks/TaskFilters';
 import { TaskCard } from '../components/Tasks/TaskCard';
 import { TaskCreateDialog } from '../components/Tasks/TaskCreateDialog';
 import { TaskStatusManager } from '../components/Tasks/TaskStatusManager';
+import { TaskBoard } from '../components/Tasks/Board/TaskBoard';
+import { BoardFilterBar } from '../components/Tasks/Board/BoardFilterBar';
 
 const SORT_OPTIONS: { value: TaskSort; label: string }[] = [
   { value: 'deadline', label: 'Deadline' },
@@ -13,20 +16,36 @@ const SORT_OPTIONS: { value: TaskSort; label: string }[] = [
   { value: 'created_at', label: 'Created' },
 ];
 
+const VIEW_OPTIONS: { value: TaskViewMode; label: string; Icon: typeof List }[] = [
+  { value: 'board', label: 'Board', Icon: Columns3 },
+  { value: 'list', label: 'List', Icon: List },
+];
+
 export function TasksPage() {
   const {
     tasks, filter, searchQuery, sort, page, total, loading, showCreateDialog,
-    loadTasks, setFilter, setSearch, setSort, setPage,
+    viewMode, loadTasks, loadBoard, loadTags, setViewMode,
+    setFilter, setSearch, setSort, setPage,
     updateStatus, createTask, setShowCreateDialog,
   } = useTaskStore();
 
   const loadStatuses = useTaskStatusStore((s) => s.load);
+  const navigate = useNavigate();
+  const location = useLocation();
 
   const [localQuery, setLocalQuery] = useState(searchQuery);
   const [showStatusManager, setShowStatusManager] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
-  useEffect(() => { loadTasks(); loadStatuses(); }, []);
+  const isBoard = viewMode === 'board';
+
+  useEffect(() => {
+    loadStatuses();
+    loadTags();
+    if (isBoard) loadBoard();
+    else loadTasks();
+    // Mount-only: view switches load through setViewMode.
+  }, []);
 
   const isSearching = searchQuery.trim().length > 0;
   const pageStart = total === 0 ? 0 : (page - 1) * TASKS_PAGE_SIZE + 1;
@@ -50,14 +69,40 @@ export function TasksPage() {
   // Cleanup debounce on unmount
   useEffect(() => () => clearTimeout(debounceRef.current), []);
 
-  return (
-    <div className="h-full flex flex-col">
-      <div className="border-b border-border-subtle px-6 py-3 flex items-center justify-between bg-bg shrink-0">
-        <div className="flex items-center gap-4">
-          <h1 className="text-lg font-semibold">Tasks</h1>
-          <TaskFilters active={filter} onChange={setFilter} />
+  // Open a task over the board: /tasks/:id renders as a modal when it's
+  // reached from here, and as the full page on a cold load or refresh.
+  const openTask = useCallback((task: { id: string }) => {
+    navigate(`/tasks/${task.id}`, { state: { background: location } });
+  }, [navigate, location]);
 
-          <div className="relative ml-2">
+  return (
+    <div className="h-full flex flex-col min-w-0">
+      <div className="border-b border-border-subtle px-4 py-3 flex items-center justify-between gap-4 bg-bg shrink-0">
+        <div className="flex items-center gap-3 min-w-0">
+          <h1 className="text-lg font-semibold shrink-0">Tasks</h1>
+
+          <div className="flex items-center bg-surface-raised border border-border-subtle rounded-lg p-0.5 shrink-0">
+            {VIEW_OPTIONS.map(({ value, label, Icon }) => (
+              <button
+                key={value}
+                onClick={() => setViewMode(value)}
+                aria-pressed={viewMode === value}
+                title={`${label} view`}
+                className={`flex items-center gap-1.5 px-2.5 py-1 text-[12px] rounded-md cursor-pointer transition-colors
+                  ${viewMode === value
+                    ? 'bg-surface text-text shadow-sm'
+                    : 'text-text-faint hover:text-text-secondary'}`}
+              >
+                <Icon size={13} /> {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Status pills are the list's filter; on the board every status
+              is already a lane, so they'd only hide columns. */}
+          {!isBoard && <TaskFilters active={filter} onChange={setFilter} />}
+
+          <div className="relative ml-2 shrink-0">
             <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
             <input
               type="text"
@@ -78,8 +123,8 @@ export function TasksPage() {
             )}
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {!isSearching && (
+        <div className="flex items-center gap-2 shrink-0">
+          {!isSearching && !isBoard && (
             <label className="flex items-center gap-1.5 text-[12px] text-text-faint">
               Sort by
               <select
@@ -109,6 +154,14 @@ export function TasksPage() {
         </div>
       </div>
 
+      {isBoard && <BoardFilterBar />}
+
+      {isBoard ? (
+        // The board owns its own scrolling: columns scroll vertically,
+        // the rail of columns scrolls horizontally. No page-level scroll,
+        // and no max-width — filling the viewport is the whole point.
+        <TaskBoard onOpenTask={openTask} />
+      ) : (
       <div className="flex-1 overflow-y-auto p-6">
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>
@@ -155,6 +208,7 @@ export function TasksPage() {
           </div>
         )}
       </div>
+      )}
 
       {showCreateDialog && (
         <TaskCreateDialog
