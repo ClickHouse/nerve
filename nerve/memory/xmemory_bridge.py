@@ -15,8 +15,13 @@ In Nerve, xmemory runs *next to* memU, never replacing it:
   query. The read mode is configurable (``xmemory.read_mode``): a synthesized
   natural-language answer by default (``single-answer``), or the structured
   ``raw-tables`` / ``xresponse`` payloads.
-* The memorization *sweep* (session-close, cron) stays memU-only — it
-  never goes through the ``memorize`` tool handler, so it's untouched.
+* The memorization *sweep* (session-close, cron) is memU-only by default.
+  With ``xmemory.index_conversations`` set, every message window the sweep
+  indexes into memU is also mirrored here as a **text-only** transcript
+  (:meth:`XmemoryBridge.memorize_conversation`): role + content only —
+  thinking and tool blocks/results never leave the box. Transcripts are
+  chunked and written with FAST extraction (they are high-volume; the
+  configured ``extraction_logic`` still governs the memorize tool).
 
 The bridge is inert unless ``config.xmemory.enabled`` (both an API token
 and an ``instance_id`` are set). Every xmemory call is wrapped so a slow
@@ -33,6 +38,11 @@ if TYPE_CHECKING:
     from nerve.config import XmemoryConfig
 
 logger = logging.getLogger(__name__)
+
+# Soft byte budget per transcript write job (headers may push a chunk a few
+# dozen bytes over). Sized so each xmemory extraction sees a coherent slice
+# of conversation (~16K tokens) while staying well under request-size caps.
+_TRANSCRIPT_CHUNK_BYTES = 64_000
 
 
 class XmemoryBridge:
@@ -127,6 +137,12 @@ class XmemoryBridge:
         """True when xmemory is configured, imported, and bound."""
         return self._available and self._instance is not None
 
+    @property
+    def indexes_conversations(self) -> bool:
+        """True when the bridge is available AND transcript mirroring is
+        opted in via ``xmemory.index_conversations``."""
+        return self.available and self._config.index_conversations
+
     # ------------------------------------------------------------------ #
     # Data ops
     # ------------------------------------------------------------------ #
@@ -170,6 +186,52 @@ class XmemoryBridge:
         except Exception as e:
             logger.warning("xmemory write_async failed: %s", e)
             return False
+
+    async def memorize_conversation(self, session_id: str, messages: list[dict]) -> int:
+        """Mirror a session-transcript window to xmemory as free-text writes.
+
+        Same text-only contract as the memU sweep: each message contributes
+        ``role`` + ``content`` (+ ``created_at`` when present) — ``thinking``
+        and ``blocks`` (tool calls/results, images) are never sent. Long
+        transcripts are split at message boundaries into
+        ~``_TRANSCRIPT_CHUNK_BYTES`` chunks, each enqueued via ``write_async``
+        with FAST extraction (transcripts are high-volume; the configured
+        ``extraction_logic`` still governs the memorize tool's writes).
+
+        Opt-in via ``xmemory.index_conversations`` and best-effort by design:
+        a failed chunk is logged, the remaining chunks are abandoned, and the
+        window is never retried for xmemory (the sweep watermark is memU's).
+        Returns the number of chunks successfully enqueued (0 when disabled,
+        empty, or on an immediate failure).
+        """
+        if not self.indexes_conversations or not messages:
+            return 0
+        chunks = _transcript_chunks(
+            session_id, messages, chunk_bytes=_TRANSCRIPT_CHUNK_BYTES,
+        )
+        if not chunks:
+            return 0
+        sent = 0
+        for chunk in chunks:
+            try:
+                await self._instance.write_async(
+                    chunk, extraction_logic=self._ExtractionLogic.FAST,
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(
+                    "xmemory transcript write failed for session %s "
+                    "(chunk %d/%d): %s — abandoning remaining chunks",
+                    session_id, sent + 1, len(chunks), e,
+                )
+                break
+        if sent:
+            logger.info(
+                "xmemory: enqueued transcript for session %s "
+                "(%d message(s), %d/%d chunk(s))",
+                session_id, len(messages), sent, len(chunks),
+            )
+        return sent
 
     async def recall_answer(self, query: str) -> str | None:
         """Query xmemory and return its read result serialized as JSON.
@@ -233,3 +295,73 @@ def _json_default(value: Any) -> Any:
     if hasattr(value, "__dict__"):
         return value.__dict__
     return str(value)
+
+
+def _transcript_lines(messages: list[dict]) -> list[str]:
+    """Flatten message rows into text-only transcript lines.
+
+    Mirrors the memU sweep's payload contract (see
+    ``MemUBridge.memorize_conversation``): only ``role`` + ``content``
+    (+ ``created_at`` when present) survive. ``thinking`` and ``blocks``
+    (tool calls/results, images) are deliberately dropped, and messages
+    with empty content are skipped.
+    """
+    lines: list[str] = []
+    for msg in messages:
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        role = msg.get("role") or "unknown"
+        created_at = msg.get("created_at")
+        prefix = f"[{created_at}] {role}" if created_at else str(role)
+        lines.append(f"{prefix}: {content}")
+    return lines
+
+
+def _transcript_chunks(
+    session_id: str,
+    messages: list[dict],
+    chunk_bytes: int = _TRANSCRIPT_CHUNK_BYTES,
+) -> list[str]:
+    """Split a transcript into write-sized chunks of ~``chunk_bytes`` each.
+
+    Splits at message boundaries so each extraction sees whole messages; a
+    single message larger than the budget is hard-split on byte boundaries
+    (multibyte characters straddling a cut are dropped, matching the recall
+    handler's clipping). Each chunk opens with a one-line header carrying
+    the session id and, for multi-chunk transcripts, its position — enough
+    context for xmemory's extraction to relate the parts.
+    """
+    lines = _transcript_lines(messages)
+    if not lines:
+        return []
+
+    # Message-boundary pieces, hard-splitting any single oversized line.
+    parts: list[str] = []
+    for line in lines:
+        data = line.encode("utf-8")
+        if len(data) <= chunk_bytes:
+            parts.append(line)
+        else:
+            parts.extend(
+                data[i : i + chunk_bytes].decode("utf-8", "ignore")
+                for i in range(0, len(data), chunk_bytes)
+            )
+
+    groups: list[list[str]] = [[]]
+    size = 0
+    for part in parts:
+        n = len(part.encode("utf-8")) + 1  # +1 for the joining newline
+        if size and size + n > chunk_bytes:
+            groups.append([])
+            size = 0
+        groups[-1].append(part)
+        size += n
+
+    total = len(groups)
+    chunks: list[str] = []
+    for i, group in enumerate(groups, start=1):
+        position = f", part {i}/{total}" if total > 1 else ""
+        header = f"Conversation transcript (session {session_id}{position}):\n"
+        chunks.append(header + "\n".join(group))
+    return chunks

@@ -2496,7 +2496,11 @@ class XmemoryConfig:
     Activated only when both ``api_key`` (the bearer token) and
     ``instance_id`` are set. When active, the ``memorize`` tool dual-writes
     to xmemory (async) and ``memory_recall`` appends xmemory's synthesized
-    answer to the memU results. The memorization sweep stays memU-only.
+    answer to the memU results. The memorization sweep stays memU-only
+    unless ``index_conversations`` is additionally set: then every message
+    window the sweep indexes into memU is also mirrored to xmemory as a
+    text-only transcript (role + content only — thinking and tool
+    blocks/results are never sent).
 
     Empty keys = no-op, zero overhead, no SDK calls. The instance and its
     schema are created out of band (by the operator) on xmemory's side.
@@ -2508,6 +2512,10 @@ class XmemoryConfig:
     extraction_logic: str = "deep"  # "deep" (default) or "fast"
     read_mode: str = "single-answer"  # "single-answer" | "raw-tables" | "xresponse"
     timeout: float = 60.0
+    # Opt-in: mirror the memorization sweep's session transcripts to xmemory.
+    # Off by default — full transcripts leave the machine only when the
+    # operator explicitly enables it.
+    index_conversations: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -2524,6 +2532,7 @@ class XmemoryConfig:
             extraction_logic=d.get("extraction_logic", "deep"),
             read_mode=d.get("read_mode", "single-answer"),
             timeout=d.get("timeout", 60.0),
+            index_conversations=d.get("index_conversations", False),
         )
 
 
