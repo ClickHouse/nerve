@@ -794,6 +794,7 @@ class AgentEngine:
                 await self._memory_bridge.memorize_conversation(
                     session_id, context_msgs,
                 )
+                self.schedule_xmemory_transcript(session_id, context_msgs)
                 logger.info(
                     "Indexed %d messages from session %s into memU",
                     len(context_msgs), session_id,
@@ -850,6 +851,37 @@ class AgentEngine:
 
         task.add_done_callback(_done)
 
+    def schedule_xmemory_transcript(
+        self, session_id: str, messages: list[dict],
+    ) -> None:
+        """Mirror a just-memorized message window to xmemory (fire-and-forget).
+
+        Inert unless ``xmemory.index_conversations`` is opted in. Runs as a
+        background task so a slow or failing xmemory never extends the global
+        memorize lock; the bridge isolates its own errors and sends text only
+        (role + content — never thinking or tool blocks/results). Best-effort
+        by design: the sweep watermark is memU's, so a window lost here (task
+        failure or shutdown cancellation) is not retried for xmemory.
+        """
+        bridge = self._xmemory_bridge
+        if bridge is None or not bridge.indexes_conversations or not messages:
+            return
+
+        task = asyncio.create_task(
+            bridge.memorize_conversation(session_id, messages),
+        )
+        self._memorize_bg_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._memorize_bg_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning(
+                    "xmemory transcript write failed for session %s: %s",
+                    session_id, t.exception(),
+                )
+
+        task.add_done_callback(_done)
+
     async def _memorize_incremental(self, session_id: str) -> int:
         """Index only messages newer than last_memorized_at into memU.
 
@@ -886,6 +918,7 @@ class AgentEngine:
             await self._memory_bridge.memorize_conversation(
                 session_id, new_msgs,
             )
+            self.schedule_xmemory_transcript(session_id, new_msgs)
 
             if latest_ts:
                 await self.db.update_session_fields(

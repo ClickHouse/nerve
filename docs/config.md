@@ -1152,16 +1152,17 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 When active:
 - The `memorize` tool **dual-writes**: memU (as always) plus an async `write_async` to xmemory. Failures on the xmemory side never fail the tool.
 - `memory_recall` appends xmemory's read result (serialized as JSON) to memU's N items, run concurrently so the dual lookup is one round-trip. Read behavior is controlled via `xmemory.read_mode` (defaults to `single-answer`).
-- The memorization **sweep** (session-close / cron) stays memU-only — it does not go through the `memorize` tool handler.
+- The memorization **sweep** (session-close / cron) stays memU-only by default — it does not go through the `memorize` tool handler. Opting in via `xmemory.index_conversations` mirrors each swept message window to xmemory as a text-only transcript (role + content only — no thinking, no tool blocks/results), chunked and written with fast extraction, fire-and-forget alongside the memU pass.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `xmemory.api_key` | string | *(empty)* | xmemory bearer token (invite-only). Secret → `config.local.yaml`. |
 | `xmemory.instance_id` | string | *(empty)* | The xmemory instance to bind. Both this and `api_key` are required to activate. |
 | `xmemory.api_url` | string | `https://api.xmemory.ai` | API base URL. |
-| `xmemory.extraction_logic` | string | `deep` | Write extraction mode: `deep` (accurate) or `fast` (high-volume). |
+| `xmemory.extraction_logic` | string | `deep` | Write extraction mode for `memorize`-tool facts: `deep` (accurate) or `fast` (high-volume). Sweep transcripts always use `fast`. |
 | `xmemory.read_mode` | string | `single-answer` | Read mode for recall, whose result is appended as JSON: `single-answer` (synthesized answer envelope), `raw-tables` (table columns + rows), or `xresponse` (objects + relations). |
 | `xmemory.timeout` | float | `60.0` | Per-request timeout in seconds. |
+| `xmemory.index_conversations` | bool | `false` | Mirror the memorization sweep's session transcripts (text only) to xmemory. Best-effort: a failed write is logged, never retried (the sweep watermark is memU's). Off by default — full transcripts leave the machine only when explicitly enabled. |
 
 ## Docker
 

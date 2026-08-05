@@ -381,6 +381,8 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
                                 context_msgs.append(msg)
                     if context_msgs:
                         await engine._memory_bridge.memorize_conversation(session_id, context_msgs)
+                        # Same window to xmemory (opt-in, fire-and-forget).
+                        engine.schedule_xmemory_transcript(session_id, context_msgs)
                 except Exception as e:
                     logger.warning("Background memorize for deleted session %s failed: %s", session_id, e)
             asyncio.create_task(_bg_memorize())
