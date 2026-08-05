@@ -25,6 +25,9 @@ const overCard = (id: string, title: string) =>
 const lane = (status: string) =>
   ({ id: `lane:${status}`, data: { current: { type: 'lane', status } } }) as unknown as Over;
 
+const column = (status: string) =>
+  ({ id: `col:${status}`, data: { current: { type: 'column', status } } }) as unknown as Active;
+
 describe('boardAnnouncements', () => {
   const dragged = card('2026-08-05-fix-the-encoder', 'Fix the encoder');
 
@@ -76,6 +79,30 @@ describe('boardAnnouncements', () => {
   it('falls back to the status name when it has no configured label', () => {
     expect(a.onDragEnd({ active: dragged, over: lane('triage') })).toBe(
       'Task Fix the encoder dropped on the triage lane.',
+    );
+  });
+});
+
+describe('boardAnnouncements for a column drag', () => {
+  // Columns and cards share one DndContext, so `active` is not always a
+  // task. Assuming it was announced "Picked up task col:pending."
+  const dragged = column('pending');
+
+  it('says a column was picked up, not a task called col:something', () => {
+    expect(a.onDragStart({ active: dragged })).toBe('Picked up the Pending column.');
+  });
+
+  it('describes both ends of a column-over-column drag', () => {
+    expect(a.onDragOver({ active: dragged, over: column('in_progress') as unknown as Over })).toBe(
+      'The Pending column is over the In Progress column.',
+    );
+  });
+
+  it('describes a column dropped onto a card it landed over', () => {
+    // Collision detection returns the nearest droppable of any kind, so a
+    // column drag routinely finishes with the cursor over a card.
+    expect(a.onDragEnd({ active: dragged, over: overCard('t9', 'Some card') })).toBe(
+      'The Pending column dropped on task Some card.',
     );
   });
 });
