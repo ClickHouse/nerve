@@ -162,12 +162,16 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   loadTasks: async () => {
     set({ loading: true });
     try {
-      const { filter, searchQuery, sort, page, tagFilter } = get();
+      // `tagFilter` is deliberately not read here. It is board state: the
+      // facet bar is the only thing that sets it and only the board renders
+      // it. Applying it to the list would filter a view with no chip to
+      // show for it and no control to clear it — and only while the search
+      // box is empty, since /tasks/search takes no tag.
+      const { filter, searchQuery, sort, page } = get();
       const result = searchQuery
         ? await api.searchTasks(searchQuery, filter || undefined)
         : await api.listTasks({
             status: filter || undefined,
-            tag: tagFilter || undefined,
             sort,
             limit: TASKS_PAGE_SIZE,
             offset: (page - 1) * TASKS_PAGE_SIZE,
@@ -301,6 +305,21 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     if (!target) {
       // A status this board doesn't know about yet (someone just created
       // one). A full reload is the only way to get its lane.
+      void get().loadBoard({ quiet: true });
+      return;
+    }
+
+    // The card is nowhere on the board. That means it is new, or it is
+    // already in this lane below the loaded page, or the active filters
+    // exclude it — and the three are indistinguishable from here. Inserting
+    // regardless would double-count a card the lane already has, or show one
+    // the filter was asked to hide. Only trust the insert when the lane is
+    // whole and unfiltered; otherwise ask the server, which knows.
+    const { tagFilter, searchQuery } = get();
+    if (
+      !currentLane &&
+      (tagFilter || searchQuery.trim() || target.tasks.length < target.total)
+    ) {
       void get().loadBoard({ quiet: true });
       return;
     }

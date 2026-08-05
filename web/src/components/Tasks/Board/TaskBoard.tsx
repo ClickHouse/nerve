@@ -14,6 +14,7 @@ import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
 import type { Task } from '../../../api/client';
 import { useTaskStatusStore } from '../../../stores/taskStatusStore';
 import { useTaskStore } from '../../../stores/taskStore';
+import { boardAnnouncements } from './announcements';
 import { BoardCardOverlay } from './BoardCard';
 import { isNoOpMove, resolveDropIntent } from './dropIntent';
 import { BoardColumn } from './BoardColumn';
@@ -60,6 +61,11 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   const statusByName = useMemo(
     () => new Map(statuses.map((s) => [s.name, s])),
     [statuses],
+  );
+
+  const announcements = useMemo(
+    () => boardAnnouncements((name) => statusByName.get(name)?.label ?? name),
+    [statusByName],
   );
 
   const handleToggleCollapse = useCallback((status: string) => {
@@ -126,16 +132,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={() => setActiveTask(null)}
-        accessibility={{
-          announcements: {
-            onDragStart: ({ active }) => `Picked up task ${active.id}.`,
-            onDragOver: ({ over }) =>
-              over ? `Task is over ${String(over.id).replace('lane:', 'the ')} lane.` : '',
-            onDragEnd: ({ over }) =>
-              over ? `Task dropped on ${over.id}.` : 'Task dropped, position unchanged.',
-            onDragCancel: () => 'Move cancelled.',
-          },
-        }}
+        accessibility={{ announcements }}
       >
         <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden px-4 pb-4">
           <div className="flex gap-3 h-full items-start min-w-min">

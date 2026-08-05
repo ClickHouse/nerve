@@ -44,6 +44,7 @@ beforeEach(() => {
     boardError: null,
     viewMode: 'board',
     searchQuery: '',
+    tagFilter: '',
   });
 });
 
@@ -182,6 +183,52 @@ describe('handleTaskEvent', () => {
     expect(laneTotal('pending')).toBe(4);
   });
 
+  it('reloads instead of inserting into a lane it has not fully loaded', () => {
+    // The lane holds 40 tasks and shows 3. An update for one of the other
+    // 37 looks identical to a brand-new task from here, and inserting it
+    // would count it twice — once in the page, once in the total that
+    // drives "+N more".
+    useTaskStore.setState({
+      lanes: [
+        { status: 'pending', total: 40, tasks: [task('a', 'pending', 1024)] },
+        { status: 'in_progress', total: 1, tasks: [task('x', 'in_progress', 1024)] },
+      ],
+    });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+
+    useTaskStore.getState().handleTaskEvent(task('deep', 'pending', 9999));
+
+    expect(api.getTaskBoard).toHaveBeenCalled();
+    expect(laneOrder('pending')).toEqual(['a']);
+    expect(laneTotal('pending')).toBe(40);
+  });
+
+  it('reloads instead of showing a card the tag filter excludes', () => {
+    // The lanes on screen are the filtered set, so a task that is missing
+    // from them may simply not match. Inserting it puts a card on the board
+    // that contradicts the filter the user set.
+    useTaskStore.setState({ tagFilter: 'urgent' });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+
+    useTaskStore.getState().handleTaskEvent(task('chore', 'pending', 0));
+
+    expect(api.getTaskBoard).toHaveBeenCalled();
+    expect(laneOrder('pending')).toEqual(['a', 'b', 'c']);
+  });
+
+  it('reloads instead of showing a card the search excludes', () => {
+    // Same reasoning as the tag filter, and it needs its own check: under a
+    // search the server sets total to the match count, so the lane never
+    // looks truncated.
+    useTaskStore.setState({ searchQuery: 'encoder' });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+
+    useTaskStore.getState().handleTaskEvent(task('unrelated', 'pending', 0));
+
+    expect(api.getTaskBoard).toHaveBeenCalled();
+    expect(laneOrder('pending')).toEqual(['a', 'b', 'c']);
+  });
+
   it('reloads when the status has no lane on this board', () => {
     vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
 
@@ -275,5 +322,25 @@ describe('setSearch', () => {
 
     await vi.waitFor(() => expect(api.searchTasks).toHaveBeenCalled());
     expect(api.getTaskBoard).not.toHaveBeenCalled();
+  });
+});
+
+describe('loadTasks', () => {
+  it('does not apply the board tag filter to the list', async () => {
+    // tagFilter belongs to the board: only the facet bar sets it and only
+    // the board renders it. Leaking it into the list silently hides rows in
+    // a view with nothing to show for the filter and no way to clear it —
+    // and only while the search box is empty, since /tasks/search takes no
+    // tag, so the result set would change on typing for no visible reason.
+    useTaskStore.setState({ viewMode: 'list', tagFilter: 'urgent' });
+    vi.mocked(api.listTasks).mockResolvedValue({
+      tasks: [], total: 0, limit: 0, offset: 0,
+    });
+
+    await useTaskStore.getState().loadTasks();
+
+    expect(api.listTasks).toHaveBeenCalledWith(
+      expect.not.objectContaining({ tag: expect.anything() }),
+    );
   });
 });
