@@ -432,6 +432,10 @@ export const api = {
     request<TaskStatusDef>('/task-statuses', { method: 'POST', body: JSON.stringify(data) }),
   updateTaskStatus: (name: string, data: { label?: string; color?: string; description?: string; sort_order?: number }) =>
     request<TaskStatusDef>(`/task-statuses/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  reorderTaskStatuses: (names: string[]) =>
+    request<{ statuses: TaskStatusDef[] }>('/task-statuses/reorder', {
+      method: 'POST', body: JSON.stringify({ names }),
+    }),
   deleteTaskStatus: (name: string) =>
     request<{ name: string; deleted: boolean }>(`/task-statuses/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 

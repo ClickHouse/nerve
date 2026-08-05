@@ -65,3 +65,52 @@ export function isNoOpMove(
   const currentAfter = lane.tasks[at + 1]?.id ?? null;
   return intent.beforeId === currentBefore && intent.afterId === currentAfter;
 }
+
+// ── Column ordering ──────────────────────────────────────────────────────
+
+const COLUMN_PREFIX = 'col:';
+
+/** Drag id for a column, namespaced so it can't collide with a task id. */
+export function columnDragId(status: string): string {
+  return `${COLUMN_PREFIX}${status}`;
+}
+
+export function isColumnDragId(id: string): boolean {
+  return id.startsWith(COLUMN_PREFIX);
+}
+
+/**
+ * The status a drop target belongs to, whichever kind of target it is.
+ *
+ * A column drag can finish over another column, over a lane body, or over
+ * a card — collision detection returns the nearest droppable of any kind,
+ * and all three mean "put it here". Resolving them all keeps the gesture
+ * forgiving instead of silently doing nothing when the cursor happens to
+ * be over a card.
+ */
+export function statusFromDropTarget(lanes: Lane[], overId: string): string | null {
+  if (isColumnDragId(overId)) return overId.slice(COLUMN_PREFIX.length);
+  if (overId.startsWith('lane:')) return overId.slice('lane:'.length);
+  const owning = lanes.find((l) => l.tasks.some((t) => t.id === overId));
+  return owning?.status ?? null;
+}
+
+/**
+ * Reorder `statuses` by moving `moved` to where `target` currently sits.
+ * Returns null when the move is a no-op or either end is unknown, so the
+ * caller can skip the request entirely.
+ */
+export function reorderStatuses(
+  statuses: string[],
+  moved: string,
+  target: string,
+): string[] | null {
+  if (moved === target) return null;
+  const from = statuses.indexOf(moved);
+  const to = statuses.indexOf(target);
+  if (from === -1 || to === -1) return null;
+  const next = [...statuses];
+  next.splice(from, 1);
+  next.splice(to, 0, moved);
+  return next;
+}

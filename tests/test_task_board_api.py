@@ -490,6 +490,37 @@ class TestTaskBoardRoutes:
         resp = setup.client.patch("/api/tasks/nope", json={"status": "pending"})
         assert resp.status_code == 404
 
+    # ── Column order ─────────────────────────────────────────────────────
+
+    async def test_reorder_sets_board_column_order(self, setup):
+        before = [l["status"] for l in setup.client.get("/api/tasks/board").json()["lanes"]]
+        target = list(reversed(before))
+
+        resp = setup.client.post("/api/task-statuses/reorder", json={"names": target})
+
+        assert resp.status_code == 200
+        assert [s["name"] for s in resp.json()["statuses"]] == target
+        # The board is what actually has to change.
+        after = [l["status"] for l in setup.client.get("/api/tasks/board").json()["lanes"]]
+        assert after == target
+
+    async def test_reorder_route_is_not_captured_as_a_status_name(self, setup):
+        """/reorder must stay declared above /task-statuses/{name}."""
+        resp = setup.client.post("/api/task-statuses/reorder", json={"names": []})
+        assert resp.status_code == 200
+        assert "statuses" in resp.json()
+
+    async def test_reorder_keeps_omitted_statuses(self, setup):
+        before = [l["status"] for l in setup.client.get("/api/tasks/board").json()["lanes"]]
+
+        resp = setup.client.post(
+            "/api/task-statuses/reorder", json={"names": [before[-1]]},
+        )
+
+        names = [s["name"] for s in resp.json()["statuses"]]
+        assert names[0] == before[-1]
+        assert set(names) == set(before), "a status left out of the request vanished"
+
     # ── List ─────────────────────────────────────────────────────────────
 
     async def test_list_accepts_a_tag_filter(self, setup):
