@@ -140,6 +140,7 @@ describe('moveTask', () => {
         { status: 'pending', total: 1, tasks: [task('b', 'pending', 2048)] },
         { status: 'in_progress', total: 1, tasks: [task('a', 'in_progress', 1024)] },
       ],
+      status_since: {},
     });
 
     await useTaskStore.getState().moveTask('a', {
@@ -230,7 +231,7 @@ describe('handleTaskEvent', () => {
   });
 
   it('reloads when the status has no lane on this board', () => {
-    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [] });
+    vi.mocked(api.getTaskBoard).mockResolvedValue({ statuses: [], lanes: [], status_since: {} });
 
     useTaskStore.getState().handleTaskEvent(task('a', 'in_review', 1024));
 
@@ -270,7 +271,7 @@ describe('setSearch', () => {
     // typing in the search box filtered an array nothing was reading.
     useTaskStore.setState({ viewMode: 'board' });
     vi.mocked(api.getTaskBoard).mockResolvedValue({
-      statuses: [], lanes: [],
+      statuses: [], lanes: [], status_since: {},
     });
 
     useTaskStore.getState().setSearch('encoder');
@@ -282,7 +283,7 @@ describe('setSearch', () => {
   it('sends the query to the board endpoint', async () => {
     useTaskStore.setState({ viewMode: 'board' });
     vi.mocked(api.getTaskBoard).mockResolvedValue({
-      statuses: [], lanes: [],
+      statuses: [], lanes: [], status_since: {},
     });
 
     useTaskStore.getState().setSearch('  encoder  ');
@@ -297,7 +298,7 @@ describe('setSearch', () => {
   it('omits the query entirely once search is cleared', async () => {
     useTaskStore.setState({ viewMode: 'board', searchQuery: 'encoder' });
     vi.mocked(api.getTaskBoard).mockResolvedValue({
-      statuses: [], lanes: [],
+      statuses: [], lanes: [], status_since: {},
     });
 
     useTaskStore.getState().setSearch('');

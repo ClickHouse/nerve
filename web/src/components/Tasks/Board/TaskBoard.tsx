@@ -43,6 +43,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   const lanes = useTaskStore((s) => s.lanes);
   const boardLoading = useTaskStore((s) => s.boardLoading);
   const boardError = useTaskStore((s) => s.boardError);
+  const statusSince = useTaskStore((s) => s.statusSince);
   const moveTask = useTaskStore((s) => s.moveTask);
   const setShowCreateDialog = useTaskStore((s) => s.setShowCreateDialog);
   const searchQuery = useTaskStore((s) => s.searchQuery);
@@ -142,6 +143,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
                 lane={lane}
                 status={statusByName.get(lane.status)}
                 collapsed={collapsed.includes(lane.status)}
+                statusSince={statusSince}
                 onToggleCollapse={handleToggleCollapse}
                 onCreate={(status) => setShowCreateDialog(true, status)}
                 onOpenTask={onOpenTask}

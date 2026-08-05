@@ -60,6 +60,7 @@ class TaskStore:
         tags: str | _Keep = KEEP,
         content: str = "",
         position: float | None = None,
+        actor: str = "system",
     ) -> None:
         """Insert or update a task row and its FTS entry.
 
@@ -84,14 +85,18 @@ class TaskStore:
         """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
-            # One read resolves every preserve-on-omit column. The statement
-            # below stays a plain full replace, and the FTS text sees the
-            # tags that actually land in the row.
+            # One read serves every column this method resolves before the
+            # write. The statement below stays a plain full replace, and the
+            # FTS text sees the tags that actually land in the row.
             stored = await self._stored_task_columns(task_id)
             source = _resolve_kept(source, stored, "source", None)
             source_url = _resolve_kept(source_url, stored, "source_url", None)
             deadline = _resolve_kept(deadline, stored, "deadline", None)
             tags = _resolve_kept(tags, stored, "tags", "")
+            # A full-row upsert is one of the paths that can change status
+            # (task_update with a note, the PATCH route saving content), so
+            # it has to record transitions like the dedicated methods do.
+            previous_status = stored["status"] if stored else None
             if position is None:
                 position = await self._resolve_upsert_position(stored, status)
             await self.db.execute(
@@ -109,6 +114,8 @@ class TaskStore:
             # The FTS5 tokenizer already splits the hyphenated slug into words
             # ("2026-03-10-distribution" → 2026, 03, 10, distribution), so slug
             # search works without rewriting the key — and the key stays joinable.
+            await self._record_status_event(task_id, previous_status, status, actor)
+
             fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
             await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
             await self.db.execute(
@@ -120,6 +127,79 @@ class TaskStore:
         async with self.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    # ── Status history (task_events) ─────────────────────────────────────
+
+    async def _record_status_event(
+        self,
+        task_id: str,
+        from_status: str | None,
+        to_status: str,
+        actor: str,
+    ) -> None:
+        """Append a transition to ``task_events``, if it is one.
+
+        Called from inside ``_atomic()`` by every path that can change a
+        task's status, so the event and the status commit together — there
+        is no window in which a task has moved but its history hasn't.
+
+        A no-op transition writes nothing, and that one rule is what keeps
+        ``TaskManager.reindex()`` from flooding the table: reindex rewrites
+        every row with the status it already had, so from == to and nothing
+        is recorded. The single case where reindex *does* change a status —
+        resetting an orphaned row to match its directory — is a real
+        correction and worth a row.
+        """
+        if from_status == to_status:
+            return
+        await self.db.execute(
+            "INSERT INTO task_events (task_id, from_status, to_status, actor, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                task_id, from_status, to_status, actor or "system",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    async def list_task_events(self, task_id: str, limit: int = 200) -> list[dict]:
+        """A task's transitions, oldest first — the order a timeline reads."""
+        async with self.db.execute(
+            "SELECT * FROM task_events WHERE task_id = ? "
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (task_id, limit),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def get_status_entry_times(self, task_ids: list[str]) -> dict[str, str]:
+        """When each task last *entered* its current status.
+
+        The basis for card aging. Takes the newest event per task and keeps
+        it only if it still matches the live status: a row whose status was
+        last changed by a path predating this table, or by a direct DB edit,
+        has no truthful entry time. Omitting it leaves the indicator silent,
+        which beats inventing an age that reads as fact.
+        """
+        if not task_ids:
+            return {}
+        placeholders = ",".join("?" * len(task_ids))
+        async with self.db.execute(
+            f"SELECT task_id, to_status, MAX(created_at) FROM task_events "
+            f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
+            tuple(task_ids),
+        ) as cursor:
+            newest = {row[0]: (row[1], row[2]) async for row in cursor}
+
+        async with self.db.execute(
+            f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+            tuple(task_ids),
+        ) as cursor:
+            live = {row[0]: row[1] async for row in cursor}
+
+        return {
+            task_id: entered_at
+            for task_id, (to_status, entered_at) in newest.items()
+            if live.get(task_id) == to_status
+        }
 
     # ── Board ordering (tasks.position) ──────────────────────────────────
     #
@@ -239,6 +319,7 @@ class TaskStore:
         status: str | None = None,
         before_id: str | None = None,
         after_id: str | None = None,
+        actor: str = "system",
     ) -> dict | None:
         """Place a task at an explicit slot in a lane; return the new row.
 
@@ -276,6 +357,10 @@ class TaskStore:
                 "UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?",
                 (lane, position, now, task_id),
             )
+            # A pure reorder leaves status alone, and _record_status_event
+            # drops the no-op — so dragging within a lane doesn't pollute
+            # the history with rows that say nothing changed.
+            await self._record_status_event(task_id, row[0], lane, actor)
             async with self.db.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,),
             ) as cursor:
@@ -368,7 +453,9 @@ class TaskStore:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
-    async def update_task_status(self, task_id: str, status: str) -> None:
+    async def update_task_status(
+        self, task_id: str, status: str, actor: str = "system",
+    ) -> None:
         """Move a task to another status, re-ranking it into the new lane.
 
         A rank only means anything relative to its own lane, so carrying
@@ -396,6 +483,7 @@ class TaskStore:
                 "UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?",
                 (status, position, now, task_id),
             )
+            await self._record_status_event(task_id, row[0], status, actor)
 
     async def update_task_tags(self, task_id: str, tags: str) -> None:
         now = datetime.now(timezone.utc).isoformat()

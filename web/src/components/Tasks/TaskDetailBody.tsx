@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Calendar, Edit3, ExternalLink, Eye, Save } from 'lucide-react';
+import { Calendar, Edit3, ExternalLink, Eye, History, Save } from 'lucide-react';
 import type { Task } from '../../api/client';
 import { useTaskStore } from '../../stores/taskStore';
 import { StatusBadge, StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
+import { TaskTimeline } from './TaskTimeline';
 
 /**
  * The task editor itself — metadata row, edit/preview toggle, markdown
@@ -19,6 +20,7 @@ export function TaskDetailBody({ task }: { task: Task }) {
   const updateStatus = useTaskStore((s) => s.updateStatus);
 
   const [mode, setMode] = useState<'edit' | 'preview'>('preview');
+  const [showHistory, setShowHistory] = useState(false);
   const [localContent, setLocalContent] = useState('');
   const [dirty, setDirty] = useState(false);
 
@@ -76,6 +78,15 @@ export function TaskDetailBody({ task }: { task: Task }) {
         )}
 
         <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={() => setShowHistory((v) => !v)}
+            aria-pressed={showHistory}
+            title="Status history"
+            className={`flex items-center gap-1 px-2 py-1 rounded-md cursor-pointer transition-colors
+              ${showHistory ? 'text-accent' : 'text-text-dim hover:text-text-muted'}`}
+          >
+            <History size={13} />
+          </button>
           {dirty && (
             <button
               onClick={handleSave}
@@ -107,6 +118,12 @@ export function TaskDetailBody({ task }: { task: Task }) {
           </div>
         </div>
       </div>
+
+      {showHistory && (
+        <div className="px-5 py-3 border-b border-border-subtle bg-surface-raised/30 max-h-52 overflow-y-auto shrink-0">
+          <TaskTimeline taskId={task.id} currentStatus={task.status} />
+        </div>
+      )}
 
       {mode === 'edit' ? (
         <textarea

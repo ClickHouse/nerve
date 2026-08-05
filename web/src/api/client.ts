@@ -10,6 +10,16 @@ export interface TaskStatusDef {
   created_at?: string;
 }
 
+export interface TaskEvent {
+  id: number;
+  task_id: string;
+  /** null on the row recording the task's creation. */
+  from_status: string | null;
+  to_status: string;
+  actor: string;
+  created_at: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -376,6 +386,9 @@ export const api = {
     return request<{
       statuses: TaskStatusDef[];
       lanes: { status: string; total: number; tasks: Task[] }[];
+      /** task_id → ISO time it entered its current status. Absent for
+          tasks whose last transition predates the history table. */
+      status_since: Record<string, string>;
     }>(`/tasks/board${q ? '?' + q : ''}`);
   },
   listTaskTags: (includeDone = false) =>
@@ -392,6 +405,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  listTaskEvents: (id: string) =>
+    request<{ events: TaskEvent[] }>(`/tasks/${id}/events`),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
   createTask: (data: {
     title: string; content?: string; deadline?: string;

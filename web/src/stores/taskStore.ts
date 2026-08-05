@@ -77,6 +77,8 @@ interface TaskState {
   boardError: string | null;
   tagFilter: string;
   availableTags: { name: string; count: number }[];
+  /** task_id → ISO time it entered its current status (card aging). */
+  statusSince: Record<string, string>;
   /** Lane to pre-select when the create dialog is opened from a column. */
   createInStatus: string | null;
 
@@ -153,6 +155,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   boardError: null,
   tagFilter: '',
   availableTags: [],
+  statusSince: {},
   createInStatus: null,
 
   selectedTask: null,
@@ -195,11 +198,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     if (!quiet) set({ boardLoading: true, boardError: null });
     try {
       const { tagFilter, searchQuery } = get();
-      const { lanes } = await api.getTaskBoard({
+      const { lanes, status_since } = await api.getTaskBoard({
         tag: tagFilter || undefined,
         q: searchQuery.trim() || undefined,
       });
-      set({ lanes, boardLoading: false });
+      set({ lanes, statusSince: status_since ?? {}, boardLoading: false });
     } catch (e) {
       console.error('Failed to load board:', e);
       set({ boardLoading: false, boardError: 'Could not load the board.' });

@@ -286,6 +286,52 @@ class TestTaskBoardRoutes:
         resp = setup.client.post("/api/tasks/nope/move", json={"status": "pending"})
         assert resp.status_code == 404
 
+    # ── History ──────────────────────────────────────────────────────────
+
+    async def test_events_endpoint_returns_the_transition_history(self, setup):
+        task_id = await self._create(setup, "Tracked task")
+        setup.client.patch(f"/api/tasks/{task_id}", json={"status": "in_progress"})
+
+        resp = setup.client.get(f"/api/tasks/{task_id}/events")
+
+        assert resp.status_code == 200
+        events = resp.json()["events"]
+        assert [(e["from_status"], e["to_status"]) for e in events] == [
+            (None, "pending"), ("pending", "in_progress"),
+        ]
+
+    async def test_events_route_is_not_shadowed_by_the_id_route(self, setup):
+        task_id = await self._create(setup, "Shadow check")
+        body = setup.client.get(f"/api/tasks/{task_id}/events").json()
+        assert "events" in body, "resolved to the task-detail route instead"
+
+    async def test_move_via_http_is_recorded_with_the_web_actor(self, setup):
+        task_id = await self._create(setup, "Dragged task")
+
+        setup.client.post(f"/api/tasks/{task_id}/move", json={"status": "in_progress"})
+
+        events = setup.client.get(f"/api/tasks/{task_id}/events").json()["events"]
+        assert events[-1]["to_status"] == "in_progress"
+        # Distinguishes a human dragging a card from the agent moving it.
+        assert events[-1]["actor"] == "web"
+
+    async def test_reorder_within_a_lane_records_no_event(self, setup):
+        first = await self._create(setup, "Reorder one")
+        second = await self._create(setup, "Reorder two")
+
+        setup.client.post(f"/api/tasks/{second}/move", json={"before_id": first})
+
+        events = setup.client.get(f"/api/tasks/{second}/events").json()["events"]
+        assert len(events) == 1, "a pure reorder is not a status change"
+
+    async def test_board_reports_when_cards_entered_their_status(self, setup):
+        task_id = await self._create(setup, "Aging card")
+
+        body = setup.client.get("/api/tasks/board").json()
+
+        # Drives the card aging indicator; absent means "unknown", not zero.
+        assert task_id in body["status_since"]
+
     # ── Create ───────────────────────────────────────────────────────────
 
     async def test_create_returns_the_structured_task(self, setup):
