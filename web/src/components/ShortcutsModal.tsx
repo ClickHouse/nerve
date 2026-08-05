@@ -44,6 +44,17 @@ const SECTIONS: Section[] = [
       { combo: { shift: true, key: 'Enter' }, description: 'New line' },
     ],
   },
+  {
+    title: 'Tasks',
+    items: [
+      { combo: { key: 'b' }, description: 'Board view' },
+      { combo: { key: 'l' }, description: 'List view' },
+      { combo: { key: 'n' }, description: 'New task' },
+      { combo: { key: '/' }, description: 'Focus task search' },
+      { combo: { key: 'Space' }, description: 'Pick up / drop a focused card' },
+      { combo: { key: 'ArrowUp' }, description: 'Move a picked-up card (with arrows)' },
+    ],
+  },
 ];
 
 export function ShortcutsModal() {

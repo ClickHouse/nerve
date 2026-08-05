@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, Columns3, List, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
 import { useTaskStore, TASKS_PAGE_SIZE, type TaskSort, type TaskViewMode } from '../stores/taskStore';
@@ -9,6 +9,8 @@ import { TaskCreateDialog } from '../components/Tasks/TaskCreateDialog';
 import { TaskStatusManager } from '../components/Tasks/TaskStatusManager';
 import { TaskBoard } from '../components/Tasks/Board/TaskBoard';
 import { BoardFilterBar } from '../components/Tasks/Board/BoardFilterBar';
+import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
+import type { ShortcutDef } from '../utils/keyboard';
 
 const SORT_OPTIONS: { value: TaskSort; label: string }[] = [
   { value: 'deadline', label: 'Deadline' },
@@ -36,6 +38,7 @@ export function TasksPage() {
   const [localQuery, setLocalQuery] = useState(searchQuery);
   const [showStatusManager, setShowStatusManager] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const isBoard = viewMode === 'board';
 
@@ -75,6 +78,42 @@ export function TasksPage() {
     navigate(`/tasks/${task.id}`, { state: { background: location } });
   }, [navigate, location]);
 
+  // Page-scoped, like ChatPage's — they only bind while /tasks is mounted.
+  // Card-level navigation is dnd-kit's (Tab to a card, Space to pick up,
+  // arrows to move), so these cover only what the page itself owns.
+  const shortcuts = useMemo<ShortcutDef[]>(() => [
+    {
+      id: 'tasks-board-view',
+      combo: { key: 'b' },
+      description: 'Board view',
+      section: 'tasks',
+      action: () => setViewMode('board'),
+    },
+    {
+      id: 'tasks-list-view',
+      combo: { key: 'l' },
+      description: 'List view',
+      section: 'tasks',
+      action: () => setViewMode('list'),
+    },
+    {
+      id: 'tasks-new',
+      combo: { key: 'n' },
+      description: 'New task',
+      section: 'tasks',
+      action: () => setShowCreateDialog(true),
+    },
+    {
+      id: 'tasks-focus-search',
+      combo: { key: '/' },
+      description: 'Focus task search',
+      section: 'tasks',
+      action: () => searchRef.current?.focus(),
+    },
+  ], [setViewMode, setShowCreateDialog]);
+
+  useKeyboardShortcuts(shortcuts);
+
   return (
     <div className="h-full flex flex-col min-w-0">
       <div className="border-b border-border-subtle px-4 py-3 flex items-center justify-between gap-4 bg-bg shrink-0">
@@ -105,6 +144,7 @@ export function TasksPage() {
           <div className="relative ml-2 shrink-0">
             <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
             <input
+              ref={searchRef}
               type="text"
               value={localQuery}
               onChange={e => handleSearchChange(e.target.value)}
