@@ -67,3 +67,64 @@ async def test_task_manager_mark_done_preserves_metadata(db: Database, tmp_path)
     assert await manager.mark_done(task_id)
 
     await _assert_metadata_preserved(db, task_id)
+
+
+class TestCompletingATaskTwice:
+    """The second completion reads the ``file_path`` the first one stored, so
+    its source and its destination are one path under done/. While the move
+    was a copy followed by an unlink, that sequence wrote the file and then
+    deleted it: the task kept its row and lost every word of its markdown,
+    including the update history the file had collected.
+
+    Two callers reach it without anything unusual happening. An agent that
+    retries ``task_done`` after a timeout sends the call twice, and the board
+    can move a card out of Done and back in.
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_done_twice_keeps_the_file(self, db: Database, tmp_path):
+        task_id = "2026-07-30-done-twice"
+        await _create_task(db, tmp_path, task_id)
+        ctx = ToolContext(session_id="test", db=db, workspace=tmp_path)
+        done_file = tmp_path / "memory" / "tasks" / "done" / f"{task_id}.md"
+
+        await task_done_handler(ctx, {"task_id": task_id, "note": "first"})
+        await task_done_handler(ctx, {"task_id": task_id, "note": "second"})
+
+        assert done_file.exists()
+        body = done_file.read_text(encoding="utf-8")
+        assert "Investigate source synchronization." in body
+        # Both completions recorded, and neither cost the file its history.
+        assert "DONE — first" in body
+        assert "DONE — second" in body
+        await _assert_metadata_preserved(db, task_id)
+
+    @pytest.mark.asyncio
+    async def test_the_row_still_points_at_the_file(self, db: Database, tmp_path):
+        """A row pointing at a path that no longer exists is the quiet half of
+        the bug: ``task_read`` and the detail page 404 while the task still
+        lists."""
+        task_id = "2026-07-30-done-twice-row"
+        await _create_task(db, tmp_path, task_id)
+        ctx = ToolContext(session_id="test", db=db, workspace=tmp_path)
+
+        await task_done_handler(ctx, {"task_id": task_id})
+        await task_done_handler(ctx, {"task_id": task_id})
+
+        row = await db.get_task(task_id)
+        assert (tmp_path / row["file_path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_mark_done_twice_keeps_the_file(self, db: Database, tmp_path):
+        task_id = "2026-07-30-manager-done-twice"
+        await _create_task(db, tmp_path, task_id)
+        manager = TaskManager(tmp_path, db)
+
+        assert await manager.mark_done(task_id)
+        assert await manager.mark_done(task_id)
+
+        done_file = tmp_path / "memory" / "tasks" / "done" / f"{task_id}.md"
+        assert done_file.exists()
+        assert "Investigate source synchronization." in done_file.read_text(
+            encoding="utf-8",
+        )

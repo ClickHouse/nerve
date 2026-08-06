@@ -38,6 +38,7 @@ from nerve.db.task_statuses import (
     normalize_color,
     random_status_color,
 )
+from nerve.tasks.files import move_task_file
 
 logger = logging.getLogger(__name__)
 
@@ -346,18 +347,20 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
                 final_title = new_title or task["title"]
                 final_status = status or task["status"]
-                final_deadline = deadline or task.get("deadline")
-                final_tags = new_tags_str if raw_tags else (task.get("tags") or "")
+                # Only the columns this call edits. The rest keep their
+                # stored values, so nothing has to be read back off ``task``.
+                edits: dict = {}
+                if deadline:
+                    edits["deadline"] = deadline
+                if raw_tags:
+                    edits["tags"] = new_tags_str
                 await ctx.db.upsert_task(
                     task_id=task_id,
                     file_path=task["file_path"],
                     title=final_title,
                     status=final_status,
-                    source=task.get("source"),
-                    source_url=task.get("source_url"),
-                    deadline=final_deadline,
-                    tags=final_tags,
                     content=content,
+                    **edits,
                 )
                 return ToolResult.text(f"Task {task_id} updated.")
 
@@ -432,18 +435,20 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     # The deadline column is a pure projection of the file's Deadline line, so it
     # comes from the content we just wrote, never from the pre-write snapshot.
     new_deadline = frontmatter.get("deadline", "")
-    new_tags = tags_to_string(parse_tags_string(frontmatter.get("tags", task.get("tags", ""))))
+    # Tags follow the reindex rule: the file wins whenever it carries the
+    # field, and an absent field keeps the stored column.
+    edits: dict = {}
+    if "tags" in frontmatter:
+        edits["tags"] = tags_to_string(parse_tags_string(frontmatter["tags"]))
 
     await ctx.db.upsert_task(
         task_id=task_id,
         file_path=task["file_path"],
         title=new_title,
         status=task["status"],
-        source=task.get("source"),
-        source_url=task.get("source_url"),
         deadline=new_deadline or None,
-        tags=new_tags,
         content=new_content,
+        **edits,
     )
 
     return ToolResult.text(f"Task {task_id} written ({len(new_content)} chars).")
@@ -458,9 +463,9 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
 
-        # Done is a write like any other — it copies the file into done/ and
-        # unlinks the source, so a stored ``file_path`` inside the tracked config
-        # subtree would delete config. Refuse before the status flip, or a
+        # Done is a write like any other — it appends to the file and moves it
+        # into done/, so a stored ``file_path`` inside the tracked config
+        # subtree would rewrite config. Refuse before the status flip, or a
         # refusal leaves a task marked done whose file never moved.
         if ctx.workspace:
             ensure_path_not_tracked_config(ctx.workspace / task["file_path"], "move")
@@ -486,11 +491,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
                 dst = _done_dir(ctx) / src.name
 
-                def _move_to_done() -> None:
-                    dst.write_text(content, encoding="utf-8")
-                    src.unlink()
-
-                await asyncio.to_thread(_move_to_done)
+                await asyncio.to_thread(move_task_file, src, dst, content)
 
                 rel_path = str(dst.relative_to(ctx.workspace))
                 await ctx.db.upsert_task(
@@ -498,10 +499,6 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     file_path=rel_path,
                     title=task["title"],
                     status="done",
-                    source=task.get("source"),
-                    source_url=task.get("source_url"),
-                    deadline=task.get("deadline"),
-                    tags=task.get("tags") or "",
                     content=content,
                 )
 

@@ -1562,9 +1562,10 @@ class TestLockdownTaskHandlersGuardWritesOnly:
         assert "lockdown: true" in (ws / "config" / "settings.yaml").read_text()
 
     @pytest.mark.asyncio
-    async def test_done_is_refused_before_it_unlinks(self, tmp_path, db, monkeypatch):
-        """``task_done`` copies the file into ``done/`` and unlinks the source —
-        a delete of tracked config, and the most destructive of the three."""
+    async def test_done_is_refused_before_it_moves(self, tmp_path, db, monkeypatch):
+        """``task_done`` appends to the file and renames it into ``done/`` —
+        a rewrite and a move of tracked config, the most destructive of the
+        three."""
         from nerve.agent.tools.handlers.tasks import task_done_handler
 
         ws, ctx = await self._locked_task(tmp_path, db, monkeypatch)
@@ -1608,10 +1609,10 @@ class TestLockdownTaskHandlersGuardWritesOnly:
 
 
 class TestLockdownTaskManagerGuardsTheMove:
-    """``TaskManager.mark_done`` has the same read-copy-unlink shape as the
-    ``task_done`` tool — a stored ``file_path`` joined to the workspace, copied
-    into ``done/`` and then unlinked — so it needs the same guard, or it is a
-    second route to deleting tracked config.
+    """``TaskManager.mark_done`` has the same append-and-rename shape as the
+    ``task_done`` tool — a stored ``file_path`` joined to the workspace,
+    appended to and then renamed into ``done/`` — so it needs the same guard,
+    or it is a second route to rewriting and moving tracked config.
 
     Both cases run locked, so the second one is what stops the guard from being
     written as "refuse every move".
