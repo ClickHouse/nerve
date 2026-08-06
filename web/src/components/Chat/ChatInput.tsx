@@ -103,15 +103,21 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     ? (chosenBackend ?? 'claude')
     : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
 
-  // ── Model picker ──
+  // ── Model picker (per-chat) ──
+  // A virtual chat's pick lives in newChatModels until the session is
+  // created; a real session's model IS its row (sessions[].model), so the
+  // picker always shows — and only ever changes — the current chat.
   const availableModels = useChatStore(s => s.availableModels);
-  const selectedModels = useChatStore(s => s.selectedModels);
+  const newChatModels = useChatStore(s => s.newChatModels);
   const modelDefaults = useChatStore(s => s.modelDefaults);
-  const setSelectedModel = useChatStore(s => s.setSelectedModel);
+  const setNewChatModel = useChatStore(s => s.setNewChatModel);
+  const setSessionModel = useChatStore(s => s.setSessionModel);
   const loadModels = useChatStore(s => s.loadModels);
   const scopedModels = availableModels.filter(m => m.backend === activeBackend);
-  const selectedModel = selectedModels[activeBackend] ?? null;
   const modelsDefault = modelDefaults[activeBackend] ?? null;
+  const currentModel = isVirtualChat
+    ? (newChatModels[activeBackend] ?? modelsDefault)
+    : (sessions.find(s => s.id === activeSession)?.model ?? modelsDefault);
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -613,16 +619,30 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           {isVirtualChat && (
             <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
           )}
-          {/* Backend-scoped model picker. A Claude/Ollama selection can never
-              leak into Codex (or vice versa) when the backend changes. */}
+          {/* Backend-scoped, PER-CHAT model picker. A pick here re-points
+              only this chat: virtual chats bind it at creation, real
+              sessions PATCH their own row — never a global preference. */}
           {scopedModels.length > 1 && (
             <select
-              value={selectedModel ?? modelsDefault ?? ''}
-              onChange={(e) => setSelectedModel(activeBackend, e.target.value === modelsDefault ? null : e.target.value)}
+              value={currentModel ?? ''}
+              onChange={(e) => {
+                const picked = e.target.value;
+                if (isVirtualChat) {
+                  setNewChatModel(activeBackend, picked === modelsDefault ? null : picked);
+                } else {
+                  setSessionModel(activeSession, picked);
+                }
+              }}
               disabled={disabled || isStreaming || rewriteActive}
-              title="Model for your next message"
+              title="Model for this chat (other chats keep theirs)"
               className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
             >
+              {/* A session may run on a model the picker no longer offers
+                  (retired id, uninstalled Ollama model) — keep it visible
+                  instead of silently snapping to the first option. */}
+              {currentModel && !scopedModels.some(m => m.id === currentModel) && (
+                <option value={currentModel}>{currentModel}</option>
+              )}
               {scopedModels.some(m => m.provider === 'anthropic') && (
                 <optgroup label="Anthropic">
                   {scopedModels.filter(m => m.provider === 'anthropic').map(m => (
