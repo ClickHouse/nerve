@@ -126,6 +126,17 @@ class InboxFilter:
         """Return True if *record* passes all rules (should be kept)."""
         return all(r.passes(record) for r in self.rules)
 
+    def rejects(self, record: SourceRecord) -> FieldRule | None:
+        """The first rule that drops *record*, or None if it passes.
+
+        Dropped records are never persisted, so this is the only way to tell
+        *why* something vanished (see the runner's drop logging).
+        """
+        for rule in self.rules:
+            if not rule.passes(record):
+                return rule
+        return None
+
     def partition(
         self, records: list[SourceRecord],
     ) -> tuple[list[SourceRecord], list[SourceRecord]]:

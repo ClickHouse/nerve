@@ -245,3 +245,29 @@ def test_actor_allowlist_is_case_insensitive():
     assert rule.passes(_rec(actors=["alice"])) is True
     assert rule.passes(_rec(actors=["ALICE"])) is True
     assert rule.passes(_rec(actors=["bob"])) is False
+
+
+def test_deny_only_rule_ignores_absent_and_empty_fields():
+    # The GitHub CI guardrail relies on this: ci_branch is "" (or absent) for
+    # every non-CheckSuite notification, and a deny list must not touch those.
+    rule = FieldRule(field="ci_branch", deny=["main", "master"])
+    assert rule.passes(_rec(ci_branch="main")) is False
+    assert rule.passes(_rec(ci_branch="fix/thing")) is True
+    assert rule.passes(_rec(ci_branch="")) is True
+    assert rule.passes(_rec()) is True          # key absent entirely
+
+
+def test_rejects_names_the_first_failing_rule():
+    flt = InboxFilter(rules=[
+        FieldRule(field="repo_name", allow=["ClickHouse/*"]),
+        FieldRule(field="ci_branch", deny=["main"]),
+    ])
+    kept = _rec("ClickHouse/nerve", ci_branch="fix/thing")
+    assert flt.rejects(kept) is None
+
+    by_branch = flt.rejects(_rec("ClickHouse/nerve", ci_branch="main"))
+    assert by_branch is not None and by_branch.field == "ci_branch"
+
+    # Rules are evaluated in order, so the repo rule is reported first.
+    by_repo = flt.rejects(_rec("other/repo", ci_branch="main"))
+    assert by_repo is not None and by_repo.field == "repo_name"
