@@ -37,6 +37,7 @@ def _collect_actors(
     latest_review: dict[str, Any] | None,
     inline_comments: list[dict[str, Any]],
     recent_comments: list[dict[str, Any]],
+    assigner: str = "",
 ) -> list[str]:
     """Every GitHub login involved in a notification, de-duplicated.
 
@@ -46,8 +47,18 @@ def _collect_actors(
     involved (see :mod:`nerve.sources.filters`). The raw ``/notifications``
     payload carries no actor, but enrichment has already fetched these logins
     for the rendered content.
+
+    ``assigner`` is the login that performed the assignment on a
+    ``reason=assign`` notification (see
+    :meth:`GitHubSource._enrich_assignment`). It is the one actor such a
+    notification is *about*, and it appears nowhere else in the payload: an
+    assignment carries no comment, so when the subject was authored by — and
+    assigned to — the same account (e.g. a bot files an issue and a maintainer
+    hands it back), every other candidate below is that same account. Without
+    this, the notification has no third-party login at all and a non-empty
+    ``allow_actors`` allowlist can never pass it.
     """
-    candidates: list[str] = [subject_user, *assignees]
+    candidates: list[str] = [subject_user, *assignees, assigner]
     if comment:
         candidates.append(comment.get("user", ""))
     if latest_review:
@@ -143,6 +154,7 @@ class GitHubSource(Source):
                 assignees = extra.get("assignees", [])
                 labels = extra.get("labels", [])
                 comment = extra.get("latest_comment")
+                assigner = extra.get("assigner", "")
 
                 content_parts = [
                     f"Repository: {repo_name}",
@@ -152,6 +164,9 @@ class GitHubSource(Source):
                     f"State: {subject_state}" if subject_state else None,
                     f"Author: {subject_user}" if subject_user else None,
                     f"Assignees: {', '.join(assignees)}" if assignees else None,
+                    # An assignment carries no comment text, so without this the
+                    # record never says who asked for the work.
+                    f"Assigned by: {assigner}" if assigner else None,
                     f"Labels: {', '.join(labels)}" if labels else None,
                     f"Updated: {updated_at}",
                     f"URL: {html_url}",
@@ -222,7 +237,7 @@ class GitHubSource(Source):
                 # allow/deny by actor (the raw notification carries no actor).
                 actors = _collect_actors(
                     subject_user, assignees, comment, latest_review,
-                    inline_comments, recent_comments,
+                    inline_comments, recent_comments, assigner,
                 )
 
                 records.append(SourceRecord(
@@ -330,7 +345,69 @@ class GitHubSource(Source):
             if reason in ("mention", "assign", "review_requested", "team_mention") and s_type in ("PullRequest", "Issue"):
                 await self._enrich_recent_comments(subject_url, s_type, result)
 
+            # For assignments: fetch who assigned it. The notification payload
+            # names the assignee but never the assigner, and an assignment has
+            # no comment body to fall back on.
+            if reason == "assign" and s_type in ("PullRequest", "Issue"):
+                await self._enrich_assignment(subject_url, s_type, result)
+
         return result
+
+    async def _enrich_assignment(
+        self, subject_url: str, subject_type: str, result: dict[str, Any],
+    ) -> None:
+        """Resolve who performed the assignment on a ``reason=assign`` thread.
+
+        Mutates *result* in place, adding ``assigner`` when found.
+
+        The assigner is the whole point of an assignment notification — it is
+        the account requesting the work — yet neither ``/notifications`` nor the
+        issue payload carries it, and an assignment has no comment text. It is
+        only available from the issue's event history, so this costs one extra
+        API call, taken only for ``reason=assign`` (a rare reason).
+
+        Reads the *last* ``assigned`` event, which is the one that triggered the
+        notification, and skips it when that assignee is no longer assigned — so
+        a stale assigner from a since-reverted assignment is not surfaced as an
+        actor. When the assignee list is empty or unknown the event is accepted
+        anyway: assigning requires write or triage access, so the assigner is
+        privileged by construction, and refusing would just reinstate the
+        fail-closed drop this method exists to prevent.
+        """
+        # PR timelines live under /issues/{n}/timeline, not /pulls/{n}/.
+        if subject_type == "PullRequest":
+            base = subject_url.replace("/pulls/", "/issues/")
+        else:
+            base = subject_url
+
+        # Single page of 100 (the API max). The timeline has no reverse sort, so
+        # an assignment past event 100 on a very chatty thread is not found —
+        # `assigner` is then simply absent, exactly as before this method
+        # existed. Degrading beats paginating an unbounded history.
+        events = await self._gh_api_get(f"{base}/timeline?per_page=100")
+        if not isinstance(events, list) or not events:
+            return
+
+        current = {a.lower() for a in result.get("assignees", [])}
+
+        for ev in reversed(events):
+            if ev.get("event") != "assigned":
+                continue
+            assignee = (ev.get("assignee") or {}).get("login", "")
+            if current and assignee.lower() not in current:
+                continue
+            # The two endpoints that expose this disagree: /issues/{n}/events
+            # carries the true actor in `assigner` (its `actor` is the assignee),
+            # while /issues/{n}/timeline carries it in `actor` and omits
+            # `assigner`. Prefer `assigner`, fall back to `actor`, so a payload
+            # of either shape resolves correctly.
+            login = (
+                (ev.get("assigner") or {}).get("login", "")
+                or (ev.get("actor") or {}).get("login", "")
+            )
+            if login:
+                result["assigner"] = login
+            return
 
     async def _enrich_pr_reviews(
         self, pr_url: str, result: dict[str, Any],
