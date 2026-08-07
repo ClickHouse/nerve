@@ -611,6 +611,14 @@ class ClaudeBackend:
         # wakeup timing (PostToolUse capture + cron-service sweep). The
         # tool itself stays available (this flag only gates the firing).
         env["CLAUDE_CODE_DISABLE_CRON"] = "1"
+        # Agent teams: gates the CLI's ``SendMessage`` tool. Without it the
+        # Agent tool still tells the model to resume sub-agents via
+        # SendMessage — in its own description and in every spawn result —
+        # so the model reaches for a tool that was never registered. Nerve
+        # loads no settings files (``setting_sources=[]``), so this env dict
+        # is the flag's only route into the CLI. See agent.agent_teams.
+        if config.agent.agent_teams:
+            env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
         if config.provider.is_bedrock:
             env["CLAUDE_CODE_USE_BEDROCK"] = "1"
             if config.provider.aws_region:

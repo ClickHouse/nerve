@@ -166,7 +166,9 @@ class TestResolveAutoCadence:
 # ---------------------------------------------------------------------------
 
 def _make_env_backend(
-    is_bedrock: bool = False, aliases: dict[str, str] | None = None
+    is_bedrock: bool = False,
+    aliases: dict[str, str] | None = None,
+    agent_teams: bool = True,
 ) -> ClaudeBackend:
     config = SimpleNamespace(
         provider=SimpleNamespace(
@@ -175,7 +177,9 @@ def _make_env_backend(
         ),
         proxy=SimpleNamespace(enabled=False, host="", port=0),
         effective_api_key="",
-        agent=SimpleNamespace(model_aliases=aliases or {}),
+        agent=SimpleNamespace(
+            model_aliases=aliases or {}, agent_teams=agent_teams,
+        ),
     )
     return ClaudeBackend(SimpleNamespace(config=lambda: config))
 
@@ -200,6 +204,25 @@ def test_build_env_1h_bedrock_sets_bedrock_flag():
 def test_build_env_default_is_5m():
     env = _make_env_backend()._build_env()
     assert "ENABLE_PROMPT_CACHING_1H" not in env
+
+
+# ---------------------------------------------------------------------------
+# Agent teams — gates the CLI's SendMessage tool (agent.agent_teams)
+# ---------------------------------------------------------------------------
+
+def test_build_env_agent_teams_enabled_by_default():
+    env = _make_env_backend()._build_env()
+    assert env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
+
+
+def test_build_env_agent_teams_disabled_omits_flag():
+    env = _make_env_backend(agent_teams=False)._build_env()
+    assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in env
+
+
+def test_build_env_agent_teams_independent_of_provider():
+    env = _make_env_backend(is_bedrock=True)._build_env()
+    assert env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
 
 
 # ---------------------------------------------------------------------------
