@@ -374,17 +374,20 @@ class GitHubSource(Source):
         privileged by construction, and refusing would just reinstate the
         fail-closed drop this method exists to prevent.
         """
-        # PR timelines live under /issues/{n}/timeline, not /pulls/{n}/.
+        # A PR's event history lives under /issues/{n}/, never /pulls/{n}/.
         if subject_type == "PullRequest":
             base = subject_url.replace("/pulls/", "/issues/")
         else:
             base = subject_url
 
-        # Single page of 100 (the API max). The timeline has no reverse sort, so
-        # an assignment past event 100 on a very chatty thread is not found —
-        # `assigner` is then simply absent, exactly as before this method
-        # existed. Degrading beats paginating an unbounded history.
-        events = await self._gh_api_get(f"{base}/timeline?per_page=100")
+        # /events, not /timeline: both carry `assigned` entries, but /events
+        # excludes comments, so a busy thread is far less likely to push the
+        # assignment out of the single page read here (measured on real threads:
+        # 11 events vs 30 timeline entries, 7 vs 26). Neither endpoint offers a
+        # reverse sort, and paginating an unbounded history on every assignment
+        # is not worth it — past 100 entries `assigner` is simply absent, exactly
+        # as before this method existed.
+        events = await self._gh_api_get(f"{base}/events?per_page=100")
         if not isinstance(events, list) or not events:
             return
 
@@ -396,17 +399,25 @@ class GitHubSource(Source):
             assignee = (ev.get("assignee") or {}).get("login", "")
             if current and assignee.lower() not in current:
                 continue
-            # The two endpoints that expose this disagree: /issues/{n}/events
-            # carries the true actor in `assigner` (its `actor` is the assignee),
-            # while /issues/{n}/timeline carries it in `actor` and omits
-            # `assigner`. Prefer `assigner`, fall back to `actor`, so a payload
-            # of either shape resolves correctly.
+            # The two endpoints carrying `assigned` disagree about where the
+            # acting login sits: /events puts it in `assigner` and the *assignee*
+            # in `actor` (verified on two separate real assignments), while
+            # /timeline puts it in `actor` and omits `assigner`. Read both, so
+            # reading `.actor` alone can't silently yield the assignee, and so
+            # this survives switching endpoint or GitHub aligning the payloads.
             login = (
                 (ev.get("assigner") or {}).get("login", "")
                 or (ev.get("actor") or {}).get("login", "")
             )
             if login:
                 result["assigner"] = login
+            # Stop at the triggering event whether or not it resolved. Falling
+            # back to an older `assigned` event would credit this notification to
+            # whoever assigned it *last* time — and that login is precisely the
+            # kind likely to be on the allowlist, so an unresolvable assignment
+            # would be admitted on the authority of someone who did not act. An
+            # actor we cannot identify (deleted account, null `actor`) must stay
+            # unidentified: no assigner, no pass.
             return
 
     async def _enrich_pr_reviews(

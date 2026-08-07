@@ -238,7 +238,7 @@ async def test_build_source_runners_actor_deny_wins(db):
 # ---------------------------------------------------------------------------
 
 def _timeline_assigned(actor: str, assignee: str) -> dict:
-    """An `assigned` entry as /issues/{n}/timeline renders it."""
+    """An `assigned` entry in the /timeline shape (acting login in `actor`)."""
     return {
         "event": "assigned",
         "actor": {"login": actor},
@@ -270,13 +270,13 @@ async def test_enrich_assignment_reads_last_assigned_event(monkeypatch):
     # The *last* assigned event is the one that triggered the notification.
     assert result["assigner"] == "maintainer"
     assert calls == [
-        "https://api.github.com/repos/owner/repo/issues/521/timeline?per_page=100",
+        "https://api.github.com/repos/owner/repo/issues/521/events?per_page=100",
     ]
 
 
 @pytest.mark.asyncio
 async def test_enrich_assignment_prefers_assigner_field_over_actor(monkeypatch):
-    # /issues/{n}/events disagrees with /timeline: it puts the assignee in
+    # /events disagrees with /timeline: it puts the assignee in
     # `actor` and the real actor in `assigner`. Preferring `assigner` keeps
     # either payload shape correct.
     src = GitHubSource()
@@ -317,8 +317,34 @@ async def test_enrich_assignment_ignores_stale_assignment(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_enrich_assignment_does_not_fall_back_to_an_older_assigner(
+    monkeypatch,
+):
+    # An unresolvable triggering event (deleted account → null actor) must leave
+    # `assigner` absent rather than reaching back to an earlier assignment.
+    # Crediting the previous assigner would admit the notification on the
+    # authority of someone who did not act — and that login is exactly the kind
+    # likely to be on the allowlist. Fail closed instead.
+    src = GitHubSource()
+
+    async def fake_get(url, timeout=30):
+        return [
+            _timeline_assigned("earlier-maintainer", "bot"),
+            {"event": "assigned", "actor": None, "assignee": {"login": "bot"}},
+        ]
+
+    monkeypatch.setattr(src, "_gh_api_get", fake_get)
+
+    result: dict = {"assignees": ["bot"]}
+    await src._enrich_assignment(
+        "https://api.github.com/repos/owner/repo/issues/1", "Issue", result,
+    )
+    assert "assigner" not in result
+
+
+@pytest.mark.asyncio
 async def test_enrich_assignment_uses_issues_path_for_prs(monkeypatch):
-    # A PR's timeline lives under /issues/{n}/timeline, never /pulls/{n}/.
+    # A PR's event history lives under /issues/{n}/, never /pulls/{n}/.
     src = GitHubSource()
     calls: list[str] = []
 
@@ -333,13 +359,13 @@ async def test_enrich_assignment_uses_issues_path_for_prs(monkeypatch):
         "https://api.github.com/repos/owner/repo/pulls/9", "PullRequest", result,
     )
     assert result["assigner"] == "maintainer"
-    assert "/issues/9/timeline" in calls[0]
+    assert "/issues/9/events" in calls[0]
     assert "/pulls/" not in calls[0]
 
 
 @pytest.mark.asyncio
-async def test_enrich_assignment_tolerates_missing_timeline(monkeypatch):
-    # A failed/empty timeline call must leave `assigner` absent, not raise.
+async def test_enrich_assignment_tolerates_missing_history(monkeypatch):
+    # A failed/empty event-history call must leave `assigner` absent, not raise.
     src = GitHubSource()
 
     async def fake_get(url, timeout=30):
@@ -355,7 +381,7 @@ async def test_enrich_assignment_tolerates_missing_timeline(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_enrich_notification_skips_timeline_for_non_assign_reasons(monkeypatch):
+async def test_enrich_notification_skips_event_fetch_for_non_assign_reasons(monkeypatch):
     # The extra API call is taken only for reason=assign.
     src = GitHubSource()
     calls: list[str] = []
@@ -380,7 +406,7 @@ async def test_enrich_notification_skips_timeline_for_non_assign_reasons(monkeyp
         },
         _asyncio.Semaphore(1),
     )
-    assert not any("timeline" in c for c in calls)
+    assert not any("/events" in c for c in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +454,7 @@ async def test_maintainer_assignment_on_self_filed_issue_passes_guardrail(
                 "assignees": [{"login": "bot"}],   # ...and is the assignee
                 "labels": [{"name": "bug"}],
             }
-        if "/timeline" in url:
+        if "/events" in url:
             return [_timeline_assigned("maintainer", "bot")]
         return []                                   # no comments at all
 
