@@ -17,6 +17,7 @@ from nerve.memory.memu_bridge import (
     _KNOWLEDGE_CUSTOM_RULES,
     _KNOWLEDGE_CUSTOM_EXAMPLES,
     _SEMANTIC_DEDUP_THRESHOLD,
+    _content_hash_reinforce,
     _is_sqlite_locked_error,
 )
 
@@ -1134,3 +1135,244 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _ensure_sqlite_indexes — hot-path index DDL
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSqliteIndexes:
+    """MemUBridge._ensure_sqlite_indexes creates the dedup/sweep indexes."""
+
+    def _index_names(self, db_path: str) -> set[str]:
+        db = sqlite3.connect(db_path)
+        names = {
+            r[0]
+            for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        db.close()
+        return names
+
+    def test_creates_both_indexes(self, tmp_path):
+        db_path = str(tmp_path / "memu.sqlite")
+        _create_memu_schema(db_path)
+
+        MemUBridge._ensure_sqlite_indexes(f"sqlite:///{db_path}")
+
+        names = self._index_names(db_path)
+        assert "ix_memu_memory_items_content_hash" in names
+        assert "ix_memu_memory_items_created_at" in names
+
+    def test_idempotent(self, tmp_path):
+        db_path = str(tmp_path / "memu.sqlite")
+        _create_memu_schema(db_path)
+
+        MemUBridge._ensure_sqlite_indexes(f"sqlite:///{db_path}")
+        MemUBridge._ensure_sqlite_indexes(f"sqlite:///{db_path}")  # must not raise
+
+        assert "ix_memu_memory_items_content_hash" in self._index_names(db_path)
+
+    def test_missing_table_is_nonfatal(self, tmp_path):
+        db_path = str(tmp_path / "empty.sqlite")
+        sqlite3.connect(db_path).close()
+
+        MemUBridge._ensure_sqlite_indexes(f"sqlite:///{db_path}")  # logs, no raise
+
+        assert self._index_names(db_path) == set()
+
+    def test_literal_content_hash_lookup_uses_index(self, tmp_path):
+        """The dedup predicate as _content_hash_reinforce renders it (literal
+        JSON path) is served by the expression index — an index seek, not a
+        table scan."""
+        db_path = str(tmp_path / "memu.sqlite")
+        _create_memu_schema(db_path)
+        MemUBridge._ensure_sqlite_indexes(f"sqlite:///{db_path}")
+
+        db = sqlite3.connect(db_path)
+        plan = " ".join(
+            r[3]
+            for r in db.execute(
+                "EXPLAIN QUERY PLAN SELECT id FROM memu_memory_items "
+                "WHERE json_extract(extra, '$.content_hash') = ?",
+                ("h",),
+            )
+        )
+        db.close()
+        assert "USING INDEX ix_memu_memory_items_content_hash" in plan
+
+    def test_bound_parameter_path_cannot_use_index(self, tmp_path):
+        """Documents WHY _content_hash_reinforce exists: SQLAlchemy compiles
+        func.json_extract(col, path) with the JSON path as a bound parameter,
+        and SQLite never matches a parameterized expression against an
+        expression index — the lookup degrades to a full table scan even with
+        the index present."""
+        db_path = str(tmp_path / "memu.sqlite")
+        _create_memu_schema(db_path)
+        MemUBridge._ensure_sqlite_indexes(f"sqlite:///{db_path}")
+
+        db = sqlite3.connect(db_path)
+        plan = " ".join(
+            r[3]
+            for r in db.execute(
+                "EXPLAIN QUERY PLAN SELECT id FROM memu_memory_items "
+                "WHERE json_extract(extra, ?) = ?",
+                ("$.content_hash", "h"),
+            )
+        )
+        db.close()
+        assert "SCAN" in plan
+        assert "ix_memu_memory_items_content_hash" not in plan
+
+
+# ---------------------------------------------------------------------------
+# _content_hash_reinforce — index-sargable port of create_item_reinforce
+# ---------------------------------------------------------------------------
+
+
+_upstream_reinforce = None  # memu-py's create_item_reinforce, captured pre-patch
+_shared_memu_repo = None  # module singleton — memu model classes are process-global
+
+
+def _memu_repo():
+    """Build a real SQLiteMemoryItemRepo the way production does.
+
+    memu-py 1.4.0's sqlite factory only works after the bridge's
+    monkey-patches (``_patch_sqlite_bugs``), and the patched model classes
+    are process-global (a second ``build_database`` re-binds the same Column
+    objects and fails) — so build ONE database for the test process, exactly
+    like production, and isolate tests by user scope. The pristine upstream
+    ``create_item_reinforce`` is captured before the patch swaps it out.
+    """
+    global _shared_memu_repo, _upstream_reinforce
+    if _shared_memu_repo is not None:
+        return _shared_memu_repo
+
+    import tempfile
+
+    from memu.app.service import MemoryService  # noqa: F401 — import order breaks the factory/app cycle
+    from memu.app.settings import DatabaseConfig, DefaultUserModel
+    from memu.database.factory import build_database
+    from memu.database.sqlite.repositories.memory_item_repo import (
+        SQLiteMemoryItemRepo,
+    )
+
+    if _upstream_reinforce is None:
+        _upstream_reinforce = SQLiteMemoryItemRepo.create_item_reinforce
+    MemUBridge._patch_sqlite_bugs()
+
+    db_dir = tempfile.mkdtemp(prefix="nerve-memu-reinforce-test-")
+    db = build_database(
+        config=DatabaseConfig(
+            metadata_store={
+                "provider": "sqlite",
+                "dsn": f"sqlite:///{db_dir}/memu.sqlite",
+            },
+        ),
+        user_model=DefaultUserModel,
+    )
+    _shared_memu_repo = db.memory_item_repo
+    return _shared_memu_repo
+
+
+def _scope_count(repo, user_id: str) -> int:
+    """Count items in a user scope from the DB (the in-memory MemoryItem
+    models don't carry scope fields — upstream drops the kwargs)."""
+    from sqlmodel import select as _sel
+
+    with repo._sessions.session() as session:
+        rows = session.exec(
+            _sel(repo._memory_item_model).where(
+                repo._memory_item_model.user_id == user_id
+            )
+        ).all()
+    return len(rows)
+
+
+class TestContentHashReinforce:
+    """Behavior and upstream parity of the index-sargable dedup port."""
+
+    def test_creates_then_reinforces_duplicate(self):
+        repo = _memu_repo()
+        kwargs = dict(
+            resource_id="res-1",
+            memory_type="knowledge",
+            summary="ClickHouse uses MergeTree",
+            embedding=[0.1, 0.2, 0.3],
+        )
+
+        first = _content_hash_reinforce(repo, user_data={"user_id": "dup-u1"}, **kwargs)
+        assert first.extra["reinforcement_count"] == 1
+        assert first.extra["content_hash"]
+
+        second = _content_hash_reinforce(repo, user_data={"user_id": "dup-u1"}, **kwargs)
+        assert second.id == first.id
+        assert second.extra["reinforcement_count"] == 2
+        # in-memory cache tracks the reinforcement
+        assert repo.items[first.id].extra["reinforcement_count"] == 2
+
+    def test_different_scope_is_not_deduped(self):
+        repo = _memu_repo()
+        kwargs = dict(
+            resource_id="res-1",
+            memory_type="knowledge",
+            summary="same fact",
+            embedding=[0.1, 0.2],
+        )
+
+        first = _content_hash_reinforce(repo, user_data={"user_id": "scope-u1"}, **kwargs)
+        second = _content_hash_reinforce(repo, user_data={"user_id": "scope-u2"}, **kwargs)
+
+        assert second.id != first.id
+        assert second.extra["reinforcement_count"] == 1
+
+    def test_different_summary_is_not_deduped(self):
+        repo = _memu_repo()
+
+        first = _content_hash_reinforce(
+            repo,
+            resource_id="res-1",
+            memory_type="knowledge",
+            summary="fact one",
+            embedding=[0.1],
+            user_data={"user_id": "sum-u1"},
+        )
+        second = _content_hash_reinforce(
+            repo,
+            resource_id="res-2",
+            memory_type="knowledge",
+            summary="fact two",
+            embedding=[0.2],
+            user_data={"user_id": "sum-u1"},
+        )
+
+        assert second.id != first.id
+        assert _scope_count(repo, "sum-u1") == 2
+
+    def test_parity_with_upstream_create_item_reinforce(self):
+        """Run the same call sequence through memu-py's pinned implementation
+        (in one user scope) and through the port (in another); the resulting
+        rows must agree on everything scope-independent."""
+        repo = _memu_repo()
+        assert _upstream_reinforce is not None
+
+        sequence = [
+            dict(resource_id="r1", memory_type="knowledge", summary="fact one", embedding=[0.1] * 4),
+            dict(resource_id="r2", memory_type="knowledge", summary="fact one", embedding=[0.1] * 4),  # dup → reinforce
+            dict(resource_id="r3", memory_type="event", summary="fact one", embedding=[0.1] * 4),  # other type → new
+            dict(resource_id="r4", memory_type="knowledge", summary="fact two", embedding=[0.2] * 4),  # other text → new
+        ]
+
+        for kwargs in sequence:
+            up = _upstream_reinforce(
+                repo, user_data={"user_id": "par-up"}, **kwargs
+            )
+            port = _content_hash_reinforce(
+                repo, user_data={"user_id": "par-port"}, **kwargs
+            )
+            assert port.memory_type == up.memory_type
+            assert port.summary == up.summary
+            assert port.extra["content_hash"] == up.extra["content_hash"]
+            assert port.extra["reinforcement_count"] == up.extra["reinforcement_count"]
+
+        assert _scope_count(repo, "par-port") == _scope_count(repo, "par-up") == 3

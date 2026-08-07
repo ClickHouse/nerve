@@ -311,6 +311,118 @@ def _log_audit_failure(future: Any) -> None:
         logger.warning("Audit log failed: %s", exc)
 
 
+def _content_hash_reinforce(
+    repo: Any,
+    *,
+    resource_id: str,
+    memory_type: Any,
+    summary: str,
+    embedding: Any,
+    user_data: dict[str, Any],
+) -> Any:
+    """Index-sargable port of ``SQLiteMemoryItemRepo.create_item_reinforce``.
+
+    Line-for-line copy of memu-py 1.4.0's implementation with ONE change: the
+    content-hash dedup predicate is rendered as a *literal* SQL expression
+    (``literal_column``) instead of ``func.json_extract(col, path)``.
+    SQLAlchemy compiles the latter with the JSON path as a bound parameter
+    (``json_extract(extra, ?)``), and SQLite never matches a parameterized
+    expression against an expression index, so the lookup degrades to a full
+    table scan of the items table. On a multi-GB corpus with a cold page
+    cache one scan is minutes-to-hours of serial 4 KiB reads — and because
+    the memorize pipeline is serialized on the memU loop thread and the scan
+    is synchronous (uncancellable mid-statement), it wedges every memorize
+    call behind it until it finishes (2026-08-07 incident: ~90 min per
+    lookup on a 26 GB / 728K-item corpus, every memorize timing out).
+
+    With the literal expression the lookup is an index seek on
+    ``ix_<table>_content_hash`` (created by
+    :meth:`MemUBridge._ensure_sqlite_indexes`). The *value* being compared
+    stays a bound parameter — only the indexed expression must be literal.
+    """
+    from sqlalchemy import literal_column
+    from sqlmodel import select as _sel
+
+    from memu.database.models import MemoryItem, compute_content_hash
+
+    content_hash = compute_content_hash(summary, memory_type)
+
+    with repo._sessions.session() as session:
+        # Check for existing item with same hash in same scope (deduplication).
+        # Literal JSON path — required for the expression index to apply.
+        content_hash_col = literal_column("json_extract(extra, '$.content_hash')")
+        filters = [content_hash_col == content_hash]
+        filters.extend(repo._build_filters(repo._memory_item_model, user_data))
+
+        existing = session.exec(_sel(repo._memory_item_model).where(*filters)).first()
+
+        if existing:
+            # Reinforce existing memory instead of creating duplicate
+            current_extra = existing.extra or {}
+            current_count = current_extra.get("reinforcement_count", 1)
+            existing.extra = {
+                **current_extra,
+                "reinforcement_count": current_count + 1,
+                "last_reinforced_at": repo._now().isoformat(),
+            }
+            existing.updated_at = repo._now()
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+
+            item = MemoryItem(
+                id=existing.id,
+                resource_id=existing.resource_id,
+                memory_type=existing.memory_type,
+                summary=existing.summary,
+                embedding=repo._normalize_embedding(existing.embedding_json),
+                created_at=existing.created_at,
+                updated_at=existing.updated_at,
+                extra=existing.extra,
+                **repo._scope_kwargs_from(existing),
+            )
+            repo.items[existing.id] = item
+            return item
+
+        # Create new item with salience tracking in extra
+        now = repo._now()
+        item_extra = user_data.pop("extra", {}) if "extra" in user_data else {}
+        item_extra.update({
+            "content_hash": content_hash,
+            "reinforcement_count": 1,
+            "last_reinforced_at": now.isoformat(),
+        })
+
+        row = repo._memory_item_model(
+            resource_id=resource_id,
+            memory_type=memory_type,
+            summary=summary,
+            embedding_json=repo._prepare_embedding(embedding),
+            extra=item_extra,
+            created_at=now,
+            updated_at=now,
+            **user_data,
+        )
+
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+
+    item = MemoryItem(
+        id=row.id,
+        resource_id=row.resource_id,
+        memory_type=row.memory_type,
+        summary=row.summary,
+        embedding=embedding,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        extra=row.extra,
+        **repo._scope_kwargs_from(row),
+    )
+    repo.items[row.id] = item
+    return item
+
+
 class _BedrockLLMClient:
     """Drop-in replacement for memU's OpenAISDKClient that uses AsyncAnthropicBedrock.
 
@@ -1226,14 +1338,39 @@ class MemUBridge:
                             matched.updated_at = now
                             return matched
 
-                return _original_sqlite_reinforce(
-                    self,
-                    resource_id=resource_id,
-                    memory_type=memory_type,
-                    summary=summary,
-                    embedding=embedding,
-                    user_data=user_data,
-                )
+                # Content-hash dedup via the indexed port — the upstream
+                # implementation renders the JSON path as a bound parameter,
+                # which SQLite cannot serve from the expression index, so
+                # every call full-scans the items table (2026-08-07: on a
+                # 26 GB / 728K-item corpus with a cold page cache that is a
+                # ~90-minute serial read which wedged the whole memorize
+                # lane; see _content_hash_reinforce).
+                _user_data_snapshot = dict(user_data)
+                try:
+                    return _content_hash_reinforce(
+                        self,
+                        resource_id=resource_id,
+                        memory_type=memory_type,
+                        summary=summary,
+                        embedding=embedding,
+                        user_data=user_data,
+                    )
+                except Exception:
+                    # The port reaches into memu-py internals — if the pinned
+                    # upstream ever shifts under it, degrade to the original
+                    # (scanning) implementation instead of failing memorize.
+                    logger.exception(
+                        "content-hash reinforce fast path failed — falling "
+                        "back to memu-py's create_item_reinforce",
+                    )
+                    return _original_sqlite_reinforce(
+                        self,
+                        resource_id=resource_id,
+                        memory_type=memory_type,
+                        summary=summary,
+                        embedding=embedding,
+                        user_data=_user_data_snapshot,
+                    )
 
             SQLiteMemoryItemRepo.create_item_reinforce = _semantic_sqlite_reinforce
 
@@ -1369,6 +1506,63 @@ class MemUBridge:
             )
         except Exception as exc:
             logger.warning("memU WAL startup checkpoint skipped: %s", exc)
+
+    @staticmethod
+    def _ensure_sqlite_indexes(sqlite_dsn: str, table: str = "memu_memory_items") -> None:
+        """Create the hot-path indexes memu-py's schema is missing.
+
+        - ``ix_<table>_content_hash`` — expression index over
+          ``json_extract(extra, '$.content_hash')``. Serves the per-item
+          dedup lookup in :func:`_content_hash_reinforce` (which runs for
+          every item the memorize pipeline persists). Without it that lookup
+          is a full scan of the items table; the table carries inline
+          embedding JSON, so on a large corpus a single scan reads the whole
+          multi-GB file — and wedges the serialized memorize lane whenever
+          the page cache is cold. NOTE: SQLite only uses an expression index
+          when the query renders the expression literally, which is exactly
+          why ``_content_hash_reinforce`` exists.
+        - ``ix_<table>_created_at`` — serves the event-date sweep
+          (``created_at >= :cutoff ORDER BY created_at DESC LIMIT :n`` in
+          ``_resolve_event_dates_sync``), which otherwise also scans.
+
+        Runs after MemoryService init so the tables exist. Idempotent; the
+        first run on a large corpus pays a one-time O(table) build, which is
+        logged with its duration.
+        """
+        import sqlite3 as _sqlite3
+
+        db_path = sqlite_dsn.replace("sqlite:///", "")
+        ddl = (
+            (
+                f"ix_{table}_content_hash",
+                f"CREATE INDEX IF NOT EXISTS ix_{table}_content_hash "
+                f"ON {table} (json_extract(extra, '$.content_hash'))",
+            ),
+            (
+                f"ix_{table}_created_at",
+                f"CREATE INDEX IF NOT EXISTS ix_{table}_created_at "
+                f"ON {table} (created_at)",
+            ),
+        )
+        try:
+            conn = _sqlite3.connect(db_path, timeout=60)
+            conn.execute("PRAGMA busy_timeout=60000")
+            for name, stmt in ddl:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                    (name,),
+                ).fetchone()
+                if exists:
+                    continue
+                t0 = time.monotonic()
+                conn.execute(stmt)
+                conn.commit()
+                logger.info(
+                    "memU index %s built in %.1fs", name, time.monotonic() - t0,
+                )
+            conn.close()
+        except Exception as exc:
+            logger.warning("memU index setup skipped: %s", exc)
 
     def _attach_engine_pragmas(self) -> None:
         """Per-connection pragmas for memU's SQLAlchemy engine.
@@ -1571,6 +1765,20 @@ class MemUBridge:
 
             # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
             self._attach_engine_pragmas()
+
+            # Hot-path indexes memu-py's schema is missing (idempotent; the
+            # first run on a large corpus pays a one-time build). Must run
+            # after MemoryService init so the tables exist.
+            item_table = getattr(
+                getattr(
+                    getattr(self._service.database, "memory_item_repo", None),
+                    "_memory_item_model",
+                    None,
+                ),
+                "__tablename__",
+                None,
+            ) or "memu_memory_items"
+            self._ensure_sqlite_indexes(sqlite_dsn, item_table)
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
