@@ -23,6 +23,7 @@ export function TaskDetailBody({ task }: { task: Task }) {
   const [showHistory, setShowHistory] = useState(false);
   const [localContent, setLocalContent] = useState('');
   const [dirty, setDirty] = useState(false);
+  const [saveError, setSaveError] = useState(false);
 
   // Adopt the loaded markdown, but never clobber unsaved edits.
   //
@@ -40,8 +41,12 @@ export function TaskDetailBody({ task }: { task: Task }) {
 
   const handleSave = useCallback(async () => {
     if (!dirty) return;
-    await saveTaskContent(task.id, localContent);
-    setDirty(false);
+    // Keep `dirty` set when the save fails. It is what keeps the Save button
+    // on screen, so the retry stays available and the editor cannot look
+    // settled while the content is still only in the browser.
+    const saved = await saveTaskContent(task.id, localContent);
+    setSaveError(!saved);
+    if (saved) setDirty(false);
   }, [task.id, dirty, localContent, saveTaskContent]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -89,13 +94,20 @@ export function TaskDetailBody({ task }: { task: Task }) {
             <History size={13} />
           </button>
           {dirty && (
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="flex items-center gap-1.5 px-3 py-1 text-[12px] bg-accent hover:bg-accent-hover text-white rounded-md cursor-pointer disabled:opacity-50"
-            >
-              <Save size={12} /> {saving ? 'Saving...' : 'Save'}
-            </button>
+            <>
+              {saveError && (
+                <span role="alert" className="text-[12px] text-hue-red">
+                  Save failed — not saved yet.
+                </span>
+              )}
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                className="flex items-center gap-1.5 px-3 py-1 text-[12px] bg-accent hover:bg-accent-hover text-white rounded-md cursor-pointer disabled:opacity-50"
+              >
+                <Save size={12} /> {saving ? 'Saving...' : 'Save'}
+              </button>
+            </>
           )}
           <div className="flex bg-surface-raised rounded-md border border-border">
             <button
@@ -129,7 +141,7 @@ export function TaskDetailBody({ task }: { task: Task }) {
       {mode === 'edit' ? (
         <textarea
           value={localContent}
-          onChange={(e) => { setLocalContent(e.target.value); setDirty(true); }}
+          onChange={(e) => { setLocalContent(e.target.value); setDirty(true); setSaveError(false); }}
           onKeyDown={handleKeyDown}
           className="flex-1 min-h-0 p-5 bg-bg-sunken text-[13px] text-text font-mono leading-relaxed outline-none resize-none"
           spellCheck={false}

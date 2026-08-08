@@ -104,7 +104,8 @@ interface TaskState {
   setShowCreateDialog: (show: boolean, status?: string | null) => void;
 
   loadTask: (id: string) => Promise<void>;
-  saveTaskContent: (id: string, content: string) => Promise<void>;
+  /** Resolves `false` when the write failed, so the caller can keep the edit. */
+  saveTaskContent: (id: string, content: string) => Promise<boolean>;
   clearSelectedTask: () => void;
 }
 
@@ -433,8 +434,12 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       if (sel && sel.id === id) {
         set({ selectedTask: { ...sel, content } });
       }
+      return true;
     } catch (e) {
+      // Reported rather than rethrown: the editor needs to know the write
+      // failed so it can hold on to the text, not to handle the error itself.
       console.error('Failed to save task:', e);
+      return false;
     } finally {
       set({ saving: false });
     }
