@@ -134,16 +134,14 @@ export class NerveWebSocket {
     return 'dropped';
   }
 
-  sendMessage(content: string, sessionId: string, fileIds?: string[], model?: string): SendStatus {
+  sendMessage(content: string, sessionId: string, fileIds?: string[]): SendStatus {
     const msg: Record<string, unknown> = { type: 'message', content, session_id: sessionId };
     if (fileIds && fileIds.length > 0) {
       msg.file_ids = fileIds;
     }
-    // Per-message model override from the composer's picker (omitted → server
-    // uses the configured default). May be an Anthropic id or an Ollama model.
-    if (model) {
-      msg.model = model;
-    }
+    // No model field: the server resolves the session row's model each
+    // turn (sessions.model, set at creation or via PATCH), so the pick is
+    // per-chat rather than a client-global override.
     return this.send(msg);
   }
 
