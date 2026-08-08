@@ -160,12 +160,16 @@ def build_source_runners(
         source = GitHubSource()
         # Guardrails: restrict which repos (matched on the "repo_name" metadata
         # key) and which GitHub actors (matched on the "actors" metadata key —
-        # every login involved in a notification) reach the inbox. The two rules
+        # every login involved in a notification) reach the inbox. The rules
         # AND together; within each, deny wins and a non-empty allow is
-        # fail-closed.
+        # fail-closed. ci_branch is deny-only on purpose: it is empty for
+        # everything except CheckSuite notifications, so an allow list there
+        # would fail closed and drop the whole feed.
         gh_filter = InboxFilter(rules=[
             FieldRule(field="repo_name", allow=gh.allow_repos, deny=gh.deny_repos),
             FieldRule(field="actors", allow=gh.allow_actors, deny=gh.deny_actors),
+            FieldRule(field="reason", allow=gh.allow_reasons, deny=gh.deny_reasons),
+            FieldRule(field="ci_branch", deny=gh.deny_ci_branches),
         ])
         runners.append(SourceRunner(
             source=source,
@@ -180,10 +184,13 @@ def build_source_runners(
         if gh_filter.active:
             logger.info(
                 "Registered source: github (batch=%d, guardrail: "
-                "repos allow=%s deny=%s; actors allow=%s deny=%s)",
+                "repos allow=%s deny=%s; actors allow=%s deny=%s; "
+                "reasons allow=%s deny=%s; ci_branches deny=%s)",
                 gh.batch_size,
                 gh.allow_repos or "*", gh.deny_repos or [],
                 gh.allow_actors or "*", gh.deny_actors or [],
+                gh.allow_reasons or "*", gh.deny_reasons or [],
+                gh.deny_ci_branches or [],
             )
         else:
             logger.info("Registered source: github (batch=%d)", gh.batch_size)

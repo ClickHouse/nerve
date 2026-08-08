@@ -128,10 +128,28 @@ sync:
   github:
     enabled: true
     schedule: "*/15 * * * *"
-    # Guardrails — limit which repos reach the inbox (case-insensitive globs).
-    # allow_repos = allowlist (empty = all); deny_repos takes precedence.
+    # Guardrails (case-insensitive globs; deny wins; non-empty allow is
+    # fail-closed). allow_* = allowlist (empty = all pass).
+    #   repo_name — the notification's repo full_name ("ClickHouse/nerve").
+    #   actors    — every login involved (author, assignees, commenters).
+    #   reason    — GitHub's notification reason: mention, author,
+    #               review_requested, assign, team_mention, comment,
+    #               subscribed, ci_activity, state_change, ...
+    #   ci_branch — branch of a CI run (empty for everything else), so this
+    #               one is deny-only: an allow list would fail closed and
+    #               drop every non-CI notification.
     allow_repos: []                # Example: ["ClickHouse/*", "myorg/myrepo"]
     deny_repos: []
+    allow_actors: []
+    deny_actors: []
+    allow_reasons: []
+    deny_reasons: []               # Example: ["comment", "subscribed"] — mute
+                                   # follow-up churn on threads you only
+                                   # commented on / watch; keep mentions,
+                                   # review requests, and your own PRs.
+    deny_ci_branches: []           # Example: ["main", "master"] — keep CI
+                                   # failures on your own PR branches, drop
+                                   # default-branch syncs and scheduled runs.
   github_repos:                    # Monitor a set of repos for NEW issues & PRs
     enabled: false
     schedule: "*/15 * * * *"

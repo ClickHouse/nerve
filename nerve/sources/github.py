@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -28,6 +29,27 @@ _MAX_COMMENT_CHARS = 2_000
 
 # Concurrent API calls for enrichment.
 _MAX_CONCURRENT_FETCHES = 5
+
+# CheckSuite notifications carry no ``subject.url``, so they can never be
+# enriched — the branch in the title is the only clue about whose run it was:
+#   "CI workflow run failed for main branch"
+#   "CI workflow run, Attempt #2 failed for chore/drop-anyio-patch branch"
+# A run on the default branch is an upstream sync or a schedule, never a PR.
+_CI_BRANCH_RE = re.compile(r"\bfor (?P<branch>\S+) branch$")
+
+
+def _ci_branch(subject_type: str, title: str) -> str:
+    """Branch of a CI run, or ``""`` for anything else.
+
+    Surfaced as the ``ci_branch`` metadata key so the inbox guardrail can deny
+    runs on branches that aren't yours (see :mod:`nerve.sources.filters`).
+    Empty for non-CheckSuite subjects and for titles we can't parse — a *deny*
+    rule never matches the empty string, so those records pass untouched.
+    """
+    if subject_type != "CheckSuite":
+        return ""
+    match = _CI_BRANCH_RE.search(title or "")
+    return match.group("branch") if match else ""
 
 
 def _collect_actors(
@@ -240,6 +262,7 @@ class GitHubSource(Source):
                         "repo_name": repo_name,
                         "repo_url": repo.get("html_url", ""),
                         "actors": actors,
+                        "ci_branch": _ci_branch(subject_type, subject_title),
                     },
                 ))
 

@@ -87,6 +87,10 @@ class SourceHealth:
 # to a fast LLM for extraction/condensation.
 _CONDENSE_THRESHOLD = 800  # chars
 
+# Per-record guardrail drop lines emitted per run (a noisy source could
+# otherwise drop hundreds at once).
+_MAX_DROP_LOG_LINES = 10
+
 _CONDENSE_PROMPT = (
     "Extract the essential information from this source record content.\n"
     "Rules:\n"
@@ -269,6 +273,17 @@ class SourceRunner:
                     self.source.source_name, dropped_count, len(records),
                     dropped[0].summary,
                 )
+                # Name the rule that fired — the summary alone can't tell a
+                # repo drop from an actor or CI-branch drop, and the record
+                # itself is gone after this point. Capped to keep logs sane.
+                for record in dropped[:_MAX_DROP_LOG_LINES]:
+                    rule = self.inbox_filter.rejects(record)
+                    field = rule.field if rule else "?"
+                    logger.info(
+                        "Source %s: dropped %s on %s=%r — %s",
+                        self.source.source_name, record.id, field,
+                        (record.metadata or {}).get(field), record.summary,
+                    )
             records = kept
 
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
