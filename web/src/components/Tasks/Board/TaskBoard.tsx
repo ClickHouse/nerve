@@ -10,13 +10,23 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core';
-import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
+import {
+  SortableContext,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+} from '@dnd-kit/sortable';
 import type { Task } from '../../../api/client';
 import { useTaskStatusStore } from '../../../stores/taskStatusStore';
 import { useTaskStore } from '../../../stores/taskStore';
 import { boardAnnouncements } from './announcements';
 import { BoardCardOverlay } from './BoardCard';
-import { isNoOpMove, resolveDropIntent } from './dropIntent';
+import {
+  columnDragId,
+  isNoOpMove,
+  reorderStatuses,
+  resolveDropIntent,
+  statusFromDropTarget,
+} from './dropIntent';
 import { BoardColumn } from './BoardColumn';
 
 const COLLAPSED_KEY = 'nerve_board_collapsed';
@@ -48,8 +58,10 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   const setShowCreateDialog = useTaskStore((s) => s.setShowCreateDialog);
   const searchQuery = useTaskStore((s) => s.searchQuery);
   const statuses = useTaskStatusStore((s) => s.statuses);
+  const reorderColumns = useTaskStatusStore((s) => s.reorder);
 
   const [activeTask, setActiveTask] = useState<Task | null>(null);
+  const [activeColumn, setActiveColumn] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<string[]>(readCollapsed);
 
   const sensors = useSensors(
@@ -80,12 +92,17 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   }, []);
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
-    const task = event.active.data.current?.task as Task | undefined;
-    setActiveTask(task ?? null);
+    const data = event.active.data.current;
+    if (data?.type === 'column') {
+      setActiveColumn(String(data.status));
+      return;
+    }
+    setActiveTask((data?.task as Task | undefined) ?? null);
   }, []);
 
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     setActiveTask(null);
+    setActiveColumn(null);
     const { active, over } = event;
     if (!over) return;
 
@@ -93,13 +110,24 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
     const overId = String(over.id);
     if (activeId === overId) return;
 
+    // Columns and cards share one DndContext, so branch on what was picked
+    // up rather than on what it landed on.
+    if (active.data.current?.type === 'column') {
+      const moved = String(active.data.current.status);
+      const target = statusFromDropTarget(lanes, overId);
+      if (!target) return;
+      const next = reorderStatuses(lanes.map((l) => l.status), moved, target);
+      if (next) void reorderColumns(next);
+      return;
+    }
+
     const intent = resolveDropIntent(lanes, activeId, overId);
     if (!intent) return;
     // Skip the round trip when the card was dropped back where it started.
     if (isNoOpMove(lanes, activeId, intent)) return;
 
     void moveTask(activeId, intent);
-  }, [lanes, moveTask]);
+  }, [lanes, moveTask, reorderColumns]);
 
   if (boardLoading) {
     return <div className="text-text-faint text-center py-10">Loading board...</div>;
@@ -132,11 +160,15 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
         collisionDetection={closestCorners}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveTask(null)}
+        onDragCancel={() => { setActiveTask(null); setActiveColumn(null); }}
         accessibility={{ announcements }}
       >
         <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden px-4 pb-4">
           <div className="flex gap-3 h-full items-start min-w-min">
+            <SortableContext
+              items={lanes.map((l) => columnDragId(l.status))}
+              strategy={horizontalListSortingStrategy}
+            >
             {lanes.map((lane) => (
               <BoardColumn
                 key={lane.status}
@@ -149,11 +181,17 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
                 onOpenTask={onOpenTask}
               />
             ))}
+            </SortableContext>
           </div>
         </div>
 
         <DragOverlay dropAnimation={null}>
           {activeTask && <BoardCardOverlay task={activeTask} />}
+          {activeColumn && (
+            <div className="w-[300px] px-3 py-2.5 bg-surface-raised border border-accent/50 rounded-xl shadow-xl text-[13px] font-semibold text-text-secondary">
+              {statusByName.get(activeColumn)?.label ?? activeColumn}
+            </div>
+          )}
         </DragOverlay>
       </DndContext>
     </>

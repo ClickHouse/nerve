@@ -434,6 +434,24 @@ async def create_task_status(
     return created
 
 
+class TaskStatusReorderRequest(BaseModel):
+    """The full desired column order, outermost first."""
+
+    names: list[str]
+
+
+@router.post("/api/task-statuses/reorder")
+async def reorder_task_statuses(
+    req: TaskStatusReorderRequest, user: dict = Depends(require_auth),
+):
+    """Set board column order in one write.
+
+    Declared above /{name} so "reorder" isn't captured as a status name.
+    """
+    deps = get_deps()
+    return {"statuses": await deps.db.reorder_task_statuses(req.names)}
+
+
 @router.patch("/api/task-statuses/{name}")
 async def update_task_status(
     name: str, req: TaskStatusUpdateRequest, user: dict = Depends(require_auth),

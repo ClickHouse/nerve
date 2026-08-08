@@ -13,6 +13,7 @@ interface TaskStatusState {
   create: (data: { name: string; label?: string; color?: string; description?: string }) => Promise<void>;
   update: (name: string, data: { label?: string; color?: string; description?: string; sort_order?: number }) => Promise<void>;
   remove: (name: string) => Promise<void>;
+  reorder: (names: string[]) => Promise<void>;
   byName: (name: string) => TaskStatusDef | undefined;
 }
 
@@ -42,6 +43,28 @@ export const useTaskStatusStore = create<TaskStatusState>((set, get) => ({
   update: async (name, data) => {
     await api.updateTaskStatus(name, data);
     await get().load(true);
+  },
+
+  /**
+   * Set column order. Applied locally first so the dragged column doesn't
+   * snap back while the request is in flight; the server's echo is
+   * authoritative, and a failure reloads rather than guessing.
+   */
+  reorder: async (names) => {
+    const snapshot = get().statuses;
+    const byName = new Map(snapshot.map((s) => [s.name, s]));
+    const optimistic = names
+      .map((n) => byName.get(n))
+      .filter((s): s is TaskStatusDef => Boolean(s));
+    if (optimistic.length === snapshot.length) set({ statuses: optimistic });
+    try {
+      const { statuses } = await api.reorderTaskStatuses(names);
+      set({ statuses });
+    } catch (e) {
+      console.error('Failed to reorder statuses:', e);
+      set({ statuses: snapshot });
+      await get().load(true);
+    }
   },
 
   // Throws on failure (e.g. 409 in-use, 400 protected) so callers can surface

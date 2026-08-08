@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { Task } from '../../../api/client';
 import type { Lane } from '../../../stores/taskStore';
-import { isNoOpMove, resolveDropIntent } from './dropIntent';
+import {
+  columnDragId,
+  isNoOpMove,
+  reorderStatuses,
+  resolveDropIntent,
+  statusFromDropTarget,
+} from './dropIntent';
 
 /**
  * Drop resolution: "card X landed on target Y" → the neighbour pair the
@@ -125,5 +131,68 @@ describe('isNoOpMove', () => {
   it('recognises the tail slot as a no-op for the last card', () => {
     expect(isNoOpMove(lanes(), 'c', { status: 'pending', beforeId: 'b', afterId: null }))
       .toBe(true);
+  });
+});
+
+describe('statusFromDropTarget', () => {
+  it('resolves a column drop target', () => {
+    expect(statusFromDropTarget(lanes(), columnDragId('done'))).toBe('done');
+  });
+
+  it('resolves a lane body drop target', () => {
+    expect(statusFromDropTarget(lanes(), 'lane:in_progress')).toBe('in_progress');
+  });
+
+  it('resolves a card drop target to its lane', () => {
+    // A column drag often finishes with the cursor over a card, since
+    // collision detection returns the nearest droppable of any kind.
+    // Treating that as "no target" would make the gesture feel broken.
+    expect(statusFromDropTarget(lanes(), 'b')).toBe('pending');
+  });
+
+  it('returns null for an unknown target', () => {
+    expect(statusFromDropTarget(lanes(), 'ghost')).toBeNull();
+  });
+
+  it('namespaces column ids away from task ids', () => {
+    // A status could legitimately be named the same as nothing here, but
+    // the prefix is what guarantees a task id can never be mistaken for a
+    // column in the shared DndContext.
+    expect(columnDragId('pending')).not.toBe('pending');
+    expect(statusFromDropTarget(lanes(), columnDragId('pending'))).toBe('pending');
+  });
+});
+
+describe('reorderStatuses', () => {
+  const order = ['pending', 'in_progress', 'done'];
+
+  it('moves a column later', () => {
+    expect(reorderStatuses(order, 'pending', 'done'))
+      .toEqual(['in_progress', 'done', 'pending']);
+  });
+
+  it('moves a column earlier', () => {
+    expect(reorderStatuses(order, 'done', 'pending'))
+      .toEqual(['done', 'pending', 'in_progress']);
+  });
+
+  it('moves into the middle', () => {
+    expect(reorderStatuses(order, 'done', 'in_progress'))
+      .toEqual(['pending', 'done', 'in_progress']);
+  });
+
+  it('returns null when the column lands on itself', () => {
+    // Skips the request entirely rather than writing the order it already had.
+    expect(reorderStatuses(order, 'pending', 'pending')).toBeNull();
+  });
+
+  it('returns null when either end is unknown', () => {
+    expect(reorderStatuses(order, 'pending', 'nope')).toBeNull();
+    expect(reorderStatuses(order, 'nope', 'pending')).toBeNull();
+  });
+
+  it('preserves every column', () => {
+    const next = reorderStatuses(order, 'in_progress', 'done')!;
+    expect([...next].sort()).toEqual([...order].sort());
   });
 });

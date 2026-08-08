@@ -1,6 +1,8 @@
 import { useDroppable } from '@dnd-kit/core';
-import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
-import { ChevronLeft, ChevronRight, Plus } from 'lucide-react';
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import { ChevronLeft, ChevronRight, GripVertical, Plus } from 'lucide-react';
+import { columnDragId } from './dropIntent';
 import type { Task, TaskStatusDef } from '../../../api/client';
 import type { Lane } from '../../../stores/taskStore';
 import { BoardCard } from './BoardCard';
@@ -26,13 +28,50 @@ export function BoardColumn({
     data: { type: 'lane', status: lane.status },
   });
 
+  // The column is itself sortable, but only by its header: the body has to
+  // stay a drop target for cards, and putting drag listeners on the whole
+  // column would make every card drag also pick up its column.
+  const {
+    setNodeRef: setColumnRef,
+    attributes: columnAttributes,
+    listeners: columnListeners,
+    transform: columnTransform,
+    transition: columnTransition,
+    isDragging: isColumnDragging,
+  } = useSortable({
+    id: columnDragId(lane.status),
+    data: { type: 'column', status: lane.status },
+  });
+
+  const columnStyle = {
+    transform: CSS.Translate.toString(columnTransform),
+    transition: columnTransition,
+  };
+  const dragHandle = (
+    <span
+      {...columnAttributes}
+      {...columnListeners}
+      title="Drag to reorder column"
+      aria-label={`Reorder ${status?.label ?? lane.status} column`}
+      className="text-text-faint hover:text-text-muted cursor-grab active:cursor-grabbing shrink-0"
+    >
+      <GripVertical size={13} />
+    </span>
+  );
+
   const label = status?.label ?? lane.status;
   const color = status?.color ?? '#6b7280';
   const hidden = lane.total - lane.tasks.length;
 
   if (collapsed) {
     return (
-      <div className="w-11 shrink-0 flex flex-col items-center gap-3 py-3 bg-surface-raised/40 border border-border-subtle rounded-xl">
+      <div
+        ref={setColumnRef}
+        style={columnStyle}
+        className={`w-11 shrink-0 flex flex-col items-center gap-3 py-3 bg-surface-raised/40 border border-border-subtle rounded-xl
+          ${isColumnDragging ? 'opacity-40' : ''}`}
+      >
+        {dragHandle}
         <button
           onClick={() => onToggleCollapse(lane.status)}
           className="text-text-faint hover:text-text-muted cursor-pointer"
@@ -56,9 +95,15 @@ export function BoardColumn({
   }
 
   return (
-    <div className="w-[300px] shrink-0 flex flex-col bg-surface-raised/40 border border-border-subtle rounded-xl max-h-full">
+    <div
+      ref={setColumnRef}
+      style={columnStyle}
+      className={`w-[300px] shrink-0 flex flex-col bg-surface-raised/40 border border-border-subtle rounded-xl max-h-full
+        ${isColumnDragging ? 'opacity-40' : ''}`}
+    >
       <div className="shrink-0 px-3 py-2.5 border-b border-border-subtle">
         <div className="flex items-center gap-2">
+          {dragHandle}
           <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
           <h2 className="text-[13px] font-semibold text-text-secondary truncate">{label}</h2>
           <span className="text-[11px] text-text-faint tabular-nums">{lane.total}</span>

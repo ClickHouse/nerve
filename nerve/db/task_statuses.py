@@ -68,6 +68,34 @@ class TaskStatusStore:
         ) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def reorder_task_statuses(self, names: list[str]) -> list[dict]:
+        """Rewrite ``sort_order`` to match the given sequence of names.
+
+        Takes the whole desired order rather than one status's new index:
+        board columns are reordered by dragging, which shifts several
+        statuses at once, and sending the full sequence makes the write
+        idempotent and free of the intermediate states a per-row PATCH
+        storm would leave behind if one of them failed.
+
+        Names not present in the list keep their relative order after the
+        ones that are, so an unknown or omitted status can't be silently
+        dropped from the board.
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT name FROM task_statuses ORDER BY sort_order ASC, name ASC"
+            ) as cursor:
+                existing = [row[0] async for row in cursor]
+
+            wanted = [n for n in names if n in existing]
+            ordered = wanted + [n for n in existing if n not in wanted]
+            await self.db.executemany(
+                "UPDATE task_statuses SET sort_order = ? WHERE name = ?",
+                [(i, name) for i, name in enumerate(ordered)],
+            )
+
+        return await self.list_task_statuses()
+
     async def get_task_status_def(self, name: str) -> dict | None:
         async with self.db.execute(
             "SELECT * FROM task_statuses WHERE name = ?", (name,)
