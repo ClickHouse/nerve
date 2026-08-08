@@ -10,6 +10,21 @@ export interface TaskStatusDef {
   created_at?: string;
 }
 
+export interface Task {
+  id: string;
+  title: string;
+  status: string;
+  deadline: string | null;
+  source: string;
+  source_url: string | null;
+  tags: string;
+  /** Board rank within its lane, ascending. Server-assigned. */
+  position: number;
+  created_at: string;
+  updated_at: string;
+  content?: string;
+}
+
 export interface UltracodeUsage {
   input_tokens?: number;
   cached_input_tokens?: number;
@@ -332,9 +347,10 @@ export const api = {
     }),
 
   // Tasks
-  listTasks: (params?: { status?: string; sort?: string; limit?: number; offset?: number }) => {
+  listTasks: (params?: { status?: string; tag?: string; sort?: string; limit?: number; offset?: number }) => {
     const qs = new URLSearchParams();
     if (params?.status) qs.set('status', params.status);
+    if (params?.tag) qs.set('tag', params.tag);
     if (params?.sort) qs.set('sort', params.sort);
     if (params?.limit !== undefined) qs.set('limit', String(params.limit));
     if (params?.offset !== undefined) qs.set('offset', String(params.offset));
@@ -350,11 +366,49 @@ export const api = {
       `/tasks/search?${qs}`,
     );
   },
+  /** Every board lane in one round trip. */
+  getTaskBoard: (params?: { tag?: string; limit?: number; q?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.tag) qs.set('tag', params.tag);
+    if (params?.q) qs.set('q', params.q);
+    if (params?.limit !== undefined) qs.set('limit', String(params.limit));
+    const q = qs.toString();
+    return request<{
+      statuses: TaskStatusDef[];
+      lanes: { status: string; total: number; tasks: Task[] }[];
+    }>(`/tasks/board${q ? '?' + q : ''}`);
+  },
+  listTaskTags: (includeDone = false) =>
+    request<{ tags: { name: string; count: number }[] }>(
+      `/tasks/tags${includeDone ? '?include_done=true' : ''}`,
+    ),
+  /**
+   * Move a task within or between lanes. Sends the neighbours it should
+   * land between rather than a rank — the server computes the ordering,
+   * so a board a few seconds stale can't write a conflicting position.
+   */
+  moveTask: (id: string, data: { status?: string; before_id?: string | null; after_id?: string | null }) =>
+    request<{ task: Task }>(`/tasks/${id}/move`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
-  createTask: (data: { title: string; content?: string; deadline?: string }) =>
-    request<any>('/tasks', { method: 'POST', body: JSON.stringify(data) }),
-  updateTask: (id: string, data: { status?: string; note?: string; content?: string }) =>
-    request<any>(`/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  createTask: (data: {
+    title: string; content?: string; deadline?: string;
+    tags?: string; status?: string; confirm_duplicate?: boolean;
+  }) => request<{ task: Task; message: string }>('/tasks', {
+    method: 'POST', body: JSON.stringify(data),
+  }),
+  /**
+   * Partial update. Server reads `deadline` and `tags` by *presence*: omit
+   * the key to leave the field alone, pass '' to clear it.
+   */
+  updateTask: (id: string, data: {
+    status?: string; note?: string; content?: string; title?: string;
+    deadline?: string; tags?: string;
+  }) => request<{ task: Task; task_id: string; updated: boolean }>(`/tasks/${id}`, {
+    method: 'PATCH', body: JSON.stringify(data),
+  }),
 
   // Task statuses (configurable)
   listTaskStatuses: () =>
