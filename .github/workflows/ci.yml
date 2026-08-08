@@ -74,3 +74,6 @@ jobs:
 
       - name: Build frontend (tsc -b && vite build)
         run: npm run build
+
+      - name: Run test suite (Vitest)
+        run: npm test
