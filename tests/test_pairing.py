@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 
 import nerve.pairing as pairing
+import pytest
 from nerve.pairing import (
     MAX_ATTEMPTS,
     clear_pairing_code,
@@ -33,6 +35,32 @@ class TestGenerate:
         clear_pairing_code()
         code = get_or_create_pairing_code()
         assert read_pairing_code() == code
+
+    def test_state_is_private_if_path_chmod_fails(self, monkeypatch):
+        def fail_chmod(*args, **kwargs):
+            raise OSError("chmod failed")
+
+        monkeypatch.setattr(os, "chmod", fail_chmod)
+        previous_umask = os.umask(0)
+        try:
+            generate_pairing_code()
+        finally:
+            os.umask(previous_umask)
+
+        assert pairing._pairing_path().stat().st_mode & 0o777 == 0o600
+
+    def test_failed_replace_preserves_existing_state(self, monkeypatch):
+        code = generate_pairing_code()
+
+        def fail_replace(*args, **kwargs):
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+        with pytest.raises(OSError, match="replace failed"):
+            generate_pairing_code()
+
+        assert read_pairing_code() == code
+        assert list(pairing._pairing_path().parent.glob(".telegram_pairing.*.tmp")) == []
 
 
 class TestVerify:
