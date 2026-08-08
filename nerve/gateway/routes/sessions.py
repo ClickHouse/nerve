@@ -137,14 +137,16 @@ async def _attach_review_loops(deps, sessions: list[dict]) -> None:
 @router.get("/api/sessions")
 async def list_sessions(user: dict = Depends(require_auth)):
     deps = get_deps()
-    sessions = await deps.engine.sessions.list_sessions()
+    sessions = await deps.engine.sessions.list_active_sessions()
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
     await _attach_review_loops(deps, sessions)
-    return {"sessions": sessions}
+    archived_count = await deps.engine.sessions.count_archived_sessions()
+    system_count = await deps.engine.sessions.count_system_sessions()
+    return {"sessions": sessions, "archived_count": archived_count, "system_count": system_count}
 
 
 @router.get("/api/sessions/search")
@@ -154,6 +156,34 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
     deps = get_deps()
     sessions = await deps.db.search_sessions(q.strip())
+    running_ids = deps.engine.sessions.get_running_ids()
+    awaiting_ids = get_awaiting_ids()
+    for s in sessions:
+        s["is_running"] = s["id"] in running_ids
+        s["awaiting_input"] = s["id"] in awaiting_ids
+    await _attach_review_loops(deps, sessions)
+    return {"sessions": sessions}
+
+
+@router.get("/api/sessions/archived")
+async def list_archived_sessions(user: dict = Depends(require_auth)):
+    """Archived sessions — lazily fetched when the sidebar Archived group is expanded."""
+    deps = get_deps()
+    sessions = await deps.engine.sessions.list_archived_sessions()
+    running_ids = deps.engine.sessions.get_running_ids()
+    awaiting_ids = get_awaiting_ids()
+    for s in sessions:
+        s["is_running"] = s["id"] in running_ids
+        s["awaiting_input"] = s["id"] in awaiting_ids
+    await _attach_review_loops(deps, sessions)
+    return {"sessions": sessions}
+
+
+@router.get("/api/sessions/system")
+async def list_system_sessions(user: dict = Depends(require_auth)):
+    """System sessions (cron/hook) — lazily fetched when the sidebar System group is expanded."""
+    deps = get_deps()
+    sessions = await deps.engine.sessions.list_system_sessions()
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
     for s in sessions:
@@ -314,6 +344,12 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
         fields["title"] = req["title"]
     if "starred" in req:
         fields["starred"] = 1 if req["starred"] else 0
+        # Starring an archived session restores it first, then stars — so the
+        # star->project hook below fires on a live (idle) session. "archived"
+        # is the persisted SessionStatus.ARCHIVED value.
+        if fields["starred"] == 1 and session.get("status") == "archived":
+            fields["status"] = "idle"
+            fields["archived_at"] = None
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
@@ -443,6 +479,14 @@ async def archive_session(session_id: str, user: dict = Depends(require_auth)):
     deps = get_deps()
     await deps.engine.sessions.archive_session(session_id)
     return {"archived": True}
+
+
+@router.post("/api/sessions/{session_id}/unarchive")
+async def unarchive_session(session_id: str, user: dict = Depends(require_auth)):
+    """Restore an archived session (Archived group → Unarchive / Star)."""
+    deps = get_deps()
+    await deps.engine.sessions.unarchive_session(session_id)
+    return {"unarchived": True}
 
 
 @router.get("/api/sessions/{session_id}/events")

@@ -85,6 +85,62 @@ class SessionStore:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
+    async def list_archived_sessions(self, limit: int = 200) -> list[dict]:
+        """Archived sessions, most recently archived first.
+
+        Separate from :meth:`list_sessions` (which always excludes archived):
+        the sidebar fetches this lazily, only when the Archived group is
+        expanded.
+        """
+        sql = (
+            "SELECT * FROM sessions WHERE status = 'archived' "
+            "ORDER BY archived_at DESC LIMIT ?"
+        )
+        async with self.db.execute(sql, (limit,)) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def count_archived_sessions(self) -> int:
+        """Count archived sessions (drives the collapsed sidebar badge)."""
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM sessions WHERE status = 'archived'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+    async def list_active_sessions(self) -> list[dict]:
+        """Main sidebar feed: every non-archived conversation session, newest
+        first, UNBOUNDED. Excludes system sources (cron/hook) — those now load
+        lazily via :meth:`list_system_sessions`, so cron traffic no longer
+        crowds the conversation list. No LIMIT: the client renders everything.
+        """
+        query = (
+            "SELECT * FROM sessions"
+            " WHERE status != 'archived' AND source NOT IN ('cron', 'hook')"
+            " ORDER BY updated_at DESC"
+        )
+        async with self.db.execute(query) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def list_system_sessions(self, limit: int = 200) -> list[dict]:
+        """System sessions (cron/hook), newest first — lazily fetched when the
+        sidebar System group is expanded."""
+        query = (
+            "SELECT * FROM sessions"
+            " WHERE status != 'archived' AND source IN ('cron', 'hook')"
+            " ORDER BY updated_at DESC LIMIT ?"
+        )
+        async with self.db.execute(query, (limit,)) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def count_system_sessions(self) -> int:
+        """Count non-archived system sessions (drives the collapsed System badge)."""
+        async with self.db.execute(
+            "SELECT COUNT(*) FROM sessions"
+            " WHERE status != 'archived' AND source IN ('cron', 'hook')"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
     async def search_sessions(self, query: str, limit: int = 100) -> list[dict]:
         """Search sessions by title (LIKE match), across all non-archived sessions."""
         sql = (

@@ -1,6 +1,6 @@
-import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, Repeat } from 'lucide-react';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, ArchiveRestore, Repeat } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
@@ -63,6 +63,9 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   collapsed?: boolean;
 }) {
   const [systemExpanded, setSystemExpanded] = useState(false);
+  // Archived group: collapsed by default and NOT persisted (mirrors System),
+  // so every reload starts collapsed and fetches nothing until expanded.
+  const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(loadCollapsedGroups);
   const [localQuery, setLocalQuery] = useState('');
   const [searchHovered, setSearchHovered] = useState(false);
@@ -76,7 +79,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, archivedSessions, archivedCount, archivedLoading, loadArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, loadSystemSessions } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   // Drag-to-resize the session list. It is left-anchored against the nav rail,
@@ -195,15 +198,16 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [isSearching, clearSearch]);
 
-  const { conversations, systemSessions } = useMemo(() => {
-    // External = Codex/Claude-Code/Cursor satellite sessions (MCP server +
-    // Codex thread sync). Live alongside web/telegram conversations.
-    const convos = sessions.filter(
+  // Main feed = conversations only. System (cron/hook) sessions load lazily
+  // from the store and are no longer part of `sessions` (the server excludes
+  // them). External = Codex/Claude-Code/Cursor satellites. The source guard is
+  // a light safety net; the server already scopes the feed.
+  const conversations = useMemo(
+    () => sessions.filter(
       s => s.source === 'web' || s.source === 'telegram' || s.source === 'api' || s.source === 'external',
-    );
-    const system = sessions.filter(s => s.source === 'cron' || s.source === 'hook');
-    return { conversations: convos, systemSessions: system };
-  }, [sessions]);
+    ),
+    [sessions],
+  );
 
   const activeIsRunning = agentStatus.state !== 'idle';
 
@@ -265,18 +269,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
     });
   }, [activeSession, pinnedRunning, pinnedStarred, groupedConversations]);
 
-  // Count running system sessions for the badge
-  const runningSystemCount = useMemo(
-    () => systemSessions.filter(s => s.is_running).length,
-    [systemSessions],
-  );
-
-  // Auto-expand system section when something starts running
-  useLayoutEffect(() => {
-    if (runningSystemCount > 0 && !systemExpanded) {
-      setSystemExpanded(true);
-    }
-  }, [runningSystemCount]); // eslint-disable-line react-hooks/exhaustive-deps
+  // (System sessions load lazily now — no running-count badge / auto-expand.)
 
   return (
     <div
@@ -495,11 +488,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               </div>
             ))}
 
-            {/* System sessions */}
-            {systemSessions.length > 0 && (
+            {/* System sessions (cron/hook) — lazy: nothing fetched until
+                expanded; collapsed shows just the counter. */}
+            {systemCount > 0 && (
               <div className="mt-2 border-t border-border-subtle pt-1">
                 <button
-                  onClick={() => setSystemExpanded(!systemExpanded)}
+                  onClick={() => {
+                    const next = !systemExpanded;
+                    setSystemExpanded(next);
+                    if (next && systemSessions === null && !systemLoading) {
+                      loadSystemSessions();
+                    }
+                  }}
                   className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left cursor-pointer hover:bg-surface-raised transition-colors"
                 >
                   {systemExpanded
@@ -508,40 +508,100 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   }
                   <Bot size={10} className="text-text-faint" />
                   <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">
-                    System ({systemSessions.length})
+                    System ({systemCount})
                   </span>
-                  {runningSystemCount > 0 && (
-                    <span className="ml-auto flex items-center gap-1 text-[10px] text-hue-emerald">
-                      <span className="relative flex h-1.5 w-1.5">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                        <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
-                      </span>
-                      {runningSystemCount}
-                    </span>
-                  )}
                 </button>
 
-                {systemExpanded && systemSessions.map((s) => (
-                  <Link
-                    key={s.id}
-                    to={`/chat/${s.id}`}
-                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors no-underline
-                      ${s.id === activeSession
-                        ? 'bg-accent/10 text-text-muted'
-                        : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
-                      }`}
-                  >
-                    <Bot size={11} className="shrink-0" />
-                    <div className="flex-1 min-w-0">
-                      <div className="truncate">{cleanTitle(s)}</div>
-                    </div>
-                    <StatusIndicator
-                      session={s}
-                      isActive={s.id === activeSession}
-                      isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
-                    />
-                  </Link>
-                ))}
+                {systemExpanded && (
+                  <>
+                    {systemLoading && systemSessions === null && (
+                      <div className="flex items-center gap-2 px-3 py-2 text-[11px] text-text-faint">
+                        <Loader2 size={11} className="animate-spin" />
+                        Loading...
+                      </div>
+                    )}
+                    {systemSessions !== null && systemSessions.length === 0 && (
+                      <div className="px-3 py-2 text-[11px] text-text-faint">No system sessions</div>
+                    )}
+                    {systemSessions !== null && systemSessions.map((s) => (
+                      <Link
+                        key={s.id}
+                        to={`/chat/${s.id}`}
+                        className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors no-underline
+                          ${s.id === activeSession
+                            ? 'bg-accent/10 text-text-muted'
+                            : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
+                          }`}
+                      >
+                        <Bot size={11} className="shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="truncate">{cleanTitle(s)}</div>
+                        </div>
+                        <StatusIndicator
+                          session={s}
+                          isActive={s.id === activeSession}
+                          isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
+                        />
+                      </Link>
+                    ))}
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Archived sessions — lazy: nothing fetched until expanded.
+                Rendered after System, collapsed by default (not persisted). */}
+            {archivedCount > 0 && (
+              <div className="mt-2 border-t border-border-subtle pt-1">
+                <button
+                  onClick={() => {
+                    const next = !archivedExpanded;
+                    setArchivedExpanded(next);
+                    if (next && archivedSessions === null && !archivedLoading) {
+                      loadArchivedSessions();
+                    }
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left cursor-pointer hover:bg-surface-raised transition-colors"
+                >
+                  {archivedExpanded
+                    ? <ChevronDown size={10} className="text-text-faint" />
+                    : <ChevronRight size={10} className="text-text-faint" />
+                  }
+                  <Archive size={10} className="text-text-faint" />
+                  <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">
+                    Archived ({archivedCount})
+                  </span>
+                </button>
+
+                {archivedExpanded && (
+                  <>
+                    {archivedLoading && archivedSessions === null && (
+                      <div className="flex items-center gap-2 px-3 py-2 text-[11px] text-text-faint">
+                        <Loader2 size={11} className="animate-spin" />
+                        Loading...
+                      </div>
+                    )}
+                    {archivedSessions !== null && archivedSessions.length === 0 && (
+                      <div className="px-3 py-2 text-[11px] text-text-faint">No archived sessions</div>
+                    )}
+                    {archivedSessions !== null && archivedSessions.map((s) => (
+                      <SessionItem
+                        key={s.id}
+                        session={s}
+                        isActive={s.id === activeSession}
+                        isRunning={false}
+                        onDelete={onDelete}
+                        onRename={renameSession}
+                        onToggleStar={toggleStar}
+                        onArchive={archiveSession}
+                        onUnarchive={unarchiveSession}
+                        onStarArchived={starArchivedSession}
+                        archived
+                        showDate
+                      />
+                    ))}
+                  </>
+                )}
               </div>
             )}
           </>
@@ -662,7 +722,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, showDate }: {
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, showDate }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
@@ -670,6 +730,9 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   onRename: (id: string, title: string) => Promise<void>;
   onToggleStar: (id: string) => Promise<void>;
   onArchive: (id: string) => Promise<void>;
+  onUnarchive?: (id: string) => Promise<void>;
+  onStarArchived?: (id: string) => Promise<void>;
+  archived?: boolean;
   showDate?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -786,13 +849,14 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                onToggleStar(session.id);
+                if (archived) onStarArchived?.(session.id);
+                else onToggleStar(session.id);
                 setMenuOpen(false);
               }}
               className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
             >
               <Star size={14} className={session.starred ? 'text-hue-yellow fill-hue-yellow' : ''} />
-              {session.starred ? 'Unstar' : 'Star'}
+              {archived ? 'Star' : session.starred ? 'Unstar' : 'Star'}
             </button>
             <button
               onClick={(e) => {
@@ -807,18 +871,33 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               <Pencil size={14} />
               Rename
             </button>
-            <button
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setMenuOpen(false);
-                onArchive(session.id);
-              }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
-            >
-              <Archive size={14} />
-              Archive
-            </button>
+            {archived ? (
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  onUnarchive?.(session.id);
+                }}
+                className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+              >
+                <ArchiveRestore size={14} />
+                Unarchive
+              </button>
+            ) : (
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  onArchive(session.id);
+                }}
+                className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+              >
+                <Archive size={14} />
+                Archive
+              </button>
+            )}
             <div className="border-t border-border my-1" />
             <button
               onClick={(e) => {

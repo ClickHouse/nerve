@@ -8,45 +8,35 @@ export function parseTimestamp(input: string): Date {
 }
 
 /**
- * Assign a human-readable group label based on when something was last updated.
+ * Assign a session to a coarse recency bucket for the sidebar.
  *
- * Today     → "Last hour" / "N hours ago"
- * Yesterday → "Yesterday"
- * This week → Day name (Monday, Tuesday, …)
- * Older     → "Last 30 Days" or "February 2026" etc.
+ *   < 1h                    → "Last hour"
+ *   1–3h                    → "Last 3 hours"
+ *   same calendar day       → "Today"
+ *   within the last 7 days  → "This week"
+ *   older                   → "Other"
  *
- * Items arrive sorted by updated_at DESC, so Map insertion order
- * naturally produces the correct top-to-bottom group sequence.
+ * The first two buckets are purely relative (elapsed time), so they stay
+ * correct across a midnight boundary. Items arrive sorted by updated_at DESC,
+ * so Map insertion order in groupByDate yields the correct top-to-bottom
+ * sequence, and empty buckets are never created (so they aren't rendered).
  */
 export function getDateGroup(updatedAt: string): string {
-  if (!updatedAt) return 'Recent';
+  if (!updatedAt) return 'Other';
   const now = new Date();
   const date = parseTimestamp(updatedAt);
+  const hoursAgo = (now.getTime() - date.getTime()) / 3600000;
+
+  if (hoursAgo < 1) return 'Last hour';
+  if (hoursAgo < 3) return 'Last 3 hours';
 
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const yesterdayStart = new Date(todayStart.getTime() - 86400000);
+  if (date >= todayStart) return 'Today';
 
-  // Today — hourly buckets
-  if (date >= todayStart) {
-    const hoursAgo = Math.floor((now.getTime() - date.getTime()) / 3600000);
-    if (hoursAgo < 1) return 'Last hour';
-    if (hoursAgo === 1) return '1 hour ago';
-    return `${hoursAgo} hours ago`;
-  }
-
-  if (date >= yesterdayStart) return 'Yesterday';
-
-  // This week — individual day names
   const daysDiff = Math.floor((todayStart.getTime() - date.getTime()) / 86400000);
-  if (daysDiff < 7) {
-    return date.toLocaleDateString(undefined, { weekday: 'long' });
-  }
+  if (daysDiff < 7) return 'This week';
 
-  // Recent — last 30 days
-  if (daysDiff < 30) return 'Last 30 Days';
-
-  // Older — month + year
-  return date.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  return 'Other';
 }
 
 /**
