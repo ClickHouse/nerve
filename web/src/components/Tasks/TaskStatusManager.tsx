@@ -5,6 +5,7 @@ import {
   statusBadgeStyle,
   type TaskStatusDef,
 } from '../../stores/taskStatusStore';
+import { Modal } from '../ui/Modal';
 
 const PALETTE = [
   '#ef4444', '#f97316', '#f59e0b', '#eab308', '#84cc16', '#22c55e',
@@ -100,26 +101,86 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
     finally { setBusy(false); }
   };
 
-  return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
-      <div
-        className="bg-surface-raised border border-border-subtle rounded-xl w-[560px] max-w-[92vw] max-h-[85vh] flex flex-col"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-3 border-b border-border">
-          <h2 className="text-[15px] font-semibold">Task Statuses</h2>
-          <button onClick={onClose} className="text-text-faint hover:text-text-muted cursor-pointer p-1">
-            <X size={18} />
-          </button>
-        </div>
+  // The add form is pinned below the scrolling status list, so it stays
+  // reachable however many statuses are configured. It's a form rather
+  // than a button row, hence the footer layout override.
+  const addStatusFooter = showAdd ? (
+    <div className="space-y-3">
+      <div className="flex gap-2">
+        <label
+          className="relative w-9 h-9 rounded-lg border border-border shrink-0 cursor-pointer"
+          style={{ backgroundColor: color }}
+          title="Pick a color"
+        >
+          <input
+            type="color"
+            value={color}
+            onChange={e => setColor(e.target.value)}
+            className="absolute inset-0 opacity-0 cursor-pointer"
+          />
+        </label>
+        <input
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="name (e.g. in_review)"
+          autoFocus
+          className="flex-1 px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50"
+        />
+        <input
+          value={label}
+          onChange={e => setLabel(e.target.value)}
+          placeholder="Label (optional)"
+          className="flex-1 px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50"
+        />
+      </div>
+      <textarea
+        value={description}
+        onChange={e => setDescription(e.target.value)}
+        rows={2}
+        placeholder="Description (optional)"
+        className="w-full px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50 resize-none"
+      />
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={resetAdd}
+          className="px-3 py-1.5 text-[13px] text-text-muted hover:text-text cursor-pointer"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={handleCreate}
+          disabled={busy || !name.trim()}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer disabled:opacity-50"
+        >
+          <Plus size={14} /> Add status
+        </button>
+      </div>
+    </div>
+  ) : (
+    <button
+      onClick={() => { setColor(randomColor()); setShowAdd(true); }}
+      className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-accent hover:bg-accent/10 rounded-lg cursor-pointer"
+    >
+      <Plus size={14} /> New status
+    </button>
+  );
 
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Task Statuses"
+      size="xl"
+      footer={addStatusFooter}
+      footerClassName="p-4"
+    >
+      <div className="p-5 space-y-2">
         {error && (
-          <div className="mx-5 mt-3 px-3 py-2 text-[12px] text-hue-red bg-red-400/10 border border-red-400/20 rounded-lg">
+          <div className="px-3 py-2 mb-1 text-[12px] text-hue-red bg-red-400/10 border border-red-400/20 rounded-lg">
             {error}
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto p-5 space-y-2">
           {statuses.map(s => (
             <div key={s.name} className="border border-border-subtle rounded-lg p-3">
               <div className="flex items-center gap-3">
@@ -215,71 +276,7 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
               )}
             </div>
           ))}
-        </div>
-
-        <div className="border-t border-border p-4">
-          {showAdd ? (
-            <div className="space-y-3">
-              <div className="flex gap-2">
-                <label
-                  className="relative w-9 h-9 rounded-lg border border-border shrink-0 cursor-pointer"
-                  style={{ backgroundColor: color }}
-                  title="Pick a color"
-                >
-                  <input
-                    type="color"
-                    value={color}
-                    onChange={e => setColor(e.target.value)}
-                    className="absolute inset-0 opacity-0 cursor-pointer"
-                  />
-                </label>
-                <input
-                  value={name}
-                  onChange={e => setName(e.target.value)}
-                  placeholder="name (e.g. in_review)"
-                  autoFocus
-                  className="flex-1 px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50"
-                />
-                <input
-                  value={label}
-                  onChange={e => setLabel(e.target.value)}
-                  placeholder="Label (optional)"
-                  className="flex-1 px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50"
-                />
-              </div>
-              <textarea
-                value={description}
-                onChange={e => setDescription(e.target.value)}
-                rows={2}
-                placeholder="Description (optional)"
-                className="w-full px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50 resize-none"
-              />
-              <div className="flex justify-end gap-2">
-                <button
-                  onClick={resetAdd}
-                  className="px-3 py-1.5 text-[13px] text-text-muted hover:text-text cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={handleCreate}
-                  disabled={busy || !name.trim()}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer disabled:opacity-50"
-                >
-                  <Plus size={14} /> Add status
-                </button>
-              </div>
-            </div>
-          ) : (
-            <button
-              onClick={() => { setColor(randomColor()); setShowAdd(true); }}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-accent hover:bg-accent/10 rounded-lg cursor-pointer"
-            >
-              <Plus size={14} /> New status
-            </button>
-          )}
-        </div>
       </div>
-    </div>
+    </Modal>
   );
 }

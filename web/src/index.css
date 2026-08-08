@@ -408,6 +408,37 @@ body {
 .question-option:nth-child(3) { animation-delay: 0.15s; }
 .question-option:nth-child(4) { animation-delay: 0.2s; }
 
+/* Modal (components/ui/Modal.tsx) */
+@keyframes modal-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.modal-backdrop {
+  animation: modal-backdrop-in 0.12s ease-out;
+}
+@keyframes modal-panel-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.modal-panel {
+  animation: modal-panel-in 0.15s ease-out;
+}
+
+/* Motion is decoration here — every animation above is an entrance, so
+   dropping them costs nothing but the flourish. Vestibular triggers are
+   the transform-based ones; opacity fades are left alone. */
+@media (prefers-reduced-motion: reduce) {
+  .modal-panel,
+  .todo-row,
+  .quote-card,
+  .rewrite-card,
+  .plan-panel,
+  .question-block,
+  .question-option {
+    animation: none;
+  }
+}
+
 /* Line clamp utility */
 .line-clamp-2 {
   display: -webkit-box;

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Save, Trash2, Zap, CheckCircle, XCircle, Clock, FileText } from 'lucide-react';
 import { useSkillsStore } from '../stores/skillsStore';
+import { Modal } from '../components/ui/Modal';
 
 function UsageBar({ total, success }: { total: number; success: number }) {
   if (total === 0) return null;
@@ -252,28 +253,30 @@ export function SkillDetailPage() {
       </div>
 
       {/* Delete Confirmation */}
-      {showDeleteConfirm && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowDeleteConfirm(false)}>
-          <div className="bg-surface-raised border border-border rounded-lg p-4 w-[360px]" onClick={e => e.stopPropagation()}>
-            <h3 className="text-sm font-medium text-text mb-2">Delete Skill</h3>
-            <p className="text-xs text-text-muted mb-4">
-              This will permanently delete <strong>{selectedSkill.name}</strong> and all its files. This cannot be undone.
-            </p>
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setShowDeleteConfirm(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
-                Cancel
-              </button>
-              <button
-                onClick={handleDelete}
-                disabled={actionLoading}
-                className="px-3 py-1.5 text-xs bg-red-600 text-white rounded hover:bg-red-700 cursor-pointer disabled:opacity-50"
-              >
-                {actionLoading ? 'Deleting...' : 'Delete'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <Modal
+        open={showDeleteConfirm}
+        onClose={() => setShowDeleteConfirm(false)}
+        title="Delete Skill"
+        size="sm"
+        footer={
+          <>
+            <button onClick={() => setShowDeleteConfirm(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
+              Cancel
+            </button>
+            <button
+              onClick={handleDelete}
+              disabled={actionLoading}
+              className="px-3 py-1.5 text-xs bg-red-600 text-white rounded hover:bg-red-700 cursor-pointer disabled:opacity-50"
+            >
+              {actionLoading ? 'Deleting...' : 'Delete'}
+            </button>
+          </>
+        }
+      >
+        <p className="px-5 py-4 text-xs text-text-muted">
+          This will permanently delete <strong>{selectedSkill.name}</strong> and all its files. This cannot be undone.
+        </p>
+      </Modal>
     </div>
   );
 }
