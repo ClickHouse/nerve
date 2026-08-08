@@ -114,6 +114,34 @@ Two rules keep ranks meaningful:
   lane, so a status change places the card at the top of its destination
   instead of carrying over a number it was never ordered against.
 
+### Status History
+
+Every status transition is appended to `task_events` (`task_id`,
+`from_status`, `to_status`, `actor`, `created_at`), added in migration v044
+and seeded with one origin row per existing task. `from_status` is NULL on
+the row recording a task's creation, so an aging calculation can tell
+"created here" from "moved here".
+
+Recording happens inside the same transaction as the status write, from all
+three paths that can change one: `update_task_status`, `move_task`, and the
+full-row `upsert_task` (which is how `task_update` flips status when it also
+writes a note). A no-op transition records nothing — that single rule is
+what keeps `reindex()` from doubling the table on every run, since it
+rewrites every row with the status it already had. The one case where
+reindex *does* change a status, resetting an orphaned row to match its
+directory, is a real correction and gets a row.
+
+`actor` is the session id for agent-driven changes, `web` for the HTTP API,
+`backfill` on the origin rows v044 seeded for tasks that predate the table,
+and `system` otherwise. `backfill` is load-bearing rather than cosmetic: a
+real creation also records a NULL `from_status`, so the actor is the only
+thing distinguishing a synthesized origin from one that actually happened.
+
+This powers the aging indicator on board cards and the timeline in the task
+detail view. Tasks whose last transition predates v044 report no entry time
+rather than a guessed one, so the UI stays silent instead of showing an age
+that isn't true.
+
 ### Live Updates
 
 Every task mutation broadcasts a `task_updated` WebSocket event on the

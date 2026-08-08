@@ -9,13 +9,14 @@ export interface BoardColumnProps {
   lane: Lane;
   status: TaskStatusDef | undefined;
   collapsed: boolean;
+  statusSince: Record<string, string>;
   onToggleCollapse: (status: string) => void;
   onCreate: (status: string) => void;
   onOpenTask: (task: Task) => void;
 }
 
 export function BoardColumn({
-  lane, status, collapsed, onToggleCollapse, onCreate, onOpenTask,
+  lane, status, collapsed, statusSince, onToggleCollapse, onCreate, onOpenTask,
 }: BoardColumnProps) {
   // A lane must accept a drop even with no cards in it, and an empty
   // SortableContext registers no droppable of its own — hence the explicit
@@ -97,7 +98,12 @@ export function BoardColumn({
           strategy={verticalListSortingStrategy}
         >
           {lane.tasks.map((task) => (
-            <BoardCard key={task.id} task={task} onOpen={onOpenTask} />
+            <BoardCard
+              key={task.id}
+              task={task}
+              statusSince={statusSince[task.id]}
+              onOpen={onOpenTask}
+            />
           ))}
         </SortableContext>
 

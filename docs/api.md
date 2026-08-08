@@ -177,7 +177,8 @@ than the rest since it grows without bound.
 ```json
 Response: {
   "statuses": [{ "name": "pending", "label": "Pending", "color": "#...", ... }],
-  "lanes": [{ "status": "pending", "total": 12, "tasks": [ ... ] }]
+  "lanes": [{ "status": "pending", "total": 12, "tasks": [ ... ] }],
+  "status_since": { "2026-03-01-fix-bug": "2026-03-02T10:00:00Z" }
 }
 ```
 
@@ -221,6 +222,16 @@ Request:  { "status": "done", "note": "Fixed in PR #123" }
 Request:  { "content": "# Updated Title\n\n**Deadline:** 2026-03-15\n\nNew details..." }
 Request:  { "deadline": "" }
 Response: { "task": { ... }, "task_id": "2026-03-01-fix-bug", "updated": true }
+```
+
+#### `GET /api/tasks/{id}/events`
+A task's status history, oldest first.
+
+```json
+Response: { "events": [
+  { "id": 1, "task_id": "...", "from_status": null, "to_status": "pending", "actor": "system", "created_at": "..." },
+  { "id": 2, "task_id": "...", "from_status": "pending", "to_status": "in_progress", "actor": "impl-abc123", "created_at": "..." }
+] }
 ```
 
 #### `POST /api/tasks/{id}/move`

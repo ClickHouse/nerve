@@ -186,7 +186,14 @@ async def task_board(
             )
         lanes.append({"status": name, "total": total, "tasks": tasks})
 
-    return {"statuses": statuses, "lanes": lanes}
+    # When each visible card last entered its current status — one query
+    # for the whole board rather than one per card. Tasks whose last
+    # transition predates task_events are simply absent, so the UI shows
+    # no age rather than a wrong one.
+    visible = [t["id"] for lane in lanes for t in lane["tasks"]]
+    status_since = await deps.db.get_status_entry_times(visible)
+
+    return {"statuses": statuses, "lanes": lanes, "status_since": status_since}
 
 
 @router.get("/api/tasks/tags")
@@ -266,7 +273,10 @@ async def move_task(
     if target != task["status"]:
         result = await get_tool_registry().invoke(
             "task_update",
-            build_route_tool_context(),
+            # "web" rather than the default "system" sentinel: this string
+            # lands in task_events.actor, and the point of that column is
+            # telling a person dragging a card from the agent moving it.
+            build_route_tool_context("web"),
             {"task_id": task_id, "status": target},
         )
         if result.is_error:
@@ -274,12 +284,23 @@ async def move_task(
 
     moved = await deps.db.move_task(
         task_id, status=target, before_id=req.before_id, after_id=req.after_id,
+        actor="web",
     )
     if not moved:
         raise HTTPException(status_code=404, detail="Task not found")
 
     await emit_task_event(moved, "moved")
     return {"task": moved}
+
+
+@router.get("/api/tasks/{task_id}/events")
+async def list_task_events(
+    task_id: str, limit: int = 200, user: dict = Depends(require_auth),
+):
+    """A task's status history, oldest first."""
+    deps = get_deps()
+    limit = max(1, min(limit, 500))
+    return {"events": await deps.db.list_task_events(task_id, limit=limit)}
 
 
 @router.get("/api/tasks/{task_id}")
@@ -365,7 +386,7 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
 
     if len(payload) > 1:
         result = await get_tool_registry().invoke(
-            "task_update", build_route_tool_context(), payload,
+            "task_update", build_route_tool_context("web"), payload,
         )
         # Previously swallowed: an unknown status returned {"updated": true}
         # while nothing had changed. Surface the handler's own message.

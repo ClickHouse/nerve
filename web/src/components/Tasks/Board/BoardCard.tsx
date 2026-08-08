@@ -1,7 +1,7 @@
 import { memo } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Calendar, Clock, ExternalLink } from 'lucide-react';
+import { Calendar, Clock, ExternalLink, Hourglass } from 'lucide-react';
 import type { Task } from '../../../api/client';
 import { formatTimeAgo } from '../../../utils/dateGroups';
 
@@ -26,8 +26,27 @@ function parseTags(tags: string | null | undefined): string[] {
   return (tags || '').split(',').map((t) => t.trim()).filter(Boolean);
 }
 
+/**
+ * Days a card has sat in its current status, once that's long enough to
+ * be worth saying. Thresholds are deliberately coarse — the signal is
+ * "this has stalled", not a precise duration, and a badge on every card
+ * would be noise rather than information.
+ */
+function laneAge(since: string | undefined): { days: number; tone: string } | null {
+  if (!since) return null;
+  const ms = Date.now() - new Date(since).getTime();
+  if (Number.isNaN(ms)) return null;
+  const days = Math.floor(ms / 86_400_000);
+  if (days < 3) return null;
+  if (days >= 14) return { days, tone: 'text-hue-red' };
+  if (days >= 7) return { days, tone: 'text-hue-orange' };
+  return { days, tone: 'text-text-faint' };
+}
+
 export interface BoardCardProps {
   task: Task;
+  /** ISO time the task entered its current status; absent = unknown. */
+  statusSince?: string;
   onOpen: (task: Task) => void;
 }
 
@@ -39,12 +58,13 @@ export interface BoardCardProps {
  * is a drag handle shouldn't also contain a control that swallows pointer
  * events. Changing status here is the drag itself.
  */
-function BoardCardInner({ task, onOpen }: BoardCardProps) {
+function BoardCardInner({ task, statusSince, onOpen }: BoardCardProps) {
   const {
     attributes, listeners, setNodeRef, transform, transition, isDragging,
   } = useSortable({ id: task.id, data: { type: 'task', task } });
 
   const tags = parseTags(task.tags);
+  const age = laneAge(statusSince);
 
   return (
     <div
@@ -93,6 +113,14 @@ function BoardCardInner({ task, onOpen }: BoardCardProps) {
             title={`Updated ${task.updated_at}`}
           >
             <Clock size={10} /> {formatTimeAgo(task.updated_at)}
+          </span>
+        )}
+        {age && (
+          <span
+            className={`flex items-center gap-1 ${age.tone}`}
+            title={`In this status since ${statusSince}`}
+          >
+            <Hourglass size={10} /> {age.days}d
           </span>
         )}
         {task.source && task.source !== 'manual' && (

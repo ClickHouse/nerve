@@ -256,6 +256,7 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             deadline=deadline or None,
             tags=tags_to_string(tags),
             content=content,
+            actor=ctx.session_id,
         )
 
     _tasks_read.add(task_id)
@@ -427,6 +428,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     title=final_title,
                     status=final_status,
                     content=content,
+                    actor=ctx.session_id,
                     **edits,
                 )
                 await _emit_task_event(ctx, task_id, "updated")
@@ -434,7 +436,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
         # Fall back to metadata updates when no task file was changed.
         if status:
-            await ctx.db.update_task_status(task_id, status)
+            await ctx.db.update_task_status(task_id, status, actor=ctx.session_id)
         if raw_tags is not None:
             await ctx.db.update_task_tags(task_id, new_tags_str)
         await _emit_task_event(ctx, task_id, "updated")
@@ -540,7 +542,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if ctx.workspace:
             ensure_path_not_tracked_config(ctx.workspace / task["file_path"], "move")
 
-        await ctx.db.update_task_status(task_id, "done")
+        await ctx.db.update_task_status(task_id, "done", actor=ctx.session_id)
 
         # Mark any implementing plans for this task as done
         implementing_plans = await ctx.db.get_plans_for_task(task_id)
@@ -635,7 +637,7 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 is_error=True,
             )
 
-    await ctx.db.update_task_status(task_id, status)
+    await ctx.db.update_task_status(task_id, status, actor=ctx.session_id)
 
     if src is not None:
         # Re-checked because the guard above is not atomic with the move.
