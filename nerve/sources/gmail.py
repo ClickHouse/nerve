@@ -112,6 +112,7 @@ class GmailSource(Source):
 
         records: list[SourceRecord] = []
         newest_epoch: int | None = int(cursor) if cursor else None
+        body_fetch_failed = False
 
         try:
             # Step 1: Search for message IDs + metadata
@@ -139,6 +140,12 @@ class GmailSource(Source):
                     body, html_body, internal_date = body_result
                 elif isinstance(body_result, Exception):
                     logger.warning("Failed to fetch body for %s: %s", msg["id"], body_result)
+                    body_fetch_failed = True
+                    continue
+                else:
+                    logger.warning("Failed to fetch body for %s", msg["id"])
+                    body_fetch_failed = True
+                    continue
 
                 # Use internalDate for cursor tracking (matches Gmail's `after:`
                 # filter).  Fall back to the Date header only if internalDate
@@ -205,7 +212,14 @@ class GmailSource(Source):
         except Exception as e:
             logger.error("Gmail error for %s: %s", self.account, e)
 
-        next_cursor = str(newest_epoch) if newest_epoch else cursor
+        # Successful messages may be persisted now, but keep the cursor behind
+        # the whole batch so a transient failure cannot strand a header-only
+        # message. Inbox persistence deduplicates unchanged successful retries
+        # by ID.
+        next_cursor = (
+            cursor if body_fetch_failed
+            else str(newest_epoch) if newest_epoch else cursor
+        )
         return FetchResult(records=records, next_cursor=next_cursor, has_more=False)
 
     async def preprocess(self, records: list[SourceRecord]) -> list[SourceRecord]:
@@ -240,11 +254,12 @@ class GmailSource(Source):
 
     async def _fetch_message_body(
         self, message_id: str, env: dict, sem: asyncio.Semaphore,
-    ) -> tuple[str, str | None, int | None]:
+    ) -> tuple[str, str | None, int | None] | None:
         """Fetch the body text, HTML body, and internalDate of a single message.
 
         Returns:
             (text_body, html_body_or_none, internal_date_epoch_seconds).
+            ``None`` when the message could not be retrieved.
 
         ``gog gmail get`` puts one body variant in its top-level ``body``
         field.  For multipart/alternative messages it picks text/plain,
@@ -264,10 +279,13 @@ class GmailSource(Source):
 
             if proc.returncode != 0:
                 logger.warning("gog gmail get %s failed: %s", message_id, stderr.decode()[:200])
-                return "", None, None
+                return None
 
             stdout_text = stdout.decode()
-            data = json.loads(stdout_text) if stdout_text.strip() else {}
+            if not stdout_text.strip():
+                logger.warning("gog gmail get %s returned no data", message_id)
+                return None
+            data = json.loads(stdout_text)
             body = data.get("body", "")
 
             # Extract internalDate from the raw Gmail API message object.
