@@ -9,9 +9,11 @@ two shipped bugs came from a caller that forgot: ``reindex`` dropped ``tags``
 after v018 added the column, and ``task_done`` nulled all four when it moved
 a file into done/.
 
-The tests here drive ``upsert_task`` directly, because the rule itself is the
-subject. The caller-level regressions live with their callers
-(``test_task_completion.py``, ``test_task_reindex.py``).
+``position`` obeys the same rule and has its own file
+(``test_task_position.py``). The tests here drive ``upsert_task`` directly,
+because the rule itself is the subject; the caller-level regressions live with
+their callers (``test_task_completion.py``, ``test_task_reindex.py``,
+``test_task_reopen.py``).
 """
 
 from __future__ import annotations

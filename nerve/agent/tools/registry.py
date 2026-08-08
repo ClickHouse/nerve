@@ -64,9 +64,12 @@ class ToolResult:
     ``content`` is a list of MCP content blocks — typically
     ``[{"type": "text", "text": "..."}]``.
 
-    ``structured`` is reserved for future use; the current adapters ignore
-    it. Tools that want to return JSON payloads should still serialize them
-    into a text block for now so behavior is identical across runtimes.
+    ``structured`` carries the same outcome as data, for in-process callers
+    that need to branch on it — an HTTP route invoking a handler through
+    the registry can read a task id or a duplicate list from here instead
+    of parsing it back out of the prose. The tool adapters ignore it, so an
+    agent sees identical behavior whether a handler sets it or not; text
+    remains the contract for anything crossing the tool boundary.
     """
 
     content: list[dict]
@@ -74,9 +77,27 @@ class ToolResult:
     structured: dict | None = None
 
     @classmethod
-    def text(cls, message: str, *, is_error: bool = False) -> "ToolResult":
+    def text(
+        cls,
+        message: str,
+        *,
+        is_error: bool = False,
+        structured: dict | None = None,
+    ) -> "ToolResult":
         """Convenience: build a ToolResult wrapping a single text block."""
-        return cls(content=[{"type": "text", "text": message}], is_error=is_error)
+        return cls(
+            content=[{"type": "text", "text": message}],
+            is_error=is_error,
+            structured=structured,
+        )
+
+    @property
+    def text_content(self) -> str:
+        """Flatten the content blocks back into plain text."""
+        return "\n".join(
+            block.get("text", "") for block in self.content
+            if block.get("type") == "text"
+        )
 
     def to_dict(self) -> dict:
         """Serialize to the dict shape Claude Agent SDK tools return."""

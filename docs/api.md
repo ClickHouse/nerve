@@ -156,8 +156,10 @@ For streaming, use the WebSocket endpoint.
 
 ### Tasks
 
-#### `GET /api/tasks?status=pending`
-List tasks with optional status filter. Valid statuses: `pending`, `in_progress`, `done`, `deferred`, or empty (all non-done).
+#### `GET /api/tasks?status=pending&tag=backend&sort=position`
+List tasks. All filters optional. Statuses are configurable — see
+`GET /api/task-statuses`; empty means all non-done. `sort` accepts `deadline`
+(default), `updated_at`, `created_at`, or `position` (board order).
 
 #### `GET /api/tasks/search?q=keyword&status=`
 Full-text search on task titles and content (FTS5). Optional status filter.
@@ -166,11 +168,37 @@ Full-text search on task titles and content (FTS5). Optional status filter.
 Response: { "tasks": [{ "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", ... }] }
 ```
 
-#### `POST /api/tasks`
-Create a task.
+#### `GET /api/tasks/board?limit=100&tag=`
+Every lane in one round trip — the board's only read. Returns the configured
+statuses plus one page of each, ordered by `position`. `total` is the lane's
+true count so a column can offer "+N more"; the `done` lane is capped tighter
+than the rest since it grows without bound.
 
 ```json
-Request: { "title": "Fix bug", "content": "Details...", "deadline": "2026-03-01" }
+Response: {
+  "statuses": [{ "name": "pending", "label": "Pending", "color": "#...", ... }],
+  "lanes": [{ "status": "pending", "total": 12, "tasks": [ ... ] }]
+}
+```
+
+#### `GET /api/tasks/tags?include_done=false`
+Distinct tags with their task counts, most-used first (filter-bar facets).
+
+```json
+Response: { "tags": [{ "name": "backend", "count": 7 }] }
+```
+
+#### `POST /api/tasks`
+Create a task. Returns the created row; **409** if the duplicate guard refuses
+(retry with `confirm_duplicate: true` to override), **422** if `status` names a
+status that does not exist — a retry cannot fix that one, so it is kept
+distinct from the collision.
+
+```json
+Request:  { "title": "Fix bug", "content": "Details...", "deadline": "2026-03-01", "tags": "backend,urgent" }
+Response: { "task": { "id": "2026-03-01-fix-bug", ... }, "message": "Task created: ..." }
+409:      { "detail": { "reason": "duplicate", "duplicates": [ ... ], "message": "..." } }
+422:      { "detail": { "reason": "invalid_status", "duplicates": [], "message": "..." } }
 ```
 
 #### `GET /api/tasks/{id}`
@@ -181,11 +209,33 @@ Response: { "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending",
 ```
 
 #### `PATCH /api/tasks/{id}`
-Update a task. All fields are optional. `content` replaces the full markdown file; title and deadline are re-synced to SQLite.
+Update a task. All fields are optional. `content` replaces the full markdown
+file; title and deadline are re-synced to SQLite. Returns the full updated row.
+
+`deadline` and `tags` read by **presence**: omit the key to leave the field
+alone, or send `""` to clear it. An invalid status is a 400 (previously
+reported as a success that changed nothing).
 
 ```json
-Request: { "status": "done", "note": "Fixed in PR #123" }
-Request: { "content": "# Updated Title\n\n**Deadline:** 2026-03-15\n\nNew details..." }
+Request:  { "status": "done", "note": "Fixed in PR #123" }
+Request:  { "content": "# Updated Title\n\n**Deadline:** 2026-03-15\n\nNew details..." }
+Request:  { "deadline": "" }
+Response: { "task": { ... }, "task_id": "2026-03-01-fix-bug", "updated": true }
+```
+
+#### `POST /api/tasks/{id}/move`
+Place a task in a lane — the board's drag-and-drop write. Send *intent*
+("between these two cards"), not a computed rank: the server resolves the
+neighbours itself, so a stale client board can't corrupt the ordering.
+`before_id` is the card that ends up directly above, `after_id` the one
+directly below; omit both to append. Omit `status` to reorder in place.
+
+Moving into or out of `done` moves the markdown file between `active/` and
+`done/` as a side effect.
+
+```json
+Request:  { "status": "in_progress", "before_id": "2026-03-01-a", "after_id": "2026-03-01-b" }
+Response: { "task": { "id": "...", "status": "in_progress", "position": 3072.0, ... } }
 ```
 
 ### Workflow Runs
