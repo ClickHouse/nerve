@@ -147,16 +147,20 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
             )
             new_title = parse_task_title(req.content)
             fields = parse_task_frontmatter(req.content)
+            # Only the columns the saved markdown carries. The rest keep their
+            # stored values, so nothing is read back off ``task`` here.
+            edits: dict = {}
+            if fields.get("deadline"):
+                edits["deadline"] = fields["deadline"]
+            if fields.get("tags"):
+                edits["tags"] = tags_to_string(parse_tags_string(fields["tags"]))
             await deps.db.upsert_task(
                 task_id=task_id,
                 file_path=task["file_path"],
                 title=new_title,
                 status=req.status or task["status"],
-                source=task.get("source"),
-                source_url=task.get("source_url"),
-                deadline=fields.get("deadline") or task.get("deadline"),
-                tags=tags_to_string(parse_tags_string(fields.get("tags") or task.get("tags", ""))),
                 content=req.content,
+                **edits,
             )
 
     # Update status/note/deadline/title via the unified handler (may

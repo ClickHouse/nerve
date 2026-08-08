@@ -6,6 +6,35 @@ import re
 from datetime import datetime, timezone
 
 
+class _Keep:
+    """Type of the :data:`KEEP` sentinel."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "KEEP"
+
+
+# Default for the preserve-on-omit columns of :meth:`TaskStore.upsert_task`.
+# A separate sentinel is necessary because ``None`` is a real value there: it
+# clears the column.
+KEEP = _Keep()
+
+
+def _resolve_kept(value, stored: dict | None, column: str, default):
+    """Resolve one preserve-on-omit argument against the stored row.
+
+    A stored NULL gives ``default``. A row written before its column existed
+    can hold NULL, and ``tags`` must stay a ``str``.
+    """
+    if value is not KEEP:
+        return value
+    if stored is None:
+        return default
+    kept = stored[column]
+    return default if kept is None else kept
+
+
 class TaskStore:
     """Mixin providing task CRUD, FTS search, and escalation operations."""
 
@@ -15,14 +44,41 @@ class TaskStore:
         file_path: str,
         title: str,
         status: str = "pending",
-        source: str | None = None,
-        source_url: str | None = None,
-        deadline: str | None = None,
-        tags: str = "",
+        source: str | None | _Keep = KEEP,
+        source_url: str | None | _Keep = KEEP,
+        deadline: str | None | _Keep = KEEP,
+        tags: str | _Keep = KEEP,
         content: str = "",
     ) -> None:
+        """Insert or update a task row and its FTS entry.
+
+        ``file_path``, ``title``, ``status`` and ``content`` are a full
+        replace. Every caller rebuilds them from the markdown file.
+
+        ``source``, ``source_url``, ``deadline`` and ``tags`` are
+        preserve-on-omit. An omitted column keeps its stored value. To clear
+        one, pass it: ``None`` for the nullable columns, ``""`` for ``tags``.
+
+        Those four columns need that rule because a markdown file carries
+        them only while it has the frontmatter for them. Under a full
+        replace, every caller has to read the row and pass all four back,
+        and a caller that forgets one deletes user data. That happened
+        twice. ``TaskManager.reindex`` dropped ``tags`` after v018 added the
+        column, and ``task_done`` nulled all four when it moved a file into
+        done/. ``test_task_upsert_preserve.py`` holds the rule itself;
+        ``test_task_reindex.py`` and ``test_task_completion.py`` hold the
+        caller-level regressions.
+        """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
+            # One read resolves every preserve-on-omit column. The statement
+            # below stays a plain full replace, and the FTS text sees the
+            # tags that actually land in the row.
+            stored = await self._stored_task_columns(task_id)
+            source = _resolve_kept(source, stored, "source", None)
+            source_url = _resolve_kept(source_url, stored, "source_url", None)
+            deadline = _resolve_kept(deadline, stored, "deadline", None)
+            tags = _resolve_kept(tags, stored, "tags", "")
             await self.db.execute(
                 """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -48,6 +104,15 @@ class TaskStore:
         async with self.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def _stored_task_columns(self, task_id: str) -> dict | None:
+        """The columns an upsert can preserve, or ``None`` for a new task."""
+        async with self.db.execute(
+            "SELECT source, source_url, deadline, tags FROM tasks WHERE id = ?",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
 
     # Supported sort keys → ORDER BY clause. Keep deterministic with a
     # secondary key so equal timestamps don't flicker between pages.

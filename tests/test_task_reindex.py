@@ -1,9 +1,11 @@
 """Regression tests for TaskManager.reindex() column preservation.
 
-``upsert_task`` replaces the whole row (its ``ON CONFLICT(id) DO UPDATE SET``
-assigns every column unconditionally), so any argument ``reindex`` omits or
-mis-keys is written back as that argument's signature default. These tests pin
-one behaviour per affected column so a partial fix cannot pass.
+``reindex`` rebuilds each row from a markdown file, so it must supply the
+columns that file carries and omit the ones it does not. ``upsert_task`` keeps
+a stored value for every column an argument omits (the rule itself lives in
+``test_task_upsert_preserve.py``), but a mis-keyed or wrongly-conditioned
+argument still writes the wrong value. These tests pin one behaviour per
+affected column so a partial fix cannot pass.
 
 Discriminator notes (measured against the unfixed tree, not assumed):
 
