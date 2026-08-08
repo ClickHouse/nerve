@@ -7,6 +7,7 @@ import { useUIStore } from './stores/uiStore';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import type { ShortcutDef } from './utils/keyboard';
 import { LoginPage } from './components/Auth/LoginPage';
+import { SessionExpiredOverlay } from './components/Auth/SessionExpiredOverlay';
 import { AppShell } from './components/Layout/AppShell';
 import { ChatPage } from './pages/ChatPage';
 import { FilesPage } from './pages/FilesPage';
@@ -29,7 +30,7 @@ import { NotificationToast } from './components/Notifications/NotificationToast'
 import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
-  const { authenticated, checking, checkAuth } = useAuthStore();
+  const { authenticated, checking, checkAuth, sessionExpired } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
 
   useEffect(() => { checkAuth(); }, []);
@@ -43,10 +44,14 @@ function App() {
   }, [authenticated]);
 
   if (checking) return null;
-  if (!authenticated) return <LoginPage />;
+  // Only a *cold* start gets the full-page login. A session that expired
+  // under a mounted app keeps the app rendered and takes the password in an
+  // overlay, so nothing you had typed is thrown away to ask for it.
+  if (!authenticated && !sessionExpired) return <LoginPage />;
 
   return (
     <>
+      {sessionExpired && <SessionExpiredOverlay />}
       <GlobalShortcuts />
       <Routes>
         <Route element={<AppShell />}>

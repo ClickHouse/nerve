@@ -14,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -25,7 +25,7 @@ from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
-from nerve.gateway.auth import authenticate_websocket
+from nerve.gateway.auth import SESSION_TOKEN_HEADER, authenticate_websocket
 from nerve.gateway.routes import (
     init_deps,
     register_all_routes,
@@ -752,6 +752,20 @@ def create_app() -> FastAPI:
     async def _skill_id_handler(request, exc: SkillIdError):  # noqa: ANN001
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    # Sliding session tokens. `require_auth` re-mints a session token once it
+    # is past half its lifetime and stashes it on request.state; hand it back
+    # on the response so the browser can swap it in. Net effect: a tab in
+    # continuous use is never logged out, and the configured
+    # `auth.jwt_expiry_hours` becomes an idle timeout instead of a hard
+    # egg timer that fires mid-typing.
+    @app.middleware("http")
+    async def _slide_session_token(request: Request, call_next):  # noqa: ANN001
+        response = await call_next(request)
+        token = getattr(request.state, "refreshed_token", None)
+        if token:
+            response.headers[SESSION_TOKEN_HEADER] = token
+        return response
+
     # CORS for development
     app.add_middleware(
         CORSMiddleware,
@@ -759,6 +773,10 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Browsers hide non-safelisted response headers from JS unless the
+        # server explicitly exposes them — without this the refreshed token
+        # is invisible to fetch() on any cross-origin (dev) setup.
+        expose_headers=[SESSION_TOKEN_HEADER],
     )
 
     # Compress JSON responses. Sessions with heavy tool-call blobs can

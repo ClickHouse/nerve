@@ -1871,6 +1871,12 @@ class RetentionConfig:
 class AuthConfig:
     password_hash: str = ""
     jwt_secret: str = ""
+    # Web-session lifetime. This is an *idle* timeout, not a cap on a working
+    # session: the gateway slides the token forward on every authenticated
+    # request (see gateway/auth.py), so an actively-used browser tab is never
+    # logged out mid-work. Only a tab left untouched for the whole window
+    # comes back to a password prompt.
+    jwt_expiry_hours: int = 720  # 30 days
 
     @classmethod
     @_coerced
@@ -1878,6 +1884,7 @@ class AuthConfig:
         return cls(
             password_hash=d.get("password_hash", ""),
             jwt_secret=d.get("jwt_secret", ""),
+            jwt_expiry_hours=max(1, _lenient_int(d.get("jwt_expiry_hours"), 720)),
         )
 
 

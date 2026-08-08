@@ -238,7 +238,7 @@ A reload is always explicit. Two things cause one:
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | ✅ read per request. Only the gateway's own auth: the MCP endpoint checks `/mcp/v1` against the `auth.jwt_secret` it was mounted with, so rotating that secret is half-hot (see the restart table) |
+| Web gateway auth (`auth.*`) | ✅ read per request. Only the gateway's own auth: the MCP endpoint checks `/mcp/v1` against the `auth.jwt_secret` it was mounted with, so rotating that secret is half-hot (see the restart table). `auth.jwt_expiry_hours` governs tokens minted *after* the reload; already-issued tokens keep the window they were signed with until they next slide |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
