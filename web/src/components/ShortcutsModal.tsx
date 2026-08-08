@@ -5,6 +5,12 @@ import { Modal } from './ui/Modal';
 interface DisplayShortcut {
   combo: ShortcutCombo;
   description: string;
+  /**
+   * Override the rendered key label. For a binding that is a *set* of keys
+   * rather than one combo — the arrow cluster — formatting a single combo
+   * would document a quarter of it.
+   */
+  label?: string;
 }
 
 interface Section {
@@ -14,7 +20,9 @@ interface Section {
 
 /**
  * Static display of every keyboard binding. The runtime handlers live in
- * App.tsx (global) and ChatPage.tsx (chat-scoped) — keep this list in sync
+ * App.tsx (global), ChatPage.tsx (chat-scoped) and TasksPage.tsx
+ * (tasks-scoped), with Enter/Shift+Enter owned by ChatInput and the board's
+ * Space/arrow bindings by dnd-kit's keyboard sensor — keep this list in sync
  * with those when bindings change.
  */
 const SECTIONS: Section[] = [
@@ -44,6 +52,17 @@ const SECTIONS: Section[] = [
       { combo: { shift: true, key: 'Enter' }, description: 'New line' },
     ],
   },
+  {
+    title: 'Tasks',
+    items: [
+      { combo: { key: 'b' }, description: 'Board view' },
+      { combo: { key: 'l' }, description: 'List view' },
+      { combo: { key: 'n' }, description: 'New task' },
+      { combo: { key: '/' }, description: 'Focus task search' },
+      { combo: { key: 'Space' }, description: 'Pick up / drop a focused card' },
+      { combo: { key: 'ArrowUp' }, label: '↑ ↓ ← →', description: 'Move a picked-up card' },
+    ],
+  },
 ];
 
 export function ShortcutsModal() {
@@ -67,7 +86,7 @@ export function ShortcutsModal() {
                   className="flex items-center justify-between gap-4 py-1"
                 >
                   <span className="text-[13px] text-text-secondary">{item.description}</span>
-                  <Kbd combo={item.combo} />
+                  <Kbd combo={item.combo} label={item.label} />
                 </div>
               ))}
             </div>
@@ -78,10 +97,10 @@ export function ShortcutsModal() {
   );
 }
 
-function Kbd({ combo }: { combo: ShortcutCombo }) {
+function Kbd({ combo, label }: { combo: ShortcutCombo; label?: string }) {
   return (
     <kbd className="px-2 py-1 text-[11px] font-mono text-text-secondary bg-surface border border-border-subtle rounded shrink-0 tabular-nums">
-      {formatCombo(combo)}
+      {label ?? formatCombo(combo)}
     </kbd>
   );
 }

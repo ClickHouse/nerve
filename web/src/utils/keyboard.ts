@@ -57,7 +57,7 @@ export interface ShortcutDef {
   combo: ShortcutCombo;
   /** Section + description shown in the modal. */
   description: string;
-  section: 'global' | 'chat' | 'input';
+  section: 'global' | 'chat' | 'input' | 'tasks';
   /** Only fire when this returns true (e.g. only on /chat). */
   when?: () => boolean;
   /**

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
+import { modalStack } from './modalStack';
 
 /**
  * The app's one dialog primitive.
@@ -28,12 +29,6 @@ import { X } from 'lucide-react';
  * the user left it, or keyboard navigation restarts from the top of the
  * document.
  */
-
-/**
- * Open dialogs, oldest first. Module-level rather than context so a dialog
- * rendered anywhere in the tree participates without a provider.
- */
-const modalStack: string[] = [];
 
 /**
  * Body scroll lock, refcounted so stacked dialogs don't unlock early.
@@ -75,13 +70,16 @@ const FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-export type ModalSize = 'sm' | 'md' | 'lg' | 'xl';
+export type ModalSize = 'sm' | 'md' | 'lg' | 'xl' | 'wide';
 
 const SIZES: Record<ModalSize, string> = {
   sm: 'w-[360px] max-w-[90vw]',
   md: 'w-[480px] max-w-[90vw]',
   lg: 'w-[520px] max-w-[90vw]',
   xl: 'w-[620px] max-w-[92vw]',
+  // For dialogs holding a document rather than a form — a markdown editor
+  // at 620px wraps prose into a column too narrow to read or edit.
+  wide: 'w-[min(1100px,94vw)]',
 };
 
 export interface ModalProps {
