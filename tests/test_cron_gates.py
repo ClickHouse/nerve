@@ -205,31 +205,22 @@ class TestMessagesGate:
         assert await gate.is_satisfied(_ctx(db)) is True
 
     @pytest.mark.asyncio
-    async def test_no_sources_fires_when_any_consumer_source_unread(self):
-        # Omitted sources → "any source": read the consumer's unread counts.
-        db = _db(list_consumer_cursors=[
-            {"source": "gmail", "unread": 0},
-            {"source": "github", "unread": 3},
-        ])
+    async def test_no_sources_fires_when_consumer_has_unread(self):
+        # Omitted sources → "any source": delegate to the read-only,
+        # expiry-agnostic consumer_has_unread check.
+        db = _db(consumer_has_unread=True)
         gate = MessagesGate()
         assert gate.sources == []
         assert await gate.is_satisfied(_ctx(db)) is True
-        db.list_consumer_cursors.assert_awaited_once_with("inbox")
-        # Read-only: the any-source path must not touch/advance cursors.
+        db.consumer_has_unread.assert_awaited_once_with("inbox")
+        # Read-only: the any-source path must not initialize or advance a cursor.
         db.get_consumer_cursor.assert_not_called()
+        db.set_consumer_cursor.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_sources_unsatisfied_when_all_caught_up(self):
-        db = _db(list_consumer_cursors=[
-            {"source": "gmail", "unread": 0},
-            {"source": "github", "unread": 0},
-        ])
+    async def test_no_sources_unsatisfied_when_consumer_caught_up(self):
+        db = _db(consumer_has_unread=False)
         assert await MessagesGate().is_satisfied(_ctx(db)) is False
-
-    @pytest.mark.asyncio
-    async def test_no_sources_unsatisfied_when_no_cursors(self):
-        db = _db(list_consumer_cursors=[])
-        assert await MessagesGate(consumer="inbox").is_satisfied(_ctx(db)) is False
 
     def test_empty_sources_means_any_source(self):
         # Empty/omitted sources is now valid (no raise) and means "any source".

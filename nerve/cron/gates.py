@@ -142,10 +142,10 @@ class MessagesGate(CronGate):
                     return True
             return False
         # No explicit sources: fire if any source the consumer tracks has
-        # unread messages. Listing cursors is read-only — unlike
-        # get_consumer_cursor it never initializes or advances a cursor.
-        cursors = await ctx.db.list_consumer_cursors(self.consumer)
-        return any((c.get("unread") or 0) > 0 for c in cursors)
+        # unread messages. Read-only and expiry-agnostic — it never
+        # initializes or advances a cursor (unlike get_consumer_cursor) and
+        # still sees a backlog after a quiet inbox's cursors pass their TTL.
+        return await ctx.db.consumer_has_unread(self.consumer)
 
     def describe(self) -> str:
         where = ", ".join(self.sources) if self.sources else "any source"
