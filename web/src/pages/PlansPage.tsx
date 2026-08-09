@@ -83,7 +83,7 @@ export function PlansPage() {
         ))}
       />
 
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>
         ) : plans.length === 0 ? (

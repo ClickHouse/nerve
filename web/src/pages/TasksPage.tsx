@@ -229,7 +229,7 @@ export function TasksPage() {
         // and no max-width — filling the viewport is the whole point.
         <TaskBoard onOpenTask={openTask} />
       ) : (
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>
         ) : tasks.length === 0 ? (

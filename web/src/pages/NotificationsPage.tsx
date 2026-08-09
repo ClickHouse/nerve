@@ -194,10 +194,17 @@ function NotificationCard({ notif }: { notif: Notification }) {
     <div className={`p-4 bg-surface border rounded-lg transition-colors ${
       notif.status === 'pending' ? 'border-border-subtle' : 'border-border-subtle'
     }`}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            {priorityDot && <span className={`w-2 h-2 rounded-full shrink-0 ${priorityDot}`} />}
+      {/* The badge column is shrink-0, so beside the text it costs a fixed
+          ~127px — over a third of the card on a phone, which left the body
+          wrapping at ~190px. Below `sm` the badges take a row of their own
+          above the title instead, and the text gets the full card width. */}
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 sm:gap-3">
+        <div className="min-w-0 flex-1 order-1 sm:order-none">
+          {/* items-start, not items-center: a title long enough to wrap was
+              centring the priority dot against the whole block, leaving it
+              floating beside the second line. */}
+          <div className="flex items-start gap-2">
+            {priorityDot && <span className={`w-2 h-2 mt-1.5 rounded-full shrink-0 ${priorityDot}`} />}
             <h3 className="font-medium text-[15px] text-text">{notif.title}</h3>
           </div>
           {notif.body && (
@@ -209,7 +216,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
             </p>
           )}
         </div>
-        <div className="flex items-center gap-2 text-[12px] shrink-0">
+        <div className="flex flex-wrap items-center gap-2 text-[12px] shrink-0 order-0 sm:order-none">
           {(notif.redelivery_count ?? 0) > 0 && (
             <span
               className="flex items-center gap-1 px-2 py-0.5 rounded-full border bg-sky-400/10 text-hue-blue border-sky-400/20"
@@ -516,7 +523,7 @@ export function NotificationsPage() {
         }
       />
 
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {showSilences && <SilencesPanel />}
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>
