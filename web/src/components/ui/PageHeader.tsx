@@ -22,7 +22,13 @@ import type { ReactNode } from 'react';
  * would move them visually while leaving the keyboard to step through every
  * filter and the search box first.
  */
-export function PageHeader({ icon, title, filters, search, actions }: {
+export function PageHeader({ leading, icon, title, filters, search, actions }: {
+  /**
+   * Sits ahead of the icon. For pages whose side pane collapses into a
+   * drawer on mobile, this is where its toggle goes — mirroring the chat
+   * header, so the control is in the same place on every page that has one.
+   */
+  leading?: ReactNode;
   icon?: ReactNode;
   title: ReactNode;
   /** Filter pills. Laid out by the caller; scrolled horizontally here. */
@@ -34,10 +40,14 @@ export function PageHeader({ icon, title, filters, search, actions }: {
     <div className="border-b border-border-subtle bg-bg shrink-0 px-4 lg:px-6 py-2.5 lg:py-3
       flex flex-wrap lg:flex-nowrap items-center gap-x-4 gap-y-2">
       {/* Row one below `lg`: the title, with the page's primary buttons pinned
-          opposite it. With an icon, desktop keeps the 16px icon-to-title gap
-          and the 24px run-out to the filters the per-page headers used. */}
+          opposite it. `w-full` is what guarantees the filters and search a line
+          of their own — leaving that to the other items overflowing the line is
+          how the break silently collapsed on the page with no visible actions.
+          With an icon, desktop keeps the 16px icon-to-title gap and the 24px
+          run-out to the filters that the per-page headers already had. */}
       <div className={`flex items-center gap-2 min-w-0 w-full lg:w-auto lg:flex-none
         ${icon ? 'lg:gap-4 lg:mr-2' : ''}`}>
+        {leading}
         {icon}
         <h1 className="text-lg font-semibold truncate">{title}</h1>
         {actions && (
@@ -50,7 +60,9 @@ export function PageHeader({ icon, title, filters, search, actions }: {
         // half-visible pill signals "there is more this way" instead of looking
         // like a clipped layout. The width has to grow by the same 2rem the
         // margins take back — `w-full` alone would only shift the strip left
-        // and leave it stopping 32px short of the right edge.
+        // and leave it stopping 32px short of the right edge. (Which is also
+        // why this cannot use `basis-full`: a non-auto flex-basis would
+        // override the width and take the bleed with it.)
         <div className="w-[calc(100%+2rem)] lg:w-auto min-w-0
           -mx-4 px-4 lg:mx-0 lg:px-0
           overflow-x-auto

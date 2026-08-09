@@ -4,6 +4,10 @@ import {
   FileText, Clock, Circle, History,
 } from 'lucide-react';
 import { useMemoryStore, type Category, type MemoryItem, type Resource, type TabView } from '../stores/memoryStore';
+import { PageHeader } from '../components/ui/PageHeader';
+import { PaneToggle } from '../components/ui/PaneToggle';
+import { Drawer } from '../components/ui/Drawer';
+import { useIsMobile } from '../hooks/useMediaQuery';
 
 const TYPE_COLORS: Record<string, string> = {
   profile: 'var(--theme-accent)',
@@ -629,7 +633,15 @@ function LogView() {
 
 // --- Sidebar ---
 
-function Sidebar() {
+function Sidebar({ inDrawer = false, onSelect }: {
+  inDrawer?: boolean;
+  /**
+   * Fired whenever a tap changes which facts are listed. Drawer mode closes
+   * on it, so the newly filtered list is actually revealed; creating a
+   * category happens inside this pane and deliberately does not fire it.
+   */
+  onSelect?: () => void;
+}) {
   const { items, categories, categoryItems, selectedCategory, setSelectedCategory } = useMemoryStore();
   const [showCreateCat, setShowCreateCat] = useState(false);
 
@@ -646,7 +658,11 @@ function Sidebar() {
   }, [categoryItems]);
 
   return (
-    <div className="w-52 shrink-0 border-r border-border-subtle flex flex-col overflow-hidden">
+    <div className={inDrawer
+      // The drawer supplies the width and the edge; the fixed column and its
+      // own border would fight them.
+      ? 'w-full flex-1 min-h-0 flex flex-col overflow-hidden'
+      : 'w-52 shrink-0 border-r border-border-subtle flex flex-col overflow-hidden'}>
       <div className="p-3 border-b border-border-subtle">
         <div className="text-[11px] text-text-dim uppercase tracking-wider mb-2">Types</div>
         <div className="space-y-1">
@@ -662,7 +678,7 @@ function Sidebar() {
       <div className="flex-1 overflow-y-auto p-3">
         <div className="text-[11px] text-text-dim uppercase tracking-wider mb-2">Categories</div>
         {selectedCategory && (
-          <button onClick={() => setSelectedCategory(null)} className="w-full text-left px-2 py-1 mb-1 text-[11px] text-accent hover:bg-surface-raised rounded cursor-pointer transition-colors flex items-center gap-1">
+          <button onClick={() => { setSelectedCategory(null); onSelect?.(); }} className="w-full text-left px-2 py-1 mb-1 text-[11px] text-accent hover:bg-surface-raised rounded cursor-pointer transition-colors flex items-center gap-1">
             <X size={10} /> Clear filter
           </button>
         )}
@@ -670,7 +686,7 @@ function Sidebar() {
           {categories.map(cat => {
             const isActive = selectedCategory === cat.id;
             return (
-              <button key={cat.id} onClick={() => setSelectedCategory(isActive ? null : cat.id)} className={`w-full text-left px-2 py-1.5 rounded text-[12px] cursor-pointer transition-colors flex items-center gap-2 ${isActive ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'}`}>
+              <button key={cat.id} onClick={() => { setSelectedCategory(isActive ? null : cat.id); onSelect?.(); }} className={`w-full text-left px-2 py-1.5 rounded text-[12px] cursor-pointer transition-colors flex items-center gap-2 ${isActive ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'}`}>
                 <span className="flex-1 truncate">{cat.name.replace(/_/g, ' ')}</span>
                 <span className="text-[10px] text-text-dim">{catCounts[cat.id] || 0}</span>
               </button>
@@ -699,6 +715,30 @@ export function MemuPage() {
 
   useEffect(() => { load(); }, [load]);
 
+  // Types/categories collapse into a left drawer on a phone — three panes
+  // sharing 412px left every one of them unreadable.
+  //
+  // Declared above the loading/unavailable early returns: hooks after a
+  // conditional return change the hook order between renders, which is what
+  // the rules of hooks forbid (React throws once `loading` flips to false).
+  const isMobile = useIsMobile();
+  const [paneOpen, setPaneOpen] = useState(false);
+
+  // Choosing a category shuts the drawer, driven by `Sidebar`'s `onSelect`.
+  // A watcher over `selectedCategory` would miss re-tapping the category that
+  // is already active — which clears the filter, so the list underneath does
+  // change — and would leave the drawer covering the result either way.
+  //
+  // All that is left here is retiring the drawer when the layout leaves the
+  // phone breakpoint, so a later resize back down doesn't arrive with an
+  // overlay already open. Adjusted during render rather than in an effect:
+  // an effect paints the stale state for a frame first.
+  const [lastIsMobile, setLastIsMobile] = useState(isMobile);
+  if (lastIsMobile !== isMobile) {
+    setLastIsMobile(isMobile);
+    setPaneOpen(false);
+  }
+
   if (loading) return <div className="flex-1 flex items-center justify-center text-text-faint">Loading...</div>;
 
   if (!available) {
@@ -717,22 +757,33 @@ export function MemuPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="border-b border-border-subtle px-5 py-2.5 flex items-center justify-between bg-bg shrink-0">
-        <div className="flex items-center gap-3">
-          <span className="font-medium text-[15px]">Semantic Memory</span>
-          <span className="text-xs text-text-faint">{items.length} items · {categories.length} categories · {resources.length} sources</span>
-        </div>
-        <div className="flex gap-1 items-center">
-          {TABS.map(tab => (
-            <button key={tab.key} onClick={() => setActiveTab(tab.key)} className={`px-3 py-1 rounded text-xs cursor-pointer transition-colors ${activeTab === tab.key ? 'bg-accent/20 text-accent' : 'text-text-dim hover:text-text-muted'}`}>
-              {tab.key === 'log' && <History size={11} className="inline mr-1 -mt-0.5" />}{tab.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      <PageHeader
+        leading={isMobile
+          ? <PaneToggle open={paneOpen} onToggle={() => setPaneOpen(o => !o)} label="types and categories" />
+          : undefined}
+        title="Semantic Memory"
+        filters={TABS.map(tab => (
+          <button key={tab.key} onClick={() => setActiveTab(tab.key)} className={`px-3 py-1 rounded text-xs cursor-pointer transition-colors whitespace-nowrap ${activeTab === tab.key ? 'bg-accent/20 text-accent' : 'text-text-dim hover:text-text-muted'}`}>
+            {tab.key === 'log' && <History size={11} className="inline mr-1 -mt-0.5" />}{tab.label}
+          </button>
+        ))}
+        actions={
+          // The counts are context, not a control: below `lg` the tabs and
+          // the pane toggle are the better use of the row.
+          <span className="hidden lg:inline text-xs text-text-faint whitespace-nowrap">
+            {items.length} items · {categories.length} categories · {resources.length} sources
+          </span>
+        }
+      />
 
       <div className="flex-1 flex overflow-hidden">
-        <Sidebar />
+        {isMobile ? (
+          <Drawer open={paneOpen} onClose={() => setPaneOpen(false)} side="left" label="Types and categories">
+            <Sidebar inDrawer onSelect={() => setPaneOpen(false)} />
+          </Drawer>
+        ) : (
+          <Sidebar />
+        )}
         <div className="flex-1 flex flex-col overflow-hidden">
           {showSearch && (
             <div className="px-3 py-2 border-b border-border-subtle shrink-0">

@@ -3,13 +3,27 @@ import { useCronStore } from '../../stores/cronStore';
 import { chatPath, jobLabel } from './utils';
 import { ChatLink, TriggerButton, JobTypeIcon } from './controls';
 
-export function CronSidebar() {
+export function CronSidebar({ inDrawer = false, onSelect }: {
+  inDrawer?: boolean;
+  /**
+   * Fired after every plain selection, including one that re-picks the job
+   * already selected. Drawer mode closes on it — watching `selectedJobId`
+   * instead misses that case and leaves the list parked over the table.
+   * Modified and middle clicks open a new tab and select nothing, so they
+   * are exempt.
+   */
+  onSelect?: () => void;
+}) {
   const { jobs, selectedJobId, selectJob } = useCronStore();
 
   return (
-    <div className="w-[220px] border-r border-border-subtle flex flex-col shrink-0 overflow-y-auto">
+    <div className={inDrawer
+      // In drawer mode the panel supplies the width and the edge, so the
+      // fixed 220px column and its own border would fight them.
+      ? 'w-full flex-1 min-h-0 flex flex-col overflow-y-auto'
+      : 'w-[220px] border-r border-border-subtle flex flex-col shrink-0 overflow-y-auto'}>
       <div className="p-2 space-y-1">
-        <button onClick={() => selectJob(null)}
+        <button onClick={() => { selectJob(null); onSelect?.(); }}
           className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-[13px] transition-colors cursor-pointer
             ${selectedJobId === null ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
           <span className="flex items-center gap-2"><Timer size={14} /> All Jobs</span>
@@ -27,6 +41,7 @@ export function CronSidebar() {
                   return;
                 }
                 selectJob(job.id);
+                onSelect?.();
               }}
               onAuxClick={(e) => {
                 // Middle-click → new tab, like a link.
