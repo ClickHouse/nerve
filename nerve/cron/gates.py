@@ -102,7 +102,7 @@ class CronGate(ABC):
 
 
 class MessagesGate(CronGate):
-    """Satisfied when monitored sync sources have unread messages.
+    """Satisfied when the sync sources feeding a consumer have unread messages.
 
     Generalises the legacy ``skip_when_idle`` / ``idle_consumer`` fields:
     a job that only wants to run when an inbox has new mail.
@@ -110,11 +110,15 @@ class MessagesGate(CronGate):
     Config::
 
         type: messages
-        sources: [gmail, github]   # source names to check (required)
+        sources: [gmail, github]   # sources to check; omit for "any source"
         consumer: inbox            # consumer cursor name (default "inbox")
 
-    The check compares each source's max ingested rowid against the
-    consumer's cursor position; it never advances any cursor.
+    With an explicit ``sources`` list, each named source's max ingested rowid
+    is compared against the consumer's cursor. With ``sources`` omitted (or
+    empty), the gate fires when *any* source the consumer already tracks has
+    unread messages — so a shared/default inbox job can be gated without
+    hard-coding the particular set of connected sources. Either way the check
+    only reads cursor state; it never advances a cursor.
     """
 
     type = "messages"
@@ -124,37 +128,41 @@ class MessagesGate(CronGate):
         "sources", "consumer", "skip_when_idle", "idle_consumer",
     })
 
-    def __init__(self, sources: list[str], consumer: str = "inbox") -> None:
-        if not sources:
-            raise GateConfigError("'messages' gate requires at least one source")
-        self.sources = sources
+    def __init__(self, sources: list[str] | None = None, consumer: str = "inbox") -> None:
+        # An empty/omitted source list means "any source this consumer tracks".
+        self.sources = list(sources or [])
         self.consumer = consumer
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
-        for source in self.sources:
-            cursor_seq = await ctx.db.get_consumer_cursor(self.consumer, source)
-            max_seq = await ctx.db.get_source_max_rowid(source)
-            if max_seq > cursor_seq:
-                return True
-        return False
+        if self.sources:
+            for source in self.sources:
+                cursor_seq = await ctx.db.get_consumer_cursor(self.consumer, source)
+                max_seq = await ctx.db.get_source_max_rowid(source)
+                if max_seq > cursor_seq:
+                    return True
+            return False
+        # No explicit sources: fire if any source the consumer tracks has
+        # unread messages. Listing cursors is read-only — unlike
+        # get_consumer_cursor it never initializes or advances a cursor.
+        cursors = await ctx.db.list_consumer_cursors(self.consumer)
+        return any((c.get("unread") or 0) > 0 for c in cursors)
 
     def describe(self) -> str:
-        return (
-            f"new messages in {', '.join(self.sources)} "
-            f"(consumer={self.consumer})"
-        )
+        where = ", ".join(self.sources) if self.sources else "any source"
+        return f"new messages in {where} (consumer={self.consumer})"
 
     @classmethod
     def from_config(cls, spec: dict) -> "MessagesGate":
         # Accept the new "sources" key, plus the legacy "skip_when_idle"
-        # spelling so an old shorthand maps cleanly onto this gate.
+        # spelling so an old shorthand maps cleanly onto this gate. An
+        # omitted/empty list means "any source the consumer tracks".
         sources = spec.get("sources")
         if sources is None:
             sources = spec.get("skip_when_idle", [])
         if isinstance(sources, str):
             sources = [sources]
         consumer = spec.get("consumer") or spec.get("idle_consumer") or "inbox"
-        return cls(sources=list(sources), consumer=consumer)
+        return cls(sources=list(sources or []), consumer=consumer)
 
 
 class TasksGate(CronGate):

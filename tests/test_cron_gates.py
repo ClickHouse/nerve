@@ -204,9 +204,38 @@ class TestMessagesGate:
         gate = MessagesGate(sources=["gmail", "github"])
         assert await gate.is_satisfied(_ctx(db)) is True
 
-    def test_empty_sources_raises(self):
-        with pytest.raises(GateConfigError):
-            MessagesGate(sources=[])
+    @pytest.mark.asyncio
+    async def test_no_sources_fires_when_any_consumer_source_unread(self):
+        # Omitted sources → "any source": read the consumer's unread counts.
+        db = _db(list_consumer_cursors=[
+            {"source": "gmail", "unread": 0},
+            {"source": "github", "unread": 3},
+        ])
+        gate = MessagesGate()
+        assert gate.sources == []
+        assert await gate.is_satisfied(_ctx(db)) is True
+        db.list_consumer_cursors.assert_awaited_once_with("inbox")
+        # Read-only: the any-source path must not touch/advance cursors.
+        db.get_consumer_cursor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_sources_unsatisfied_when_all_caught_up(self):
+        db = _db(list_consumer_cursors=[
+            {"source": "gmail", "unread": 0},
+            {"source": "github", "unread": 0},
+        ])
+        assert await MessagesGate().is_satisfied(_ctx(db)) is False
+
+    @pytest.mark.asyncio
+    async def test_no_sources_unsatisfied_when_no_cursors(self):
+        db = _db(list_consumer_cursors=[])
+        assert await MessagesGate(consumer="inbox").is_satisfied(_ctx(db)) is False
+
+    def test_empty_sources_means_any_source(self):
+        # Empty/omitted sources is now valid (no raise) and means "any source".
+        assert MessagesGate(sources=[]).sources == []
+        assert MessagesGate.from_config({"type": "messages"}).sources == []
+        assert "any source" in MessagesGate().describe()
 
     def test_from_config_sources(self):
         gate = MessagesGate.from_config(
@@ -263,8 +292,10 @@ class TestBuildGate:
                 {"type": "tasks", "status": "pending"},
                 {"type": "bogus"},
             ])
-        with pytest.raises(GateConfigError):
-            build_gates([{"type": "messages"}])  # no sources → invalid
+        # A "messages" gate with no sources is now valid ("any source"),
+        # so it builds rather than failing the lot.
+        gates = build_gates([{"type": "messages"}])
+        assert len(gates) == 1 and isinstance(gates[0], MessagesGate)
 
     def test_build_gates_builds_every_valid_spec(self):
         gates = build_gates([
