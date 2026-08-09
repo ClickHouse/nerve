@@ -25,6 +25,9 @@ import contextlib
 import logging
 import os
 import re
+import stat
+import time
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from claude_agent_sdk import (
@@ -63,6 +66,7 @@ from nerve.agent.interactive import (
     InteractiveToolHandler,
     _read_file_safe,
 )
+from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -71,21 +75,36 @@ try:
 except ImportError:  # pragma: no cover - depends on SDK version
     ThinkingBlock = None
 
-# Linux execve() limits a single argv element to MAX_ARG_STRLEN = PAGE_SIZE * 32
-# = 131,072 bytes on common configurations. The Claude Agent SDK passes the
-# system prompt inline as `--system-prompt <STRING>`, which makes the string a
-# single argv element. When SOUL.md + TASK.md + AGENTS.md + TOOLS.md +
-# MEMORY.md + recalled memU summaries cross that boundary, execve() returns
-# E2BIG ("Argument list too long") and Claude Code fails to start.
+# The system prompt is confidential, so it never travels in argv.
 #
-# We sidestep the limit by writing the prompt to a file and passing
-# `SystemPromptFile = {"type": "file", "path": ...}` (which the SDK converts
-# to `--system-prompt-file <PATH>` — the path string is short).
+# What Nerve assembles into it is the instance's whole private context:
+# SOUL.md / IDENTITY.md / USER.md (the operator's name, addresses, health
+# notes), AGENTS.md and TOOLS.md (which is an index of where every
+# credential on the host lives), MEMORY.md, and the recalled-memory block.
+# The SDK's default transport is `--system-prompt <STRING>`, and argv is
+# world-readable on every OS Nerve runs on: any process under any uid can
+# `ps -ww` the lot out of a running session, for every session at once,
+# unprivileged and untraced. Every MCP server Nerve spawns and every
+# command an agent shells out to is such a process.
 #
-# Threshold below which we keep passing inline (preserves prompt-cache hit
-# behavior for small, stable prompts). Set conservatively well under the
-# kernel limit to leave room for env/argv overhead.
-SYSTEM_PROMPT_INLINE_MAX = 100_000  # bytes
+# So `_build_options` always passes `SystemPromptFile = {"type": "file",
+# "path": ...}` — the SDK turns that into `--system-prompt-file <PATH>`,
+# and only the short path reaches the process table. The file itself is
+# written 0600 in a 0700 directory (see ``_write_system_prompt_file``).
+# There is no size threshold and no inline branch: a small prompt is not
+# less secret than a large one, and prompt-cache behavior is keyed on the
+# prompt's *content*, not on how it reached the CLI.
+#
+# Two consequences worth naming, both of which used to be the whole
+# rationale for this path:
+#
+#  * execve() caps a single argv element at MAX_ARG_STRLEN (PAGE_SIZE * 32
+#    = 131,072 bytes on common Linux configs). A full bundle crosses that
+#    and the CLI fails to start with E2BIG. Off argv, it cannot happen.
+#  * Workspace-file text in argv makes every string in SOUL/TOOLS/MEMORY a
+#    `pkill -f` pattern that matches *every* concurrent session on the
+#    box. Off argv, an ordinary cleanup command stops being a fleet-wide
+#    kill switch.
 
 # CLI env vars that remap model *aliases* (the short names accepted by the
 # Agent/Workflow tools' model option, skill frontmatter, `--model opus`,
@@ -441,20 +460,14 @@ class ClaudeBackend:
         config = self.config
         session_id = spec.session_id
 
-        # Pass the system prompt as a file when it's large enough to risk
-        # hitting Linux's MAX_ARG_STRLEN argv-element limit (see the
-        # SYSTEM_PROMPT_INLINE_MAX comment above).
-        system_prompt: str | dict[str, Any]
-        if len(spec.system_prompt) > SYSTEM_PROMPT_INLINE_MAX:
-            sp_path = self._write_system_prompt_file(session_id, spec.system_prompt)
-            system_prompt = {"type": "file", "path": sp_path}
-            logger.info(
-                "Session %s: system prompt %d bytes (> %d), passing via file %s",
-                session_id[:8], len(spec.system_prompt),
-                SYSTEM_PROMPT_INLINE_MAX, sp_path,
-            )
-        else:
-            system_prompt = spec.system_prompt
+        # Always via file, never inline — argv is world-readable and this
+        # prompt is the instance's private context (see the module comment).
+        sp_path = self._write_system_prompt_file(session_id, spec.system_prompt)
+        system_prompt: dict[str, Any] = {"type": "file", "path": sp_path}
+        logger.debug(
+            "Session %s: system prompt %d bytes passed via file %s",
+            session_id[:8], len(spec.system_prompt), sp_path,
+        )
 
         # Local Ollama models are reached through the proxy and speak the
         # OpenAI-translated API — Anthropic-only knobs (extended thinking,
@@ -565,39 +578,76 @@ class ClaudeBackend:
             plugins=self._deps.claude_plugins(),
         )
 
-    def _system_prompt_dir(self) -> "os.PathLike[str]":
-        """Directory where oversized system prompts are spilled to disk."""
-        from pathlib import Path
+    def _system_prompt_dir(self) -> Path:
+        """Owner-only directory holding the per-session system prompts.
+
+        ``mkdir(exist_ok=True)`` does not touch the mode of a directory
+        that already exists, and the pre-hardening code created this one
+        at the umask default (0755 on most hosts) — so the chmod is
+        unconditional, not just part of the create. That is the upgrade
+        path for every install that ran the old code; without it the dir
+        stays world-traversable forever.
+        """
         d = Path(self.config.workspace) / ".nerve" / "cache" / "system_prompts"
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(d, 0o700)
+        except OSError as e:  # read-only FS, or someone else owns it
+            logger.warning("Could not restrict %s to 0700: %s", d, e)
         return d
 
     def _write_system_prompt_file(self, session_id: str, content: str) -> str:
-        """Write the system prompt to disk and return its absolute path.
+        """Write the system prompt to disk 0600 and return its path.
 
         Deterministic filename so a session that reconnects (resume) gets
-        the same prompt without re-writing. Lazy GC of stale files (>7d).
+        the same prompt without re-writing. The write is atomic and the
+        mode is in place *before* the content is, so the bundle is never
+        briefly readable at the process umask — same discipline the Codex
+        backend uses for the files it generates.
         """
-        import time
-        from pathlib import Path
-
-        dir_path = Path(self._system_prompt_dir())
-
-        cutoff = time.time() - 7 * 24 * 3600
-        try:
-            for old in dir_path.iterdir():
-                try:
-                    if old.is_file() and old.stat().st_mtime < cutoff:
-                        old.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
+        dir_path = self._system_prompt_dir()
+        self._sweep_system_prompt_dir(dir_path)
 
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)[:120]
         path = dir_path / f"{safe_id}.md"
-        path.write_text(content, encoding="utf-8")
+        atomic_write_text(path, content, mode=0o600)
         return str(path)
+
+    @staticmethod
+    def _sweep_system_prompt_dir(dir_path: Path) -> None:
+        """Drop spills older than 7d; clamp whatever is left to 0600.
+
+        Two jobs, one pass over the directory. The GC is what keeps a
+        long-lived workspace from accumulating a prompt file per session
+        forever. The clamp is the upgrade path for files the
+        pre-hardening code already wrote at 0644: they hold the full
+        identity bundle and would otherwise sit there world-readable
+        until they aged out.
+
+        Best-effort throughout — a file that cannot be removed or
+        chmod'd (foreign owner, read-only mount) must not stop a session
+        from starting.
+
+        ``lstat``, not ``stat``: a symlink here is skipped rather than
+        followed, so neither the unlink nor the chmod can be aimed at a
+        file outside this directory by planting one.
+        """
+        cutoff = time.time() - 7 * 24 * 3600
+        try:
+            entries = list(dir_path.iterdir())
+        except OSError:
+            return
+        for old in entries:
+            try:
+                st = old.lstat()
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if st.st_mtime < cutoff:
+                    old.unlink()
+                elif st.st_mode & 0o077:
+                    os.chmod(old, 0o600)
+            except OSError:
+                pass
 
     def _build_env(self, cache_ttl: str = "5m") -> dict[str, str]:
         """Build environment variables for the SDK subprocess."""

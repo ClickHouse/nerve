@@ -4,6 +4,7 @@ helpers (no SDK subprocess)."""
 import asyncio
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -135,9 +136,12 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
          patch.object(backend, "_build_hooks", return_value={}):
         options = backend._build_options(spec)
 
-    assert options.system_prompt == marker
-    assert "Nerve runbooks" not in str(options.system_prompt)
-    assert "Codex-native skills" not in str(options.system_prompt)
+    # The prompt travels by file (never argv), so the exactness check is on
+    # what landed on disk.
+    rendered = Path(options.system_prompt["path"]).read_text(encoding="utf-8")
+    assert rendered == marker
+    assert "Nerve runbooks" not in rendered
+    assert "Codex-native skills" not in rendered
 
 
 # ---------------------------------------------------------------------------
