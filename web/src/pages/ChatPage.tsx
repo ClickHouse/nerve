@@ -43,7 +43,7 @@ export function ChatPage() {
     sessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
-    sidebarCollapsed, mobileSidebarOpen, panels,
+    sidebarCollapsed, mobileSidebarOpen, panels, panelVisible,
     modifiedFiles, modifiedFilesCount,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
@@ -212,9 +212,14 @@ export function ChatPage() {
 
   const fileCount = modifiedFiles.length || modifiedFilesCount;
   const filesPanelActive = panels.some(p => p.id === 'files-panel');
+  // SidePanel renders nothing without a tab, so it only covers the column when
+  // there is one.
+  const panelCoversColumn = isMobile && panelVisible && panels.length > 0;
 
   return (
-    <div className="h-full flex">
+    // `relative` anchors the mobile side panel, which covers this column but
+    // deliberately not the bottom nav below it.
+    <div className="h-full flex relative">
       <SessionSidebar
         sessions={sessions}
         activeSession={activeSession}
@@ -228,8 +233,16 @@ export function ChatPage() {
 
       {/* Main content area: chat column + optional plan panel */}
       <div className="flex-1 flex min-w-0">
-        {/* Chat column */}
-        <div className="flex-1 flex flex-col min-w-0">
+        {/* Chat column. On a phone the side panel covers it completely, so it
+            goes inert while that is open: the panel is not a modal — the nav
+            below it stays reachable on purpose — and without this, Tab would
+            walk through a transcript and a composer nobody can see. Marking it
+            inert also moves focus off the covered composer, so keystrokes stop
+            landing in a box that is no longer on screen. */}
+        <div
+          className="flex-1 flex flex-col min-w-0"
+          inert={panelCoversColumn ? true : undefined}
+        >
           {/* Header */}
           <div className="border-b border-border-subtle px-3 md:px-5 py-2.5 flex items-center justify-between gap-2 bg-bg shrink-0">
             <div className="flex items-center gap-2 min-w-0">

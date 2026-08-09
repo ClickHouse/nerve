@@ -5,6 +5,7 @@ import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
 import { useModalSurface } from '../../hooks/useModalSurface';
+import { safeAreaInsets } from '../../utils/safeArea';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
@@ -314,7 +315,9 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       className={mobile
         ? `bg-surface border-r border-border-subtle flex flex-col overflow-hidden fixed inset-y-0 left-0 z-50 w-[85vw] max-w-[320px] transition-transform duration-200 outline-none ${collapsed ? '-translate-x-full' : 'translate-x-0'}`
         : `bg-surface border-r border-border-subtle flex flex-col shrink-0 overflow-hidden relative ${collapsed ? 'border-r-0' : ''} ${isDragging ? '' : 'transition-all duration-200'}`}
-      style={mobile ? undefined : { width: collapsed ? 0 : sidebarWidth }}
+      // Fixed in drawer mode, so the shell's safe-area padding does not reach
+      // it: without this its first controls sit under the status bar.
+      style={mobile ? safeAreaInsets('left') : { width: collapsed ? 0 : sidebarWidth }}
       // Keep the closed drawer out of the tab order: it stays mounted so the
       // slide transition has something to animate, but it is off-canvas.
       inert={mobile && collapsed ? true : undefined}

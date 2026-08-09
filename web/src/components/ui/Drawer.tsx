@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { useModalSurface } from '../../hooks/useModalSurface';
+import { safeAreaInsets } from '../../utils/safeArea';
 
 /**
  * Off-canvas panel over a tap-to-dismiss scrim.
@@ -46,11 +47,9 @@ export function Drawer({ open, onClose, side = 'left', label, children }: {
         className={`fixed inset-y-0 z-50 flex w-[85vw] max-w-[320px] flex-col overflow-hidden bg-surface outline-none transition-transform duration-200
           ${side === 'left' ? 'left-0 border-r' : 'right-0 border-l'} border-border-subtle
           ${open ? 'translate-x-0' : closedTransform}`}
-        // The panel spans the full height, so it owns both insets itself.
-        style={{
-          paddingTop: 'env(safe-area-inset-top)',
-          paddingBottom: 'env(safe-area-inset-bottom)',
-        }}
+        // Fixed, so the shell's safe-area padding does not reach it — including
+        // the side inset for the edge it is anchored to.
+        style={safeAreaInsets(side)}
       >
         {children}
       </div>
