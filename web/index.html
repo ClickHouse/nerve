@@ -2,7 +2,16 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover lets the layout extend under the notch and home
+         indicator; whatever sits against an edge pays it back with
+         env(safe-area-inset-*) padding. interactive-widget=resizes-content
+         makes the on-screen keyboard shrink the layout instead of floating
+         over it, which is what keeps the composer and the bottom nav
+         reachable while typing. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <!-- Served from the workspace config subtree when a favicon is tracked
          there, 404 otherwise. Not a bundled asset: it is per-instance config. -->
     <link rel="icon" href="/favicon.ico" />

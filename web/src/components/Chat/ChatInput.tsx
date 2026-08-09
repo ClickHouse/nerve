@@ -561,9 +561,15 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
         </div>
       )}
 
-      {/* Main input */}
+      {/* Main input.
+
+          One row on desktop. On a phone the controls alone can run to six
+          buttons plus the model picker, which left the textarea a ~90px
+          stub, so the row wraps instead: controls stay on the first line and
+          the textarea takes a full-width line of its own below them (see the
+          `basis-full`/`order-1` pair on it). */}
       <div className="px-4 py-3">
-        <div className="max-w-[var(--chat-width)] mx-auto flex gap-3 items-end">
+        <div className="max-w-[var(--chat-width)] mx-auto flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
           {/* File attach button */}
           <button
             onClick={() => fileInputRef.current?.click()}
@@ -695,7 +701,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             }
             rows={1}
             disabled={disabled || rewriteActive}
-            className="flex-1 px-4 py-3 bg-surface-raised border border-border rounded-xl text-[15px] text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
+            // basis-full makes the textarea claim a whole flex line on its
+            // own; order-1 puts that line under the controls rather than
+            // above them. Both are undone at `md`, back to a single row.
+            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-[15px] text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
           {isStreaming ? (
             <button

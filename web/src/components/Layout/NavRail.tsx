@@ -1,27 +1,12 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, LogOut, Clock, Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket } from 'lucide-react';
+import { LogOut } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
 import { ThemeToggle } from './ThemeToggle';
-
-const NAV_ITEMS = [
-  { path: '/chat', icon: MessageSquare, label: 'Chat' },
-  { path: '/notifications', icon: Bell, label: 'Notifs' },
-  { path: '/files', icon: FolderOpen, label: 'Files' },
-  { path: '/tasks', icon: CheckSquare, label: 'Tasks' },
-  { path: '/plans', icon: Lightbulb, label: 'Plans' },
-  { path: '/skills', icon: Sparkles, label: 'Skills' },
-  { path: '/mcp', icon: Plug, label: 'MCP' },
-  { path: '/ultracode', icon: Workflow, label: 'Ultra', feature: 'ultracode' as const },
-  { path: '/workflow-runs', icon: Rocket, label: 'Runs' },
-  { path: '/sources', icon: Inbox, label: 'Sources' },
-  { path: '/cron', icon: Clock, label: 'Cron' },
-  { path: '/memory', icon: Brain, label: 'Memory' },
-  { path: '/diagnostics', icon: Activity, label: 'Diag' },
-];
+import { NAV_ITEMS } from './navItems';
 
 export function NavRail() {
   const location = useLocation();
