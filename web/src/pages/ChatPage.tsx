@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
@@ -15,6 +15,7 @@ import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'lucide-react';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
+import { useIsMobile } from '../hooks/useMediaQuery';
 import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import type { ChatMessage, TextBlockData } from '../types/chat';
@@ -42,12 +43,41 @@ export function ChatPage() {
     sessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
-    sidebarCollapsed, panels,
+    sidebarCollapsed, mobileSidebarOpen, panels,
     modifiedFiles, modifiedFilesCount,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
-    sendMessage, stopSession, toggleSidebar, openFilesPanel,
+    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
   } = useChatStore();
+
+  // Below `md` the session list becomes an off-canvas drawer. Its open state is
+  // deliberately NOT `sidebarCollapsed`: that one is a persisted desktop
+  // preference (default: expanded), and reusing it would both pop the drawer
+  // open on first load and let a phone overwrite the desktop layout. It lives
+  // in the store rather than here so the global Cmd+K shortcut can open it.
+  const isMobile = useIsMobile();
+  const sessionListOpen = isMobile ? mobileSidebarOpen : !sidebarCollapsed;
+
+  // Retire the drawer on the way out of the phone layout, so a later resize
+  // back down doesn't arrive with an overlay already on screen. Nothing
+  // flashes on the way out: above `md` the drawer state is not read at all.
+  useEffect(() => {
+    if (!isMobile) setMobileSidebarOpen(false);
+  }, [isMobile, setMobileSidebarOpen]);
+
+  // Picking a conversation should reveal it, not leave the list covering it.
+  // The drawer closes itself the moment one of its links is tapped — including
+  // a tap on the conversation that is already open, which never reaches here
+  // because `activeSession` doesn't change. This is the backstop for switches
+  // from anywhere else (browser Back, a deep link). The first resolution of
+  // `activeSession` out of '' is skipped: it lands after the initial load and
+  // would otherwise slam the drawer shut right after Cmd+K opened it.
+  const previousSession = useRef(activeSession);
+  useEffect(() => {
+    const switched = previousSession.current && previousSession.current !== activeSession;
+    previousSession.current = activeSession;
+    if (switched) setMobileSidebarOpen(false);
+  }, [activeSession, setMobileSidebarOpen]);
 
   // Chat-scoped keyboard shortcuts. Global ones (new chat, search, modal,
   // Esc cascade) live in <GlobalShortcuts /> in App.tsx.
@@ -64,7 +94,9 @@ export function ChatPage() {
       combo: { mod: true, shift: true, key: 's' },
       description: 'Toggle session sidebar',
       section: 'chat',
-      action: () => useChatStore.getState().toggleSidebar(),
+      // Not `toggleSidebar`: below `md` that would silently rewrite the
+      // persisted desktop preference and move nothing on screen.
+      action: () => useChatStore.getState().toggleSessionList(),
     },
     {
       id: 'chat-focus-input',
@@ -189,7 +221,9 @@ export function ChatPage() {
         agentStatus={agentStatus}
         onCreate={handleCreateSession}
         onDelete={handleDeleteSession}
-        collapsed={sidebarCollapsed}
+        collapsed={!sessionListOpen}
+        mobile={isMobile}
+        onRequestClose={() => setMobileSidebarOpen(false)}
       />
 
       {/* Main content area: chat column + optional plan panel */}
@@ -197,16 +231,17 @@ export function ChatPage() {
         {/* Chat column */}
         <div className="flex-1 flex flex-col min-w-0">
           {/* Header */}
-          <div className="border-b border-border-subtle px-5 py-2.5 flex items-center justify-between bg-bg shrink-0">
-            <div className="flex items-center gap-2">
+          <div className="border-b border-border-subtle px-3 md:px-5 py-2.5 flex items-center justify-between gap-2 bg-bg shrink-0">
+            <div className="flex items-center gap-2 min-w-0">
               <button
-                onClick={toggleSidebar}
-                className="w-6 h-6 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer transition-colors rounded"
-                title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
+                onClick={toggleSessionList}
+                className="w-6 h-6 shrink-0 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer transition-colors rounded"
+                title={sessionListOpen ? 'Hide sidebar' : 'Show sidebar'}
+                aria-expanded={sessionListOpen}
               >
-                {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+                {sessionListOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
               </button>
-              <span className="font-medium text-[15px]">
+              <span className="font-medium text-[15px] truncate">
                 {virtualSession?.id === activeSession
                   ? 'New chat'
                   : (sessions.find(s => s.id === activeSession)?.title || activeSession)}
@@ -218,7 +253,7 @@ export function ChatPage() {
                 return (
                   <span
                     title={`Agent backend: ${backend}`}
-                    className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border ${
+                    className={`hidden md:inline shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border ${
                       backend === 'codex'
                         ? 'text-hue-teal border-teal-400/25 bg-teal-400/10'
                         : 'text-hue-orange border-orange-400/25 bg-orange-400/10'
@@ -231,7 +266,7 @@ export function ChatPage() {
               {(() => {
                 const model = sessions.find(s => s.id === activeSession)?.model;
                 return model ? (
-                  <span className="text-[11px] text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
+                  <span className="hidden md:inline shrink-0 text-[11px] text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
                     {formatModelLabel(model)}
                   </span>
                 ) : null;
@@ -266,9 +301,9 @@ export function ChatPage() {
                 );
               })()}
               {statusLabel && (
-                <div className="flex items-center gap-1.5 text-[12px] text-text-muted">
-                  <Loader2 size={12} className="animate-spin text-accent" />
-                  <span>{statusLabel}</span>
+                <div className="flex items-center gap-1.5 min-w-0 text-[12px] text-text-muted">
+                  <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
+                  <span className="truncate">{statusLabel}</span>
                 </div>
               )}
               {backendStatus?.subtype === 'codex_rate_limits' && (() => {
@@ -286,7 +321,7 @@ export function ChatPage() {
                 );
               })()}
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 shrink-0">
               <BackgroundJobs
                 sessions={sessions}
                 activeSession={activeSession}
@@ -306,13 +341,17 @@ export function ChatPage() {
                   <span className="tabular-nums">{fileCount}</span>
                 </button>
               )}
-              {contextUsage && <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />}
+              {contextUsage && (
+                <div className="hidden md:flex">
+                  <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />
+                </div>
+              )}
               {langfuse?.enabled && langfuse.host && activeSession && (
                 <a
                   href={`${langfuse.host}/sessions?sessionId=${encodeURIComponent(activeSession)}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="flex items-center gap-1 px-2 py-1 rounded text-[12px] text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
+                  className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-[12px] text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
                   title="View this session's trace in Langfuse"
                 >
                   <ExternalLink size={12} />

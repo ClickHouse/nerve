@@ -132,7 +132,10 @@ function GlobalShortcuts() {
       action: () => {
         const focusNow = () => {
           const store = useChatStore.getState();
-          if (store.sidebarCollapsed) store.toggleSidebar();
+          // On a phone the list is an off-canvas drawer, on desktop a collapsible
+          // column; revealSessionList opens whichever one this viewport uses, so
+          // the search field is never focused inside a closed, inert drawer.
+          store.revealSessionList();
           // The sidebar search input is unmounted until something asks for it.
           // requestSearchFocus bumps a nonce the sidebar subscribes to.
           store.requestSearchFocus();

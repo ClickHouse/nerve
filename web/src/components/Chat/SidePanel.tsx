@@ -1,6 +1,8 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban, Workflow as WorkflowIcon } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
+import { useIsMobile } from '../../hooks/useMediaQuery';
+import { useModalSurface } from '../../hooks/useModalSurface';
 import { MarkdownContent } from './MarkdownContent';
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
@@ -266,9 +268,18 @@ export function SidePanel() {
   const focusPanelTab = useChatStore(s => s.focusPanelTab);
   const closePanelTab = useChatStore(s => s.closePanelTab);
   const setPanelWidth = useChatStore(s => s.setPanelWidth);
+  const mobile = useIsMobile();
 
   const activeTab = panels.find(p => p.id === activePanelId) || panels[0] || null;
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // On a phone this panel covers the whole viewport, which makes it a modal:
+  // without this, the transcript and the navigation underneath stay in the tab
+  // order and Tab lands on controls nobody can see.
+  const { dialogProps } = useModalSurface<HTMLDivElement>(
+    mobile && panelVisible && panels.length > 0,
+    togglePanel,
+  );
 
   // Drag-to-resize (disable transition during drag for responsiveness)
   const [isDragging, setIsDragging] = useState(false);
@@ -305,6 +316,36 @@ export function SidePanel() {
 
   const isOpen = panelVisible;
   const showTabs = panels.length > 1;
+
+  // A phone has no room to split the viewport: at 412px a 45% panel leaves the
+  // transcript an unreadable sliver. Cover it instead, and dismiss the same way
+  // as on desktop — via the tab header's close button.
+  if (mobile) {
+    return (
+      <div
+        {...dialogProps}
+        aria-label={activeTab.label || 'Panel'}
+        className={`side-panel fixed inset-0 z-30 flex flex-col bg-bg-sunken outline-none ${isOpen ? '' : 'hidden'}`}
+      >
+        {showTabs && (
+          <TabBar
+            panels={panels}
+            activeId={activePanelId}
+            onFocus={focusPanelTab}
+            onClose={closePanelTab}
+          />
+        )}
+        <TabHeader tab={activeTab} onClose={togglePanel} />
+        {activeTab.type === 'files'
+          ? <FileChangesPanel />
+          : activeTab.type === 'workflow'
+            ? <WorkflowPanel tab={activeTab} />
+            : <TabContent tab={activeTab} containerRef={containerRef} />
+        }
+        {activeTab.type === 'plan' && <PlanActions tab={activeTab} />}
+      </div>
+    );
+  }
 
   return (
     <div

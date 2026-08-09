@@ -4,6 +4,7 @@ import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
+import { useModalSurface } from '../../hooks/useModalSurface';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
@@ -54,13 +55,17 @@ function saveCollapsedGroups(groups: Set<string>): void {
   } catch { /* quota exceeded / disabled — keep the in-memory state only */ }
 }
 
-export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed }: {
+export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, mobile = false, onRequestClose }: {
   sessions: Session[];
   activeSession: string;
   agentStatus: AgentStatus;
   onCreate: () => void;
   onDelete: (id: string) => void;
   collapsed?: boolean;
+  /** Render as an off-canvas drawer instead of an inline column. */
+  mobile?: boolean;
+  /** Drawer mode only — tapping the scrim asks the parent to close. */
+  onRequestClose?: () => void;
 }) {
   const [systemExpanded, setSystemExpanded] = useState(false);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(loadCollapsedGroups);
@@ -78,6 +83,19 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
+
+  // In drawer mode the list is a modal overlay: it needs focus, Tab
+  // containment, Escape, and focus restoration. Declared before the search
+  // effects below so that when Cmd+K opens the drawer and asks for search
+  // focus in the same tick, the search input wins the race.
+  const drawerOpen = mobile && !collapsed;
+  const { dialogProps } = useModalSurface<HTMLDivElement>(drawerOpen, onRequestClose);
+
+  // Opening a conversation should reveal it, so every row dismisses the
+  // drawer. Leaving this to the parent's `activeSession` watcher isn't enough:
+  // re-tapping the conversation that is already open never changes the route,
+  // and the drawer would stay parked over the transcript.
+  const handleSelect = mobile ? onRequestClose : undefined;
 
   // Drag-to-resize the session list. It is left-anchored against the nav rail,
   // so the width tracks the cursor 1:1. The width transition is disabled while
@@ -279,12 +297,31 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   }, [runningSystemCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
+    <>
+      {/* Drawer scrim. Only in mobile mode, and only while open — a phone has
+          no room for a persistent column, so the list sits above the
+          transcript and the scrim is what dismisses it. */}
+      {drawerOpen && (
+        <div
+          onClick={onRequestClose}
+          className="fixed inset-0 z-40 bg-black/60 transition-opacity duration-200"
+          aria-hidden="true"
+        />
+      )}
     <div
-      className={`bg-surface border-r border-border-subtle flex flex-col shrink-0 overflow-hidden relative ${collapsed ? 'border-r-0' : ''} ${isDragging ? '' : 'transition-all duration-200'}`}
-      style={{ width: collapsed ? 0 : sidebarWidth }}
+      {...(mobile ? dialogProps : {})}
+      aria-label={mobile ? 'Conversations' : undefined}
+      className={mobile
+        ? `bg-surface border-r border-border-subtle flex flex-col overflow-hidden fixed inset-y-0 left-0 z-50 w-[85vw] max-w-[320px] transition-transform duration-200 outline-none ${collapsed ? '-translate-x-full' : 'translate-x-0'}`
+        : `bg-surface border-r border-border-subtle flex flex-col shrink-0 overflow-hidden relative ${collapsed ? 'border-r-0' : ''} ${isDragging ? '' : 'transition-all duration-200'}`}
+      style={mobile ? undefined : { width: collapsed ? 0 : sidebarWidth }}
+      // Keep the closed drawer out of the tab order: it stays mounted so the
+      // slide transition has something to animate, but it is off-canvas.
+      inert={mobile && collapsed ? true : undefined}
     >
-      {/* Drag-to-resize handle on the right edge (hidden when collapsed). */}
-      {!collapsed && (
+      {/* Drag-to-resize handle on the right edge (hidden when collapsed).
+          Pointer-driven and mouse-only, so it has no place in drawer mode. */}
+      {!collapsed && !mobile && (
         <div
           onMouseDown={handleResizeStart}
           className="group/resize absolute top-0 right-0 bottom-0 z-20 w-2 cursor-col-resize"
@@ -310,7 +347,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
           {/* New chat pill (hidden under input when open) */}
           <button
-            onClick={onCreate}
+            onClick={() => { onCreate(); handleSelect?.(); }}
             title="New chat"
             className="absolute right-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 rounded-full border border-border-subtle flex items-center gap-1 text-[11px] text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
           >
@@ -379,6 +416,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                       onRename={renameSession}
                       onToggleStar={toggleStar}
                       onArchive={archiveSession}
+                      onSelect={handleSelect}
                       showDate
                     />
                   ))
@@ -393,6 +431,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
             {virtualSession && (
               <Link
                 to={`/chat/${virtualSession.id}`}
+                onClick={handleSelect}
                 className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-sm transition-colors no-underline
                   ${virtualSession.id === activeSession
                     ? 'bg-accent/10 text-text'
@@ -436,6 +475,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     onRename={renameSession}
                     onToggleStar={toggleStar}
                     onArchive={archiveSession}
+                    onSelect={handleSelect}
                   />
                 ))}
               </div>
@@ -462,6 +502,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     onRename={renameSession}
                     onToggleStar={toggleStar}
                     onArchive={archiveSession}
+                    onSelect={handleSelect}
                   />
                 ))}
               </div>
@@ -490,6 +531,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     onRename={renameSession}
                     onToggleStar={toggleStar}
                     onArchive={archiveSession}
+                    onSelect={handleSelect}
                   />
                 ))}
               </div>
@@ -525,6 +567,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   <Link
                     key={s.id}
                     to={`/chat/${s.id}`}
+                    onClick={handleSelect}
                     className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors no-underline
                       ${s.id === activeSession
                         ? 'bg-accent/10 text-text-muted'
@@ -548,6 +591,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
         )}
       </div>
     </div>
+    </>
   );
 }
 
@@ -662,7 +706,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, showDate }: {
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onSelect, showDate }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
@@ -670,6 +714,8 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   onRename: (id: string, title: string) => Promise<void>;
   onToggleStar: (id: string) => Promise<void>;
   onArchive: (id: string) => Promise<void>;
+  /** Fired when the row itself is opened (not its menu) — drawer mode uses it to close. */
+  onSelect?: () => void;
   showDate?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -727,6 +773,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   return (
     <Link
       to={`/chat/${session.id}`}
+      onClick={onSelect}
       className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
