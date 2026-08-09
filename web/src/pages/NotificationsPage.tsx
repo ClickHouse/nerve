@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus, RotateCw, Clock } from 'lucide-react';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
+import { PageHeader } from '../components/ui/PageHeader';
 
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
@@ -450,68 +451,70 @@ export function NotificationsPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="border-b border-border-subtle px-6 py-3 flex items-center gap-4 bg-bg shrink-0">
-        <Bell size={18} className="text-accent" />
-        <h1 className="text-lg font-semibold">Notifications</h1>
-
-        {/* Status filters */}
-        <div className="flex items-center gap-1 ml-2">
-          {STATUS_FILTERS.map(f => (
-            <button
-              key={f.value}
-              onClick={() => setFilter(f.value)}
-              className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
-                ${filter === f.value
-                  ? 'bg-accent/15 text-accent border-accent/30'
-                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                }`}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Type filters */}
-        <div className="flex items-center gap-1 ml-1">
-          {TYPE_FILTERS.map(f => (
-            <button
-              key={f.value}
-              onClick={() => setTypeFilter(f.value)}
-              className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
-                ${typeFilter === f.value
-                  ? 'bg-accent/15 text-accent border-accent/30'
-                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                }`}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Silences toggle */}
-        <button
-          onClick={() => setShowSilences(v => !v)}
-          className={`ml-auto flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border cursor-pointer transition-colors
-            ${showSilences
-              ? 'bg-accent/15 text-accent border-accent/30'
-              : 'border-border text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-            }`}
-        >
-          <BellOff size={13} />
-          Silences
-        </button>
-
-        {/* Dismiss All */}
-        {pendingCount > 0 && (
+      <PageHeader
+        icon={<Bell size={18} className="text-accent shrink-0" />}
+        title="Notifications"
+        filters={
+          <>
+            {/* Status filters */}
+            {STATUS_FILTERS.map(f => (
+              <button
+                key={f.value}
+                onClick={() => setFilter(f.value)}
+                className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
+                  ${filter === f.value
+                    ? 'bg-accent/15 text-accent border-accent/30'
+                    : 'text-text-dim border-border hover:border-border hover:text-text-muted'
+                  }`}
+              >
+                {f.label}
+              </button>
+            ))}
+            {/* Type filters — separated by a rule rather than the old ml-1,
+                which read as one undifferentiated run of pills once they
+                shared a scroller. */}
+            <span className="mx-1 h-4 w-px shrink-0 bg-border-subtle" aria-hidden="true" />
+            {TYPE_FILTERS.map(f => (
+              <button
+                key={f.value}
+                onClick={() => setTypeFilter(f.value)}
+                className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
+                  ${typeFilter === f.value
+                    ? 'bg-accent/15 text-accent border-accent/30'
+                    : 'text-text-dim border-border hover:border-border hover:text-text-muted'
+                  }`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </>
+        }
+        actions={
+          <>
           <button
-            onClick={dismissAll}
-            className="flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors"
+            onClick={() => setShowSilences(v => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border cursor-pointer transition-colors whitespace-nowrap
+              ${showSilences
+                ? 'bg-accent/15 text-accent border-accent/30'
+                : 'border-border text-text-muted hover:text-text-secondary hover:bg-surface-raised'
+              }`}
           >
-            <CheckCheck size={13} />
-            Dismiss All
+            <BellOff size={13} />
+            Silences
           </button>
-        )}
-      </div>
+          {/* Dismiss All */}
+          {pendingCount > 0 && (
+            <button
+              onClick={dismissAll}
+              className="flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors whitespace-nowrap"
+            >
+              <CheckCheck size={13} />
+              Dismiss All
+            </button>
+          )}
+          </>
+        }
+      />
 
       <div className="flex-1 overflow-y-auto p-6">
         {showSilences && <SilencesPanel />}
