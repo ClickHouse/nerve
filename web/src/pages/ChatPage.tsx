@@ -158,9 +158,14 @@ export function ChatPage() {
           switchSession(sessionId);
         }
       } else if (!activeSession) {
-        // No URL param and no active session yet — pick the most recent
-        const { sessions: loaded } = useChatStore.getState();
-        if (loaded.length > 0) {
+        // No URL param and no active session yet. A restored unsent chat wins
+        // over the most recent real one: it only survives a reload when it
+        // still holds draft text, and dropping the user somewhere else would
+        // hide the very prompt they were writing.
+        const { sessions: loaded, virtualSession } = useChatStore.getState();
+        if (virtualSession) {
+          switchSession(virtualSession.id);
+        } else if (loaded.length > 0) {
           switchSession(loaded[0].id);
         }
         // Otherwise, the server's session_switched WS message will set it

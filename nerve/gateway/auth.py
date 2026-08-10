@@ -18,7 +18,24 @@ from nerve.config import get_config
 logger = logging.getLogger(__name__)
 
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRY_HOURS = 24
+
+# Fallback web-session lifetime, used only when the config can't be read.
+# The real value is ``auth.jwt_expiry_hours`` (default 720h / 30 days).
+#
+# Session tokens *slide*: ``require_auth`` re-mints one that is past
+# REFRESH_AFTER_RATIO of its lifetime and the gateway hands the fresh token
+# back on the response, so continuous use never expires. The configured
+# window is therefore an idle timeout — the old fixed 24h constant logged
+# you out mid-work exactly one day after login no matter what you were doing.
+DEFAULT_JWT_EXPIRY_HOURS = 720
+
+# Re-mint once a token is this far into its lifetime. At 0.5 an active
+# session is refreshed about every half-window (so it never dies), while a
+# fresh token costs no crypto on the vast majority of requests.
+REFRESH_AFTER_RATIO = 0.5
+
+# Response header carrying a slid session token back to the browser.
+SESSION_TOKEN_HEADER = "X-Nerve-Token"
 
 # Audience claim on session-bound MCP tokens (see create_mcp_session_token).
 MCP_AUDIENCE = "nerve-mcp"
@@ -32,14 +49,51 @@ def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
-def create_token(jwt_secret: str) -> str:
-    """Create a JWT token."""
+def session_expiry_hours() -> int:
+    """Configured web-session lifetime, in hours (never below 1)."""
+    try:
+        hours = int(get_config().auth.jwt_expiry_hours)
+    except Exception:  # config unreadable (very early boot / tests)
+        hours = DEFAULT_JWT_EXPIRY_HOURS
+    return max(1, hours)
+
+
+def create_token(jwt_secret: str, expiry_hours: int | None = None) -> str:
+    """Create a web-session JWT token."""
+    hours = max(1, int(expiry_hours)) if expiry_hours else session_expiry_hours()
+    now = datetime.now(timezone.utc)
     payload = {
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
-        "iat": datetime.now(timezone.utc),
+        "exp": now + timedelta(hours=hours),
+        "iat": now,
         "sub": "user",
     }
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
+    """Re-mint a session token that is past its refresh threshold.
+
+    Sliding expiry: each authenticated request carries the session further
+    into the future, so a tab in continuous use never hits the wall. Returns
+    ``None`` while the token is still fresh — the common case, and the reason
+    this costs nothing on most requests.
+
+    Only ordinary web-session tokens slide. Audience-scoped tokens (MCP
+    session/worker credentials) are minted per-process with deliberately
+    short TTLs and must expire on schedule.
+    """
+    if payload.get("aud") or payload.get("sub") != "user":
+        return None
+    iat, exp = payload.get("iat"), payload.get("exp")
+    if not isinstance(iat, (int, float)) or not isinstance(exp, (int, float)):
+        return None
+    lifetime = exp - iat
+    if lifetime <= 0:
+        return None
+    age = datetime.now(timezone.utc).timestamp() - iat
+    if age < lifetime * REFRESH_AFTER_RATIO:
+        return None
+    return create_token(jwt_secret)
 
 
 def create_mcp_session_token(
@@ -153,7 +207,14 @@ async def require_auth(request: Request) -> dict:
         return {"sub": "user"}
 
     token = get_token_from_request(request)
-    return decode_token(token, config.auth.jwt_secret)
+    payload = decode_token(token, config.auth.jwt_secret)
+    # Slide the session forward. Stashed on request.state rather than returned
+    # so every existing caller of this dependency is unaffected; the gateway's
+    # http middleware picks it up and emits SESSION_TOKEN_HEADER.
+    refreshed = maybe_refresh_token(payload, config.auth.jwt_secret)
+    if refreshed:
+        request.state.refreshed_token = refreshed
+    return payload
 
 
 async def authenticate_websocket(websocket: WebSocket) -> bool:

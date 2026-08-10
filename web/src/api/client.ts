@@ -216,6 +216,43 @@ export function getToken(): string | null {
   return authToken;
 }
 
+/** Response header carrying a server-refreshed session token. */
+const SESSION_TOKEN_HEADER = 'X-Nerve-Token';
+
+/**
+ * Adopt a slid session token. The gateway re-mints the token once it is past
+ * half its lifetime and returns it on the response, so a tab that keeps
+ * talking to the server never expires — no daily re-login, no logout
+ * mid-sentence.
+ */
+function absorbRefreshedToken(res: Response): void {
+  const fresh = res.headers.get(SESSION_TOKEN_HEADER);
+  if (fresh && fresh !== authToken) setToken(fresh);
+}
+
+/**
+ * What to do when the server says 401. Registered by the auth store so this
+ * module doesn't have to import it (that would be a cycle).
+ *
+ * The default is deliberately NOT `window.location.reload()`: a reload is how
+ * an expired token used to destroy whatever you were typing. Any background
+ * poll could trip it, the page would blow away mid-keystroke, and an unsent
+ * draft in a *new* chat — whose session id lives only in memory — was
+ * orphaned and then swept by pruneDrafts. The app now stays mounted and asks
+ * for the password over the top of your work.
+ */
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler;
+}
+
+function handleUnauthorized(): Error {
+  clearToken();
+  onUnauthorized?.();
+  return new Error('Unauthorized');
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -227,10 +264,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
 
+  absorbRefreshedToken(res);
+
   if (res.status === 401) {
-    clearToken();
-    window.location.reload();
-    throw new Error('Unauthorized');
+    throw handleUnauthorized();
   }
 
   if (!res.ok) {
@@ -623,10 +660,10 @@ export const api = {
       body: formData,
     });
 
+    absorbRefreshedToken(res);
+
     if (res.status === 401) {
-      clearToken();
-      window.location.reload();
-      throw new Error('Unauthorized');
+      throw handleUnauthorized();
     }
     if (!res.ok) {
       const body = await res.text();

@@ -144,8 +144,15 @@ telegram:
 auth:
   password_hash: "$2b$12$..."    # Generate below
   jwt_secret: "..."              # Generate below
+  jwt_expiry_hours: 720          # Optional — web-session idle timeout (default 30 days)
 EOF
 ```
+
+`jwt_expiry_hours` is an **idle** timeout, not a cap on a working session: the
+gateway re-mints the token whenever a request arrives past half its lifetime,
+so a tab in continuous use is never logged out. Only a tab left untouched for
+the whole window comes back to a password prompt. Lower it if the browser is
+somewhere you don't fully trust.
 
 ### Generate auth credentials
 

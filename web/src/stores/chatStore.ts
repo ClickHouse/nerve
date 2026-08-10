@@ -9,6 +9,7 @@ import { randomUUID } from '../utils/uuid';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
+import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
@@ -236,10 +237,32 @@ interface ChatState {
   openFilesPanel: () => void;
 }
 
+/**
+ * Rebuild the unsent chat from its persisted id, if there is one. Dropped
+ * unless it still has draft text — a restored empty "New chat" is just noise
+ * in the sidebar, and the whole point of restoring is the unsent text.
+ */
+function restoreVirtualSession(): Session | null {
+  const stored = loadVirtualSession();
+  if (!stored) return null;
+  const drafts = loadDrafts();
+  if (!(drafts[stored.id] || '').trim()) {
+    clearVirtualSession();
+    return null;
+  }
+  return {
+    id: stored.id, title: '', source: 'web', status: 'created',
+    updated_at: stored.created, is_running: false,
+  };
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   activeSession: '',
-  virtualSession: null,
+  // Rehydrated too: an unsent chat's id is the key its draft is stored under,
+  // so losing the id on reload orphaned the draft. Restoring it brings the
+  // half-written prompt back with the chat.
+  virtualSession: restoreVirtualSession(),
   // Rehydrated from localStorage so unsent composer text survives a reload.
   drafts: loadDrafts(),
   messages: [],
@@ -471,6 +494,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const rlDirty = !!(rl && (rl.goal.trim() || rl.verifier.trim()));
     if (vs && get().activeSession === vs.id && id !== vs.id
         && !(get().drafts[vs.id] || '').trim() && !rlDirty) {
+      clearVirtualSession();
       set((s) => {
         const drafts = { ...s.drafts };
         delete drafts[vs.id];
@@ -552,6 +576,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       id, title: '', source: 'web', status: 'created',
       updated_at: now, is_running: false,
     };
+    // Persist the id: it's the key this chat's draft is written under, and
+    // without it on disk a reload strands the draft under an id nothing
+    // remembers.
+    persistVirtualSession(id, now);
     set({ virtualSession: virtual });
     await get().switchSession(id);
   },
@@ -611,6 +639,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // now owns the draft.
       removeDraft(vs.id);
       if (carried) persistDraft(real.id, carried);
+      // The chat is real now — nothing left to restore on reload.
+      clearVirtualSession();
       return {
         // Don't yank the view if the user navigated away during the POST.
         ...(state.activeSession === vs.id ? { activeSession: real.id } : {}),
@@ -634,6 +664,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!vs) return;
     set({ newChatBackend: null, newChatReviewLoop: null });
     removeDraft(vs.id);
+    clearVirtualSession();
     set((s) => {
       const drafts = { ...s.drafts };
       delete drafts[vs.id];
