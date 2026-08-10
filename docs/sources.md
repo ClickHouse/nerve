@@ -141,8 +141,9 @@ visible rather than failing the fetch.
 - **Cursor:** ISO 8601 timestamp of the newest notification's `updated_at`
 - **First run:** Fetches from the last 24 hours
 - **Subsequent runs:** Uses `since=<cursor + 1s>` with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
-- **Filter:** `participating=true` (assigned, review requested, mentioned)
+- **Filter:** `participating=true` (assigned, review requested, mentioned). Note it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source at all (verified against a live account: 25 `ci_activity` with `all=true`, 0 with `participating=true`)
 - **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls)
+- **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering)
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 
 ### GitHub Events
@@ -221,6 +222,9 @@ sync:
     deny_repos: []                # Guardrail denylist — always dropped (takes precedence)
     allow_actors: []              # Guardrail allowlist of GitHub logins — empty = all. Example: ["alice", "bob"]
     deny_actors: []               # Guardrail denylist of GitHub logins — always dropped (takes precedence)
+    allow_reasons: []             # Guardrail allowlist of GitHub reasons — empty = all. Example: ["mention"]
+    deny_reasons: []              # Guardrail denylist of reasons. Example: ["comment", "subscribed"]
+    deny_ci_branches: []          # Drop CI runs on these branches. Example: ["main", "master"]
 
   github_events:
     enabled: true
@@ -314,6 +318,70 @@ default), all actors pass — behavior is unchanged. The repo and actor rules AN
 |-------|------|---------|-------------|
 | `github.allow_actors` | list | `[]` | Allowlist of GitHub login globs. Empty = all actors pass |
 | `github.deny_actors` | list | `[]` | Denylist of GitHub login globs. Takes precedence over `allow_actors` |
+
+### GitHub reason guardrail
+
+`reason` is GitHub's own answer to "why am I being told this": `author` (you opened the
+thread), `mention`, `team_mention`, `assign`, `review_requested`, `comment` (you commented
+on it once), `subscribed` (you only watch it), `manual` (you subscribed by hand),
+`ci_activity`, `state_change`, `security_alert`.
+
+```yaml
+sync:
+  github:
+    deny_reasons: ["comment", "subscribed", "manual", "state_change"]
+```
+
+That denylist is the compact way to say *"only threads that are mine or that call me by
+name"* — it keeps `author`, `mention`, `team_mention`, `assign`, `review_requested` and
+`ci_activity`. Prefer `deny_reasons` over `allow_reasons`: the allowlist is fail-closed, so
+a reason GitHub adds later would be silently dropped.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.allow_reasons` | list | `[]` | Allowlist of reason globs. Empty = all reasons pass |
+| `github.deny_reasons` | list | `[]` | Denylist of reason globs. Takes precedence over `allow_reasons` |
+
+### GitHub CI-branch guardrail
+
+Keeping `ci_activity` lets in every workflow-run notification, including default-branch
+runs that have nothing to do with your work — upstream syncs, scheduled cleanup jobs,
+deploys. GitHub has no server-side setting for this: one workflow file serves both the
+`push`-to-`main` runs and the `pull_request` runs, and the Actions notification preference
+is account-wide.
+
+CheckSuite notifications carry no `subject.url` and can't be enriched, but the branch is
+right there in the title (`"CI workflow run failed for main branch"`). The source parses it
+into the `ci_branch` metadata key, which is `""` for every other notification:
+
+```yaml
+sync:
+  github:
+    deny_ci_branches: ["main", "master"]
+```
+
+You keep CI failures on your own PR branches and drop the default-branch noise. This rule
+is **deny-only** by design — `ci_branch` is empty for non-CI records, and a non-empty allow
+list is fail-closed, so it would drop the entire feed.
+
+**Currently inert:** the fetch uses `participating=true`, which never returns `ci_activity`
+(see the GitHub adapter notes above), so no CheckSuite record reaches the guardrail today.
+The rule exists for the day that filter is relaxed — without it, dropping `participating`
+would flood the inbox with default-branch runs.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.deny_ci_branches` | list | `[]` | Denylist of branch globs for CI runs. Empty = all CI notifications pass |
+
+### Debugging drops
+
+Dropped records are never persisted, so the run summary count is backed by per-record log
+lines naming the rule that fired:
+
+```
+Source github: guardrail dropped 3/5 records (e.g. '[owner/repo] CI workflow run failed …')
+Source github: dropped 19542… on ci_branch='main' — [owner/repo] CI workflow run failed …
+```
 
 ### Extending to other sources
 

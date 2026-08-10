@@ -1225,6 +1225,24 @@ class GitHubSyncConfig:
     # matching actor is dropped before it reaches the inbox). Empty = all pass.
     allow_actors: list[str] = field(default_factory=list)
     deny_actors: list[str] = field(default_factory=list)
+    # Reason guardrails — limit which GitHub notification "reason" values reach
+    # the inbox, matched on the "reason" metadata key (GitHub's own reason:
+    # mention, author, review_requested, assign, team_mention, comment,
+    # subscribed, ci_activity, state_change, ...). Same semantics — case-
+    # insensitive globs, deny wins, non-empty allow is fail-closed. Denying
+    # "comment"/"subscribed" drops follow-up churn on threads you merely
+    # commented on or watch, while keeping mentions, review requests and
+    # activity on your own PRs/issues. Empty = all reasons pass.
+    allow_reasons: list[str] = field(default_factory=list)
+    deny_reasons: list[str] = field(default_factory=list)
+    # CI guardrail — drop workflow-run notifications for branches that aren't
+    # yours, matched on the "ci_branch" metadata key (the branch parsed out of
+    # a CheckSuite title; "" for every other notification). Denying
+    # "main"/"master" keeps CI failures on your own PR branches while dropping
+    # upstream-sync and scheduled runs on the default branch. deny only — an
+    # allow list is fail-closed and would drop every non-CI notification, since
+    # their ci_branch is empty.
+    deny_ci_branches: list[str] = field(default_factory=list)
 
     @classmethod
     @_coerced
@@ -1241,6 +1259,9 @@ class GitHubSyncConfig:
             deny_repos=d.get("deny_repos", []),
             allow_actors=d.get("allow_actors", []),
             deny_actors=d.get("deny_actors", []),
+            allow_reasons=d.get("allow_reasons", []),
+            deny_reasons=d.get("deny_reasons", []),
+            deny_ci_branches=d.get("deny_ci_branches", []),
         )
 
 
