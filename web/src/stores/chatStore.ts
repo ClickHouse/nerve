@@ -4,6 +4,7 @@ import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
 import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary } from '../types/chat';
 import { hydrateMessage } from '../utils/hydrateMessage';
+import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
@@ -152,8 +153,16 @@ interface ChatState {
     toolInput: Record<string, unknown>;
   } | null;
 
-  // Sidebar collapse
+  // Sidebar collapse (desktop column — persisted)
   sidebarCollapsed: boolean;
+  /**
+   * Whether the phone-sized off-canvas session drawer is showing. Deliberately
+   * separate from `sidebarCollapsed`: that one is a persisted *desktop*
+   * preference, so driving the drawer with it would both pop the drawer open on
+   * first load and let a phone overwrite the desktop layout. Lives in the store
+   * rather than in ChatPage so the global Cmd+K shortcut can open it.
+   */
+  mobileSidebarOpen: boolean;
 
   // Modified files tracking
   modifiedFiles: ModifiedFileSummary[];
@@ -240,6 +249,11 @@ interface ChatState {
   answerInteraction: (result: Record<string, string> | null) => void;
   denyInteraction: (message?: string) => void;
   toggleSidebar: () => void;
+  setMobileSidebarOpen: (open: boolean) => void;
+  /** Show/hide the session list, whichever form it takes on this viewport. */
+  toggleSessionList: () => void;
+  /** Make sure the session list is on screen (Cmd+K, before focusing search). */
+  revealSessionList: () => void;
   // Modified files
   fetchModifiedFiles: (sessionId: string) => Promise<void>;
   openFilesPanel: () => void;
@@ -291,6 +305,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sidebarWidth: parseFloat(localStorage.getItem('nerve_sidebar_width') || '240'),
   pendingInteraction: null,
   sidebarCollapsed: localStorage.getItem('nerve_sidebar_collapsed') === 'true',
+  mobileSidebarOpen: false,
   modifiedFiles: [],
   modifiedFilesCount: 0,
   backgroundTasks: [],
@@ -429,6 +444,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const next = !get().sidebarCollapsed;
     localStorage.setItem('nerve_sidebar_collapsed', String(next));
     set({ sidebarCollapsed: next });
+  },
+
+  setMobileSidebarOpen: (open: boolean) => set({ mobileSidebarOpen: open }),
+
+  // Both entry points below branch on the viewport so that the header button
+  // and the keyboard shortcuts stay in agreement — and so neither writes the
+  // persisted desktop preference from a phone.
+  toggleSessionList: () => {
+    if (isMobileViewport()) set({ mobileSidebarOpen: !get().mobileSidebarOpen });
+    else get().toggleSidebar();
+  },
+
+  revealSessionList: () => {
+    if (isMobileViewport()) set({ mobileSidebarOpen: true });
+    else if (get().sidebarCollapsed) get().toggleSidebar();
   },
 
   // ------------------------------------------------------------------ //

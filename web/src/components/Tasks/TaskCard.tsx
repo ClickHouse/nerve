@@ -15,30 +15,46 @@ export function TaskCard({ task, onStatusChange }: {
       onClick={() => navigate(`/tasks/${task.id}`)}
       className="p-4 bg-surface border border-border-subtle rounded-lg hover:border-border transition-colors cursor-pointer"
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <h3 className="font-medium text-[15px] text-text mb-1">{task.title}</h3>
-          <div className="flex items-center gap-3 text-[12px]">
+      {/* On a phone the status select held ~110px against a title that then
+          had to wrap inside ~200px. It drops to the meta line instead, where
+          there is room to spare, and the title gets the full card width.
+          Ordering does it without duplicating anything:
+
+            phone   title / meta + controls
+            ≥ sm    title + controls / meta                                */}
+      <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
+        <h3 className="font-medium text-[15px] text-text min-w-0 basis-full sm:basis-0 sm:flex-1 order-0">
+          {task.title}
+        </h3>
+
+        <div className="flex items-center gap-3 text-[12px] min-w-0 order-2 sm:order-3 sm:basis-full">
+          {/* Hidden on a phone: the select sitting beside it already names
+              the status, and one value is not worth showing twice. */}
+          <span className="hidden sm:flex">
             <StatusBadge status={task.status} />
-            {task.deadline && (
-              <span className="flex items-center gap-1 text-text-dim">
-                <Calendar size={11} /> {task.deadline}
-              </span>
-            )}
-            {task.updated_at && (
-              <span
-                className="flex items-center gap-1 text-text-faint"
-                title={`Updated ${task.updated_at}`}
-              >
-                <Clock size={11} /> {formatTimeAgo(task.updated_at)}
-              </span>
-            )}
-            {task.source && (
-              <span className="text-text-faint">from {task.source}</span>
-            )}
-          </div>
+          </span>
+          {task.deadline && (
+            <span className="flex items-center gap-1 text-text-dim whitespace-nowrap">
+              <Calendar size={11} /> {task.deadline}
+            </span>
+          )}
+          {task.updated_at && (
+            <span
+              className="flex items-center gap-1 text-text-faint whitespace-nowrap"
+              title={`Updated ${task.updated_at}`}
+            >
+              <Clock size={11} /> {formatTimeAgo(task.updated_at)}
+            </span>
+          )}
+          {task.source && (
+            <span className="text-text-faint truncate">from {task.source}</span>
+          )}
         </div>
-        <div className="flex items-center gap-2 shrink-0" onClick={e => e.stopPropagation()}>
+
+        <div
+          className="flex items-center gap-2 shrink-0 ml-auto order-3 sm:order-2"
+          onClick={e => e.stopPropagation()}
+        >
           {task.source_url && (
             <a
               href={task.source_url}

@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Lightbulb } from 'lucide-react';
 import { usePlanStore, type Plan } from '../stores/planStore';
+import { PageHeader } from '../components/ui/PageHeader';
 
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
@@ -64,27 +65,25 @@ export function PlansPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="border-b border-border-subtle px-6 py-3 flex items-center gap-4 bg-bg shrink-0">
-        <Lightbulb size={18} className="text-accent" />
-        <h1 className="text-lg font-semibold">Plans</h1>
-        <div className="flex items-center gap-1 ml-2">
-          {FILTERS.map(f => (
-            <button
-              key={f.value}
-              onClick={() => setFilter(f.value)}
-              className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
-                ${filter === f.value
-                  ? 'bg-accent/15 text-accent border-accent/30'
-                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                }`}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-      </div>
+      <PageHeader
+        icon={<Lightbulb size={18} className="text-accent shrink-0" />}
+        title="Plans"
+        filters={FILTERS.map(f => (
+          <button
+            key={f.value}
+            onClick={() => setFilter(f.value)}
+            className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
+              ${filter === f.value
+                ? 'bg-accent/15 text-accent border-accent/30'
+                : 'text-text-dim border-border hover:border-border hover:text-text-muted'
+              }`}
+          >
+            {f.label}
+          </button>
+        ))}
+      />
 
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>
         ) : plans.length === 0 ? (

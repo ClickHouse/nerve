@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus, RotateCw, Clock } from 'lucide-react';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
+import { PageHeader } from '../components/ui/PageHeader';
 
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
@@ -193,10 +194,17 @@ function NotificationCard({ notif }: { notif: Notification }) {
     <div className={`p-4 bg-surface border rounded-lg transition-colors ${
       notif.status === 'pending' ? 'border-border-subtle' : 'border-border-subtle'
     }`}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            {priorityDot && <span className={`w-2 h-2 rounded-full shrink-0 ${priorityDot}`} />}
+      {/* The badge column is shrink-0, so beside the text it costs a fixed
+          ~127px — over a third of the card on a phone, which left the body
+          wrapping at ~190px. Below `sm` the badges take a row of their own
+          above the title instead, and the text gets the full card width. */}
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 sm:gap-3">
+        <div className="min-w-0 flex-1 order-1 sm:order-none">
+          {/* items-start, not items-center: a title long enough to wrap was
+              centring the priority dot against the whole block, leaving it
+              floating beside the second line. */}
+          <div className="flex items-start gap-2">
+            {priorityDot && <span className={`w-2 h-2 mt-1.5 rounded-full shrink-0 ${priorityDot}`} />}
             <h3 className="font-medium text-[15px] text-text">{notif.title}</h3>
           </div>
           {notif.body && (
@@ -208,7 +216,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
             </p>
           )}
         </div>
-        <div className="flex items-center gap-2 text-[12px] shrink-0">
+        <div className="flex flex-wrap items-center gap-2 text-[12px] shrink-0 order-0 sm:order-none">
           {(notif.redelivery_count ?? 0) > 0 && (
             <span
               className="flex items-center gap-1 px-2 py-0.5 rounded-full border bg-sky-400/10 text-hue-blue border-sky-400/20"
@@ -450,70 +458,72 @@ export function NotificationsPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="border-b border-border-subtle px-6 py-3 flex items-center gap-4 bg-bg shrink-0">
-        <Bell size={18} className="text-accent" />
-        <h1 className="text-lg font-semibold">Notifications</h1>
-
-        {/* Status filters */}
-        <div className="flex items-center gap-1 ml-2">
-          {STATUS_FILTERS.map(f => (
-            <button
-              key={f.value}
-              onClick={() => setFilter(f.value)}
-              className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
-                ${filter === f.value
-                  ? 'bg-accent/15 text-accent border-accent/30'
-                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                }`}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Type filters */}
-        <div className="flex items-center gap-1 ml-1">
-          {TYPE_FILTERS.map(f => (
-            <button
-              key={f.value}
-              onClick={() => setTypeFilter(f.value)}
-              className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors
-                ${typeFilter === f.value
-                  ? 'bg-accent/15 text-accent border-accent/30'
-                  : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                }`}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Silences toggle */}
-        <button
-          onClick={() => setShowSilences(v => !v)}
-          className={`ml-auto flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border cursor-pointer transition-colors
-            ${showSilences
-              ? 'bg-accent/15 text-accent border-accent/30'
-              : 'border-border text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-            }`}
-        >
-          <BellOff size={13} />
-          Silences
-        </button>
-
-        {/* Dismiss All */}
-        {pendingCount > 0 && (
+      <PageHeader
+        icon={<Bell size={18} className="text-accent shrink-0" />}
+        title="Notifications"
+        filters={
+          <>
+            {/* Status filters */}
+            {STATUS_FILTERS.map(f => (
+              <button
+                key={f.value}
+                onClick={() => setFilter(f.value)}
+                className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
+                  ${filter === f.value
+                    ? 'bg-accent/15 text-accent border-accent/30'
+                    : 'text-text-dim border-border hover:border-border hover:text-text-muted'
+                  }`}
+              >
+                {f.label}
+              </button>
+            ))}
+            {/* Type filters — separated by a rule rather than the old ml-1,
+                which read as one undifferentiated run of pills once they
+                shared a scroller. */}
+            <span className="mx-1 h-4 w-px shrink-0 bg-border-subtle" aria-hidden="true" />
+            {TYPE_FILTERS.map(f => (
+              <button
+                key={f.value}
+                onClick={() => setTypeFilter(f.value)}
+                className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
+                  ${typeFilter === f.value
+                    ? 'bg-accent/15 text-accent border-accent/30'
+                    : 'text-text-dim border-border hover:border-border hover:text-text-muted'
+                  }`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </>
+        }
+        actions={
+          <>
           <button
-            onClick={dismissAll}
-            className="flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors"
+            onClick={() => setShowSilences(v => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border cursor-pointer transition-colors whitespace-nowrap
+              ${showSilences
+                ? 'bg-accent/15 text-accent border-accent/30'
+                : 'border-border text-text-muted hover:text-text-secondary hover:bg-surface-raised'
+              }`}
           >
-            <CheckCheck size={13} />
-            Dismiss All
+            <BellOff size={13} />
+            Silences
           </button>
-        )}
-      </div>
+          {/* Dismiss All */}
+          {pendingCount > 0 && (
+            <button
+              onClick={dismissAll}
+              className="flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors whitespace-nowrap"
+            >
+              <CheckCheck size={13} />
+              Dismiss All
+            </button>
+          )}
+          </>
+        }
+      />
 
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {showSilences && <SilencesPanel />}
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>

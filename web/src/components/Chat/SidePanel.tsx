@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban, Workflow as WorkflowIcon } from 'lucide-react';
 import { useChatStore } from '../../stores/chatStore';
+import { useIsMobile } from '../../hooks/useMediaQuery';
 import { MarkdownContent } from './MarkdownContent';
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
@@ -266,6 +267,7 @@ export function SidePanel() {
   const focusPanelTab = useChatStore(s => s.focusPanelTab);
   const closePanelTab = useChatStore(s => s.closePanelTab);
   const setPanelWidth = useChatStore(s => s.setPanelWidth);
+  const mobile = useIsMobile();
 
   const activeTab = panels.find(p => p.id === activePanelId) || panels[0] || null;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -305,6 +307,47 @@ export function SidePanel() {
 
   const isOpen = panelVisible;
   const showTabs = panels.length > 1;
+
+  // A phone has no room to split the viewport: at 412px a 45% panel leaves the
+  // transcript an unreadable sliver. Cover it instead, and dismiss the same way
+  // as on desktop — via the tab header's close button.
+  if (mobile) {
+    return (
+      // absolute, not fixed: this covers the chat column (ChatPage's root is
+      // the positioned ancestor), so the bottom nav stays visible and usable
+      // underneath it. Fixed inset-0 covered the nav too, leaving the close
+      // button as the only way out of the panel.
+      // overflow-hidden matters as much as the positioning: without it the
+      // `flex-1 overflow-y-auto` content region grows past the panel (flex
+      // items default to min-height:auto) and spills over the bottom nav
+      // instead of scrolling inside.
+      // It stops being a modal here — the nav outside it is meant to stay
+      // reachable — so it is a named region rather than a dialog, and what it
+      // covers is made inert by ChatPage instead of trapped by this panel.
+      <div
+        role="region"
+        aria-label={activeTab.label || 'Panel'}
+        className={`side-panel absolute inset-0 z-30 flex flex-col overflow-hidden bg-bg-sunken ${isOpen ? '' : 'hidden'}`}
+      >
+        {showTabs && (
+          <TabBar
+            panels={panels}
+            activeId={activePanelId}
+            onFocus={focusPanelTab}
+            onClose={closePanelTab}
+          />
+        )}
+        <TabHeader tab={activeTab} onClose={togglePanel} />
+        {activeTab.type === 'files'
+          ? <FileChangesPanel />
+          : activeTab.type === 'workflow'
+            ? <WorkflowPanel tab={activeTab} />
+            : <TabContent tab={activeTab} containerRef={containerRef} />
+        }
+        {activeTab.type === 'plan' && <PlanActions tab={activeTab} />}
+      </div>
+    );
+  }
 
   return (
     <div
