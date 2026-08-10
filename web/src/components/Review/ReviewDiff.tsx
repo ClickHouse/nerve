@@ -82,6 +82,7 @@ function ThreadBlock({
             <div className="flex items-center gap-1.5 mb-0.5">
               {c.author === 'agent' ? <Bot size={12} className="text-hue-emerald" /> : <User size={12} className="text-hue-blue" />}
               <span className={`font-medium ${AUTHOR_STYLE[c.author] || ''}`}>{c.author}</span>
+              {c.pending ? <span className="text-[9px] px-1 rounded-full bg-yellow-400/15 text-hue-yellow" title="Not sent until you Submit review">draft</span> : null}
               <span className="text-text-faint text-[10px]">{c.created_at?.slice(0, 16).replace('T', ' ')}</span>
             </div>
             <div className="whitespace-pre-wrap text-text-secondary pl-4">{c.body}</div>

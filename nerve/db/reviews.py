@@ -169,16 +169,21 @@ class ReviewStore:
         author: str,
         body: str,
         thread_status: str | None = None,
+        pending: bool = False,
     ) -> dict:
         """Append a comment, bump the thread + its review, and optionally set
-        the thread status (e.g. 'answered' when the agent replies)."""
+        the thread status (e.g. 'answered' when the agent replies).
+
+        ``pending=True`` stages a human *draft* comment that is NOT delivered to
+        the target session until the review is submitted — see
+        :meth:`list_pending_comments` and :meth:`mark_review_submitted`."""
         comment_id = _new_id()
         now = _now()
         async with self._atomic():
             await self.db.execute(
-                """INSERT INTO code_review_comments (id, thread_id, author, body)
-                   VALUES (?, ?, ?, ?)""",
-                (comment_id, thread_id, author, body),
+                """INSERT INTO code_review_comments (id, thread_id, author, body, pending)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (comment_id, thread_id, author, body, 1 if pending else 0),
             )
             if thread_status is not None:
                 await self.db.execute(
@@ -209,3 +214,30 @@ class ReviewStore:
             (thread_id,),
         ) as cursor:
             return [dict(row) async for row in cursor]
+
+    # -- Batched review submission ------------------------------------------
+
+    async def list_pending_comments(self, review_id: str) -> list[dict]:
+        """Human draft comments not yet submitted, each with its thread anchor
+        (file/side/line/snippet), ordered for a readable batch message."""
+        async with self.db.execute(
+            """SELECT c.id, c.thread_id, c.body, c.created_at,
+                      t.file_path, t.side, t.line_start, t.line_end, t.anchor_snippet
+               FROM code_review_comments c
+               JOIN code_review_threads t ON c.thread_id = t.id
+               WHERE t.review_id = ? AND c.pending = 1 AND c.author = 'human'
+               ORDER BY t.file_path ASC, t.line_start ASC, c.created_at ASC""",
+            (review_id,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def mark_review_submitted(self, review_id: str) -> int:
+        """Clear the pending flag on all of a review's staged comments.
+        Returns how many comments were published."""
+        result = await self._write(
+            """UPDATE code_review_comments SET pending = 0
+               WHERE pending = 1
+                 AND thread_id IN (SELECT id FROM code_review_threads WHERE review_id = ?)""",
+            (review_id,),
+        )
+        return result.rowcount

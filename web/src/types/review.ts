@@ -26,6 +26,8 @@ export interface ReviewComment {
   author: 'human' | 'agent';
   body: string;
   created_at: string;
+  /** 1 = staged draft (not yet delivered to the session); 0 = submitted. */
+  pending?: number;
 }
 
 export interface ReviewThread {

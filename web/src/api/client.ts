@@ -431,6 +431,10 @@ export const api = {
     ),
   resolveReviewThread: (id: string, threadId: string) =>
     request<{ resolved: boolean }>(`/reviews/${id}/threads/${threadId}/resolve`, { method: 'POST' }),
+  submitReview: (id: string, summary: string) =>
+    request<{ submitted: number; target_session_id: string | null }>(
+      `/reviews/${id}/submit`, { method: 'POST', body: JSON.stringify({ summary }) },
+    ),
 
   // Chat (non-streaming)
   chat: (message: string, sessionId?: string) =>

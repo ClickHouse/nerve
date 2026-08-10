@@ -73,36 +73,41 @@ async def _run_inject(session_id: str, message: str) -> None:
             logger.exception("code-review inject into session %s failed", session_id)
 
 
-def _format_comment_message(review: dict, thread: dict, body: str) -> str:
-    loc = thread["file_path"]
-    ls, le = thread.get("line_start"), thread.get("line_end")
-    if ls and le and le != ls:
-        loc += f":{ls}-{le}"
-    elif ls:
-        loc += f":{ls}"
+def _format_review_submission(review: dict, summary: str, items: list[dict]) -> str:
+    """One message delivering a whole review — an optional overall summary plus
+    every staged inline comment — so the agent acts on it in a single turn."""
     header = (
         f'Review {review["id"]} "{review.get("title") or "(untitled)"}" — '
         f'{review["worktree"]}'
     )
     if review.get("branch"):
         header += f' (branch {review["branch"]})'
+    n = len(items)
     lines = [
-        "[code-review comment · from the reviewer — automated delivery, not a chat message]",
+        f"[code review · {n} inline comment{'s' if n != 1 else ''} from the reviewer "
+        "— automated delivery, not a chat message]",
         header,
-        f'File: {loc} ({thread.get("side", "new")} side)',
     ]
-    if thread.get("anchor_snippet"):
-        lines.append(f'> {thread["anchor_snippet"]}')
-    lines += [
-        "",
-        "The reviewer wrote:",
-        body,
-        "",
-        f"(review {review['id']}, thread {thread['id']}) — reply in this chat to "
-        "discuss. To post your answer back onto the review thread so it appears "
-        "inline in the Code Review panel and marks the thread answered, use your "
-        "code-review reply tool with that review id and thread id.",
-    ]
+    if summary and summary.strip():
+        lines += ["", "Overall:", summary.strip()]
+    lines.append("")
+    for i, it in enumerate(items, 1):
+        loc = it["file_path"]
+        ls, le = it.get("line_start"), it.get("line_end")
+        if ls and le and le != ls:
+            loc += f":{ls}-{le}"
+        elif ls:
+            loc += f":{ls}"
+        lines.append(f'{i}. {loc} ({it.get("side", "new")} side)  [thread {it["thread_id"]}]')
+        if it.get("anchor_snippet"):
+            lines.append(f'   > {it["anchor_snippet"]}')
+        for bl in ((it.get("body") or "").splitlines() or [""]):
+            lines.append(f'   {bl}')
+        lines.append("")
+    lines.append(
+        "To respond: address the points and reply per thread with your code-review "
+        f'reply tool (review {review["id"]}, the thread ids above), or discuss here.'
+    )
     return "\n".join(lines)
 
 
@@ -146,6 +151,10 @@ class ThreadCreate(BaseModel):
 class CommentCreate(BaseModel):
     body: str
     author: str = "human"
+
+
+class SubmitReview(BaseModel):
+    summary: str = ""
 
 
 # --- Git-backed read endpoints ---------------------------------------------
@@ -305,15 +314,15 @@ async def create_thread(review_id: str, req: ThreadCreate, user: dict = Depends(
         anchor_snippet=req.anchor_snippet,
     )
     if req.body:
-        await db.add_comment(thread_id=thread["id"], author=req.author, body=req.body)
-
-    target = None
-    if req.author == "human":
-        target = await _ensure_target(review)
-        asyncio.create_task(_run_inject(target, _format_comment_message(review, thread, req.body or "(no text)")))
+        # Human comments are staged (pending) until the review is submitted;
+        # agent-authored threads are published immediately.
+        await db.add_comment(
+            thread_id=thread["id"], author=req.author, body=req.body,
+            pending=(req.author == "human"),
+        )
 
     thread["comments"] = await db.list_comments(thread["id"])
-    return {"thread": thread, "target_session_id": target}
+    return {"thread": thread, "target_session_id": review.get("target_session_id")}
 
 
 @router.post("/api/reviews/{review_id}/threads/{thread_id}/comments")
@@ -327,15 +336,10 @@ async def add_comment(review_id: str, thread_id: str, req: CommentCreate, user: 
 
     thread_status = "answered" if req.author == "agent" else None
     comment = await db.add_comment(
-        thread_id=thread_id, author=req.author, body=req.body, thread_status=thread_status,
+        thread_id=thread_id, author=req.author, body=req.body,
+        thread_status=thread_status, pending=(req.author == "human"),
     )
-
-    target = None
-    if req.author == "human":
-        target = await _ensure_target(review)
-        asyncio.create_task(_run_inject(target, _format_comment_message(review, thread, req.body)))
-
-    return {"comment": comment, "target_session_id": target}
+    return {"comment": comment, "target_session_id": review.get("target_session_id")}
 
 
 @router.post("/api/reviews/{review_id}/threads/{thread_id}/resolve")
@@ -347,3 +351,29 @@ async def resolve_thread(review_id: str, thread_id: str, user: dict = Depends(re
         raise HTTPException(status_code=404, detail="Thread not found")
     await db.set_thread_status(thread_id, "resolved")
     return {"resolved": True}
+
+
+@router.post("/api/reviews/{review_id}/submit")
+async def submit_review(review_id: str, req: SubmitReview, user: dict = Depends(require_auth)):
+    """Deliver the whole review — optional summary + all staged (pending) inline
+    comments — to the target session as ONE turn, then clear the pending flags.
+
+    This is the batched alternative to per-comment delivery: the reviewer stages
+    N line comments (each pending), then submits once and the agent receives the
+    entire review in a single turn.
+    """
+    _cfg()
+    db = get_deps().db
+    review = await db.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    items = await db.list_pending_comments(review_id)
+    if not items and not (req.summary or "").strip():
+        return {"submitted": 0, "target_session_id": review.get("target_session_id")}
+
+    target = await _ensure_target(review)
+    message = _format_review_submission(review, req.summary, items)
+    asyncio.create_task(_run_inject(target, message))
+    await db.mark_review_submitted(review_id)
+    return {"submitted": len(items), "target_session_id": target}

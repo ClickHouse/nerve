@@ -227,40 +227,79 @@ class TestReviewRoutes:
         finally:
             app_setup.cfg.code_review.enabled = True
 
-    async def test_human_comment_injects_agent_reply_does_not(self, app_setup):
+    async def test_human_comments_stage_pending_without_injecting(self, app_setup):
         c, engine = app_setup.client, app_setup.engine
-
         review = c.post("/api/reviews", json={
             "worktree": str(app_setup.repo), "title": "t", "created_by": "agent",
+            "target_session_id": "sess-tgt",
         }).json()
         rid = review["id"]
         assert review["branch"]           # derived from the worktree
 
-        # Human thread → mints a target session and injects.
+        # Human line comment → staged pending, NO turn injected.
         resp = c.post(f"/api/reviews/{rid}/threads", json={
             "file_path": "a.txt", "side": "new", "line_start": 2, "line_end": 2,
             "anchor_snippet": "CHANGED", "body": "why change this?", "author": "human",
         })
         assert resp.status_code == 200
-        data = resp.json()
-        target = data["target_session_id"]
-        assert target
-        tid = data["thread"]["id"]
+        await asyncio.sleep(0)            # let any stray task run — there should be none
+        assert engine.runs == []
+
+        full = c.get(f"/api/reviews/{rid}").json()
+        cmt = full["threads"][0]["comments"][0]
+        assert cmt["author"] == "human" and cmt["pending"] == 1
+
+    async def test_submit_delivers_whole_review_in_one_turn(self, app_setup):
+        c, engine = app_setup.client, app_setup.engine
+        review = c.post("/api/reviews", json={
+            "worktree": str(app_setup.repo), "title": "t", "created_by": "agent",
+            "target_session_id": "sess-tgt",
+        }).json()
+        rid = review["id"]
+
+        # Stage two comments across two files — nothing delivered yet.
+        c.post(f"/api/reviews/{rid}/threads", json={
+            "file_path": "a.txt", "side": "new", "line_start": 2,
+            "anchor_snippet": "CHANGED", "body": "rename this", "author": "human"})
+        c.post(f"/api/reviews/{rid}/threads", json={
+            "file_path": "new.txt", "side": "new", "line_start": 1,
+            "anchor_snippet": "brand new", "body": "needs a test", "author": "human"})
+        assert engine.runs == []
+
+        # Submit once → exactly ONE turn carrying the summary + both comments.
+        r = c.post(f"/api/reviews/{rid}/submit", json={"summary": "looks close, two nits"})
+        assert r.status_code == 200 and r.json()["submitted"] == 2
+        assert r.json()["target_session_id"] == "sess-tgt"
 
         await asyncio.wait_for(engine.run_event.wait(), timeout=2.0)
         assert len(engine.runs) == 1
-        assert engine.runs[0]["session_id"] == target
-        assert "why change this?" in engine.runs[0]["user_message"]
-        assert "a.txt:2" in engine.runs[0]["user_message"]
+        msg = engine.runs[0]["user_message"]
+        assert engine.runs[0]["session_id"] == "sess-tgt"
+        assert "looks close, two nits" in msg
+        assert "rename this" in msg and "needs a test" in msg
+        assert "a.txt:2" in msg and "new.txt:1" in msg
 
-        # Agent reply → marks the thread answered, and does NOT inject.
-        engine.run_event.clear()
-        r2 = c.post(f"/api/reviews/{rid}/threads/{tid}/comments",
-                    json={"body": "because Y", "author": "agent"})
-        assert r2.status_code == 200
-
+        # Pending cleared; a re-submit with nothing staged sends no new turn.
         full = c.get(f"/api/reviews/{rid}").json()
-        th = full["threads"][0]
+        assert all(cm["pending"] == 0 for t in full["threads"] for cm in t["comments"])
+        engine.run_event.clear()
+        assert c.post(f"/api/reviews/{rid}/submit", json={"summary": ""}).json()["submitted"] == 0
+        await asyncio.sleep(0)
+        assert len(engine.runs) == 1     # unchanged
+
+    async def test_agent_reply_marks_answered_without_injecting(self, app_setup):
+        c, engine = app_setup.client, app_setup.engine
+        rid = c.post("/api/reviews", json={
+            "worktree": str(app_setup.repo), "title": "t", "target_session_id": "sess-tgt",
+        }).json()["id"]
+        thr = c.post(f"/api/reviews/{rid}/threads", json={
+            "file_path": "a.txt", "side": "new", "line_start": 2,
+            "anchor_snippet": "CHANGED", "body": "q?", "author": "human"}).json()["thread"]
+        r = c.post(f"/api/reviews/{rid}/threads/{thr['id']}/comments",
+                   json={"body": "because Y", "author": "agent"})
+        assert r.status_code == 200
+        th = c.get(f"/api/reviews/{rid}").json()["threads"][0]
         assert th["status"] == "answered"
         assert [cm["author"] for cm in th["comments"]] == ["human", "agent"]
-        assert len(engine.runs) == 1     # no extra inject from the agent reply
+        await asyncio.sleep(0)
+        assert engine.runs == []         # neither staging nor the agent reply injected

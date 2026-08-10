@@ -46,6 +46,7 @@ interface ReviewState {
   addComment: (anchor: CommentAnchor, body: string) => Promise<void>;
   reply: (threadId: string, body: string) => Promise<void>;
   resolve: (threadId: string) => Promise<void>;
+  submitReview: (summary: string) => Promise<void>;
   clearError: () => void;
 }
 
@@ -239,6 +240,20 @@ export const useReviewStore = create<ReviewState>((set, get) => ({
       await get().refreshActive();
     } catch (e) {
       set({ error: errMsg(e, 'Failed to resolve') });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  submitReview: async (summary) => {
+    const r = get().activeReview;
+    if (!r) return;
+    set({ busy: true, error: null });
+    try {
+      await api.submitReview(r.id, summary);
+      await get().refreshActive();
+    } catch (e) {
+      set({ error: errMsg(e, 'Failed to submit review') });
     } finally {
       set({ busy: false });
     }

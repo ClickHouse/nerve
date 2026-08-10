@@ -244,6 +244,45 @@ function ChangedFileRow({ file, onClick }: { file: ReviewChangedFile; onClick: (
 }
 
 // The active worktree's changed-files list (+ header with base + refresh).
+// "Submit review (N)" — batches all staged (pending) comments + an optional
+// overall summary and delivers them to the session as ONE turn. Shown only
+// while there are pending comments on the active review.
+function SubmitReviewBar() {
+  const activeReview = useReviewStore(s => s.activeReview);
+  const submitReview = useReviewStore(s => s.submitReview);
+  const busy = useReviewStore(s => s.busy);
+  const [open, setOpen] = useState(false);
+  const [summary, setSummary] = useState('');
+  const pending = (activeReview?.threads || []).reduce(
+    (n, t) => n + (t.comments || []).filter(c => c.pending).length, 0);
+  if (!activeReview || pending === 0) return null;
+  const submit = () => { void submitReview(summary).then(() => { setSummary(''); setOpen(false); }); };
+  return (
+    <div className="px-4 py-2 border-b border-border-subtle bg-yellow-400/5 shrink-0">
+      {!open ? (
+        <button onClick={() => setOpen(true)}
+          className="w-full text-[12px] px-2 py-1 rounded-md bg-accent/15 text-accent hover:bg-accent/25 cursor-pointer">
+          Submit review ({pending} pending comment{pending !== 1 ? 's' : ''})
+        </button>
+      ) : (
+        <div className="space-y-1.5">
+          <textarea value={summary} onChange={e => setSummary(e.target.value)} rows={2}
+            placeholder="Overall summary (optional)…"
+            className="w-full bg-bg border border-border rounded-md px-2 py-1 text-[12px] text-text resize-y focus:outline-none focus:border-accent" />
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] text-text-faint">Sends all {pending} pending + summary as one turn.</span>
+            <div className="flex gap-2 shrink-0">
+              <button onClick={() => setOpen(false)} className="px-2 py-1 text-[11px] rounded-md text-text-muted hover:bg-surface-hover cursor-pointer">Cancel</button>
+              <button disabled={busy} onClick={submit}
+                className="px-2.5 py-1 text-[11px] rounded-md bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40 cursor-pointer">Send</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ReviewWorktreeView() {
   const r = useReviewStore(s => s.activeReview)!;
   const changed = useReviewStore(s => s.changed);
@@ -266,6 +305,7 @@ function ReviewWorktreeView() {
         </button>
       </div>
       <div className="text-[11px] text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised truncate">{r.worktree}</div>
+      <SubmitReviewBar />
       <div className="flex-1 overflow-y-auto">
         {loading && <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint"><Loader2 size={14} className="animate-spin" /> Loading changes…</div>}
         {!loading && changed.length === 0 && <div className="px-4 py-8 text-center text-[13px] text-text-faint">No changes vs {r.base_ref}.</div>}
@@ -309,6 +349,7 @@ function ReviewFileDetail() {
         </div>
       </div>
       <div className="text-[11px] text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised truncate">{path}</div>
+      <SubmitReviewBar />
       <div className="flex-1 overflow-y-auto">
         {loading && <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint"><Loader2 size={14} className="animate-spin" /> Loading…</div>}
         {!loading && mode === 'file' && fileContent?.binary && <div className="px-4 py-8 text-center text-[13px] text-text-faint">Binary file — not shown.</div>}
