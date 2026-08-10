@@ -223,7 +223,7 @@ def _format_reply_context(message: Any) -> str:
 
 
 # Inline-keyboard /sessions rendering ------------------------------------- #
-_SESSIONS_BUTTON_LIMIT = 8      # keep the keyboard thumb-friendly on mobile
+_SESSIONS_PAGE_SIZE = 10        # sessions shown per /sessions page; ⬅️/➡️ page the rest
 _SESSION_LABEL_MAX = 40         # Telegram wraps long button labels poorly
 
 
@@ -240,18 +240,26 @@ def _session_label(session: dict, current_id: str | None) -> str:
 
 
 def build_sessions_view(
-    sessions: list[dict], current_id: str | None,
+    sessions: list[dict],
+    current_id: str | None,
+    *,
+    offset: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
 ) -> "tuple[str, InlineKeyboardMarkup]":
     """Render the /sessions inline keyboard (pure, sync — unit-testable).
 
     One tap-to-switch button per session (the current one marked ✓), with the
     session id carried in ``callback_data`` as ``sess:<id>`` — so switching
     routing takes a single tap and never requires copy-pasting an id on mobile.
-    A trailing ``➕ New session`` button (``sess:new``) starts a fresh one.
-    Returns ``(message_text, keyboard)``.
+    ``sessions`` is one already-ordered page (the caller pins the current
+    session first and starred ones ahead of merely-recent ones); ``⬅️``/``➡️``
+    page through the rest via ``sess:page:<offset>`` when ``has_prev`` /
+    ``has_next`` report more exist. A trailing ``➕ New session`` button
+    (``sess:new``) starts a fresh one. Returns ``(message_text, keyboard)``.
     """
     rows: list[list[InlineKeyboardButton]] = []
-    for s in sessions[:_SESSIONS_BUTTON_LIMIT]:
+    for s in sessions[:_SESSIONS_PAGE_SIZE]:
         sid = s.get("id")
         cb = f"sess:{sid}"
         # callback_data is capped at 64 bytes by Telegram; interactive session
@@ -269,13 +277,34 @@ def build_sessions_view(
                 )
             )
         rows.append(row)
+    shown = len(rows)
+
+    # Pager row — only the arrows that lead somewhere, so no tap is a dead end.
+    nav: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ Prev",
+                callback_data=f"sess:page:{max(0, offset - _SESSIONS_PAGE_SIZE)}",
+            )
+        )
+    if has_next:
+        nav.append(
+            InlineKeyboardButton(
+                "➡️ More",
+                callback_data=f"sess:page:{offset + _SESSIONS_PAGE_SIZE}",
+            )
+        )
+    if nav:
+        rows.append(nav)
+
     rows.append([InlineKeyboardButton("➕ New session", callback_data="sess:new")])
 
     # The New-session button switches routing to a fresh session WITHOUT
     # stopping the current one (unlike /new). A session switched away from
     # keeps running any in-flight turn and still delivers its result to the
     # chat (output is bound per-session, not to the channel's current map).
-    if rows[:-1]:
+    if shown:
         current_title = next(
             (
                 (s.get("title") or s.get("id"))
@@ -287,8 +316,12 @@ def build_sessions_view(
         text = "🗂 Sessions — tap to switch."
         if current_title:
             text += f"\nCurrent: {current_title}"
+        if offset or has_next:
+            text += f"\nPage {offset // _SESSIONS_PAGE_SIZE + 1}"
         text += "\n➕ New session keeps the current one running."
         text += "\n⭐ keeps a session alive (never auto-closed); tap ☆/⭐ to toggle."
+    elif has_prev:
+        text = "No more sessions — tap ⬅️ Prev to go back."
     else:
         text = "No sessions yet — tap ➕ to start one."
     return text, InlineKeyboardMarkup(rows)
@@ -1104,29 +1137,28 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text(str(e))
 
     async def _sessions_view_for(
-        self, channel_key: str,
+        self, channel_key: str, offset: int = 0,
     ) -> "tuple[str, InlineKeyboardMarkup]":
         """Build the inline-keyboard sessions view for a channel.
 
         Shared by /sessions and the button-press handler so both render the
-        same thing. Only interactive (telegram/web) sessions are offered as
-        switch targets — cron/automation sessions are never listed.
+        same page. Only interactive (telegram/web) sessions that have history
+        are switch targets — cron/automation sessions are never listed — and the
+        store pins the current session first with starred (kept-alive) ones
+        ahead of the rest, so an idle starred session is never buried. Filtering
+        and ordering happen in SQL; we fetch one extra row to learn whether a
+        further page exists.
         """
+        offset = max(0, offset)
         current = await self.router.get_last_session(channel_key)
-        sessions = await self.router.list_sessions(limit=30)
-        # Keep the most-recent interactive sessions that have history: empty
-        # (0-message) sessions are useless to switch to, and cron/automation
-        # sessions are never switch targets. Stop once the keyboard is full so
-        # we don't count every session.
-        non_empty: list[dict] = []
-        for s in sessions:
-            if s.get("source") not in ("telegram", "web"):
-                continue
-            if await self.router.count_session_messages(s["id"]) > 0:
-                non_empty.append(s)
-                if len(non_empty) >= _SESSIONS_BUTTON_LIMIT:
-                    break
-        return build_sessions_view(non_empty, current)
+        page = await self.router.list_interactive_sessions(
+            limit=_SESSIONS_PAGE_SIZE + 1, offset=offset, current_id=current,
+        )
+        has_next = len(page) > _SESSIONS_PAGE_SIZE
+        return build_sessions_view(
+            page[:_SESSIONS_PAGE_SIZE], current,
+            offset=offset, has_prev=offset > 0, has_next=has_next,
+        )
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
         """Handle /sessions — native inline keyboard to switch session routing.
@@ -1832,7 +1864,8 @@ class TelegramChannel(BaseChannel):
         """Handle /sessions inline-keyboard presses.
 
         callback_data forms:
-          ``sess:list``           — (re)show the session switch list
+          ``sess:list``           — (re)show the session switch list (first page)
+          ``sess:page:<offset>``  — show the switch list at a pagination offset
           ``sess:new``            — create a fresh session (current keeps running)
           ``sess:<id>``           — switch routing to <id>, then show its history
           ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
@@ -1852,6 +1885,16 @@ class TelegramChannel(BaseChannel):
         if data == "sess:list":
             await query.answer()
             text, markup = await self._sessions_view_for(channel_key)
+            await self._safe_edit(query, text, markup)
+            return
+
+        if data.startswith("sess:page:"):
+            try:
+                page_offset = max(0, int(data.rsplit(":", 1)[1]))
+            except (IndexError, ValueError):
+                page_offset = 0
+            await query.answer()
+            text, markup = await self._sessions_view_for(channel_key, page_offset)
             await self._safe_edit(query, text, markup)
             return
 
