@@ -344,7 +344,13 @@ class GitHubPrActivityGate(CronGate):
         self.author = author
         self.force_run_after_hours = force_run_after_hours
         # Our own comments/replies must never count as activity to react to.
-        self.ignore_actors = {self._norm_actor(a) for a in (ignore_actors or [])}
+        # A login that normalises to empty is dropped rather than stored:
+        # ``_actor`` reports "" for a deleted/ghost user, so an empty entry here
+        # would quietly mute every ghost-authored comment. ``from_config``
+        # rejects those loudly; this keeps the invariant for direct callers too.
+        self.ignore_actors = {
+            norm for a in (ignore_actors or []) if (norm := self._norm_actor(a))
+        }
         self.ignore_actors.add(self._norm_actor(author))
 
     @staticmethod
@@ -396,15 +402,21 @@ class GitHubPrActivityGate(CronGate):
                 "'github_pr_activity' gate 'force_run_after_hours' must be a "
                 f"number, got {hours!r}"
             )
-        ignore = spec.get("ignore_actors") or []
-        if isinstance(ignore, str):
+        # Only a bare `ignore_actors:` (None) means "not set". Anything else that
+        # merely happens to be falsy — 0, false, "" — is a misconfiguration, and
+        # reading it as an empty denylist would hide the mistake behind a gate
+        # that still fires on every bot comment.
+        ignore = spec.get("ignore_actors")
+        if ignore is None:
+            ignore = []
+        elif isinstance(ignore, str):
             ignore = [ignore]
         if not isinstance(ignore, list) or not all(
-            isinstance(a, str) for a in ignore
+            isinstance(a, str) and a.strip() for a in ignore
         ):
             raise GateConfigError(
                 "'github_pr_activity' gate 'ignore_actors' must be a list of "
-                f"login strings, got {ignore!r}"
+                f"non-empty login strings, got {ignore!r}"
             )
         return cls(
             author=author,

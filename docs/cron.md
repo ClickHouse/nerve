@@ -270,7 +270,7 @@ whole life of an open PR while nothing actually happens on it.
 |-------|------|---------|-------------|
 | `author` | string | — (required) | GitHub login whose open PRs to watch. Also ignored as a comment/review actor, so the job's own replies don't wake it |
 | `force_run_after_hours` | number | 8 | Fire regardless if this long has elapsed since the last run; `0` disables the safety net |
-| `ignore_actors` | list | — | Logins whose comments/reviews don't count as activity, for chatty bots that would otherwise wake the job on every push. Matching is case-insensitive and a trailing `[bot]` is ignored, so `codecov` also covers `codecov[bot]` |
+| `ignore_actors` | list | — | Logins whose comments/reviews don't count as activity, for chatty bots that would otherwise wake the job on every push. Matching is case-insensitive and a trailing `[bot]` is ignored, so `codecov` also covers `codecov[bot]`. A bare `ignore_actors:` means unset; any other non-list value, or an empty login, is refused rather than read as an empty list |
 
 ```yaml
 run_if:

@@ -760,10 +760,12 @@ class TestGitHubPrActivityCommentActivity:
         gate._gh = fake_gh  # type: ignore[method-assign]
         await gate._fingerprint()
         view = next(a for a in seen if a[0] == "pr")
-        fields = view[view.index("--json") + 1]
-        for field in ("state", "reviewDecision", "headRefOid",
-                      "statusCheckRollup", "comments", "reviews"):
-            assert field in fields
+        # Compare tokens, not substrings: `"reviews" in "...,latestReviews"` is
+        # true, so a substring check would still pass if the code asked for a
+        # differently-named field that `_pr_detail` never reads.
+        fields = set(view[view.index("--json") + 1].split(","))
+        assert {"state", "reviewDecision", "headRefOid",
+                "statusCheckRollup", "comments", "reviews"} <= fields
 
     def test_author_is_always_ignored(self):
         gate = GitHubPrActivityGate(author="My-Bot")
@@ -789,6 +791,14 @@ class TestGitHubPrActivityCommentActivity:
         gate = build_gate({"type": "github_pr_activity", "author": "my-bot"})
         assert gate.ignore_actors == {"my-bot"}
 
+    def test_from_config_bare_ignore_actors_means_unset(self):
+        """A bare `ignore_actors:` is None — the one value that means "not set"."""
+        gate = build_gate({
+            "type": "github_pr_activity", "author": "my-bot",
+            "ignore_actors": None,
+        })
+        assert gate.ignore_actors == {"my-bot"}
+
     def test_from_config_bad_ignore_actors(self):
         with pytest.raises(GateConfigError):
             build_gate({
@@ -796,6 +806,38 @@ class TestGitHubPrActivityCommentActivity:
                 "author": "my-bot",
                 "ignore_actors": [{"login": "codecov"}],
             })
+
+    @pytest.mark.parametrize("bad", [0, False, "", [""], ["  "], ["ok", ""], {}])
+    def test_from_config_falsy_ignore_actors_is_refused(self, bad):
+        """Refused, not read as an empty denylist.
+
+        `spec.get(...) or []` would have taken every one of these as "not set",
+        leaving a job that still wakes on every bot comment while the config
+        says otherwise.
+        """
+        with pytest.raises(GateConfigError, match="ignore_actors"):
+            build_gate({
+                "type": "github_pr_activity",
+                "author": "my-bot",
+                "ignore_actors": bad,
+            })
+
+    @pytest.mark.asyncio
+    async def test_empty_login_cannot_mute_a_ghost_author(self):
+        """An empty entry must never reach the denylist.
+
+        `_actor` reports "" for a deleted/ghost user, so a stored "" would mute
+        exactly the comments `test_ghost_author_counts_as_activity` says must
+        count. from_config refuses one; a direct caller gets it dropped.
+        """
+        gate = GitHubPrActivityGate(author="my-bot", ignore_actors=["", "  "])
+        assert gate.ignore_actors == {"my-bot"}
+
+        quiet = await _fp(_pr_payload(), ignore_actors=["", "  "])
+        loud = await _fp(
+            _pr_payload(comments=[_comment("")]), ignore_actors=["", "  "]
+        )
+        assert quiet != loud
 
     def test_describe_mentions_comments(self):
         assert "comment" in GitHubPrActivityGate(author="my-bot").describe()
