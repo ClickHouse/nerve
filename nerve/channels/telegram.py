@@ -266,17 +266,9 @@ def build_sessions_view(
         # ids are short, but guard defensively so a button always round-trips.
         if sid is None or len(cb.encode("utf-8")) > 64:
             continue
-        row = [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
-        # Per-session star toggle: ⭐ = kept alive (never auto-closed),
-        # ☆ = normal. Add it only when its callback also round-trips.
-        star_cb = f"sessstar:{sid}"
-        if len(star_cb.encode("utf-8")) <= 64:
-            row.append(
-                InlineKeyboardButton(
-                    "⭐" if s.get("starred") else "☆", callback_data=star_cb,
-                )
-            )
-        rows.append(row)
+        rows.append(
+            [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
+        )
     shown = len(rows)
 
     # Pager row — only the arrows that lead somewhere, so no tap is a dead end.
@@ -319,7 +311,7 @@ def build_sessions_view(
         if offset or has_next:
             text += f"\nPage {offset // _SESSIONS_PAGE_SIZE + 1}"
         text += "\n➕ New session keeps the current one running."
-        text += "\n⭐ keeps a session alive (never auto-closed); tap ☆/⭐ to toggle."
+        text += "\n⭐ = kept alive (never auto-closed); /star or /unstar the current session."
     elif has_prev:
         text = "No more sessions — tap ⬅️ Prev to go back."
     else:
@@ -1869,7 +1861,6 @@ class TelegramChannel(BaseChannel):
           ``sess:new``            — create a fresh session (current keeps running)
           ``sess:<id>``           — switch routing to <id>, then show its history
           ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
-          ``sessstar:<id>``       — toggle the session's starred (kept-alive) flag
 
         After a switch/create the card is replaced by that session's recent
         history (native order, oldest→newest) so the user can catch up — which
@@ -1909,24 +1900,6 @@ class TelegramChannel(BaseChannel):
             await self._edit_session_tail(query, sid, window)
             return
 
-        if data.startswith("sessstar:"):
-            sid = data.split(":", 1)[1]
-            try:
-                now_starred = await self.router.toggle_session_starred(sid)
-            except ValueError:
-                await query.answer(
-                    "That session is no longer available", show_alert=True,
-                )
-            else:
-                await query.answer(
-                    "⭐ Kept alive — won't auto-close"
-                    if now_starred
-                    else "☆ Normal — may auto-close when idle"
-                )
-            text, markup = await self._sessions_view_for(channel_key)
-            await self._safe_edit(query, text, markup)
-            return
-
         # sess:new / sess:<id>
         target = data.split(":", 1)[1]
         sid = target
@@ -1963,7 +1936,6 @@ class TelegramChannel(BaseChannel):
         if (
             query.data.startswith("sess:")
             or query.data.startswith("sesstail:")
-            or query.data.startswith("sessstar:")
         ):
             await self._handle_session_button(query)
             return
