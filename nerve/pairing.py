@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import secrets
 import time
 from pathlib import Path
 
 from nerve import paths
+from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,7 @@ def _read_state() -> dict | None:
 
 
 def _write_state(state: dict) -> None:
-    path = _pairing_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state), encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    atomic_write_text(_pairing_path(), json.dumps(state), mode=0o600)
 
 
 def generate_pairing_code() -> str:
