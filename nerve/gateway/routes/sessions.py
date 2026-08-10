@@ -299,7 +299,12 @@ async def get_messages(session_id: str, limit: int = 500, user: dict = Depends(r
 
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
-    """Update session fields (title, starred).
+    """Update session fields (title, starred, model).
+
+    ``model`` re-points THIS session only — the composer's picker is
+    per-chat, not a global preference. The engine re-reads the session
+    row each turn (per-message override -> ``sessions.model`` -> backend
+    default), so the switch takes effect on the session's next message.
 
     When ``sessions.star_project_hook`` is enabled (default off), a ``starred``
     0<->1 transition fires a one-shot internal turn in that same session so the
@@ -314,6 +319,22 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
         fields["title"] = req["title"]
     if "starred" in req:
         fields["starred"] = 1 if req["starred"] else 0
+    if "model" in req:
+        requested_model = str(req["model"] or "").strip()
+        if not requested_model:
+            raise HTTPException(status_code=400, detail="model cannot be empty")
+        # Backend is sticky on the session row — validate the pick against
+        # it (same optional seam as session creation: codex can cheaply
+        # reject; claude accepts any ID since Ollama models ride it).
+        backend_id = session.get("backend") or deps.engine.config.agent.backend
+        selected_backend = deps.engine._backends.get(backend_id)
+        validate_model = getattr(selected_backend, "validate_model", None)
+        if validate_model is not None:
+            try:
+                await validate_model(requested_model)
+            except BackendError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+        fields["model"] = requested_model
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
