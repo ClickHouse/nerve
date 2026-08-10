@@ -246,3 +246,53 @@ class TestStatusToolHandlers:
         ctx = self._ctx(db, tmp_path)
         text = _text(await task_status_list_handler(ctx, {}))
         assert "pending" in text and "[protected]" in text
+
+
+@pytest.mark.asyncio
+class TestReorderTaskStatuses:
+    """Board column order, rewritten as a whole sequence.
+
+    Reordering by drag shifts several statuses at once, so the API takes the
+    full desired order rather than one status's new index — that makes the
+    write idempotent and avoids the half-applied states a per-row PATCH
+    storm would leave if one of them failed.
+    """
+
+    async def test_reorder_sets_the_given_sequence(self, db):
+        await db.create_task_status(name="review", label="Review", color="#111111")
+        original = [s["name"] for s in await db.list_task_statuses()]
+        reversed_order = list(reversed(original))
+
+        returned = await db.reorder_task_statuses(reversed_order)
+
+        assert [s["name"] for s in returned] == reversed_order
+        # And it persisted, rather than only shaping the return value.
+        assert [s["name"] for s in await db.list_task_statuses()] == reversed_order
+
+    async def test_reorder_is_idempotent(self, db):
+        order = [s["name"] for s in await db.list_task_statuses()]
+        await db.reorder_task_statuses(order)
+        await db.reorder_task_statuses(order)
+        assert [s["name"] for s in await db.list_task_statuses()] == order
+
+    async def test_omitted_statuses_are_kept_after_the_named_ones(self, db):
+        order = [s["name"] for s in await db.list_task_statuses()]
+        assert len(order) > 2
+
+        returned = await db.reorder_task_statuses([order[-1]])
+
+        # A status left out of the request must not vanish from the board.
+        assert [s["name"] for s in returned][0] == order[-1]
+        assert set(s["name"] for s in returned) == set(order)
+
+    async def test_unknown_names_are_ignored(self, db):
+        order = [s["name"] for s in await db.list_task_statuses()]
+
+        returned = await db.reorder_task_statuses(["not_a_status", *order])
+
+        assert [s["name"] for s in returned] == order
+
+    async def test_sort_order_is_contiguous_from_zero(self, db):
+        order = [s["name"] for s in await db.list_task_statuses()]
+        returned = await db.reorder_task_statuses(list(reversed(order)))
+        assert [s["sort_order"] for s in returned] == list(range(len(order)))

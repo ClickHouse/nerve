@@ -9,6 +9,7 @@ from pathlib import Path
 
 from nerve.config import ensure_path_not_tracked_config
 from nerve.db import Database
+from nerve.tasks.files import move_task_file
 from nerve.tasks.models import (
     Task,
     TaskStatus,
@@ -35,14 +36,16 @@ class TaskManager:
     async def reindex(self) -> int:
         """Scan task files and rebuild the SQLite + FTS index.
 
-        ``upsert_task`` replaces the whole row, so every column this loop does
-        not supply is written back as its signature default. Values that live
-        only in the DB (status) are carried from the stored row. For values the
-        file may carry, the rule is per column, each matching the save path that
-        already writes it: ``tags`` takes the file whenever the field is
-        present, so a present-but-empty field is an explicit clear;
-        ``source_url`` and ``deadline`` take any non-empty file value and
-        otherwise keep the stored row.
+        This loop supplies only the columns a markdown file carries. The rest
+        keep their stored values, because ``upsert_task`` is preserve-on-omit
+        for them. Which file values win is a per-column rule, each matching
+        the save path that already writes the column: ``tags`` takes the file
+        whenever the field is present, so a present-but-empty field is an
+        explicit clear; ``source_url`` and ``deadline`` take any non-empty
+        file value.
+
+        ``status`` is different. It lives only in the DB, so this loop reads
+        it from the stored row and always supplies it.
         """
         await self.db.rebuild_fts()
         count = 0
@@ -72,24 +75,26 @@ class TaskManager:
                         prev = stored.get("status")
                         status = prev if prev and prev != "done" else default_status
 
+                    edits: dict = {}
+                    # **Source:** carries the URL (handlers/tasks.py writes
+                    # source_url there); `source` is a DB-only vocabulary, so
+                    # no file value ever reaches it.
+                    if fields.get("source"):
+                        edits["source_url"] = fields["source"]
+                    if fields.get("deadline"):
+                        edits["deadline"] = fields["deadline"]
+                    # Presence, not truthiness: a present-but-empty field is
+                    # an explicit clear, an absent one is "no information".
+                    if "tags" in fields:
+                        edits["tags"] = tags_to_string(parse_tags_string(fields["tags"]))
+
                     await self.db.upsert_task(
                         task_id=task_id,
                         file_path=rel_path,
                         title=title,
                         status=status,
-                        # **Source:** carries the URL (handlers/tasks.py writes
-                        # source_url there); `source` is a DB-only vocabulary.
-                        source=stored.get("source"),
-                        source_url=fields.get("source") or stored.get("source_url"),
-                        deadline=fields.get("deadline") or stored.get("deadline"),
-                        # Presence, not truthiness: a present-but-empty field is
-                        # an explicit clear, an absent one is "no information".
-                        tags=(
-                            tags_to_string(parse_tags_string(fields["tags"]))
-                            if "tags" in fields
-                            else (stored.get("tags") or "")
-                        ),
                         content=content,
+                        **edits,
                     )
                     count += 1
                 except Exception as e:
@@ -128,9 +133,9 @@ class TaskManager:
             return False
 
         src = self.workspace / row["file_path"]
-        # Done is a write like any other — it copies the file into done/ and
-        # unlinks the source, so a stored ``file_path`` inside the tracked config
-        # subtree would delete config. Refuse before any of it runs, or the
+        # Done is a write like any other — it appends to the file and moves it
+        # into done/, so a stored ``file_path`` inside the tracked config
+        # subtree would rewrite config. Refuse before any of it runs, or the
         # refusal still leaves that config file mirrored into done/.
         ensure_path_not_tracked_config(src, "move")
         if src.exists():
@@ -139,11 +144,7 @@ class TaskManager:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             content += f"\n- {today}: DONE"
 
-            def _move_to_done() -> None:
-                dst.write_text(content, encoding="utf-8")
-                src.unlink()
-
-            await asyncio.to_thread(_move_to_done)
+            await asyncio.to_thread(move_task_file, src, dst, content)
 
             # Update DB
             rel_path = str(dst.relative_to(self.workspace))
@@ -152,10 +153,6 @@ class TaskManager:
                 file_path=rel_path,
                 title=row["title"],
                 status="done",
-                source=row.get("source"),
-                source_url=row.get("source_url"),
-                deadline=row.get("deadline"),
-                tags=row.get("tags") or "",
                 content=content,
             )
 

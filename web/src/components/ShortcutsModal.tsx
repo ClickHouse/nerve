@@ -1,11 +1,16 @@
-import { useEffect } from 'react';
-import { X } from 'lucide-react';
 import { useUIStore } from '../stores/uiStore';
 import { formatCombo, type ShortcutCombo } from '../utils/keyboard';
+import { Modal } from './ui/Modal';
 
 interface DisplayShortcut {
   combo: ShortcutCombo;
   description: string;
+  /**
+   * Override the rendered key label. For a binding that is a *set* of keys
+   * rather than one combo — the arrow cluster — formatting a single combo
+   * would document a quarter of it.
+   */
+  label?: string;
 }
 
 interface Section {
@@ -15,7 +20,9 @@ interface Section {
 
 /**
  * Static display of every keyboard binding. The runtime handlers live in
- * App.tsx (global) and ChatPage.tsx (chat-scoped) — keep this list in sync
+ * App.tsx (global), ChatPage.tsx (chat-scoped) and TasksPage.tsx
+ * (tasks-scoped), with Enter/Shift+Enter owned by ChatInput and the board's
+ * Space/arrow bindings by dnd-kit's keyboard sensor — keep this list in sync
  * with those when bindings change.
  */
 const SECTIONS: Section[] = [
@@ -45,78 +52,55 @@ const SECTIONS: Section[] = [
       { combo: { shift: true, key: 'Enter' }, description: 'New line' },
     ],
   },
+  {
+    title: 'Tasks',
+    items: [
+      { combo: { key: 'b' }, description: 'Board view' },
+      { combo: { key: 'l' }, description: 'List view' },
+      { combo: { key: 'n' }, description: 'New task' },
+      { combo: { key: '/' }, description: 'Focus task search' },
+      { combo: { key: 'Space' }, description: 'Pick up / drop a focused card' },
+      { combo: { key: 'ArrowUp' }, label: '↑ ↓ ← →', description: 'Move a picked-up card' },
+    ],
+  },
 ];
 
 export function ShortcutsModal() {
   const open = useUIStore((s) => s.shortcutsModalOpen);
   const close = useUIStore((s) => s.closeShortcutsModal);
 
-  // Local Esc handler — runs *before* the document-level shortcut listeners
-  // because modal mount captures it first when focus is inside.
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        close();
-      }
-    };
-    document.addEventListener('keydown', onKey, true); // capture phase = wins
-    return () => document.removeEventListener('keydown', onKey, true);
-  }, [open, close]);
-
-  if (!open) return null;
-
+  // The capture-phase Escape handling this component used to own is now
+  // the Modal's job, along with the focus trap it never had.
   return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
-      onClick={close}
-    >
-      <div
-        className="bg-surface-raised border border-border-subtle rounded-xl w-[520px] max-w-[90vw] max-h-[80vh] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-3 border-b border-border">
-          <h2 className="text-[15px] font-semibold">Keyboard shortcuts</h2>
-          <button
-            onClick={close}
-            className="text-text-faint hover:text-text-muted cursor-pointer p-1"
-            title="Close"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        <div className="overflow-y-auto p-5 space-y-5">
-          {SECTIONS.map((section) => (
-            <div key={section.title}>
-              <h3 className="text-[11px] uppercase tracking-wider text-text-faint font-medium mb-2">
-                {section.title}
-              </h3>
-              <div className="space-y-1.5">
-                {section.items.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="flex items-center justify-between gap-4 py-1"
-                  >
-                    <span className="text-[13px] text-text-secondary">{item.description}</span>
-                    <Kbd combo={item.combo} />
-                  </div>
-                ))}
-              </div>
+    <Modal open={open} onClose={close} title="Keyboard shortcuts" size="lg">
+      <div className="p-5 space-y-5">
+        {SECTIONS.map((section) => (
+          <div key={section.title}>
+            <h3 className="text-[11px] uppercase tracking-wider text-text-faint font-medium mb-2">
+              {section.title}
+            </h3>
+            <div className="space-y-1.5">
+              {section.items.map((item, idx) => (
+                <div
+                  key={idx}
+                  className="flex items-center justify-between gap-4 py-1"
+                >
+                  <span className="text-[13px] text-text-secondary">{item.description}</span>
+                  <Kbd combo={item.combo} label={item.label} />
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          </div>
+        ))}
       </div>
-    </div>
+    </Modal>
   );
 }
 
-function Kbd({ combo }: { combo: ShortcutCombo }) {
+function Kbd({ combo, label }: { combo: ShortcutCombo; label?: string }) {
   return (
     <kbd className="px-2 py-1 text-[11px] font-mono text-text-secondary bg-surface border border-border-subtle rounded shrink-0 tabular-nums">
-      {formatCombo(combo)}
+      {label ?? formatCombo(combo)}
     </kbd>
   );
 }

@@ -1,23 +1,66 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, type Task } from '../api/client';
 
-export interface Task {
-  id: string;
-  title: string;
-  status: string;
-  deadline: string | null;
-  source: string;
-  source_url: string | null;
-  created_at: string;
-  updated_at: string;
-  content?: string;
-}
+export type { Task };
 
 export type TaskSort = 'deadline' | 'updated_at' | 'created_at';
+export type TaskViewMode = 'board' | 'list';
 
 export const TASKS_PAGE_SIZE = 50;
 
+/** One board column: a page of its tasks plus the lane's true total. */
+export interface Lane {
+  status: string;
+  total: number;
+  tasks: Task[];
+}
+
+/**
+ * Where a dragged card should land, expressed as its new neighbours.
+ *
+ * The server resolves this into a rank. Sending intent rather than a
+ * computed position means a board that's a few seconds stale still
+ * produces a sane result instead of overwriting someone else's ordering
+ * with numbers derived from a lane it no longer matches.
+ */
+export interface MoveIntent {
+  status: string;
+  beforeId: string | null;
+  afterId: string | null;
+}
+
+const VIEW_KEY = 'nerve_tasks_view';
+
+/** localStorage is unavailable in private modes; never let it break a render. */
+function readStoredView(): TaskViewMode | null {
+  try {
+    const raw = localStorage.getItem(VIEW_KEY);
+    return raw === 'board' || raw === 'list' ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredView(mode: TaskViewMode): void {
+  try {
+    localStorage.setItem(VIEW_KEY, mode);
+  } catch {
+    /* not fatal — the choice just won't survive a reload */
+  }
+}
+
+/** Board below this width is unusable; the list is the better default. */
+const BOARD_MIN_WIDTH = 1280;
+
+function defaultViewMode(): TaskViewMode {
+  const stored = readStoredView();
+  if (stored) return stored;
+  if (typeof window === 'undefined') return 'list';
+  return window.innerWidth >= BOARD_MIN_WIDTH ? 'board' : 'list';
+}
+
 interface TaskState {
+  // List view
   tasks: Task[];
   filter: string;
   searchQuery: string;
@@ -27,23 +70,74 @@ interface TaskState {
   loading: boolean;
   showCreateDialog: boolean;
 
+  // Board view
+  viewMode: TaskViewMode;
+  lanes: Lane[];
+  boardLoading: boolean;
+  boardError: string | null;
+  tagFilter: string;
+  availableTags: { name: string; count: number }[];
+  /** task_id → ISO time it entered its current status (card aging). */
+  statusSince: Record<string, string>;
+  /** Lane to pre-select when the create dialog is opened from a column. */
+  createInStatus: string | null;
+
   // Detail view
   selectedTask: Task | null;
   detailLoading: boolean;
   saving: boolean;
 
   loadTasks: () => Promise<void>;
+  loadBoard: (opts?: { quiet?: boolean }) => Promise<void>;
+  loadTags: () => Promise<void>;
+  setViewMode: (mode: TaskViewMode) => void;
+  setTagFilter: (tag: string) => void;
+  moveTask: (taskId: string, intent: MoveIntent) => Promise<void>;
+  applyLocalMove: (taskId: string, intent: MoveIntent) => void;
+  handleTaskEvent: (task: Task) => void;
   setFilter: (f: string) => void;
   setSearch: (q: string) => void;
   setSort: (s: TaskSort) => void;
   setPage: (p: number) => void;
   updateStatus: (id: string, status: string) => Promise<void>;
   createTask: (title: string, content: string, deadline: string) => Promise<void>;
-  setShowCreateDialog: (show: boolean) => void;
+  setShowCreateDialog: (show: boolean, status?: string | null) => void;
 
   loadTask: (id: string) => Promise<void>;
-  saveTaskContent: (id: string, content: string) => Promise<void>;
+  /** Resolves `false` when the write failed, so the caller can keep the edit. */
+  saveTaskContent: (id: string, content: string) => Promise<boolean>;
   clearSelectedTask: () => void;
+}
+
+/** Remove a task from every lane, returning the pruned lanes. */
+function withoutTask(lanes: Lane[], taskId: string): Lane[] {
+  return lanes.map((lane) => {
+    const kept = lane.tasks.filter((t) => t.id !== taskId);
+    return kept.length === lane.tasks.length
+      ? lane
+      : { ...lane, tasks: kept, total: Math.max(0, lane.total - 1) };
+  });
+}
+
+/** Insert a task into `status` at the slot described by the intent. */
+function withTaskAt(lanes: Lane[], task: Task, intent: MoveIntent): Lane[] {
+  return lanes.map((lane) => {
+    if (lane.status !== intent.status) return lane;
+    const tasks = [...lane.tasks];
+    let index = tasks.length;
+    if (intent.afterId) {
+      const at = tasks.findIndex((t) => t.id === intent.afterId);
+      if (at !== -1) index = at;
+    } else if (intent.beforeId) {
+      const at = tasks.findIndex((t) => t.id === intent.beforeId);
+      if (at !== -1) index = at + 1;
+    } else {
+      // No anchors: an empty lane, or a drop on the column background.
+      index = tasks.length;
+    }
+    tasks.splice(index, 0, { ...task, status: intent.status });
+    return { ...lane, tasks, total: lane.total + 1 };
+  });
 }
 
 export const useTaskStore = create<TaskState>((set, get) => ({
@@ -56,6 +150,15 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   loading: true,
   showCreateDialog: false,
 
+  viewMode: defaultViewMode(),
+  lanes: [],
+  boardLoading: true,
+  boardError: null,
+  tagFilter: '',
+  availableTags: [],
+  statusSince: {},
+  createInStatus: null,
+
   selectedTask: null,
   detailLoading: false,
   saving: false,
@@ -63,6 +166,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   loadTasks: async () => {
     set({ loading: true });
     try {
+      // `tagFilter` is deliberately not read here. It is board state: the
+      // facet bar is the only thing that sets it and only the board renders
+      // it. Applying it to the list would filter a view with no chip to
+      // show for it and no control to clear it — and only while the search
+      // box is empty, since /tasks/search takes no tag.
       const { filter, searchQuery, sort, page } = get();
       const result = searchQuery
         ? await api.searchTasks(searchQuery, filter || undefined)
@@ -79,6 +187,182 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     }
   },
 
+  /**
+   * `quiet` refetches without flipping the spinner — used to resync after a
+   * failed drag, where the board is already on screen and blanking it would
+   * be a worse experience than a brief inconsistency.
+   */
+  loadBoard: async ({ quiet = false } = {}) => {
+    // Only an explicit load clears the error. A quiet resync is usually
+    // triggered *by* a failure, so clearing here would wipe the message
+    // explaining what just went wrong before it could be read.
+    if (!quiet) set({ boardLoading: true, boardError: null });
+    try {
+      const { tagFilter, searchQuery } = get();
+      const { lanes, status_since } = await api.getTaskBoard({
+        tag: tagFilter || undefined,
+        q: searchQuery.trim() || undefined,
+      });
+      set({ lanes, statusSince: status_since ?? {}, boardLoading: false });
+    } catch (e) {
+      console.error('Failed to load board:', e);
+      set({ boardLoading: false, boardError: 'Could not load the board.' });
+    }
+  },
+
+  loadTags: async () => {
+    try {
+      const { tags } = await api.listTaskTags();
+      set({ availableTags: tags });
+    } catch (e) {
+      console.error('Failed to load tags:', e);
+    }
+  },
+
+  setViewMode: (mode) => {
+    writeStoredView(mode);
+    set({ viewMode: mode });
+    if (mode === 'board') void get().loadBoard();
+    else void get().loadTasks();
+  },
+
+  setTagFilter: (tag) => {
+    set({ tagFilter: tag, page: 1 });
+    if (get().viewMode === 'board') void get().loadBoard();
+    else void get().loadTasks();
+  },
+
+  /** Reorder lanes in place, without touching the server. */
+  applyLocalMove: (taskId, intent) => {
+    const { lanes } = get();
+    const task = lanes.flatMap((l) => l.tasks).find((t) => t.id === taskId);
+    if (!task) return;
+    set({ lanes: withTaskAt(withoutTask(lanes, taskId), task, intent) });
+  },
+
+  moveTask: async (taskId, intent) => {
+    // Snapshot before the optimistic write so a failure can restore the
+    // exact prior order rather than approximating it.
+    const snapshot = get().lanes;
+    const priorStatus = snapshot.find((l) => l.tasks.some((t) => t.id === taskId))?.status;
+    get().applyLocalMove(taskId, intent);
+
+    try {
+      const { task } = await api.moveTask(taskId, {
+        status: intent.status,
+        before_id: intent.beforeId,
+        after_id: intent.afterId,
+      });
+      // Reconcile against the server's authoritative row — mainly to pick
+      // up the real `position` and `updated_at`, and any file move that
+      // came with a status change.
+      set({
+        lanes: get().lanes.map((lane) => ({
+          ...lane,
+          tasks: lane.tasks.map((t) => (t.id === task.id ? { ...t, ...task } : t)),
+        })),
+        // The server recorded a transition, so this card's clock restarted.
+        // Without resetting it the aging badge keeps counting from the lane
+        // the card has just left, which reads as "stalled" on the one card
+        // the user is actively working — and nothing polls the board, so it
+        // would stay wrong until the next reload. A reorder inside a lane
+        // records no transition, so it must not reset. `updated_at` is the
+        // server's own stamp, written in the same breath as the event.
+        statusSince: task.status === priorStatus
+          ? get().statusSince
+          : { ...get().statusSince, [task.id]: task.updated_at },
+        // A move that lands clears any stale failure banner.
+        boardError: null,
+      });
+    } catch (e) {
+      console.error('Move failed:', e);
+      set({ lanes: snapshot, boardError: 'Move failed — the board has been restored.' });
+      // Something rejected the move (a status that vanished, a task deleted
+      // from under us); resync rather than trusting the snapshot for long.
+      void get().loadBoard({ quiet: true });
+    }
+  },
+
+  /**
+   * Apply a `task_updated` broadcast.
+   *
+   * Fires for changes this client didn't make — the agent working in
+   * another session, a second tab, the HTTP API. It's also echoed back for
+   * changes this client *did* make, so it has to be idempotent: replacing
+   * in place when the lane is unchanged, and only re-slotting on an actual
+   * status change.
+   */
+  handleTaskEvent: (task) => {
+    const { lanes, selectedTask } = get();
+
+    if (selectedTask?.id === task.id) {
+      // Keep any locally-loaded markdown; the broadcast carries the row only.
+      set({ selectedTask: { ...selectedTask, ...task } });
+    }
+
+    if (lanes.length === 0) return;
+
+    const currentLane = lanes.find((l) => l.tasks.some((t) => t.id === task.id));
+
+    if (currentLane?.status === task.status) {
+      set({
+        lanes: lanes.map((lane) =>
+          lane.status !== task.status
+            ? lane
+            : { ...lane, tasks: lane.tasks.map((t) => (t.id === task.id ? { ...t, ...task } : t)) },
+        ),
+      });
+      return;
+    }
+
+    const pruned = currentLane ? withoutTask(lanes, task.id) : lanes;
+    const target = pruned.find((l) => l.status === task.status);
+    if (!target) {
+      // A status this board doesn't know about yet (someone just created
+      // one). A full reload is the only way to get its lane.
+      void get().loadBoard({ quiet: true });
+      return;
+    }
+
+    // The card is nowhere on the board. That means it is new, or it is
+    // already in this lane below the loaded page, or the active filters
+    // exclude it — and the three are indistinguishable from here. Inserting
+    // regardless would double-count a card the lane already has, or show one
+    // the filter was asked to hide. Only trust the insert when the lane is
+    // whole and unfiltered; otherwise ask the server, which knows.
+    const { tagFilter, searchQuery } = get();
+    if (
+      !currentLane &&
+      (tagFilter || searchQuery.trim() || target.tasks.length < target.total)
+    ) {
+      void get().loadBoard({ quiet: true });
+      return;
+    }
+
+    // Insert by rank so a card from elsewhere lands where the server would
+    // have put it, rather than at whichever end is convenient.
+    set({
+      // Same reasoning as moveTask: a card we watched change lanes entered
+      // its new status now, and leaving the old entry time in place would
+      // age it from a lane it no longer sits in. A card the board has never
+      // seen gets no entry — absent keeps the indicator silent, which beats
+      // inventing a time we don't have.
+      ...(currentLane
+        ? { statusSince: { ...get().statusSince, [task.id]: task.updated_at } }
+        : {}),
+      lanes: pruned.map((lane) => {
+        if (lane.status !== task.status) return lane;
+        const tasks = [...lane.tasks];
+        const at = tasks.findIndex((t) => t.position > task.position);
+        tasks.splice(at === -1 ? tasks.length : at, 0, task);
+        // withoutTask already decremented the source lane, so this is a
+        // plain +1 whether the card came from another lane or from nowhere
+        // (a task created directly into this status).
+        return { ...lane, tasks, total: lane.total + 1 };
+      }),
+    });
+  },
+
   setFilter: (f: string) => {
     set({ filter: f, page: 1 });
     get().loadTasks();
@@ -86,7 +370,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
 
   setSearch: (q: string) => {
     set({ searchQuery: q, page: 1 });
-    get().loadTasks();
+    // Board and list read different state, so a search has to refresh
+    // whichever is on screen — the list's tasks[] and the board's lanes[]
+    // are populated by different calls. Quiet on the board: the input is
+    // debounced, and blanking the lanes on each keystroke reads as a
+    // flicker rather than as progress.
+    if (get().viewMode === 'board') void get().loadBoard({ quiet: true });
+    else get().loadTasks();
   },
 
   setSort: (s: TaskSort) => {
@@ -101,21 +391,29 @@ export const useTaskStore = create<TaskState>((set, get) => ({
 
   updateStatus: async (id: string, status: string) => {
     await api.updateTask(id, { status });
-    // Update selected task inline if viewing it
     const sel = get().selectedTask;
     if (sel && sel.id === id) {
       set({ selectedTask: { ...sel, status } });
     }
-    get().loadTasks();
+    // The WS broadcast updates the board; only the list needs a refetch.
+    if (get().viewMode === 'list') get().loadTasks();
   },
 
   createTask: async (title: string, content: string, deadline: string) => {
-    await api.createTask({ title, content, deadline });
-    set({ showCreateDialog: false, page: 1 });
-    get().loadTasks();
+    const { createInStatus } = get();
+    await api.createTask({
+      title,
+      content,
+      deadline,
+      ...(createInStatus ? { status: createInStatus } : {}),
+    });
+    set({ showCreateDialog: false, createInStatus: null, page: 1 });
+    if (get().viewMode === 'board') void get().loadBoard({ quiet: true });
+    else get().loadTasks();
   },
 
-  setShowCreateDialog: (show: boolean) => set({ showCreateDialog: show }),
+  setShowCreateDialog: (show: boolean, status: string | null = null) =>
+    set({ showCreateDialog: show, createInStatus: show ? status : null }),
 
   loadTask: async (id: string) => {
     set({ detailLoading: true, selectedTask: null });
@@ -132,13 +430,16 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     set({ saving: true });
     try {
       await api.updateTask(id, { content });
-      // Update local state
       const sel = get().selectedTask;
       if (sel && sel.id === id) {
         set({ selectedTask: { ...sel, content } });
       }
+      return true;
     } catch (e) {
+      // Reported rather than rethrown: the editor needs to know the write
+      // failed so it can hold on to the text, not to handle the error itself.
       console.error('Failed to save task:', e);
+      return false;
     } finally {
       set({ saving: false });
     }

@@ -112,15 +112,16 @@ TASK_UPDATE_SCHEMA = {
             "description": "Update note to append to the task file",
             "default": "",
         },
+        # No "default" on deadline/tags: these two use presence rather than
+        # truthiness, so an omitted key and an empty string mean different
+        # things. Declaring a default invites callers to send "" as a no-op.
         "deadline": {
             "type": "string",
-            "description": "New deadline in YYYY-MM-DD format",
-            "default": "",
+            "description": "New deadline in YYYY-MM-DD format. Send an empty string to remove the deadline; omit the field entirely to leave it unchanged.",
         },
         "tags": {
             "type": "string",
-            "description": "Replace tags (comma-separated). Use '+tag' to add, '-tag' to remove, or 'tag1,tag2' to set.",
-            "default": "",
+            "description": "Replace tags (comma-separated). Use '+tag' to add, '-tag' to remove, or 'tag1,tag2' to set. Send an empty string to remove all tags; omit the field entirely to leave them unchanged.",
         },
         "title": {
             "type": "string",

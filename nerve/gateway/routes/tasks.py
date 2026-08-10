@@ -7,8 +7,9 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from nerve.agent.streaming import emit_task_event
 from nerve.config import ensure_path_not_tracked_config, get_config
-from nerve.db.task_statuses import STATUS_NAME_RE, normalize_color
+from nerve.db.task_statuses import STATUS_NAME_RE, TERMINAL_STATUS, normalize_color
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import (
     build_route_tool_context,
@@ -25,14 +26,41 @@ class TaskCreateRequest(BaseModel):
     source: str = "manual"
     source_url: str = ""
     deadline: str = ""
+    tags: str = ""
+    status: str = ""
+    confirm_duplicate: bool = False
 
 
 class TaskUpdateRequest(BaseModel):
+    """Partial task edit.
+
+    ``deadline`` and ``tags`` are ``None``-by-default rather than
+    ``""``-by-default: the handler reads them by *presence*, so omitting
+    the key leaves the field alone while sending an empty string clears
+    it. The remaining fields keep truthiness semantics — there is no
+    meaningful "clear" for a title, a status, or an appended note.
+    """
+
     status: str = ""
     note: str = ""
-    deadline: str = ""
     content: str = ""
     title: str = ""
+    deadline: str | None = None
+    tags: str | None = None
+
+
+class TaskMoveRequest(BaseModel):
+    """Place a task in a lane, relative to its new neighbours.
+
+    ``before_id`` is the card that ends up directly above the moved task,
+    ``after_id`` the one directly below; omit both to append to the lane.
+    Ranks are resolved server-side from these anchors — see
+    :meth:`nerve.db.tasks.TaskStore.move_task`.
+    """
+
+    status: str | None = None
+    before_id: str | None = None
+    after_id: str | None = None
 
 
 class TaskStatusCreateRequest(BaseModel):
@@ -49,12 +77,19 @@ class TaskStatusUpdateRequest(BaseModel):
     sort_order: int | None = None
 
 
-_ALLOWED_SORTS = {"deadline", "updated_at", "created_at"}
+_ALLOWED_SORTS = {"deadline", "updated_at", "created_at", "position"}
+
+# Per-lane page size for the board. Done accumulates without bound and is
+# collapsed by default in the UI, so it gets a tighter cap — every lane
+# reports its true ``total`` so the column can offer "+N more".
+_BOARD_LANE_LIMIT = 100
+_BOARD_DONE_LANE_LIMIT = 25
 
 
 @router.get("/api/tasks")
 async def list_tasks(
     status: str = "",
+    tag: str = "",
     sort: str = "deadline",
     limit: int = 50,
     offset: int = 0,
@@ -68,10 +103,11 @@ async def list_tasks(
         sort = "deadline"
 
     status_filter = status or None
+    tag_filter = tag.strip().lower() or None
     tasks = await deps.db.list_tasks(
-        status=status_filter, sort=sort, limit=limit, offset=offset,
+        status=status_filter, tag=tag_filter, sort=sort, limit=limit, offset=offset,
     )
-    total = await deps.db.count_tasks(status=status_filter)
+    total = await deps.db.count_tasks(status=status_filter, tag=tag_filter)
     return {"tasks": tasks, "total": total, "limit": limit, "offset": offset}
 
 
@@ -82,6 +118,91 @@ async def search_tasks(q: str, status: str = "", user: dict = Depends(require_au
     # so we return up to 100 hits and let the UI hide pagination when active.
     tasks = await deps.db.search_tasks(query=q, status=status or None, limit=100)
     return {"tasks": tasks, "total": len(tasks), "limit": len(tasks), "offset": 0}
+
+
+# ── Board ────────────────────────────────────────────────────────────────
+#
+# NOTE: /board and /tags must stay above /{task_id} — FastAPI matches in
+# declaration order, so a dynamic segment declared first would swallow both.
+
+
+@router.get("/api/tasks/board")
+async def task_board(
+    limit: int = _BOARD_LANE_LIMIT,
+    tag: str = "",
+    q: str = "",
+    user: dict = Depends(require_auth),
+):
+    """Every lane in one round trip: statuses + their ordered tasks.
+
+    The board needs one page of each configured status plus that status's
+    full count. Fetching it here rather than as N parallel filtered calls
+    keeps the lanes consistent with each other (a task that moves mid-load
+    can't appear in two lanes or neither) and keeps the client from having
+    to know the status list before it can start fetching.
+
+    ``q`` searches server-side, per lane. It has to happen here rather than
+    as a client-side filter over the loaded cards: a lane is paginated, so
+    filtering what the client holds would silently miss matches deeper in
+    the lane and report "no results" for tasks that exist. Hits keep their
+    lane order rather than FTS relevance order — the board is spatial, and
+    reordering cards under a search would move them away from where the
+    person looking already knows they are.
+    """
+    deps = get_deps()
+    limit = max(1, min(limit, 200))
+    tag_filter = tag.strip().lower() or None
+
+    query = q.strip()
+
+    statuses = await deps.db.list_task_statuses()
+    # One GROUP BY covers every lane's total; a tag filter (which the grouped
+    # count can't express) or a search needs the per-lane path instead.
+    counts = {} if (tag_filter or query) else await deps.db.count_tasks_by_status()
+
+    lanes = []
+    for status_def in statuses:
+        name = status_def["name"]
+        lane_limit = (
+            min(limit, _BOARD_DONE_LANE_LIMIT) if name == TERMINAL_STATUS else limit
+        )
+        if query:
+            tasks = await deps.db.search_tasks(
+                query=query, status=name, tag=tag_filter, limit=lane_limit,
+            )
+            # search_tasks ranks by relevance; the board wants lane order.
+            tasks.sort(key=lambda t: (t.get("position") or 0.0, t["id"]))
+            # No count query for a search: the lane holds every hit unless it
+            # hit the cap, in which case "+N more" would be a guess anyway.
+            total = len(tasks)
+        else:
+            tasks = await deps.db.list_tasks(
+                status=name, tag=tag_filter, sort="position", limit=lane_limit,
+            )
+            total = (
+                await deps.db.count_tasks(status=name, tag=tag_filter)
+                if tag_filter
+                else counts.get(name, 0)
+            )
+        lanes.append({"status": name, "total": total, "tasks": tasks})
+
+    # When each visible card last entered its current status — one query
+    # for the whole board rather than one per card. Tasks whose last
+    # transition predates task_events are simply absent, so the UI shows
+    # no age rather than a wrong one.
+    visible = [t["id"] for lane in lanes for t in lane["tasks"]]
+    status_since = await deps.db.get_status_entry_times(visible)
+
+    return {"statuses": statuses, "lanes": lanes, "status_since": status_since}
+
+
+@router.get("/api/tasks/tags")
+async def list_task_tags(
+    include_done: bool = False, user: dict = Depends(require_auth),
+):
+    """Tag facets for the board filter bar, most-used first."""
+    deps = get_deps()
+    return {"tags": await deps.db.distinct_task_tags(include_done=include_done)}
 
 
 @router.post("/api/tasks")
@@ -97,9 +218,89 @@ async def create_task(req: TaskCreateRequest, user: dict = Depends(require_auth)
             "source": req.source,
             "source_url": req.source_url,
             "deadline": req.deadline,
+            "tags": req.tags,
+            "status": req.status,
+            "confirm_duplicate": req.confirm_duplicate,
         },
     )
-    return result.to_dict()
+
+    # The handler reports its outcome as data as well as prose; branch on
+    # that rather than on the wording of the message.
+    outcome = result.structured or {}
+    message = result.text_content
+    if not outcome.get("created"):
+        # The duplicate guard is a refusal, not a success — say so with a
+        # status code instead of a 200 carrying an apology. The body keeps
+        # the near-matches so the client can offer "create anyway".
+        #
+        # An unknown status is the other way this refuses, and it is a bad
+        # field rather than a collision: offering "create anyway" cannot fix
+        # it. Give it the 422 that /move already returns for the same
+        # mistake, so a client can tell the two apart by status code.
+        reason = outcome.get("reason", "refused")
+        raise HTTPException(
+            status_code=422 if reason == "invalid_status" else 409,
+            detail={
+                "message": message,
+                "reason": reason,
+                "duplicates": outcome.get("duplicates", []),
+            },
+        )
+
+    deps = get_deps()
+    task = await deps.db.get_task(outcome["task_id"])
+    return {"task": task, "message": message}
+
+
+@router.post("/api/tasks/{task_id}/move")
+async def move_task(
+    task_id: str, req: TaskMoveRequest, user: dict = Depends(require_auth),
+):
+    """Reorder a task within a lane, or move it to another one."""
+    deps = get_deps()
+    task = await deps.db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    target = (req.status or "").strip().lower() or task["status"]
+    if target not in await deps.db.task_status_names():
+        raise HTTPException(status_code=422, detail=f"Unknown status: '{target}'")
+
+    # A lane change is more than a column write — `done` owns its own
+    # directory on disk. Hand the status flip to task_update, which routes
+    # to task_done / task_reopen so the markdown travels with the status,
+    # then stamp the rank on top of whatever it left behind.
+    if target != task["status"]:
+        result = await get_tool_registry().invoke(
+            "task_update",
+            # "web" rather than the default "system" sentinel: this string
+            # lands in task_events.actor, and the point of that column is
+            # telling a person dragging a card from the agent moving it.
+            build_route_tool_context("web"),
+            {"task_id": task_id, "status": target},
+        )
+        if result.is_error:
+            raise HTTPException(status_code=409, detail=result.text_content)
+
+    moved = await deps.db.move_task(
+        task_id, status=target, before_id=req.before_id, after_id=req.after_id,
+        actor="web",
+    )
+    if not moved:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    await emit_task_event(moved, "moved")
+    return {"task": moved}
+
+
+@router.get("/api/tasks/{task_id}/events")
+async def list_task_events(
+    task_id: str, limit: int = 200, user: dict = Depends(require_auth),
+):
+    """A task's status history, oldest first."""
+    deps = get_deps()
+    limit = max(1, min(limit, 500))
+    return {"events": await deps.db.list_task_events(task_id, limit=limit)}
 
 
 @router.get("/api/tasks/{task_id}")
@@ -147,35 +348,57 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
             )
             new_title = parse_task_title(req.content)
             fields = parse_task_frontmatter(req.content)
+            # Only the columns the saved markdown carries. The rest keep their
+            # stored values, so nothing is read back off ``task`` here.
+            edits: dict = {}
+            if fields.get("deadline"):
+                edits["deadline"] = fields["deadline"]
+            if fields.get("tags"):
+                edits["tags"] = tags_to_string(parse_tags_string(fields["tags"]))
             await deps.db.upsert_task(
                 task_id=task_id,
                 file_path=task["file_path"],
                 title=new_title,
                 status=req.status or task["status"],
-                source=task.get("source"),
-                source_url=task.get("source_url"),
-                deadline=fields.get("deadline") or task.get("deadline"),
-                tags=tags_to_string(parse_tags_string(fields.get("tags") or task.get("tags", ""))),
                 content=req.content,
+                **edits,
             )
 
-    # Update status/note/deadline/title via the unified handler (may
+    # Update status/note/deadline/tags/title via the unified handler (may
     # move the file for "done" — the handler routes to task_done in that
-    # case so the FTS index stays consistent).
-    if req.status or req.note or req.deadline or req.title:
-        await get_tool_registry().invoke(
-            "task_update",
-            build_route_tool_context(),
-            {
-                "task_id": task_id,
-                "status": req.status,
-                "note": req.note,
-                "deadline": req.deadline,
-                "title": req.title,
-            },
-        )
+    # case, and to task_reopen on the way back out, so the FTS index and
+    # the file's directory stay consistent).
+    #
+    # Fields are added by presence, not truthiness: the handler reads
+    # deadline/tags that way, so forwarding an unset field as "" would turn
+    # "don't touch this" into "clear this".
+    payload: dict = {"task_id": task_id}
+    if req.status:
+        payload["status"] = req.status
+    if req.note:
+        payload["note"] = req.note
+    if req.title:
+        payload["title"] = req.title
+    if req.deadline is not None:
+        payload["deadline"] = req.deadline
+    if req.tags is not None:
+        payload["tags"] = req.tags
 
-    return {"task_id": task_id, "updated": True}
+    if len(payload) > 1:
+        result = await get_tool_registry().invoke(
+            "task_update", build_route_tool_context("web"), payload,
+        )
+        # Previously swallowed: an unknown status returned {"updated": true}
+        # while nothing had changed. Surface the handler's own message.
+        if result.is_error:
+            raise HTTPException(status_code=400, detail=result.text_content)
+
+    updated = await deps.db.get_task(task_id)
+    await emit_task_event(updated, "updated")
+    # ``task_id``/``updated`` are kept for existing callers; ``task`` is the
+    # full post-write row so an optimistic client can reconcile without a
+    # follow-up GET.
+    return {"task": updated, "task_id": task_id, "updated": True}
 
 
 # ── Configurable task statuses ───────────────────────────────────────────
@@ -209,6 +432,24 @@ async def create_task_status(
         description=(req.description or "").strip(),
     )
     return created
+
+
+class TaskStatusReorderRequest(BaseModel):
+    """The full desired column order, outermost first."""
+
+    names: list[str]
+
+
+@router.post("/api/task-statuses/reorder")
+async def reorder_task_statuses(
+    req: TaskStatusReorderRequest, user: dict = Depends(require_auth),
+):
+    """Set board column order in one write.
+
+    Declared above /{name} so "reorder" isn't captured as a status name.
+    """
+    deps = get_deps()
+    return {"statuses": await deps.db.reorder_task_statuses(req.names)}
 
 
 @router.patch("/api/task-statuses/{name}")

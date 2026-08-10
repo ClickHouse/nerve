@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from 'react';
-import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
+import type { Location } from 'react-router-dom';
 import { useAuthStore } from './stores/authStore';
 import { ws } from './api/websocket';
 import { useChatStore } from './stores/chatStore';
@@ -13,6 +14,7 @@ import { ChatPage } from './pages/ChatPage';
 import { FilesPage } from './pages/FilesPage';
 import { TasksPage } from './pages/TasksPage';
 import { TaskDetailPage } from './pages/TaskDetailPage';
+import { TaskDetailModal } from './components/Tasks/TaskDetailModal';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
 import { MemuPage } from './pages/MemuPage';
 import { SourcesPage } from './pages/SourcesPage';
@@ -32,6 +34,8 @@ import { ShortcutsModal } from './components/ShortcutsModal';
 function App() {
   const { authenticated, checking, checkAuth, sessionExpired } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
+  // Above the early returns — hooks can't run conditionally.
+  const location = useLocation();
 
   useEffect(() => { checkAuth(); }, []);
 
@@ -49,11 +53,19 @@ function App() {
   // overlay, so nothing you had typed is thrown away to ask for it.
   if (!authenticated && !sessionExpired) return <LoginPage />;
 
+  // Background-location routing: when a route is entered with a
+  // `background` location in history state, render *that* location's route
+  // tree and overlay the real one as a modal. Reaching the same URL
+  // directly — a cold load, a refresh, a shared link — carries no such
+  // state and renders the ordinary full page. Used by the task board so
+  // opening a card doesn't tear the board down.
+  const background = (location.state as { background?: Location } | null)?.background;
+
   return (
     <>
       {sessionExpired && <SessionExpiredOverlay />}
       <GlobalShortcuts />
-      <Routes>
+      <Routes location={background ?? location}>
         <Route element={<AppShell />}>
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
@@ -75,6 +87,13 @@ function App() {
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
+
+      {background && (
+        <Routes>
+          <Route path="/tasks/:taskId" element={<TaskDetailModal />} />
+        </Routes>
+      )}
+
       <NotificationToast />
       <ShortcutsModal />
     </>

@@ -77,6 +77,81 @@ Setting a task's status to `done` via `task_update` automatically delegates to `
 
 This prevents orphan tasks (status=done in DB but file still in active/).
 
+Leaving `done` delegates the same way, to the inverse path: `task_update`
+routes a task whose stored status is `done` through the reopen handler, which
+moves the file back to `active/` and appends a `REOPENED` line. Both
+directions check the tracked-config guard *before* the status flip, so a
+refused move never leaves a task whose status and file disagree.
+
+The inverse matters because the disagreement is silent rather than loud.
+`reindex()` treats a file under `done/` as terminal by definition, so a row
+pointing there with an active status is an orphan it force-resets back to
+`done` — a status change that appeared to work would quietly undo itself the
+next time anything reindexed. A *missing* file is worse: `reindex()` only
+walks files that exist, so it never sees that row to repair it. Hence the
+reopen refuses outright when the file is already gone.
+
+### Ordering (`position`)
+
+Board lanes are hand-ordered, so the order is stored rather than derived:
+`tasks.position` is a sparse REAL rank, ascending (lower sorts higher in the
+lane), added in migration v043 and backfilled per status.
+
+A move sends *intent* — "put this card between A and B" — and the server takes
+the midpoint of the two neighbours' ranks. One drag is one UPDATE, with no
+renumbering of the lane. If repeated midpoint inserts ever exhaust float
+precision between two neighbours, that lane is re-spaced at even intervals and
+the move retried.
+
+Two rules keep ranks meaningful:
+
+- **Preserved on omit.** `upsert_task(position=None)` keeps the stored rank.
+  Nothing in the markdown file encodes a rank, so callers that rebuild a row
+  from disk (`reindex`, `task_write`, the PATCH route) *cannot* supply one —
+  under replace semantics, appending a note would silently reset the card's
+  place in its lane.
+- **Re-ranked across lanes.** A rank only means something relative to its own
+  lane, so a status change places the card at the top of its destination
+  instead of carrying over a number it was never ordered against.
+
+### Status History
+
+Every status transition is appended to `task_events` (`task_id`,
+`from_status`, `to_status`, `actor`, `created_at`), added in migration v044
+and seeded with one origin row per existing task. `from_status` is NULL on
+the row recording a task's creation, so an aging calculation can tell
+"created here" from "moved here".
+
+Recording happens inside the same transaction as the status write, from all
+three paths that can change one: `update_task_status`, `move_task`, and the
+full-row `upsert_task` (which is how `task_update` flips status when it also
+writes a note). A no-op transition records nothing — that single rule is
+what keeps `reindex()` from doubling the table on every run, since it
+rewrites every row with the status it already had. The one case where
+reindex *does* change a status, resetting an orphaned row to match its
+directory, is a real correction and gets a row.
+
+`actor` is the session id for agent-driven changes, `web` for the HTTP API,
+`backfill` on the origin rows v044 seeded for tasks that predate the table,
+and `system` otherwise. `backfill` is load-bearing rather than cosmetic: a
+real creation also records a NULL `from_status`, so the actor is the only
+thing distinguishing a synthesized origin from one that actually happened.
+
+This powers the aging indicator on board cards and the timeline in the task
+detail view. Tasks whose last transition predates v044 report no entry time
+rather than a guessed one, so the UI stays silent instead of showing an age
+that isn't true.
+
+### Live Updates
+
+Every task mutation broadcasts a `task_updated` WebSocket event on the
+`__global__` channel carrying the whole row (`event` is one of `created`,
+`updated`, `moved`, `done`). It fires from both the HTTP routes and the tool
+handlers, so a card moves on any open board whether the change came from the
+web UI, another tab, or the agent working in an unrelated session. Broadcast
+failures are logged and swallowed — a stale card is never worth failing a
+write over.
+
 ### FTS Index
 
 Tasks are indexed in an FTS5 virtual table (`tasks_fts`) for fast full-text search. The index is synced on every `upsert_task()` call. On startup, an integrity check compares task count vs FTS count — if they diverge, the index is automatically reseeded from the database.

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, RefreshCw, Zap, CheckCircle, XCircle, Clock } from 'lucide-react';
 import { useSkillsStore, type Skill } from '../stores/skillsStore';
+import { Modal } from '../components/ui/Modal';
 
 function SkillCard({ skill }: { skill: Skill }) {
   const navigate = useNavigate();
@@ -77,39 +78,15 @@ function CreateSkillDialog() {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowCreateDialog(false)}>
-      <div className="bg-surface-raised border border-border rounded-lg w-[500px] max-h-[80vh] overflow-auto" onClick={e => e.stopPropagation()}>
-        <div className="p-4 border-b border-border">
-          <h2 className="text-sm font-medium text-text">New Skill</h2>
-        </div>
-        <div className="p-4 space-y-3">
-          <div>
-            <label className="text-xs text-text-muted block mb-1">Name</label>
-            <input
-              value={name} onChange={e => setName(e.target.value)}
-              className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
-              placeholder="e.g. code-review"
-              autoFocus
-            />
-          </div>
-          <div>
-            <label className="text-xs text-text-muted block mb-1">Description</label>
-            <textarea
-              value={description} onChange={e => setDescription(e.target.value)}
-              className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent min-h-[60px] resize-y"
-              placeholder='This skill should be used when the user asks to "review code"...'
-            />
-          </div>
-          <div>
-            <label className="text-xs text-text-muted block mb-1">Instructions (optional)</label>
-            <textarea
-              value={content} onChange={e => setContent(e.target.value)}
-              className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent min-h-[120px] resize-y font-mono text-xs"
-              placeholder="Markdown instructions for the agent..."
-            />
-          </div>
-        </div>
-        <div className="p-4 border-t border-border flex justify-end gap-2">
+    <Modal
+      open
+      onClose={() => setShowCreateDialog(false)}
+      title="New Skill"
+      size="lg"
+      // Three fields of typing behind a backdrop click is too much to lose.
+      closeOnBackdrop={false}
+      footer={
+        <>
           <button onClick={() => setShowCreateDialog(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
             Cancel
           </button>
@@ -120,9 +97,37 @@ function CreateSkillDialog() {
           >
             {actionLoading ? 'Creating...' : 'Create Skill'}
           </button>
+        </>
+      }
+    >
+      <div className="p-4 space-y-3">
+        <div>
+          <label className="text-xs text-text-muted block mb-1">Name</label>
+          <input
+            value={name} onChange={e => setName(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
+            placeholder="e.g. code-review"
+            autoFocus
+          />
+        </div>
+        <div>
+          <label className="text-xs text-text-muted block mb-1">Description</label>
+          <textarea
+            value={description} onChange={e => setDescription(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent min-h-[60px] resize-y"
+            placeholder='This skill should be used when the user asks to "review code"...'
+          />
+        </div>
+        <div>
+          <label className="text-xs text-text-muted block mb-1">Instructions (optional)</label>
+          <textarea
+            value={content} onChange={e => setContent(e.target.value)}
+            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent min-h-[120px] resize-y font-mono text-xs"
+            placeholder="Markdown instructions for the agent..."
+          />
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 

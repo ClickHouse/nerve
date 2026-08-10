@@ -959,6 +959,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Review loops — global event (session_running pattern): chip state on
       // the observer session row + live milestone append for the open view.
       case 'review_loop_update': return handleReviewLoopUpdate(msg, get, set);
+      // Tasks — global event (session_id is always null), so the board
+      // reflects a change made by the agent in any session, by another
+      // tab, or over the API. Must stay out of VIEW_SCOPED_EVENTS.
+      case 'task_updated':
+        void import('./taskStore').then(({ useTaskStore }) =>
+          useTaskStore.getState().handleTaskEvent(msg.task)
+        );
+        return;
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
       case 'interaction_resolved':     return handleInteractionResolved(msg, get, set);

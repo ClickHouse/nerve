@@ -38,6 +38,7 @@ from nerve.db.task_statuses import (
     normalize_color,
     random_status_color,
 )
+from nerve.tasks.files import move_task_file
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,21 @@ def _done_dir(ctx: ToolContext) -> Path:
     return d
 
 
+async def _emit_task_event(ctx: ToolContext, task_id: str, event: str) -> None:
+    """Push the post-mutation row to every connected task board.
+
+    Re-reads the row rather than assembling a dict from local variables so
+    the broadcast always carries what actually landed in the database —
+    including the columns the handler never touched (``position``, the
+    refreshed ``updated_at``).
+    """
+    if not ctx.db:
+        return
+    from nerve.agent.streaming import emit_task_event
+
+    await emit_task_event(await ctx.db.get_task(task_id), event)
+
+
 async def task_search_handler(ctx: ToolContext, args: dict) -> ToolResult:
     query = args["query"]
     raw_status = (args.get("status", "") or "").strip().lower()
@@ -184,7 +200,9 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
     # Reject unknown statuses up front with the list of valid options.
     err = await _validate_status(ctx, status)
     if err:
-        return ToolResult.text(err)
+        return ToolResult.text(
+            err, structured={"created": False, "reason": "invalid_status"},
+        )
 
     # Duplicate check (skip if explicitly confirmed)
     if not confirm:
@@ -196,7 +214,17 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 lines.append(f"  - [{t['status']}] {t['title']}{deadline_str} — {t['id']}")
             lines.append("")
             lines.append("Task NOT created. To create anyway, call task_create again with confirm_duplicate=true.")
-            return ToolResult.text("\n".join(lines))
+            return ToolResult.text(
+                "\n".join(lines),
+                structured={
+                    "created": False,
+                    "reason": "duplicate",
+                    "duplicates": [
+                        {"id": t["id"], "title": t["title"], "status": t["status"]}
+                        for t in dupes
+                    ],
+                },
+            )
 
     task_id = _make_task_id(title, ctx)
     file_path = _task_dir(ctx) / f"{task_id}.md"
@@ -228,16 +256,21 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             deadline=deadline or None,
             tags=tags_to_string(tags),
             content=content,
+            actor=ctx.session_id,
         )
 
     _tasks_read.add(task_id)
+    await _emit_task_event(ctx, task_id, "created")
 
     # Creating directly in the terminal status: route through task_done so
     # the file is moved into done/ and stays consistent with the done-flow.
     if status == TERMINAL_STATUS and ctx.db:
         await task_done_handler(ctx, {"task_id": task_id, "note": ""})
 
-    return ToolResult.text(f"Task created: {task_id} (status: {status})\nFile: {file_path}")
+    return ToolResult.text(
+        f"Task created: {task_id} (status: {status})\nFile: {file_path}",
+        structured={"created": True, "task_id": task_id, "status": status},
+    )
 
 
 async def task_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -276,9 +309,20 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     status = (args.get("status", "") or "").strip().lower()
     note = args.get("note", "")
-    deadline = args.get("deadline", "")
-    raw_tags = (args.get("tags", "") or "").strip()
     new_title = (args.get("title", "") or "").strip()
+
+    # ``deadline`` and ``tags`` use presence, not truthiness: an absent key
+    # means "leave it alone", a present-but-empty one is an explicit clear.
+    # Clearing has to be expressible — otherwise the board's detail modal
+    # can add a deadline or a tag but never remove the last one. Every
+    # in-tree caller omits these keys entirely, so nothing else changes.
+    deadline = args.get("deadline")
+    raw_tags = args.get("tags")
+    if raw_tags is not None:
+        raw_tags = raw_tags.strip()
+    has_field_edits = (
+        deadline is not None or raw_tags is not None or bool(new_title)
+    )
 
     # Reject unknown statuses with the list of valid options.
     if status:
@@ -290,13 +334,30 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if status == TERMINAL_STATUS:
         return await task_done_handler(ctx, {"task_id": task_id, "note": note})
 
+    # ...and the mirror. A task leaving the terminal status has to have its
+    # markdown moved back out of done/ *before* anything else edits it —
+    # otherwise the row points into done/ with a non-done status, which
+    # TaskManager.reindex() treats as an orphan and force-resets to done.
+    if ctx.db and status:
+        current = await ctx.db.get_task(task_id)
+        if current and current.get("status") == TERMINAL_STATUS:
+            reopened = await task_reopen_handler(
+                ctx, {"task_id": task_id, "status": status, "note": note},
+            )
+            if reopened.is_error or not has_field_edits:
+                return reopened
+            # More fields to apply: fall through and re-read the row below
+            # so those edits land on the file's new location, not the stale
+            # done/ path. The note has already been recorded by the reopen.
+            note = ""
+
     if ctx.db:
         task = await ctx.db.get_task(task_id)
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
 
         new_tags_str = ""
-        if raw_tags:
+        if raw_tags is not None:
             current_tags = set(parse_tags_string(task.get("tags", "") or ""))
             if raw_tags.startswith("+") or raw_tags.startswith("-"):
                 for part in raw_tags.split(","):
@@ -309,7 +370,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
             else:
                 new_tags_str = tags_to_string(parse_tags_string(raw_tags))
 
-        if ctx.workspace and (note or deadline or raw_tags or new_title):
+        if ctx.workspace and (note or has_field_edits):
             file_path = ctx.workspace / task["file_path"]
             ensure_path_not_tracked_config(file_path, "write")
             if file_path.exists():
@@ -326,7 +387,11 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                         content = re.sub(r"\*\*Deadline:\*\* .*", f"**Deadline:** {deadline}", content)
                     else:
                         content = content.replace("\n\n", f"\n**Deadline:** {deadline}\n\n", 1)
-                if raw_tags:
+                elif deadline is not None:
+                    # Explicit clear — drop the line entirely so the file
+                    # stops projecting a deadline back onto the column.
+                    content = re.sub(r"\*\*Deadline:\*\* .*\n?", "", content, count=1)
+                if new_tags_str:
                     display_tags = ", ".join(parse_tags_string(new_tags_str))
                     if "**Tags:**" in content:
                         content = re.sub(r"\*\*Tags:\*\* .*", f"**Tags:** {display_tags}", content)
@@ -340,32 +405,41 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                         )
                         if "**Tags:**" not in content:
                             content = content.replace("\n\n", f"\n**Tags:** {display_tags}\n\n", 1)
+                elif raw_tags is not None:
+                    # Every tag removed (an empty set, or "-last_tag").
+                    content = re.sub(r"\*\*Tags:\*\* .*\n?", "", content, count=1)
                 await asyncio.to_thread(
                     file_path.write_text, content, encoding="utf-8",
                 )
 
                 final_title = new_title or task["title"]
                 final_status = status or task["status"]
-                final_deadline = deadline or task.get("deadline")
-                final_tags = new_tags_str if raw_tags else (task.get("tags") or "")
+                # Presence carries through to the row the same way it does to
+                # the file above: an omitted column keeps its stored value, a
+                # present-but-empty one clears it.
+                edits: dict = {}
+                if deadline is not None:
+                    edits["deadline"] = deadline or None
+                if raw_tags is not None:
+                    edits["tags"] = new_tags_str
                 await ctx.db.upsert_task(
                     task_id=task_id,
                     file_path=task["file_path"],
                     title=final_title,
                     status=final_status,
-                    source=task.get("source"),
-                    source_url=task.get("source_url"),
-                    deadline=final_deadline,
-                    tags=final_tags,
                     content=content,
+                    actor=ctx.session_id,
+                    **edits,
                 )
+                await _emit_task_event(ctx, task_id, "updated")
                 return ToolResult.text(f"Task {task_id} updated.")
 
         # Fall back to metadata updates when no task file was changed.
         if status:
-            await ctx.db.update_task_status(task_id, status)
-        if raw_tags:
+            await ctx.db.update_task_status(task_id, status, actor=ctx.session_id)
+        if raw_tags is not None:
             await ctx.db.update_task_tags(task_id, new_tags_str)
+        await _emit_task_event(ctx, task_id, "updated")
 
     return ToolResult.text(f"Task {task_id} updated.")
 
@@ -432,20 +506,23 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     # The deadline column is a pure projection of the file's Deadline line, so it
     # comes from the content we just wrote, never from the pre-write snapshot.
     new_deadline = frontmatter.get("deadline", "")
-    new_tags = tags_to_string(parse_tags_string(frontmatter.get("tags", task.get("tags", ""))))
+    # Tags follow the reindex rule: the file wins whenever it carries the
+    # field, and an absent field keeps the stored column.
+    edits: dict = {}
+    if "tags" in frontmatter:
+        edits["tags"] = tags_to_string(parse_tags_string(frontmatter["tags"]))
 
     await ctx.db.upsert_task(
         task_id=task_id,
         file_path=task["file_path"],
         title=new_title,
         status=task["status"],
-        source=task.get("source"),
-        source_url=task.get("source_url"),
         deadline=new_deadline or None,
-        tags=new_tags,
         content=new_content,
+        **edits,
     )
 
+    await _emit_task_event(ctx, task_id, "updated")
     return ToolResult.text(f"Task {task_id} written ({len(new_content)} chars).")
 
 
@@ -458,14 +535,14 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
 
-        # Done is a write like any other — it copies the file into done/ and
-        # unlinks the source, so a stored ``file_path`` inside the tracked config
-        # subtree would delete config. Refuse before the status flip, or a
+        # Done is a write like any other — it appends to the file and moves it
+        # into done/, so a stored ``file_path`` inside the tracked config
+        # subtree would rewrite config. Refuse before the status flip, or a
         # refusal leaves a task marked done whose file never moved.
         if ctx.workspace:
             ensure_path_not_tracked_config(ctx.workspace / task["file_path"], "move")
 
-        await ctx.db.update_task_status(task_id, "done")
+        await ctx.db.update_task_status(task_id, "done", actor=ctx.session_id)
 
         # Mark any implementing plans for this task as done
         implementing_plans = await ctx.db.get_plans_for_task(task_id)
@@ -486,11 +563,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
                 dst = _done_dir(ctx) / src.name
 
-                def _move_to_done() -> None:
-                    dst.write_text(content, encoding="utf-8")
-                    src.unlink()
-
-                await asyncio.to_thread(_move_to_done)
+                await asyncio.to_thread(move_task_file, src, dst, content)
 
                 rel_path = str(dst.relative_to(ctx.workspace))
                 await ctx.db.upsert_task(
@@ -498,14 +571,96 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     file_path=rel_path,
                     title=task["title"],
                     status="done",
-                    source=task.get("source"),
-                    source_url=task.get("source_url"),
-                    deadline=task.get("deadline"),
-                    tags=task.get("tags") or "",
                     content=content,
                 )
 
+        await _emit_task_event(ctx, task_id, "done")
+
     return ToolResult.text(f"Task {task_id} marked as done.")
+
+
+async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Mirror of ``task_done``: bring a completed task back to life.
+
+    ``task_done`` only moves a file one way, into done/, and nothing moved it
+    back. That was fine while the only way out of ``done`` was never taking
+    it, but the board lets a card be dragged out of the Done lane. Without
+    the file travelling with the status, the row points into done/ while
+    claiming to be active, and
+    ``TaskManager.reindex()`` classifies exactly that as an orphan and
+    force-resets it to done — silently undoing the move on the next reindex.
+
+    Not registered as a standalone tool: ``task_update`` routes here on its
+    own when it sees a task leaving the terminal status, so the agent-facing
+    surface stays the same size.
+    """
+    task_id = args["task_id"]
+    status = (args.get("status", "") or "").strip().lower() or DEFAULT_STATUS
+    note = args.get("note", "")
+
+    if status == TERMINAL_STATUS:
+        return ToolResult.text(
+            "task_reopen needs a non-terminal status — use task_done to complete a task.",
+            is_error=True,
+        )
+
+    err = await _validate_status(ctx, status)
+    if err:
+        return ToolResult.text(err, is_error=True)
+
+    if not ctx.db:
+        return ToolResult.text("Database not available.", is_error=True)
+
+    task = await ctx.db.get_task(task_id)
+    if not task:
+        return ToolResult.text(f"Task not found: {task_id}", is_error=True)
+    if task["status"] != TERMINAL_STATUS:
+        return ToolResult.text(
+            f"Task {task_id} is not done (status: {task['status']}) — nothing to reopen.",
+            is_error=True,
+        )
+
+    # Same ordering rationale as task_done: the refusal has to land before
+    # the status flip, or a rejected move leaves a task marked active whose
+    # file never left done/.
+    src = ctx.workspace / task["file_path"] if ctx.workspace else None
+    if src is not None:
+        ensure_path_not_tracked_config(src, "move")
+        # A missing file is a refusal for that same reason. With nothing to
+        # move, the flip on its own leaves the row claiming an active status
+        # while file_path still points into done/ — and reindex() cannot
+        # repair it, because it only walks files that exist.
+        if not src.exists():
+            return ToolResult.text(
+                f"Task {task_id} is done but its file is missing "
+                f"({task['file_path']}) — not reopening it.",
+                is_error=True,
+            )
+
+    await ctx.db.update_task_status(task_id, status, actor=ctx.session_id)
+
+    if src is not None:
+        # Re-checked because the guard above is not atomic with the move.
+        if src.exists():
+            content = await asyncio.to_thread(src.read_text, encoding="utf-8")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            suffix = f" — {note}" if note else ""
+            content += f"\n- {today}: REOPENED ({status}){suffix}"
+
+            dst = _task_dir(ctx) / src.name
+
+            await asyncio.to_thread(move_task_file, src, dst, content)
+
+            await ctx.db.upsert_task(
+                task_id=task_id,
+                file_path=str(dst.relative_to(ctx.workspace)),
+                title=task["title"],
+                status=status,
+                content=content,
+            )
+
+    await _emit_task_event(ctx, task_id, "updated")
+    return ToolResult.text(f"Task {task_id} reopened (status: {status}).")
 
 
 async def task_status_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
