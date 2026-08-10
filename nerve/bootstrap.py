@@ -77,6 +77,9 @@ PRODUCTIVITY_CRONS = [
         "session_mode": "persistent",
         "context_rotate_hours": 24,
         "reminder_mode": True,
+        # Skip idle polls: only wake when the inbox actually has new messages.
+        # No "sources" list → any source the "inbox" consumer tracks.
+        "run_if": [{"type": "messages", "consumer": "inbox"}],
         "prompt": (
             "Process the sync inbox by calling poll_all_sources(consumer=\"inbox\").\n\n"
             "If there are new messages, review them and take appropriate action:\n"

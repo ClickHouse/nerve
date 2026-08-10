@@ -395,6 +395,29 @@ class SourceStore:
         ) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def consumer_has_unread(self, consumer: str) -> bool:
+        """True if any source this consumer tracks has messages past its cursor.
+
+        Read-only and expiry-agnostic: compares each tracked source's max
+        ingested rowid against the consumer's stored cursor position — even a
+        cursor past its TTL — and never initializes or advances a cursor.
+        Sources the consumer has no cursor row for are ignored (new consumers
+        see only future messages), matching get_consumer_cursor.
+
+        Unlike list_consumer_cursors, which hides expired cursors, this keeps
+        a run gate from wedging shut when an inbox goes quiet long enough for
+        its cursors to expire and then receives new mail.
+        """
+        async with self.db.execute(
+            """SELECT 1 FROM consumer_cursors cc
+               WHERE cc.consumer = ?
+                 AND (SELECT COALESCE(MAX(sm.rowid), 0) FROM source_messages sm
+                      WHERE sm.source = cc.source) > cc.cursor_seq
+               LIMIT 1""",
+            (consumer,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def read_source_messages_by_rowid(
         self,
         source: str,

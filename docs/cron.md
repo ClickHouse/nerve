@@ -237,18 +237,19 @@ run_if:
 
 #### `messages`
 
-Satisfied when monitored sync sources have unread messages (compares each
-source's max ingested rowid against the consumer cursor; never advances it).
+Satisfied when the sync sources feeding a consumer have unread messages
+(compares each source's max ingested rowid against the consumer cursor; never
+advances it).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `sources` | list | — (required) | Source names to check (e.g. `gmail`, `github`) |
+| `sources` | list | *(any source)* | Source names to check (e.g. `gmail`, `github`). **Omit** to fire when *any* source the consumer already tracks has unread messages — handy for a shared/default inbox job that shouldn't hard-code the connected sources. |
 | `consumer` | string | `inbox` | Consumer cursor name used for the unread check |
 
 ```yaml
 run_if:
   - type: messages
-    sources: [gmail, github]
+    sources: [gmail, github]   # omit `sources` entirely for "any source"
     consumer: inbox
 ```
 

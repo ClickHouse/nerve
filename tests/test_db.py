@@ -1334,6 +1334,33 @@ class TestConsumerCursors:
                 rowids.append(row[0])
         return rowids
 
+    async def test_consumer_has_unread_true_when_behind(self, db: Database):
+        rowids = await self._insert_messages(db, "github", 3)
+        await db.set_consumer_cursor("inbox", "github", rowids[0])
+        assert await db.consumer_has_unread("inbox") is True
+
+    async def test_consumer_has_unread_false_when_caught_up(self, db: Database):
+        rowids = await self._insert_messages(db, "github", 3)
+        await db.set_consumer_cursor("inbox", "github", rowids[-1])
+        assert await db.consumer_has_unread("inbox") is False
+
+    async def test_consumer_has_unread_ignores_untracked_source(self, db: Database):
+        """Messages exist but the consumer has no cursor for the source → not unread."""
+        await self._insert_messages(db, "github", 2)
+        assert await db.consumer_has_unread("inbox") is False
+
+    async def test_consumer_has_unread_counts_expired_cursor(self, db: Database):
+        """A quiet inbox whose cursor expired must still report a backlog.
+
+        list_consumer_cursors hides expired cursors; consumer_has_unread must
+        not, or a gate that uses it would wedge shut once cursors age out.
+        """
+        rowids = await self._insert_messages(db, "github", 3)
+        # Cursor behind the latest, and already past its TTL (negative ttl).
+        await db.set_consumer_cursor("inbox", "github", rowids[0], ttl_days=-1)
+        assert await db.list_consumer_cursors("inbox") == []
+        assert await db.consumer_has_unread("inbox") is True
+
     async def test_consumer_cursor_init_to_latest(self, db: Database):
         """New consumer cursor should initialize to MAX(rowid) so first poll returns nothing."""
         rowids = await self._insert_messages(db, "github", 3)

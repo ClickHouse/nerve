@@ -167,6 +167,20 @@ class TestNonInteractiveSetup:
         assert "inbox-processor" in choices.enabled_crons
         assert "task-planner" in choices.enabled_crons
 
+    def test_inbox_processor_default_has_idle_gate(self) -> None:
+        """The default inbox-processor ships gated so idle polls are skipped."""
+        from nerve.bootstrap import PRODUCTIVITY_CRONS
+        from nerve.cron.gates import MessagesGate, build_gate
+
+        inbox = next(c for c in PRODUCTIVITY_CRONS if c["id"] == "inbox-processor")
+        assert inbox.get("run_if"), "inbox-processor must ship a run gate"
+        spec = inbox["run_if"][0]
+        assert spec["type"] == "messages"
+        assert spec.get("consumer") == "inbox"
+        # No hard-coded sources → the generic "any source" form.
+        assert "sources" not in spec
+        assert isinstance(build_gate(spec), MessagesGate)
+
 
 class TestDeferredWrites:
     """Verify nothing is written until _apply()."""
