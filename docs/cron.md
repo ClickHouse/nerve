@@ -257,6 +257,41 @@ run_if:
 > `idle_consumer: <name>` fields still work — they are translated into an
 > equivalent `messages` gate at load time. Prefer `run_if` for new jobs.
 
+#### `github_pr_activity`
+
+Satisfied when something actionable changed on an author's open PRs: a merge or
+close (`state`), a new commit (`headRefOid`), a review verdict
+(`reviewDecision`), a CI transition (`statusCheckRollup`), or a human
+comment/review. Those fields are fingerprinted via `gh` and the job fires only
+when the fingerprint moves, so an expensive PR-monitor job can stay idle for the
+whole life of an open PR while nothing actually happens on it.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `author` | string | — (required) | GitHub login whose open PRs to watch. Also ignored as a comment/review actor, so the job's own replies don't wake it |
+| `force_run_after_hours` | number | 8 | Fire regardless if this long has elapsed since the last run; `0` disables the safety net |
+| `ignore_actors` | list | — | Logins whose comments/reviews don't count as activity, for chatty bots that would otherwise wake the job on every push. Matching is case-insensitive and a trailing `[bot]` is ignored, so `codecov` also covers `codecov[bot]` |
+
+```yaml
+run_if:
+  - type: tasks                  # cheap DB check first...
+    status: in_progress
+    tag: pr-open
+  - type: github_pr_activity     # ...then the network check
+    author: my-bot
+    force_run_after_hours: 8
+    ignore_actors: [codecov, sonarqubecloud]
+```
+
+Two behaviours worth knowing. Any `gh` failure fails **open** — the job fires —
+so a transient error can never strand a PR. And `ignore_actors` is a denylist
+rather than bot autodetection, because bots are not reliably identifiable here:
+`author.is_bot` is `null` inside `gh`'s comment payloads and GraphQL strips the
+`[bot]` login suffix, while `authorAssociation` reports real maintainers as
+`CONTRIBUTOR` — the same value as some review bots. A denylist fails in the safe
+direction: an unlisted bot costs one extra wake, whereas a wrong autodetect
+would silently drop human feedback.
+
 ### Adding a built-in gate type
 
 Built-in gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`,

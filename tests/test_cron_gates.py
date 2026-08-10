@@ -577,3 +577,225 @@ class TestGitHubPrActivityGate:
     def test_build_gate_via_registry(self):
         gate = build_gate({"type": "github_pr_activity", "author": "bot"})
         assert isinstance(gate, GitHubPrActivityGate)
+
+
+# ---------------------------------------------------------------------------
+# GitHubPrActivityGate — comment/review activity in the fingerprint
+# ---------------------------------------------------------------------------
+
+def _comment(login: str, created: str = "2026-08-04T12:19:24Z", edited: bool = False):
+    return {
+        "author": {"login": login},
+        "createdAt": created,
+        "includesCreatedEdit": edited,
+    }
+
+
+def _review(
+    login: str,
+    state: str = "COMMENTED",
+    submitted: str = "2026-08-04T12:19:24Z",
+    edited: bool = False,
+):
+    return {
+        "author": {"login": login},
+        "state": state,
+        "submittedAt": submitted,
+        "includesCreatedEdit": edited,
+    }
+
+
+def _pr_payload(comments=None, reviews=None, **overrides):
+    """A `gh pr view --json ...` payload with stable non-comment state."""
+    payload = {
+        "state": "OPEN",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "headRefOid": "cd46fa400806f5634728a5a7c9963afefbc940bd",
+        "statusCheckRollup": [
+            {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ],
+        "comments": comments or [],
+        "reviews": reviews or [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _stub_gh(gate: GitHubPrActivityGate, payload: dict) -> None:
+    """Point the gate's `gh` shell-out at a single fake open PR."""
+    async def fake_gh(*args, **kwargs):
+        if args[0] == "search":
+            return json.dumps(
+                [{"repository": {"nameWithOwner": "acme/widget"}, "number": 7}]
+            )
+        return json.dumps(payload)
+
+    gate._gh = fake_gh  # type: ignore[method-assign]
+
+
+async def _fp(payload: dict, **kwargs) -> str:
+    gate = GitHubPrActivityGate(author="my-bot", **kwargs)
+    _stub_gh(gate, payload)
+    return await gate._fingerprint()
+
+
+class TestGitHubPrActivityCommentActivity:
+    """Regression cover for the 2026-08-04 comment-blindness bug.
+
+    The gate originally hashed only state/reviewDecision/headRefOid/checks, so a
+    maintainer's comment on one of our PRs never woke the monitor — and the
+    `github` inbox path silently consumed it (reason=author on our own PR), so
+    nothing observed it until the 8h force-run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_human_comment_changes_fingerprint(self):
+        """THE regression: a new human comment must move the fingerprint."""
+        before = await _fp(_pr_payload())
+        after = await _fp(_pr_payload(comments=[_comment("alex-clickhouse")]))
+        assert before != after
+
+    @pytest.mark.asyncio
+    async def test_human_commented_review_changes_fingerprint(self):
+        """A COMMENTED review leaves reviewDecision untouched, so hash it too."""
+        before = await _fp(_pr_payload())
+        after = await _fp(_pr_payload(reviews=[_review("alex-clickhouse")]))
+        assert before != after
+
+    @pytest.mark.asyncio
+    async def test_comment_edit_changes_fingerprint(self):
+        """Editing a comment in place keeps count/timestamp — catch it anyway."""
+        before = await _fp(_pr_payload(comments=[_comment("alex-clickhouse")]))
+        after = await _fp(
+            _pr_payload(comments=[_comment("alex-clickhouse", edited=True)])
+        )
+        assert before != after
+
+    @pytest.mark.asyncio
+    async def test_ignored_bot_comment_does_not_change_fingerprint(self):
+        """Chatty bots must not wake an expensive monitor (CI covers them)."""
+        quiet = await _fp(_pr_payload(), ignore_actors=["codecov"])
+        noisy = await _fp(
+            _pr_payload(comments=[_comment("codecov")]), ignore_actors=["codecov"]
+        )
+        assert quiet == noisy
+
+    @pytest.mark.asyncio
+    async def test_ignored_bot_review_does_not_change_fingerprint(self):
+        quiet = await _fp(_pr_payload(), ignore_actors=["cursor"])
+        noisy = await _fp(
+            _pr_payload(reviews=[_review("cursor")]), ignore_actors=["cursor"]
+        )
+        assert quiet == noisy
+
+    @pytest.mark.asyncio
+    async def test_bot_suffix_is_normalised(self):
+        """GraphQL strips `[bot]`; REST keeps it. One denylist entry covers both."""
+        quiet = await _fp(_pr_payload(), ignore_actors=["codecov"])
+        noisy = await _fp(
+            _pr_payload(comments=[_comment("Codecov[bot]")]),
+            ignore_actors=["codecov"],
+        )
+        assert quiet == noisy
+
+    @pytest.mark.asyncio
+    async def test_own_comment_does_not_change_fingerprint(self):
+        """Our own replies must never wake us."""
+        quiet = await _fp(_pr_payload())
+        noisy = await _fp(_pr_payload(comments=[_comment("my-bot")]))
+        assert quiet == noisy
+
+    @pytest.mark.asyncio
+    async def test_unlisted_bot_still_counts(self):
+        """Denylist fails safe: an unknown actor costs a wake, never a miss."""
+        before = await _fp(_pr_payload(), ignore_actors=["codecov"])
+        after = await _fp(
+            _pr_payload(comments=[_comment("brand-new-bot")]),
+            ignore_actors=["codecov"],
+        )
+        assert before != after
+
+    @pytest.mark.asyncio
+    async def test_ghost_author_counts_as_activity(self):
+        """A deleted user's comment (author=null) must not be silently dropped."""
+        before = await _fp(_pr_payload())
+        after = await _fp(
+            _pr_payload(
+                comments=[{"author": None, "createdAt": "x", "includesCreatedEdit": False}]
+            )
+        )
+        assert before != after
+
+    @pytest.mark.asyncio
+    async def test_non_comment_state_still_fingerprinted(self):
+        """Pre-existing signals must keep working."""
+        base = _pr_payload()
+        assert await _fp(base) != await _fp(_pr_payload(state="MERGED"))
+        assert await _fp(base) != await _fp(_pr_payload(headRefOid="deadbeef"))
+        assert await _fp(base) != await _fp(
+            _pr_payload(reviewDecision="CHANGES_REQUESTED")
+        )
+        assert await _fp(base) != await _fp(
+            _pr_payload(
+                statusCheckRollup=[
+                    {"name": "build", "status": "COMPLETED", "conclusion": "FAILURE"}
+                ]
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_comments_are_requested_from_gh(self):
+        """The payload is useless if the fields aren't asked for."""
+        gate = GitHubPrActivityGate(author="my-bot")
+        seen: list[tuple] = []
+
+        async def fake_gh(*args, **kwargs):
+            seen.append(args)
+            if args[0] == "search":
+                return json.dumps(
+                    [{"repository": {"nameWithOwner": "acme/widget"}, "number": 7}]
+                )
+            return json.dumps(_pr_payload())
+
+        gate._gh = fake_gh  # type: ignore[method-assign]
+        await gate._fingerprint()
+        view = next(a for a in seen if a[0] == "pr")
+        fields = view[view.index("--json") + 1]
+        for field in ("state", "reviewDecision", "headRefOid",
+                      "statusCheckRollup", "comments", "reviews"):
+            assert field in fields
+
+    def test_author_is_always_ignored(self):
+        gate = GitHubPrActivityGate(author="My-Bot")
+        assert "my-bot" in gate.ignore_actors
+
+    def test_from_config_ignore_actors(self):
+        gate = build_gate({
+            "type": "github_pr_activity",
+            "author": "my-bot",
+            "ignore_actors": ["Codecov[bot]", "cursor"],
+        })
+        assert {"codecov", "cursor", "my-bot"} <= gate.ignore_actors
+
+    def test_from_config_ignore_actors_string_coerced(self):
+        gate = build_gate({
+            "type": "github_pr_activity",
+            "author": "my-bot",
+            "ignore_actors": "codecov",
+        })
+        assert "codecov" in gate.ignore_actors
+
+    def test_from_config_ignore_actors_omitted(self):
+        gate = build_gate({"type": "github_pr_activity", "author": "my-bot"})
+        assert gate.ignore_actors == {"my-bot"}
+
+    def test_from_config_bad_ignore_actors(self):
+        with pytest.raises(GateConfigError):
+            build_gate({
+                "type": "github_pr_activity",
+                "author": "my-bot",
+                "ignore_actors": [{"login": "codecov"}],
+            })
+
+    def test_describe_mentions_comments(self):
+        assert "comment" in GitHubPrActivityGate(author="my-bot").describe()

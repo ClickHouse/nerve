@@ -263,15 +263,29 @@ class GitHubPrActivityGate(CronGate):
     The motivating case: wake an expensive (LLM) PR-monitor cron only when
     something it actually acts on has changed on one of the author's open
     PRs — merge/close (``state``), a new commit (``headRefOid``), a review
-    verdict (``reviewDecision``), or a CI transition (``statusCheckRollup``)
-    — instead of every N minutes for the entire lifetime of an open PR.
+    verdict (``reviewDecision``), a CI transition (``statusCheckRollup``), or
+    a human comment/review (``comments``/``reviews``, see below) — instead of
+    every N minutes for the entire lifetime of an open PR.
 
-    Why a dedicated gate (not the ``messages``/``tasks`` gates): comments and
-    @-mentions arrive via the ``github`` sync source, but **CI status changes
-    and silent merges do not** (a check flipping red posts no comment), so a
-    poll-based signal is required. A PR's ``updatedAt`` is *not* enough — check
-    runs attach to the head commit, not the PR, so CI changes often don't bump
-    it; we therefore fingerprint the CI rollup directly.
+    Why a dedicated gate (not the ``messages``/``tasks`` gates): **CI status
+    changes and silent merges post no comment**, so a poll-based signal is
+    required. A PR's ``updatedAt`` is *not* enough — check runs attach to the
+    head commit, not the PR, so CI changes often don't bump it; we therefore
+    fingerprint the CI rollup directly.
+
+    Comment/review activity is fingerprinted here too, and must be. It is
+    tempting to assume a reviewer's comment arrives via the ``github`` sync
+    source instead — it does *not* reliably reach a consumer. A plain comment
+    on a PR **we** authored has notification ``reason=author`` (not
+    ``mention``), and an inbox cron that delegates own-PR activity to this
+    monitor will discard it — after its poll has already advanced the durable
+    consumer cursor, so it is never re-delivered. Nothing else observes it.
+    (Regression: 2026-08-04, a maintainer comment on clickhouse-cs#513 sat
+    unseen for ~2h because this gate hashed only the four fields above.)
+
+    Note ``reviewDecision`` does not stand in for review activity either:
+    GitHub only populates it with ``APPROVED``/``CHANGES_REQUESTED``, so a
+    ``COMMENTED`` review leaves it unchanged.
 
     Mechanics (cheap, non-LLM): shell out to ``gh`` (same async-subprocess
     pattern as ``nerve.sources.github``), hash the fields above across all of
@@ -291,24 +305,53 @@ class GitHubPrActivityGate(CronGate):
           - type: github_pr_activity    # network: did any open PR change?
             author: my-bot
             force_run_after_hours: 8
+            ignore_actors: [codecov, sonarqubecloud]
 
     Config:
 
-    * ``author`` (required) — GitHub login whose open PRs to watch.
+    * ``author`` (required) — GitHub login whose open PRs to watch. Also
+      ignored as a comment/review actor: our own replies must not wake us.
     * ``force_run_after_hours`` (default 8) — force a run if this long has
       elapsed since the last fire; ``0`` disables the safety net.
+    * ``ignore_actors`` (default none) — logins whose comments/reviews don't
+      count as activity, for chatty bots that would otherwise wake the cron on
+      every push (coverage/lint/AI-review bots). Matching is case-insensitive
+      and a trailing ``[bot]`` is ignored, so ``codecov`` also covers
+      ``codecov[bot]``.
+
+      Why a denylist and not bot autodetection: ``author.is_bot`` is ``null``
+      inside ``gh``'s ``comments``/``reviews`` payloads, and GraphQL strips the
+      ``[bot]`` login suffix, so bots are not reliably identifiable.
+      ``authorAssociation`` does not work either — real maintainers show up as
+      ``CONTRIBUTOR``, the same value as some review bots, so filtering on it
+      would silently drop human feedback. A denylist fails in the safe
+      direction: an unlisted bot costs an extra wake, never a missed human.
     """
 
     type = "github_pr_activity"
-    spec_keys = frozenset({"author", "force_run_after_hours"})
+    spec_keys = frozenset({"author", "force_run_after_hours", "ignore_actors"})
 
-    def __init__(self, author: str, force_run_after_hours: float = 8.0) -> None:
+    def __init__(
+        self,
+        author: str,
+        force_run_after_hours: float = 8.0,
+        ignore_actors: list[str] | None = None,
+    ) -> None:
         if not author:
             raise GateConfigError(
                 "'github_pr_activity' gate requires a non-empty 'author'"
             )
         self.author = author
         self.force_run_after_hours = force_run_after_hours
+        # Our own comments/replies must never count as activity to react to.
+        self.ignore_actors = {self._norm_actor(a) for a in (ignore_actors or [])}
+        self.ignore_actors.add(self._norm_actor(author))
+
+    @staticmethod
+    def _norm_actor(login: str) -> str:
+        """Normalise a login for denylist comparison ('Codecov[bot]' -> 'codecov')."""
+        s = (login or "").strip().lower()
+        return s[:-5] if s.endswith("[bot]") else s
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
         fp = await self._fingerprint()
@@ -338,7 +381,8 @@ class GitHubPrActivityGate(CronGate):
     def describe(self) -> str:
         return (
             f"new activity on {self.author}'s open PRs "
-            f"(state/CI/review change; force every {self.force_run_after_hours}h)"
+            f"(state/CI/review/comment change; "
+            f"force every {self.force_run_after_hours}h)"
         )
 
     @classmethod
@@ -352,7 +396,21 @@ class GitHubPrActivityGate(CronGate):
                 "'github_pr_activity' gate 'force_run_after_hours' must be a "
                 f"number, got {hours!r}"
             )
-        return cls(author=author, force_run_after_hours=hours)
+        ignore = spec.get("ignore_actors") or []
+        if isinstance(ignore, str):
+            ignore = [ignore]
+        if not isinstance(ignore, list) or not all(
+            isinstance(a, str) for a in ignore
+        ):
+            raise GateConfigError(
+                "'github_pr_activity' gate 'ignore_actors' must be a list of "
+                f"login strings, got {ignore!r}"
+            )
+        return cls(
+            author=author,
+            force_run_after_hours=hours,
+            ignore_actors=ignore,
+        )
 
     # --- internals ---------------------------------------------------------
 
@@ -383,7 +441,8 @@ class GitHubPrActivityGate(CronGate):
     async def _pr_detail(self, repo: str, number: int) -> dict | None:
         out = await self._gh(
             "pr", "view", str(number), "--repo", repo,
-            "--json", "state,reviewDecision,headRefOid,statusCheckRollup",
+            "--json",
+            "state,reviewDecision,headRefOid,statusCheckRollup,comments,reviews",
         )
         if out is None:
             return None
@@ -392,6 +451,23 @@ class GitHubPrActivityGate(CronGate):
             (c.get("name", ""), c.get("status", ""), c.get("conclusion", ""))
             for c in (d.get("statusCheckRollup") or [])
         )
+        # `includesCreatedEdit` flips False->True the first time a comment is
+        # edited, so an edited-in-place comment still moves the fingerprint.
+        comments = sorted(
+            (c.get("createdAt", ""), self._actor(c), bool(c.get("includesCreatedEdit")))
+            for c in (d.get("comments") or [])
+            if not self._is_ignored(c)
+        )
+        reviews = sorted(
+            (
+                r.get("submittedAt", ""),
+                self._actor(r),
+                r.get("state", ""),
+                bool(r.get("includesCreatedEdit")),
+            )
+            for r in (d.get("reviews") or [])
+            if not self._is_ignored(r)
+        )
         return {
             "repo": repo,
             "number": number,
@@ -399,7 +475,17 @@ class GitHubPrActivityGate(CronGate):
             "review": d.get("reviewDecision"),
             "head": d.get("headRefOid"),
             "checks": checks,
+            "comments": comments,
+            "reviews": reviews,
         }
+
+    @staticmethod
+    def _actor(item: dict) -> str:
+        """Login of a comment/review author ('' for a deleted/ghost user)."""
+        return ((item.get("author") or {}).get("login") or "")
+
+    def _is_ignored(self, item: dict) -> bool:
+        return self._norm_actor(self._actor(item)) in self.ignore_actors
 
     @staticmethod
     async def _gh(*args: str, timeout: float = 30.0) -> str | None:
