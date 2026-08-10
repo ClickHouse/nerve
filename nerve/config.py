@@ -871,6 +871,22 @@ class AgentConfig:
     # grants the permission. Set False to restore the CLI default (background
     # sub-agent writes denied; build/write agents must then run in foreground).
     background_agent_permissions: bool = True
+    # Agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). The CLI gates the
+    # `SendMessage` tool behind this flag, and without it the Agent tool still
+    # advertises SendMessage in its own description and in every spawn result
+    # ("use SendMessage with to: '<id>' to continue this agent") — so the model
+    # is told to resume sub-agents with a tool that does not exist, tries, and
+    # fails. Enabling it makes SendMessage real: sub-agents become resumable
+    # with their context intact, and teammates can message each other.
+    # Nerve loads no settings files (setting_sources=[]), so the flag can only
+    # reach the CLI through the env dict built in the claude backend.
+    # Teammates are opt-in per turn — the model still has to spawn them — and
+    # they cost a full context window each. Note the CLI cannot restore
+    # in-process teammates on resume: a session whose client is recycled (idle
+    # timeout, restart, crash retry) comes back without them, and the lead may
+    # message teammates that no longer exist. Set False to restore the CLI
+    # default (no SendMessage, no teams).
+    agent_teams: bool = True
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @property
@@ -908,6 +924,7 @@ class AgentConfig:
             ),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             background_agent_permissions=d.get("background_agent_permissions", True),
+            agent_teams=d.get("agent_teams", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 

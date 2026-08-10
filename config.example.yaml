@@ -68,6 +68,15 @@ agent:
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
   background_agent_permissions: true  # Background sub-agents (Agent run_in_background) get the same tool permissions as foreground; false denies their Write/Edit/Bash
+  # Agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). The CLI gates the
+  # SendMessage tool behind this flag while the Agent tool advertises it
+  # regardless ("use SendMessage with to: '<id>' to continue this agent"), so
+  # with it off the model is told to resume sub-agents with a tool that does
+  # not exist. On: sub-agents are resumable with their context intact, and
+  # teammates can message each other. Teammates stay opt-in per turn and cost
+  # a full context window each; the CLI cannot restore in-process teammates
+  # when a session's client is recycled (idle timeout, restart, crash retry).
+  agent_teams: true
   # First-prompt rewrite — the web UI can refine the opening message of a
   # new chat with a fast model, preview it, and send only after approval.
   prompt_rewrite:

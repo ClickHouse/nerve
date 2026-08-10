@@ -260,6 +260,23 @@ class TestModelDefaultsAndAliases:
         assert validate_config_keys(merged) == []
 
 
+class TestAgentTeams:
+    """agent.agent_teams — gates the CLI's SendMessage tool."""
+
+    def test_enabled_by_default(self):
+        from nerve.config import AgentConfig
+
+        assert AgentConfig.from_dict({}).agent_teams is True
+
+    def test_can_be_disabled(self):
+        from nerve.config import AgentConfig
+
+        assert AgentConfig.from_dict({"agent_teams": False}).agent_teams is False
+
+    def test_key_recognized_by_validator(self):
+        assert validate_config_keys({"agent": {"agent_teams": False}}) == []
+
+
 class TestClaudeModels:
     """config.claude_models — the composer's selectable Claude model list."""
 
