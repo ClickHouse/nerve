@@ -926,6 +926,7 @@ function SessionTree({
         isRunning={session.id === activeSession ? activeIsRunning : !!session.is_running}
         depth={depth}
         hasChildren={hasChildren}
+        childCount={kids ? kids.length : 0}
         expanded={expanded}
         onToggleExpand={onToggleExpand}
         onDelete={onDelete}
@@ -962,7 +963,7 @@ function SessionTree({
 
 
 function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate,
-  depth = 0, hasChildren = false, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd }: {
+  depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
@@ -980,6 +981,8 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       chevron in place of its icon that toggles its children. */
   depth?: number;
   hasChildren?: boolean;
+  /** Direct-child count, shown as a badge when the parent is collapsed. */
+  childCount?: number;
   expanded?: boolean;
   onToggleExpand?: (id: string) => void;
   onRemoveParent?: (id: string) => void;
@@ -1089,6 +1092,16 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       <div className="flex-1 min-w-0">
         <div className="truncate text-[13px]">{cleanTitle(session)}</div>
       </div>
+
+      {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
+      {hasChildren && !expanded && childCount > 0 && (
+        <span
+          className="shrink-0 text-[10px] text-text-faint/60 tabular-nums"
+          title={`${childCount} nested session${childCount !== 1 ? 's' : ''}`}
+        >
+          {childCount}
+        </span>
+      )}
 
       {/* Unsent draft marker */}
       {hasDraft && !isActive && (
