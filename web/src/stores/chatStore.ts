@@ -243,6 +243,8 @@ interface ChatState {
   starArchivedSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
+  /** Re-parent a session (drag onto another) or clear it (null → top-level). */
+  setSessionParent: (childId: string, parentId: string | null) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
   clearSearch: () => void;
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
@@ -839,6 +841,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }));
     } catch (e) {
       console.error('Failed to toggle star:', e);
+    }
+  },
+
+  setSessionParent: async (childId: string, parentId: string | null) => {
+    const child = get().sessions.find(s => s.id === childId);
+    if (!child || childId === parentId) return;
+    const prev = child.parent_session_id;
+    // Optimistic: move the child immediately so the drop feels instant; revert
+    // if the server rejects it (e.g. a cycle) so the tree stays truthful.
+    set(s => ({
+      sessions: s.sessions.map(sess =>
+        sess.id === childId ? { ...sess, parent_session_id: parentId ?? undefined } : sess
+      ),
+    }));
+    try {
+      await api.updateSession(childId, { parent_session_id: parentId });
+    } catch (e) {
+      console.error('Failed to set session parent:', e);
+      set(s => ({
+        sessions: s.sessions.map(sess =>
+          sess.id === childId ? { ...sess, parent_session_id: prev } : sess
+        ),
+      }));
     }
   },
 
