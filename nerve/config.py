@@ -1856,6 +1856,10 @@ class SessionsConfig:
     sticky_period_minutes: int = 120  # Reuse session if active within this window
     client_idle_timeout_minutes: int = 60  # Auto-disconnect clients idle longer than this (0 = disabled)
     star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
+    # Rows per sidebar request: caps the conversation feed and sizes one lazy
+    # Archived/System page. 0 = unlimited (a group loads in a single request).
+    # Starred sessions are exempt and always returned in full.
+    sidebar_page_size: int = 50
 
     @classmethod
     @_coerced
@@ -1869,6 +1873,7 @@ class SessionsConfig:
             sticky_period_minutes=d.get("sticky_period_minutes", 120),
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
             star_project_hook=d.get("star_project_hook", False),
+            sidebar_page_size=max(0, _lenient_int(d.get("sidebar_page_size"), 50)),
         )
 
 
