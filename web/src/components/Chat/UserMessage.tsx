@@ -1,6 +1,7 @@
 import type { ChatMessage, ImageBlockData, FileBlockData } from '../../types/chat';
 import { Download, FileText } from 'lucide-react';
 import { getToken } from '../../api/client';
+import { formatMessageTime } from '../../utils/messageTime';
 
 function authUrl(url: string): string {
   const token = getToken();
@@ -63,6 +64,14 @@ export function UserMessage({ message }: { message: ChatMessage }) {
             )}
           </div>
         </div>
+        {message.created_at && (
+          <div
+            className="mt-1 text-right text-[10px] text-text-faint/60 tabular-nums"
+            title={new Date(message.created_at).toLocaleString()}
+          >
+            {formatMessageTime(message.created_at)}
+          </div>
+        )}
       </div>
     </div>
   );
