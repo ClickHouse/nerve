@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { api, setToken, clearToken, getToken, setUnauthorizedHandler } from '../api/client';
 import { clearAllDrafts } from './helpers/draftStorage';
+import { clearAllReads } from './helpers/readStorage';
 
 interface AuthState {
   authenticated: boolean;
@@ -57,6 +58,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     // browser. Only on a *deliberate* logout — an expired session must never
     // take your unsent work with it.
     clearAllDrafts();
+    clearAllReads();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
     set({ authenticated: false, sessionExpired: false });
   },

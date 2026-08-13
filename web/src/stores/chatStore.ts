@@ -10,6 +10,7 @@ import { randomUUID } from '../utils/uuid';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
+import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
@@ -107,6 +108,10 @@ interface ChatState {
   virtualSession: Session | null;
   // Per-session unsent input text, keyed by session id (incl. the virtual one).
   drafts: Record<string, string>;
+  // Per-session "last seen" moment (ms) + a one-time baseline. A session is
+  // "unread" when its updated_at is newer than max(reads[id], readsBaseline).
+  reads: Record<string, number>;
+  readsBaseline: number;
   messages: ChatMessage[];
   // Streaming state — blocks built incrementally
   streamingBlocks: MessageBlock[];
@@ -227,6 +232,7 @@ interface ChatState {
   ensureRealSession: (running?: boolean) => Promise<string>;
   discardVirtualSession: () => void;
   setDraft: (sessionId: string, text: string) => void;
+  markSeen: (sessionId: string) => void;
   deleteSession: (id: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
   unarchiveSession: (id: string) => Promise<void>;
@@ -329,6 +335,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   virtualSession: restoreVirtualSession(),
   // Rehydrated from localStorage so unsent composer text survives a reload.
   drafts: loadDrafts(),
+  // Read/unread tracking (client-only): per-session last-seen stamps + the
+  // first-run baseline that keeps pre-existing sessions from all showing unread.
+  reads: loadReads(),
+  readsBaseline: loadBaseline(),
   messages: [],
   streamingBlocks: [],
   isStreaming: false,
@@ -580,6 +590,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   switchSession: async (id: string) => {
+    // Opening a session marks whatever you're leaving as read — you've now seen
+    // its latest content (the incoming session is marked on the real path below).
+    const leaving = get().activeSession;
+    if (leaving && leaving !== id) get().markSeen(leaving);
     // Leaving an untouched (empty-draft) virtual chat discards it, so the
     // sidebar never accumulates empty "New chat" entries. A filled
     // review-loop form counts as touched — don't silently drop it.
@@ -614,6 +628,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ loading: false });
       return;
     }
+    // Real session opened → mark it read (R1: auto-clear its unread marker).
+    get().markSeen(id);
     ws.switchSession(id);
     // Note: opening a chat deliberately does NOT touch updated_at (locally or
     // server-side) — updated_at means "last message activity", so browsing
@@ -779,10 +795,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { drafts: { ...s.drafts, [sessionId]: text } };
     }),
 
+  markSeen: (sessionId: string) => {
+    if (!sessionId) return;
+    const now = Date.now();
+    persistRead(sessionId, now);
+    set((s) => ({ reads: { ...s.reads, [sessionId]: now } }));
+  },
+
   deleteSession: async (id: string) => {
     try {
       await api.deleteSession(id);
       removeDraft(id);
+      removeRead(id);
       set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
       await get().loadSessions();
       if (get().activeSession === id) {
