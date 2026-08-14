@@ -66,10 +66,11 @@ A persistent cron job (`inbox-processor`) runs every 15 minutes:
 
 ### Gmail
 - **Adapter:** `nerve/sources/gmail.py` — uses `gog gmail messages search` + `gog gmail get` CLI
-- **Cursor:** Epoch timestamp from Gmail's `internalDate` (the receive timestamp Gmail uses for `after:` filtering)
+- **Cursor:** JSON containing the newest successfully fetched `internalDate` epoch timestamp plus per-message retry state; legacy epoch-only cursors are accepted
 - **First run:** Fetches emails from the last 24 hours (`newer_than:1d`)
-- **Subsequent runs:** Uses `after:<epoch+1>` with client-side dedup (Gmail's `after:` has ~2s tolerance window)
+- **Subsequent runs:** Uses `after:<epoch+1>` with client-side dedup (Gmail's `after:` has ~2s tolerance window), and retries pending message IDs directly even after they fall out of the bounded search window
 - **Two-step fetch:** Search returns metadata only; body + `internalDate` are fetched per-message via `gog gmail get` (up to 5 concurrent)
+- **Body failures:** Failed fetches are omitted from the inbox and stored with their search metadata, status, and attempt count so one deterministic failure cannot block or lose newer messages
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 
 ### IMAP

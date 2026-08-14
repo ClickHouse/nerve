@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,7 +23,7 @@ def _message(message_id: str, epoch: int) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_failed_body_fetch_keeps_cursor_until_message_recovers():
+async def test_failed_body_fetch_is_retried_until_message_recovers():
     source = GmailSource("me@example.com", {})
     messages = [_message("failed", 101), _message("healthy", 102)]
     failed_body_recovers = False
@@ -44,16 +45,22 @@ async def test_failed_body_fetch_keeps_cursor_until_message_recovers():
     first = await source.fetch(cursor="100")
 
     assert [record.id for record in first.records] == ["healthy"]
-    assert first.next_cursor == "100"
+    first_cursor = json.loads(first.next_cursor)
+    assert first_cursor["epoch"] == 102
+    assert first_cursor["pending"]["failed"]["status"] == "failed"
+    assert first_cursor["pending"]["failed"]["attempts"] == 1
     assert "body for healthy" in first.records[0].content
 
     failed_body_recovers = True
     second = await source.fetch(cursor=first.next_cursor)
 
-    assert [record.id for record in second.records] == ["failed", "healthy"]
+    assert [record.id for record in second.records] == ["failed"]
     assert "body for failed" in second.records[0].content
-    assert second.next_cursor == "102"
-    assert queries == ["after:101 -in:spam -in:trash"] * 2
+    assert json.loads(second.next_cursor) == {"epoch": 102, "pending": {}}
+    assert queries == [
+        "after:101 -in:spam -in:trash",
+        "after:103 -in:spam -in:trash",
+    ]
 
 
 @pytest.mark.asyncio
@@ -72,17 +79,29 @@ async def test_body_fetch_exception_does_not_create_header_only_record():
     result = await source.fetch(cursor=None)
 
     assert result.records == []
-    assert result.next_cursor is None
+    state = json.loads(result.next_cursor)
+    assert state["epoch"] is None
+    assert state["pending"]["failed"]["status"] == "failed"
+    assert state["pending"]["failed"]["attempts"] == 1
+
+    retry = await source.fetch(cursor=result.next_cursor)
+    retry_state = json.loads(retry.next_cursor)
+    assert retry_state["pending"]["failed"]["attempts"] == 2
 
 
 @pytest.mark.asyncio
-async def test_partial_first_sync_waits_to_establish_cursor_until_recovery():
+async def test_partial_first_sync_persists_failed_message_for_recovery():
     source = GmailSource("me@example.com", {})
     messages = [_message("failed", 101), _message("healthy", 102)]
     failed_body_recovers = False
+    queries: list[str] = []
 
     async def search(query, limit, env):
-        assert query == "newer_than:1d -in:spam -in:trash"
+        queries.append(query)
+        assert query in {
+            "newer_than:1d -in:spam -in:trash",
+            "after:103 -in:spam -in:trash",
+        }
         return messages
 
     async def fetch_body(message_id, env, sem):
@@ -97,13 +116,55 @@ async def test_partial_first_sync_waits_to_establish_cursor_until_recovery():
     first = await source.fetch(cursor=None)
 
     assert [record.id for record in first.records] == ["healthy"]
-    assert first.next_cursor is None
+    first_cursor = json.loads(first.next_cursor)
+    assert first_cursor["epoch"] == 102
+    assert "failed" in first_cursor["pending"]
 
     failed_body_recovers = True
     second = await source.fetch(cursor=first.next_cursor)
 
-    assert [record.id for record in second.records] == ["failed", "healthy"]
-    assert second.next_cursor == "102"
+    assert [record.id for record in second.records] == ["failed"]
+    assert json.loads(second.next_cursor) == {"epoch": 102, "pending": {}}
+    assert queries == [
+        "newer_than:1d -in:spam -in:trash",
+        "after:103 -in:spam -in:trash",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_body_fetch_is_retried_after_message_leaves_search_window():
+    source = GmailSource("me@example.com", {})
+    failed = _message("failed", 101)
+    search_results = [[failed], []]
+    failed_body_recovers = False
+    queries: list[str] = []
+
+    async def search(query, limit, env):
+        queries.append(query)
+        return search_results.pop(0)
+
+    async def fetch_body(message_id, env, sem):
+        if not failed_body_recovers:
+            return None
+        return "recovered body", None, 101
+
+    source._search_messages = search
+    source._fetch_message_body = fetch_body
+
+    first = await source.fetch(cursor="100")
+    assert first.records == []
+    assert json.loads(first.next_cursor)["pending"]["failed"]["attempts"] == 1
+
+    failed_body_recovers = True
+    second = await source.fetch(cursor=first.next_cursor)
+
+    assert [record.id for record in second.records] == ["failed"]
+    assert "recovered body" in second.records[0].content
+    assert json.loads(second.next_cursor) == {"epoch": 101, "pending": {}}
+    assert queries == [
+        "after:101 -in:spam -in:trash",
+        "after:101 -in:spam -in:trash",
+    ]
 
 
 @pytest.mark.asyncio
