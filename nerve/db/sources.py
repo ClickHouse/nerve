@@ -407,6 +407,16 @@ class SourceStore:
         Unlike list_consumer_cursors, which hides expired cursors, this keeps
         a run gate from wedging shut when an inbox goes quiet long enough for
         its cursors to expire and then receives new mail.
+
+        Bootstrap fail-open: with *zero* cursor rows, "tracks nothing" would
+        make this permanently False — yet the job a gate blocks on it is the
+        very job whose poll creates the first cursor row, so the gate could
+        never open. A consumer reaches that state two ways: a fresh install,
+        and cleanup_expired_consumer_cursors physically deleting every row
+        after a quiet stretch longer than the cursor TTL. In both cases report
+        unread whenever any messages exist at all, letting the job run once;
+        its poll then seeds cursors at MAX(rowid) (backlog still skipped —
+        delivery semantics unchanged) and the check reverts to cursor-based.
         """
         async with self.db.execute(
             """SELECT 1 FROM consumer_cursors cc
@@ -415,6 +425,17 @@ class SourceStore:
                       WHERE sm.source = cc.source) > cc.cursor_seq
                LIMIT 1""",
             (consumer,),
+        ) as cursor:
+            if await cursor.fetchone() is not None:
+                return True
+        async with self.db.execute(
+            "SELECT 1 FROM consumer_cursors WHERE consumer = ? LIMIT 1",
+            (consumer,),
+        ) as cursor:
+            if await cursor.fetchone() is not None:
+                return False
+        async with self.db.execute(
+            "SELECT 1 FROM source_messages LIMIT 1"
         ) as cursor:
             return await cursor.fetchone() is not None
 

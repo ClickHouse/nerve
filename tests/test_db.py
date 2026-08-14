@@ -1345,9 +1345,48 @@ class TestConsumerCursors:
         assert await db.consumer_has_unread("inbox") is False
 
     async def test_consumer_has_unread_ignores_untracked_source(self, db: Database):
-        """Messages exist but the consumer has no cursor for the source → not unread."""
-        await self._insert_messages(db, "github", 2)
+        """An established consumer ignores sources it has no cursor row for.
+
+        "New consumers see only future messages": once the consumer tracks at
+        least one source, a backlog in some *other* source it never polled must
+        not count as unread.
+        """
+        gh_rowids = await self._insert_messages(db, "github", 2)
+        await self._insert_messages(db, "gmail", 2)
+        # Tracks github and is caught up; gmail is untracked.
+        await db.set_consumer_cursor("inbox", "github", gh_rowids[-1])
         assert await db.consumer_has_unread("inbox") is False
+
+    async def test_consumer_has_unread_bootstrap_fresh_install(self, db: Database):
+        """Zero cursor rows + a backlog → unread (fail-open bootstrap).
+
+        On a fresh install the consumer has no cursor rows at all, so the
+        tracked-sources check can never fire — and the job that would create
+        the first cursor row is the very job the gate is blocking. With any
+        messages present, report unread so the job runs once and seeds its
+        cursors (at MAX(rowid), so the backlog itself is still skipped).
+        """
+        await self._insert_messages(db, "telegram", 3)
+        assert await db.consumer_has_unread("inbox") is True
+
+    async def test_consumer_has_unread_false_on_empty_db(self, db: Database):
+        """Zero cursor rows and zero messages → nothing to do, gate stays shut."""
+        assert await db.consumer_has_unread("inbox") is False
+
+    async def test_consumer_has_unread_survives_cursor_cleanup(self, db: Database):
+        """Cursor rows deleted by cleanup must not wedge the check shut again.
+
+        cleanup_expired_consumer_cursors physically DELETEs expired rows, so
+        after a quiet stretch longer than the cursor TTL the consumer is back
+        to zero rows — the same state as a fresh install. New messages arriving
+        after that must still count as unread.
+        """
+        rowids = await self._insert_messages(db, "telegram", 2)
+        await db.set_consumer_cursor("inbox", "telegram", rowids[-1], ttl_days=-1)
+        assert await db.cleanup_expired_consumer_cursors() == 1
+
+        await self._insert_messages(db, "telegram", 2)
+        assert await db.consumer_has_unread("inbox") is True
 
     async def test_consumer_has_unread_counts_expired_cursor(self, db: Database):
         """A quiet inbox whose cursor expired must still report a backlog.
