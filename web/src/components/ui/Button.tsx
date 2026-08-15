@@ -34,6 +34,7 @@ export type ButtonVariant =
   | 'warning'
   | 'info'
   | 'accent'
+  | 'accentSoft'
   | 'link'
   | 'pill'
   | 'tab';
@@ -89,6 +90,18 @@ const VARIANTS: Record<ButtonVariant, string> = {
     'text-warning bg-warning-bg border border-warning-border hover:border-warning rounded-md font-medium',
   /** Same shape as `success`, for an informational action. 7.2:1 dark, 6.2:1 light. */
   info: 'text-info bg-info-bg border border-info-border hover:border-info rounded-md font-medium',
+  /**
+   * The accent member of the tinted family, for a committing action that must
+   * not shout — a list of answer options where every one is equally valid, or a
+   * button standing beside `success`/`danger` siblings that has to read as the
+   * same kind of control. `primary` would be too loud on all of them, and
+   * `accent` has no fill so it reads as a link.
+   *
+   * Like the other tinted variants it is never paired with `active`, so it sets
+   * its colour directly rather than going through INACTIVE.
+   */
+  accentSoft:
+    'text-accent bg-accent/15 border border-accent/30 hover:bg-accent/25 rounded-md font-medium',
   /**
    * An accent-coloured text button that is *not* a selection — "Clear filter",
    * "View processing session". Distinct from `link` (which drops the padding to

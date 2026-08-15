@@ -60,6 +60,7 @@ const ALL_BUTTON_VARIANTS: Record<ButtonVariant, true> = {
   dangerGhost: true,
   dangerSolid: true,
   success: true,
+  accentSoft: true,
   warning: true,
   info: true,
   accent: true,

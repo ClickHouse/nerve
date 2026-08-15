@@ -3,7 +3,7 @@ import {
   type InputHTMLAttributes,
   type TextareaHTMLAttributes,
 } from 'react';
-import { FIELD_BASE, FIELD_SIZES, cx, type FieldSize } from './styles';
+import { FIELD_BARE, FIELD_BASE, FIELD_SIZES, cx, type FieldSize } from './styles';
 
 /**
  * Text inputs.
@@ -21,8 +21,25 @@ import { FIELD_BASE, FIELD_SIZES, cx, type FieldSize } from './styles';
  * `w-full` would win the cascade against them.
  */
 
+/**
+ * Drop the field chrome — background, border, radius and padding — keeping only
+ * the focus and placeholder behaviour.
+ *
+ * This exists because the chrome cannot be removed from a call site. Tailwind
+ * emits same-property utilities in alphabetical order, so a `bg-bg-sunken` or
+ * `p-5` written by the caller loses to the primitive's `bg-surface-raised` and
+ * `px-3` at equal specificity. Without an opt-out, every full-bleed editing
+ * surface in the app — the markdown editor pane, the chat composer — has to
+ * stay a native element and misses the shared focus and disabled handling.
+ */
+export interface FieldChromeProps {
+  /** Render as a bare editing surface rather than a bordered form field. */
+  bare?: boolean;
+}
+
 export interface TextFieldProps
-  extends Omit<InputHTMLAttributes<HTMLInputElement>, 'size'> {
+  extends Omit<InputHTMLAttributes<HTMLInputElement>, 'size'>,
+    FieldChromeProps {
   fieldSize?: FieldSize;
   /** Stretch to the container. */
   fullWidth?: boolean;
@@ -30,7 +47,14 @@ export interface TextFieldProps
 
 export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(
   function TextField(
-    { fieldSize = 'md', fullWidth = true, className, type = 'text', ...rest },
+    {
+      fieldSize = 'md',
+      fullWidth = true,
+      bare = false,
+      className,
+      type = 'text',
+      ...rest
+    },
     ref,
   ) {
     return (
@@ -38,8 +62,8 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(
         ref={ref}
         type={type}
         className={cx(
-          FIELD_BASE,
-          FIELD_SIZES[fieldSize],
+          bare ? FIELD_BARE : FIELD_BASE,
+          !bare && FIELD_SIZES[fieldSize],
           fullWidth && 'w-full',
           className,
         )}
@@ -50,7 +74,8 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(
 );
 
 export interface TextAreaProps
-  extends TextareaHTMLAttributes<HTMLTextAreaElement> {
+  extends TextareaHTMLAttributes<HTMLTextAreaElement>,
+    FieldChromeProps {
   fieldSize?: FieldSize;
   fullWidth?: boolean;
   /**
@@ -67,6 +92,7 @@ export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(
       fieldSize = 'md',
       fullWidth = true,
       resizable = false,
+      bare = false,
       className,
       rows = 3,
       ...rest
@@ -78,8 +104,8 @@ export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(
         ref={ref}
         rows={rows}
         className={cx(
-          FIELD_BASE,
-          FIELD_SIZES[fieldSize],
+          bare ? FIELD_BARE : FIELD_BASE,
+          !bare && FIELD_SIZES[fieldSize],
           fullWidth && 'w-full',
           resizable ? 'resize-y' : 'resize-none',
           className,

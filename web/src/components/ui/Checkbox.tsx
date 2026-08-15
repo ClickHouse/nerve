@@ -14,15 +14,54 @@ import { cx } from './styles';
  * the hit area — the app's one hand-rolled checkbox put its label in a sibling
  * span, which made a 13px box the only place you could click.
  */
+/**
+ * The label's typography, as props rather than as classes on `labelClassName`.
+ *
+ * `labelClassName` cannot set either of these: Tailwind emits same-property
+ * utilities in alphabetical order, so a caller's `text-text-dim` loses to the
+ * wrapper's own `text-text-secondary`, and `text-xs` loses to `text-sm`. Naming
+ * the two properties the label actually varies keeps the choice type-checked
+ * and puts exactly one class per property on the element.
+ */
+export type CheckboxLabelSize = 'xs' | 'sm';
+export type CheckboxLabelTone = 'secondary' | 'muted' | 'dim';
+
+const LABEL_SIZES: Record<CheckboxLabelSize, string> = {
+  xs: 'text-xs',
+  sm: 'text-sm',
+};
+
+const LABEL_TONES: Record<CheckboxLabelTone, string> = {
+  secondary: 'text-text-secondary',
+  muted: 'text-text-muted',
+  dim: 'text-text-dim',
+};
+
 export interface CheckboxProps
   extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type' | 'size'> {
   label?: ReactNode;
-  /** Classes for the `<label>` wrapper; `className` goes to the input. */
+  /**
+   * Classes for the `<label>` wrapper; `className` goes to the input.
+   * Use `labelSize`/`labelTone` for typography — see the note above.
+   */
   labelClassName?: string;
+  labelSize?: CheckboxLabelSize;
+  labelTone?: CheckboxLabelTone;
 }
 
 export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
-  function Checkbox({ label, className, labelClassName, disabled, ...rest }, ref) {
+  function Checkbox(
+    {
+      label,
+      className,
+      labelClassName,
+      labelSize = 'sm',
+      labelTone = 'secondary',
+      disabled,
+      ...rest
+    },
+    ref,
+  ) {
     const input = (
       <input
         ref={ref}
@@ -44,7 +83,9 @@ export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
     return (
       <label
         className={cx(
-          'inline-flex items-center gap-2 text-sm text-text-secondary',
+          'inline-flex items-center gap-2',
+          LABEL_SIZES[labelSize],
+          LABEL_TONES[labelTone],
           disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
           labelClassName,
         )}

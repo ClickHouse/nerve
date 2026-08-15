@@ -83,8 +83,21 @@
        bg-emerald-400/10 border border-emerald-400/25 text-emerald-400
      → bg-success-bg     border border-success-border  text-success
 
-       bg-red-500  (solid chip/dot)   → bg-error
-       bg-blue-400 (solid chip/dot)   → bg-info
+   ⚠ A SOLID FILL IS NOT `bg-<status>`. An earlier version of this note said it
+   was, and that is wrong — it is the single most repeated mistake in this
+   migration. The bare status token is Click UI's feedback *foreground*, a
+   colour meant to sit as TEXT on the matching `-bg` tint, so in dark mode it is
+   pale: error #ffbaba, success #ccffd0, warning #ffb88f. `bg-error text-white`
+   measures 1.62:1. Use the `-solid` tokens, which are theme-independent and
+   hold white text in both themes:
+
+       bg-red-500  (solid chip/dot/badge) → bg-error-solid   text-white
+       bg-blue-400 (solid chip/dot/badge) → bg-info-solid    text-white
+       bg-emerald-500                     → bg-success-solid text-white
+       bg-amber-500                       → bg-warning-solid text-white
+
+   A small coloured dot with no text on it can use `bg-error` etc. quite
+   happily — the rule only bites when something has to be legible on top.
 
    `-bg` is an opaque tint from `--global-color-feedback-*-background`; do not
    stack an alpha modifier on it. `-border` is the foreground at 30% alpha, so
@@ -161,6 +174,9 @@
   --color-error-bg: var(--theme-error-bg);
   --color-error-border: var(--theme-error-border);
   --color-error-solid: var(--theme-error-solid);
+  --color-success-solid: var(--theme-success-solid);
+  --color-warning-solid: var(--theme-warning-solid);
+  --color-info-solid: var(--theme-info-solid);
   --color-warning: var(--theme-warning);
   --color-warning-bg: var(--theme-warning-bg);
   --color-warning-border: var(--theme-warning-border);
@@ -275,13 +291,22 @@
   --theme-error: var(--global-color-feedback-danger-foreground);
   --theme-error-bg: var(--global-color-feedback-danger-background);
   --theme-error-border: color-mix(in oklab, var(--global-color-feedback-danger-foreground) 30%, transparent);
-  /* A destructive *fill* that carries white text, for the confirm step of a
-     delete. Deliberately a raw palette ramp entry rather than a semantic token:
-     the ramp is theme-independent (#c10000 in both), whereas every semantic red
-     we have flips with the theme and so cannot hold white in both. `hue-red` is
-     #ff7575 in dark — white on it is 2.61:1 — and `error` is the feedback
-     *foreground*, a pale #ffbaba. This is 6.43:1 in both themes. */
-  --theme-error-solid: var(--palette-danger-600);
+  /* ── Solid status fills, for a saturated block of colour carrying white text:
+     a notification count badge, a delete-confirm button.
+
+     These exist because `bg-error` and friends are WRONG for a fill and it is
+     not obvious. The bare status token is Click UI's feedback *foreground* — a
+     colour meant to sit as text on the matching `-bg` tint — so in dark mode it
+     is pale: `error` #ffbaba, `success` #ccffd0, `warning` #ffb88f. White on
+     `bg-error` measures 1.62:1. `hue-*` is no better: it is an identity colour
+     for text on the page, so it flips per theme (#ff7575 in dark, 2.61:1).
+
+     Raw ramp entries, deliberately: the ramp is theme-independent, which is the
+     only way one fill can hold white text in both themes. 6.4–7.7:1 each. */
+  --theme-error-solid: var(--palette-danger-600);    /* #c10000  6.43:1 */
+  --theme-success-solid: var(--palette-success-800); /* #006108  7.74:1 */
+  --theme-warning-solid: var(--palette-warning-700); /* #a33c00  6.56:1 */
+  --theme-info-solid: var(--palette-info-600);       /* #104ec6  7.17:1 */
   --theme-warning: var(--global-color-feedback-warning-foreground);
   --theme-warning-bg: var(--global-color-feedback-warning-background);
   --theme-warning-border: color-mix(in oklab, var(--global-color-feedback-warning-foreground) 30%, transparent);
