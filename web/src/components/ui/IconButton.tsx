@@ -31,16 +31,61 @@ const SIZES: Record<IconButtonSize, string> = {
   md: 'w-10 h-10 rounded-xl',
 };
 
-export type IconButtonVariant = 'ghost' | 'subtle' | 'primary' | 'danger';
+export type IconButtonVariant =
+  | 'ghost'
+  | 'subtle'
+  | 'primary'
+  | 'danger'
+  | 'dangerGhost';
 
-const VARIANTS: Record<IconButtonVariant, string> = {
+/**
+ * The colour a variant carries **when it is not active**.
+ *
+ * Split out of VARIANTS because Tailwind v4 emits same-property utilities in
+ * alphabetical order of class name, so between two colour classes on one
+ * element the later-*sorting* name wins rather than the one written last.
+ * `.text-accent` sorts before every other colour token in this app (offset
+ * 49085 in the built stylesheet, against `.text-hue-red` 51903, `.text-on-accent`
+ * 52978, `.text-text-dim` 53924, `.text-text-faint` 53967, `.text-text-muted`
+ * 54167), so appending the accent `active` treatment after a coloured base lost
+ * every time — `active` did nothing on any of these four. Emitting exactly one
+ * of REST/ACTIVE makes the result independent of that order.
+ */
+const REST: Record<IconButtonVariant, string> = {
   /** Quiet until pointed at — the default, and what most of these are. */
   ghost: 'text-text-faint hover:text-text-muted hover:bg-surface-raised',
   /** Carries a surface at rest, for controls sitting on the page background. */
-  subtle:
-    'text-text-muted bg-surface-raised hover:bg-surface-hover border border-border',
-  primary: 'text-white bg-accent hover:bg-accent-hover',
+  subtle: 'text-text-muted bg-surface-raised hover:bg-surface-hover',
+  /**
+   * `text-on-accent`, never `text-white`: the accent is ClickHouse yellow in
+   * dark mode, where white is unreadable on it. A call site cannot correct this
+   * itself — Tailwind emits same-property colour utilities alphabetically, so
+   * `.text-white` lands after `.text-on-accent` and wins at equal specificity.
+   */
+  primary: 'text-on-accent bg-accent hover:bg-accent-hover',
+  /** Destructive and already red at rest, for a control that sits alone. */
   danger: 'text-hue-red hover:bg-hue-red/15',
+  /**
+   * Destructive but quiet until pointed at. This is the row-level
+   * delete/remove/purge treatment — inside a list, `danger` reads as an alarm
+   * on every row.
+   */
+  dangerGhost: 'text-text-dim hover:text-hue-red hover:bg-hue-red/10',
+};
+
+/** The selected treatment. Mutually exclusive with REST — see the note above. */
+const ACTIVE: Record<IconButtonVariant, string> = {
+  ghost: 'text-accent bg-accent/15',
+  subtle: 'text-accent bg-accent/15',
+  // Already the loudest thing on screen; staying lit is the whole point.
+  primary: 'text-on-accent bg-accent-hover',
+  danger: 'text-hue-red bg-hue-red/15',
+  dangerGhost: 'text-hue-red bg-hue-red/10',
+};
+
+/** Non-colour classes a variant always carries. */
+const SHAPE: Partial<Record<IconButtonVariant, string>> = {
+  subtle: 'border border-border',
 };
 
 export interface IconButtonProps
@@ -79,8 +124,8 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
           'inline-flex items-center justify-center shrink-0 cursor-pointer',
           'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
           SIZES[size],
-          VARIANTS[variant],
-          active && 'bg-accent/15 text-accent',
+          SHAPE[variant],
+          active ? ACTIVE[variant] : REST[variant],
           className,
         )}
         {...rest}
