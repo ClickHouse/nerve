@@ -1,5 +1,5 @@
 import type { ComponentProps, ComponentType, ReactNode, SVGProps } from 'react';
-import { Icon as ClickIcon, type IconName } from '@clickhouse/click-ui';
+import { Icon as ClickIcon, type IconName } from '@clickhouse/click-ui/Icon';
 
 /**
  * The app's icon set, on Click UI's glyphs behind lucide's call signature.

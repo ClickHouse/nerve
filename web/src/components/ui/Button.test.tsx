@@ -112,6 +112,30 @@ const ALL_ICON_VARIANTS: Record<IconButtonVariant, true> = {
 const BUTTON_VARIANTS = Object.keys(ALL_BUTTON_VARIANTS) as ButtonVariant[];
 const ICON_VARIANTS = Object.keys(ALL_ICON_VARIANTS) as IconButtonVariant[];
 
+/**
+ * Hover feedback that only exists as a surface change disappears when the
+ * parent already carries that surface. This is invisible to every other check:
+ * the classes are all present and well-formed, nothing collides, and the
+ * failure is purely that the user sees nothing happen.
+ *
+ * It is also the regression a reasonable person would introduce on purpose.
+ * `subtle` currently hovers *both* the text and the surface, and the surface
+ * half looks like the redundant one — so "we already hover the background,
+ * drop the text move" is the obvious cleanup. It is backwards: on a raised
+ * parent the surface step is the invisible half, roughly 2/255 in dark and
+ * 4/255 in light (see the comment on INACTIVE.subtle for the arithmetic).
+ *
+ * The comment there explains it, but a comment cannot fail a build. This can.
+ */
+describe('Button hover feedback survives its container', () => {
+  it('subtle keeps a text hover: its surface hover is invisible on a raised parent', () => {
+    // TasksPage's Board/List switch is the live example — `bg-surface-raised`
+    // on the container, `subtle` segments sitting directly on it.
+    render(<Button variant="subtle">List</Button>);
+    expect(screen.getByRole('button')).toHaveClass('hover:text-text');
+  });
+});
+
 describe('Button colour classes are unambiguous', () => {
   for (const variant of BUTTON_VARIANTS) {
     for (const active of [false, true]) {

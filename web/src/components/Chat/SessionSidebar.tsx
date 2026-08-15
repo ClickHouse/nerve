@@ -1,6 +1,7 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, Repeat } from 'lucide-react';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, Repeat } from '../ui/icons';
+import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
@@ -338,32 +339,35 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       <div className="px-2 py-1.5 border-b border-border-subtle">
         <div className="relative h-7">
           {/* Search pill (always visible, hover-zone trigger) */}
-          <button
-            type="button"
+          <Button
+            variant="pill"
+            size="xs"
             onMouseEnter={() => setSearchHovered(true)}
             onMouseLeave={() => setSearchHovered(false)}
-            className="absolute left-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 rounded-full border border-border-subtle flex items-center gap-1 text-[11px] text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer z-10"
+            className="absolute left-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 z-10 border-border-subtle hover:bg-surface-hover"
           >
             <Search size={11} className="pointer-events-none" />
             <span>Search sessions</span>
-          </button>
+          </Button>
 
           {/* New chat pill (hidden under input when open) */}
-          <button
+          <Button
+            variant="pill"
+            size="xs"
             onClick={() => { onCreate(); handleSelect?.(); }}
             title="New chat"
-            className="absolute right-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 rounded-full border border-border-subtle flex items-center gap-1 text-[11px] text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
+            className="absolute right-0 top-1/2 -translate-y-1/2 h-6 pl-1.5 pr-2.5 border-border-subtle hover:bg-surface-hover"
           >
             <Plus size={11} />
             <span>New chat</span>
-          </button>
+          </Button>
 
           {searchMounted && (
             <>
-              <input
+              <TextField
                 id="nerve-sidebar-search"
+                fieldSize="sm"
                 ref={inputRef}
-                type="text"
                 value={localQuery}
                 onChange={e => handleSearchChange(e.target.value)}
                 onFocus={() => setSearchFocused(true)}
@@ -371,19 +375,21 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                 onMouseEnter={() => setSearchHovered(true)}
                 onMouseLeave={() => setSearchHovered(false)}
                 placeholder="Search sessions..."
-                className={`absolute inset-0 w-full h-full bg-surface-raised border border-border rounded-md text-[12px] text-text-secondary placeholder-text-faint pl-7 pr-7 outline-none focus:border-text-faint transition-all duration-200 ease-out z-20 ${
+                className={`absolute inset-0 h-full pl-7 pr-7 z-20 transition-all duration-200 ease-out ${
                   searchVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
                 }`}
               />
               {isSearching && (
-                <button
+                <IconButton
+                  label="Clear the search"
+                  size="xs"
                   onClick={() => { setLocalQuery(''); clearSearch(); }}
-                  className={`absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-text-faint hover:text-text-muted cursor-pointer transition-opacity duration-200 z-30 ${
+                  className={`absolute right-1.5 top-1/2 -translate-y-1/2 z-30 transition-opacity duration-200 ${
                     searchVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
                   }`}
                 >
                   <X size={12} />
-                </button>
+                </IconButton>
               )}
             </>
           )}
@@ -395,19 +401,19 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
         {isSearching ? (
           <div>
             {searchLoading && !searchResults && (
-              <div className="flex items-center gap-2 px-3 py-3 text-[11px] text-text-faint">
+              <div className="flex items-center gap-2 px-3 py-3 text-xs text-text-faint">
                 <Loader2 size={11} className="animate-spin" />
                 Searching...
               </div>
             )}
             {searchResults && (
               <>
-                <div className="px-3 py-1.5 text-[10px] text-text-faint">
+                <div className="px-3 py-1.5 text-2xs text-text-faint">
                   {searchResults.length} result{searchResults.length !== 1 ? 's' : ''}
                   {searchLoading && <Loader2 size={9} className="inline ml-1.5 animate-spin" />}
                 </div>
                 {searchResults.length === 0 ? (
-                  <div className="px-3 py-2 text-[11px] text-text-faint">No matching sessions</div>
+                  <div className="px-3 py-2 text-xs text-text-faint">No matching sessions</div>
                 ) : (
                   searchResults.map((s) => (
                     <SessionItem
@@ -443,18 +449,19 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               >
                 <MessageSquare size={13} className="shrink-0 opacity-50" />
                 <div className="flex-1 min-w-0">
-                  <div className="truncate text-[13px] italic">New chat</div>
+                  <div className="truncate text-sm leading-tight italic">New chat</div>
                 </div>
                 {virtualSession.id === activeSession && activeIsRunning && (
                   <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
                 )}
-                <button
+                <IconButton
+                  label="Discard new chat"
+                  size="xs"
                   onClick={(e) => { e.preventDefault(); e.stopPropagation(); discardVirtualSession(); }}
-                  className="p-0.5 text-text-faint hover:text-text-muted opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
-                  title="Discard new chat"
+                  className="opacity-0 group-hover:opacity-100 transition-opacity"
                 >
                   <X size={13} />
-                </button>
+                </IconButton>
               </Link>
             )}
 
@@ -465,7 +472,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   label="Running"
                   count={pinnedRunning.length}
                   collapsed={collapsedGroups.has('Running')}
-                  tone="text-emerald-600/70"
+                  tone="text-success/70"
                   onToggle={() => toggleGroup('Running')}
                 />
                 {!collapsedGroups.has('Running') && pinnedRunning.map((s) => (
@@ -492,7 +499,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   label="Starred"
                   count={pinnedStarred.length}
                   collapsed={collapsedGroups.has('Starred')}
-                  tone="text-yellow-600/70"
+                  tone="text-hue-yellow/70"
                   onToggle={() => toggleGroup('Starred')}
                 />
                 {!collapsedGroups.has('Starred') && pinnedStarred.map((s) => (
@@ -513,7 +520,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
             {/* Normal date-grouped view */}
             {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
-              <div className="px-3 py-2 text-[11px] text-text-faint">No conversations yet</div>
+              <div className="px-3 py-2 text-xs text-text-faint">No conversations yet</div>
             )}
 
             {groupedConversations.map(({ group, items }) => (
@@ -543,35 +550,39 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
             {/* System sessions */}
             {systemSessions.length > 0 && (
               <div className="mt-2 border-t border-border-subtle pt-1">
-                <button
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  fullWidth
                   onClick={() => setSystemExpanded(!systemExpanded)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left cursor-pointer hover:bg-surface-raised transition-colors"
+                  aria-expanded={systemExpanded}
+                  className="justify-start gap-1.5 px-3 py-1.5 rounded-none text-left"
                 >
                   {systemExpanded
                     ? <ChevronDown size={10} className="text-text-faint" />
                     : <ChevronRight size={10} className="text-text-faint" />
                   }
                   <Bot size={10} className="text-text-faint" />
-                  <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">
+                  <span className="text-2xs uppercase tracking-wider text-text-faint font-medium">
                     System ({systemSessions.length})
                   </span>
                   {runningSystemCount > 0 && (
-                    <span className="ml-auto flex items-center gap-1 text-[10px] text-hue-emerald">
+                    <span className="ml-auto flex items-center gap-1 text-2xs text-hue-emerald">
                       <span className="relative flex h-1.5 w-1.5">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                        <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-current opacity-75" />
+                        <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-current" />
                       </span>
                       {runningSystemCount}
                     </span>
                   )}
-                </button>
+                </Button>
 
                 {systemExpanded && systemSessions.map((s) => (
                   <Link
                     key={s.id}
                     to={`/chat/${s.id}`}
                     onClick={handleSelect}
-                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors no-underline
+                    className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-xs leading-tight transition-colors no-underline
                       ${s.id === activeSession
                         ? 'bg-accent/10 text-text-muted'
                         : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
@@ -608,19 +619,23 @@ function GroupHeader({ label, count, collapsed, tone, onToggle }: {
   onToggle: () => void;
 }) {
   return (
-    <button
+    <Button
+      variant="subtle"
+      size="xs"
+      fullWidth
       onClick={onToggle}
-      className="flex items-center gap-1 px-3 pt-2 pb-0.5 w-full text-left cursor-pointer hover:bg-surface-raised/60 transition-colors"
+      aria-expanded={!collapsed}
+      className="justify-start gap-1 px-3 pt-2 pb-0.5 rounded-none text-left"
     >
       {collapsed
         ? <ChevronRight size={10} className="shrink-0 text-text-faint" />
         : <ChevronDown size={10} className="shrink-0 text-text-faint" />
       }
-      <span className={`text-[10px] font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
+      <span className={`text-2xs font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
       {collapsed && count > 0 && (
-        <span className="text-[10px] text-text-faint/60 tabular-nums">{count}</span>
+        <span className="text-2xs text-text-faint/60 tabular-nums">{count}</span>
       )}
-    </button>
+    </Button>
   );
 }
 
@@ -628,11 +643,11 @@ function GroupHeader({ label, count, collapsed, tone, onToggle }: {
 /** Sidebar icon tint for review-loop observer sessions, by loop status. */
 function reviewLoopIconTone(status: string): string {
   switch (status) {
-    case 'passed': return 'text-emerald-500/80';
-    case 'awaiting_user': return 'text-orange-400/90';
+    case 'passed': return 'text-success/80';
+    case 'awaiting_user': return 'text-warning/90';
     case 'failed':
-    case 'killed': return 'text-red-400/70';
-    default: return 'text-emerald-400/80';  // pending / implementing / verifying
+    case 'killed': return 'text-error/70';
+    default: return 'text-success/80';  // pending / implementing / verifying
   }
 }
 
@@ -649,8 +664,8 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (session.awaiting_input) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-blue" />
       </span>
     );
   }
@@ -660,8 +675,8 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (session.review_loop?.status === 'awaiting_user') {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title="Review loop needs your decision">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-orange-500" />
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-orange" />
       </span>
     );
   }
@@ -673,8 +688,8 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (loopLive && !isRunning) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title={`Review loop ${session.review_loop!.status}`}>
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
       </span>
     );
   }
@@ -688,20 +703,20 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (isRunning) {
     return (
       <span className="relative flex h-2 w-2 shrink-0">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
       </span>
     );
   }
 
   // Error state: solid red
   if (session.status === 'error') {
-    return <span className="inline-flex rounded-full h-1.5 w-1.5 shrink-0 bg-red-500" />;
+    return <span className="inline-flex rounded-full h-1.5 w-1.5 shrink-0 bg-hue-red" />;
   }
 
   // Stopped: solid yellow
   if (session.status === 'stopped') {
-    return <span className="inline-flex rounded-full h-1.5 w-1.5 shrink-0 bg-yellow-500" />;
+    return <span className="inline-flex rounded-full h-1.5 w-1.5 shrink-0 bg-hue-yellow" />;
   }
 
   // Idle / created / active-but-not-running: no indicator (reduces noise)
@@ -758,7 +773,9 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-surface-raised">
         <MessageSquare size={13} className="shrink-0 opacity-50" />
-        <input
+        <TextField
+          bare
+          fullWidth={false}
           ref={inputRef}
           value={renameValue}
           onChange={e => setRenameValue(e.target.value)}
@@ -767,7 +784,8 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
             if (e.key === 'Escape') setRenaming(false);
           }}
           onBlur={handleRenameSubmit}
-          className="flex-1 min-w-0 bg-transparent text-[13px] text-text outline-none border-b border-text-faint"
+          aria-label="Rename this session"
+          className="flex-1 min-w-0 text-sm border-b border-text-faint"
         />
       </div>
     );
@@ -790,7 +808,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         : <MessageSquare size={13} className="shrink-0 opacity-50" />
       }
       <div className="flex-1 min-w-0">
-        <div className="truncate text-[13px]">{cleanTitle(session)}</div>
+        <div className="truncate text-sm leading-tight">{cleanTitle(session)}</div>
       </div>
 
       {/* Unsent draft marker */}
@@ -805,7 +823,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
 
       {/* Date label in search results */}
       {showDate && !isRunning && (
-        <span className="shrink-0 text-[10px] text-text-faint tabular-nums">
+        <span className="shrink-0 text-2xs text-text-faint tabular-nums">
           {formatShortDate(session.updated_at)}
         </span>
       )}
@@ -813,7 +831,12 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       {/* Menu trigger: starred → show star, on hover → three dots; unstarred → three dots on hover */}
       <div className="relative shrink-0" ref={menuRef}>
         <button
+          type="button"
           onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuOpen(!menuOpen); }}
+          title="Session actions"
+          aria-label={`Actions for ${cleanTitle(session)}`}
+          aria-expanded={menuOpen}
+          aria-haspopup="menu"
           className={`p-0.5 cursor-pointer transition-opacity ${
             session.starred
               ? 'text-hue-yellow opacity-100 [&>*:first-child]:block [&>*:last-child]:hidden hover:[&>*:first-child]:hidden hover:[&>*:last-child]:block hover:text-text-muted'
@@ -832,19 +855,25 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
 
         {menuOpen && (
           <div className="absolute right-0 top-full mt-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[140px]">
-            <button
+            <Button
+              variant="subtle"
+              size="sm"
+              fullWidth
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 onToggleStar(session.id);
                 setMenuOpen(false);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+              className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
             >
               <Star size={14} className={session.starred ? 'text-hue-yellow fill-hue-yellow' : ''} />
               {session.starred ? 'Unstar' : 'Star'}
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="subtle"
+              size="sm"
+              fullWidth
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -852,36 +881,42 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
                 setRenaming(true);
                 setMenuOpen(false);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+              className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
             >
               <Pencil size={14} />
               Rename
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="subtle"
+              size="sm"
+              fullWidth
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 setMenuOpen(false);
                 onArchive(session.id);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+              className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
             >
               <Archive size={14} />
               Archive
-            </button>
+            </Button>
             <div className="border-t border-border my-1" />
-            <button
+            <Button
+              variant="dangerGhost"
+              size="sm"
+              fullWidth
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 setMenuOpen(false);
                 onDelete(session.id);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-hue-red hover:bg-border-subtle cursor-pointer transition-colors"
+              className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
             >
               <Trash2 size={14} />
               Delete
-            </button>
+            </Button>
           </div>
         )}
       </div>

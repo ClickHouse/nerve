@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Download, FileText, Clock, RefreshCw, TrendingDown, TrendingUp } from 'lucide-react';
+import { Download, FileText, Clock, RefreshCw, TrendingDown, TrendingUp } from '../ui/icons';
 import type { MessageBlock } from '../../types/chat';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
@@ -14,7 +14,7 @@ interface BlockRendererProps {
   streaming?: boolean;
   /** Tailwind bg class for text cursor (default: 'bg-accent'). */
   cursorColor?: string;
-  /** Optional wrapper class for text blocks (e.g. 'text-[13px] my-1'). */
+  /** Optional wrapper class for text blocks (e.g. 'text-sm my-1'). */
   textClassName?: string;
 }
 
@@ -64,7 +64,7 @@ export function BlockRenderer({
                 <span
                   className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border ${
                     item.downgrade
-                      ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                      ? 'border-warning-border bg-warning-bg text-warning'
                       : 'border-border bg-surface'
                   }`}
                   title={

@@ -171,26 +171,31 @@ const INACTIVE: Partial<Record<ButtonVariant, string>> = {
   tab: 'text-text-dim border-transparent hover:text-text-muted',
   ghost: 'text-text-muted hover:text-text-secondary',
   /**
-   * The hover moves the *text* as well as the surface, because the surface
-   * alone is not always visible: a segmented control puts `bg-surface-raised`
-   * on the container and the segments sit directly on it, so a
-   * `hover:bg-surface-raised` segment is hovering to the colour it is already
-   * on and the control goes inert. (`TasksPage`'s Board/List switch is exactly
-   * that shape.) A call site cannot patch it either — `hover:bg-surface-hover`
-   * from a className loses to `hover:bg-surface-raised` on the same
-   * alphabetical ordering described below.
+   * `hover:text-text` is the load-bearing half of this. Do not drop it.
+   *
+   * `subtle` is the menu/list-row variant, and rows frequently sit *inside* a
+   * raised group — a segmented control puts `bg-surface-raised` on the
+   * container and the segments sit directly on it (`TasksPage`'s Board/List
+   * switch is exactly that shape). A `hover:bg-surface-raised` segment would
+   * then be hovering to the colour it is already on, and the control would go
+   * dead.
+   *
+   * `surface-hover` instead of `surface-raised` is a real improvement but it
+   * does not rescue that case on its own, and it is worth writing down why so
+   * nobody "simplifies" the text move away on the strength of it. Both are
+   * `color-mix` of the same two near-neutral greys: `surface-raised` is 50/50,
+   * `surface-hover` is 25/75. In dark those inputs are #282828 and #323232, so
+   * the two land roughly 2 units apart out of 255; in light (#f6f7fa, #e6e7e9)
+   * roughly 4. On a raised parent that step is essentially invisible, and the
+   * text is the only thing the eye actually gets. A genuinely distinct surface
+   * step would need a token the palette does not have.
    *
    * The text moves *up* from the resting colour rather than the resting colour
-   * moving down: `subtle` is the menu/list-row variant, ~71 rows across the
-   * app, and dimming all of them at rest to buy a hover state on one segmented
-   * control would be a bad trade.
+   * moving down: dimming ~71 list rows at rest to buy a hover state on one
+   * segmented control would be a bad trade. Both hovers are `hover:`-prefixed,
+   * so they carry a pseudo-class and sit outside the ordering hazard described
+   * below — this pair is decided by specificity, not by class name.
    */
-  // `surface-hover`, not `surface-raised`: this variant is used for segmented
-  // controls and list rows, which frequently sit *inside* a raised group, where
-  // hovering to `surface-raised` is a no-op and the row appears dead. Hovering
-  // to `surface-hover` is at least always a change, though on a raised parent
-  // it is only a couple of units — a genuinely distinct step would need a token
-  // the palette does not currently have.
   subtle: 'text-text-secondary hover:text-text hover:bg-surface-hover',
 };
 

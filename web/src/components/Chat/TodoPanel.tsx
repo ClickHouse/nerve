@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, Circle, Loader2 } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, Circle, Loader2 } from '../ui/icons';
+import { Button } from '../ui';
 import type { TodoItem, CCTask } from '../../stores/chatStore';
 
 /**
@@ -101,8 +102,8 @@ export function TodoPanel({
     <div className={`border-t border-border-subtle bg-bg-sunken shrink-0 transition-all duration-300 ${allDone ? 'opacity-60' : ''}`}>
       <div className="max-w-[var(--chat-width)] mx-auto px-5 py-2.5">
         <div className="flex items-center gap-2 mb-1.5">
-          <span className="text-[11px] font-medium text-text-faint uppercase tracking-wider">Tasks</span>
-          <span className="text-[10px] text-text-faint">
+          <span className="text-xs font-medium text-text-faint uppercase tracking-wider">Tasks</span>
+          <span className="text-2xs text-text-faint">
             {completedCount}/{rows.length}
           </span>
         </div>
@@ -148,10 +149,13 @@ function CompletedSummaryRow({
   onClick: () => void;
 }) {
   return (
-    <button
-      type="button"
+    <Button
+      variant="ghost"
+      size="sm"
+      fullWidth
       onClick={onClick}
-      className="flex items-center gap-2 py-0.5 text-[13px] w-full text-left rounded text-text-faint hover:text-text-muted transition-colors"
+      aria-expanded={expanded}
+      className="justify-start gap-2 px-0 py-0.5 text-sm leading-tight text-left"
     >
       <CheckCircle2 size={14} className="text-hue-green shrink-0 opacity-60" />
       {expanded ? (
@@ -162,7 +166,7 @@ function CompletedSummaryRow({
       <span>
         {count} completed {count === 1 ? 'task' : 'tasks'}
       </span>
-    </button>
+    </Button>
   );
 }
 
@@ -171,7 +175,7 @@ function TaskRow({ row }: { row: PanelRow }) {
   const isActive = row.status === 'in_progress';
 
   return (
-    <div className={`todo-row flex items-center gap-2 py-0.5 text-[13px] transition-opacity duration-300 ${isCompleted ? 'opacity-50' : ''}`}>
+    <div className={`todo-row flex items-center gap-2 py-0.5 text-sm leading-tight transition-opacity duration-300 ${isCompleted ? 'opacity-50' : ''}`}>
       {isCompleted ? (
         <CheckCircle2 size={14} className="text-hue-green shrink-0 todo-icon-enter" />
       ) : isActive ? (
@@ -180,7 +184,7 @@ function TaskRow({ row }: { row: PanelRow }) {
         <Circle size={14} className="text-text-faint shrink-0" />
       )}
       {row.id && (
-        <span className="text-[10px] tabular-nums text-text-faint shrink-0">#{row.id}</span>
+        <span className="text-2xs tabular-nums text-text-faint shrink-0">#{row.id}</span>
       )}
       <span className={`${isCompleted ? 'line-through text-text-faint' : isActive ? 'text-text' : 'text-text-muted'} transition-colors duration-300`}>
         {isActive ? row.activeLabel : row.label}

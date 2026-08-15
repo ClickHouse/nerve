@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban, Workflow as WorkflowIcon } from 'lucide-react';
+import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban, Workflow as WorkflowIcon } from '../ui/icons';
+import { Button, IconButton } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { MarkdownContent } from './MarkdownContent';
@@ -63,12 +64,14 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
         const color = TAB_COLORS[tab.subagentType] || 'text-text-muted';
         const isActive = tab.id === activeId;
         return (
-          <button
+          <Button
             key={tab.id}
+            variant="tab"
+            size="sm"
+            active={isActive}
+            aria-selected={isActive}
             onClick={() => onFocus(tab.id)}
-            className={`group flex items-center gap-1.5 px-3 py-2 text-[12px] border-r border-surface-raised shrink-0 transition-colors cursor-pointer ${
-              isActive ? 'bg-bg-sunken text-text-secondary' : 'text-text-dim hover:text-text-muted hover:bg-surface-hover'
-            }`}
+            className="group gap-1.5 px-3 py-2 border-r border-r-surface-raised hover:bg-surface-hover"
           >
             {tab.status === 'running'
               ? <Loader2 size={11} className={`animate-spin ${color}`} />
@@ -76,7 +79,7 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
             }
             <span className="truncate max-w-[100px]">{tab.label}</span>
             {tab.status !== 'running' && tab.completedAt && (
-              <span className="text-[10px] text-text-faint">{formatElapsed(tab.startedAt, tab.completedAt)}</span>
+              <span className="text-2xs text-text-faint">{formatElapsed(tab.startedAt, tab.completedAt)}</span>
             )}
             <span
               onClick={(e) => { e.stopPropagation(); onClose(tab.id); }}
@@ -84,7 +87,7 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
             >
               <X size={10} />
             </span>
-          </button>
+          </Button>
         );
       })}
     </div>
@@ -106,25 +109,22 @@ function TabHeader({ tab, onClose }: { tab: PanelTab; onClose: () => void }) {
           ? <Loader2 size={14} className={`animate-spin shrink-0 ${color}`} />
           : <Icon size={14} className={`shrink-0 ${tab.isError ? 'text-hue-red' : color}`} />
         }
-        <span className="text-[13px] font-medium text-text-secondary">{tab.label}</span>
+        <span className="text-sm font-medium text-text-secondary">{tab.label}</span>
         {tab.description && (
-          <span className="text-[11px] text-text-faint truncate">{tab.description}</span>
+          <span className="text-xs text-text-faint truncate">{tab.description}</span>
         )}
         {tab.model && (
-          <span className="text-[10px] text-text-faint shrink-0">{tab.model}</span>
+          <span className="text-2xs text-text-faint shrink-0">{tab.model}</span>
         )}
         {tab.status === 'running' && (
-          <span className="text-[10px] text-text-faint shrink-0">
+          <span className="text-2xs text-text-faint shrink-0">
             <ElapsedTimer startedAt={tab.startedAt} />
           </span>
         )}
       </div>
-      <button
-        onClick={onClose}
-        className="w-6 h-6 flex items-center justify-center text-text-faint hover:text-text-muted rounded cursor-pointer transition-colors shrink-0"
-      >
+      <IconButton label="Close the panel" size="xs" onClick={onClose}>
         <X size={14} />
-      </button>
+      </IconButton>
     </div>
   );
 }
@@ -134,7 +134,7 @@ function TabHeader({ tab, onClose }: { tab: PanelTab; onClose: () => void }) {
 // ------------------------------------------------------------------ //
 
 function TabContent({ tab, containerRef }: { tab: PanelTab; containerRef: React.RefObject<HTMLDivElement | null> }) {
-  const cursorColor = tab.type === 'plan' ? 'bg-amber-400' : 'bg-link';
+  const cursorColor = tab.type === 'plan' ? 'bg-hue-amber' : 'bg-link';
   const hasBlocks = tab.blocks.length > 0;
   const endRef = useRef<HTMLDivElement>(null);
   const isNearBottom = useRef(true);
@@ -168,7 +168,7 @@ function TabContent({ tab, containerRef }: { tab: PanelTab; containerRef: React.
             blocks={tab.blocks}
             streaming={tab.streaming}
             cursorColor={cursorColor}
-            textClassName="text-[13px] my-1"
+            textClassName="text-sm my-1"
           />
         </div>
       )}
@@ -179,19 +179,19 @@ function TabContent({ tab, containerRef }: { tab: PanelTab; containerRef: React.
       )}
 
       {tab.content ? (
-        <div className="text-[13px]">
+        <div className="text-sm">
           <MarkdownContent content={tab.content} />
           {tab.streaming && (
             <span className={`streaming-cursor inline-block w-1.5 h-4 ${cursorColor} ml-0.5 align-text-bottom`} />
           )}
         </div>
       ) : tab.streaming && !hasBlocks ? (
-        <div className="flex items-center gap-2 text-[13px] text-text-dim pt-4">
+        <div className="flex items-center gap-2 text-sm text-text-dim pt-4">
           <Loader2 size={14} className="animate-spin" />
           {tab.type === 'plan' ? 'Planning...' : `${tab.label} working...`}
         </div>
       ) : !hasBlocks ? (
-        <div className="text-[13px] text-text-faint">No content</div>
+        <div className="text-sm text-text-faint">No content</div>
       ) : null}
 
       <div ref={endRef} />
@@ -235,21 +235,15 @@ function PlanActions({ tab }: { tab: PanelTab }) {
   return (
     <div className="flex items-center justify-end gap-2 px-4 py-2.5 border-t border-border-subtle bg-bg shrink-0">
       {isPlanExit && (
-        <button
-          onClick={handleDecline}
-          className="flex items-center gap-1.5 px-3 py-1 bg-surface-raised hover:bg-surface-hover text-text-muted text-[12px] font-medium rounded-md cursor-pointer transition-colors"
-        >
+        <Button size="sm" onClick={handleDecline} className="py-1 rounded-md font-medium">
           <Ban size={12} />
           Decline
-        </button>
+        </Button>
       )}
-      <button
-        onClick={handleApprove}
-        className="flex items-center gap-1.5 px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[12px] font-medium rounded-md cursor-pointer transition-colors"
-      >
+      <Button variant="success" size="sm" onClick={handleApprove} className="py-1">
         <Check size={12} />
         Approve
-      </button>
+      </Button>
     </div>
   );
 }

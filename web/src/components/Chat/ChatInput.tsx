@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat } from 'lucide-react';
+import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat } from '../ui/icons';
+import { IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
@@ -9,11 +10,11 @@ import { BackendSelector } from './BackendSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
-  add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)', placeholder: 'Instructions...' },
-  remove:   { icon: Trash2,     label: 'Remove',  color: '#ef4444', placeholder: 'Instructions...' },
-  improve:  { icon: Sparkles,   label: 'Improve', color: '#a855f7', placeholder: 'Instructions...' },
-  question: { icon: HelpCircle, label: 'Ask',     color: '#f59e0b', placeholder: 'What do you want to know?' },
-  note:     { icon: StickyNote, label: 'Note',    color: '#6b7280', placeholder: 'Your note...' },
+  add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)',     placeholder: 'Instructions...' },
+  remove:   { icon: Trash2,     label: 'Remove',  color: 'var(--theme-hue-red)',    placeholder: 'Instructions...' },
+  improve:  { icon: Sparkles,   label: 'Improve', color: 'var(--theme-hue-purple)', placeholder: 'Instructions...' },
+  question: { icon: HelpCircle, label: 'Ask',     color: 'var(--theme-hue-amber)',  placeholder: 'What do you want to know?' },
+  note:     { icon: StickyNote, label: 'Note',    color: 'var(--theme-text-muted)', placeholder: 'Your note...' },
 };
 
 // Actions that auto-focus the instruction input (need user input)
@@ -571,17 +572,17 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       <div className="px-4 py-3">
         <div className="max-w-[var(--chat-width)] mx-auto flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
           {/* File attach button */}
-          <button
+          <IconButton
+            size="md"
             onClick={() => fileInputRef.current?.click()}
             disabled={disabled || isStreaming || rewriteActive
               || (isVirtualChat && !!(newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())))}
-            className="w-10 h-10 text-text-muted hover:text-text-secondary rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0 disabled:opacity-30"
-            title={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
+            label={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
               ? 'Attaching files would start the review loop — start it or clear the form first'
               : 'Attach files'}
           >
             <Paperclip size={18} />
-          </button>
+          </IconButton>
 
           {/* Prompt rewrite toggle — only on a fresh chat, where it applies */}
           {rewriteAvailable && isNewChat && (
@@ -590,7 +591,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               disabled={disabled || isStreaming || rewriteActive}
               className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
                 rewriteEnabled
-                  ? 'text-hue-purple bg-purple-500/10 hover:bg-purple-500/15 shadow-[inset_0_0_0_1px_rgba(168,85,247,0.25)]'
+                  ? 'text-hue-purple bg-hue-purple/10 hover:bg-hue-purple/15 ring-1 ring-inset ring-hue-purple/25'
                   : 'text-text-muted hover:text-text-secondary'
               }`}
               title={rewriteEnabled
@@ -608,7 +609,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               disabled={disabled || isStreaming || rewriteActive}
               className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
                 newChatReviewLoop
-                  ? 'text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/15 shadow-[inset_0_0_0_1px_rgba(52,211,153,0.25)]'
+                  ? 'text-hue-emerald bg-hue-emerald/10 hover:bg-hue-emerald/15 ring-1 ring-inset ring-hue-emerald/25'
                   : 'text-text-muted hover:text-text-secondary'
               }`}
               title={newChatReviewLoop
@@ -629,7 +630,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               only this chat: virtual chats bind it at creation, real
               sessions PATCH their own row — never a global preference. */}
           {scopedModels.length > 1 && (
-            <select
+            <Select
               value={currentModel ?? ''}
               onChange={(e) => {
                 const picked = e.target.value;
@@ -641,7 +642,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               }}
               disabled={disabled || isStreaming || rewriteActive}
               title="Model for this chat (other chats keep theirs)"
-              className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
+              className="h-10 max-w-[170px] px-2.5 rounded-xl shrink-0 truncate"
             >
               {/* A session may run on a model the picker no longer offers
                   (retired id, uninstalled Ollama model) — keep it visible
@@ -670,7 +671,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
                   ))}
                 </optgroup>
               )}
-            </select>
+            </Select>
           )}
 
           <input
@@ -704,24 +705,25 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             // basis-full makes the textarea claim a whole flex line on its
             // own; order-1 puts that line under the controls rather than
             // above them. Both are undone at `md`, back to a single row.
-            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-[15px] text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
+            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-base text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
           {isStreaming ? (
+            /* Native: this is a solid destructive fill, and IconButton has no
+               `dangerSolid` — its `danger` is red-on-transparent. `bg-error-solid`
+               rather than `bg-error`, which is the pale feedback foreground. */
             <button
+              type="button"
               onClick={onStop}
-              className="w-10 h-10 bg-red-500/80 hover:bg-red-500 text-white rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0"
+              className="w-10 h-10 bg-error-solid hover:bg-error-solid/90 text-white rounded-xl inline-flex items-center justify-center cursor-pointer transition-colors shrink-0"
               title="Stop generation"
+              aria-label="Stop generation"
             >
               <Square size={16} />
             </button>
           ) : (
-            <button
-              onClick={handleSend}
-              disabled={!canSend}
-              className="w-10 h-10 bg-accent hover:bg-accent-hover text-on-accent rounded-xl flex items-center justify-center disabled:opacity-30 cursor-pointer transition-colors shrink-0"
-            >
+            <IconButton label="Send" variant="primary" size="md" onClick={handleSend} disabled={!canSend}>
               <Send size={18} />
-            </button>
+            </IconButton>
           )}
         </div>
       </div>
@@ -743,8 +745,8 @@ function AttachmentPreview({ attachment, onRemove }: { attachment: AttachmentFil
         </div>
       )}
       <div className="pr-7 py-1.5 min-w-0">
-        <div className="text-[12px] text-text-secondary truncate max-w-[120px]">{attachment.file.name}</div>
-        <div className="text-[11px] text-text-muted">
+        <div className="text-xs text-text-secondary truncate max-w-[120px]">{attachment.file.name}</div>
+        <div className="text-xs text-text-muted">
           {attachment.uploading ? (
             <span className="flex items-center gap-1"><Loader2 size={10} className="animate-spin" /> Uploading...</span>
           ) : attachment.error ? (
@@ -754,12 +756,14 @@ function AttachmentPreview({ attachment, onRemove }: { attachment: AttachmentFil
           )}
         </div>
       </div>
-      <button
+      <IconButton
+        label={`Remove ${attachment.file.name}`}
+        size="xs"
         onClick={onRemove}
-        className="absolute top-1 right-1 w-5 h-5 rounded-full bg-bg/80 text-text-muted hover:text-text flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+        className="absolute top-1 right-1 rounded-full bg-bg/80 opacity-0 group-hover:opacity-100 transition-opacity"
       >
         <X size={12} />
-      </button>
+      </IconButton>
     </div>
   );
 }
@@ -785,32 +789,29 @@ function QuoteCard({ quote, instructionRef, onRemove, onUpdateInstruction, onSen
         {/* Icon + label */}
         <div className="flex items-center gap-1.5 shrink-0 pt-0.5">
           <Icon size={13} style={{ color: config.color }} />
-          <span className="text-[11px] font-medium uppercase tracking-wider" style={{ color: config.color }}>
+          <span className="text-xs font-medium uppercase tracking-wider" style={{ color: config.color }}>
             {config.label}
           </span>
         </div>
 
         {/* Content */}
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] text-text-muted leading-relaxed line-clamp-2">{truncated}</div>
-          <input
+          <div className="text-xs text-text-muted leading-relaxed line-clamp-2">{truncated}</div>
+          <TextField
+            bare
             ref={instructionRef}
-            type="text"
             value={quote.instruction}
             onChange={(e) => onUpdateInstruction(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && onSend) { e.preventDefault(); onSend(); } }}
             placeholder={config.placeholder}
-            className="w-full mt-1.5 px-0 py-0.5 bg-transparent text-[13px] text-text-secondary outline-none placeholder:text-text-faint border-b border-border focus:border-border transition-colors"
+            className="mt-1.5 py-0.5 text-sm text-text-secondary border-b border-border transition-colors"
           />
         </div>
 
         {/* Remove */}
-        <button
-          onClick={onRemove}
-          className="text-text-faint hover:text-text-muted cursor-pointer transition-colors shrink-0 pt-0.5"
-        >
+        <IconButton label="Remove this quote" size="xs" onClick={onRemove} className="shrink-0 mt-0.5">
           <X size={14} />
-        </button>
+        </IconButton>
       </div>
     </div>
   );
