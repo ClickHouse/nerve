@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom';
-import { Calendar, Clock, ExternalLink } from 'lucide-react';
+import { Calendar, Clock, ExternalLink } from '../ui/icons';
 import type { Task } from '../../stores/taskStore';
 import { formatTimeAgo } from '../../utils/dateGroups';
 import { StatusBadge, StatusSelect } from './StatusControls';
@@ -23,11 +23,11 @@ export function TaskCard({ task, onStatusChange }: {
             phone   title / meta + controls
             ≥ sm    title + controls / meta                                */}
       <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
-        <h3 className="font-medium text-[15px] text-text min-w-0 basis-full sm:basis-0 sm:flex-1 order-0">
+        <h3 className="font-medium text-base text-text min-w-0 basis-full sm:basis-0 sm:flex-1 order-0">
           {task.title}
         </h3>
 
-        <div className="flex items-center gap-3 text-[12px] min-w-0 order-2 sm:order-3 sm:basis-full">
+        <div className="flex items-center gap-3 text-xs min-w-0 order-2 sm:order-3 sm:basis-full">
           {/* Hidden on a phone: the select sitting beside it already names
               the status, and one value is not worth showing twice. */}
           <span className="hidden sm:flex">
@@ -60,6 +60,10 @@ export function TaskCard({ task, onStatusChange }: {
               href={task.source_url}
               target="_blank"
               rel="noopener noreferrer"
+              // A link, not a button, so not an `IconButton` — but the icon is
+              // `aria-hidden`, so the name has to be spelled out here.
+              title="Open source link"
+              aria-label="Open source link"
               className="p-1.5 text-text-faint hover:text-text-muted hover:bg-surface-hover rounded cursor-pointer"
             >
               <ExternalLink size={14} />
@@ -68,7 +72,6 @@ export function TaskCard({ task, onStatusChange }: {
           <StatusSelect
             value={task.status}
             onChange={(status) => onStatusChange(task.id, status)}
-            className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-text-muted outline-none cursor-pointer"
           />
         </div>
       </div>

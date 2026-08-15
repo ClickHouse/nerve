@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Lightbulb, ListTodo, FileText, Check, X, MessageSquare, Loader2, ExternalLink, RefreshCw } from 'lucide-react';
+import { ChevronRight, ChevronDown, Lightbulb, ListTodo, FileText, Check, X, MessageSquare, Loader2, ExternalLink, RefreshCw } from '../../ui/icons';
 import { useNavigate } from 'react-router-dom';
 import { MarkdownContent } from '../MarkdownContent';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { Badge, Button, type BadgeTone } from '../../ui';
 
 /** Extract readable text from MCP content blocks. */
 function extractText(result: string): string {
@@ -44,12 +45,13 @@ function parsePlanList(text: string): ParsedPlan[] {
   return items;
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  pending: 'bg-yellow-500/15 text-hue-yellow',
-  approved: 'bg-green-500/15 text-hue-green',
-  implementing: 'bg-blue-500/15 text-hue-blue',
-  declined: 'bg-red-500/15 text-hue-red',
-  superseded: 'bg-border-subtle text-text-muted',
+/** Plan lifecycle state — an outcome, so it takes the status-shaped tones. */
+const STATUS_TONES: Record<string, BadgeTone> = {
+  pending: 'warning',
+  approved: 'success',
+  implementing: 'info',
+  declined: 'danger',
+  superseded: 'neutral',
 };
 
 type PlanTool = 'plan_propose' | 'plan_update' | 'plan_list' | 'plan_read' | 'plan_approve' | 'plan_decline' | 'plan_revise';
@@ -111,14 +113,16 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
   else if (toolName === 'plan_list' && planList.length > 0) summary = `${planList.length} plans`;
   else if (planId) summary = planId;
 
-  // Icon color
-  const iconColor = block.isError ? 'text-hue-red'
+  // Icon colour. Identity, not status: the hue says *which* plan tool ran, and
+  // amber is the plan system's colour throughout this card. Only `isError` —
+  // the call actually failing — reaches for a status token.
+  const iconColor = block.isError ? 'text-error'
     : toolName === 'plan_approve' ? 'text-hue-emerald'
     : toolName === 'plan_decline' ? 'text-hue-red'
     : 'text-hue-amber';
 
   return (
-    <div className="my-1.5 border border-amber-500/20 rounded-lg bg-surface overflow-hidden">
+    <div className="my-1.5 border border-hue-amber/20 rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
@@ -127,35 +131,37 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
           ? <Loader2 size={14} className="text-hue-amber animate-spin shrink-0" />
           : <Icon size={14} className={`shrink-0 ${iconColor}`} />
         }
-        <span className="text-[13px] font-medium text-amber-300">{config.label}</span>
-        {summary && <span className="text-[12px] text-text-dim truncate">{summary}</span>}
+        <span className="text-sm leading-tight font-medium text-hue-amber">{config.label}</span>
+        {summary && <span className="text-xs text-text-dim truncate">{summary}</span>}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
 
       {expanded && (
-        <div className="border-t border-amber-500/10">
+        <div className="border-t border-hue-amber/10">
 
           {/* ── plan_propose ── */}
           {toolName === 'plan_propose' && (
             <div className="px-3 py-2">
               {block.input.content ? (
-                <div className="text-[12px] text-text-muted max-h-40 overflow-y-auto whitespace-pre-wrap">
+                <div className="text-xs text-text-muted max-h-40 overflow-y-auto whitespace-pre-wrap">
                   {String(block.input.content).slice(0, 500)}
                   {String(block.input.content).length > 500 ? '...' : null}
                 </div>
               ) : null}
               {proposedPlanId && !block.isError && (
-                <button
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="mt-2 -ml-2"
                   onClick={(e) => { e.stopPropagation(); navigate(`/plans/${proposedPlanId}`); }}
-                  className="mt-2 flex items-center gap-1 text-[11px] text-hue-amber hover:text-amber-300 cursor-pointer"
                 >
-                  <ExternalLink size={10} /> Review plan
-                </button>
+                  <ExternalLink size={10} className="text-hue-amber" /> Review plan
+                </Button>
               )}
               {proposedPlanId && !block.isError && (
-                <div className="mt-1 text-[11px] text-hue-green/70">
+                <div className="mt-1 text-xs text-success">
                   Plan proposed — awaiting review
                 </div>
               )}
@@ -168,19 +174,17 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
               {planList.map((p, i) => (
                 <div
                   key={i}
-                  className="flex items-center gap-2 text-[12px] cursor-pointer hover:bg-surface-hover rounded px-1 py-0.5"
+                  className="flex items-center gap-2 text-xs cursor-pointer hover:bg-surface-hover rounded px-1 py-0.5"
                   onClick={() => navigate(`/plans/${p.planId}`)}
                 >
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[p.status] || 'bg-border-subtle text-text-muted'}`}>
-                    {p.status}
-                  </span>
+                  <Badge tone={STATUS_TONES[p.status] || 'neutral'} className="shrink-0">{p.status}</Badge>
                   <span className="text-text-secondary truncate">{p.taskTitle}</span>
-                  <span className="text-[10px] text-text-faint shrink-0">v{p.version}</span>
+                  <span className="text-2xs text-text-faint shrink-0">v{p.version}</span>
                 </div>
               ))}
             </div>
           ) : resultText ? (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+            <pre className={`px-3 py-2 text-xs whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-error' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           ) : null)}
@@ -190,21 +194,23 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="px-3 py-2">
               {/* Header metadata */}
               {readHeader && (
-                <pre className="text-[12px] text-text-muted whitespace-pre-wrap mb-2">{readHeader}</pre>
+                <pre className="text-xs text-text-muted whitespace-pre-wrap mb-2">{readHeader}</pre>
               )}
               {/* Plan content */}
               {readContent && (
-                <div className="max-h-96 overflow-y-auto bg-bg rounded-lg p-4 border border-amber-500/10">
+                <div className="max-h-96 overflow-y-auto bg-bg rounded-lg p-4 border border-hue-amber/10">
                   <MarkdownContent content={readContent} />
                 </div>
               )}
               {planId && (
-                <button
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="mt-2 -ml-2"
                   onClick={(e) => { e.stopPropagation(); navigate(`/plans/${planId}`); }}
-                  className="mt-2 flex items-center gap-1 text-[11px] text-hue-amber hover:text-amber-300 cursor-pointer"
                 >
-                  <ExternalLink size={10} /> Open plan
-                </button>
+                  <ExternalLink size={10} className="text-hue-amber" /> Open plan
+                </Button>
               )}
             </div>
           )}
@@ -212,25 +218,29 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* ── plan_approve ── */}
           {toolName === 'plan_approve' && resultText && !block.isError && (
             <div className="px-3 py-2">
-              <div className="flex items-center gap-2 text-[12px] text-hue-emerald">
+              <div className="flex items-center gap-2 text-xs text-success">
                 <Check size={12} />
                 <span>Plan approved</span>
               </div>
               {implSessionId && (
-                <button
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="mt-2 -ml-2"
                   onClick={(e) => { e.stopPropagation(); navigate(`/chat/${implSessionId}`); }}
-                  className="mt-2 flex items-center gap-1 text-[11px] text-hue-blue hover:text-hue-blue cursor-pointer"
                 >
-                  <MessageSquare size={10} /> Watch implementation
-                </button>
+                  <MessageSquare size={10} className="text-hue-blue" /> Watch implementation
+                </Button>
               )}
               {planId && (
-                <button
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="mt-1 -ml-2"
                   onClick={(e) => { e.stopPropagation(); navigate(`/plans/${planId}`); }}
-                  className="mt-1 flex items-center gap-1 text-[11px] text-hue-amber hover:text-amber-300 cursor-pointer"
                 >
-                  <ExternalLink size={10} /> View plan
-                </button>
+                  <ExternalLink size={10} className="text-hue-amber" /> View plan
+                </Button>
               )}
             </div>
           )}
@@ -238,14 +248,14 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* ── plan_decline ── */}
           {toolName === 'plan_decline' && resultText && !block.isError && (
             <div className="px-3 py-2">
-              <div className="flex items-center gap-2 text-[12px] text-hue-red">
+              <div className="flex items-center gap-2 text-xs text-error">
                 <X size={12} />
                 <span>Plan declined</span>
               </div>
               {feedback && (
                 <div className="mt-2 flex gap-0">
-                  <div className="w-0.5 bg-red-400/30 rounded-full shrink-0" />
-                  <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
+                  <div className="w-0.5 bg-error/30 rounded-full shrink-0" />
+                  <p className="pl-2 text-xs text-text-muted whitespace-pre-wrap">{feedback}</p>
                 </div>
               )}
             </div>
@@ -255,27 +265,29 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
           {toolName === 'plan_update' && !block.isError && (
             <div className="px-3 py-2">
               {block.input.content ? (
-                <div className="text-[12px] text-text-muted max-h-40 overflow-y-auto whitespace-pre-wrap">
+                <div className="text-xs text-text-muted max-h-40 overflow-y-auto whitespace-pre-wrap">
                   {String(block.input.content).slice(0, 500)}
                   {String(block.input.content).length > 500 ? '...' : null}
                 </div>
               ) : null}
               {feedback && (
                 <div className="mt-2 flex gap-0">
-                  <div className="w-0.5 bg-amber-400/30 rounded-full shrink-0" />
-                  <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
+                  <div className="w-0.5 bg-hue-amber/30 rounded-full shrink-0" />
+                  <p className="pl-2 text-xs text-text-muted whitespace-pre-wrap">{feedback}</p>
                 </div>
               )}
               {updatedNewPlanId && (
-                <button
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="mt-2 -ml-2"
                   onClick={(e) => { e.stopPropagation(); navigate(`/plans/${updatedNewPlanId}`); }}
-                  className="mt-2 flex items-center gap-1 text-[11px] text-hue-amber hover:text-amber-300 cursor-pointer"
                 >
-                  <ExternalLink size={10} /> Review v{updatedNewVersion}
-                </button>
+                  <ExternalLink size={10} className="text-hue-amber" /> Review v{updatedNewVersion}
+                </Button>
               )}
               {updatedNewPlanId && (
-                <div className="mt-1 text-[11px] text-hue-green/70">
+                <div className="mt-1 text-xs text-success">
                   Plan revised — awaiting review
                 </div>
               )}
@@ -285,14 +297,14 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* ── plan_revise ── */}
           {toolName === 'plan_revise' && resultText && !block.isError && (
             <div className="px-3 py-2">
-              <div className="flex items-center gap-2 text-[12px] text-hue-amber">
+              <div className="flex items-center gap-2 text-xs text-hue-amber">
                 <MessageSquare size={12} />
                 <span>Revision requested</span>
               </div>
               {feedback && (
                 <div className="mt-2 flex gap-0">
-                  <div className="w-0.5 bg-amber-400/30 rounded-full shrink-0" />
-                  <p className="pl-2 text-[12px] text-text-muted whitespace-pre-wrap">{feedback}</p>
+                  <div className="w-0.5 bg-hue-amber/30 rounded-full shrink-0" />
+                  <p className="pl-2 text-xs text-text-muted whitespace-pre-wrap">{feedback}</p>
                 </div>
               )}
             </div>
@@ -300,14 +312,14 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* ── Error fallback ── */}
           {block.isError && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-hue-red whitespace-pre-wrap border-t border-amber-500/10">
+            <pre className="px-3 py-2 text-xs text-error whitespace-pre-wrap border-t border-hue-amber/10">
               {resultText}
             </pre>
           )}
 
           {/* ── Running spinner ── */}
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> {config.runningLabel}
             </div>
           )}

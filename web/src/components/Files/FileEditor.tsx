@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react';
-import { Eye, Edit3, Lock, Save } from 'lucide-react';
 import { MarkdownContent } from '../Chat/MarkdownContent';
+import { Button, IconButton } from '../ui';
+import { Eye, Edit3, Lock, Save } from '../ui/icons';
 
 interface FileEditorProps {
   path: string;
@@ -28,39 +29,38 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
     <div className="flex-1 flex flex-col min-h-0">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border-subtle bg-bg shrink-0">
-        <span className="text-[13px] text-text-dim font-mono">{path}</span>
+        <span className="text-sm text-text-dim font-mono">{path}</span>
         <div className="flex items-center gap-2">
+          {/* A segmented pair. Both halves were nameless icon-only buttons;
+              IconButton's required label gives each one an accessible name,
+              and `active` is the accent tint the rest of the app uses for a
+              current selection. `px-2.5` keeps the segments as wide as they
+              were — the `p-1` of size xs would halve them. */}
           <div className="flex bg-surface-raised rounded-md border border-border">
-            <button
-              onClick={() => setMode('edit')}
-              className={`px-2.5 py-1 text-[12px] rounded-l-md cursor-pointer
-                ${mode === 'edit' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-text-muted'}`}
+            <IconButton
+              label="Edit source" size="xs" className="px-2.5"
+              active={mode === 'edit'} onClick={() => setMode('edit')}
             >
               <Edit3 size={13} />
-            </button>
-            <button
-              onClick={() => setMode('preview')}
-              className={`px-2.5 py-1 text-[12px] rounded-r-md cursor-pointer
-                ${mode === 'preview' ? 'bg-surface-raised text-text' : 'text-text-dim hover:text-text-muted'}`}
+            </IconButton>
+            <IconButton
+              label="Preview rendered" size="xs" className="px-2.5"
+              active={mode === 'preview'} onClick={() => setMode('preview')}
             >
               <Eye size={13} />
-            </button>
+            </IconButton>
           </div>
           {readOnly && (
-            <span className="flex items-center gap-1.5 text-[12px] text-text-dim">
+            <span className="flex items-center gap-1.5 text-xs text-text-dim">
               <Lock size={12} />
               Read-only (lockdown)
             </span>
           )}
           {modified && !readOnly && (
-            <button
-              onClick={onSave}
-              disabled={saving}
-              className="flex items-center gap-1.5 px-3 py-1 text-[12px] bg-accent hover:bg-accent-hover text-on-accent rounded-md cursor-pointer disabled:opacity-50"
-            >
+            <Button variant="primary" onClick={onSave} disabled={saving}>
               <Save size={12} />
               {saving ? 'Saving...' : 'Save'}
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -72,7 +72,11 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
           onChange={(e) => onContentChange(e.target.value)}
           onKeyDown={handleKeyDown}
           readOnly={readOnly}
-          className="flex-1 p-4 bg-bg-sunken text-[14px] text-text outline-none resize-none editor-textarea"
+          // Not the `TextArea` primitive: `.editor-textarea` carries the mono
+          // stack and `tab-size: 2` that make this a code editor rather than a
+          // form field, and the primitive's field chrome (border, radius,
+          // raised surface, px-3 py-2) is wrong for a full-pane editor.
+          className="flex-1 p-4 bg-bg-sunken text-sm text-text outline-none resize-none editor-textarea"
           spellCheck={false}
         />
       ) : (

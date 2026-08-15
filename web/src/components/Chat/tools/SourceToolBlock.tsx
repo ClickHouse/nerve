@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Inbox, Radio, BookOpen, Loader2, Mail, Github, MessageCircle } from 'lucide-react';
+import { ChevronRight, ChevronDown, Inbox, Radio, BookOpen, Loader2, Mail, Github, MessageCircle } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 
 /** Extract readable text from MCP content blocks or plain text. */
@@ -18,6 +18,8 @@ function extractText(result: string): string {
   return result;
 }
 
+/** Per-source identity hues — gmail red, github purple, telegram blue.
+ *  Not status: a Gmail row is not an error because it is red. */
 function sourceIcon(source: string) {
   const type = source.split(':')[0];
   switch (type) {
@@ -149,19 +151,19 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
   }
 
   return (
-    <div className="my-1.5 border border-cyan-500/20 rounded-lg bg-surface overflow-hidden">
+    <div className="my-1.5 border border-hue-cyan/20 rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-hue-cyan animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : 'text-hue-cyan'}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-cyan'}`} />
         }
-        <span className="text-[13px] font-medium text-cyan-300">{label}</span>
-        {summary && <span className="text-[12px] text-text-dim truncate">{summary}</span>}
+        <span className="text-sm leading-tight font-medium text-hue-cyan">{label}</span>
+        {summary && <span className="text-xs text-text-dim truncate">{summary}</span>}
         {(isPoll || isRead) && messageCount > 0 && !isRunning && (
-          <span className="text-[10px] text-hue-cyan/60 shrink-0">{messageCount} msg</span>
+          <span className="text-2xs text-hue-cyan/60 shrink-0">{messageCount} msg</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
@@ -169,12 +171,12 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
       </button>
 
       {expanded && (
-        <div className="border-t border-cyan-500/10">
+        <div className="border-t border-hue-cyan/10">
           {/* list_sources: structured source list */}
           {isList && sourceEntries.length > 0 && (
             <div className="px-3 py-2 space-y-1">
               {sourceEntries.map((entry, i) => (
-                <div key={i} className="flex items-center gap-2 text-[12px]">
+                <div key={i} className="flex items-center gap-2 text-xs">
                   {sourceIcon(entry.name)}
                   <span className="text-text-secondary font-mono">{entry.name}</span>
                   {entry.messageCount && <span className="text-text-dim">{entry.messageCount} msgs</span>}
@@ -196,16 +198,16 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
                 <div key={i} className="px-3 py-2 border-t border-surface-raised first:border-t-0">
                   <div className="flex items-center gap-2 mb-1">
                     {sourceIcon(msg.source)}
-                    <span className="text-[12px] text-text-secondary font-medium truncate flex-1">{msg.summary}</span>
-                    <span className="text-[10px] text-text-dim shrink-0">{msg.relativeTime}</span>
+                    <span className="text-xs text-text-secondary font-medium truncate flex-1">{msg.summary}</span>
+                    <span className="text-2xs text-text-dim shrink-0">{msg.relativeTime}</span>
                   </div>
-                  <div className="text-[11px] text-text-faint flex items-center gap-2 mb-1">
+                  <div className="text-xs text-text-faint flex items-center gap-2 mb-1">
                     <span>{msg.type}</span>
                     <span>seq:{msg.seq}</span>
                     {msg.time && <span>{msg.time}</span>}
                   </div>
                   {msg.content && (
-                    <pre className="text-[11px] text-text-muted whitespace-pre-wrap leading-relaxed max-h-32 overflow-y-auto">
+                    <pre className="text-xs text-text-muted whitespace-pre-wrap leading-relaxed max-h-32 overflow-y-auto">
                       {msg.content.length > 500 ? msg.content.slice(0, 500) + '...' : msg.content}
                     </pre>
                   )}
@@ -216,35 +218,35 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* No messages state */}
           {isNoMessages && !isList && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Inbox size={12} className="text-text-faint" /> No new messages
             </div>
           )}
 
           {/* Fallback: raw text for unparsed results */}
           {!isList && parsedMessages.length === 0 && !isNoMessages && resultText && (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+            <pre className={`px-3 py-2 text-xs whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-error' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           )}
 
           {/* list_sources fallback */}
           {isList && sourceEntries.length === 0 && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-text-muted whitespace-pre-wrap max-h-60 overflow-y-auto">
+            <pre className="px-3 py-2 text-xs text-text-muted whitespace-pre-wrap max-h-60 overflow-y-auto">
               {resultText}
             </pre>
           )}
 
           {/* Error */}
           {block.isError && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-hue-red whitespace-pre-wrap border-t border-cyan-500/10">
+            <pre className="px-3 py-2 text-xs text-error whitespace-pre-wrap border-t border-hue-cyan/10">
               {resultText}
             </pre>
           )}
 
           {/* Running state */}
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> {isPoll ? 'Polling...' : isList ? 'Loading sources...' : 'Browsing...'}
             </div>
           )}

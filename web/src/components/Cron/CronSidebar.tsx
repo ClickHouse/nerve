@@ -1,5 +1,5 @@
-import { Timer } from 'lucide-react';
 import { useCronStore } from '../../stores/cronStore';
+import { Timer } from '../ui/icons';
 import { chatPath, jobLabel } from './utils';
 import { ChatLink, TriggerButton, JobTypeIcon } from './controls';
 
@@ -22,12 +22,20 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
       // fixed 220px column and its own border would fight them.
       ? 'w-full flex-1 min-h-0 flex flex-col overflow-y-auto'
       : 'w-[220px] border-r border-border-subtle flex flex-col shrink-0 overflow-y-auto'}>
+      {/* Native buttons, not `Button`: these are `justify-between` rows — label
+          on the left, count or hover controls on the right — and the
+          primitive's base `justify-center` wins over a `justify-between` from
+          the call site (Tailwind emits it later), so the layout cannot be had
+          back. The job rows below also carry their own controls (`ChatLink`,
+          `TriggerButton`), which makes each row a container for interactive
+          children as much as a control. Selected treatment is `subtle
+          active`'s. */}
       <div className="p-2 space-y-1">
         <button onClick={() => { selectJob(null); onSelect?.(); }}
-          className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-[13px] transition-colors cursor-pointer
+          className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-sm transition-colors cursor-pointer
             ${selectedJobId === null ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
           <span className="flex items-center gap-2"><Timer size={14} /> All Jobs</span>
-          <span className="text-[11px] opacity-70">{jobs.length}</span>
+          <span className="text-xs opacity-70">{jobs.length}</span>
         </button>
 
         {jobs.map(job => (
@@ -49,7 +57,7 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
                   window.open(chatPath(job.last_session_id), '_blank', 'noopener');
                 }
               }}
-              className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-[13px] transition-colors cursor-pointer
+              className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-sm transition-colors cursor-pointer
                 ${selectedJobId === job.id ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
               <span className="flex items-center gap-2 min-w-0 truncate">
                 <JobTypeIcon type={job.type} />
@@ -72,7 +80,7 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
         ))}
 
         {jobs.length === 0 && (
-          <div className="text-[12px] text-text-faint text-center py-4">No jobs configured</div>
+          <div className="text-xs text-text-faint text-center py-4">No jobs configured</div>
         )}
       </div>
     </div>

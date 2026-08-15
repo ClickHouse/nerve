@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { Bell, HelpCircle, Loader2, ChevronRight, ChevronDown } from 'lucide-react';
+import { Bell, HelpCircle, Loader2, ChevronRight, ChevronDown } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { Badge, type BadgeTone } from '../../ui';
 
 /** Extract readable text from MCP content blocks. */
 function extractText(result: string): string {
@@ -16,6 +17,12 @@ function extractText(result: string): string {
   return result;
 }
 
+/** Notification severity → chip tone. */
+const PRIORITY_TONES: Record<string, BadgeTone> = {
+  urgent: 'danger',
+  high: 'warning',
+};
+
 export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
   const isRunning = block.status === 'running';
@@ -30,7 +37,7 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
   const body = String(block.input.body || '');
 
   const Icon = isAsk ? HelpCircle : Bell;
-  const iconColor = block.isError ? 'text-hue-red' : isAsk ? 'text-hue-blue' : 'text-hue-amber';
+  const iconColor = block.isError ? 'text-error' : isAsk ? 'text-hue-blue' : 'text-hue-amber';
   const label = isNotify ? 'Notify' : 'Ask User';
 
   const resultText = block.result ? extractText(block.result) : '';
@@ -46,22 +53,18 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
           : <Icon size={14} className={`shrink-0 ${iconColor}`} />
         }
-        <span className="text-[13px] font-medium text-text-secondary">{label}</span>
-        {title && <span className="text-[12px] text-text-muted truncate">{title}</span>}
+        <span className="text-sm leading-tight font-medium text-text-secondary">{label}</span>
+        {title && <span className="text-xs text-text-muted truncate">{title}</span>}
         {priority !== 'normal' && (
-          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
-            priority === 'urgent' ? 'bg-red-500/15 text-hue-red' :
-            priority === 'high' ? 'bg-orange-400/15 text-hue-orange' :
-            'bg-border-subtle text-text-muted'
-          }`}>
+          <Badge tone={PRIORITY_TONES[priority] || 'neutral'} className="shrink-0">
             {priority}
-          </span>
+          </Badge>
         )}
         {wait && isAsk && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/15 text-hue-blue shrink-0">blocking</span>
+          <Badge tone="info" className="shrink-0">blocking</Badge>
         )}
         {isSent && !isRunning && (
-          <span className="text-[10px] text-hue-emerald/70 shrink-0">sent</span>
+          <span className="text-2xs text-success shrink-0">sent</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
@@ -71,16 +74,14 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
       {expanded && (
         <div className="border-t border-border">
           <div className="px-3 py-2">
-            {title && <p className="text-[13px] text-text font-medium">{title}</p>}
-            {body && <p className="text-[12px] text-text-muted mt-0.5">{body}</p>}
+            {title && <p className="text-sm text-text font-medium">{title}</p>}
+            {body && <p className="text-xs text-text-muted mt-0.5">{body}</p>}
 
             {/* Options for questions */}
             {isAsk && options.length > 0 && (
               <div className="flex flex-wrap gap-1.5 mt-2">
                 {options.map(opt => (
-                  <span key={opt} className="px-2 py-0.5 text-[11px] bg-surface-raised text-info/80 rounded border border-info/20">
-                    {opt}
-                  </span>
+                  <Badge key={opt} tone="info" size="sm" outline>{opt}</Badge>
                 ))}
               </div>
             )}
@@ -89,14 +90,14 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Result */}
           {resultText && (
             <div className="px-3 py-2 border-t border-border-subtle">
-              <pre className={`text-[12px] font-mono whitespace-pre-wrap ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+              <pre className={`text-xs font-mono whitespace-pre-wrap ${block.isError ? 'text-error' : 'text-text-muted'}`}>
                 {resultText}
               </pre>
             </div>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2 border-t border-border-subtle">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2 border-t border-border-subtle">
               <Loader2 size={12} className="animate-spin" /> Sending...
             </div>
           )}

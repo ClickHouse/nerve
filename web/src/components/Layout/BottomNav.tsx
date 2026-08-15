@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { MoreHorizontal, LogOut, X } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
-import { Drawer } from '../ui/Drawer';
+import { Drawer, IconButton } from '../ui';
+import { MoreHorizontal, LogOut, X } from '../ui/icons';
 import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS, PRIMARY_PATHS, type NavItem } from './navItems';
 
@@ -65,6 +65,11 @@ export function BottomNav() {
           const active = location.pathname.startsWith(path);
           const isNotifs = path === '/notifications';
           return (
+            // Native, like the nav rail's cells and for the same reason: a tab
+            // bar cell is a flexed column of glyph-over-label whose geometry is
+            // the component, not the button. Keeping both navs on the same
+            // shape means the phone and the desktop agree on what a current
+            // destination looks like. See NavRail for the ordering detail.
             <button
               key={path}
               onClick={() => go(path)}
@@ -75,9 +80,14 @@ export function BottomNav() {
               }`}
             >
               <Icon size={20} />
-              <span className="text-[10px]">{label}</span>
+              {/* leading-none: the 14px line-height of text-2xs would otherwise
+                  push the pair off-centre in the 56px cell. */}
+              <span className="text-2xs leading-none">{label}</span>
+              {/* bg-error-solid, not bg-error — see the matching badge in
+                  NavRail. The bare token is a feedback *foreground*, pale in
+                  dark mode, giving 1.62:1 under white text. */}
               {isNotifs && pendingCount > 0 && (
-                <span className="absolute right-1/2 top-1.5 flex h-4 w-4 translate-x-3 items-center justify-center rounded-full bg-red-500 text-[9px] font-medium text-white">
+                <span className="absolute right-1/2 top-1.5 flex h-4 w-4 translate-x-3 items-center justify-center rounded-full bg-error-solid text-2xs font-medium leading-none text-white">
                   {pendingCount > 9 ? '9+' : pendingCount}
                 </span>
               )}
@@ -98,7 +108,7 @@ export function BottomNav() {
           }`}
         >
           <MoreHorizontal size={20} />
-          <span className="text-[10px]">More</span>
+          <span className="text-2xs leading-none">More</span>
         </button>
       </nav>
 
@@ -109,21 +119,23 @@ export function BottomNav() {
           <span className="text-sm font-medium">More</span>
           <div className="flex items-center gap-3">
             <span
-              className={`h-2 w-2 rounded-full ${ws.connected ? 'bg-emerald-400' : 'bg-red-400'}`}
+              className={`h-2 w-2 rounded-full ${ws.connected ? 'bg-success' : 'bg-error'}`}
               title={ws.connected ? 'Connected' : 'Disconnected'}
             />
             <ThemeToggle />
             {/* Escape closes it too, but only this is discoverable. */}
-            <button
-              onClick={() => setMoreOpen(false)}
-              aria-label="Close menu"
-              className="cursor-pointer text-text-faint transition-colors hover:text-text-muted"
-            >
+            <IconButton label="Close menu" size="xs" onClick={() => setMoreOpen(false)}>
               <X size={16} />
-            </button>
+            </IconButton>
           </div>
         </div>
 
+        {/* Native, for a different reason from the tab cells above: `Button`'s
+            largest size is `px-3 py-2`, which on a phone drops these rows from
+            a 44px touch target to ~36px. Restoring `px-4 py-3` from the call
+            site does work today — but only because Tailwind happens to emit
+            the larger value of a utility later, which is not a rule to build a
+            touch target on. */}
         <div className="flex-1 overflow-y-auto py-1">
           {overflow.map(({ path, icon: Icon, label }) => {
             const active = location.pathname.startsWith(path);

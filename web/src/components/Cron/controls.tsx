@@ -1,9 +1,10 @@
 import { Link } from 'react-router-dom';
+import { useCronStore } from '../../stores/cronStore';
+import { Badge, Button, IconButton, type BadgeTone } from '../ui';
 import {
   RotateCw, Play, Loader2, Clock, Inbox, MessageSquare,
   CheckCircle2, XCircle,
-} from 'lucide-react';
-import { useCronStore } from '../../stores/cronStore';
+} from '../ui/icons';
 import { chatPath } from './utils';
 
 export function JobTypeIcon({ type }: { type: string }) {
@@ -14,28 +15,31 @@ export function JobTypeIcon({ type }: { type: string }) {
   }
 }
 
+/**
+ * Which kind of job this is — identity, not status, so it keeps the `hue-*`
+ * colours (through the Badge tones that carry them) and pairs with the amber /
+ * blue of `JobTypeIcon` above. A green badge here would read as "healthy",
+ * which is what `StatusBadge` is for.
+ */
+const JOB_TYPE_TONES: Record<string, BadgeTone> = {
+  cron: 'warning',
+  source: 'info',
+};
+
 export function JobTypeBadge({ type }: { type: string }) {
-  const styles: Record<string, string> = {
-    cron: 'text-amber-600 bg-amber-500/15',
-    source: 'text-blue-600 bg-blue-500/15',
-  };
-  return (
-    <span className={`text-[10px] px-1.5 py-0.5 rounded ${styles[type] || 'text-text-muted bg-surface-raised'}`}>
-      {type}
-    </span>
-  );
+  return <Badge tone={JOB_TYPE_TONES[type] ?? 'neutral'}>{type}</Badge>;
 }
 
 export function StatusBadge({ status }: { status: string | null | undefined }) {
   if (status === 'success') {
-    return <span className="flex items-center gap-1 text-hue-emerald"><CheckCircle2 size={12} /> ok</span>;
+    return <span className="flex items-center gap-1 text-success"><CheckCircle2 size={12} /> ok</span>;
   }
   if (status === 'error') {
-    return <span className="flex items-center gap-1 text-hue-red"><XCircle size={12} /> error</span>;
+    return <span className="flex items-center gap-1 text-error"><XCircle size={12} /> error</span>;
   }
   if (!status) {
     return (
-      <span className="flex items-center gap-1 text-hue-amber">
+      <span className="flex items-center gap-1 text-warning">
         <Loader2 size={12} className="animate-spin" /> running
       </span>
     );
@@ -52,7 +56,7 @@ export function ChatLink({ sessionId, small = false, label }: { sessionId: strin
       onAuxClick={(e) => e.stopPropagation()}
       className={`flex items-center gap-1 rounded transition-colors cursor-pointer shrink-0
         text-text-muted hover:text-text-secondary hover:bg-surface-raised
-        ${small ? 'p-1' : 'px-2 py-1.5 text-[12px]'}`}
+        ${small ? 'p-1' : 'px-2 py-1.5 text-xs'}`}
       title="Open chat">
       <MessageSquare size={small ? 12 : 14} />
       {!small && <span>{label || 'Chat'}</span>}
@@ -70,16 +74,27 @@ export function TriggerButton({ jobId, small = false }: { jobId: string; small?:
     await triggerJob(jobId);
   };
 
+  const glyph = isTriggering
+    ? <Loader2 size={small ? 12 : 14} className="animate-spin" />
+    : <Play size={small ? 12 : 14} />;
+
+  // The disabled treatment is the primitives' (`opacity-50`, `cursor-not-allowed`)
+  // rather than the hand-rolled `text-text-faint` this used to swap in.
+  if (small) {
+    return (
+      <IconButton label="Trigger now" size="xs" onClick={handleClick}
+        disabled={isTriggering} onAuxClick={(e) => e.stopPropagation()}>
+        {glyph}
+      </IconButton>
+    );
+  }
+
   return (
-    <button onClick={handleClick} disabled={isTriggering}
-      onAuxClick={(e) => e.stopPropagation()}
-      className={`flex items-center gap-1 rounded transition-colors cursor-pointer shrink-0
-        ${isTriggering ? 'text-text-faint cursor-not-allowed' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}
-        ${small ? 'p-1' : 'px-2 py-1.5 text-[12px]'}`}
-      title="Trigger now">
-      {isTriggering ? <Loader2 size={small ? 12 : 14} className="animate-spin" /> : <Play size={small ? 12 : 14} />}
-      {!small && !isTriggering && <span>Run</span>}
-    </button>
+    <Button variant="subtle" onClick={handleClick} disabled={isTriggering}
+      onAuxClick={(e) => e.stopPropagation()} title="Trigger now">
+      {glyph}
+      {!isTriggering && <span>Run</span>}
+    </Button>
   );
 }
 
@@ -94,12 +109,10 @@ export function RotateButton({ jobId }: { jobId: string }) {
   };
 
   return (
-    <button onClick={handleClick} disabled={isRotating}
-      className={`flex items-center gap-1 rounded transition-colors cursor-pointer px-2 py-1.5 text-[12px]
-        ${isRotating ? 'text-text-faint cursor-not-allowed' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}
+    <Button variant="subtle" onClick={handleClick} disabled={isRotating}
       title="Start a fresh chat (current chat is kept)">
       {isRotating ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}
       {!isRotating && <span>Rotate</span>}
-    </button>
+    </Button>
   );
 }

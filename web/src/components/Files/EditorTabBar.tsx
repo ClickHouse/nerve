@@ -1,4 +1,5 @@
-import { X } from 'lucide-react';
+import { IconButton } from '../ui';
+import { X } from '../ui/icons';
 
 interface OpenFile {
   path: string;
@@ -19,7 +20,7 @@ export function EditorTabBar({ files, activePath, onSelect, onClose }: {
       {files.map(f => (
         <div
           key={f.path}
-          className={`flex items-center gap-1.5 px-3 py-2 text-[13px] cursor-pointer border-r border-border-subtle shrink-0
+          className={`flex items-center gap-1.5 px-3 py-2 text-sm cursor-pointer border-r border-border-subtle shrink-0
             ${f.path === activePath
               ? 'bg-bg text-text border-b-2 border-b-accent'
               : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
@@ -28,12 +29,15 @@ export function EditorTabBar({ files, activePath, onSelect, onClose }: {
         >
           <span>{f.name}</span>
           {f.modified && <span className="w-1.5 h-1.5 rounded-full bg-accent" />}
-          <button
+          {/* Named per tab: a row of identical "Close" buttons tells a screen
+              reader nothing about which file each one closes. */}
+          <IconButton
+            label={`Close ${f.name}`}
+            size="xs"
             onClick={(e) => { e.stopPropagation(); onClose(f.path); }}
-            className="p-0.5 hover:bg-border-subtle rounded cursor-pointer"
           >
             <X size={12} />
-          </button>
+          </IconButton>
         </div>
       ))}
     </div>

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { Button } from '../../ui';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface Props {
@@ -39,10 +40,19 @@ export function EmailRenderer({ content, rawContent, summary }: Props) {
     return <MarkdownRenderer content={content} />;
   }
 
-  // Inject base styles for dark-mode-friendly rendering.
-  // Many HTML emails have hardcoded light backgrounds — we let those render
-  // as-is since the iframe isolates them.  The base styles provide sensible
-  // defaults for emails without explicit styling.
+  // Base styles for the sandboxed document, deliberately light in BOTH themes.
+  //
+  // Not a token oversight: HTML email is authored against a white background,
+  // and a large share of it sets foreground colours (dark body text, dark table
+  // borders) without setting a background. Painting this document dark would
+  // leave that mail dark-on-dark and unreadable, which is worse than a light
+  // panel inside a dark page. The iframe is the isolation boundary that makes
+  // the choice safe: nothing here leaks into the app's palette, and the frame
+  // itself carries the app's border and radius.
+  //
+  // Consequence to keep in mind: `bg-white` on the frame below is load-bearing
+  // for the same reason — it stops a transparent-background email from
+  // rendering its dark text straight onto the app's dark surface.
   const styledHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
 body {
@@ -66,22 +76,15 @@ pre { white-space: pre-wrap; }
 
   return (
     <div>
-      {/* Toggle between HTML and text views */}
+      {/* Toggle between HTML and text views. The pill's active/inactive pair
+          is what these two were already spelling out by hand. */}
       <div className="flex items-center gap-1 mb-3">
-        <button
-          onClick={() => setShowHtml(true)}
-          className={`text-[12px] px-2 py-1 rounded transition-colors cursor-pointer
-            ${showHtml ? 'bg-accent/15 text-accent' : 'text-text-dim hover:text-text-muted'}`}
-        >
+        <Button variant="pill" size="xs" active={showHtml} onClick={() => setShowHtml(true)}>
           HTML
-        </button>
-        <button
-          onClick={() => setShowHtml(false)}
-          className={`text-[12px] px-2 py-1 rounded transition-colors cursor-pointer
-            ${!showHtml ? 'bg-accent/15 text-accent' : 'text-text-dim hover:text-text-muted'}`}
-        >
+        </Button>
+        <Button variant="pill" size="xs" active={!showHtml} onClick={() => setShowHtml(false)}>
           Text
-        </button>
+        </Button>
       </div>
 
       {showHtml ? (

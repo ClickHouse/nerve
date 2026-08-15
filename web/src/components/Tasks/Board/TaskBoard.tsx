@@ -142,7 +142,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   // itself were empty.
   if (searchQuery.trim() && lanes.every((lane) => lane.tasks.length === 0)) {
     return (
-      <div className="text-text-faint text-center py-10 text-[13px]">
+      <div className="text-text-faint text-center py-10 text-sm">
         No tasks matching &ldquo;{searchQuery.trim()}&rdquo;
       </div>
     );
@@ -151,7 +151,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
   return (
     <>
       {boardError && (
-        <div className="mx-4 mb-2 px-3 py-2 text-[12px] text-hue-red bg-red-400/10 border border-red-400/20 rounded-lg">
+        <div className="mx-4 mb-2 px-3 py-2 text-xs text-error bg-error-bg border border-error-border rounded-lg">
           {boardError}
         </div>
       )}
@@ -188,7 +188,7 @@ export function TaskBoard({ onOpenTask }: { onOpenTask: (task: Task) => void }) 
         <DragOverlay dropAnimation={null}>
           {activeTask && <BoardCardOverlay task={activeTask} />}
           {activeColumn && (
-            <div className="w-[300px] px-3 py-2.5 bg-surface-raised border border-accent/50 rounded-xl shadow-xl text-[13px] font-semibold text-text-secondary">
+            <div className="w-[300px] px-3 py-2.5 bg-surface-raised border border-accent/50 rounded-xl shadow-xl text-sm leading-tight font-semibold text-text-secondary">
               {statusByName.get(activeColumn)?.label ?? activeColumn}
             </div>
           )}

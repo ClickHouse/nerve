@@ -1,9 +1,10 @@
 import { memo } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Calendar, Clock, ExternalLink, Hourglass } from 'lucide-react';
 import type { Task } from '../../../api/client';
 import { formatTimeAgo } from '../../../utils/dateGroups';
+import { Badge } from '../../ui';
+import { Calendar, Clock, ExternalLink, Hourglass } from '../../ui/icons';
 
 /**
  * Deadline urgency, as a token class rather than a raw colour so it tracks
@@ -79,29 +80,27 @@ function BoardCardInner({ task, statusSince, onOpen }: BoardCardProps) {
         hover:border-border cursor-pointer transition-colors
         ${isDragging ? 'opacity-40' : ''}`}
     >
-      <h3 className="text-[13px] font-medium text-text leading-snug line-clamp-2 mb-2">
+      <h3 className="text-sm font-medium text-text leading-snug line-clamp-2 mb-2">
         {task.title}
       </h3>
 
       {tags.length > 0 && (
         <div className="flex flex-wrap gap-1 mb-2">
           {tags.slice(0, 3).map((tag) => (
-            <span
-              key={tag}
-              className="px-1.5 py-0.5 text-[10px] rounded bg-surface-raised text-text-dim border border-border-subtle"
-            >
-              {tag}
-            </span>
+            <Badge key={tag}>{tag}</Badge>
           ))}
           {tags.length > 3 && (
-            <span className="px-1 py-0.5 text-[10px] text-text-faint">
+            <span className="px-1 py-0.5 text-2xs text-text-faint">
               +{tags.length - 3}
             </span>
           )}
         </div>
       )}
 
-      <div className="flex items-center gap-2.5 text-[11px] flex-wrap">
+      {/* `text-xs` carries a 1rem line-height where `text-[11px]` inherited
+          `normal`; the meta line is the densest row on the board, so it keeps
+          its own leading rather than reverting to an arbitrary size. */}
+      <div className="flex items-center gap-2.5 text-xs leading-tight flex-wrap">
         {task.deadline && (
           <span className={`flex items-center gap-1 ${deadlineTone(task.deadline)}`}>
             <Calendar size={10} /> {task.deadline}
@@ -155,18 +154,13 @@ export function BoardCardOverlay({ task }: { task: Task }) {
   const tags = parseTags(task.tags);
   return (
     <div className="w-[272px] p-3 bg-surface border border-accent/50 rounded-lg shadow-xl rotate-2">
-      <h3 className="text-[13px] font-medium text-text leading-snug line-clamp-2">
+      <h3 className="text-sm font-medium text-text leading-snug line-clamp-2">
         {task.title}
       </h3>
       {tags.length > 0 && (
         <div className="flex flex-wrap gap-1 mt-2">
           {tags.slice(0, 3).map((tag) => (
-            <span
-              key={tag}
-              className="px-1.5 py-0.5 text-[10px] rounded bg-surface-raised text-text-dim border border-border-subtle"
-            >
-              {tag}
-            </span>
+            <Badge key={tag}>{tag}</Badge>
           ))}
         </div>
       )}
