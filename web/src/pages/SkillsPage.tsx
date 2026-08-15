@@ -93,7 +93,7 @@ function CreateSkillDialog() {
           <button
             onClick={handleCreate}
             disabled={!name.trim() || !description.trim() || actionLoading}
-            className="px-3 py-1.5 text-xs bg-accent text-white rounded hover:bg-accent-hover disabled:opacity-50 cursor-pointer disabled:cursor-default"
+            className="px-3 py-1.5 text-xs bg-accent text-on-accent rounded hover:bg-accent-hover disabled:opacity-50 cursor-pointer disabled:cursor-default"
           >
             {actionLoading ? 'Creating...' : 'Create Skill'}
           </button>
@@ -158,7 +158,7 @@ export function SkillsPage() {
           </button>
           <button
             onClick={() => setShowCreateDialog(true)}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover cursor-pointer"
+            className="flex items-center gap-1 px-2 py-1 text-xs bg-accent text-on-accent rounded hover:bg-accent-hover cursor-pointer"
           >
             <Plus size={12} />
             New Skill

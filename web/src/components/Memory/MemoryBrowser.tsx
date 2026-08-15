@@ -81,7 +81,7 @@ export function MemoryBrowser() {
                     <button
                       onClick={saveFile}
                       disabled={saving}
-                      className="text-xs px-2 py-1 bg-accent rounded text-white cursor-pointer"
+                      className="text-xs px-2 py-1 bg-accent rounded text-on-accent cursor-pointer"
                     >
                       {saving ? 'Saving...' : 'Save'}
                     </button>

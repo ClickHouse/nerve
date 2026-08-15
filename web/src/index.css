@@ -23,7 +23,109 @@
 @import "tailwindcss";
 @import "highlight.js/styles/github-dark.min.css";
 
-/* ── Theme tokens ── */
+/* ═══════════════════════════════════════════════════════════════════════════
+   MIGRATION REFERENCE — read this before touching a className.
+
+   Everything below is generated from Click UI's design tokens. Nerve keeps its
+   own `--theme-*` names (2,495 utility call sites depend on them) but every
+   value now derives from a Click UI token, so light/dark switching is handled
+   by `data-cui-theme` on <html> and there is exactly one palette definition.
+
+   ───────────────────────────────────────────────────────────────────────────
+   1. TYPE SCALE — replace every `text-[Npx]` with a named step.
+
+   Click UI's scale is 10/12/14/16/18/20/32px. Tailwind's built-in
+   xs/sm/base/lg/xl are already 12/14/16/18/20, so they ARE the Click UI scale
+   and are NOT redefined. Only the 10px step (`text-2xs`) and the 32px display
+   step (`text-display`) are added.
+
+       OLD                NEW             PX    NOTE
+       text-[9px]      →  text-2xs        10    round up
+       text-[10px]     →  text-2xs        10
+       text-[11px]     →  text-xs         12    round up
+       text-[12px]     →  text-xs         12
+       text-[12.5px]   →  text-xs         12
+       text-[13px]     →  text-sm         14    round up
+       text-[13.5px]   →  text-sm         14
+       text-[14px]     →  text-sm         14
+       text-[15px]     →  text-base       16    round up
+       text-[16px]     →  text-base       16
+       text-[18px]     →  text-lg         18
+       text-[20px]     →  text-xl         20
+       text-[32px]     →  text-display    32
+
+       text-xs / text-sm / text-base / text-lg / text-xl  — UNCHANGED, keep
+       using them. Nothing about Tailwind's built-in sizes was redefined.
+
+   Two consequences of leaving the built-ins alone, both intended:
+     • A named step carries a line-height; `text-[Npx]` did not (it inherited
+       `normal`). So `text-[12px]` → `text-xs` also gains `line-height: 1rem`,
+       `text-[13px]` → `text-sm` gains `1.25rem`. Rows get slightly roomier.
+       If a row must stay tight, add an explicit `leading-*` — do NOT go back
+       to an arbitrary pixel size.
+     • `text-2xs` ships 10px/14px so the densest rows stay dense.
+
+   ───────────────────────────────────────────────────────────────────────────
+   2. STATUS TOKENS — replace raw palette utilities (`emerald`/`red`/`amber`/
+      `blue`/`green`/`slate`-400/500 with /10–/25 alpha) with these.
+
+   Each status has three variants, and the suffix names the CSS property it is
+   for, so there is nothing to guess:
+
+       STATUS    text (+ solid fill)   tinted surface     tinted border
+       success   text-success          bg-success-bg      border-success-border
+       error     text-error            bg-error-bg        border-error-border
+       warning   text-warning          bg-warning-bg      border-warning-border
+       info      text-info             bg-info-bg         border-info-border
+       neutral   text-neutral          bg-neutral-bg      border-neutral-bg
+
+   Typical rewrite:
+       bg-emerald-400/10 border border-emerald-400/25 text-emerald-400
+     → bg-success-bg     border border-success-border  text-success
+
+       bg-red-500  (solid chip/dot)   → bg-error
+       bg-blue-400 (solid chip/dot)   → bg-info
+
+   `-bg` is an opaque tint from `--global-color-feedback-*-background`; do not
+   stack an alpha modifier on it. `-border` is the foreground at 30% alpha, so
+   it reads on top of the matching `-bg`. Nerve's `error` is Click UI's
+   `danger`; the token name stays `error` because call sites already use it.
+
+   Hue identity colours (`text-hue-red`, `text-hue-emerald`, …) are for tool /
+   badge / category IDENTITY, not status. Keep using them for that; use the
+   status tokens above whenever the colour means "this succeeded / failed".
+
+   ───────────────────────────────────────────────────────────────────────────
+   3. ACCENT IS NOW CLICKHOUSE YELLOW IN DARK MODE.
+
+   `--theme-accent` is #faff69 (dark) / #151515 (light). White text on it is
+   unreadable in dark mode, so every `bg-accent … text-white` MUST become:
+
+       bg-accent text-white  →  bg-accent text-on-accent
+
+   `text-on-accent` is Click UI's primary-button text colour (#1f1f1c dark /
+   #ffffff light) and stays legible in both themes. Same for `bg-accent-hover`.
+   `text-accent` on a page/`bg-accent/10` surface is fine as-is.
+
+   ───────────────────────────────────────────────────────────────────────────
+   4. FONTS. Inter (sans) and Inconsolata (mono) are self-hosted via
+   @fontsource and imported in main.tsx. Use `font-mono` for monospace; it now
+   resolves to Click UI's mono stack. Click UI also names 'Basier Square' for
+   display type — it is commercial, we do not ship it, and it falls back to
+   Inter. There is no `font-display` utility for that reason.
+
+   ───────────────────────────────────────────────────────────────────────────
+   5. NOT AVAILABLE. `prose*` classes appear in SourcesPage.tsx and
+   Sources/renderers/MarkdownRenderer.tsx but @tailwindcss/typography is not
+   installed, so they generate nothing today. Do not build on them — use
+   `.markdown-content` (defined below) instead.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Tailwind colour theme ──
+   `inline` matters: it makes `bg-accent/15` expand to
+   color-mix(… var(--theme-accent) …) instead of going through a second
+   indirection, which is what keeps alpha modifiers working on tokens whose
+   value changes at runtime with the theme. */
 @theme inline {
   /* Surfaces */
   --color-bg: var(--theme-bg);
@@ -47,13 +149,26 @@
   --color-accent-hover: var(--theme-accent-hover);
   --color-accent-muted: var(--theme-accent-muted);
   --color-accent-text: var(--theme-accent-text);
+  --color-on-accent: var(--theme-on-accent);
   /* Links */
   --color-link: var(--theme-link);
-  /* Semantic */
+  --color-link-hover: var(--theme-link-hover);
+  /* Semantic status — text/solid, tinted surface, tinted border */
   --color-success: var(--theme-success);
+  --color-success-bg: var(--theme-success-bg);
+  --color-success-border: var(--theme-success-border);
   --color-error: var(--theme-error);
+  --color-error-bg: var(--theme-error-bg);
+  --color-error-border: var(--theme-error-border);
   --color-warning: var(--theme-warning);
+  --color-warning-bg: var(--theme-warning-bg);
+  --color-warning-border: var(--theme-warning-border);
   --color-info: var(--theme-info);
+  --color-info-bg: var(--theme-info-bg);
+  --color-info-border: var(--theme-info-border);
+  --color-neutral: var(--theme-neutral);
+  --color-neutral-bg: var(--theme-neutral-bg);
+  --color-neutral-border: var(--theme-neutral-border);
   /* Diff */
   --color-diff-add: var(--theme-diff-add);
   --color-diff-del: var(--theme-diff-del);
@@ -72,6 +187,21 @@
   --color-hue-teal: var(--theme-hue-teal);
   --color-hue-sky: var(--theme-hue-sky);
   --color-hue-violet: var(--theme-hue-violet);
+
+  /* Font stacks — sourced from Click UI so there is one definition. The
+     fallback list keeps text readable if the token layer has not loaded. */
+  --font-sans: var(--typography-font-families-regular, "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
+  --font-mono: var(--typography-font-families-mono, "Inconsolata", ui-monospace, "SFMono-Regular", Consolas, monospace);
+}
+
+/* ── Tailwind type scale ──
+   Only the two steps Tailwind lacks. xs/sm/base/lg/xl already equal Click UI's
+   12/14/16/18/20 and are deliberately left untouched — see §1 above. */
+@theme {
+  --text-2xs: 0.625rem;                        /* 10px — Click UI font-sizes-0 */
+  --text-2xs--line-height: calc(0.875 / 0.625);/* 14px, keeps dense rows dense */
+  --text-display: 2rem;                        /* 32px — Click UI font-sizes-6 */
+  --text-display--line-height: calc(2.5 / 2);  /* 40px */
 }
 
 /* ── Layout (theme-independent) ── */
@@ -79,150 +209,141 @@
   /* Conversation reading-column max width. Defaults to the previous fixed
      768px cap; ChatWidthHandle overrides this on :root at runtime so the
      column is drag-resizable (persisted to localStorage 'nerve_chat_width'). */
-  --chat-width: 48rem; /* 768px */
+  --chat-width: 48rem;
 }
 
-/* ── Dark palette (default) ── */
+/* ═══ Palette ═══
+   Unlayered on purpose. Click UI's tokens live in the `clickui` layer, so
+   unlayered declarations here outrank them and we can safely re-point Nerve's
+   names at Click UI's without an !important anywhere.
+
+   There is only ONE definition of almost every `--theme-*` variable, because
+   the Click UI globals it derives from are themselves defined twice — on
+   `:root, [data-cui-theme="light"]` and on `[data-cui-theme="dark"]` — and
+   themeStore always writes the *resolved* theme to `data-cui-theme` (including
+   when the preference is 'system', and it re-writes on OS change). So the
+   theme switch happens one level down and the old `@media
+   (prefers-color-scheme: light)` duplicate of this whole block is gone. */
 :root {
+  /* Surfaces. Click UI gives two page surfaces (background-default and
+     background-muted); the intermediate steps interpolate towards
+     stroke-default, which is the next tone up in dark and the next tone down
+     in light — so one formula produces the right direction in both themes. */
+  --theme-bg: var(--click-global-color-background-default);
+  --theme-surface: var(--click-global-color-background-muted);
+  --theme-surface-raised: color-mix(in oklab, var(--click-global-color-background-muted) 50%, var(--click-global-color-stroke-default));
+  --theme-surface-hover: color-mix(in oklab, var(--click-global-color-background-muted) 25%, var(--click-global-color-stroke-default));
+  /* Code wells match the muted surface (Click UI's own code/split tone); the
+     1px border on `.markdown-content pre` is what separates them. */
+  --theme-code-bg: var(--click-global-color-background-muted);
+  /* --theme-bg-sunken is defined per theme below: "recessed" is darker than the
+     page in both themes, and a single percentage cannot move white and #1f1f1c
+     by the same perceptual amount. */
+
+  /* Text. Click UI ships three levels (default / muted / disabled); Nerve needs
+     five, so secondary and faint are interpolated. */
+  --theme-text: var(--click-global-color-text-default);
+  --theme-text-secondary: color-mix(in oklab, var(--click-global-color-text-default) 70%, var(--click-global-color-text-muted));
+  --theme-text-muted: var(--click-global-color-text-muted);
+  --theme-text-dim: var(--click-global-color-text-disabled);
+  --theme-text-faint: color-mix(in oklab, var(--click-global-color-text-disabled) 70%, var(--click-global-color-background-default));
+  --theme-placeholder: var(--click-global-color-text-disabled);
+
+  /* Borders. stroke-muted is identical to stroke-default in both Click UI
+     themes, so `subtle` fades stroke-default towards the page instead. */
+  --theme-border: var(--click-global-color-stroke-default);
+  --theme-border-subtle: color-mix(in oklab, var(--click-global-color-stroke-default) 75%, var(--click-global-color-background-default));
+
+  /* Accent — ClickHouse yellow in dark, near-black in light. `on-accent` is the
+     only legible text colour on top of it; see §3 above. */
+  --theme-accent: var(--click-global-color-accent-default);
+  --theme-accent-hover: var(--click-button-basic-color-primary-background-hover);
+  --theme-accent-muted: color-mix(in oklab, var(--click-global-color-accent-default) 15%, transparent);
+  --theme-accent-text: var(--click-global-color-accent-default);
+  --theme-on-accent: var(--click-button-basic-color-primary-text-default);
+
+  /* Links */
+  --theme-link: var(--click-global-color-text-link-default);
+  --theme-link-hover: var(--click-global-color-text-link-hover);
+
+  /* Status. Click UI's feedback pairs are foreground (text/icon) + background
+     (opaque tint); the border is the foreground at 30% so it reads on the tint. */
+  --theme-success: var(--global-color-feedback-success-foreground);
+  --theme-success-bg: var(--global-color-feedback-success-background);
+  --theme-success-border: color-mix(in oklab, var(--global-color-feedback-success-foreground) 30%, transparent);
+  --theme-error: var(--global-color-feedback-danger-foreground);
+  --theme-error-bg: var(--global-color-feedback-danger-background);
+  --theme-error-border: color-mix(in oklab, var(--global-color-feedback-danger-foreground) 30%, transparent);
+  --theme-warning: var(--global-color-feedback-warning-foreground);
+  --theme-warning-bg: var(--global-color-feedback-warning-background);
+  --theme-warning-border: color-mix(in oklab, var(--global-color-feedback-warning-foreground) 30%, transparent);
+  --theme-info: var(--global-color-feedback-info-foreground);
+  --theme-info-bg: var(--global-color-feedback-info-background);
+  --theme-info-border: color-mix(in oklab, var(--global-color-feedback-info-foreground) 30%, transparent);
+  --theme-neutral: var(--global-color-feedback-neutral-foreground);
+  --theme-neutral-bg: var(--global-color-feedback-neutral-background);
+  --theme-neutral-border: var(--global-color-feedback-neutral-stroke);
+
+  /* Diff. Same four names and same meanings as before — `*-bg` is the row tint,
+     the other two are the +/- indicator and gutter colour. Chat/diffTheme.ts
+     forwards all four into the @pierre/diffs shadow root, so do not rename
+     them. Deriving them from the feedback pair means the tint is pale-on-dark
+     and dark-on-light automatically. */
+  --theme-diff-add: var(--global-color-feedback-success-foreground);
+  --theme-diff-del: var(--global-color-feedback-danger-foreground);
+  --theme-diff-add-bg: var(--global-color-feedback-success-background);
+  --theme-diff-del-bg: var(--global-color-feedback-danger-background);
+}
+
+/* ── Per-theme remainder ──
+   `--palette-*` is the raw ramp: 152 entries with identical values in both
+   Click UI theme files, so anything derived from it has to pick its own step
+   per theme. That is the whole reason these two blocks exist; keep them small.
+   Same specificity as each other (0,1,0), so the light block wins by coming
+   second whenever the attribute says light. */
+:root,
+[data-cui-theme="dark"] {
   color-scheme: dark;
-  --theme-bg: #0f0f0f;
-  --theme-bg-sunken: #0c0c0c;
-  --theme-surface: #141414;
-  --theme-surface-raised: #1a1a1a;
-  --theme-surface-hover: #1f1f1f;
-  --theme-code-bg: #161616;
-  --theme-text: #e0e0e0;
-  --theme-text-secondary: #cccccc;
-  --theme-text-muted: #888888;
-  --theme-text-dim: #666666;
-  --theme-text-faint: #444444;
-  --theme-placeholder: #555555;
-  --theme-border: #2a2a2a;
-  --theme-border-subtle: #222222;
-  --theme-accent: #6366f1;
-  --theme-accent-hover: #818cf8;
-  --theme-accent-muted: rgba(99, 102, 241, 0.15);
-  --theme-accent-text: #c7d2fe;
-  --theme-link: #818cf8;
-  --theme-success: #4ade80;
-  --theme-error: #f87171;
-  --theme-warning: #fbbf24;
-  --theme-info: #60a5fa;
-  --theme-diff-add: var(--color-green-300);    /* original: light pastel text */
-  --theme-diff-del: var(--color-red-300);      /* original: light pastel text */
-  --theme-diff-add-bg: var(--color-green-950); /* original: very dark tint base */
-  --theme-diff-del-bg: var(--color-red-950);   /* original: very dark tint base */
-  /* Hue indicators: -400 for dark mode (bright on dark bg) */
-  --theme-hue-yellow: var(--color-yellow-400);
-  --theme-hue-blue: var(--color-blue-400);
-  --theme-hue-emerald: var(--color-emerald-400);
-  --theme-hue-green: var(--color-green-400);
-  --theme-hue-red: var(--color-red-400);
-  --theme-hue-purple: var(--color-purple-400);
-  --theme-hue-amber: var(--color-amber-400);
-  --theme-hue-cyan: var(--color-cyan-400);
-  --theme-hue-orange: var(--color-orange-400);
-  --theme-hue-teal: var(--color-teal-400);
-  --theme-hue-sky: var(--color-sky-400);
-  --theme-hue-violet: var(--color-violet-400);
+  --theme-bg-sunken: var(--palette-neutral-800);   /* #1d1d1d, under #1f1f1c */
+  /* Identity hues — bright steps so they carry on a dark page. */
+  --theme-hue-yellow: var(--palette-brand-300);    /* #faff69 */
+  --theme-hue-amber: var(--palette-sunrise-300);   /* #ffcf33 */
+  --theme-hue-orange: var(--palette-warning-300);  /* #ff9457 */
+  --theme-hue-red: var(--palette-danger-300);      /* #ff7575 */
+  --theme-hue-emerald: var(--palette-success-300); /* #66ff73 */
+  --theme-hue-green: var(--palette-success-400);   /* #33ff44 */
+  --theme-hue-teal: var(--palette-teal-300);       /* #6df8e1 */
+  --theme-hue-cyan: var(--palette-babyblue-300);   /* #33e4ff */
+  --theme-hue-sky: var(--palette-info-300);        /* #6d9bf3 */
+  --theme-hue-blue: var(--palette-info-400);       /* #437eef */
+  --theme-hue-violet: var(--palette-violet-300);   /* #cc66ff */
+  --theme-hue-purple: var(--palette-violet-400);   /* #bb33ff */
 }
 
-/* ── Light palette (explicit) ── */
-[data-theme="light"] {
+[data-cui-theme="light"] {
   color-scheme: light;
-  --theme-bg: #f5f5f5;
-  --theme-bg-sunken: #ebebeb;
-  --theme-surface: #ffffff;
-  --theme-surface-raised: #f8f8f8;
-  --theme-surface-hover: #e8e8e8;
-  --theme-code-bg: #f3f4f6;
-  --theme-text: #1a1a1a;
-  --theme-text-secondary: #333333;
-  --theme-text-muted: #666666;
-  --theme-text-dim: #999999;
-  --theme-text-faint: #bbbbbb;
-  --theme-placeholder: #9ca3af;
-  --theme-border: #d4d4d4;
-  --theme-border-subtle: #e5e7eb;
-  --theme-accent: #4f46e5;
-  --theme-accent-hover: #4338ca;
-  --theme-accent-muted: rgba(79, 70, 229, 0.10);
-  --theme-accent-text: #3730a3;
-  --theme-link: #4f46e5;
-  --theme-success: #16a34a;
-  --theme-error: #dc2626;
-  --theme-warning: #d97706;
-  --theme-info: #2563eb;
-  --theme-diff-add: var(--color-green-800);    /* dark text on light bg */
-  --theme-diff-del: var(--color-red-800);      /* dark text on light bg */
-  --theme-diff-add-bg: var(--color-green-300); /* light tint base */
-  --theme-diff-del-bg: var(--color-red-300);   /* light tint base */
-  /* Hue indicators: -600 for light mode (dark on light bg) */
-  --theme-hue-yellow: var(--color-yellow-600);
-  --theme-hue-blue: var(--color-blue-600);
-  --theme-hue-emerald: var(--color-emerald-600);
-  --theme-hue-green: var(--color-green-600);
-  --theme-hue-red: var(--color-red-600);
-  --theme-hue-purple: var(--color-purple-600);
-  --theme-hue-amber: var(--color-amber-600);
-  --theme-hue-cyan: var(--color-cyan-600);
-  --theme-hue-orange: var(--color-orange-400);
-  --theme-hue-teal: var(--color-teal-600);
-  --theme-hue-sky: var(--color-sky-600);
-  --theme-hue-violet: var(--color-violet-600);
+  --theme-bg-sunken: var(--palette-slate-50);      /* #f6f7fa, under #ffffff */
+  /* Identity hues — dark steps so they carry on a white page. */
+  --theme-hue-yellow: var(--palette-brand-700);    /* #686b00 */
+  --theme-hue-amber: var(--palette-sunrise-700);   /* #8a6900 */
+  --theme-hue-orange: var(--palette-warning-700);  /* #a33c00 */
+  --theme-hue-red: var(--palette-danger-600);      /* #c10000 */
+  --theme-hue-emerald: var(--palette-success-700); /* #008a0b */
+  --theme-hue-green: var(--palette-success-800);   /* #006108 */
+  --theme-hue-teal: var(--palette-teal-700);       /* #067462 */
+  --theme-hue-cyan: var(--palette-babyblue-700);   /* #006170 */
+  --theme-hue-sky: var(--palette-info-500);        /* #1d64ec */
+  --theme-hue-blue: var(--palette-info-600);       /* #104ec6 */
+  --theme-hue-violet: var(--palette-violet-600);   /* #8800cc */
+  --theme-hue-purple: var(--palette-violet-700);   /* #660099 */
 }
 
-/* ── System preference (when no explicit data-theme) ── */
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    color-scheme: light;
-    --theme-bg: #f5f5f5;
-    --theme-bg-sunken: #ebebeb;
-    --theme-surface: #ffffff;
-    --theme-surface-raised: #f8f8f8;
-    --theme-surface-hover: #e8e8e8;
-    --theme-code-bg: #f3f4f6;
-    --theme-text: #1a1a1a;
-    --theme-text-secondary: #333333;
-    --theme-text-muted: #666666;
-    --theme-text-dim: #999999;
-    --theme-text-faint: #bbbbbb;
-    --theme-placeholder: #9ca3af;
-    --theme-border: #d4d4d4;
-    --theme-border-subtle: #e5e7eb;
-    --theme-accent: #4f46e5;
-    --theme-accent-hover: #4338ca;
-    --theme-accent-muted: rgba(79, 70, 229, 0.10);
-    --theme-accent-text: #3730a3;
-    --theme-link: #4f46e5;
-    --theme-success: #16a34a;
-    --theme-error: #dc2626;
-    --theme-warning: #d97706;
-    --theme-info: #2563eb;
-    --theme-diff-add: var(--color-green-800);    /* dark text on light bg */
-    --theme-diff-del: var(--color-red-800);      /* dark text on light bg */
-    --theme-diff-add-bg: var(--color-green-300); /* light tint base */
-    --theme-diff-del-bg: var(--color-red-300);   /* light tint base */
-    --theme-hue-yellow: var(--color-yellow-600);
-    --theme-hue-blue: var(--color-blue-600);
-    --theme-hue-emerald: var(--color-emerald-600);
-    --theme-hue-green: var(--color-green-600);
-    --theme-hue-red: var(--color-red-600);
-    --theme-hue-purple: var(--color-purple-600);
-    --theme-hue-amber: var(--color-amber-600);
-    --theme-hue-cyan: var(--color-cyan-600);
-    --theme-hue-orange: var(--color-orange-400);
-    --theme-hue-teal: var(--color-teal-600);
-    --theme-hue-sky: var(--color-sky-600);
-    --theme-hue-violet: var(--color-violet-600);
-  }
-}
 
 body {
   margin: 0;
   background: var(--theme-bg);
   color: var(--theme-text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--typography-font-families-regular, "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
 }
 
 * { box-sizing: border-box; }
@@ -237,14 +358,13 @@ body {
    to a greyer surface so the two roles read as distinct bands when scrolling. */
 .msg-assistant { background: var(--theme-bg-sunken); }
 .msg-user { background: var(--theme-surface-hover); }
-/* Light: invert — assistant messages are lighter (white) to stand out; user
-   prompts stay on the page bg (already distinct from the white assistant band). */
-[data-theme="light"] .msg-assistant { background: var(--theme-surface); }
-[data-theme="light"] .msg-user { background: transparent; }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .msg-assistant { background: var(--theme-surface); }
-  :root:not([data-theme="dark"]) .msg-user { background: transparent; }
-}
+/* Light: the page is white, so "stand out" has to mean the tinted surface
+   rather than a lighter one — the polarity flips but the two roles still read
+   as alternating bands. Keyed on `data-cui-theme` (always the resolved theme,
+   so this also covers preference='system'), which is why the old
+   prefers-color-scheme duplicate is gone. */
+[data-cui-theme="light"] .msg-assistant { background: var(--theme-surface); }
+[data-cui-theme="light"] .msg-user { background: transparent; }
 
 /* Markdown rendering styles */
 .markdown-content h1 { font-size: 1.5em; font-weight: 600; margin: 0.8em 0 0.4em; }
@@ -255,7 +375,7 @@ body {
 .markdown-content li { margin: 0.2em 0; line-height: 1.5; }
 .markdown-content blockquote { border-left: 3px solid var(--theme-text-faint); padding-left: 1em; margin: 0.5em 0; color: var(--theme-text-muted); }
 .markdown-content a { color: var(--theme-link); text-decoration: none; }
-.markdown-content a:hover { text-decoration: underline; }
+.markdown-content a:hover { color: var(--theme-link-hover); text-decoration: underline; }
 .markdown-content table { border-collapse: collapse; margin: 0.5em 0; width: 100%; }
 .markdown-content th, .markdown-content td { border: 1px solid var(--theme-border-subtle); padding: 0.4em 0.8em; text-align: left; }
 .markdown-content th { background: var(--theme-surface-raised); font-weight: 600; }
@@ -269,7 +389,7 @@ body {
   padding: 0.15em 0.4em;
   border-radius: 3px;
   font-size: 0.9em;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--typography-font-families-mono, "Inconsolata", ui-monospace, "SFMono-Regular", Consolas, monospace);
 }
 
 /* Code blocks */
@@ -285,52 +405,43 @@ body {
 .markdown-content pre code {
   background: none;
   padding: 0;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--typography-font-families-mono, "Inconsolata", ui-monospace, "SFMono-Regular", Consolas, monospace);
 }
 
 /* File editor line numbers */
 .editor-textarea {
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--typography-font-families-mono, "Inconsolata", ui-monospace, "SFMono-Regular", Consolas, monospace);
   tab-size: 2;
   line-height: 1.5;
 }
 
-/* ── Highlight.js light mode overrides ── */
-/* Both explicit [data-theme="light"] and system-preference light share the same syntax palette.
-   We use :is() to merge selectors and avoid duplication. */
-:is([data-theme="light"], :root:not([data-theme="dark"]):where(@media (prefers-color-scheme: light) *)) .hljs {
-  color: #24292e;
-  background: var(--theme-code-bg);
-}
-[data-theme="light"] .hljs { color: #24292e; background: var(--theme-code-bg); }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .hljs { color: #24292e; background: var(--theme-code-bg); }
-}
-
-/* Shared light syntax colors — helper class applied via both selectors */
-[data-theme="light"] .hljs-comment, [data-theme="light"] .hljs-quote { color: #6a737d; }
-[data-theme="light"] .hljs-keyword, [data-theme="light"] .hljs-selector-tag { color: #d73a49; }
-[data-theme="light"] .hljs-string { color: #032f62; }
-[data-theme="light"] .hljs-number, [data-theme="light"] .hljs-literal { color: #005cc5; }
-[data-theme="light"] .hljs-built_in, [data-theme="light"] .hljs-type { color: #e36209; }
-[data-theme="light"] .hljs-title, [data-theme="light"] .hljs-section, [data-theme="light"] .hljs-name { color: #6f42c1; }
-[data-theme="light"] .hljs-attr, [data-theme="light"] .hljs-attribute { color: #005cc5; }
-[data-theme="light"] .hljs-variable { color: #e36209; }
-[data-theme="light"] .hljs-deletion { color: #b31d28; background: #ffeef0; }
-[data-theme="light"] .hljs-addition { color: #22863a; background: #f0fff4; }
-
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .hljs-comment, :root:not([data-theme="dark"]) .hljs-quote { color: #6a737d; }
-  :root:not([data-theme="dark"]) .hljs-keyword, :root:not([data-theme="dark"]) .hljs-selector-tag { color: #d73a49; }
-  :root:not([data-theme="dark"]) .hljs-string { color: #032f62; }
-  :root:not([data-theme="dark"]) .hljs-number, :root:not([data-theme="dark"]) .hljs-literal { color: #005cc5; }
-  :root:not([data-theme="dark"]) .hljs-built_in, :root:not([data-theme="dark"]) .hljs-type { color: #e36209; }
-  :root:not([data-theme="dark"]) .hljs-title, :root:not([data-theme="dark"]) .hljs-section, :root:not([data-theme="dark"]) .hljs-name { color: #6f42c1; }
-  :root:not([data-theme="dark"]) .hljs-attr, :root:not([data-theme="dark"]) .hljs-attribute { color: #005cc5; }
-  :root:not([data-theme="dark"]) .hljs-variable { color: #e36209; }
-  :root:not([data-theme="dark"]) .hljs-deletion { color: #b31d28; background: #ffeef0; }
-  :root:not([data-theme="dark"]) .hljs-addition { color: #22863a; background: #f0fff4; }
-}
+/* ── Highlight.js light mode overrides ──
+   github-dark.min.css is imported unconditionally above (unlayered, all rules
+   at specificity 0,1,0) and patched here for light mode at 0,2,0. Previously
+   this section existed three times: an invalid `:where(@media …)` selector that
+   never matched, a `[data-theme="light"]` copy, and a prefers-color-scheme copy
+   with the same ten hardcoded GitHub-light hexes. One block now, keyed on
+   `data-cui-theme` so it also covers preference='system', and driven off the
+   Click UI palette so the syntax colours belong to the same system as the
+   rest of the UI. */
+[data-cui-theme="light"] .hljs { color: var(--theme-text); background: var(--theme-code-bg); }
+[data-cui-theme="light"] .hljs-comment,
+[data-cui-theme="light"] .hljs-quote { color: var(--palette-slate-600); }
+[data-cui-theme="light"] .hljs-keyword,
+[data-cui-theme="light"] .hljs-selector-tag { color: var(--palette-danger-600); }
+[data-cui-theme="light"] .hljs-string { color: var(--palette-info-700); }
+[data-cui-theme="light"] .hljs-number,
+[data-cui-theme="light"] .hljs-literal { color: var(--palette-info-600); }
+[data-cui-theme="light"] .hljs-built_in,
+[data-cui-theme="light"] .hljs-type { color: var(--palette-warning-700); }
+[data-cui-theme="light"] .hljs-title,
+[data-cui-theme="light"] .hljs-section,
+[data-cui-theme="light"] .hljs-name { color: var(--palette-violet-600); }
+[data-cui-theme="light"] .hljs-attr,
+[data-cui-theme="light"] .hljs-attribute { color: var(--palette-info-600); }
+[data-cui-theme="light"] .hljs-variable { color: var(--palette-warning-700); }
+[data-cui-theme="light"] .hljs-deletion { color: var(--theme-diff-del); background: var(--theme-diff-del-bg); }
+[data-cui-theme="light"] .hljs-addition { color: var(--theme-diff-add); background: var(--theme-diff-add-bg); }
 
 /* Pulse animation for streaming cursor */
 @keyframes blink {
@@ -399,13 +510,11 @@ body {
   animation: rewrite-shimmer 1.4s ease-in-out infinite;
 }
 
-/* Plan panel slide-in */
+/* Plan panel slide-in. The `.plan-panel` class rule had zero call sites and was
+   deleted; the keyframe is kept so a plan panel can opt back in. */
 @keyframes plan-panel-enter {
   from { opacity: 0; transform: translateX(20px); }
   to { opacity: 1; transform: translateX(0); }
-}
-.plan-panel {
-  animation: plan-panel-enter 0.15s ease-out;
 }
 
 /* Question block entry */
@@ -454,17 +563,8 @@ body {
   .todo-row,
   .quote-card,
   .rewrite-card,
-  .plan-panel,
   .question-block,
   .question-option {
     animation: none;
   }
-}
-
-/* Line clamp utility */
-.line-clamp-2 {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }

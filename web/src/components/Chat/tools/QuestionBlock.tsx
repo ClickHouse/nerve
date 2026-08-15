@@ -189,7 +189,7 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
               disabled={!allAnswered}
               className={`w-full py-2 rounded-md text-[13px] font-medium transition-all duration-150 flex items-center justify-center gap-2 ${
                 allAnswered
-                  ? 'bg-accent hover:bg-accent-hover text-white cursor-pointer'
+                  ? 'bg-accent hover:bg-accent-hover text-on-accent cursor-pointer'
                   : 'bg-surface text-text-faint cursor-not-allowed'
               }`}
             >

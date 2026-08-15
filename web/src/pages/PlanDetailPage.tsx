@@ -220,7 +220,7 @@ export function PlanDetailPage() {
                     <button
                       onClick={handleRevise}
                       disabled={actionLoading || !feedback.trim()}
-                      className="px-4 py-2 text-[13px] bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-lg cursor-pointer"
+                      className="px-4 py-2 text-[13px] bg-accent hover:bg-accent-hover disabled:opacity-50 text-on-accent rounded-lg cursor-pointer"
                     >
                       Send Revision Request
                     </button>
