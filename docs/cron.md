@@ -411,12 +411,32 @@ These ship in `<workspace>/config/cron/system.yaml` and are managed by `nerve in
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | ✅ default |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
+| `pr-feedback-harvester` | Weekly (Mon 4 AM) | persistent (168h rotation) | Reads review feedback on the last week of PRs the agent authored, clusters it into recurring themes, and proposes skill or instruction-file updates via task+plan. Needs an authenticated `gh` CLI or a GitHub sync source. | ✅ optional | ✅ default |
 
 **Mode defaults:**
-- **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are presented as optional during `nerve init`.
-- **Worker** — `memory-maintenance` (always on) + `task-planner` + `skill-extractor` + `skill-reviser` enabled by default. `inbox-processor` is not included (workers don't have sync sources).
+- **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor`, `skill-reviser`, and `pr-feedback-harvester` are presented as optional during `nerve init`.
+- **Worker** — `memory-maintenance` (always on) + `task-planner` + `skill-extractor` + `skill-reviser` + `pr-feedback-harvester` enabled by default. `inbox-processor` is not included (workers don't have sync sources).
 
 Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, the plan approval handler creates/updates the skill directly from the plan content (which is a full SKILL.md file) instead of spawning an implementation session.
+
+### The skill feedback loop
+
+The three skill jobs are deliberately split by where their evidence comes from:
+
+| Job | Evidence | Answers |
+|-----|----------|---------|
+| `skill-extractor` | memory + recent activity | "What do I keep doing that isn't written down?" |
+| `skill-reviser` | the SKILL.md files themselves | "Is what's written down still true?" |
+| `pr-feedback-harvester` | review comments on the agent's own PRs | "What do reviewers keep telling me I got wrong?" |
+
+Only the harvester reads anything from outside the instance, which makes it the one path by which an outside correction can reach a skill. It classifies each cluster before proposing:
+
+- **General** (commit hygiene, testing discipline, security habits) → a generic skill, or a workspace instruction file such as `AGENTS.md` via `propose_config_change`.
+- **Repo-specific** (build commands, module layout, local conventions) → that repository's own dev skill, creating one if it doesn't exist.
+
+Its tasks use `source="pr-feedback-harvester"`, which is **not** in the `plan_type` auto-detection map — a cluster can produce either a new skill or a revision, so the job passes `plan_type="skill-create"` / `"skill-update"` explicitly. Omitting it silently yields a `generic` plan that spawns an implementation session instead of writing the skill.
+
+Because it ingests third-party text and then proposes edits to the agent's own instructions, its prompt carries an explicit prompt-injection guard: comments are read as evidence of what a reviewer wanted, never as instructions. Keep that guard if you customize the prompt.
 
 ## Persistent Timers
 
