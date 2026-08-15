@@ -1,10 +1,19 @@
-/* Cascade layer order. Click UI ships all its styles — component rules AND its
-   design tokens — inside a single `clickui` layer. Declaring that layer FIRST
-   here means every Tailwind layer, and any unlayered app CSS, outranks it no
-   matter what order Vite happens to inject the CSS Module stylesheets in.
-   Without this line the precedence depends on import order and is not
-   deterministic. */
-@layer clickui, theme, base, components, utilities;
+/* Cascade layer order — load-bearing, do not reorder.
+   Click UI ships all its styles (component rules AND design tokens) in one
+   `clickui` layer. Layer order beats selector specificity, so this line alone
+   decides who wins, and both neighbours matter:
+
+     base < clickui   Tailwind's preflight resets bare `button`/`input`/`select`
+                      /`textarea` to transparent, zero-padding, zero-radius,
+                      font:inherit. If preflight outranked click-ui, every
+                      Click UI control would render unstyled.
+     clickui < utilities
+                      so `className="mt-4"` on a Click UI component still wins,
+                      with no `!important`.
+
+   Declaring it explicitly also removes the dependency on the order Vite happens
+   to inject the CSS Module stylesheets in, which is not guaranteed. */
+@layer theme, base, clickui, components, utilities;
 
 /* Click UI's own stylesheets are NOT imported here: <ClickUIProvider> pulls in
    tokens-light.css / tokens-dark.css / global.css itself, and each component
