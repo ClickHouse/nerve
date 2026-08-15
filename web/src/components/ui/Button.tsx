@@ -28,22 +28,42 @@ export type ButtonVariant =
   | 'ghost'
   | 'subtle'
   | 'danger'
+  | 'dangerGhost'
   | 'dangerSolid'
+  | 'success'
+  | 'warning'
+  | 'info'
+  | 'accent'
+  | 'link'
   | 'pill'
   | 'tab';
 
 export type ButtonSize = 'xs' | 'sm' | 'md';
 
 const VARIANTS: Record<ButtonVariant, string> = {
-  /** The page's one committing action. */
-  primary: 'text-white bg-accent hover:bg-accent-hover rounded-lg font-medium',
+  /**
+   * The page's one committing action.
+   *
+   * `text-on-accent`, never `text-white`: the accent is ClickHouse yellow in
+   * dark mode, where white is unreadable on it. A call site cannot correct this
+   * itself — Tailwind emits same-property colour utilities alphabetically, so
+   * `.text-white` lands after `.text-on-accent` and wins at equal specificity.
+   * It has to be right here.
+   */
+  primary: 'text-on-accent bg-accent hover:bg-accent-hover rounded-lg font-medium',
   /** Sits beside a primary without competing with it. */
   secondary:
     'text-text-secondary bg-surface-raised hover:bg-surface-hover border border-border rounded-lg',
-  /** Bare label; only the text colour moves. For "Cancel", "Show more". */
-  ghost: 'text-text-muted hover:text-text-secondary rounded',
-  /** The menu/list-row shape: no chrome at rest, a surface on hover. */
-  subtle: 'text-text-secondary hover:bg-surface-raised rounded',
+  /**
+   * Bare label; only the text colour moves. For "Cancel", "Show more".
+   * Resting colour lives in INACTIVE — see the note there.
+   */
+  ghost: 'rounded',
+  /**
+   * The menu/list-row shape: no chrome at rest, a surface on hover.
+   * Resting colour lives in INACTIVE — see the note there.
+   */
+  subtle: 'rounded',
   /**
    * Destructive, tinted. Uses `hue-red` rather than a stock `red-*` so it
    * follows the light theme — the hand-rolled `bg-red-600` buttons this
@@ -51,18 +71,80 @@ const VARIANTS: Record<ButtonVariant, string> = {
    */
   danger:
     'text-hue-red bg-hue-red/15 hover:bg-hue-red/25 rounded-md font-medium',
-  /** Destructive and unmissable — for the confirm step, not the trigger. */
-  dangerSolid: 'text-white bg-hue-red hover:bg-hue-red/90 rounded-md font-medium',
+  /**
+   * Affirmative, but *not* the page's primary action — "Accept as-is",
+   * "Adopt & continue", "Start review loop". Green rather than accent, because
+   * the accent is now ClickHouse yellow and reads as neither.
+   *
+   * Tinted, not solid, and that is forced rather than chosen: `--theme-success`
+   * is Click UI's feedback *foreground*, which in dark mode is a pale mint
+   * (#ccffd0). `bg-success text-white` measures 1.12:1 — the same bug as
+   * `bg-accent text-white`, from the same cause. Text-on-tint is the only
+   * pairing legible in both themes (10.5:1 dark, 7.3:1 light).
+   */
+  success:
+    'text-success bg-success-bg border border-success-border hover:border-success rounded-md font-medium',
+  /** Same shape as `success`, for a cautionary action. 5.7:1 dark, 5.3:1 light. */
+  warning:
+    'text-warning bg-warning-bg border border-warning-border hover:border-warning rounded-md font-medium',
+  /** Same shape as `success`, for an informational action. 7.2:1 dark, 6.2:1 light. */
+  info: 'text-info bg-info-bg border border-info-border hover:border-info rounded-md font-medium',
+  /**
+   * An accent-coloured text button that is *not* a selection — "Clear filter",
+   * "View processing session". Distinct from `link` (which drops the padding to
+   * sit inside a sentence) and from `ghost active` (which would claim the
+   * control is currently selected).
+   */
+  accent: 'text-accent hover:bg-surface-raised rounded',
+  /**
+   * Destructive, but quiet until pointed at — the row-level delete/remove/purge
+   * treatment. Distinct from `danger`, which is already red at rest and shouts
+   * from inside a list.
+   */
+  dangerGhost: 'text-text-dim hover:text-hue-red hover:bg-hue-red/10 rounded',
+  /**
+   * Destructive and unmissable — for the confirm step, not the trigger.
+   *
+   * `bg-error-solid`, not `bg-hue-red`. An earlier version of this comment
+   * claimed `text-white` was safe here "because it sits on red, not on the
+   * accent" — that was wrong. `hue-red` is an *identity* hue meant for text on
+   * the page background, so it flips to a light #ff7575 in dark mode, where
+   * white on it measures 2.61:1. `error-solid` is a theme-independent palette
+   * entry (#c10000 both ways), giving 6.43:1 in either theme.
+   */
+  dangerSolid:
+    'text-white bg-error-solid hover:bg-error-solid/90 rounded-md font-medium',
+  /** An inline affordance that reads as a link but acts as a button. */
+  link: 'text-accent hover:underline rounded',
   /** Filter chip. Pair with `active`. */
   pill: 'rounded-full border whitespace-nowrap',
   /** Underlined tab. Pair with `active`. */
-  tab: 'font-medium border-b-2 border-transparent rounded-none',
+  tab: 'font-medium border-b-2 rounded-none',
 };
 
 /**
  * The selected treatment, per variant. The app was already consistent about
  * this — an active control is accent-on-accent-tint — it just spelled the tint
  * three different ways (`/10`, `/15`, `/20`).
+ *
+ * **Any variant with an entry here must set no colour in VARIANTS.** Its
+ * resting colour goes in INACTIVE instead, so that exactly one of the two sets
+ * is ever on the element.
+ *
+ * That is not tidiness, it is the only thing that works. Tailwind v4 emits
+ * same-property utilities in alphabetical order of class name, so between two
+ * colour classes on one element the later-*sorting* name wins — not the one
+ * written last, and not the one from the "more specific" map. `.text-accent`
+ * sorts before every other colour token in this app; measured in the built
+ * stylesheet it lands at offset 49085, against `.text-hue-red` 51903,
+ * `.text-on-accent` 52978, `.text-text-dim` 53924, `.text-text-faint` 53967,
+ * `.text-text-muted` 54167, `.text-text-secondary` 54214 and `.text-white`
+ * 54310. Appending an accent `ACTIVE` after a coloured base therefore lost
+ * silently, every time — `active` simply did nothing on `ghost` and `subtle`.
+ * The same trap caught `tab`, whose `border-transparent` outsorted, and so
+ * beat, `ACTIVE.tab`'s `border-accent`.
+ *
+ * `Button.test.tsx` pins the invariant so it cannot come back unnoticed.
  */
 const ACTIVE: Partial<Record<ButtonVariant, string>> = {
   pill: 'bg-accent/15 text-accent border-accent/30',
@@ -73,13 +155,27 @@ const ACTIVE: Partial<Record<ButtonVariant, string>> = {
 
 const INACTIVE: Partial<Record<ButtonVariant, string>> = {
   pill: 'text-text-dim border-border hover:text-text-muted',
-  tab: 'text-text-dim hover:text-text-muted',
+  tab: 'text-text-dim border-transparent hover:text-text-muted',
+  ghost: 'text-text-muted hover:text-text-secondary',
+  subtle: 'text-text-secondary hover:bg-surface-raised',
 };
 
 const SIZES: Record<ButtonSize, string> = {
   xs: 'px-2 py-1 text-xs gap-1',
   sm: 'px-3 py-1.5 text-xs gap-1.5',
   md: 'px-3 py-2 text-sm gap-2',
+};
+
+/**
+ * `link` takes the type scale but not the padding — a link sitting in a
+ * sentence cannot carry a button's box. The classes have to be dropped rather
+ * than overridden: `p-0` from a call site would lose to `px-3` here, on the
+ * same ordering rule described above.
+ */
+const LINK_SIZES: Record<ButtonSize, string> = {
+  xs: 'text-xs gap-1',
+  sm: 'text-xs gap-1.5',
+  md: 'text-sm gap-2',
 };
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -116,7 +212,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       className={cx(
         'inline-flex items-center justify-center shrink-0 cursor-pointer',
         'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
-        SIZES[size],
+        variant === 'link' ? LINK_SIZES[size] : SIZES[size],
         VARIANTS[variant],
         state,
         fullWidth && 'w-full',

@@ -160,6 +160,7 @@
   --color-error: var(--theme-error);
   --color-error-bg: var(--theme-error-bg);
   --color-error-border: var(--theme-error-border);
+  --color-error-solid: var(--theme-error-solid);
   --color-warning: var(--theme-warning);
   --color-warning-bg: var(--theme-warning-bg);
   --color-warning-border: var(--theme-warning-border);
@@ -274,6 +275,13 @@
   --theme-error: var(--global-color-feedback-danger-foreground);
   --theme-error-bg: var(--global-color-feedback-danger-background);
   --theme-error-border: color-mix(in oklab, var(--global-color-feedback-danger-foreground) 30%, transparent);
+  /* A destructive *fill* that carries white text, for the confirm step of a
+     delete. Deliberately a raw palette ramp entry rather than a semantic token:
+     the ramp is theme-independent (#c10000 in both), whereas every semantic red
+     we have flips with the theme and so cannot hold white in both. `hue-red` is
+     #ff7575 in dark — white on it is 2.61:1 — and `error` is the feedback
+     *foreground*, a pale #ffbaba. This is 6.43:1 in both themes. */
+  --theme-error-solid: var(--palette-danger-600);
   --theme-warning: var(--global-color-feedback-warning-foreground);
   --theme-warning-bg: var(--global-color-feedback-warning-background);
   --theme-warning-border: color-mix(in oklab, var(--global-color-feedback-warning-foreground) 30%, transparent);
@@ -323,6 +331,24 @@
 [data-cui-theme="light"] {
   color-scheme: light;
   --theme-bg-sunken: var(--palette-slate-50);      /* #f6f7fa, under #ffffff */
+
+  /* ── Two AA corrections, each one palette step darker ──
+     Click UI's own light-theme values fail WCAG AA on their intended
+     backgrounds, so these are the only places we knowingly diverge from the
+     design system. Both replacements are still Click UI palette entries, and
+     `info-600` is the colour Click UI itself uses for link-hover.
+
+       token            was                     now                on white   on its tint
+       --theme-info     info-400  #437eef        info-600  #104ec6  3.84 -> 7.17   3.32 -> 6.20
+       --theme-link     same as info
+       --theme-success  success-700 #008a0b      success-800 #006108  7.74      4.27 -> 7.30
+
+     Dark mode is unaffected — it passes comfortably (success 10.5, info 7.2).
+     Revert by deleting these three lines if design-system fidelity is worth
+     more than AA here. */
+  --theme-info: var(--palette-info-600);
+  --theme-link: var(--palette-info-600);
+  --theme-success: var(--palette-success-800);
   /* Identity hues — dark steps so they carry on a white page. */
   --theme-hue-yellow: var(--palette-brand-700);    /* #686b00 */
   --theme-hue-amber: var(--palette-sunrise-700);   /* #8a6900 */
