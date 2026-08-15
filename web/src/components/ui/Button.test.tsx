@@ -43,6 +43,38 @@ function borderColours(el: Element): string[] {
 }
 
 /**
+ * The same collision, for the properties that are not colours.
+ *
+ * Tailwind orders numerically as well as alphabetically, so a *smaller* value
+ * always sorts earlier and therefore loses: `size="md"` plus a call site's
+ * `py-1` renders `py-2`, and `size="xs"` plus `px-0` renders `px-2`. The rule a
+ * caller could actually rely on is "you may increase a spacing value but never
+ * decrease it", which nobody will remember — so the variant and size tables must
+ * simply never emit two of the same property, exactly as with colour.
+ *
+ * Grouped by the precise utility prefix rather than by CSS property, because
+ * `px-2` and `pl-8` legitimately coexist: the longhand sorts after the shorthand
+ * and is meant to win. Only a genuine duplicate — two `px-*`, two `rounded-*` —
+ * is a bug.
+ */
+const SPACING_GROUPS = ['p', 'px', 'py', 'gap', 'rounded'] as const;
+
+function duplicateSpacing(el: Element): string[] {
+  const classes = [...el.classList].filter((c) => !c.includes(':'));
+  const clashes: string[] = [];
+  for (const group of SPACING_GROUPS) {
+    const hits = classes.filter(
+      (c) => c === group || c.startsWith(`${group}-`),
+    );
+    if (hits.length > 1) clashes.push(`${group}: ${hits.join(' + ')}`);
+  }
+  // Font size is the same shape: `text-xs` against `text-sm`.
+  const sizes = classes.filter((c) => /^text-(2xs|xs|sm|base|lg|xl|display)$/.test(c));
+  if (sizes.length > 1) clashes.push(`font-size: ${sizes.join(' + ')}`);
+  return clashes;
+}
+
+/**
  * Every variant, as a `Record` keyed by the union rather than a plain array.
  *
  * This is the part that keeps the suite honest while several people are adding
@@ -93,6 +125,21 @@ describe('Button colour classes are unambiguous', () => {
         expect(textColours(el)).toHaveLength(1);
         expect(backgrounds(el).length).toBeLessThanOrEqual(1);
         expect(borderColours(el).length).toBeLessThanOrEqual(1);
+      });
+    }
+  }
+
+  // Every variant against every size, because the clash is between the two
+  // tables rather than inside either one.
+  for (const variant of BUTTON_VARIANTS) {
+    for (const size of ['xs', 'sm', 'md'] as const) {
+      it(`${variant} at ${size} sets each spacing property at most once`, () => {
+        render(
+          <Button variant={variant} size={size}>
+            label
+          </Button>,
+        );
+        expect(duplicateSpacing(screen.getByRole('button'))).toEqual([]);
       });
     }
   }

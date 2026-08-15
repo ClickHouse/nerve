@@ -1,15 +1,17 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw, Zap, CheckCircle, XCircle, Clock, Plug } from 'lucide-react';
+import { RefreshCw, Zap, CheckCircle, XCircle, Clock, Plug } from '../components/ui/icons';
+import { Badge, Button } from '../components/ui';
 import { useMcpStore, type McpServer } from '../stores/mcpStore';
 import { formatMcpName } from '../utils/formatMcpName';
 
+/** Transport identity, not status — so `hue-*` rather than a feedback token. */
 const TYPE_COLORS: Record<string, string> = {
   sdk: 'text-accent bg-accent/10',
-  stdio: 'text-hue-emerald bg-emerald-400/10',
-  sse: 'text-hue-amber bg-amber-400/10',
-  http: 'text-hue-sky bg-sky-400/10',
-  plugin: 'text-hue-violet bg-violet-400/10',
+  stdio: 'text-hue-emerald bg-hue-emerald/10',
+  sse: 'text-hue-amber bg-hue-amber/10',
+  http: 'text-hue-sky bg-hue-sky/10',
+  plugin: 'text-hue-violet bg-hue-violet/10',
 };
 
 function ServerCard({ server }: { server: McpServer }) {
@@ -28,19 +30,17 @@ function ServerCard({ server }: { server: McpServer }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <h3 className="text-sm font-medium text-text truncate">{formatMcpName(server.name)}</h3>
-            <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${typeClass}`}>
+            <span className={`text-2xs px-1.5 py-0.5 rounded font-mono ${typeClass}`}>
               {server.type}
             </span>
           </div>
         </div>
         {!server.enabled && (
-          <span className="text-[10px] text-hue-amber/70 bg-amber-500/10 px-1.5 py-0.5 rounded ml-2">
-            disabled
-          </span>
+          <Badge tone="warning" className="ml-2">disabled</Badge>
         )}
       </div>
 
-      <div className="flex items-center gap-4 mt-3 text-[10px] text-text-dim">
+      <div className="flex items-center gap-4 mt-3 text-2xs text-text-dim">
         {server.tool_count > 0 && (
           <div className="flex items-center gap-1">
             <Plug size={10} />
@@ -81,19 +81,18 @@ export function McpServersPage() {
       <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
         <div className="flex items-center gap-2">
           <h1 className="text-sm font-medium text-text">MCP Servers</h1>
-          <span className="text-[10px] text-text-dim bg-surface-raised px-1.5 py-0.5 rounded">
-            {servers.length}
-          </span>
+          <Badge>{servers.length}</Badge>
         </div>
-        <button
+        <Button
+          variant="subtle"
+          size="xs"
           onClick={reloadServers}
           disabled={reloading}
-          className="flex items-center gap-1 px-2 py-1 text-xs text-text-muted hover:text-text-secondary hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
           title="Reload MCP config from YAML files"
         >
           <RefreshCw size={12} className={reloading ? 'animate-spin' : ''} />
           Reload
-        </button>
+        </Button>
       </div>
 
       {/* Content */}

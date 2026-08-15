@@ -3,7 +3,7 @@ import { useFilesStore } from '../stores/filesStore';
 import { FileTree } from '../components/Files/FileTree';
 import { EditorTabBar } from '../components/Files/EditorTabBar';
 import { FileEditor } from '../components/Files/FileEditor';
-import { FolderOpen } from 'lucide-react';
+import { FolderOpen } from '../components/ui/icons';
 
 export function FilesPage() {
   const {
