@@ -13,6 +13,23 @@ import { Modal } from './Modal';
  * and the mousedown-not-click backdrop — rather than its markup.
  */
 
+/**
+ * The backdrop, found by its own class rather than by its position relative to
+ * the panel.
+ *
+ * These specs used to reach it as `getByRole('dialog').parentElement` — which
+ * only holds while the backdrop is the panel's *direct* parent. Insert any
+ * wrapper between them (a transition container, a portal's own node) and the
+ * lookup silently retargets at the wrapper: the clicks still land on something,
+ * `onClose` still isn't called, and the specs pass without testing the
+ * backdrop at all.
+ */
+function backdrop(): HTMLElement {
+  const el = document.querySelector<HTMLElement>('.modal-backdrop');
+  if (!el) throw new Error('no .modal-backdrop in the document');
+  return el;
+}
+
 function Basic({
   onClose = () => {},
   ...props
@@ -86,7 +103,7 @@ describe('Modal dismissal', () => {
     const onClose = vi.fn();
     render(<Basic onClose={onClose} />);
 
-    await userEvent.click(screen.getByRole('dialog').parentElement!);
+    await userEvent.click(backdrop());
 
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -106,11 +123,10 @@ describe('Modal dismissal', () => {
     // mid-interaction; closing on mousedown does not.
     const onClose = vi.fn();
     render(<Basic onClose={onClose} />);
-    const backdrop = screen.getByRole('dialog').parentElement!;
 
     await userEvent.pointer([
       { target: screen.getByText('first'), keys: '[MouseLeft>]' },
-      { target: backdrop, keys: '[/MouseLeft]' },
+      { target: backdrop(), keys: '[/MouseLeft]' },
     ]);
 
     expect(onClose).not.toHaveBeenCalled();
@@ -120,7 +136,7 @@ describe('Modal dismissal', () => {
     const onClose = vi.fn();
     render(<Basic onClose={onClose} closeOnBackdrop={false} />);
 
-    await userEvent.click(screen.getByRole('dialog').parentElement!);
+    await userEvent.click(backdrop());
 
     expect(onClose).not.toHaveBeenCalled();
     // Escape still works — the guard is about stray clicks, not lock-in.

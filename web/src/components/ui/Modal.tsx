@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { X } from 'lucide-react';
+import { X } from './icons';
+import { IconButton } from './IconButton';
 import { modalStack } from './modalStack';
 
 /**
@@ -10,6 +11,20 @@ import { modalStack } from './modalStack';
  * backdrop, one handled Escape, none trapped focus, none locked body
  * scroll, and none carried dialog semantics for a screen reader. Behaviour
  * that every dialog needs belongs in one place.
+ *
+ * **Why this is not Click UI's `Dialog`.** That one is Radix's, and Radix
+ * dismisses on Escape by calling `preventDefault()` and nothing else — it never
+ * stops the event propagating. This app's global shortcuts are a bubble-phase
+ * `document` listener (`useKeyboardShortcuts`) that does not consult
+ * `defaultPrevented`, so under Radix an Escape would close the dialog *and*
+ * stop a generation running behind it: the exact regression the third spec in
+ * `Modal.test.tsx` exists to catch. Radix would also bring a second body-scroll
+ * lock alongside the refcounted one below, and it renders its overlay as a
+ * *sibling* of the panel rather than its parent, which changes what "click the
+ * backdrop" means. The behaviour here is kept; Click UI is adopted through the
+ * theme tokens the panel is painted with and through the `IconButton` in the
+ * header. Click UI's `Dialog` remains the right choice for a dialog that does
+ * not have to coexist with these global handlers.
  *
  * Three details are load-bearing:
  *
@@ -229,17 +244,12 @@ export function Modal({
       >
         {title && (
           <div className="flex items-center justify-between px-5 py-3 border-b border-border shrink-0">
-            <h2 id={titleId} className="text-[15px] font-semibold">
+            <h2 id={titleId} className="text-base font-semibold">
               {title}
             </h2>
-            <button
-              onClick={onClose}
-              className="text-text-faint hover:text-text-muted cursor-pointer p-1"
-              aria-label="Close dialog"
-              title="Close"
-            >
+            <IconButton label="Close dialog" size="xs" onClick={onClose}>
               <X size={18} />
-            </button>
+            </IconButton>
           </div>
         )}
 
