@@ -158,7 +158,8 @@ Filesystem-based skill system (Claude SDK compatible):
 - Agent can create/update skills dynamically via `skill_create`/`skill_update` MCP tools
 - Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes new skills via task+plan system
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
-- Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
+- External feedback: `pr-feedback-harvester` cron reads review comments on the agent's own PRs, clusters recurring themes, and routes them to a generic skill / instruction file (general) or a repo dev skill (repo-specific). The only skill job whose evidence comes from outside the instance
+- Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals; the harvester passes `plan_type` explicitly to reach the same path
 
 #### Platform skills
 
