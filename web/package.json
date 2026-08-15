@@ -12,10 +12,12 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@clickhouse/click-ui": "^0.10.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@pierre/diffs": "^1.2.7",
+    "dayjs": "^1.11.21",
     "highlight.js": "^11.11.1",
     "lucide-react": "^0.575.0",
     "react": "^19.2.0",

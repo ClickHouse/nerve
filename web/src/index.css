@@ -1,3 +1,16 @@
+/* Cascade layer order. Click UI ships all its styles — component rules AND its
+   design tokens — inside a single `clickui` layer. Declaring that layer FIRST
+   here means every Tailwind layer, and any unlayered app CSS, outranks it no
+   matter what order Vite happens to inject the CSS Module stylesheets in.
+   Without this line the precedence depends on import order and is not
+   deterministic. */
+@layer clickui, theme, base, components, utilities;
+
+/* Click UI's own stylesheets are NOT imported here: <ClickUIProvider> pulls in
+   tokens-light.css / tokens-dark.css / global.css itself, and each component
+   imports its own CSS Module. That keeps the per-component tree-shaking the
+   library is built for. (The package `exports` map has no wildcard, so deep
+   `dist/...` CSS imports do not resolve anyway.) */
 @import "tailwindcss";
 @import "highlight.js/styles/github-dark.min.css";
 
