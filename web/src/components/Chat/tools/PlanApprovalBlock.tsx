@@ -87,7 +87,7 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
           <div className="flex gap-2">
             <button
               onClick={() => { setResponded(true); setApproved(true); answerInteraction(null); }}
-              className="flex-1 py-2 rounded-md text-[13px] font-medium bg-accent hover:bg-accent-hover text-white cursor-pointer transition-colors flex items-center justify-center gap-2"
+              className="flex-1 py-2 rounded-md text-[13px] font-medium bg-accent hover:bg-accent-hover text-on-accent cursor-pointer transition-colors flex items-center justify-center gap-2"
             >
               <Check size={13} />
               {isExitPlan ? 'Approve' : 'Allow'}

@@ -56,7 +56,7 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
             <button
               onClick={onSave}
               disabled={saving}
-              className="flex items-center gap-1.5 px-3 py-1 text-[12px] bg-accent hover:bg-accent-hover text-white rounded-md cursor-pointer disabled:opacity-50"
+              className="flex items-center gap-1.5 px-3 py-1 text-[12px] bg-accent hover:bg-accent-hover text-on-accent rounded-md cursor-pointer disabled:opacity-50"
             >
               <Save size={12} />
               {saving ? 'Saving...' : 'Save'}

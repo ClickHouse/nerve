@@ -150,7 +150,7 @@ export function InteractiveQuestionCard() {
         <button
           onClick={submit}
           disabled={!complete}
-          className="px-3 py-1.5 rounded text-[12px] bg-accent text-white disabled:opacity-40 flex items-center gap-1 cursor-pointer disabled:cursor-not-allowed"
+          className="px-3 py-1.5 rounded text-[12px] bg-accent text-on-accent disabled:opacity-40 flex items-center gap-1 cursor-pointer disabled:cursor-not-allowed"
         >
           <Send size={12} /> Continue
         </button>

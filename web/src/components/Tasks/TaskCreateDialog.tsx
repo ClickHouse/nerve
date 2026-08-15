@@ -38,7 +38,7 @@ export function TaskCreateDialog({ onClose, onCreate }: {
           <button
             type="submit"
             form={FORM_ID}
-            className="px-4 py-2 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer disabled:opacity-50"
+            className="px-4 py-2 text-[13px] bg-accent hover:bg-accent-hover text-on-accent rounded-lg cursor-pointer disabled:opacity-50"
             disabled={!title.trim()}
           >
             Create

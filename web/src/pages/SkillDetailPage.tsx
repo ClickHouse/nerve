@@ -101,7 +101,7 @@ export function SkillDetailPage() {
             <button
               onClick={handleSave}
               disabled={actionLoading}
-              className="flex items-center gap-1 px-2 py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover cursor-pointer disabled:opacity-50"
+              className="flex items-center gap-1 px-2 py-1 text-xs bg-accent text-on-accent rounded hover:bg-accent-hover cursor-pointer disabled:opacity-50"
             >
               <Save size={12} />
               Save

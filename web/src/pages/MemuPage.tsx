@@ -97,7 +97,7 @@ function EditForm({ item, onSave, onCancel }: {
         </select>
         <div className="flex-1" />
         <button onClick={onCancel} className="px-3 py-1 text-xs text-text-muted hover:text-text-secondary cursor-pointer transition-colors">Cancel</button>
-        <button onClick={handleSave} disabled={saving || !content.trim()} className="px-3 py-1 bg-accent text-white text-xs rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-hover transition-colors">
+        <button onClick={handleSave} disabled={saving || !content.trim()} className="px-3 py-1 bg-accent text-on-accent text-xs rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-hover transition-colors">
           {saving ? 'Saving...' : 'Save'}
         </button>
       </div>
@@ -194,7 +194,7 @@ function CategorySummaryEditor({ category }: { category: Category }) {
       <textarea value={value} onChange={e => setValue(e.target.value)} rows={3} autoFocus className="w-full bg-surface-raised border border-border-subtle rounded px-2 py-1.5 text-[11px] text-text-secondary outline-none focus:border-accent/50 resize-none" />
       <div className="flex justify-end gap-2 mt-1">
         <button onClick={() => setEditingCategoryId(null)} className="px-2 py-0.5 text-[10px] text-text-muted hover:text-text-secondary cursor-pointer">Cancel</button>
-        <button onClick={handleSave} disabled={saving} className="px-2 py-0.5 bg-accent text-white text-[10px] rounded cursor-pointer disabled:opacity-40 hover:bg-accent-hover transition-colors">
+        <button onClick={handleSave} disabled={saving} className="px-2 py-0.5 bg-accent text-on-accent text-[10px] rounded cursor-pointer disabled:opacity-40 hover:bg-accent-hover transition-colors">
           {saving ? 'Saving...' : 'Save'}
         </button>
       </div>
@@ -225,7 +225,7 @@ function CreateCategoryForm({ onClose }: { onClose: () => void }) {
       </div>
       <input type="text" placeholder="Name (e.g. travel_plans)" value={name} onChange={e => setName(e.target.value)} className="w-full bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary mb-2 outline-none focus:border-accent/50" />
       <input type="text" placeholder="Description" value={desc} onChange={e => setDesc(e.target.value)} className="w-full bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary mb-2 outline-none focus:border-accent/50" />
-      <button onClick={handleCreate} disabled={!name.trim() || creating} className="px-3 py-1 bg-accent text-white text-[11px] rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-hover transition-colors">
+      <button onClick={handleCreate} disabled={!name.trim() || creating} className="px-3 py-1 bg-accent text-on-accent text-[11px] rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-hover transition-colors">
         {creating ? 'Creating...' : 'Create'}
       </button>
     </div>

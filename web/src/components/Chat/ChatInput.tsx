@@ -828,7 +828,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             <button
               onClick={handleSend}
               disabled={!canSend}
-              className="w-10 h-10 bg-accent hover:bg-accent-hover text-white rounded-xl flex items-center justify-center disabled:opacity-30 cursor-pointer transition-colors shrink-0"
+              className="w-10 h-10 bg-accent hover:bg-accent-hover text-on-accent rounded-xl flex items-center justify-center disabled:opacity-30 cursor-pointer transition-colors shrink-0"
             >
               <Send size={18} />
             </button>

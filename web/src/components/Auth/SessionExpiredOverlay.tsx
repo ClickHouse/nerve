@@ -48,7 +48,7 @@ export function SessionExpiredOverlay() {
         <button
           type="submit"
           disabled={loading}
-          className="w-full py-2 bg-accent hover:bg-accent-hover text-white rounded font-medium disabled:opacity-50 cursor-pointer"
+          className="w-full py-2 bg-accent hover:bg-accent-hover text-on-accent rounded font-medium disabled:opacity-50 cursor-pointer"
         >
           {loading ? '...' : 'Unlock'}
         </button>

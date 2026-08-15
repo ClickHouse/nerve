@@ -150,7 +150,7 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
         <button
           onClick={handleCreate}
           disabled={busy || !name.trim()}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer disabled:opacity-50"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-on-accent rounded-lg cursor-pointer disabled:opacity-50"
         >
           <Plus size={14} /> Add status
         </button>

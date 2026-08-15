@@ -170,7 +170,7 @@ export function PromptRewriteCard({ state, original, onApprove, onSendOriginal, 
             <button
               onClick={() => canApprove && onApprove(edited.trim())}
               disabled={!canApprove}
-              className="px-3.5 py-1.5 text-[12px] font-medium text-white bg-accent hover:bg-accent-hover rounded-lg flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-30"
+              className="px-3.5 py-1.5 text-[12px] font-medium text-on-accent bg-accent hover:bg-accent-hover rounded-lg flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-30"
             >
               <CornerDownLeft size={12} />
               <span>Send</span>
@@ -194,7 +194,7 @@ export function PromptRewriteCard({ state, original, onApprove, onSendOriginal, 
             </button>
             <button
               onClick={onSendOriginal}
-              className="px-3.5 py-1.5 text-[12px] font-medium text-white bg-accent hover:bg-accent-hover rounded-lg cursor-pointer transition-colors"
+              className="px-3.5 py-1.5 text-[12px] font-medium text-on-accent bg-accent hover:bg-accent-hover rounded-lg cursor-pointer transition-colors"
             >
               Send original
             </button>

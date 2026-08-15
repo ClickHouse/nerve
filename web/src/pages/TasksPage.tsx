@@ -213,7 +213,7 @@ export function TasksPage() {
               // text that is not always rendered.
               title="New task"
               aria-label="New task"
-              className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer whitespace-nowrap"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-on-accent rounded-lg cursor-pointer whitespace-nowrap"
             >
               <Plus size={14} /> <span className="hidden sm:inline">New Task</span>
             </button>
