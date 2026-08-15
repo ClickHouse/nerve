@@ -184,6 +184,23 @@ export const ShieldCheck = clickUI('secure', 'ShieldCheck');
 export const SlidersHorizontal = clickUI('settings', 'SlidersHorizontal');
 export const Square = clickUI('square', 'Square');
 export const Star = clickUI('star', 'Star');
+/**
+ * [drawn] The filled counterpart of Click UI's `star`, for a starred item.
+ *
+ * Click UI ships only the outline, and a `fill-*` class on the call site cannot
+ * fill it: `<Icon>` renders the glyph inside a wrapper element, so `className`
+ * lands on that box and never reaches the `<path>`. The starred sessions in the
+ * sidebar asked for `fill-hue-yellow` and silently got an outline — the class
+ * was applied, just to the wrong node.
+ *
+ * Same path data as Click UI's `star`, so the two are the same shape at the
+ * same optical weight; only `fill` differs.
+ */
+export const StarFilled = drawn(
+  'StarFilled',
+  <path d="M12 2.896L14.935 8.889L21.5 9.856L16.75 14.518L17.871 21.104L12 17.993L6.129 21.104L7.25 14.518L2.5 9.856L9.064 8.889L12 2.896Z" />,
+  { fill: 'currentColor' },
+);
 export const Trash2 = clickUI('trash', 'Trash2');
 export const Zap = clickUI('flash', 'Zap');
 

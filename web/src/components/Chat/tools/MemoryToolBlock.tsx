@@ -92,7 +92,7 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
         <span className="text-sm leading-tight font-medium text-hue-purple">{label}</span>
         {truncatedQuery && <span className="text-xs text-text-dim truncate">{truncatedQuery}</span>}
         {count && !isRunning && (
-          <span className="text-2xs text-hue-purple/60 shrink-0">{count} items</span>
+          <span className="text-2xs text-hue-purple shrink-0">{count} items</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
@@ -106,7 +106,7 @@ export function MemoryToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="px-3 py-2 text-xs text-text-secondary">
               <div className="flex items-center gap-1.5 mb-1">
                 <Brain size={11} className="text-hue-purple" />
-                <span className="text-2xs uppercase tracking-wider text-hue-purple/60">Memorized</span>
+                <span className="text-2xs uppercase tracking-wider text-hue-purple">Memorized</span>
               </div>
               <p className="leading-relaxed">{String(query)}</p>
               {block.input.memory_type ? (

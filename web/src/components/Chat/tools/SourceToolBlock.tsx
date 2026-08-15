@@ -163,7 +163,7 @@ export function SourceToolBlock({ block }: { block: ToolCallBlockData }) {
         <span className="text-sm leading-tight font-medium text-hue-cyan">{label}</span>
         {summary && <span className="text-xs text-text-dim truncate">{summary}</span>}
         {(isPoll || isRead) && messageCount > 0 && !isRunning && (
-          <span className="text-2xs text-hue-cyan/60 shrink-0">{messageCount} msg</span>
+          <span className="text-2xs text-hue-cyan shrink-0">{messageCount} msg</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
