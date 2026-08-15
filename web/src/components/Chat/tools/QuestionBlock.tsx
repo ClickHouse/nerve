@@ -1,8 +1,9 @@
 import { useState, useRef } from 'react';
-import { MessageCircleQuestion, Check, Send } from 'lucide-react';
+import { MessageCircleQuestion, Check, Send } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { MarkdownContent } from '../MarkdownContent';
 import { useChatStore } from '../../../stores/chatStore';
+import { Badge, Button } from '../../ui';
 
 interface QuestionOption {
   label: string;
@@ -119,14 +120,14 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
             <div className="px-4 pt-3.5 pb-2">
               <div className="flex items-center gap-2 mb-2">
                 <MessageCircleQuestion size={15} className="text-accent shrink-0" />
-                <span className="text-[10px] font-semibold uppercase tracking-wider text-accent/70 bg-accent/10 px-2 py-0.5 rounded">
+                <Badge tone="accent" className="px-2 font-semibold uppercase tracking-wider">
                   {q.header}
-                </span>
+                </Badge>
                 {q.multiSelect && (
-                  <span className="text-[10px] text-text-faint ml-auto">Select multiple</span>
+                  <span className="text-2xs text-text-faint ml-auto">Select multiple</span>
                 )}
               </div>
-              <p className="text-[14px] text-text-secondary leading-relaxed">{q.question}</p>
+              <p className="text-sm text-text-secondary leading-relaxed">{q.question}</p>
             </div>
 
             {/* Options */}
@@ -156,21 +157,21 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                         <div className={`mt-0.5 shrink-0 w-4 h-4 ${q.multiSelect ? 'rounded-sm' : 'rounded-full'} border flex items-center justify-center transition-colors duration-150 ${
                           isSelected ? 'border-accent bg-accent' : 'border-text-faint bg-transparent'
                         }`}>
-                          {isSelected && <Check size={10} className="text-white" strokeWidth={3} />}
+                          {isSelected && <Check size={10} className="text-on-accent" />}
                         </div>
                         <div className="flex-1 min-w-0">
-                          <div className={`text-[13px] font-medium ${isSelected ? 'text-accent-text' : 'text-text-secondary'}`}>
+                          <div className={`text-sm font-medium ${isSelected ? 'text-accent-text' : 'text-text-secondary'}`}>
                             {opt.label}
                           </div>
                           {opt.description && (
-                            <div className="text-[12px] text-text-muted mt-0.5 leading-relaxed">{opt.description}</div>
+                            <div className="text-xs text-text-muted mt-0.5 leading-relaxed">{opt.description}</div>
                           )}
                         </div>
                       </div>
                     </button>
 
                     {opt.markdown && (isHovered || (isSelected && !isResolved)) && (
-                      <div className="mx-2 mt-1 mb-0.5 px-3 py-2 bg-bg border border-border-subtle rounded text-[12px] max-h-48 overflow-y-auto">
+                      <div className="mx-2 mt-1 mb-0.5 px-3 py-2 bg-bg border border-border-subtle rounded text-xs max-h-48 overflow-y-auto">
                         <MarkdownContent content={opt.markdown} />
                       </div>
                     )}
@@ -184,18 +185,16 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
         {/* Submit button — shown for multi-question or multiSelect, hidden for single simple question */}
         {!isSingleSimple && !isResolved && (
           <div className="px-3 pb-3">
-            <button
-              onClick={() => submitAnswers()}
+            <Button
+              variant="primary"
+              size="md"
+              fullWidth
               disabled={!allAnswered}
-              className={`w-full py-2 rounded-md text-[13px] font-medium transition-all duration-150 flex items-center justify-center gap-2 ${
-                allAnswered
-                  ? 'bg-accent hover:bg-accent-hover text-on-accent cursor-pointer'
-                  : 'bg-surface text-text-faint cursor-not-allowed'
-              }`}
+              onClick={() => submitAnswers()}
             >
               <Send size={13} />
               Submit
-            </button>
+            </Button>
           </div>
         )}
 
@@ -203,8 +202,8 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
             interaction ended without an answer (timeout / cancel / deny). */}
         {isResolved && (
           <div className="px-4 py-2 border-t border-accent/10 flex items-center gap-2">
-            <Check size={12} className={block.isError ? 'text-text-faint' : 'text-hue-green'} />
-            <span className={`text-[11px] ${block.isError ? 'text-text-faint' : 'text-hue-green/70'}`}>
+            <Check size={12} className={block.isError ? 'text-text-faint' : 'text-success'} />
+            <span className={`text-xs ${block.isError ? 'text-text-faint' : 'text-success'}`}>
               {block.isError ? 'Closed' : 'Answered'}
             </span>
           </div>

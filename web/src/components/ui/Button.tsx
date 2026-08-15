@@ -170,7 +170,22 @@ const INACTIVE: Partial<Record<ButtonVariant, string>> = {
   pill: 'text-text-dim border-border hover:text-text-muted',
   tab: 'text-text-dim border-transparent hover:text-text-muted',
   ghost: 'text-text-muted hover:text-text-secondary',
-  subtle: 'text-text-secondary hover:bg-surface-raised',
+  /**
+   * The hover moves the *text* as well as the surface, because the surface
+   * alone is not always visible: a segmented control puts `bg-surface-raised`
+   * on the container and the segments sit directly on it, so a
+   * `hover:bg-surface-raised` segment is hovering to the colour it is already
+   * on and the control goes inert. (`TasksPage`'s Board/List switch is exactly
+   * that shape.) A call site cannot patch it either — `hover:bg-surface-hover`
+   * from a className loses to `hover:bg-surface-raised` on the same
+   * alphabetical ordering described below.
+   *
+   * The text moves *up* from the resting colour rather than the resting colour
+   * moving down: `subtle` is the menu/list-row variant, ~71 rows across the
+   * app, and dimming all of them at rest to buy a hover state on one segmented
+   * control would be a bad trade.
+   */
+  subtle: 'text-text-secondary hover:text-text hover:bg-surface-raised',
 };
 
 const SIZES: Record<ButtonSize, string> = {

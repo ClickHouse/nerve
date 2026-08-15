@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { useAuthStore } from '../../stores/authStore';
+import { Button, TextField } from '../ui';
 
 /**
  * Password prompt shown *over* the running app when a session expires.
@@ -36,31 +37,25 @@ export function SessionExpiredOverlay() {
         <p className="text-sm text-text-muted mb-6 text-center">
           Your work is still here — log back in to continue.
         </p>
-        <input
+        <TextField
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           placeholder="Password"
+          aria-label="Password"
           autoFocus
-          className="w-full px-3 py-2 bg-surface-raised border border-border-subtle rounded text-text outline-none focus:border-accent mb-4"
+          className="mb-4"
         />
-        {error && <p className="text-hue-red text-sm mb-3">{error}</p>}
-        <button
-          type="submit"
-          disabled={loading}
-          className="w-full py-2 bg-accent hover:bg-accent-hover text-on-accent rounded font-medium disabled:opacity-50 cursor-pointer"
-        >
+        {error && <p className="text-error text-sm mb-3">{error}</p>}
+        <Button type="submit" variant="primary" size="md" fullWidth disabled={loading}>
           {loading ? '...' : 'Unlock'}
-        </button>
+        </Button>
         {/* Explicit escape hatch. Unlike the overlay this *does* clear unsent
-            drafts, so it is deliberately the secondary action. */}
-        <button
-          type="button"
-          onClick={logout}
-          className="w-full mt-3 text-xs text-text-muted hover:text-text cursor-pointer"
-        >
+            drafts, so it is deliberately the secondary action — `ghost` is the
+            variant that says "this is the quieter of the two". */}
+        <Button variant="ghost" fullWidth onClick={logout} className="mt-3">
           Log out and discard unsent drafts
-        </button>
+        </Button>
       </form>
     </div>
   );

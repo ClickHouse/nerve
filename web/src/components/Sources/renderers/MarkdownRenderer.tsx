@@ -6,12 +6,22 @@ interface Props {
   muted?: boolean;
 }
 
+/**
+ * The eight `prose*` classes this used to carry — `prose prose-invert
+ * prose-sm`, plus five `prose-<element>:` modifiers — generated no CSS at all:
+ * `@tailwindcss/typography` is not installed, so every heading, link, table and
+ * code block in a source message rendered as bare browser defaults. They are
+ * replaced by `.markdown-content` (index.css), which is the app's own markdown
+ * stylesheet and is what the chat transcript already uses — so a GitHub
+ * notification and an agent message now render the same way.
+ *
+ * The base text colour stays on this element: `.markdown-content` colours
+ * links, blockquotes and code, but inherits the body colour, which is what
+ * `muted` is for.
+ */
 export function MarkdownRenderer({ content, muted = false }: Props) {
   return (
-    <div className={`prose prose-invert prose-sm max-w-none
-      prose-headings:text-text prose-a:text-accent prose-code:text-text-secondary
-      prose-pre:bg-surface prose-pre:border prose-pre:border-border-subtle
-      ${muted ? 'text-text-muted' : 'text-text-secondary'}`}>
+    <div className={`markdown-content ${muted ? 'text-text-muted' : 'text-text-secondary'}`}>
       <ReactMarkdown remarkPlugins={[remarkGfm]}>
         {content || '*(empty)*'}
       </ReactMarkdown>

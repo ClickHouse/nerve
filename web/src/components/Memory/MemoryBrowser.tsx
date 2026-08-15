@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api/client';
+import { Button } from '../ui';
 
 interface MemFile {
   path: string;
@@ -78,31 +79,27 @@ export function MemoryBrowser() {
               <div className="flex gap-2">
                 {editing ? (
                   <>
-                    <button
-                      onClick={saveFile}
-                      disabled={saving}
-                      className="text-xs px-2 py-1 bg-accent rounded text-on-accent cursor-pointer"
-                    >
+                    <Button variant="primary" size="xs" onClick={saveFile} disabled={saving}>
                       {saving ? 'Saving...' : 'Save'}
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      size="xs"
                       onClick={() => { setEditing(false); openFile(selected); }}
-                      className="text-xs px-2 py-1 bg-surface-raised border border-border-subtle rounded text-text-muted cursor-pointer"
                     >
                       Cancel
-                    </button>
+                    </Button>
                   </>
                 ) : (
-                  <button
-                    onClick={() => setEditing(true)}
-                    className="text-xs px-2 py-1 bg-surface-raised border border-border-subtle rounded text-text-muted hover:text-text cursor-pointer"
-                  >
+                  <Button size="xs" onClick={() => setEditing(true)}>
                     Edit
-                  </button>
+                  </Button>
                 )}
               </div>
             </div>
             {editing ? (
+              // Native, like FileEditor's: the `TextArea` primitive is a form
+              // field (bordered, rounded, raised surface, px-3 py-2) and this
+              // is a full-height editing pane flush with the panel.
               <textarea
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
