@@ -248,7 +248,7 @@ export function ReviewLoopCard({ loopId }: { loopId: string }) {
                   return (
                     <div key={a.id} className="flex items-center gap-2 text-xs leading-tight py-0.5">
                       {a.role === 'implementer'
-                        ? <Hammer size={12} className="text-hue-violet/70 shrink-0" />
+                        ? <Hammer size={12} className="text-hue-cyan/70 shrink-0" />
                         : <SearchCheck size={12} className="text-hue-teal shrink-0" />}
                       <span className="text-text-secondary shrink-0">
                         {a.role === 'implementer' ? 'implement' : 'verify'} #{a.iteration}

@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, Repeat } from '../ui/icons';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, Repeat } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp } from '../../utils/dateGroups';
@@ -441,7 +441,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               <Link
                 to={`/chat/${virtualSession.id}`}
                 onClick={handleSelect}
-                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-sm transition-colors no-underline
+                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-xs transition-colors no-underline
                   ${virtualSession.id === activeSession
                     ? 'bg-accent/10 text-text'
                     : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -449,7 +449,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               >
                 <MessageSquare size={13} className="shrink-0 opacity-50" />
                 <div className="flex-1 min-w-0">
-                  <div className="truncate text-sm leading-tight italic">New chat</div>
+                  <div className="truncate text-xs leading-tight italic">New chat</div>
                 </div>
                 {virtualSession.id === activeSession && activeIsRunning && (
                   <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
@@ -785,7 +785,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           }}
           onBlur={handleRenameSubmit}
           aria-label="Rename this session"
-          className="flex-1 min-w-0 text-sm border-b border-text-faint"
+          className="flex-1 min-w-0 text-xs border-b border-text-faint"
         />
       </div>
     );
@@ -795,7 +795,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
     <Link
       to={`/chat/${session.id}`}
       onClick={onSelect}
-      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors no-underline
+      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-xs transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -804,11 +804,11 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       {session.review_loop
         ? <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
         : isImplementSession(session)
-        ? <Hammer size={13} className="shrink-0 text-hue-violet/60" />
+        ? <Hammer size={13} className="shrink-0 text-hue-cyan/70" />
         : <MessageSquare size={13} className="shrink-0 opacity-50" />
       }
       <div className="flex-1 min-w-0">
-        <div className="truncate text-sm leading-tight">{cleanTitle(session)}</div>
+        <div className="truncate text-xs leading-tight">{cleanTitle(session)}</div>
       </div>
 
       {/* Unsent draft marker */}
@@ -845,7 +845,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         >
           {session.starred ? (
             <>
-              <Star size={13} className="fill-hue-yellow" />
+              <StarFilled size={13} className="text-hue-yellow" />
               <MoreHorizontal size={14} />
             </>
           ) : (
@@ -867,7 +867,9 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               }}
               className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
             >
-              <Star size={14} className={session.starred ? 'text-hue-yellow fill-hue-yellow' : ''} />
+              {session.starred
+                ? <StarFilled size={14} className="text-hue-yellow" />
+                : <Star size={14} />}
               {session.starred ? 'Unstar' : 'Star'}
             </Button>
             <Button

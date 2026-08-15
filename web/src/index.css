@@ -349,8 +349,15 @@
   --theme-hue-cyan: var(--palette-babyblue-300);   /* #33e4ff */
   --theme-hue-sky: var(--palette-info-300);        /* #6d9bf3 */
   --theme-hue-blue: var(--palette-info-400);       /* #437eef */
-  --theme-hue-violet: var(--palette-violet-300);   /* #cc66ff */
-  --theme-hue-purple: var(--palette-violet-400);   /* #bb33ff */
+  /* Violet sits two ramp steps lighter than the other identity hues on purpose.
+     It is the most saturated ramp in the palette and it collapses fastest under
+     an opacity modifier, which is how these are almost always used. At the old
+     -300/-400 steps, `text-hue-violet/60` measured 2.79:1 on the sidebar and
+     `text-hue-purple/60` just 2.03:1 on a raised surface — below the 3:1 floor
+     for a non-text glyph, and visibly murky. -200/-300 give 3.71 and 2.79 at
+     60%, and clear 4.5:1 by /80. */
+  --theme-hue-violet: var(--palette-violet-200);   /* #dd99ff */
+  --theme-hue-purple: var(--palette-violet-300);   /* #cc66ff */
 }
 
 [data-cui-theme="light"] {
