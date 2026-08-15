@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Tooltip as ClickTooltip } from '@clickhouse/click-ui';
+import { Tooltip as ClickTooltip } from '@clickhouse/click-ui/Tooltip';
 
 /**
  * A hover/focus tooltip, on Click UI's.

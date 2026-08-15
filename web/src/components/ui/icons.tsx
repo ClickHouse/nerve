@@ -1,5 +1,5 @@
 import type { ComponentProps, ComponentType, ReactNode, SVGProps } from 'react';
-import { Icon as ClickIcon, type IconName } from '@clickhouse/click-ui';
+import { Icon as ClickIcon, type IconName } from '@clickhouse/click-ui/Icon';
 
 /**
  * The app's icon set, on Click UI's glyphs behind lucide's call signature.
@@ -509,6 +509,32 @@ export const ShieldQuestion = drawn(
     <path d={SHIELD} />
     <path d="M12 11.25V11c0-.817.505-1.26 1.011-1.6.494-.333.989-.767.989-1.567a2 2 0 1 0-4 0" />
     <path d={dot(12, 13.75)} />
+  </>,
+);
+
+/**
+ * [drawn] The lidded box of `Archive` with an up-arrow lifting out of it.
+ * Click UI has `cards` (used for `Archive`) but nothing for the inverse, and
+ * the two sit next to each other in the session menu — so this repeats
+ * `cards`' lid-over-body proportions and swaps the body for the arrow.
+ */
+export const ArchiveRestore = drawn(
+  'ArchiveRestore',
+  <>
+    <path d="M4 8.5h16" />
+    <path d="M4 6.5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2H4v-2Z" />
+    <path d="M5.5 8.5v9a2 2 0 0 0 2 2h3M18.5 8.5v9a2 2 0 0 1-2 2h-3" />
+    <path d="M12 18.5v-7M9.5 14 12 11.5 14.5 14" />
+  </>,
+);
+
+/** [drawn] A broken chain — the two halves of a link, pulled apart. */
+export const Unlink = drawn(
+  'Unlink',
+  <>
+    <path d="M9.5 14.5 8 16a3.536 3.536 0 0 1-5-5l1.5-1.5" />
+    <path d="M14.5 9.5 16 8a3.536 3.536 0 0 1 5 5l-1.5 1.5" />
+    <path d="M17 17l2.5 2.5M4.5 4.5 7 7M12.5 19.5V22M19.5 12.5H22M11.5 4.5V2M4.5 11.5H2" />
   </>,
 );
 
