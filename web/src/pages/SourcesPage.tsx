@@ -6,7 +6,8 @@ import {
   RefreshCw, Play, Loader2, Mail, Github, MessageCircle, Inbox,
   ExternalLink, Trash2, ChevronDown, ChevronRight,
   CheckCircle2, XCircle, HardDrive, Database, Filter, AlertTriangle,
-} from 'lucide-react';
+} from '../components/ui/icons';
+import { Badge, Button, Checkbox, IconButton, type BadgeTone } from '../components/ui';
 import { useSourcesStore, type SourceOverviewEntry } from '../stores/sourcesStore';
 import { MessageContent } from '../components/Sources/MessageContent';
 
@@ -40,14 +41,18 @@ function sourceIcon(source: string) {
   }
 }
 
-function sourceBadgeColor(source: string): string {
+/**
+ * Identity, not status — the tone says *which* source this is, so it stays on
+ * the `hue-*` ramp `Badge` is built from rather than the success/error tokens.
+ */
+function sourceBadgeTone(source: string): BadgeTone {
   const type = source.split(':')[0];
   switch (type) {
-    case 'gmail': return 'text-red-600 bg-red-500/15';
-    case 'github': return 'text-purple-600 bg-purple-500/15';
-    case 'github_repos': return 'text-purple-600 bg-purple-500/15';
-    case 'telegram': return 'text-blue-600 bg-blue-500/15';
-    default: return 'text-text-muted bg-surface-raised';
+    case 'gmail': return 'danger';
+    case 'github': return 'purple';
+    case 'github_repos': return 'purple';
+    case 'telegram': return 'info';
+    default: return 'neutral';
   }
 }
 
@@ -71,15 +76,23 @@ function SyncButton({ onClick, small = false }: { onClick: () => Promise<void>; 
     setRunning(true);
     try { await onClick(); } finally { setRunning(false); }
   };
+  const glyph = running
+    ? <Loader2 size={small ? 12 : 14} className="animate-spin" />
+    : <Play size={small ? 12 : 14} />;
+
+  if (small) {
+    return (
+      <IconButton size="xs" label="Sync now" onClick={handleClick} disabled={running}>
+        {glyph}
+      </IconButton>
+    );
+  }
+
   return (
-    <button onClick={handleClick} disabled={running}
-      className={`flex items-center gap-1 rounded transition-colors cursor-pointer shrink-0
-        ${running ? 'text-text-faint cursor-not-allowed' : 'text-text-dim hover:text-text-secondary hover:bg-surface-raised'}
-        ${small ? 'p-1' : 'px-2 py-1.5 text-[12px]'}`}
-      title="Sync now">
-      {running ? <Loader2 size={small ? 12 : 14} className="animate-spin" /> : <Play size={small ? 12 : 14} />}
-      {!small && !running && <span>Sync</span>}
-    </button>
+    <Button variant="ghost" onClick={handleClick} disabled={running} title="Sync now">
+      {glyph}
+      {!running && <span>Sync</span>}
+    </Button>
   );
 }
 
@@ -88,19 +101,18 @@ function SyncButton({ onClick, small = false }: { onClick: () => Promise<void>; 
 function HealthBadge({ state }: { state: 'healthy' | 'degraded' | 'open' | undefined }) {
   if (!state || state === 'healthy') return null;
 
-  const config = {
-    degraded: { Icon: AlertTriangle, color: 'text-amber-600', bg: 'bg-amber-500/15', label: 'degraded' },
-    open:     { Icon: XCircle,       color: 'text-red-600',   bg: 'bg-red-500/15',   label: 'circuit open' },
+  const config: { Icon: typeof AlertTriangle; tone: BadgeTone; label: string } | undefined = {
+    degraded: { Icon: AlertTriangle, tone: 'warning' as const, label: 'degraded' },
+    open:     { Icon: XCircle,       tone: 'danger' as const,  label: 'circuit open' },
   }[state];
   if (!config) return null;
 
   const { Icon } = config;
   return (
-    <span className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${config.color} ${config.bg}`}
-          title={`Source is ${config.label} — check runs tab for errors`}>
+    <Badge tone={config.tone} title={`Source is ${config.label} — check runs tab for errors`}>
       <Icon size={10} />
       {config.label}
-    </span>
+    </Badge>
   );
 }
 
@@ -119,30 +131,29 @@ function SourceSidebar() {
       {/* Tab toggle */}
       <div className="flex border-b border-border-subtle">
         {(['inbox', 'runs', 'consumers'] as const).map(tab => (
-          <button key={tab} onClick={() => setActiveTab(tab)}
-            className={`flex-1 py-2 text-[12px] font-medium transition-colors cursor-pointer
-              ${activeTab === tab ? 'text-accent border-b-2 border-accent' : 'text-text-dim hover:text-text-muted'}`}>
+          <Button key={tab} variant="tab" active={activeTab === tab}
+            onClick={() => setActiveTab(tab)} className="flex-1 py-2">
             {tab === 'inbox' ? 'Inbox' : tab === 'runs' ? 'Runs' : 'Consumers'}
-          </button>
+          </Button>
         ))}
       </div>
 
       {/* Source list */}
       <div className="p-2 space-y-1">
-        <button onClick={() => setActiveSource(null)}
-          className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-[13px] transition-colors cursor-pointer
-            ${activeSource === null ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
+        <Button variant="subtle" size="sm" fullWidth active={activeSource === null}
+          onClick={() => setActiveSource(null)}
+          className="justify-between">
           <span className="flex items-center gap-2"><Inbox size={14} /> All</span>
-          <span className="text-[11px] opacity-70 tabular-nums shrink-0">{totalMessages}</span>
-        </button>
+          <span className="text-xs opacity-70 tabular-nums shrink-0">{totalMessages}</span>
+        </Button>
 
         {Object.entries(sources).map(([src, info]) => {
           const unread = consumers.find(c => c.consumer === 'inbox' && c.source === src)?.unread || 0;
           return (
             <div key={src} className="group">
-              <button onClick={() => setActiveSource(src)}
-                className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-[13px] transition-colors cursor-pointer
-                  ${activeSource === src ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
+              <Button variant="subtle" size="sm" fullWidth active={activeSource === src}
+                onClick={() => setActiveSource(src)}
+                className="justify-between">
                 <span className="flex items-center gap-1.5 min-w-0 truncate">
                   {sourceIcon(src)}
                   <span className="truncate">{sourceLabel(src)}</span>
@@ -150,12 +161,12 @@ function SourceSidebar() {
                 </span>
                 <span className="shrink-0 flex items-center gap-1.5">
                   {unread > 0 && (
-                    <span className="text-[10px] tabular-nums bg-amber-500/20 text-hue-amber px-1 py-0.5 rounded-full leading-none font-medium">
+                    <Badge tone="warning" pill className="tabular-nums leading-none">
                       {unread}
-                    </span>
+                    </Badge>
                   )}
                   <span className="relative w-6 h-5 flex items-center justify-end">
-                    <span className="text-[11px] opacity-70 tabular-nums group-hover:opacity-0 transition-opacity">
+                    <span className="text-xs opacity-70 tabular-nums group-hover:opacity-0 transition-opacity">
                       {info.message_count}
                     </span>
                     <span className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
@@ -163,7 +174,7 @@ function SourceSidebar() {
                     </span>
                   </span>
                 </span>
-              </button>
+              </Button>
             </div>
           );
         })}
@@ -172,36 +183,42 @@ function SourceSidebar() {
       {/* Storage section */}
       <div className="mt-auto border-t border-border-subtle p-3 space-y-2">
         <div className="flex items-center justify-between">
-          <span className="text-[11px] text-text-dim flex items-center gap-1"><HardDrive size={11} /> Storage</span>
-          <span className="text-[12px] text-text-muted">{formatBytes(totalStorage)}</span>
+          <span className="text-xs text-text-dim flex items-center gap-1"><HardDrive size={11} /> Storage</span>
+          <span className="text-xs text-text-muted">{formatBytes(totalStorage)}</span>
         </div>
         {Object.entries(sources).filter(([, s]) => s.storage_bytes > 0).map(([src, s]) => (
-          <div key={src} className="flex items-center justify-between text-[11px]">
+          <div key={src} className="flex items-center justify-between text-xs">
             <span className="text-text-dim truncate">{sourceLabel(src)}</span>
             <span className="text-text-muted">{formatBytes(s.storage_bytes)}</span>
           </div>
         ))}
 
-        {/* Purge buttons */}
+        {/* Purge buttons. The confirm step escalates from the quiet
+            hover-to-red treatment to the tinted one, which is the whole
+            difference between the two variants. */}
         <div className="flex gap-1 pt-1">
           {activeSource ? (
-            <button onClick={() => {
-              if (purgeConfirm === activeSource) { purgeMessages(activeSource); setPurgeConfirm(null); }
-              else setPurgeConfirm(activeSource);
-            }}
-              className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 text-[11px] rounded transition-colors cursor-pointer
-                ${purgeConfirm === activeSource ? 'bg-red-500/15 text-red-600 border border-red-500/30' : 'text-text-dim hover:text-hue-red bg-surface border border-border-subtle'}`}>
+            <Button
+              variant={purgeConfirm === activeSource ? 'danger' : 'dangerGhost'}
+              size="xs"
+              className="flex-1"
+              onClick={() => {
+                if (purgeConfirm === activeSource) { purgeMessages(activeSource); setPurgeConfirm(null); }
+                else setPurgeConfirm(activeSource);
+              }}>
               <Trash2 size={10} /> {purgeConfirm === activeSource ? 'Confirm?' : 'Purge source'}
-            </button>
+            </Button>
           ) : (
-            <button onClick={() => {
-              if (purgeConfirm === '_all') { purgeMessages(); setPurgeConfirm(null); }
-              else setPurgeConfirm('_all');
-            }}
-              className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 text-[11px] rounded transition-colors cursor-pointer
-                ${purgeConfirm === '_all' ? 'bg-red-500/15 text-red-600 border border-red-500/30' : 'text-text-dim hover:text-hue-red bg-surface border border-border-subtle'}`}>
+            <Button
+              variant={purgeConfirm === '_all' ? 'danger' : 'dangerGhost'}
+              size="xs"
+              className="flex-1"
+              onClick={() => {
+                if (purgeConfirm === '_all') { purgeMessages(); setPurgeConfirm(null); }
+                else setPurgeConfirm('_all');
+              }}>
               <Trash2 size={10} /> {purgeConfirm === '_all' ? 'Confirm purge all?' : 'Purge all'}
-            </button>
+            </Button>
           )}
         </div>
 
@@ -214,7 +231,7 @@ function SourceSidebar() {
 
         {/* Health summary */}
         {sourceHealth && Object.values(sourceHealth).some(h => h.state !== 'healthy') && (
-          <div className="text-[11px] text-hue-amber flex items-center gap-1 pt-1">
+          <div className="text-xs text-warning flex items-center gap-1 pt-1">
             <AlertTriangle size={10} />
             {Object.values(sourceHealth).filter(h => h.state !== 'healthy').length} source(s) unhealthy
           </div>
@@ -227,14 +244,14 @@ function SourceSidebar() {
 function SourceStats({ info }: { info: SourceOverviewEntry }) {
   return (
     <div className="space-y-1 pt-1">
-      <div className="text-[11px] text-text-dim flex items-center gap-1"><Database size={10} /> Stats</div>
-      <div className="grid grid-cols-2 gap-x-3 text-[11px]">
+      <div className="text-xs text-text-dim flex items-center gap-1"><Database size={10} /> Stats</div>
+      <div className="grid grid-cols-2 gap-x-3 text-xs">
         <span className="text-text-dim">1h runs</span><span className="text-text-muted">{info.stats_1h.runs}</span>
         <span className="text-text-dim">1h fetched</span><span className="text-text-muted">{info.stats_1h.fetched}</span>
         <span className="text-text-dim">24h runs</span><span className="text-text-muted">{info.stats_24h.runs}</span>
         <span className="text-text-dim">24h fetched</span><span className="text-text-muted">{info.stats_24h.fetched}</span>
         {info.stats_24h.errors > 0 && <>
-          <span className="text-text-dim">24h errors</span><span className="text-hue-red">{info.stats_24h.errors}</span>
+          <span className="text-text-dim">24h errors</span><span className="text-error">{info.stats_24h.errors}</span>
         </>}
       </div>
     </div>
@@ -254,14 +271,14 @@ function AggregateStats({ sources }: { sources: Record<string, SourceOverviewEnt
   );
   return (
     <div className="space-y-1 pt-1">
-      <div className="text-[11px] text-text-dim flex items-center gap-1"><Database size={10} /> Stats (all)</div>
-      <div className="grid grid-cols-2 gap-x-3 text-[11px]">
+      <div className="text-xs text-text-dim flex items-center gap-1"><Database size={10} /> Stats (all)</div>
+      <div className="grid grid-cols-2 gap-x-3 text-xs">
         <span className="text-text-dim">1h runs</span><span className="text-text-muted">{totals.runs_1h}</span>
         <span className="text-text-dim">1h fetched</span><span className="text-text-muted">{totals.fetched_1h}</span>
         <span className="text-text-dim">24h runs</span><span className="text-text-muted">{totals.runs_24h}</span>
         <span className="text-text-dim">24h fetched</span><span className="text-text-muted">{totals.fetched_24h}</span>
         {totals.errors_24h > 0 && <>
-          <span className="text-text-dim">24h errors</span><span className="text-hue-red">{totals.errors_24h}</span>
+          <span className="text-text-dim">24h errors</span><span className="text-error">{totals.errors_24h}</span>
         </>}
       </div>
     </div>
@@ -295,16 +312,17 @@ function MessageList() {
       {messages.map((msg) => {
         const isSelected = selectedMessage?.id === msg.id && selectedMessage?.source === msg.source;
         return (
+          // Left as a bare <button>: this is a two-line card, and `Button`'s
+          // base `inline-flex items-center justify-center` would lay the two
+          // rows side by side rather than stacked.
           <button key={`${msg.source}:${msg.id}`} onClick={() => selectMessage(msg.source, msg.id)}
             className={`w-full text-left px-3 py-2.5 border-b border-border-subtle transition-colors cursor-pointer
               ${isSelected ? 'bg-accent/10 border-l-2 border-l-accent' : 'hover:bg-surface'}`}>
             <div className="flex items-center gap-2 mb-0.5">
-              <span className={`text-[10px] px-1.5 py-0.5 rounded ${sourceBadgeColor(msg.source)}`}>
-                {msg.source.split(':')[0]}
-              </span>
-              <span className="text-[11px] text-text-faint ml-auto">{formatRelativeTime(msg.timestamp)}</span>
+              <Badge tone={sourceBadgeTone(msg.source)}>{msg.source.split(':')[0]}</Badge>
+              <span className="text-xs text-text-faint ml-auto">{formatRelativeTime(msg.timestamp)}</span>
             </div>
-            <div className="text-[13px] text-text-secondary truncate">{msg.summary}</div>
+            <div className="text-sm text-text-secondary truncate">{msg.summary}</div>
           </button>
         );
       })}
@@ -342,13 +360,13 @@ function RunsList() {
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Health info card */}
       {isUnhealthy && (
-        <div className={`mx-3 mt-2 mb-1 p-2 rounded text-[12px] ${
+        <div className={`mx-3 mt-2 mb-1 p-2 rounded text-xs border ${
           healthEntry.state === 'open'
-            ? 'bg-red-500/10 border border-red-500/20'
-            : 'bg-amber-500/10 border border-amber-500/20'
+            ? 'bg-error-bg border-error-border'
+            : 'bg-warning-bg border-warning-border'
         }`}>
           <div className={`flex items-center gap-1.5 font-medium mb-1 ${
-            healthEntry.state === 'open' ? 'text-red-600' : 'text-amber-600'
+            healthEntry.state === 'open' ? 'text-error' : 'text-warning'
           }`}>
             <AlertTriangle size={12} />
             Circuit breaker: {healthEntry.state}
@@ -360,7 +378,7 @@ function RunsList() {
             )}
           </div>
           {healthEntry.last_error && (
-            <div className="mt-1 text-[11px] text-text-dim truncate">
+            <div className="mt-1 text-xs text-text-dim truncate">
               Last error: {healthEntry.last_error}
             </div>
           )}
@@ -369,23 +387,21 @@ function RunsList() {
 
       {/* Filter bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-border-subtle shrink-0">
-        <span className="text-[11px] text-text-dim">
+        <span className="text-xs text-text-dim">
           {filteredRuns.length}{hideEmpty && filteredRuns.length !== runs.length ? ` of ${runs.length}` : ''} runs
         </span>
-        <label className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer select-none">
+        {/* Checkbox's own `label` prop is not used here: it renders the label
+            after the input, and this one puts the filter glyph first. The
+            wrapping <label> already makes the text part of the hit area. */}
+        <label className="flex items-center gap-1.5 text-xs text-text-dim cursor-pointer select-none">
           <Filter size={10} />
-          <input
-            type="checkbox"
-            checked={hideEmpty}
-            onChange={(e) => setHideEmpty(e.target.checked)}
-            className="accent-accent cursor-pointer"
-          />
+          <Checkbox checked={hideEmpty} onChange={(e) => setHideEmpty(e.target.checked)} />
           Hide empty
         </label>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        <table className="w-full text-[13px]">
+        <table className="w-full text-sm">
           <thead className="sticky top-0 bg-bg">
             <tr className="text-text-muted">
               <th className="text-left px-3 py-2 font-medium">Source</th>
@@ -411,9 +427,9 @@ function RunsList() {
                   <td className="px-3 py-2 text-text-muted">{run.records_fetched}/{run.records_processed}</td>
                   <td className="px-3 py-2">
                     {run.error ? (
-                      <span className="flex items-center gap-1 text-hue-red"><XCircle size={12} /> error</span>
+                      <span className="flex items-center gap-1 text-error"><XCircle size={12} /> error</span>
                     ) : (
-                      <span className="flex items-center gap-1 text-hue-emerald"><CheckCircle2 size={12} /> ok</span>
+                      <span className="flex items-center gap-1 text-success"><CheckCircle2 size={12} /> ok</span>
                     )}
                   </td>
                 </tr>
@@ -455,22 +471,22 @@ function RunDetail() {
       <div className="px-4 py-3 border-b border-border-subtle bg-bg">
         <div className="flex items-center gap-2 mb-1">
           {sourceIcon(run.source)}
-          <span className="text-[14px] text-text-secondary font-medium">{sourceLabel(run.source)}</span>
+          <span className="text-sm text-text-secondary font-medium">{sourceLabel(run.source)}</span>
           {run.error ? (
-            <span className="flex items-center gap-1 text-[11px] text-hue-red"><XCircle size={11} /> error</span>
+            <span className="flex items-center gap-1 text-xs text-error"><XCircle size={11} /> error</span>
           ) : (
-            <span className="flex items-center gap-1 text-[11px] text-hue-emerald"><CheckCircle2 size={11} /> ok</span>
+            <span className="flex items-center gap-1 text-xs text-success"><CheckCircle2 size={11} /> ok</span>
           )}
         </div>
-        <div className="text-[12px] text-text-dim">{new Date(run.ran_at).toLocaleString()}</div>
+        <div className="text-xs text-text-dim">{new Date(run.ran_at).toLocaleString()}</div>
 
         {/* Stats */}
         <div className="flex gap-4 mt-2">
-          <span className="text-[12px]">
+          <span className="text-xs">
             <span className="text-text-dim">Fetched:</span>{' '}
             <span className="text-text-muted">{run.records_fetched}</span>
           </span>
-          <span className="text-[12px]">
+          <span className="text-xs">
             <span className="text-text-dim">Processed:</span>{' '}
             <span className="text-text-muted">{run.records_processed}</span>
           </span>
@@ -478,23 +494,23 @@ function RunDetail() {
 
         {/* Error message */}
         {run.error && (
-          <div className="mt-2 p-2 bg-red-500/10 border border-red-500/20 rounded text-[12px] text-red-600">
+          <div className="mt-2 p-2 bg-error-bg border border-error-border rounded text-xs text-error">
             {run.error}
           </div>
         )}
 
         {/* Session link */}
         {run.session_id && (
-          <button onClick={() => navigate(`/chat/${run.session_id}`)}
-            className="flex items-center gap-1.5 mt-2 text-[12px] text-accent hover:text-link transition-colors cursor-pointer">
+          <Button variant="accent" size="xs" className="gap-1.5 mt-2"
+            onClick={() => navigate(`/chat/${run.session_id}`)}>
             <ExternalLink size={12} /> View processing session
-          </button>
+          </Button>
         )}
       </div>
 
       {/* Consumed messages */}
       <div className="px-4 py-3">
-        <div className="text-[12px] text-text-dim mb-2">
+        <div className="text-xs text-text-dim mb-2">
           {selectedRunMessages.length > 0
             ? `${selectedRunMessages.length} message${selectedRunMessages.length > 1 ? 's' : ''} consumed`
             : run.session_id ? 'No linked messages' : 'No session linked to this run'}
@@ -502,12 +518,12 @@ function RunDetail() {
         {selectedRunMessages.map((msg) => (
           <div key={`${msg.source}:${msg.id}`}
             className="flex items-start gap-2 px-2 py-2 rounded hover:bg-surface transition-colors border-b border-border-subtle last:border-0">
-            <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 mt-0.5 ${sourceBadgeColor(msg.source)}`}>
+            <Badge tone={sourceBadgeTone(msg.source)} className="mt-0.5">
               {msg.record_type.replace('_', ' ')}
-            </span>
+            </Badge>
             <div className="min-w-0 flex-1">
-              <div className="text-[13px] text-text-secondary truncate">{msg.summary}</div>
-              <div className="text-[11px] text-text-faint">{formatRelativeTime(msg.timestamp)}</div>
+              <div className="text-sm text-text-secondary truncate">{msg.summary}</div>
+              <div className="text-xs text-text-faint">{formatRelativeTime(msg.timestamp)}</div>
             </div>
           </div>
         ))}
@@ -546,18 +562,18 @@ function MessageDetail() {
       {/* Header */}
       <div className="px-4 py-3 border-b border-border-subtle bg-bg">
         <div className="flex items-center gap-2 mb-1">
-          <span className={`text-[10px] px-1.5 py-0.5 rounded ${sourceBadgeColor(msg.source)}`}>
+          <Badge tone={sourceBadgeTone(msg.source)}>
             {msg.record_type}
-          </span>
-          <span className="text-[11px] text-text-faint">{new Date(msg.timestamp).toLocaleString()}</span>
+          </Badge>
+          <span className="text-xs text-text-faint">{new Date(msg.timestamp).toLocaleString()}</span>
         </div>
-        <div className="text-[14px] text-text-secondary font-medium">{msg.summary}</div>
+        <div className="text-sm text-text-secondary font-medium">{msg.summary}</div>
 
         {/* Metadata */}
         {msg.metadata && Object.keys(msg.metadata).length > 0 && (
           <div className="flex flex-wrap gap-2 mt-2">
             {Object.entries(msg.metadata).map(([k, v]) => (
-              <span key={k} className="text-[11px] px-1.5 py-0.5 bg-surface border border-border-subtle rounded">
+              <span key={k} className="text-xs px-1.5 py-0.5 bg-surface border border-border-subtle rounded">
                 <span className="text-text-dim">{k}:</span>{' '}
                 <span className="text-text-muted">{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
               </span>
@@ -567,10 +583,10 @@ function MessageDetail() {
 
         {/* Session link */}
         {msg.run_session_id && (
-          <button onClick={() => navigate(`/chat/${msg.run_session_id}`)}
-            className="flex items-center gap-1.5 mt-2 text-[12px] text-accent hover:text-link transition-colors cursor-pointer">
+          <Button variant="accent" size="xs" className="gap-1.5 mt-2"
+            onClick={() => navigate(`/chat/${msg.run_session_id}`)}>
             <ExternalLink size={12} /> View processing session
-          </button>
+          </Button>
         )}
       </div>
 
@@ -588,14 +604,17 @@ function MessageDetail() {
       {/* Processed content toggle */}
       {hasProcessedContent && (
         <div className="px-4 pb-4">
-          <button onClick={() => setShowProcessed(!showProcessed)}
-            className="flex items-center gap-1.5 text-[12px] text-text-dim hover:text-text-muted transition-colors cursor-pointer mb-2">
+          <Button variant="ghost" size="xs" className="gap-1.5 mb-2"
+            onClick={() => setShowProcessed(!showProcessed)}>
             {showProcessed ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             Processed version (what the agent saw)
-          </button>
+          </Button>
           {showProcessed && (
             <div className="p-3 bg-surface border border-border-subtle rounded-lg">
-              <div className="prose prose-invert prose-sm max-w-none text-text-muted">
+              {/* Was `prose prose-invert prose-sm`, which generated nothing —
+                  @tailwindcss/typography is not installed. `.markdown-content`
+                  is this app's own rule set and covers the same ground. */}
+              <div className="markdown-content text-sm text-text-muted">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {msg.processed_content || ''}
                 </ReactMarkdown>
@@ -631,13 +650,13 @@ function ConsumersList() {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       <div className="flex items-center px-3 py-1.5 border-b border-border-subtle shrink-0">
-        <span className="text-[11px] text-text-dim">
+        <span className="text-xs text-text-dim">
           {consumers.length} cursor{consumers.length !== 1 ? 's' : ''} across {Object.keys(grouped).length} consumer{Object.keys(grouped).length !== 1 ? 's' : ''}
         </span>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        <table className="w-full text-[13px]">
+        <table className="w-full text-sm">
           <thead className="sticky top-0 bg-bg">
             <tr className="text-text-muted">
               <th className="text-left px-3 py-2 font-medium">Consumer</th>
@@ -652,14 +671,14 @@ function ConsumersList() {
             {consumers.map((c) => (
               <tr key={`${c.consumer}-${c.source}`}
                 className="border-t border-border-subtle hover:bg-surface transition-colors">
-                <td className="px-3 py-2 text-text-secondary font-mono text-[12px]">{c.consumer}</td>
+                <td className="px-3 py-2 text-text-secondary font-mono text-xs">{c.consumer}</td>
                 <td className="px-3 py-2">
                   <span className="flex items-center gap-1.5">
                     {sourceIcon(c.source)}
                     <span className="text-text-secondary truncate max-w-[140px]">{sourceLabel(c.source)}</span>
                   </span>
                 </td>
-                <td className="px-3 py-2 text-right text-text-muted font-mono tabular-nums text-[12px]">
+                <td className="px-3 py-2 text-right text-text-muted font-mono tabular-nums text-xs">
                   {c.cursor_seq}
                 </td>
                 <td className="px-3 py-2 text-right">
@@ -695,22 +714,23 @@ function ConsumersDetail() {
     <div className="flex-1 flex flex-col overflow-y-auto">
       <div className="px-4 py-3 border-b border-border-subtle bg-bg">
         <h3 className="text-sm font-medium text-text-secondary">Consumer Sessions</h3>
-        <p className="text-[11px] text-text-dim mt-0.5">Cron sessions processing the inbox</p>
+        <p className="text-xs text-text-dim mt-0.5">Cron sessions processing the inbox</p>
       </div>
       <div className="p-4 space-y-2">
         {sessions.length === 0 ? (
-          <div className="text-[13px] text-text-faint">No active consumer sessions</div>
+          <div className="text-sm text-text-faint">No active consumer sessions</div>
         ) : sessions.map(sid => {
           const cursorsForSession = consumers.filter(c => c.session_id === sid);
           const totalUnread = cursorsForSession.reduce((sum, c) => sum + c.unread, 0);
           return (
+            // Two-line card; see MessageList for why this stays a <button>.
             <button key={sid} onClick={() => navigate(`/chat/${sid}`)}
               className="w-full text-left p-3 rounded border border-border-subtle hover:border-border-subtle hover:bg-surface transition-colors cursor-pointer">
               <div className="flex items-center justify-between">
-                <span className="text-[13px] text-text-secondary font-mono">{sid}</span>
+                <span className="text-sm text-text-secondary font-mono">{sid}</span>
                 <ExternalLink size={12} className="text-text-faint" />
               </div>
-              <div className="flex items-center gap-3 mt-1.5 text-[11px] text-text-dim">
+              <div className="flex items-center gap-3 mt-1.5 text-xs text-text-dim">
                 <span>{cursorsForSession.length} source{cursorsForSession.length !== 1 ? 's' : ''}</span>
                 {totalUnread > 0 && <span className="text-hue-amber">{totalUnread} unread</span>}
               </div>
@@ -752,17 +772,14 @@ export function SourcesPage() {
       <div className="border-b border-border-subtle px-4 py-2.5 flex items-center justify-between bg-bg shrink-0">
         <h1 className="text-lg font-semibold">Sources</h1>
         <div className="flex items-center gap-2">
-          <button onClick={handleSyncAll} disabled={syncing}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-[12px] rounded-lg transition-colors cursor-pointer
-              ${syncing ? 'text-text-faint cursor-not-allowed bg-surface' : 'text-text-muted hover:text-text-secondary bg-surface hover:bg-surface-raised border border-border-subtle'}`}>
+          <Button variant="secondary" onClick={handleSyncAll} disabled={syncing}>
             {syncing ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
             {syncing ? 'Syncing...' : 'Sync All'}
-          </button>
-          <button onClick={() => { loadOverview(); if (activeTab === 'inbox') loadMessages(); }}
-            className="text-text-dim hover:text-text-muted cursor-pointer p-1.5 hover:bg-surface-raised rounded"
-            title="Refresh">
+          </Button>
+          <IconButton label="Refresh"
+            onClick={() => { loadOverview(); if (activeTab === 'inbox') loadMessages(); }}>
             <RefreshCw size={16} />
-          </button>
+          </IconButton>
         </div>
       </div>
 

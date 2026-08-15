@@ -1,21 +1,24 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from '../components/ui/icons';
+import { Badge, type BadgeTone, Button, IconButton, TextArea } from '../components/ui';
 import { usePlanStore } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
-  approved: 'bg-emerald-400/10 text-hue-emerald border-emerald-400/20',
-  implementing: 'bg-blue-400/10 text-hue-blue border-blue-400/20',
-  declined: 'bg-red-400/10 text-hue-red border-red-400/20',
-  superseded: 'bg-border-subtle/50 text-text-muted border-border-subtle',
-  failed: 'bg-red-400/10 text-hue-red border-red-400/20',
+/** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
+const STATUS_TONES: Record<string, BadgeTone> = {
+  pending: 'warning',
+  approved: 'success',
+  implementing: 'info',
+  declined: 'danger',
+  superseded: 'neutral',
+  failed: 'danger',
 };
 
-const TYPE_STYLES: Record<string, { label: string; className: string }> = {
-  'skill-create': { label: 'Skill', className: 'bg-purple-400/10 text-hue-purple border-purple-400/20' },
-  'skill-update': { label: 'Skill Update', className: 'bg-purple-400/10 text-hue-purple border-purple-400/20' },
+/** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
+const TYPE_LABELS: Record<string, string> = {
+  'skill-create': 'Skill',
+  'skill-update': 'Skill Update',
 };
 
 export function PlanDetailPage() {
@@ -81,41 +84,34 @@ export function PlanDetailPage() {
       {/* Header */}
       <div className="border-b border-border-subtle px-6 py-3 bg-bg shrink-0">
         <div className="flex items-center gap-3 mb-2">
-          <button
-            onClick={() => navigate('/plans')}
-            className="p-1 text-text-faint hover:text-text-muted hover:bg-surface-hover rounded cursor-pointer"
-          >
+          <IconButton label="Back to plans" size="xs" onClick={() => navigate('/plans')}>
             <ArrowLeft size={16} />
-          </button>
+          </IconButton>
           <h1 className="text-lg font-semibold text-text">
             {plan.task_title || plan.task_id}
           </h1>
-          <span className={`px-2 py-0.5 text-[12px] rounded-full border ${STATUS_STYLES[plan.status] || STATUS_STYLES.superseded}`}>
+          <Badge size="sm" pill outline tone={STATUS_TONES[plan.status] ?? 'neutral'}>
             {plan.status}
-          </span>
-          {plan.plan_type && plan.plan_type !== 'generic' && TYPE_STYLES[plan.plan_type] && (
-            <span className={`px-2 py-0.5 text-[11px] rounded-full border ${TYPE_STYLES[plan.plan_type].className}`}>
-              {TYPE_STYLES[plan.plan_type].label}
-            </span>
+          </Badge>
+          {plan.plan_type && plan.plan_type !== 'generic' && TYPE_LABELS[plan.plan_type] && (
+            <Badge size="sm" pill outline tone="purple">
+              {TYPE_LABELS[plan.plan_type]}
+            </Badge>
           )}
-          <span className="text-[12px] text-text-faint">v{plan.version}</span>
+          <span className="text-xs text-text-faint">v{plan.version}</span>
         </div>
-        <div className="flex items-center gap-4 text-[12px] text-text-faint ml-7">
+        <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
           <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
           {plan.model && <span>{plan.model}</span>}
-          <button
-            onClick={() => navigate(`/tasks/${plan.task_id}`)}
-            className="flex items-center gap-1 text-accent hover:text-link cursor-pointer"
-          >
+          <Button variant="link" size="xs" onClick={() => navigate(`/tasks/${plan.task_id}`)}>
             <ExternalLink size={11} /> View task
-          </button>
+          </Button>
           {isImplementing && plan.impl_session_id && (
-            <button
-              onClick={() => navigate(`/chat/${plan.impl_session_id}`)}
-              className="flex items-center gap-1 text-hue-blue hover:text-hue-blue cursor-pointer"
-            >
-              <MessageSquare size={11} /> Watch implementation
-            </button>
+            // House convention for a tinted inline action: the identity hue
+            // rides the icon, the label stays neutral.
+            <Button variant="ghost" size="xs" onClick={() => navigate(`/chat/${plan.impl_session_id}`)}>
+              <MessageSquare size={11} className="text-hue-blue" /> Watch implementation
+            </Button>
           )}
         </div>
       </div>
@@ -132,8 +128,8 @@ export function PlanDetailPage() {
             <div className="mt-4 flex gap-0">
               <div className="w-1 bg-accent/40 rounded-full shrink-0" />
               <div className="pl-3 py-2">
-                <div className="text-[11px] text-accent/60 font-medium mb-1">Revision feedback</div>
-                <div className="text-[13px] text-text-muted leading-relaxed whitespace-pre-wrap">{plan.feedback}</div>
+                <div className="text-xs text-accent/60 font-medium mb-1">Revision feedback</div>
+                <div className="text-sm text-text-muted leading-relaxed whitespace-pre-wrap">{plan.feedback}</div>
               </div>
             </div>
           )}
@@ -142,52 +138,50 @@ export function PlanDetailPage() {
           {isPending && (
             <div className="mt-6 space-y-3">
               <div className="flex items-center gap-3">
-                <button
-                  onClick={handleApprove}
-                  disabled={actionLoading}
-                  className="flex items-center gap-1.5 px-4 py-2 text-[13px] disabled:opacity-50 text-white rounded-lg cursor-pointer bg-emerald-600 hover:bg-emerald-500"
-                >
+                {/* Approving is this page's one committing action, so it takes
+                    the `primary` treatment — a deliberate green→accent change.
+                    It was `bg-emerald-600 text-white`, and the alternatives do
+                    not hold: `success` is tinted, which would leave the
+                    affirmative action quieter than the `dangerSolid` Decline
+                    beside it, and there is no solid-success pair to build one
+                    from — `--theme-success` is a feedback *foreground*. */}
+                <Button variant="primary" size="md" onClick={handleApprove} disabled={actionLoading}>
                   <Check size={14} />
                   Approve &amp; Implement
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="dangerSolid"
+                  size="md"
                   onClick={() => setShowDeclineFeedback(!showDeclineFeedback)}
                   disabled={actionLoading}
-                  className="flex items-center gap-1.5 px-4 py-2 text-[13px] bg-red-600/80 hover:bg-red-500/80 disabled:opacity-50 text-white rounded-lg cursor-pointer"
                 >
                   <X size={14} /> Decline
-                </button>
-                <button
-                  onClick={() => setShowFeedback(!showFeedback)}
-                  className="flex items-center gap-1.5 px-4 py-2 text-[13px] bg-surface-raised hover:bg-surface-hover text-text-secondary rounded-lg cursor-pointer"
-                >
+                </Button>
+                <Button variant="secondary" size="md" onClick={() => setShowFeedback(!showFeedback)}>
                   <MessageSquare size={14} /> Request Revision
-                </button>
+                </Button>
               </div>
 
               {showDeclineFeedback && (
                 <div className="space-y-2">
                   <div className="flex gap-0">
-                    <div className="w-1 bg-red-500/40 rounded-full shrink-0" />
+                    <div className="w-1 bg-error/40 rounded-full shrink-0" />
                     <div className="flex-1 pl-3">
-                      <textarea
+                      {/* The red focus border is gone on purpose: FIELD_BASE is
+                          the app's one focus treatment and it is accent. */}
+                      <TextArea
                         value={declineFeedback}
                         onChange={e => setDeclineFeedback(e.target.value)}
                         placeholder="Optional: why is this plan being declined? (leave empty to close without a reason)"
-                        className="w-full p-3 text-[13px] bg-surface-raised border border-border-subtle rounded-lg text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-red-500/50 resize-none"
                         rows={3}
                         autoFocus
                       />
                     </div>
                   </div>
                   <div className="flex justify-end">
-                    <button
-                      onClick={handleDecline}
-                      disabled={actionLoading}
-                      className="px-4 py-2 text-[13px] bg-red-600/80 hover:bg-red-500/80 disabled:opacity-50 text-white rounded-lg cursor-pointer"
-                    >
+                    <Button variant="dangerSolid" size="md" onClick={handleDecline} disabled={actionLoading}>
                       Confirm Decline
-                    </button>
+                    </Button>
                   </div>
                 </div>
               )}
@@ -197,14 +191,13 @@ export function PlanDetailPage() {
                   <div className="flex gap-0">
                     <div className="w-1 bg-accent/30 rounded-full shrink-0" />
                     <div className="flex-1 pl-3">
-                      <textarea
+                      <TextArea
                         value={feedback}
                         onChange={e => {
                           setFeedback(e.target.value);
                           if (actionError) clearActionError();
                         }}
                         placeholder="Describe what to change..."
-                        className="w-full p-3 text-[13px] bg-surface-raised border border-border-subtle rounded-lg text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-accent/50 resize-none"
                         rows={3}
                         autoFocus
                       />
@@ -212,18 +205,19 @@ export function PlanDetailPage() {
                   </div>
                   {actionError && (
                     <div className="flex gap-0">
-                      <div className="w-1 bg-red-500/40 rounded-full shrink-0" />
-                      <div className="pl-3 py-1 text-[12px] text-hue-red">{actionError}</div>
+                      <div className="w-1 bg-error/40 rounded-full shrink-0" />
+                      <div className="pl-3 py-1 text-xs text-hue-red">{actionError}</div>
                     </div>
                   )}
                   <div className="flex justify-end">
-                    <button
+                    <Button
+                      variant="primary"
+                      size="md"
                       onClick={handleRevise}
                       disabled={actionLoading || !feedback.trim()}
-                      className="px-4 py-2 text-[13px] bg-accent hover:bg-accent-hover disabled:opacity-50 text-on-accent rounded-lg cursor-pointer"
                     >
                       Send Revision Request
-                    </button>
+                    </Button>
                   </div>
                 </div>
               )}

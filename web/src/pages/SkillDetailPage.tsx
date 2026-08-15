@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Save, Trash2, Zap, CheckCircle, XCircle, Clock, FileText } from 'lucide-react';
+import { ArrowLeft, Save, Trash2, Zap, CheckCircle, XCircle, Clock, FileText } from '../components/ui/icons';
 import { useSkillsStore } from '../stores/skillsStore';
-import { Modal } from '../components/ui/Modal';
+import { Badge, Button, IconButton, Modal, TextArea } from '../components/ui';
 
 function UsageBar({ total, success }: { total: number; success: number }) {
   if (total === 0) return null;
@@ -10,7 +10,7 @@ function UsageBar({ total, success }: { total: number; success: number }) {
   return (
     <div className="w-full bg-surface-raised rounded-full h-1.5">
       <div
-        className={`h-1.5 rounded-full ${pct >= 90 ? 'bg-emerald-500' : pct >= 70 ? 'bg-amber-500' : 'bg-red-500'}`}
+        className={`h-1.5 rounded-full ${pct >= 90 ? 'bg-success' : pct >= 70 ? 'bg-warning' : 'bg-error'}`}
         style={{ width: `${pct}%` }}
       />
     </div>
@@ -75,44 +75,42 @@ export function SkillDetailPage() {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
         <div className="flex items-center gap-3">
-          <button onClick={() => navigate('/skills')} className="text-text-dim hover:text-text-secondary cursor-pointer">
+          <IconButton label="Back to skills" onClick={() => navigate('/skills')}>
             <ArrowLeft size={16} />
-          </button>
+          </IconButton>
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-sm font-medium text-text">{selectedSkill.name}</h1>
-              <span className="text-[10px] text-text-dim bg-surface-raised px-1.5 py-0.5 rounded">v{selectedSkill.version}</span>
+              <Badge>v{selectedSkill.version}</Badge>
             </div>
-            <p className="text-[10px] text-text-dim mt-0.5">{selectedSkill.id}</p>
+            <p className="text-2xs text-text-dim mt-0.5">{selectedSkill.id}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button
+          {/* A state readout that toggles: `success` when on, plain when off.
+              Not `pill active` — accent would read as a selected filter. */}
+          <Button
+            variant={selectedSkill.enabled ? 'success' : 'secondary'}
+            size="xs"
+            aria-pressed={selectedSkill.enabled}
             onClick={() => toggleSkill(selectedSkill.id, !selectedSkill.enabled)}
-            className={`px-2 py-1 text-xs rounded cursor-pointer ${
-              selectedSkill.enabled
-                ? 'bg-emerald-500/15 text-emerald-600 hover:bg-emerald-500/25'
-                : 'bg-surface-raised text-text-dim hover:bg-surface-raised'
-            }`}
           >
             {selectedSkill.enabled ? 'Enabled' : 'Disabled'}
-          </button>
+          </Button>
           {hasChanges && (
-            <button
-              onClick={handleSave}
-              disabled={actionLoading}
-              className="flex items-center gap-1 px-2 py-1 text-xs bg-accent text-on-accent rounded hover:bg-accent-hover cursor-pointer disabled:opacity-50"
-            >
+            <Button variant="primary" size="xs" onClick={handleSave} disabled={actionLoading}>
               <Save size={12} />
               Save
-            </button>
+            </Button>
           )}
-          <button
+          <IconButton
+            label="Delete skill"
+            variant="dangerGhost"
+            size="xs"
             onClick={() => setShowDeleteConfirm(true)}
-            className="flex items-center gap-1 px-2 py-1 text-xs text-hue-red hover:bg-red-900/20 rounded cursor-pointer"
           >
             <Trash2 size={12} />
-          </button>
+          </IconButton>
         </div>
       </div>
 
@@ -123,12 +121,15 @@ export function SkillDetailPage() {
           <div className="px-4 py-2 border-b border-border flex items-center gap-2">
             <FileText size={12} className="text-text-dim" />
             <span className="text-xs text-text-muted">SKILL.md</span>
-            {hasChanges && <span className="text-[10px] text-hue-amber">unsaved</span>}
+            {hasChanges && <span className="text-2xs text-hue-amber">unsaved</span>}
           </div>
-          <textarea
+          {/* `bare`: a full-bleed editor pane, so no surface, border or radius
+              — FIELD_BARE leaves the spacing and colour to this call site. */}
+          <TextArea
+            bare
             value={editContent}
             onChange={e => { setEditContent(e.target.value); setHasChanges(true); }}
-            className="flex-1 bg-bg text-text-secondary text-xs font-mono p-4 resize-none outline-none leading-relaxed"
+            className="flex-1 text-text-secondary text-xs font-mono p-4 leading-relaxed"
             spellCheck={false}
             onKeyDown={e => {
               if ((e.metaKey || e.ctrlKey) && e.key === 's') {
@@ -205,7 +206,7 @@ export function SkillDetailPage() {
                   <span className="text-text-dim">Allowed Tools</span>
                   <div className="flex flex-wrap gap-1 mt-1">
                     {selectedSkill.allowed_tools.map(t => (
-                      <span key={t} className="text-[10px] bg-surface-raised text-text-muted px-1.5 py-0.5 rounded">{t}</span>
+                      <Badge key={t}>{t}</Badge>
                     ))}
                   </div>
                 </div>
@@ -231,7 +232,7 @@ export function SkillDetailPage() {
               <h3 className="text-xs font-medium text-text-muted mb-2">Recent Usage</h3>
               <div className="space-y-2">
                 {selectedSkill.recent_usage.map(u => (
-                  <div key={u.id} className="flex items-center justify-between text-[10px]">
+                  <div key={u.id} className="flex items-center justify-between text-2xs">
                     <div className="flex items-center gap-1.5">
                       {u.success ? (
                         <CheckCircle size={10} className="text-hue-emerald" />
@@ -260,16 +261,12 @@ export function SkillDetailPage() {
         size="sm"
         footer={
           <>
-            <button onClick={() => setShowDeleteConfirm(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
+            <Button variant="ghost" onClick={() => setShowDeleteConfirm(false)}>
               Cancel
-            </button>
-            <button
-              onClick={handleDelete}
-              disabled={actionLoading}
-              className="px-3 py-1.5 text-xs bg-red-600 text-white rounded hover:bg-red-700 cursor-pointer disabled:opacity-50"
-            >
+            </Button>
+            <Button variant="dangerSolid" onClick={handleDelete} disabled={actionLoading}>
               {actionLoading ? 'Deleting...' : 'Delete'}
-            </button>
+            </Button>
           </>
         }
       >

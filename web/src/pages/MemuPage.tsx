@@ -2,21 +2,39 @@ import { useEffect, useState, useMemo } from 'react';
 import {
   Database, Search, Plus, X, Pencil, Trash2, ChevronDown, ChevronRight,
   FileText, Clock, Circle, History,
-} from 'lucide-react';
+} from '../components/ui/icons';
+import { Badge, Button, IconButton, Select, TextArea, TextField } from '../components/ui';
 import { useMemoryStore, type Category, type MemoryItem, type Resource, type TabView } from '../stores/memoryStore';
 import { PageHeader } from '../components/ui/PageHeader';
 import { PaneToggle } from '../components/ui/PaneToggle';
 import { Drawer } from '../components/ui/Drawer';
 import { useIsMobile } from '../hooks/useMediaQuery';
 
+/**
+ * Memory-type identity colours. Data-driven: the map is read at runtime to
+ * colour a dot, a badge and a badge tint, so these stay CSS colour *values*
+ * rather than becoming utility classes. They are `--theme-hue-*` now, so the
+ * identity colour follows the light/dark theme like the rest of the page —
+ * the raw hexes here were pinned dark-theme values.
+ */
 const TYPE_COLORS: Record<string, string> = {
   profile: 'var(--theme-accent)',
-  event: '#f59e0b',
-  knowledge: '#22c55e',
-  behavior: '#ef4444',
-  skill: '#3b82f6',
-  tool: '#a855f7',
+  event: 'var(--theme-hue-amber)',
+  knowledge: 'var(--theme-hue-green)',
+  behavior: 'var(--theme-hue-red)',
+  skill: 'var(--theme-hue-blue)',
+  tool: 'var(--theme-hue-purple)',
 };
+
+/**
+ * A 15% wash of an identity colour, matching the 15% alpha `Badge`'s tones use.
+ *
+ * `color-mix` rather than the `color + '20'` string concat this replaces: that
+ * only ever worked for a literal hex, and produced the invalid `var(--theme-
+ * accent)20` for the one entry that was already a token — so `profile` badges
+ * have been rendering with no tint at all.
+ */
+const tint = (color: string) => `color-mix(in oklab, ${color} 15%, transparent)`;
 
 const FACT_TYPES = ['profile', 'knowledge', 'behavior', 'skill', 'tool'];
 
@@ -36,6 +54,16 @@ function formatDateGroup(iso: string): string {
   // Date-only strings (YYYY-MM-DD) are parsed as UTC by JS; force local interpretation
   const d = new Date(iso.length === 10 ? iso + 'T00:00:00' : iso);
   return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+}
+
+/** The memory-type chip, coloured from `TYPE_COLORS`. */
+function TypeBadge({ type, className }: { type: string; className?: string }) {
+  const color = TYPE_COLORS[type] || 'var(--theme-text-muted)';
+  return (
+    <Badge className={className} style={{ backgroundColor: tint(color), color }}>
+      {type}
+    </Badge>
+  );
 }
 
 // --- Inline Edit Form ---
@@ -79,39 +107,38 @@ function EditForm({ item, onSave, onCancel }: {
 
   return (
     <div className="border border-accent/30 rounded-lg p-3 bg-accent/5 space-y-2">
-      <textarea
+      <TextArea
         value={content}
         onChange={e => setContent(e.target.value)}
         rows={3}
-        className="w-full bg-surface-raised border border-border-subtle rounded px-3 py-2 text-[13px] text-text-secondary outline-none focus:border-accent/50 resize-none"
       />
       <div className="flex items-center gap-2">
-        <select
+        <Select
+          fieldSize="sm"
           value={memType}
           onChange={e => setMemType(e.target.value)}
-          className="bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary outline-none focus:border-accent/50"
-        >
-          {Object.keys(TYPE_COLORS).map(t => (
-            <option key={t} value={t}>{t}</option>
-          ))}
-        </select>
+          options={Object.keys(TYPE_COLORS).map(t => ({ value: t, label: t }))}
+        />
         <div className="flex-1" />
-        <button onClick={onCancel} className="px-3 py-1 text-xs text-text-muted hover:text-text-secondary cursor-pointer transition-colors">Cancel</button>
-        <button onClick={handleSave} disabled={saving || !content.trim()} className="px-3 py-1 bg-accent text-on-accent text-xs rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-hover transition-colors">
+        <Button variant="ghost" onClick={onCancel}>Cancel</Button>
+        <Button variant="primary" onClick={handleSave} disabled={saving || !content.trim()}>
           {saving ? 'Saving...' : 'Save'}
-        </button>
+        </Button>
       </div>
       {categories.length > 0 && (
         <div className="flex flex-wrap gap-1 pt-1 border-t border-border-subtle/50">
-          <span className="text-[10px] text-text-dim self-center mr-1">Categories:</span>
-          {categories.map(cat => {
-            const selected = selectedCatIds.has(cat.id);
-            return (
-              <button key={cat.id} onClick={() => toggleCat(cat.id)} className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer transition-colors ${selected ? 'bg-accent/25 text-accent border border-accent/40' : 'bg-surface-raised text-text-dim border border-border-subtle hover:text-text-muted hover:border-border'}`}>
-                {cat.name.replace(/_/g, ' ')}
-              </button>
-            );
-          })}
+          <span className="text-2xs text-text-dim self-center mr-1">Categories:</span>
+          {categories.map(cat => (
+            <Button
+              key={cat.id}
+              variant="pill"
+              size="xs"
+              active={selectedCatIds.has(cat.id)}
+              onClick={() => toggleCat(cat.id)}
+            >
+              {cat.name.replace(/_/g, ' ')}
+            </Button>
+          ))}
         </div>
       )}
     </div>
@@ -124,14 +151,14 @@ function DeleteConfirm({ item, onConfirm, onCancel }: { item: MemoryItem; onConf
   const [deleting, setDeleting] = useState(false);
   const handleDelete = async () => { setDeleting(true); try { await onConfirm(); } finally { setDeleting(false); } };
   return (
-    <div className="border border-red-500/30 rounded-lg p-3 bg-red-500/5">
-      <div className="text-[12px] text-text-secondary mb-2">Delete this memory item?</div>
-      <div className="text-[11px] text-text-muted mb-3 line-clamp-2">{item.summary}</div>
+    <div className="border border-error-border rounded-lg p-3 bg-error-bg">
+      <div className="text-xs text-text-secondary mb-2">Delete this memory item?</div>
+      <div className="text-xs text-text-muted mb-3 line-clamp-2">{item.summary}</div>
       <div className="flex items-center gap-2 justify-end">
-        <button onClick={onCancel} className="px-3 py-1 text-xs text-text-muted hover:text-text-secondary cursor-pointer transition-colors">Cancel</button>
-        <button onClick={handleDelete} disabled={deleting} className="px-3 py-1 bg-red-600 text-white text-xs rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-red-700 transition-colors">
+        <Button variant="ghost" onClick={onCancel}>Cancel</Button>
+        <Button variant="dangerSolid" onClick={handleDelete} disabled={deleting}>
           {deleting ? 'Deleting...' : 'Delete'}
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -149,13 +176,11 @@ function ItemRow({ item, isEditing, isDeleting, onEdit, onDelete, onSave, onCanc
   if (isDeleting) return <DeleteConfirm item={item} onConfirm={onConfirmDelete} onCancel={onCancelDelete} />;
   return (
     <div className="group flex items-start gap-2 px-3 py-2 rounded hover:bg-surface-raised transition-colors">
-      <span className="text-[10px] px-1.5 py-0.5 rounded mt-0.5 shrink-0" style={{ backgroundColor: (TYPE_COLORS[item.memory_type] || '#666') + '20', color: TYPE_COLORS[item.memory_type] || '#666' }}>
-        {item.memory_type}
-      </span>
-      <span className="text-[12px] text-text-secondary flex-1">{item.summary}</span>
+      <TypeBadge type={item.memory_type} />
+      <span className="text-xs text-text-secondary flex-1">{item.summary}</span>
       <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button onClick={onEdit} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-text-muted cursor-pointer transition-colors" title="Edit"><Pencil size={12} /></button>
-        <button onClick={onDelete} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-hue-red cursor-pointer transition-colors" title="Delete"><Trash2 size={12} /></button>
+        <IconButton size="xs" label="Edit" onClick={onEdit}><Pencil size={12} /></IconButton>
+        <IconButton size="xs" variant="dangerGhost" label="Delete" onClick={onDelete}><Trash2 size={12} /></IconButton>
       </div>
     </div>
   );
@@ -174,7 +199,7 @@ function CategorySummaryEditor({ category }: { category: Category }) {
   if (!isEditing) {
     return (
       <div
-        className="px-3 py-2 bg-bg-sunken text-[11px] text-text-muted whitespace-pre-wrap border-b border-border-subtle group/summary cursor-pointer hover:bg-surface-hover transition-colors"
+        className="px-3 py-2 bg-bg-sunken text-xs text-text-muted whitespace-pre-wrap border-b border-border-subtle group/summary cursor-pointer hover:bg-surface-hover transition-colors"
         onClick={() => setEditingCategoryId(category.id)}
         title="Click to edit summary"
       >
@@ -191,12 +216,12 @@ function CategorySummaryEditor({ category }: { category: Category }) {
 
   return (
     <div className="px-3 py-2 bg-bg-sunken border-b border-border-subtle">
-      <textarea value={value} onChange={e => setValue(e.target.value)} rows={3} autoFocus className="w-full bg-surface-raised border border-border-subtle rounded px-2 py-1.5 text-[11px] text-text-secondary outline-none focus:border-accent/50 resize-none" />
+      <TextArea fieldSize="sm" value={value} onChange={e => setValue(e.target.value)} rows={3} autoFocus />
       <div className="flex justify-end gap-2 mt-1">
-        <button onClick={() => setEditingCategoryId(null)} className="px-2 py-0.5 text-[10px] text-text-muted hover:text-text-secondary cursor-pointer">Cancel</button>
-        <button onClick={handleSave} disabled={saving} className="px-2 py-0.5 bg-accent text-on-accent text-[10px] rounded cursor-pointer disabled:opacity-40 hover:bg-accent-hover transition-colors">
+        <Button variant="ghost" size="xs" onClick={() => setEditingCategoryId(null)}>Cancel</Button>
+        <Button variant="primary" size="xs" onClick={handleSave} disabled={saving}>
           {saving ? 'Saving...' : 'Save'}
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -220,14 +245,14 @@ function CreateCategoryForm({ onClose }: { onClose: () => void }) {
   return (
     <div className="border border-accent/30 rounded-lg p-3 bg-accent/5 mx-3 mb-3">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-[12px] font-medium">New Category</span>
-        <button onClick={onClose} className="text-text-faint hover:text-text-muted cursor-pointer"><X size={12} /></button>
+        <span className="text-xs font-medium">New Category</span>
+        <IconButton size="xs" label="Close" onClick={onClose}><X size={12} /></IconButton>
       </div>
-      <input type="text" placeholder="Name (e.g. travel_plans)" value={name} onChange={e => setName(e.target.value)} className="w-full bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary mb-2 outline-none focus:border-accent/50" />
-      <input type="text" placeholder="Description" value={desc} onChange={e => setDesc(e.target.value)} className="w-full bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary mb-2 outline-none focus:border-accent/50" />
-      <button onClick={handleCreate} disabled={!name.trim() || creating} className="px-3 py-1 bg-accent text-on-accent text-[11px] rounded cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed hover:bg-accent-hover transition-colors">
+      <TextField fieldSize="sm" placeholder="Name (e.g. travel_plans)" value={name} onChange={e => setName(e.target.value)} className="mb-2" />
+      <TextField fieldSize="sm" placeholder="Description" value={desc} onChange={e => setDesc(e.target.value)} className="mb-2" />
+      <Button variant="primary" size="xs" onClick={handleCreate} disabled={!name.trim() || creating}>
         {creating ? 'Creating...' : 'Create'}
-      </button>
+      </Button>
     </div>
   );
 }
@@ -267,17 +292,20 @@ function Heatmap({ items, onDayClick, selectedDate }: { items: MemoryItem[]; onD
     return result;
   }, [dayCounts]);
 
+  // Data-driven, so these stay colour values rather than utilities. The three
+  // steps are one hue at three alphas, keyed off item count; `color-mix` lets
+  // that hue be the theme token instead of the old pinned `#f59e0b`.
   const getColor = (count: number, dateStr: string) => {
     if (selectedDate === dateStr) return 'var(--theme-accent)';
     if (count === 0) return 'var(--theme-surface)';
-    if (count <= 2) return '#f59e0b33';
-    if (count <= 5) return '#f59e0b88';
-    return '#f59e0b';
+    if (count <= 2) return 'color-mix(in oklab, var(--theme-hue-amber) 20%, transparent)';
+    if (count <= 5) return 'color-mix(in oklab, var(--theme-hue-amber) 53%, transparent)';
+    return 'var(--theme-hue-amber)';
   };
 
   return (
     <div className="px-3 py-2 border-b border-border-subtle overflow-x-auto">
-      <div className="text-[10px] text-text-faint mb-1">Memory activity — last 6 months</div>
+      <div className="text-2xs text-text-faint mb-1">Memory activity — last 6 months</div>
       <div style={{ display: 'flex', gap: 2 }}>
         {weeks.map((week, wi) => (
           <div key={wi} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -351,11 +379,11 @@ function FactsView() {
     <div className="space-y-1 p-3">
       {grouped.map(({ category, items: catItems }) => (
         <div key={category.id} className="border border-border-subtle rounded-lg overflow-hidden">
-          <button onClick={() => toggle(category.id)} className="w-full px-3 py-2.5 flex items-center gap-2 hover:bg-surface-raised cursor-pointer transition-colors">
+          <Button variant="subtle" size="md" fullWidth onClick={() => toggle(category.id)} className="justify-start rounded-none">
             {collapsed[category.id] ? <ChevronRight size={13} className="text-text-faint" /> : <ChevronDown size={13} className="text-text-faint" />}
-            <span className="font-medium text-[13px]">{category.name.replace(/_/g, ' ')}</span>
-            <span className="text-[11px] text-text-faint">{catItems.length}</span>
-          </button>
+            <span className="font-medium">{category.name.replace(/_/g, ' ')}</span>
+            <span className="text-xs text-text-faint">{catItems.length}</span>
+          </Button>
           {!collapsed[category.id] && (
             <div className="border-t border-border-subtle">
               <CategorySummaryEditor category={category} />
@@ -374,11 +402,11 @@ function FactsView() {
 
       {uncategorized.length > 0 && (
         <div className="border border-border-subtle rounded-lg overflow-hidden">
-          <button onClick={() => toggle('__uncategorized')} className="w-full px-3 py-2.5 flex items-center gap-2 hover:bg-surface-raised cursor-pointer transition-colors">
+          <Button variant="subtle" size="md" fullWidth onClick={() => toggle('__uncategorized')} className="justify-start rounded-none">
             {collapsed['__uncategorized'] ? <ChevronRight size={13} className="text-text-faint" /> : <ChevronDown size={13} className="text-text-faint" />}
-            <span className="font-medium text-[13px] text-text-muted">uncategorized</span>
-            <span className="text-[11px] text-text-faint">{uncategorized.length}</span>
-          </button>
+            <span className="font-medium text-text-muted">uncategorized</span>
+            <span className="text-xs text-text-faint">{uncategorized.length}</span>
+          </Button>
           {!collapsed['__uncategorized'] && (
             <div className="border-t border-border-subtle divide-y divide-border-subtle">
               {uncategorized.map(item => (
@@ -393,7 +421,7 @@ function FactsView() {
       )}
 
       {grouped.length === 0 && uncategorized.length === 0 && (
-        <div className="text-center text-text-faint text-[13px] py-12">{searchQuery ? 'No facts match your search' : 'No facts found'}</div>
+        <div className="text-center text-text-faint text-sm py-12">{searchQuery ? 'No facts match your search' : 'No facts found'}</div>
       )}
     </div>
   );
@@ -460,20 +488,20 @@ function TimelineView() {
     <div className="flex flex-col h-full">
       <Heatmap items={allEvents} onDayClick={handleDayClick} selectedDate={filterDate} />
       {filterDate && (
-        <div className="px-3 py-1.5 bg-warning/10 border-b border-border-subtle flex items-center gap-2">
-          <span className="text-[11px] text-warning">Showing: {filterDate}</span>
-          <button onClick={() => setFilterDate(null)} className="text-warning hover:text-warning cursor-pointer"><X size={12} /></button>
+        <div className="px-3 py-1.5 bg-warning-bg border-b border-border-subtle flex items-center gap-2">
+          <span className="text-xs text-warning">Showing: {filterDate}</span>
+          <IconButton size="xs" label="Clear date filter" className="text-warning" onClick={() => setFilterDate(null)}><X size={12} /></IconButton>
         </div>
       )}
       <div className="flex-1 overflow-y-auto p-3">
         {grouped.length === 0 && (
-          <div className="text-center text-text-faint text-[13px] py-12">{searchQuery ? 'No events match your search' : 'No events found'}</div>
+          <div className="text-center text-text-faint text-sm py-12">{searchQuery ? 'No events match your search' : 'No events found'}</div>
         )}
         {grouped.map(group => (
           <div key={group.dateKey} id={`timeline-date-${group.dateKey}`} className="mb-4">
             <div className="flex items-center gap-2 mb-2 px-2">
               <Clock size={12} className="text-warning" />
-              <span className="text-[12px] text-warning font-medium">{formatDateGroup(group.date)}</span>
+              <span className="text-xs text-warning font-medium">{formatDateGroup(group.date)}</span>
             </div>
             <div className="border-l-2 border-border-subtle ml-3 pl-4 space-y-1">
               {group.items.map(item => {
@@ -484,16 +512,16 @@ function TimelineView() {
                   <div key={item.id} className="group flex items-start gap-2 px-2 py-1.5 rounded hover:bg-surface-raised transition-colors">
                     <div className="w-2 h-2 rounded-full bg-warning mt-1.5 shrink-0" />
                     <div className="flex-1 min-w-0">
-                      <div className="text-[12px] text-text-secondary">{item.summary}</div>
+                      <div className="text-xs text-text-secondary">{item.summary}</div>
                       {catIds.length > 0 && (
                         <div className="flex gap-1 mt-1">
-                          {catIds.map(cid => { const cat = categoryMap.get(cid); return cat ? <span key={cid} className="text-[10px] px-1.5 py-0.5 rounded bg-border-subtle text-text-muted">{cat.name}</span> : null; })}
+                          {catIds.map(cid => { const cat = categoryMap.get(cid); return cat ? <Badge key={cid}>{cat.name}</Badge> : null; })}
                         </div>
                       )}
                     </div>
                     <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button onClick={() => setEditingItemId(item.id)} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-text-muted cursor-pointer transition-colors" title="Edit"><Pencil size={12} /></button>
-                      <button onClick={() => setDeletingItemId(item.id)} className="p-1 rounded hover:bg-surface-raised text-text-dim hover:text-hue-red cursor-pointer transition-colors" title="Delete"><Trash2 size={12} /></button>
+                      <IconButton size="xs" label="Edit" onClick={() => setEditingItemId(item.id)}><Pencil size={12} /></IconButton>
+                      <IconButton size="xs" variant="dangerGhost" label="Delete" onClick={() => setDeletingItemId(item.id)}><Trash2 size={12} /></IconButton>
                     </div>
                   </div>
                 );
@@ -538,8 +566,8 @@ function SourcesView() {
         <div key={group.date}>
           <div className="flex items-center gap-2 mb-2 px-1">
             <Clock size={12} className="text-info" />
-            <span className="text-[12px] text-info font-medium">{formatDateGroup(group.date)}</span>
-            <span className="text-[10px] text-text-faint">{group.resources.length} sources</span>
+            <span className="text-xs text-info font-medium">{formatDateGroup(group.date)}</span>
+            <span className="text-2xs text-text-faint">{group.resources.length} sources</span>
           </div>
           <div className="space-y-2 ml-3">
             {group.resources.map(res => {
@@ -547,25 +575,25 @@ function SourcesView() {
               const isExpanded = expanded.has(res.id);
               return (
                 <div key={res.id} className="border border-border-subtle rounded-lg overflow-hidden">
-                  <button onClick={() => toggleExpand(res.id)} className="w-full p-3 flex items-center gap-2 hover:bg-surface-raised cursor-pointer transition-colors text-left">
+                  <Button variant="subtle" size="md" fullWidth onClick={() => toggleExpand(res.id)} className="justify-start rounded-none text-left">
                     {isExpanded ? <ChevronDown size={13} className="text-text-faint" /> : <ChevronRight size={13} className="text-text-faint" />}
                     <FileText size={13} className="text-text-dim" />
-                    <span className="text-[12px] font-medium flex-1 truncate">{formatPath(res.url)}</span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: '#3b82f620', color: '#3b82f6' }}>{res.modality}</span>
-                    <span className="text-[11px] text-text-faint">{resItems.length} items</span>
-                  </button>
+                    <span className="text-xs font-medium flex-1 truncate">{formatPath(res.url)}</span>
+                    <Badge tone="info">{res.modality}</Badge>
+                    <span className="text-xs text-text-faint">{resItems.length} items</span>
+                  </Button>
                   {isExpanded && resItems.length > 0 && (
                     <div className="border-t border-border-subtle divide-y divide-border-subtle">
                       {resItems.map(item => (
                         <div key={item.id} className="flex items-start gap-2 px-3 py-2">
-                          <span className="text-[10px] px-1.5 py-0.5 rounded mt-0.5 shrink-0" style={{ backgroundColor: (TYPE_COLORS[item.memory_type] || '#666') + '20', color: TYPE_COLORS[item.memory_type] || '#666' }}>{item.memory_type}</span>
-                          <span className="text-[11px] text-text-muted">{item.summary}</span>
+                          <TypeBadge type={item.memory_type} className="mt-0.5" />
+                          <span className="text-xs text-text-muted">{item.summary}</span>
                         </div>
                       ))}
                     </div>
                   )}
                   {isExpanded && resItems.length === 0 && (
-                    <div className="border-t border-border-subtle px-3 py-2 text-[11px] text-text-faint">No items extracted from this source</div>
+                    <div className="border-t border-border-subtle px-3 py-2 text-xs text-text-faint">No items extracted from this source</div>
                   )}
                 </div>
               );
@@ -573,60 +601,72 @@ function SourcesView() {
           </div>
         </div>
       ))}
-      {resources.length === 0 && <div className="text-center text-text-faint text-[13px] py-12">No sources found</div>}
+      {resources.length === 0 && <div className="text-center text-text-faint text-sm py-12">No sources found</div>}
     </div>
   );
 }
 
 // --- Audit Log Tab ---
 
+/** Audit-action identity colours. Same contract as `TYPE_COLORS` above. */
 const ACTION_COLORS: Record<string, string> = {
-  item_created: '#22c55e',
+  item_created: 'var(--theme-hue-green)',
   item_updated: 'var(--theme-accent)',
-  item_deleted: '#ef4444',
-  category_created: '#a855f7',
-  category_updated: '#a855f7',
-  conversation_indexed: '#f59e0b',
-  file_indexed: '#3b82f6',
+  item_deleted: 'var(--theme-hue-red)',
+  category_created: 'var(--theme-hue-purple)',
+  category_updated: 'var(--theme-hue-purple)',
+  conversation_indexed: 'var(--theme-hue-amber)',
+  file_indexed: 'var(--theme-hue-blue)',
 };
 
 function LogView() {
   const { auditLogs, auditLoading, auditFilter, loadAuditLogs, setAuditFilter } = useMemoryStore();
   useEffect(() => { loadAuditLogs(); }, []);
 
-  if (auditLoading) return <div className="text-center text-text-faint text-[13px] py-12">Loading audit log...</div>;
+  if (auditLoading) return <div className="text-center text-text-faint text-sm py-12">Loading audit log...</div>;
 
   return (
     <div className="p-3 space-y-1">
       <div className="flex gap-2 mb-3">
-        <select value={auditFilter.action} onChange={e => setAuditFilter({ action: e.target.value })} className="bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary outline-none">
-          <option value="">All actions</option>
-          {Object.keys(ACTION_COLORS).map(a => <option key={a} value={a}>{a.replace(/_/g, ' ')}</option>)}
-        </select>
-        <select value={auditFilter.target_type} onChange={e => setAuditFilter({ target_type: e.target.value })} className="bg-surface-raised border border-border-subtle rounded px-2 py-1 text-[12px] text-text-secondary outline-none">
-          <option value="">All types</option>
-          <option value="item">item</option>
-          <option value="category">category</option>
-          <option value="resource">resource</option>
-        </select>
+        <Select
+          fieldSize="sm"
+          value={auditFilter.action}
+          onChange={e => setAuditFilter({ action: e.target.value })}
+          emptyLabel="All actions"
+          options={Object.keys(ACTION_COLORS).map(a => ({ value: a, label: a.replace(/_/g, ' ') }))}
+        />
+        <Select
+          fieldSize="sm"
+          value={auditFilter.target_type}
+          onChange={e => setAuditFilter({ target_type: e.target.value })}
+          emptyLabel="All types"
+          options={[
+            { value: 'item', label: 'item' },
+            { value: 'category', label: 'category' },
+            { value: 'resource', label: 'resource' },
+          ]}
+        />
       </div>
 
-      {auditLogs.map(entry => (
-        <div key={entry.id} className="flex items-start gap-2 px-3 py-2 rounded hover:bg-surface-raised transition-colors border border-border-subtle">
-          <span className="text-[10px] px-1.5 py-0.5 rounded mt-0.5 shrink-0" style={{ backgroundColor: (ACTION_COLORS[entry.action] || '#666') + '20', color: ACTION_COLORS[entry.action] || '#666' }}>
-            {entry.action.replace(/_/g, ' ')}
-          </span>
-          <div className="flex-1 min-w-0">
-            <div className="text-[12px] text-text-secondary">
-              {entry.target_type}{entry.target_id ? `: ${entry.target_id.length > 20 ? entry.target_id.substring(0, 20) + '...' : entry.target_id}` : ''}
+      {auditLogs.map(entry => {
+        const color = ACTION_COLORS[entry.action] || 'var(--theme-text-muted)';
+        return (
+          <div key={entry.id} className="flex items-start gap-2 px-3 py-2 rounded hover:bg-surface-raised transition-colors border border-border-subtle">
+            <Badge className="mt-0.5" style={{ backgroundColor: tint(color), color }}>
+              {entry.action.replace(/_/g, ' ')}
+            </Badge>
+            <div className="flex-1 min-w-0">
+              <div className="text-xs text-text-secondary">
+                {entry.target_type}{entry.target_id ? `: ${entry.target_id.length > 20 ? entry.target_id.substring(0, 20) + '...' : entry.target_id}` : ''}
+              </div>
+              {entry.source && <span className="text-2xs text-text-dim">via {entry.source}</span>}
             </div>
-            {entry.source && <span className="text-[10px] text-text-dim">via {entry.source}</span>}
+            <span className="text-2xs text-text-faint shrink-0">{new Date(entry.timestamp).toLocaleString()}</span>
           </div>
-          <span className="text-[10px] text-text-faint shrink-0">{new Date(entry.timestamp).toLocaleString()}</span>
-        </div>
-      ))}
+        );
+      })}
 
-      {auditLogs.length === 0 && <div className="text-center text-text-faint text-[13px] py-12">No audit log entries</div>}
+      {auditLogs.length === 0 && <div className="text-center text-text-faint text-sm py-12">No audit log entries</div>}
     </div>
   );
 }
@@ -664,32 +704,43 @@ function Sidebar({ inDrawer = false, onSelect }: {
       ? 'w-full flex-1 min-h-0 flex flex-col overflow-hidden'
       : 'w-52 shrink-0 border-r border-border-subtle flex flex-col overflow-hidden'}>
       <div className="p-3 border-b border-border-subtle">
-        <div className="text-[11px] text-text-dim uppercase tracking-wider mb-2">Types</div>
+        <div className="text-xs text-text-dim uppercase tracking-wider mb-2">Types</div>
         <div className="space-y-1">
           {Object.entries(TYPE_COLORS).map(([type, color]) => (
             <div key={type} className="flex items-center gap-2">
+              {/* `fill` opts the glyph into Click UI's recolour rule and
+                  `color` supplies the value, so the dot is filled with the
+                  type's identity colour. */}
               <Circle size={8} fill={color} color={color} />
-              <span className="text-[12px] text-text-muted flex-1">{type}</span>
-              <span className="text-[11px] text-text-dim">{stats[type] || 0}</span>
+              <span className="text-xs text-text-muted flex-1">{type}</span>
+              <span className="text-xs text-text-dim">{stats[type] || 0}</span>
             </div>
           ))}
         </div>
       </div>
       <div className="flex-1 overflow-y-auto p-3">
-        <div className="text-[11px] text-text-dim uppercase tracking-wider mb-2">Categories</div>
+        <div className="text-xs text-text-dim uppercase tracking-wider mb-2">Categories</div>
         {selectedCategory && (
-          <button onClick={() => { setSelectedCategory(null); onSelect?.(); }} className="w-full text-left px-2 py-1 mb-1 text-[11px] text-accent hover:bg-surface-raised rounded cursor-pointer transition-colors flex items-center gap-1">
+          <Button variant="accent" size="xs" fullWidth onClick={() => { setSelectedCategory(null); onSelect?.(); }} className="justify-start mb-1">
             <X size={10} /> Clear filter
-          </button>
+          </Button>
         )}
         <div className="space-y-0.5">
           {categories.map(cat => {
             const isActive = selectedCategory === cat.id;
             return (
-              <button key={cat.id} onClick={() => { setSelectedCategory(isActive ? null : cat.id); onSelect?.(); }} className={`w-full text-left px-2 py-1.5 rounded text-[12px] cursor-pointer transition-colors flex items-center gap-2 ${isActive ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'}`}>
-                <span className="flex-1 truncate">{cat.name.replace(/_/g, ' ')}</span>
-                <span className="text-[10px] text-text-dim">{catCounts[cat.id] || 0}</span>
-              </button>
+              <Button
+                key={cat.id}
+                variant="subtle"
+                size="xs"
+                fullWidth
+                active={isActive}
+                onClick={() => { setSelectedCategory(isActive ? null : cat.id); onSelect?.(); }}
+                className="justify-start px-2 py-1.5 gap-2"
+              >
+                <span className="flex-1 truncate text-left">{cat.name.replace(/_/g, ' ')}</span>
+                <span className="text-2xs text-text-dim">{catCounts[cat.id] || 0}</span>
+              </Button>
             );
           })}
         </div>
@@ -698,9 +749,9 @@ function Sidebar({ inDrawer = false, onSelect }: {
         <CreateCategoryForm onClose={() => setShowCreateCat(false)} />
       ) : (
         <div className="p-3 border-t border-border-subtle">
-          <button onClick={() => setShowCreateCat(true)} className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded border border-dashed border-border-subtle text-[12px] text-text-dim hover:text-text-muted hover:border-border cursor-pointer transition-colors">
+          <Button variant="ghost" fullWidth onClick={() => setShowCreateCat(true)} className="rounded border border-dashed border-border-subtle hover:border-border">
             <Plus size={12} /> Category
-          </button>
+          </Button>
         </div>
       )}
     </div>
@@ -763,9 +814,9 @@ export function MemuPage() {
           : undefined}
         title="Semantic Memory"
         filters={TABS.map(tab => (
-          <button key={tab.key} onClick={() => setActiveTab(tab.key)} className={`px-3 py-1 rounded text-xs cursor-pointer transition-colors whitespace-nowrap ${activeTab === tab.key ? 'bg-accent/20 text-accent' : 'text-text-dim hover:text-text-muted'}`}>
-            {tab.key === 'log' && <History size={11} className="inline mr-1 -mt-0.5" />}{tab.label}
-          </button>
+          <Button key={tab.key} variant="pill" active={activeTab === tab.key} onClick={() => setActiveTab(tab.key)}>
+            {tab.key === 'log' && <History size={11} />}{tab.label}
+          </Button>
         ))}
         actions={
           // The counts are context, not a control: below `lg` the tabs and
@@ -789,9 +840,22 @@ export function MemuPage() {
             <div className="px-3 py-2 border-b border-border-subtle shrink-0">
               <div className="relative">
                 <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
-                <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder={`Search ${activeTab === 'facts' ? 'facts' : 'events'}...`} className="w-full bg-surface-raised border border-border-subtle rounded pl-8 pr-3 py-1.5 text-[12px] text-text-secondary outline-none focus:border-border-subtle placeholder:text-text-faint" />
+                <TextField
+                  fieldSize="sm"
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  placeholder={`Search ${activeTab === 'facts' ? 'facts' : 'events'}...`}
+                  className="pl-8 pr-8 py-1.5"
+                />
                 {searchQuery && (
-                  <button onClick={() => setSearchQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-text-faint hover:text-text-muted cursor-pointer"><X size={12} /></button>
+                  <IconButton
+                    size="xs"
+                    label="Clear search"
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-1 top-1/2 -translate-y-1/2"
+                  >
+                    <X size={12} />
+                  </IconButton>
                 )}
               </div>
             </div>

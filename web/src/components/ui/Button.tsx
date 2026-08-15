@@ -185,7 +185,13 @@ const INACTIVE: Partial<Record<ButtonVariant, string>> = {
    * app, and dimming all of them at rest to buy a hover state on one segmented
    * control would be a bad trade.
    */
-  subtle: 'text-text-secondary hover:text-text hover:bg-surface-raised',
+  // `surface-hover`, not `surface-raised`: this variant is used for segmented
+  // controls and list rows, which frequently sit *inside* a raised group, where
+  // hovering to `surface-raised` is a no-op and the row appears dead. Hovering
+  // to `surface-hover` is at least always a change, though on a raised parent
+  // it is only a couple of units — a genuinely distinct step would need a token
+  // the palette does not currently have.
+  subtle: 'text-text-secondary hover:text-text hover:bg-surface-hover',
 };
 
 const SIZES: Record<ButtonSize, string> = {

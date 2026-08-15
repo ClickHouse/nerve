@@ -28,13 +28,30 @@ export type BadgeTone =
   | 'info'
   | 'purple';
 
+/**
+ * The four tones that mean *outcome* use the status tokens; the three that mean
+ * *identity* use hue tokens.
+ *
+ * Two agents independently asked which system chips belong to, having been told
+ * to convert status colour to `bg-success-bg`/`text-success` while `Badge`'s own
+ * tones resolved to `hue-*`. The answer is that a chip saying "failed" and a
+ * banner saying "failed" must be the same red, so the status tones follow the
+ * tokens. They are also the pairs Click UI actually designed and that we have
+ * measured — success 10.5:1 dark / 7.3:1 light, warning 5.7 / 5.3, danger 8.6 /
+ * 5.1, info 7.2 / 6.2 — whereas a hue over a 15% tint of itself was never
+ * checked against anything.
+ *
+ * `accent`, `purple` and `neutral` stay as they are: they label a *kind* of
+ * thing (a plan type, a skill, a transport), not how something went, and there
+ * is no status token that means "purple".
+ */
 const TONES: Record<BadgeTone, string> = {
   neutral: 'text-text-muted bg-border-subtle',
   accent: 'text-accent bg-accent/15',
-  success: 'text-hue-emerald bg-hue-emerald/15',
-  warning: 'text-hue-amber bg-hue-amber/15',
-  danger: 'text-hue-red bg-hue-red/15',
-  info: 'text-hue-blue bg-hue-blue/15',
+  success: 'text-success bg-success-bg',
+  warning: 'text-warning bg-warning-bg',
+  danger: 'text-error bg-error-bg',
+  info: 'text-info bg-info-bg',
   purple: 'text-hue-purple bg-hue-purple/15',
 };
 

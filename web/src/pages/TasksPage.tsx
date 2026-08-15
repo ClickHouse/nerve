@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { ChevronLeft, ChevronRight, Columns3, List, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Columns3, List, Plus, Search, SlidersHorizontal, X } from '../components/ui/icons';
+import { Button, IconButton, Select, TextField } from '../components/ui';
 import { useTaskStore, TASKS_PAGE_SIZE, type TaskSort, type TaskViewMode } from '../stores/taskStore';
 import { useTaskStatusStore } from '../stores/taskStatusStore';
 import { TaskFilters } from '../components/Tasks/TaskFilters';
@@ -133,20 +134,21 @@ export function TasksPage() {
         title="Tasks"
         filters={
           <>
+            {/* A segmented control: `subtle` + `active` is the app's selected
+                treatment, so the raised-surface segment becomes an accent tint. */}
             <div className="flex items-center bg-surface-raised border border-border-subtle rounded-lg p-0.5 shrink-0 mr-2">
               {VIEW_OPTIONS.map(({ value, label, Icon }) => (
-                <button
+                <Button
                   key={value}
+                  variant="subtle"
+                  size="xs"
+                  active={viewMode === value}
                   onClick={() => setViewMode(value)}
                   aria-pressed={viewMode === value}
                   title={`${label} view`}
-                  className={`flex items-center gap-1.5 px-2.5 py-1 text-[12px] rounded-md cursor-pointer transition-colors
-                    ${viewMode === value
-                      ? 'bg-surface text-text shadow-sm'
-                      : 'text-text-faint hover:text-text-secondary'}`}
                 >
                   <Icon size={13} /> {label}
-                </button>
+                </Button>
               ))}
             </div>
 
@@ -158,23 +160,25 @@ export function TasksPage() {
         search={
           <div className="relative">
             <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
-            <input
+            {/* `pl-8 pr-7` survives the field's own `px-3`: Tailwind emits the
+                per-side padding utilities after the axis ones. */}
+            <TextField
               ref={searchRef}
-              type="text"
               value={localQuery}
               onChange={e => handleSearchChange(e.target.value)}
               placeholder="Search..."
-              className="pl-8 pr-7 py-1.5 w-48 text-[13px] bg-surface-raised border border-border-subtle rounded-lg
-                text-text-secondary placeholder:text-placeholder focus:outline-none focus:border-accent/50
-                transition-colors"
+              fullWidth={false}
+              className="pl-8 pr-7 w-48"
             />
             {localQuery && (
-              <button
+              <IconButton
+                label="Clear search"
+                size="xs"
                 onClick={clearSearch}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-text-faint hover:text-text-muted cursor-pointer"
+                className="absolute right-2 top-1/2 -translate-y-1/2"
               >
                 <X size={13} />
-              </button>
+              </IconButton>
             )}
           </div>
         }
@@ -183,40 +187,42 @@ export function TasksPage() {
             {!isSearching && !isBoard && (
               // The "Sort by" label costs more than it explains once space is
               // tight; the select still names itself via title/aria-label.
-              <label className="flex items-center gap-1.5 text-[12px] text-text-faint">
+              <label className="flex items-center gap-1.5 text-xs text-text-faint">
                 <span className="hidden lg:inline">Sort by</span>
-                <select
+                {/* The house `Select` is a native `<select>`; a portalling one
+                    could not live inside this page's dialogs. */}
+                <Select
                   value={sort}
                   onChange={e => setSort(e.target.value as TaskSort)}
                   title="Sort tasks"
                   aria-label="Sort tasks"
-                  className="px-2 py-1.5 text-[13px] bg-surface-raised border border-border-subtle rounded-lg text-text-secondary focus:outline-none focus:border-accent/50 cursor-pointer"
-                >
-                  {SORT_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
+                  options={SORT_OPTIONS}
+                />
               </label>
             )}
-            <button
+            <Button
+              variant="secondary"
+              size="md"
               onClick={() => setShowStatusManager(true)}
               title="Manage statuses"
               aria-label="Manage statuses"
-              className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-text-secondary bg-surface-raised border border-border-subtle hover:border-border rounded-lg cursor-pointer whitespace-nowrap"
+              className="whitespace-nowrap"
             >
               <SlidersHorizontal size={14} /> <span className="hidden sm:inline">Statuses</span>
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="primary"
+              size="md"
               onClick={() => setShowCreateDialog(true)}
               // The label collapses to an icon on narrow screens, so the
               // button carries its name explicitly rather than relying on
               // text that is not always rendered.
               title="New task"
               aria-label="New task"
-              className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-on-accent rounded-lg cursor-pointer whitespace-nowrap"
+              className="whitespace-nowrap"
             >
               <Plus size={14} /> <span className="hidden sm:inline">New Task</span>
-            </button>
+            </Button>
           </>
         }
       />
@@ -243,31 +249,31 @@ export function TasksPage() {
             ))}
 
             {!isSearching && total > 0 && (
-              <div className="flex items-center justify-between pt-4 text-[12px] text-text-faint">
+              <div className="flex items-center justify-between pt-4 text-xs text-text-faint">
                 <span>
                   Showing {pageStart}–{pageEnd} of {total}
                 </span>
                 {totalPages > 1 && (
                   <div className="flex items-center gap-1">
-                    <button
+                    <IconButton
+                      label="Previous page"
+                      size="xs"
                       onClick={() => setPage(page - 1)}
                       disabled={!hasPrev}
-                      className="p-1.5 rounded-md text-text-dim hover:bg-surface-raised hover:text-text-muted disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                      aria-label="Previous page"
                     >
                       <ChevronLeft size={14} />
-                    </button>
+                    </IconButton>
                     <span className="px-2 text-text-dim">
                       Page {page} of {totalPages}
                     </span>
-                    <button
+                    <IconButton
+                      label="Next page"
+                      size="xs"
                       onClick={() => setPage(page + 1)}
                       disabled={!hasNext}
-                      className="p-1.5 rounded-md text-text-dim hover:bg-surface-raised hover:text-text-muted disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                      aria-label="Next page"
                     >
                       <ChevronRight size={14} />
-                    </button>
+                    </IconButton>
                   </div>
                 )}
               </div>
