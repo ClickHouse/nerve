@@ -298,9 +298,10 @@ With `allow_repos` empty (the default), all repos pass — behavior is unchanged
 ### GitHub actor guardrail
 
 The GitHub notification source also matches on `actors` — the list of every GitHub login
-involved in a notification (issue/PR author, assignees, and comment/review authors). This
-restricts **who** can put a notification in front of the worker, so a drive-by `@mention`
-from an untrusted account is dropped before the agent ever sees it:
+involved in a notification (issue/PR author, assignees, comment/review authors, and on a
+`reason=assign` notification the account that performed the assignment). This restricts
+**who** can put a notification in front of the worker, so a drive-by `@mention` from an
+untrusted account is dropped before the agent ever sees it:
 
 ```yaml
 sync:
@@ -313,6 +314,14 @@ sync:
 allowlist. A non-empty `allow_actors` is **fail-closed**: a notification with no
 identifiable actor (e.g. enrichment failed) is dropped. With `allow_actors` empty (the
 default), all actors pass — behavior is unchanged. The repo and actor rules AND together.
+
+Assignments are worth calling out. An `assign` notification names the assignee but not the
+assigner, and carries no comment text, so the assigner is fetched from the thread's event
+history and rendered as `Assigned by: <login>`. Without it, an assignment on a subject the
+inbox account itself authored has no third-party login anywhere — every candidate is that
+one account — and a non-empty `allow_actors` would drop it fail-closed. If you rely on
+"a maintainer assigns an issue to the bot" as a work signal, that login needs to be in
+`allow_actors`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
