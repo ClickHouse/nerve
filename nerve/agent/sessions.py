@@ -609,6 +609,21 @@ class SessionManager:
             limit=limit, include_archived=include_archived,
         )
 
+    async def list_interactive_sessions(
+        self,
+        limit: int,
+        offset: int = 0,
+        sources: tuple[str, ...] = ("telegram", "web"),
+        current_id: str | None = None,
+    ) -> list[dict]:
+        """Paginated switchable sessions (current → starred → recent) for the
+        channel /sessions keyboards. See
+        :meth:`nerve.db.sessions.SessionStore.list_interactive_sessions`.
+        """
+        return await self.db.list_interactive_sessions(
+            limit=limit, offset=offset, sources=sources, current_id=current_id,
+        )
+
     async def set_starred(self, session_id: str, starred: bool) -> bool:
         """Star or unstar a session.
 
