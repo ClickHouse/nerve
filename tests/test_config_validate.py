@@ -628,6 +628,155 @@ class TestScheduleChecking:
         assert any("SYNC_SCHED" in i for i in result.info)
 
 
+class TestPromptFileChecking:
+    """A prompt_file that will not resolve must fail here, not when the job fires.
+
+    resolve_prompt re-reads the file on every run, so nothing about a bad path is
+    known at load: the job validates, schedules, and then fails on its own
+    cadence — a day later for a nightly job.
+    """
+
+    def _run(self, tmp_path, job_extra, *, make=None):
+        ws = tmp_path / "ws"
+        _jobs(ws, [{"id": "j", "schedule": "1h", **job_extra}])
+        if make:
+            target = ws / "config" / "cron" / make
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("do the thing\n", encoding="utf-8")
+        return validate_config_bundle(
+            _cfg(tmp_path, workspace=ws), workspace_override=ws,
+        )
+
+    def test_existing_prompt_file_passes(self, tmp_path):
+        result = self._run(
+            tmp_path, {"prompt_file": "prompts/j.md"}, make="prompts/j.md",
+        )
+
+        assert result.ok, result.errors
+        assert result.warnings == []
+
+    def test_missing_prompt_file_without_fallback_is_an_error(self, tmp_path):
+        result = self._run(tmp_path, {"prompt_file": "prompts/typo.md"})
+
+        assert not result.ok
+        assert any("prompts/typo.md" in e for e in result.errors)
+
+    def test_the_error_names_the_job_and_the_consequence(self, tmp_path):
+        result = self._run(tmp_path, {"prompt_file": "prompts/typo.md"})
+
+        assert any(
+            "job 'j'" in e and "every run of it fails" in e for e in result.errors
+        )
+
+    def test_missing_prompt_file_with_inline_fallback_is_only_a_warning(
+        self, tmp_path,
+    ):
+        result = self._run(
+            tmp_path, {"prompt_file": "prompts/typo.md", "prompt": "fallback"},
+        )
+
+        assert result.ok, result.errors
+        assert any("prompts/typo.md" in w for w in result.warnings)
+
+    def test_a_directory_is_reported_as_such(self, tmp_path):
+        result = self._run(
+            tmp_path, {"prompt_file": "prompts"}, make="prompts/j.md",
+        )
+
+        assert not result.ok
+        assert any("is a directory" in e for e in result.errors)
+
+    def test_relative_path_resolves_against_the_jobs_file(self, tmp_path):
+        """Not the process's working directory — that is where cron resolves it."""
+        result = self._run(
+            tmp_path, {"prompt_file": "prompts/j.md"}, make="prompts/j.md",
+        )
+
+        assert result.ok, result.errors
+
+    def test_inline_prompt_only_is_not_flagged(self, tmp_path):
+        result = self._run(tmp_path, {"prompt": "hi"})
+
+        assert result.ok, result.errors
+        assert result.warnings == []
+
+    def test_unset_env_ref_in_a_prompt_file_is_not_flagged(self, tmp_path):
+        result = self._run(tmp_path, {"prompt_file": "${PROMPTS_DIR}/j.md"})
+
+        assert result.ok, result.errors
+        assert not any("prompt_file" in w for w in result.warnings)
+
+    def test_a_workflow_job_is_not_flagged(self, tmp_path):
+        """A workflow job never calls resolve_prompt, so its path is inert."""
+        result = self._run(tmp_path, {
+            "prompt_file": "prompts/typo.md",
+            "workflow": {
+                "engine": "claude-workflow", "prompt": "go", "budget_usd": 1,
+            },
+        })
+
+        assert result.ok, result.errors
+
+    def test_every_bad_job_is_reported_not_just_the_first(self, tmp_path):
+        ws = tmp_path / "ws"
+        _jobs(ws, [
+            {"id": "a", "schedule": "1h", "prompt_file": "prompts/a.md"},
+            {"id": "b", "schedule": "1h", "prompt_file": "prompts/b.md"},
+        ])
+        result = validate_config_bundle(
+            _cfg(tmp_path, workspace=ws), workspace_override=ws,
+        )
+
+        assert not result.ok
+        assert sum("job 'a'" in e or "job 'b'" in e for e in result.errors) == 2
+
+    def test_an_out_of_tree_path_is_judged_when_validating_this_machine(
+        self, tmp_path,
+    ):
+        """No portable_only: the filesystem checked is the one that will run it."""
+        ws = tmp_path / "ws"
+        _jobs(ws, [
+            {"id": "j", "schedule": "1h",
+             "prompt_file": str(tmp_path / "elsewhere" / "j.md")},
+        ])
+        result = validate_config_bundle(
+            _cfg(tmp_path, workspace=ws), workspace_override=ws,
+        )
+
+        assert not result.ok
+
+    def test_portable_only_does_not_judge_an_out_of_tree_path(self, tmp_path):
+        """A shared bundle cannot be expected to carry a machine-local prompt,
+        and failing a config repo over one is the same substitution
+        _tracked_cron_only refuses one directory over."""
+        ws = tmp_path / "ws"
+        _settings(ws, "timezone: UTC\n")
+        _jobs(ws, [
+            {"id": "j", "schedule": "1h",
+             "prompt_file": str(tmp_path / "elsewhere" / "j.md")},
+        ])
+        result = validate_config_bundle(
+            _cfg(tmp_path, workspace=ws), workspace_override=ws,
+            portable_only=True,
+        )
+
+        assert result.ok, result.errors
+
+    def test_portable_only_still_judges_a_path_inside_the_bundle(self, tmp_path):
+        """The footgun this check exists for: the in-repo prompts/<id>.md
+        convention, which the bundle does carry and CI can therefore verify."""
+        ws = tmp_path / "ws"
+        _settings(ws, "timezone: UTC\n")
+        _jobs(ws, [{"id": "j", "schedule": "1h", "prompt_file": "prompts/typo.md"}])
+        result = validate_config_bundle(
+            _cfg(tmp_path, workspace=ws), workspace_override=ws,
+            portable_only=True,
+        )
+
+        assert not result.ok
+        assert any("prompts/typo.md" in e for e in result.errors)
+
+
 class TestGateSpecChecking:
     """Three cases, and only three: structure is always enforced, a built-in
     type is checked in full, anything else is reported as unverified."""
