@@ -397,6 +397,27 @@ class WorkflowRunService:
     def _session_id(self, run_id: str) -> str:
         return f"{_SESSION_PREFIX}{run_id}"
 
+    async def _origin_session_id(self, run: dict) -> str | None:
+        """The session a run was started from, for sidebar nesting.
+
+        ``created_by`` encodes the origin: ``session:``/``mcp:<id>`` for a
+        direct start, ``review-loop:<loop_id>`` for a review-loop leg (whose
+        observer session is the origin). Returns None for a non-session origin
+        (``user``/``cron``) or a reference that no longer resolves.
+        """
+        cb = str(run.get("created_by") or "")
+        sid: str | None = None
+        if cb.startswith("session:"):
+            sid = cb[len("session:"):]
+        elif cb.startswith("mcp:"):
+            sid = cb[len("mcp:"):]
+        elif cb.startswith("review-loop:"):
+            loop = await self.db.get_review_loop(cb[len("review-loop:"):])
+            sid = (loop or {}).get("session_id")
+        if not sid or sid == self._session_id(run["id"]):
+            return None
+        return sid if await self.db.get_session(sid) else None
+
     def _default_model(self, backend: str) -> str:
         if backend == "codex":
             return self.config.codex.model
@@ -472,6 +493,13 @@ class WorkflowRunService:
                 model=model,
                 cwd=spec.get("cwd") or None,
             )
+            # Nest the leg under the session it was started from (display-only;
+            # engine skips the fork path for source=="workflow").
+            origin = await self._origin_session_id(run)
+            if origin:
+                await self.db.update_session_fields(
+                    session_id, {"parent_session_id": origin},
+                )
             await self.db.update_workflow_run(run_id, {"session_id": session_id})
             run = await self.db.get_workflow_run(run_id) or run
             self._journal_event(run, "started", {

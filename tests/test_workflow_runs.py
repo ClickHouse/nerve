@@ -455,6 +455,40 @@ class TestExecute:
         assert result_md.read_text(encoding="utf-8") == "final answer"
         assert any("finished" in c.kwargs["title"] for c in _notif_calls(engine))
 
+    async def test_leg_is_nested_under_origin_session(self, service, db, engine):
+        """The leg session nests under the session the run was started from,
+        so the sidebar shows it as a child instead of a top-level orphan."""
+        await db.create_session("human-1", source="web")
+        run = await service.start_run(
+            ENGINE_CLAUDE, {"prompt": "p"}, 5.0, created_by="session:human-1",
+        )
+        await _drain(service)
+        leg = await db.get_session(f"workflow:{run['id']}")
+        assert leg["parent_session_id"] == "human-1"
+
+    async def test_origin_session_id_resolves_every_created_by_shape(self, service, db):
+        """created_by → origin session: direct (session:/mcp:), review-loop leg
+        (→ observer), and None for non-session/dangling origins."""
+        await db.create_session("s1", source="web")
+        await db.create_review_loop(
+            "rvl-orig", title="t", session_id="s1", goal_prompt="g",
+            verifier_prompt="v", criteria_adoption="no", criteria=[],
+            implementer={}, verifier={}, cwd=None, max_iterations=3,
+            budget_usd=1.0,
+        )
+
+        async def origin(created_by: str) -> str | None:
+            return await service._origin_session_id(
+                {"created_by": created_by, "id": "wfr-orig"},
+            )
+
+        assert await origin("session:s1") == "s1"
+        assert await origin("mcp:s1") == "s1"
+        assert await origin("review-loop:rvl-orig") == "s1"
+        assert await origin("user") is None            # non-session origin
+        assert await origin("session:ghost") is None   # dangling reference
+        assert await origin("") is None
+
     async def test_codex_engine_uses_codex_backend(self, service, db, engine):
         run = await service.start_run(
             ENGINE_CODEX, {"prompt": "parallelize the tests"}, 5.0,
