@@ -484,18 +484,28 @@ class WorkflowRunService:
             # (SessionSpec.extra["sandbox"] beats the global codex.sandbox).
             metadata = {"codex_sandbox": str(spec["sandbox"])}
         try:
+            # Nest the leg under the session it was started from and name it
+            # "[<parent title>] <slug>"; engine skips the fork path for
+            # source=="workflow", so parent_session_id is display-only here.
+            origin = await self._origin_session_id(run)
+            parent_title = None
+            if origin:
+                parent = await self.db.get_session(origin)
+                parent_title = (parent or {}).get("title")
+            label = run.get("title") or run_id
+            leg_title = (
+                f"[{parent_title}] {label}" if parent_title
+                else f"Workflow: {label}"
+            )
             await self.engine.sessions.get_or_create(
                 session_id,
-                title=f"Workflow: {run.get('title') or run_id}",
+                title=leg_title,
                 source="workflow",
                 metadata=metadata,
                 backend=backend,
                 model=model,
                 cwd=spec.get("cwd") or None,
             )
-            # Nest the leg under the session it was started from (display-only;
-            # engine skips the fork path for source=="workflow").
-            origin = await self._origin_session_id(run)
             if origin:
                 await self.db.update_session_fields(
                     session_id, {"parent_session_id": origin},
