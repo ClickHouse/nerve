@@ -373,12 +373,6 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
         fields["title"] = req["title"]
     if "starred" in req:
         fields["starred"] = 1 if req["starred"] else 0
-        # Starring an archived session restores it first, then stars — so the
-        # star->project hook below fires on a live (idle) session. "archived"
-        # is the persisted SessionStatus.ARCHIVED value.
-        if fields["starred"] == 1 and session.get("status") == "archived":
-            fields["status"] = "idle"
-            fields["archived_at"] = None
     if "model" in req:
         requested_model = str(req["model"] or "").strip()
         if not requested_model:
@@ -398,6 +392,13 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
+    # Starring an archived session restores it via the shared unarchive path (logs "unarchived", bumps updated_at) before the star write, so the star->project hook fires on a live session.
+    if fields.get("starred") == 1 and session.get("status") == "archived":
+        if deps.engine:
+            await deps.engine.sessions.unarchive_session(session_id)
+        else:
+            fields["status"] = "idle"
+            fields["archived_at"] = None
     await deps.db.update_session_fields(session_id, fields)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default

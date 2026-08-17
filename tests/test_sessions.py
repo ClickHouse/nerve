@@ -957,6 +957,18 @@ class TestUnarchiveRoute:
         resp = setup.client.post("/api/sessions/does-not-exist/unarchive")
         assert resp.status_code == 404
 
+    async def test_star_archived_restores_via_shared_path(self, setup):
+        await setup.sm.get_or_create("star-arch")
+        await setup.sm.archive_session("star-arch")
+        resp = setup.client.patch("/api/sessions/star-arch", json={"starred": True})
+        assert resp.status_code == 200
+        session = await setup.db.get_session("star-arch")
+        assert session["status"] == "idle"
+        assert session["starred"] == 1
+        assert session["archived_at"] is None
+        events = await setup.db.get_session_events("star-arch")
+        assert any(e["event_type"] == "unarchived" for e in events)
+
 
 class MockClient:
     """Mock SDK client for testing."""
