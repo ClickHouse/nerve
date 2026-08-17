@@ -550,6 +550,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadSessions: async () => {
     try {
+      // Prior paged-in conversation depth (excludes starred, which arrive in full on page 1).
+      const prevDepth = get().sessionsNextOffset;
       const { sessions, archived_count, system_count, has_more, next_offset } = await api.listSessions();
       set({
         sessions,
@@ -558,19 +560,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sessionsHasMore: !!has_more,
         sessionsNextOffset: next_offset ?? sessions.length,
       });
-      // Keep an OPEN lazy group fresh (archive/unarchive/delete all funnel
-      // through here) by refetching its first page; a collapsed group stays
-      // untouched, i.e. still unfetched. Paged-in rows past page 1 fold back —
-      // the group is a live view, not a scroll position to preserve.
+      // Restore the depth the user had paged to, so a refresh never collapses the feed to page 1.
+      while (get().sessionsHasMore && get().sessionsNextOffset < prevDepth) {
+        await get().loadMoreSessions();
+      }
+      // Keep an OPEN lazy group fresh by refetching its first page; a collapsed group stays unfetched.
       if (get().archivedSessions !== null) {
         get().loadArchivedSessions();
       }
       if (get().systemSessions !== null) {
         get().loadSystemSessions();
       }
-      // Reclaim persisted drafts whose session no longer exists (deleted or
-      // archived elsewhere) — but never the chat you're in or an unsent one.
-      const keep = new Set(sessions.map(s => s.id));
+      // Reclaim drafts whose session is gone — but never the active chat or an unsent one.
+      const keep = new Set(get().sessions.map(s => s.id));
       const { activeSession, virtualSession } = get();
       if (activeSession) keep.add(activeSession);
       if (virtualSession) keep.add(virtualSession.id);
