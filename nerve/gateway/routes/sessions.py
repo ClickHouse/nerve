@@ -159,12 +159,7 @@ def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> 
 
 @router.get("/api/sessions")
 async def list_sessions(offset: int = 0, user: dict = Depends(require_auth)):
-    """Sidebar feed: one page of conversations, plus every starred session.
-
-    The page window covers only non-archived, non-system, non-starred rows, so
-    cron traffic can never displace conversations. Starred rows ride along
-    in full on the first page (``offset=0``) and are never truncated.
-    """
+    """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
     deps = get_deps()
     limit = _page_size()
     page = await deps.engine.sessions.list_conversation_sessions(limit=limit, offset=offset)

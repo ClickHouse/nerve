@@ -171,21 +171,16 @@ interface ChatState {
   // Background tasks (run_in_background)
   backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout'; startedAt: number }[];
 
-  // Feed pagination: the server sends one page of conversations (page size =
-  // sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
+  // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
   sessionsHasMore: boolean;
   sessionsNextOffset: number;
-  // Archived sessions — lazily loaded: nothing is fetched until the sidebar
-  // Archived group is expanded, and dropped again when it collapses. null =
-  // not loaded. archivedCount rides on every GET /api/sessions, so the
-  // collapsed group shows its badge without fetching a single row.
+  // Archived sessions — lazily loaded: fetched when the Archived group expands, dropped on collapse (null = not loaded); archivedCount rides on every GET /api/sessions for the badge.
   archivedSessions: Session[] | null;
   archivedCount: number;
   archivedLoading: boolean;
   archivedHasMore: boolean;
   archivedNextOffset: number;
-  // System sessions (cron/hook) — lazily loaded, mirror of archived. Kept out
-  // of the feed so cron traffic can never crowd the conversation list.
+  // System sessions (cron/hook) — lazily loaded, mirror of archived; kept out of the feed so cron traffic can never crowd the conversation list.
   systemSessions: Session[] | null;
   systemCount: number;
   systemLoading: boolean;
@@ -848,8 +843,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   loadMoreSessions: async () => {
-    // Feed '...': append the next page of conversations. Starred rows already
-    // arrived in full on page 1, so later pages carry conversations only.
+    // Feed '...': append the next page of conversations (starred already arrived in full on page 1).
     try {
       const { sessions, has_more, next_offset } = await api.listSessions(get().sessionsNextOffset);
       set(s => ({
@@ -863,8 +857,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   loadArchivedSessions: async (more = false) => {
-    // more=false → (re)load page 1; more=true → append the next page ('...').
-    // The spinner shows only on a cold open; refreshes swap in silently.
+    // more=false → (re)load page 1; more=true → append the next page ('...'); spinner shows only on a cold open.
     const firstLoad = get().archivedSessions === null;
     if (firstLoad) set({ archivedLoading: true });
     try {
@@ -900,8 +893,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  // Collapsing a group drops its rows entirely, so the next expand repeats the
-  // exact same cold-open request instead of showing a stale snapshot.
+  // Collapsing a group drops its rows entirely, so the next expand repeats the exact same cold-open request instead of showing a stale snapshot.
   clearArchivedSessions: () =>
     set({ archivedSessions: null, archivedHasMore: false, archivedNextOffset: 0, archivedLoading: false }),
 
@@ -911,8 +903,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   unarchiveSession: async (id: string) => {
     try {
       await api.unarchiveSession(id);
-      // Drop from the archived list right away; loadSessions() then brings it
-      // back into its normal group and refreshes the count.
+      // Drop from the archived list right away; loadSessions() then brings it back into its normal group and refreshes the count.
       set(s => ({
         archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
         archivedCount: Math.max(0, s.archivedCount - 1),
@@ -925,8 +916,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   starArchivedSession: async (id: string) => {
     try {
-      // Backend composites this: starring an archived session unarchives it
-      // first, then stars, firing the star->project hook on a live session.
+      // Backend composites this: starring an archived session unarchives it first, then stars, firing the star->project hook on a live session.
       await api.updateSession(id, { starred: true });
       set(s => ({
         archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,

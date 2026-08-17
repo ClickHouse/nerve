@@ -504,9 +504,7 @@ class TestArchiveAndCleanup:
         assert await sm.count_archived_sessions() == 1
 
     async def test_star_archived_field_write_restores(self, sm: SessionManager, db: Database):
-        """The update_session route composites star+unarchive by writing these
-        fields together; verify that write restores the row to a live, starred
-        state (status idle, archived_at cleared)."""
+        """The update_session route composites star+unarchive; verify the write restores the row to a live, starred state."""
         await sm.get_or_create("star-arch")
         await sm.archive_session("star-arch")
         await db.update_session_fields(
@@ -528,8 +526,7 @@ class TestArchiveAndCleanup:
         assert "feed-arch" not in ids   # archived excluded
 
     async def test_feed_keeps_unknown_sources(self, sm: SessionManager):
-        """Sources split by exclusion: anything that is not cron/hook is a
-        conversation, so a new source can never render nowhere."""
+        """Sources split by exclusion: anything not cron/hook is a conversation, so a new source can never render nowhere."""
         await sm.get_or_create("feed-workflow", source="workflow")
         await sm.get_or_create("feed-external", source="external")
         ids = {s["id"] for s in await sm.list_conversation_sessions()}
@@ -543,8 +540,7 @@ class TestArchiveAndCleanup:
         assert len([s for s in feed if s["id"].startswith("many-")]) == 55
 
     async def test_feed_page_window_ignores_system(self, sm: SessionManager):
-        """The window applies AFTER system rows are excluded, so cron churn can
-        never displace conversations — the bug this rework fixes."""
+        """The window applies AFTER system rows are excluded, so cron churn can never displace conversations."""
         for i in range(6):
             await sm.get_or_create(f"chat-{i}", source="web")
         for i in range(30):                      # cron churn arrives afterwards
@@ -568,8 +564,7 @@ class TestArchiveAndCleanup:
         assert await sm.count_conversation_sessions() == 12
 
     async def test_starred_never_truncated(self, sm: SessionManager, db: Database):
-        """Starred rows are off-budget: excluded from the page window and
-        returned in full however small the page size is."""
+        """Starred rows are off-budget: excluded from the page window and returned in full however small the page size is."""
         for i in range(8):
             await sm.get_or_create(f"star-{i}", source="web")
             await db.update_session_fields(f"star-{i}", {"starred": 1})
@@ -584,8 +579,7 @@ class TestArchiveAndCleanup:
     async def test_starred_system_session_is_pinned_not_hidden(
         self, sm: SessionManager, db: Database,
     ):
-        """Starring a cron session pins it in the feed and drops it from the
-        System page, so every session shows in exactly one place."""
+        """Starring a cron session pins it in the feed and drops it from the System page, so every session shows in exactly one place."""
         await sm.get_or_create("star-cron", source="cron")
         await db.update_session_fields("star-cron", {"starred": 1})
         assert "star-cron" in {s["id"] for s in await sm.list_starred_sessions()}

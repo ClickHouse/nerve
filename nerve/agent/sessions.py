@@ -670,13 +670,7 @@ class SessionManager:
         logger.info("Archived session %s", session_id)
 
     async def unarchive_session(self, session_id: str) -> None:
-        """Restore an archived session to ``idle`` so it's resumable again.
-
-        Inverse of :meth:`archive_session`: clears ``archived_at`` and flips
-        the status back to idle. ``sdk_session_id`` stays cleared (archive
-        dropped it) — the next open resumes with fresh context, like any
-        idle session.
-        """
+        """Restore an archived session to ``idle`` so it's resumable again."""
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")

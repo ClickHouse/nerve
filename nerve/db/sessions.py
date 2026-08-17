@@ -5,11 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-# Sources the sidebar treats as "system": machine-driven runs that must never
-# compete with human conversations for the feed's page window. Every other
-# source (web, telegram, api, external, workflow, …) is a conversation — the
-# split is by exclusion, so a new source shows up in the feed by default
-# instead of silently rendering nowhere.
+# Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
 _SYSTEM_SQL = "('" + "', '".join(SYSTEM_SOURCES) + "')"
 
@@ -94,12 +90,7 @@ class SessionStore:
             return row[0] if row else 0
 
     async def _page(self, sql: str, params: tuple, limit: int | None, offset: int) -> list[dict]:
-        """Run a sidebar list query with an optional page window.
-
-        ``limit=None`` means unbounded — the LIMIT/OFFSET clause is omitted
-        entirely rather than passing a sentinel, so an unlimited sidebar is a
-        plain full scan of the (already narrow) predicate.
-        """
+        """Run a sidebar list query with an optional page window (``limit=None`` = unbounded, LIMIT/OFFSET omitted)."""
         if limit is None:
             async with self.db.execute(sql, params) as cursor:
                 return [dict(row) async for row in cursor]
@@ -114,12 +105,7 @@ class SessionStore:
             return row[0] if row else 0
 
     async def list_starred_sessions(self) -> list[dict]:
-        """Every non-archived starred session, newest first — NEVER truncated.
-
-        Starred rows are off-budget for the sidebar page size (a star is a
-        durable pin), and they are returned regardless of source, so a starred
-        cron session is pinned in the feed instead of hiding in System.
-        """
+        """Every non-archived starred session, newest first — NEVER truncated (off-budget for the page size, any source)."""
         return await self._page(
             "SELECT * FROM sessions WHERE starred = 1 AND status != 'archived'"
             " ORDER BY updated_at DESC", (), None, 0,
@@ -128,13 +114,7 @@ class SessionStore:
     async def list_conversation_sessions(
         self, limit: int | None = None, offset: int = 0,
     ) -> list[dict]:
-        """Main sidebar feed page: non-archived, non-system, non-starred.
-
-        The page window applies *after* system sources are excluded, so cron
-        traffic can never crowd conversations out of the feed. Sources are
-        filtered by exclusion, not by a whitelist: anything that is not
-        cron/hook (web, telegram, api, external, workflow, …) is a conversation.
-        """
+        """Main sidebar feed page: non-archived, non-system, non-starred (window applied after excluding system sources)."""
         return await self._page(
             "SELECT * FROM sessions"
             f" WHERE status != 'archived' AND starred = 0 AND source NOT IN {_SYSTEM_SQL}"
@@ -150,8 +130,7 @@ class SessionStore:
     async def list_archived_sessions(
         self, limit: int | None = None, offset: int = 0,
     ) -> list[dict]:
-        """Archived sessions page, most recently archived first — lazily
-        fetched when the sidebar Archived group is expanded."""
+        """Archived sessions page, most recently archived first — lazily fetched when the sidebar Archived group is expanded."""
         return await self._page(
             f"SELECT * FROM sessions WHERE status = 'archived' AND source NOT IN {_SYSTEM_SQL}"
             " ORDER BY archived_at DESC", (), limit, offset,
@@ -164,9 +143,7 @@ class SessionStore:
     async def list_system_sessions(
         self, limit: int | None = None, offset: int = 0,
     ) -> list[dict]:
-        """System sessions page (cron/hook), newest first — lazily fetched when
-        the sidebar System group is expanded. Starred rows are excluded: they
-        are already pinned in the feed, so every session shows exactly once."""
+        """System sessions page (cron/hook), newest first — lazily fetched when the sidebar System group is expanded (starred rows excluded)."""
         return await self._page(
             "SELECT * FROM sessions"
             f" WHERE status != 'archived' AND starred = 0 AND source IN {_SYSTEM_SQL}"

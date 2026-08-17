@@ -33,8 +33,7 @@ export function loadCollapsedGroups(): Set<string> {
     const raw = localStorage.getItem(COLLAPSED_GROUPS_KEY);
     if (!raw) return new Set(DEFAULT_COLLAPSED_GROUPS);
     const parsed = JSON.parse(raw);
-    // Legacy payload was a bare array; anything not at the current version
-    // (including that array) is migrated by union with the defaults.
+    // Legacy payload was a bare array; anything not at the current version is migrated by union with the defaults.
     const stored = Array.isArray(parsed) ? asStrings(parsed) : asStrings(parsed?.groups);
     if (Array.isArray(parsed) || parsed?.v !== COLLAPSED_GROUPS_VERSION) {
       const merged = new Set([...stored, ...DEFAULT_COLLAPSED_GROUPS]);

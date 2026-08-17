@@ -1856,9 +1856,7 @@ class SessionsConfig:
     sticky_period_minutes: int = 120  # Reuse session if active within this window
     client_idle_timeout_minutes: int = 60  # Auto-disconnect clients idle longer than this (0 = disabled)
     star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
-    # Rows per sidebar request: caps the conversation feed and sizes one lazy
-    # Archived/System page. 0 = unlimited (a group loads in a single request).
-    # Starred sessions are exempt and always returned in full.
+    # Rows per sidebar request; caps the conversation feed and sizes one lazy Archived/System page (0 = unlimited, starred exempt).
     sidebar_page_size: int = 50
 
     @classmethod

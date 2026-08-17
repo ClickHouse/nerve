@@ -34,10 +34,6 @@ function formatShortDate(dateStr: string): string {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-// Collapsed-group persistence (Running / Starred / date buckets, keyed by the
-// group's visible label) lives in utils/dateGroups next to the bucket
-// taxonomy and its default-collapsed set.
-
 export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, mobile = false, onRequestClose }: {
   sessions: Session[];
   activeSession: string;
@@ -51,9 +47,9 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   onRequestClose?: () => void;
 }) {
   const [systemExpanded, setSystemExpanded] = useState(false);
-  // Archived group: collapsed by default and NOT persisted (mirrors System),
-  // so every reload starts collapsed and fetches nothing until expanded.
+  // Archived group: collapsed by default and NOT persisted (mirrors System), so every reload starts collapsed and fetches nothing until expanded.
   const [archivedExpanded, setArchivedExpanded] = useState(false);
+  // Collapsed-group persistence (Running / Starred / date buckets, keyed by visible label) lives in utils/dateGroups.
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(loadCollapsedGroups);
   const [localQuery, setLocalQuery] = useState('');
   const [searchHovered, setSearchHovered] = useState(false);
@@ -199,10 +195,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [isSearching, clearSearch]);
 
-  // Main feed = whatever the server sent. It already excludes archived rows
-  // and system (cron/hook) sources, which load lazily into their own groups.
-  // No client-side source whitelist: a source the UI hasn't heard of yet
-  // (workflow, a new channel) belongs in the feed rather than nowhere.
+  // Main feed = whatever the server sent (already excludes archived + system sources); no client-side source whitelist, so an unknown source lands in the feed rather than nowhere.
   const conversations = sessions;
 
   const activeIsRunning = agentStatus.state !== 'idle';
@@ -513,9 +506,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
             {/* Feed page window exhausted — never truncate silently. */}
             {sessionsHasMore && <MoreRow onClick={loadMoreSessions} />}
 
-            {/* System sessions (cron/hook) — lazy: nothing is fetched until the
-                group is expanded, and collapsing drops the rows again, so the
-                next expand repeats the identical request. */}
+            {/* System sessions (cron/hook) — lazy: nothing fetched until expanded, dropped on collapse, so the next expand repeats the identical request. */}
             {systemCount > 0 && (
               <div className="mt-2 border-t border-border-subtle pt-1">
                 <button
@@ -576,8 +567,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               </div>
             )}
 
-            {/* Archived sessions — lazy, mirror of System: fetched on expand,
-                dropped on collapse. Rendered last, collapsed by default. */}
+            {/* Archived sessions — lazy, mirror of System: fetched on expand, dropped on collapse. Rendered last, collapsed by default. */}
             {archivedCount > 0 && (
               <div className="mt-2 border-t border-border-subtle pt-1">
                 <button

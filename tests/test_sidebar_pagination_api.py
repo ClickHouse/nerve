@@ -1,15 +1,4 @@
-"""HTTP tests for the sidebar's three lists (``gateway/routes/sessions.py``).
-
-The store layer is covered in test_sessions.py; what's verified here is the
-contract the frontend actually reads — that the page window comes from
-``sessions.sidebar_page_size``, that ``has_more``/``next_offset`` drive the
-'...' control, and that starred rows ride along whole regardless of the page
-size. The shipped default (50) is exercised as a default, not as a value the
-test passes in, so a regression that hard-codes or drops the knob fails here.
-
-Harness follows TestTaskBoardRoutes in test_task_board_api.py: a minimal
-FastAPI app with the real router, auth disabled via an empty jwt_secret.
-"""
+"""HTTP tests for the sidebar's three lists (``gateway/routes/sessions.py``)."""
 
 from __future__ import annotations
 
@@ -90,8 +79,7 @@ class TestSidebarListRoutes:
         assert body["has_more"] is False
 
     async def test_cron_never_consumes_the_feed_window(self, setup):
-        """The regression this rework fixes: cron rows are counted and paged
-        separately, so they cannot displace conversations."""
+        """The regression this rework fixes: cron rows are counted and paged separately, so they cannot displace conversations."""
         await self._seed(setup.sm, setup.db, chats=10, crons=200)
 
         body = setup.client.get("/api/sessions").json()
