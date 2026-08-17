@@ -66,7 +66,7 @@ The sidebar is collapsible (toggle in header, persists via localStorage). The si
 ## Features
 
 ### Session Management
-- **Sidebar** — Collapsible sidebar with sessions split into Conversations (grouped by date) and System (cron/hook, collapsed). Toggle via header button; state persists in localStorage.
+- **Sidebar** — Collapsible sidebar with sessions split into four groups: **Starred** (pinned, any source), **Conversations** (the feed, grouped by date and paginated with a "…" load-more), **Archived** (lazy, collapsed — archived conversations only; cron/hook sessions are excluded), and **System** (lazy, collapsed — live cron/hook sessions). The Archived and System groups fetch on first expand and drop their rows again on collapse. Toggle the sidebar via header button; state persists in localStorage.
 - **Auto-naming** — New sessions get AI-generated titles via Haiku (e.g. "Italy Summer Vacation Planning" instead of the first message text)
 - **Resumable sessions** — Sessions persist across server restarts via SDK `--resume` flag; full conversation context is restored
 - **Stop button** — Red stop button replaces send during streaming; cancels agent task, saves partial response
