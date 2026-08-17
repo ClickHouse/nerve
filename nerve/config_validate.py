@@ -304,7 +304,14 @@ def validate_config_bundle(
     if portable_only:
         cron_files = _tracked_cron_only(cron_files, portable_root, result)
 
-    _validate_cron(cron_files, result, strict_keys=strict_keys)
+    _validate_cron(
+        cron_files,
+        result,
+        strict_keys=strict_keys,
+        # Out-of-tree prompt files are only judgeable when the filesystem being
+        # validated is the one that will run the jobs — see _prompt_file_problem.
+        prompt_root=portable_root if portable_only else None,
+    )
     if config is not None:
         # Source runners are scheduled from the same parser as cron jobs, so a
         # typo'd sync schedule fails identically — and needs the same gate.
@@ -621,10 +628,18 @@ def _note_layers(
 
 
 def _validate_cron(
-    cron_files, result: ValidationResult, *, strict_keys: bool = False,
+    cron_files,
+    result: ValidationResult,
+    *,
+    strict_keys: bool = False,
+    prompt_root: Path | None = None,
 ) -> None:
     """Validate cron files strictly, including gate specs (which build_gates
-    otherwise swallows)."""
+    otherwise swallows).
+
+    ``prompt_root`` bounds where ``prompt_file`` existence is judged: set to the
+    tracked config root under ``portable_only``, ``None`` to judge every path.
+    """
     from nerve.cron.gates import GATE_REGISTRY, GateConfigError, build_gate
     from nerve.cron.jobs import load_jobs
 
@@ -657,6 +672,11 @@ def _validate_cron(
             problem = _schedule_problem(job.schedule)
             if problem:
                 result.errors.append(f"{where}: {problem}")
+            problem = _prompt_file_problem(job, prompt_root)
+            if problem:
+                # Fatal only without an inline prompt to fall back to.
+                bucket = result.warnings if job.prompt else result.errors
+                bucket.append(f"{where}: {problem}")
             for spec in _job_gate_specs(job, where, result):
                 problem = _gate_spec_problem(spec)
                 if problem:
@@ -697,6 +717,58 @@ def _validate_cron(
                         f"{', '.join(unknown)} (known: "
                         f"{', '.join(sorted(cls.spec_keys))})"
                     )
+
+
+def _prompt_file_problem(job: Any, root: Path | None = None) -> str | None:
+    """Why *job*'s ``prompt_file`` would not be readable when the job fires.
+
+    ``resolve_prompt`` re-reads the file on **every run** — that is what makes a
+    prompt editable without a restart — so a path that never resolves is not
+    caught at load. The job loads, validates, schedules, and then fails only when
+    it fires, which for a nightly job can be a day later.
+
+    A missing file is fatal exactly when there is no inline ``prompt`` to fall
+    back to. With one it degrades quietly to that instead, which is survivable
+    but almost never what the author meant: a fallback is typically a short
+    summary of a long prompt, so the job silently runs a lesser version of
+    itself. That earns a warning, not an error.
+
+    Three cases are deliberately not flagged:
+
+    * a ``workflow`` job never calls ``resolve_prompt`` at all, so its prompt
+      settings are inert;
+    * a path still carrying a literal ``${VAR}`` is unset-by-definition here and
+      gets the same leniency as every other unresolved reference in the bundle —
+      the environment that runs the daemon is not the one validating it;
+    * a path outside *root*, when a *root* is given. Under ``portable_only`` the
+      question is whether the shared bundle is sound, and a bundle cannot be
+      expected to carry a file the author deliberately kept on the machine. Same
+      substitution ``_tracked_cron_only`` refuses one directory over: judging a
+      config repo by what the reviewing filesystem happens to have. With no
+      *root* the filesystem being validated is the one that will run the jobs,
+      so every path is fair game.
+    """
+    if getattr(job, "workflow", None) is not None or not job.prompt_file:
+        return None
+    if _is_unresolved(job.prompt_file):
+        return None
+    path = job.prompt_path
+    if path is None or path.is_file():
+        return None
+    if root is not None and not path.is_relative_to(root):
+        return None
+    # A directory is as unreadable as an absent file (read_text raises), and it
+    # is the likelier typo of the two — `prompts/` instead of `prompts/x.md`.
+    what = "is a directory, not a file" if path.is_dir() else "does not exist"
+    if job.prompt:
+        return (
+            f"prompt_file {path} {what}, so every run falls back to the inline "
+            f"prompt instead — which is rarely the same instruction"
+        )
+    return (
+        f"prompt_file {path} {what} and the job has no inline prompt to fall "
+        f"back to, so every run of it fails"
+    )
 
 
 def _schedule_problem(schedule: Any) -> str | None:

@@ -77,6 +77,47 @@ class SessionStore:
         async with self.db.execute(query, (limit,)) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def list_interactive_sessions(
+        self,
+        limit: int,
+        offset: int = 0,
+        sources: tuple[str, ...] = ("telegram", "web"),
+        current_id: str | None = None,
+    ) -> list[dict]:
+        """Page through switchable sessions for a channel's /sessions keyboard.
+
+        Returns non-archived sessions whose source is interactive (``sources``,
+        default telegram + web) and which have at least one message, ordered so
+        the switcher stays useful:
+
+          1. the current session (``current_id``) first, so you can always see
+             where you are however the rest is sorted;
+          2. then starred (kept-alive) sessions — they exist precisely to
+             survive going idle, so recency must not bury them;
+          3. then everything else, most recently updated first.
+
+        Filtering source and non-emptiness in SQL — rather than post-filtering a
+        plain recency fetch — is what stops constantly-updating cron/automation
+        sessions from filling the window and starving the interactive rows a
+        human actually switches between. Paginate with ``limit``/``offset``;
+        fetch ``page_size + 1`` to learn whether a further page exists.
+        """
+        if not sources:
+            return []
+        placeholders = ",".join("?" for _ in sources)
+        query = (
+            f"SELECT * FROM sessions AS s "
+            f"WHERE s.status != 'archived' "
+            f"AND s.source IN ({placeholders}) "
+            f"AND EXISTS (SELECT 1 FROM messages AS m WHERE m.session_id = s.id) "
+            f"ORDER BY (s.id = ?) DESC, COALESCE(s.starred, 0) DESC, "
+            f"s.updated_at DESC "
+            f"LIMIT ? OFFSET ?"
+        )
+        params = (*sources, current_id or "", limit, offset)
+        async with self.db.execute(query, params) as cursor:
+            return [dict(row) async for row in cursor]
+
     async def count_sessions(self, include_archived: bool = False) -> int:
         """Count sessions without loading them. Used by diagnostics."""
         if include_archived:

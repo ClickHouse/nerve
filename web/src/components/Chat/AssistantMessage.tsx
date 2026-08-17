@@ -1,6 +1,7 @@
 import { Repeat } from 'lucide-react';
 import type { ChatMessage } from '../../types/chat';
 import { BlockRenderer } from './BlockRenderer';
+import { formatMessageTime } from '../../utils/messageTime';
 
 export function AssistantMessage({ message }: { message: ChatMessage }) {
   // Review-loop milestones are controller-written system entries, not the
@@ -30,6 +31,14 @@ export function AssistantMessage({ message }: { message: ChatMessage }) {
             <BlockRenderer blocks={message.blocks} />
           </div>
         </div>
+        {message.created_at && (
+          <div
+            className="mt-1 text-right text-[10px] text-text-faint/60 tabular-nums"
+            title={new Date(message.created_at).toLocaleString()}
+          >
+            {formatMessageTime(message.created_at)}
+          </div>
+        )}
       </div>
     </div>
   );

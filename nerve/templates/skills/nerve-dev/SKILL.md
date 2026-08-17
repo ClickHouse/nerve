@@ -148,8 +148,9 @@ async def example(user: dict = Depends(require_auth)):
 4. **Run tests** — `cd ~/nerve && .venv/bin/pytest tests/ -v`
 5. **Build UI** — `cd ~/nerve/web && npm run build`
 6. **Commit** — focused, scoped commits to the feature branch
-7. **Push to fork** — `git push origin <username>/<feature-name>`
-8. **Create a PR** — open PR targeting `ClickHouse/nerve:main`
+7. **Launch a review subagent** — evaluate its feedback and make any necessary adjustments
+8. **Push to fork** — `git push origin <username>/<feature-name>`
+9. **Create a PR** — open PR targeting `ClickHouse/nerve:main`
 
 ### PR Workflow
 

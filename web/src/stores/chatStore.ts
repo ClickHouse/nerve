@@ -1029,7 +1029,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
     set((state) => ({
-      messages: [...state.messages, { role: 'user' as const, blocks }],
+      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString() }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },

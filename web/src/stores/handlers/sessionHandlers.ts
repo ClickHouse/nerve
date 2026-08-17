@@ -266,7 +266,7 @@ export function handleSessionRunning(
       if (finalBlocks.length > 0) {
         updates.messages = [
           ...s.messages,
-          { role: 'assistant' as const, blocks: finalBlocks },
+          { role: 'assistant' as const, blocks: finalBlocks, created_at: new Date().toISOString() },
         ];
       }
       updates.streamingBlocks = [];
@@ -309,6 +309,7 @@ export function handleAnswerInjected(
       messages: [...s.messages, {
         role: 'user' as const,
         blocks: [{ type: 'text' as const, content: msg.content }],
+        created_at: new Date().toISOString(),
       }],
     }));
   }
@@ -323,6 +324,6 @@ export function handleUserMessage(
   // bubble live. The sender is excluded server-side, so this never duplicates
   // its own optimistic message. hydrateMessage rebuilds any image/file blocks.
   if (msg.session_id !== get().activeSession) return;
-  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined });
+  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString() });
   set(s => ({ messages: [...s.messages, hydrated] }));
 }

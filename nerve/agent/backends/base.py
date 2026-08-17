@@ -53,7 +53,19 @@ class TurnInput:
 
 @dataclass
 class SessionSpec:
-    """Everything a backend needs to build a client for one session."""
+    """Everything a backend needs to build a client for one session.
+
+    **``system_prompt`` never goes on a command line.** It carries the
+    instance's private context — the operator's identity and memory files
+    plus TOOLS.md, which indexes where the host's credentials live — and
+    argv is world-readable: one unprivileged ``ps`` reads it out of every
+    running session at once. Backends must hand it to their runtime out
+    of band. Claude writes it to a 0600 file and passes the path
+    (``--system-prompt-file``); Codex sends it as ``developerInstructions``
+    inside the app-server JSON payload. A new backend that puts it in an
+    argument is a data leak, not a style choice —
+    ``tests/test_system_prompt_transport.py`` guards the invariant.
+    """
 
     session_id: str
     source: str
