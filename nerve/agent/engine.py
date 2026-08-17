@@ -2523,7 +2523,9 @@ class AgentEngine:
             if session:
                 parent_id = session.get("parent_session_id")
                 fork_msg = session.get("forked_from_message")
-                if parent_id and session.get("status") == SessionStatus.CREATED.value:
+                # Workflow legs carry parent_session_id for sidebar nesting only — never fork their fresh prompt from the parent (nor cross-backend).
+                if (parent_id and session.get("status") == SessionStatus.CREATED.value
+                        and session.get("source") != "workflow"):
                     parent = await self.db.get_session(parent_id)
                     if parent and parent.get("sdk_session_id"):
                         if parent.get("backend") != session.get("backend"):
