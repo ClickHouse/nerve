@@ -922,6 +922,7 @@ function SessionTree({
     <>
       <SessionItem
         session={session}
+        showUnread
         isActive={session.id === activeSession}
         isRunning={session.id === activeSession ? activeIsRunning : !!session.is_running}
         depth={depth}
@@ -962,7 +963,7 @@ function SessionTree({
 }
 
 
-function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate,
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate, showUnread = false,
   depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd }: {
   session: Session;
   isActive: boolean;
@@ -977,6 +978,8 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Fired when the row itself is opened (not its menu) — drawer mode uses it to close. */
   onSelect?: () => void;
   showDate?: boolean;
+  /** Feed-only: light up an "unread" marker when updated since last opened. */
+  showUnread?: boolean;
   /** Nesting: depth (0 = top level) indents the row; a parent shows a
       chevron in place of its icon that toggles its children. */
   depth?: number;
@@ -997,6 +1000,12 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   const inputRef = useRef<HTMLInputElement>(null);
   // Unsent draft for this chat (hidden on the active one — its text is in the box).
   const hasDraft = useChatStore(s => !!(s.drafts[session.id] || '').trim());
+  // Unread = updated since you last opened it (client-only, see readStorage).
+  // Never for the open session or a running one; feed-scoped via showUnread.
+  const lastSeen = useChatStore(s => s.reads[session.id]);
+  const readsBaseline = useChatStore(s => s.readsBaseline);
+  const isUnread = showUnread && !isActive && !isRunning
+    && parseTimestamp(session.updated_at).getTime() > Math.max(lastSeen ?? 0, readsBaseline);
 
   // Close menu on outside click
   useEffect(() => {
@@ -1090,7 +1099,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         <MessageSquare size={13} className="shrink-0 opacity-50" />
       )}
       <div className="flex-1 min-w-0">
-        <div className="truncate text-[13px]">{cleanTitle(session)}</div>
+        <div className={`truncate text-[13px]${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
       </div>
 
       {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
@@ -1100,6 +1109,13 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           title={`${childCount} nested session${childCount !== 1 ? 's' : ''}`}
         >
           {childCount}
+        </span>
+      )}
+
+      {/* Unread marker: updated since you last opened it (client-only). */}
+      {isUnread && (
+        <span title="Unread — updated since you last opened it" className="shrink-0 flex items-center">
+          <span className="h-2 w-2 rounded-full bg-accent" />
         </span>
       )}
 
