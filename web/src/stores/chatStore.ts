@@ -826,10 +826,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await api.archiveSession(id);
       removeDraft(id);
       set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
+      // Archiving cascades to the whole descendant subtree server-side, so
+      // loadSessions() drops the parent AND its children from the active feed.
       await get().loadSessions();
-      if (get().activeSession === id) {
-        // Switch to most recent remaining session
-        const remaining = get().sessions.filter(s => s.id !== id);
+      // The active chat may have been the target OR a now-archived descendant;
+      // switch away whenever it's no longer in the active list.
+      const active = get().activeSession;
+      const stillActive = get().sessions.some(s => s.id === active);
+      if (active && !stillActive) {
+        const remaining = get().sessions;
         if (remaining.length > 0) {
           await get().switchSession(remaining[0].id);
         }

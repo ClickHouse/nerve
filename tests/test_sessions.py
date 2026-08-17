@@ -975,6 +975,86 @@ class TestUnarchiveRoute:
         assert any(e["event_type"] == "unarchived" for e in events)
 
 
+@pytest.mark.asyncio
+class TestArchiveCascade:
+    """Archiving a session cascades to its whole descendant subtree."""
+
+    async def _tree(self, db: Database):
+        """Build root -> {a -> a1, b} (a1 is a grandchild)."""
+        await db.create_session("root", source="web")
+        await db.create_session("a", source="web", parent_session_id="root")
+        await db.create_session("b", source="web", parent_session_id="root")
+        await db.create_session("a1", source="web", parent_session_id="a")
+
+    async def _status(self, db: Database, sid: str) -> str:
+        return (await db.get_session(sid))["status"]
+
+    async def test_multilevel_tree_archived_wholesale(
+        self, sm: SessionManager, db: Database,
+    ):
+        await self._tree(db)
+        result = await sm.archive_session_cascade("root")
+
+        # Every node in the subtree is archived.
+        for sid in ("root", "a", "b", "a1"):
+            assert await self._status(db, sid) == SessionStatus.ARCHIVED.value
+        assert set(result["archived"]) == {"root", "a", "b", "a1"}
+        assert result["skipped"] == []
+
+    async def test_bottom_up_order_children_before_parents(
+        self, sm: SessionManager, db: Database,
+    ):
+        await self._tree(db)
+        result = await sm.archive_session_cascade("root")
+        order = result["archived"]
+        # Deepest descendants archived before their ancestors; target last.
+        assert order.index("a1") < order.index("a")
+        assert order.index("a") < order.index("root")
+        assert order.index("b") < order.index("root")
+        assert order[-1] == "root"
+
+    async def test_partial_failure_no_orphaned_archived_parent(
+        self, sm: SessionManager, db: Database,
+    ):
+        """A running grandchild blocks itself AND its un-archived ancestors,
+        while the fully-archivable sibling subtree still completes."""
+        await self._tree(db)
+        sm.mark_running("a1")  # deepest node cannot be archived
+
+        result = await sm.archive_session_cascade("root")
+
+        # a1 running -> skipped; its ancestors a and root left active (no orphan).
+        assert await self._status(db, "a1") != SessionStatus.ARCHIVED.value
+        assert await self._status(db, "a") != SessionStatus.ARCHIVED.value
+        assert await self._status(db, "root") != SessionStatus.ARCHIVED.value
+        # Sibling subtree b has no blocked descendant -> still archived.
+        assert await self._status(db, "b") == SessionStatus.ARCHIVED.value
+
+        assert "b" in result["archived"]
+        assert {"root", "a", "a1"}.isdisjoint(result["archived"])
+        skipped_ids = {s["id"] for s in result["skipped"]}
+        assert {"root", "a", "a1"} == skipped_ids
+        # No archived session retains an active (non-archived) descendant.
+        for sid in result["archived"]:
+            for child in await db.list_child_sessions(sid):
+                assert child["status"] == SessionStatus.ARCHIVED.value
+
+    async def test_cycle_guard_terminates(self, sm: SessionManager, db: Database):
+        """A malformed parent cycle must not hang the descendant walk.
+
+        The seen-set guarantees termination; every node is accounted for in
+        the structured result (archived or skipped), and the call returns.
+        """
+        await db.create_session("c1", source="web")
+        await db.create_session("c2", source="web", parent_session_id="c1")
+        # Force a cycle: c1's parent points back at its own child c2.
+        await db.update_session_fields("c1", {"parent_session_id": "c2"})
+
+        result = await asyncio.wait_for(sm.archive_session_cascade("c1"), timeout=5)
+        accounted = set(result["archived"]) | {s["id"] for s in result["skipped"]}
+        assert {"c1", "c2"} == accounted
+
+
 class MockClient:
     """Mock SDK client for testing."""
 

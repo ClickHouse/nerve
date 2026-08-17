@@ -561,10 +561,20 @@ async def resume_session(session_id: str, user: dict = Depends(require_auth)):
 
 @router.post("/api/sessions/{session_id}/archive")
 async def archive_session(session_id: str, user: dict = Depends(require_auth)):
-    """Archive a session (soft delete)."""
+    """Archive a session and its entire descendant subtree (soft delete).
+
+    Cascade is the default: children, grandchildren and deeper are archived
+    bottom-up. Returns a structured report of which session ids were archived
+    vs skipped (with reasons) so a still-running descendant never silently
+    leaves an archived-parent-with-active-child orphan.
+    """
     deps = get_deps()
-    await deps.engine.sessions.archive_session(session_id)
-    return {"archived": True}
+    result = await deps.engine.sessions.archive_session_cascade(session_id)
+    return {
+        "archived": True,
+        "archived_ids": result["archived"],
+        "skipped": result["skipped"],
+    }
 
 
 @router.post("/api/sessions/{session_id}/unarchive")
