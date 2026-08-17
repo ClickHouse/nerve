@@ -458,6 +458,16 @@ class TestArchiveAndCleanup:
         events = await db.get_session_events("unarch-ev")
         assert any(e["event_type"] == "unarchived" for e in events)
 
+    async def test_unarchive_refreshes_updated_at(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("unarch-ts")
+        old = "2000-01-01T00:00:00+00:00"
+        await db._write("UPDATE sessions SET updated_at = ? WHERE id = ?", (old, "unarch-ts"))
+        await sm.archive_session("unarch-ts")
+        await db._write("UPDATE sessions SET updated_at = ? WHERE id = ?", (old, "unarch-ts"))
+        await sm.unarchive_session("unarch-ts")
+        session = await db.get_session("unarch-ts")
+        assert session["updated_at"] > old
+
     async def test_unarchive_missing_raises(self, sm: SessionManager):
         with pytest.raises(ValueError):
             await sm.unarchive_session("does-not-exist")

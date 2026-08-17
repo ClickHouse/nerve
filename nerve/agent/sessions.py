@@ -684,6 +684,8 @@ class SessionManager:
             "status": SessionStatus.IDLE.value,
             "archived_at": None,
         })
+        # Bump updated_at so the unarchived session sorts to the top of the feed.
+        await self.db.touch_session(session_id)
         await self.db.log_session_event(session_id, "unarchived", {})
         logger.info("Unarchived session %s", session_id)
 
