@@ -661,12 +661,15 @@ class SessionManager:
 
     async def archive_session(self, session_id: str) -> None:
         """Archive a session: memorize, disconnect client, update status."""
-        # Memorize before losing the context
+        # Memorize in the background: memU indexing can take ~90s; awaiting it
+        # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
-            try:
-                await self._on_memorize(session_id)
-            except Exception as e:
-                logger.warning("Memorize before archive failed for %s: %s", session_id, e)
+            async def _memorize_bg(sid: str = session_id) -> None:
+                try:
+                    await self._on_memorize(sid)
+                except Exception as e:
+                    logger.warning("Background memorize for %s failed: %s", sid, e)
+            asyncio.create_task(_memorize_bg())
 
         client = self.remove_client(session_id)
         if client:
