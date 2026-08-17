@@ -530,8 +530,11 @@ async def archive_session(session_id: str, user: dict = Depends(require_auth)):
 async def unarchive_session(session_id: str, user: dict = Depends(require_auth)):
     """Restore an archived session (Archived group → Unarchive / Star)."""
     deps = get_deps()
-    await deps.engine.sessions.unarchive_session(session_id)
-    return {"unarchived": True}
+    try:
+        await deps.engine.sessions.unarchive_session(session_id)
+        return {"unarchived": True}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/api/sessions/{session_id}/events")

@@ -913,6 +913,41 @@ class TestRegisterTaskRaceCondition:
         assert "run_finished" in call_log
 
 
+@pytest.mark.asyncio
+class TestUnarchiveRoute:
+    """HTTP contract for POST /api/sessions/{id}/unarchive."""
+
+    @pytest_asyncio.fixture
+    async def setup(self, db: Database):
+        from types import SimpleNamespace
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import nerve.config as cfg_mod
+        from nerve.config import NerveConfig
+        from nerve.gateway.routes._deps import init_deps
+        from nerve.gateway.routes.sessions import router as sessions_router
+
+        cfg = NerveConfig()
+        cfg.auth.jwt_secret = ""      # require_auth becomes a no-op
+        cfg_mod._config = cfg
+
+        sm = SessionManager(db)
+        engine = SimpleNamespace(config=cfg, sessions=sm)
+        init_deps(engine=engine, db=db)  # type: ignore[arg-type]
+
+        app = FastAPI()
+        app.include_router(sessions_router)
+        yield SimpleNamespace(client=TestClient(app), db=db, sm=sm, cfg=cfg)
+
+        cfg_mod._config = None
+
+    async def test_unarchive_nonexistent_returns_404(self, setup):
+        resp = setup.client.post("/api/sessions/does-not-exist/unarchive")
+        assert resp.status_code == 404
+
+
 class MockClient:
     """Mock SDK client for testing."""
 
