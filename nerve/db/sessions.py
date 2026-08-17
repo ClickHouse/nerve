@@ -411,6 +411,18 @@ class SessionStore:
         ) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def list_child_sessions(self, parent_id: str) -> list[dict]:
+        """Direct children of ``parent_id`` (the sidebar nesting relationship).
+
+        Returns full rows regardless of status so an archive cascade sees the
+        whole subtree; callers walk this recursively to resolve descendants.
+        """
+        async with self.db.execute(
+            "SELECT * FROM sessions WHERE parent_session_id = ?",
+            (parent_id,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
     async def get_stale_sessions(
         self, before_iso: str, exclude_ids: list[str] | None = None,
     ) -> list[dict]:
