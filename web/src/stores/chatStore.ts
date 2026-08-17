@@ -171,6 +171,22 @@ interface ChatState {
   // Background tasks (run_in_background)
   backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout'; startedAt: number }[];
 
+  // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
+  sessionsHasMore: boolean;
+  sessionsNextOffset: number;
+  // Archived sessions — lazily loaded: fetched when the Archived group expands, dropped on collapse (null = not loaded); archivedCount rides on every GET /api/sessions for the badge.
+  archivedSessions: Session[] | null;
+  archivedCount: number;
+  archivedLoading: boolean;
+  archivedHasMore: boolean;
+  archivedNextOffset: number;
+  // System sessions (cron/hook) — lazily loaded, mirror of archived; kept out of the feed so cron traffic can never crowd the conversation list.
+  systemSessions: Session[] | null;
+  systemCount: number;
+  systemLoading: boolean;
+  systemHasMore: boolean;
+  systemNextOffset: number;
+
   // Session search
   searchQuery: string;
   searchResults: Session[] | null;  // null = not searching
@@ -213,6 +229,18 @@ interface ChatState {
   setDraft: (sessionId: string, text: string) => void;
   deleteSession: (id: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
+  unarchiveSession: (id: string) => Promise<void>;
+  /** Append the next page of conversations to the feed (the '...' row). */
+  loadMoreSessions: () => Promise<void>;
+  /** Fetch archived sessions: first page when the group opens, next page on '...'. */
+  loadArchivedSessions: (more?: boolean) => Promise<void>;
+  /** Fetch system sessions: first page when the group opens, next page on '...'. */
+  loadSystemSessions: (more?: boolean) => Promise<void>;
+  /** Forget a collapsed group's rows so reopening refetches from page 1. */
+  clearArchivedSessions: () => void;
+  clearSystemSessions: () => void;
+  /** Star an archived session: unarchive + star in one PATCH (hook fires). */
+  starArchivedSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
@@ -280,6 +308,18 @@ function restoreVirtualSession(): Session | null {
 
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
+  sessionsHasMore: false,
+  sessionsNextOffset: 0,
+  archivedSessions: null,
+  archivedCount: 0,
+  archivedLoading: false,
+  archivedHasMore: false,
+  archivedNextOffset: 0,
+  systemSessions: null,
+  systemCount: 0,
+  systemLoading: false,
+  systemHasMore: false,
+  systemNextOffset: 0,
   activeSession: '',
   // Rehydrated too: an unsent chat's id is the key its draft is stored under,
   // so losing the id on reload orphaned the draft. Restoring it brings the
@@ -505,11 +545,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadSessions: async () => {
     try {
-      const { sessions } = await api.listSessions();
-      set({ sessions });
-      // Reclaim persisted drafts whose session no longer exists (deleted or
-      // archived elsewhere) — but never the chat you're in or an unsent one.
-      const keep = new Set(sessions.map(s => s.id));
+      // Prior paged-in conversation depth (excludes starred, which arrive in full on page 1).
+      const prevDepth = get().sessionsNextOffset;
+      const { sessions, archived_count, system_count, has_more, next_offset } = await api.listSessions();
+      set({
+        sessions,
+        archivedCount: archived_count ?? 0,
+        systemCount: system_count ?? 0,
+        sessionsHasMore: !!has_more,
+        sessionsNextOffset: next_offset ?? sessions.length,
+      });
+      // Restore the depth the user had paged to, so a refresh never collapses the feed to page 1.
+      while (get().sessionsHasMore && get().sessionsNextOffset < prevDepth) {
+        await get().loadMoreSessions();
+      }
+      // Keep an OPEN lazy group fresh by refetching its first page; a collapsed group stays unfetched.
+      if (get().archivedSessions !== null) {
+        get().loadArchivedSessions();
+      }
+      if (get().systemSessions !== null) {
+        get().loadSystemSessions();
+      }
+      // Reclaim drafts whose session is gone — but never the active chat or an unsent one.
+      const keep = new Set(get().sessions.map(s => s.id));
       const { activeSession, virtualSession } = get();
       if (activeSession) keep.add(activeSession);
       if (virtualSession) keep.add(virtualSession.id);
@@ -781,6 +839,92 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }));
     } catch (e) {
       console.error('Failed to toggle star:', e);
+    }
+  },
+
+  loadMoreSessions: async () => {
+    // Feed '...': append the next page of conversations (starred already arrived in full on page 1).
+    try {
+      const { sessions, has_more, next_offset } = await api.listSessions(get().sessionsNextOffset);
+      set(s => ({
+        sessions: [...s.sessions, ...sessions],
+        sessionsHasMore: !!has_more,
+        sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
+      }));
+    } catch (e) {
+      console.error('Failed to load more sessions:', e);
+    }
+  },
+
+  loadArchivedSessions: async (more = false) => {
+    // more=false → (re)load page 1; more=true → append the next page ('...'); spinner shows only on a cold open.
+    const firstLoad = get().archivedSessions === null;
+    if (firstLoad) set({ archivedLoading: true });
+    try {
+      const offset = more ? get().archivedNextOffset : 0;
+      const { sessions, has_more, next_offset } = await api.listArchivedSessions(offset);
+      set(s => ({
+        archivedSessions: more && s.archivedSessions ? [...s.archivedSessions, ...sessions] : sessions,
+        archivedHasMore: !!has_more,
+        archivedNextOffset: next_offset ?? offset + sessions.length,
+        archivedLoading: false,
+      }));
+    } catch (e) {
+      console.error('Failed to load archived sessions:', e);
+      set({ archivedLoading: false });
+    }
+  },
+
+  loadSystemSessions: async (more = false) => {
+    const firstLoad = get().systemSessions === null;
+    if (firstLoad) set({ systemLoading: true });
+    try {
+      const offset = more ? get().systemNextOffset : 0;
+      const { sessions, has_more, next_offset } = await api.listSystemSessions(offset);
+      set(s => ({
+        systemSessions: more && s.systemSessions ? [...s.systemSessions, ...sessions] : sessions,
+        systemHasMore: !!has_more,
+        systemNextOffset: next_offset ?? offset + sessions.length,
+        systemLoading: false,
+      }));
+    } catch (e) {
+      console.error('Failed to load system sessions:', e);
+      set({ systemLoading: false });
+    }
+  },
+
+  // Collapsing a group drops its rows entirely, so the next expand repeats the exact same cold-open request instead of showing a stale snapshot.
+  clearArchivedSessions: () =>
+    set({ archivedSessions: null, archivedHasMore: false, archivedNextOffset: 0, archivedLoading: false }),
+
+  clearSystemSessions: () =>
+    set({ systemSessions: null, systemHasMore: false, systemNextOffset: 0, systemLoading: false }),
+
+  unarchiveSession: async (id: string) => {
+    try {
+      await api.unarchiveSession(id);
+      // Drop from the archived list right away; loadSessions() then brings it back into its normal group and refreshes the count.
+      set(s => ({
+        archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
+        archivedCount: Math.max(0, s.archivedCount - 1),
+      }));
+      await get().loadSessions();
+    } catch (e) {
+      console.error('Failed to unarchive session:', e);
+    }
+  },
+
+  starArchivedSession: async (id: string) => {
+    try {
+      // Backend composites this: starring an archived session unarchives it first, then stars, firing the star->project hook on a live session.
+      await api.updateSession(id, { starred: true });
+      set(s => ({
+        archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
+        archivedCount: Math.max(0, s.archivedCount - 1),
+      }));
+      await get().loadSessions();
+    } catch (e) {
+      console.error('Failed to star archived session:', e);
     }
   },
 

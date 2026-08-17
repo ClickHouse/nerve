@@ -134,17 +134,44 @@ async def _attach_review_loops(deps, sessions: list[dict]) -> None:
             s["review_loop"] = _loop_summary(lp)
 
 
-@router.get("/api/sessions")
-async def list_sessions(user: dict = Depends(require_auth)):
-    deps = get_deps()
-    sessions = await deps.engine.sessions.list_sessions()
+def _page_size() -> int | None:
+    """Sidebar page size from config; ``None`` when configured unlimited."""
+    size = get_config().sessions.sidebar_page_size
+    return size if size and size > 0 else None
+
+
+async def _decorate(deps, sessions: list[dict]) -> list[dict]:
+    """Attach the live per-row bits every sidebar list needs."""
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
     await _attach_review_loops(deps, sessions)
-    return {"sessions": sessions}
+    return sessions
+
+
+def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> dict:
+    """``has_more``/``next_offset`` for the client's '...' control."""
+    seen = offset + len(page)
+    return {"has_more": limit is not None and seen < total, "next_offset": seen}
+
+
+@router.get("/api/sessions")
+async def list_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_conversation_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_conversation_sessions()
+    sessions = page if offset else await deps.engine.sessions.list_starred_sessions() + page
+    await _decorate(deps, sessions)
+    return {
+        "sessions": sessions,
+        "archived_count": await deps.engine.sessions.count_archived_sessions(),
+        "system_count": await deps.engine.sessions.count_system_sessions(),
+        **_page_meta(page, offset, total, limit),
+    }
 
 
 @router.get("/api/sessions/search")
@@ -161,6 +188,28 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
         s["awaiting_input"] = s["id"] in awaiting_ids
     await _attach_review_loops(deps, sessions)
     return {"sessions": sessions}
+
+
+@router.get("/api/sessions/archived")
+async def list_archived_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """One page of archived sessions — fetched only when the group is expanded."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_archived_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_archived_sessions()
+    await _decorate(deps, page)
+    return {"sessions": page, **_page_meta(page, offset, total, limit)}
+
+
+@router.get("/api/sessions/system")
+async def list_system_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """One page of system (cron/hook) sessions — fetched only when expanded."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_system_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_system_sessions()
+    await _decorate(deps, page)
+    return {"sessions": page, **_page_meta(page, offset, total, limit)}
 
 
 @router.post("/api/sessions")
@@ -338,6 +387,13 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
+    # Starring an archived session restores it via the shared unarchive path (logs "unarchived", bumps updated_at) before the star write, so the star->project hook fires on a live session.
+    if fields.get("starred") == 1 and session.get("status") == "archived":
+        if deps.engine:
+            await deps.engine.sessions.unarchive_session(session_id)
+        else:
+            fields["status"] = "idle"
+            fields["archived_at"] = None
     await deps.db.update_session_fields(session_id, fields)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
@@ -464,6 +520,17 @@ async def archive_session(session_id: str, user: dict = Depends(require_auth)):
     deps = get_deps()
     await deps.engine.sessions.archive_session(session_id)
     return {"archived": True}
+
+
+@router.post("/api/sessions/{session_id}/unarchive")
+async def unarchive_session(session_id: str, user: dict = Depends(require_auth)):
+    """Restore an archived session (Archived group → Unarchive / Star)."""
+    deps = get_deps()
+    try:
+        await deps.engine.sessions.unarchive_session(session_id)
+        return {"unarchived": True}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/api/sessions/{session_id}/events")

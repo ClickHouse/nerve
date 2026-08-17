@@ -18,6 +18,7 @@ import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
+import { findSessionById } from '../utils/findSession';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
 const STATUS_LABELS: Record<string, string> = {
@@ -40,7 +41,7 @@ export function ChatPage() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
   const {
-    sessions, activeSession, virtualSession, messages,
+    sessions, archivedSessions, systemSessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, mobileSidebarOpen, panels, panelVisible,
@@ -49,6 +50,9 @@ export function ChatPage() {
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
   } = useChatStore();
+
+  // The active session row may live in the feed or a lazy archived/system group.
+  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
 
   // Below `md` the session list becomes an off-canvas drawer. Its open state is
   // deliberately NOT `sidebarCollapsed`: that one is a persisted desktop
@@ -161,16 +165,15 @@ export function ChatPage() {
   // Restored to plain "Nerve" when leaving the chat page or when there's
   // no active session yet.
   useEffect(() => {
-    const session = sessions.find(s => s.id === activeSession);
-    if (!session) {
+    if (!activeSessionRow) {
       document.title = 'Nerve';
       return;
     }
-    const raw = session.title || session.id;
+    const raw = activeSessionRow.title || activeSessionRow.id;
     const clean = raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
     document.title = clean;
     return () => { document.title = 'Nerve'; };
-  }, [activeSession, sessions]);
+  }, [activeSession, activeSessionRow]);
 
   // Langfuse deep-link status — fetched once. Shows a small "external link"
   // icon when observability is enabled so we can jump from a session to
@@ -257,12 +260,12 @@ export function ChatPage() {
               <span className="font-medium text-[15px] truncate">
                 {virtualSession?.id === activeSession
                   ? 'New chat'
-                  : (sessions.find(s => s.id === activeSession)?.title || activeSession)}
+                  : (activeSessionRow?.title || activeSession)}
               </span>
               {(() => {
                 const backend = virtualSession?.id === activeSession
                   ? (newChatBackend ?? backendDefault ?? 'claude')
-                  : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
+                  : (activeSessionRow?.backend ?? 'claude');
                 return (
                   <span
                     title={`Agent backend: ${backend}`}
@@ -277,7 +280,7 @@ export function ChatPage() {
                 );
               })()}
               {(() => {
-                const model = sessions.find(s => s.id === activeSession)?.model;
+                const model = activeSessionRow?.model;
                 return model ? (
                   <span className="hidden md:inline shrink-0 text-[11px] text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
                     {formatModelLabel(model)}
@@ -287,7 +290,7 @@ export function ChatPage() {
               {(() => {
                 // Live review-loop chip for observer sessions (fed by the
                 // global review_loop_update event; rehydrate via reload).
-                const rl = sessions.find(s => s.id === activeSession)?.review_loop;
+                const rl = activeSessionRow?.review_loop;
                 if (!rl) return null;
                 const live = rl.status === 'implementing' || rl.status === 'verifying' || rl.status === 'pending';
                 const label = rl.status === 'awaiting_user'
@@ -356,7 +359,7 @@ export function ChatPage() {
               )}
               {contextUsage && (
                 <div className="hidden md:flex">
-                  <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />
+                  <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
                 </div>
               )}
               {langfuse?.enabled && langfuse.host && activeSession && (
@@ -378,7 +381,7 @@ export function ChatPage() {
               observer sessions: live criteria, attempt timeline with
               watch-the-leg jumps, inline decisions when parked. */}
           {(() => {
-            const rl = sessions.find(s => s.id === activeSession)?.review_loop;
+            const rl = activeSessionRow?.review_loop;
             return rl ? <ReviewLoopCard key={rl.id} loopId={rl.id} /> : null;
           })()}
 

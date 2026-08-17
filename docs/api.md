@@ -23,11 +23,40 @@ Response: { "authenticated": true }
 
 ### Sessions
 
-#### `GET /api/sessions`
-List all sessions, ordered by most recently updated.
+#### `GET /api/sessions?offset=0`
+Sidebar feed: one page of conversations plus every starred session.
+
+`sessions` is a single page of the conversation feed (page size = `sessions.sidebar_page_size`, default 50; `0` = unlimited). The window covers only non-archived, non-system (cron/hook), non-starred rows, so cron traffic can never displace conversations. On the first page (`offset=0`) all starred sessions are prepended in full and are never truncated; pass the returned `next_offset` back as `?offset=N` to load subsequent pages. `archived_count`/`system_count` are the collapsed-group badge counts, and `has_more`/`next_offset` drive the "…" load-more control.
 
 ```json
-Response: { "sessions": [{ "id": "main", "title": "Main", "source": "system", "updated_at": "..." }] }
+Response: {
+  "sessions": [{ "id": "main", "title": "Main", "source": "system", "updated_at": "..." }],
+  "archived_count": 12,
+  "system_count": 3,
+  "has_more": true,
+  "next_offset": 50
+}
+```
+
+#### `GET /api/sessions/archived?offset=0`
+One page of archived **conversations** — system/cron sessions are excluded. Fetched only when the sidebar's Archived group is expanded.
+
+```json
+Response: { "sessions": [{ "id": "a1b2c3d4", "title": "Old chat", "status": "archived", "updated_at": "..." }], "has_more": false, "next_offset": 7 }
+```
+
+#### `GET /api/sessions/system?offset=0`
+One page of live (non-archived) system/cron/hook sessions. Fetched only when the sidebar's System group is expanded.
+
+```json
+Response: { "sessions": [{ "id": "cron-1", "title": "task-heartbeat", "source": "system", "updated_at": "..." }], "has_more": false, "next_offset": 3 }
+```
+
+#### `POST /api/sessions/{id}/unarchive`
+Restore an archived session to idle so it resurfaces at the top of the conversation feed. Returns 404 if the session doesn't exist.
+
+```json
+Response: { "unarchived": true }
 ```
 
 #### `POST /api/sessions`

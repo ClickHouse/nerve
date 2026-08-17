@@ -684,6 +684,54 @@ class SessionManager:
         await self.db.log_session_event(session_id, "archived", {})
         logger.info("Archived session %s", session_id)
 
+    async def unarchive_session(self, session_id: str) -> None:
+        """Restore an archived session to ``idle`` so it's resumable again."""
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        await self.db.update_session_fields(session_id, {
+            "status": SessionStatus.IDLE.value,
+            "archived_at": None,
+        })
+        # Bump updated_at so the unarchived session sorts to the top of the feed.
+        await self.db.touch_session(session_id)
+        await self.db.log_session_event(session_id, "unarchived", {})
+        logger.info("Unarchived session %s", session_id)
+
+    async def list_starred_sessions(self) -> list[dict]:
+        """Starred, non-archived sessions — always returned, never truncated."""
+        return await self.db.list_starred_sessions()
+
+    async def list_conversation_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """One page of the sidebar feed — non-archived, non-system, non-starred."""
+        return await self.db.list_conversation_sessions(limit=limit, offset=offset)
+
+    async def count_conversation_sessions(self) -> int:
+        """Number of pageable conversations (drives the feed's has_more)."""
+        return await self.db.count_conversation_sessions()
+
+    async def list_archived_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """One page of archived sessions for the sidebar's lazy Archived group."""
+        return await self.db.list_archived_sessions(limit=limit, offset=offset)
+
+    async def count_archived_sessions(self) -> int:
+        """Number of archived sessions (cheap badge count)."""
+        return await self.db.count_archived_sessions()
+
+    async def list_system_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """One page of system (cron/hook) sessions for the lazy System group."""
+        return await self.db.list_system_sessions(limit=limit, offset=offset)
+
+    async def count_system_sessions(self) -> int:
+        """Number of pageable system sessions (cheap badge count)."""
+        return await self.db.count_system_sessions()
+
     async def run_cleanup(
         self,
         archive_after_days: int = DEFAULT_ARCHIVE_AFTER_DAYS,

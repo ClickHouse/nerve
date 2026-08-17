@@ -4,6 +4,7 @@ import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
+import { findSessionById } from '../../utils/findSession';
 import { PromptRewriteCard } from './PromptRewriteCard';
 import { BackendSelector } from './BackendSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
@@ -99,9 +100,13 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const backendDefault = useChatStore(s => s.backendDefault);
   const chosenBackend = newChatBackend ?? backendDefault;
   const sessions = useChatStore(s => s.sessions);
+  const archivedSessions = useChatStore(s => s.archivedSessions);
+  const systemSessions = useChatStore(s => s.systemSessions);
+  // The active session row may live in the feed or a lazy archived/system group.
+  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
   const activeBackend = isVirtualChat
     ? (chosenBackend ?? 'claude')
-    : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
+    : (activeSessionRow?.backend ?? 'claude');
 
   // ── Model picker (per-chat) ──
   // A virtual chat's pick lives in newChatModels until the session is
@@ -117,7 +122,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const modelsDefault = modelDefaults[activeBackend] ?? null;
   const currentModel = isVirtualChat
     ? (newChatModels[activeBackend] ?? modelsDefault)
-    : (sessions.find(s => s.id === activeSession)?.model ?? modelsDefault);
+    : (activeSessionRow?.model ?? modelsDefault);
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
