@@ -346,9 +346,33 @@ async def get_messages(session_id: str, limit: int = 500, user: dict = Depends(r
     return {"messages": messages, "last_usage": last_usage}
 
 
+async def _would_create_cycle(db, child_id: str, new_parent_id: str) -> bool:
+    """True if making ``child_id`` a child of ``new_parent_id`` forms a loop.
+
+    Walks up the ancestor chain from the proposed parent; reaching ``child_id``
+    means the drop would nest a session under its own descendant. The seen-set
+    also breaks any pre-existing cycle so the walk always terminates.
+    """
+    seen: set[str] = set()
+    cursor: str | None = new_parent_id
+    while cursor:
+        if cursor == child_id:
+            return True
+        if cursor in seen:
+            break
+        seen.add(cursor)
+        row = await db.get_session(cursor)
+        cursor = row.get("parent_session_id") if row else None
+    return False
+
+
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
-    """Update session fields (title, starred, model).
+    """Update session fields (title, starred, model, parent_session_id).
+
+    ``parent_session_id`` is the sidebar drag-to-nest relationship (null clears
+    it → top-level). It is display-only: guarded against self/cycle links and
+    against the ``created`` fork window so a drag never alters execution.
 
     ``model`` re-points THIS session only — the composer's picker is
     per-chat, not a global preference. The engine re-reads the session
@@ -384,6 +408,27 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
             except BackendError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
         fields["model"] = requested_model
+    if "parent_session_id" in req:
+        raw = req["parent_session_id"]
+        new_parent = str(raw).strip() if raw not in (None, "") else None
+        if new_parent is not None:
+            if new_parent == session_id:
+                raise HTTPException(status_code=400, detail="A session cannot be its own parent")
+            if not await deps.db.get_session(new_parent):
+                raise HTTPException(status_code=404, detail="Parent session not found")
+            # Fork-window guard: the engine reads parent_session_id to fork a
+            # brand-new session's first turn ONLY while status == 'created'.
+            # Refuse to set a parent in that window so a display drag can never
+            # turn a not-yet-started session into a fork. Anything already run
+            # (everything draggable in the sidebar) is unaffected.
+            if session.get("status") == "created":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Send a first message before nesting this session",
+                )
+            if await _would_create_cycle(deps.db, session_id, new_parent):
+                raise HTTPException(status_code=400, detail="That drop would create a cycle")
+        fields["parent_session_id"] = new_parent
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)

@@ -1,8 +1,8 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, ArchiveRestore, Repeat } from 'lucide-react';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink } from 'lucide-react';
 import type { Session, AgentStatus } from '../../types/chat';
-import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups } from '../../utils/dateGroups';
+import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
@@ -34,6 +34,25 @@ function formatShortDate(dateStr: string): string {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+// Collapsed-group persistence (Running / Starred / date buckets, keyed by the
+// group's visible label) lives in utils/dateGroups next to the bucket
+// taxonomy and its default-collapsed set.
+
+/** Order by last message activity, newest first (opening/starring doesn't bump it). */
+const byUpdatedDesc = (a: Session, b: Session) =>
+  parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime();
+
+/** Drag-to-nest wiring shared by every draggable session row. */
+type RowDnd = {
+  draggingId: string | null;
+  dragOverId: string | null;
+  onDragStart: (id: string) => void;
+  onDragEnd: () => void;
+  onDragOver: (id: string) => void;
+  onDragLeave: (id: string) => void;
+  onDrop: (id: string) => void;
+};
+
 export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, mobile = false, onRequestClose }: {
   sessions: Session[];
   activeSession: string;
@@ -51,6 +70,14 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   // Collapsed-group persistence (Running / Starred / date buckets, keyed by visible label) lives in utils/dateGroups.
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(loadCollapsedGroups);
+  // Per-session expand state for parent→children nesting (persisted, keyed by
+  // parent id). Drag state for the nest gesture: draggingId = the row being
+  // dragged, dragOverId = the row it's hovering (the drop target highlight),
+  // rootDropActive = the "remove from parent" strip is hovered.
+  const [expandedParents, setExpandedParents] = useState<Set<string>>(loadExpandedParents);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [rootDropActive, setRootDropActive] = useState(false);
   const [localQuery, setLocalQuery] = useState('');
   const [searchHovered, setSearchHovered] = useState(false);
   const [searchFocused, setSearchFocused] = useState(false);
@@ -63,7 +90,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   // In drawer mode the list is a modal overlay: it needs focus, Tab
@@ -205,22 +232,46 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   // "last message activity" (opening/starring a chat doesn't bump it), so
   // browsing never reshuffles the list. Sort explicitly rather than trusting
   // API array order to keep that invariant regardless of fetch shape.
+  // Nest children under their parent: a session whose parent_session_id resolves
+  // to another session in the feed renders only beneath that parent (recursively,
+  // to whatever depth the data carries — no client-side cap). A session whose
+  // parent isn't in the feed (not returned under the page limit, archived, or
+  // deleted) stays top-level, so the client draws exactly the hierarchy the
+  // server sent and nothing more.
+  const { childrenByParent, topLevel } = useMemo(() => {
+    const byId = new Map(conversations.map(s => [s.id, s]));
+    const kids = new Map<string, Session[]>();
+    const top: Session[] = [];
+    for (const s of conversations) {
+      const pid = s.parent_session_id;
+      if (pid && pid !== s.id && byId.has(pid)) {
+        const arr = kids.get(pid);
+        if (arr) arr.push(s); else kids.set(pid, [s]);
+      } else {
+        top.push(s);
+      }
+    }
+    for (const arr of kids.values()) arr.sort(byUpdatedDesc);
+    return { childrenByParent: kids, topLevel: top };
+  }, [conversations]);
+
+  // Split TOP-LEVEL conversations into pinned Running / Starred / rest. Children
+  // never appear here — they ride under their parent wherever it renders,
+  // including inside the pinned Starred group.
   const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
     const running: Session[] = [];
     const starred: Session[] = [];
     const rest: Session[] = [];
-    for (const s of conversations) {
+    for (const s of topLevel) {
       const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
       if (isRunning) running.push(s);
       else if (s.starred) starred.push(s);
       else rest.push(s);
     }
-    const byUpdatedDesc = (a: Session, b: Session) =>
-      parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime();
     starred.sort(byUpdatedDesc);
     rest.sort(byUpdatedDesc);
     return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
-  }, [conversations, activeSession, activeIsRunning]);
+  }, [topLevel, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
 
@@ -235,6 +286,84 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       return next;
     });
   }, []);
+
+  // Expand/collapse one parent's children, persisting so it survives reload.
+  const toggleExpandParent = useCallback((id: string) => {
+    setExpandedParents(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      saveExpandedParents(next);
+      return next;
+    });
+  }, []);
+
+  const handleRemoveParent = useCallback((id: string) => {
+    setSessionParent(id, null);
+  }, [setSessionParent]);
+
+  // Drop a dragged row ONTO a target row → nest it under the target and reveal
+  // it. No-op on self; the server rejects self/cycle links and the store's
+  // optimistic update reverts on rejection.
+  const handleRowDrop = useCallback((targetId: string) => {
+    const src = draggingId;
+    setDragOverId(null);
+    setDraggingId(null);
+    setRootDropActive(false);
+    if (!src || src === targetId) return;
+    setSessionParent(src, targetId);
+    setExpandedParents(prev => {
+      if (prev.has(targetId)) return prev;
+      const next = new Set(prev);
+      next.add(targetId);
+      saveExpandedParents(next);
+      return next;
+    });
+  }, [draggingId, setSessionParent]);
+
+  // Drop onto the "remove from parent" strip → clear the parent (→ top-level).
+  const handleUnparentDrop = useCallback(() => {
+    const src = draggingId;
+    setRootDropActive(false);
+    setDragOverId(null);
+    setDraggingId(null);
+    if (src) setSessionParent(src, null);
+  }, [draggingId, setSessionParent]);
+
+  const dnd: RowDnd = {
+    draggingId,
+    dragOverId,
+    onDragStart: (id) => setDraggingId(id),
+    onDragEnd: () => { setDraggingId(null); setDragOverId(null); setRootDropActive(false); },
+    onDragOver: (id) => setDragOverId(id),
+    onDragLeave: (id) => setDragOverId(cur => (cur === id ? null : cur)),
+    onDrop: handleRowDrop,
+  };
+
+  // The un-parent drop strip shows only while dragging a row that HAS a parent.
+  const draggedHasParent = !!(draggingId && conversations.find(s => s.id === draggingId)?.parent_session_id);
+
+  // One top-level feed row + its nested subtree (Running / Starred / date
+  // buckets all render through this so nesting + drag behave identically).
+  const renderTree = (s: Session) => (
+    <SessionTree
+      key={s.id}
+      session={s}
+      depth={0}
+      childrenByParent={childrenByParent}
+      expandedParents={expandedParents}
+      onToggleExpand={toggleExpandParent}
+      activeSession={activeSession}
+      activeIsRunning={activeIsRunning}
+      dnd={dnd}
+      onDelete={onDelete}
+      onRename={renameSession}
+      onToggleStar={toggleStar}
+      onArchive={archiveSession}
+      onRemoveParent={handleRemoveParent}
+      onSelect={handleSelect}
+    />
+  );
 
   // Never leave the active session hidden inside a collapsed group: when the
   // active session changes, expand whichever group holds it — once, so a later
@@ -257,6 +386,30 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       return next;
     });
   }, [activeSession, pinnedRunning, pinnedStarred, groupedConversations]);
+
+  // Never leave the active session hidden inside a collapsed parent: expand its
+  // whole ancestor chain when it (or the feed) changes. The seen-set guards any
+  // pre-existing cycle so the walk always ends.
+  useEffect(() => {
+    if (!activeSession) return;
+    const byId = new Map(conversations.map(s => [s.id, s]));
+    const toOpen: string[] = [];
+    const seen = new Set<string>();
+    let cur = byId.get(activeSession)?.parent_session_id;
+    while (cur && byId.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      toOpen.push(cur);
+      cur = byId.get(cur)?.parent_session_id;
+    }
+    if (toOpen.length === 0) return;
+    setExpandedParents(prev => {
+      if (toOpen.every(id => prev.has(id))) return prev;
+      const next = new Set(prev);
+      toOpen.forEach(id => next.add(id));
+      saveExpandedParents(next);
+      return next;
+    });
+  }, [activeSession, conversations]);
 
   // (System sessions load lazily now — no running-count badge / auto-expand.)
 
@@ -431,19 +584,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   tone="text-emerald-600/70"
                   onToggle={() => toggleGroup('Running')}
                 />
-                {!collapsedGroups.has('Running') && pinnedRunning.map((s) => (
-                  <SessionItem
-                    key={s.id}
-                    session={s}
-                    isActive={s.id === activeSession}
-                    isRunning
-                    onDelete={onDelete}
-                    onRename={renameSession}
-                    onToggleStar={toggleStar}
-                    onArchive={archiveSession}
-                    onSelect={handleSelect}
-                  />
-                ))}
+                {!collapsedGroups.has('Running') && pinnedRunning.map(renderTree)}
               </div>
             )}
 
@@ -458,19 +599,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   tone="text-yellow-600/70"
                   onToggle={() => toggleGroup('Starred')}
                 />
-                {!collapsedGroups.has('Starred') && pinnedStarred.map((s) => (
-                  <SessionItem
-                    key={s.id}
-                    session={s}
-                    isActive={s.id === activeSession}
-                    isRunning={false}
-                    onDelete={onDelete}
-                    onRename={renameSession}
-                    onToggleStar={toggleStar}
-                    onArchive={archiveSession}
-                    onSelect={handleSelect}
-                  />
-                ))}
+                {!collapsedGroups.has('Starred') && pinnedStarred.map(renderTree)}
               </div>
             )}
 
@@ -487,24 +616,30 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   collapsed={collapsedGroups.has(group)}
                   onToggle={() => toggleGroup(group)}
                 />
-                {!collapsedGroups.has(group) && items.map((s) => (
-                  <SessionItem
-                    key={s.id}
-                    session={s}
-                    isActive={s.id === activeSession}
-                    isRunning={s.id === activeSession ? activeIsRunning : !!s.is_running}
-                    onDelete={onDelete}
-                    onRename={renameSession}
-                    onToggleStar={toggleStar}
-                    onArchive={archiveSession}
-                    onSelect={handleSelect}
-                  />
-                ))}
+                {!collapsedGroups.has(group) && items.map(renderTree)}
               </div>
             ))}
 
             {/* Feed page window exhausted — never truncate silently. */}
             {sessionsHasMore && <MoreRow onClick={loadMoreSessions} />}
+
+            {/* Un-parent target: drop a nested row here to make it top-level.
+                Shown only while dragging a row that has a parent — a drop lands
+                here (not on a row) purely by event bubbling, no position math. */}
+            {draggingId && draggedHasParent && (
+              <div
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setRootDropActive(true); }}
+                onDragLeave={() => setRootDropActive(false)}
+                onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleUnparentDrop(); }}
+                className={`mx-1 my-1 px-3 py-2 rounded-md border border-dashed text-[11px] text-center transition-colors ${
+                  rootDropActive
+                    ? 'border-accent text-accent bg-accent/10'
+                    : 'border-border-subtle text-text-faint'
+                }`}
+              >
+                Drop here to remove from parent
+              </div>
+            )}
 
             {/* System sessions (cron/hook) — lazy: nothing fetched until expanded, dropped on collapse, so the next expand repeats the identical request. */}
             {systemCount > 0 && (
@@ -755,7 +890,80 @@ function StatusIndicator({ session, isActive, isRunning }: {
 }
 
 
-function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate }: {
+/**
+ * One feed row plus its nested subtree: renders the row via SessionItem, then —
+ * when it has children and is expanded — recurses for each child at depth+1.
+ * Depth is unbounded; the client draws whatever hierarchy the server returned.
+ */
+function SessionTree({
+  session, depth, childrenByParent, expandedParents, onToggleExpand,
+  activeSession, activeIsRunning, dnd,
+  onDelete, onRename, onToggleStar, onArchive, onRemoveParent, onSelect,
+}: {
+  session: Session;
+  depth: number;
+  childrenByParent: Map<string, Session[]>;
+  expandedParents: Set<string>;
+  onToggleExpand: (id: string) => void;
+  activeSession: string;
+  activeIsRunning: boolean;
+  dnd: RowDnd;
+  onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => Promise<void>;
+  onToggleStar: (id: string) => Promise<void>;
+  onArchive: (id: string) => Promise<void>;
+  onRemoveParent: (id: string) => void;
+  onSelect?: () => void;
+}) {
+  const kids = childrenByParent.get(session.id);
+  const hasChildren = !!kids && kids.length > 0;
+  const expanded = expandedParents.has(session.id);
+  return (
+    <>
+      <SessionItem
+        session={session}
+        isActive={session.id === activeSession}
+        isRunning={session.id === activeSession ? activeIsRunning : !!session.is_running}
+        depth={depth}
+        hasChildren={hasChildren}
+        childCount={kids ? kids.length : 0}
+        expanded={expanded}
+        onToggleExpand={onToggleExpand}
+        onDelete={onDelete}
+        onRename={onRename}
+        onToggleStar={onToggleStar}
+        onArchive={onArchive}
+        onRemoveParent={onRemoveParent}
+        onSelect={onSelect}
+        draggable
+        dnd={dnd}
+      />
+      {hasChildren && expanded && kids!.map(k => (
+        <SessionTree
+          key={k.id}
+          session={k}
+          depth={depth + 1}
+          childrenByParent={childrenByParent}
+          expandedParents={expandedParents}
+          onToggleExpand={onToggleExpand}
+          activeSession={activeSession}
+          activeIsRunning={activeIsRunning}
+          dnd={dnd}
+          onDelete={onDelete}
+          onRename={onRename}
+          onToggleStar={onToggleStar}
+          onArchive={onArchive}
+          onRemoveParent={onRemoveParent}
+          onSelect={onSelect}
+        />
+      ))}
+    </>
+  );
+}
+
+
+function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate,
+  depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
@@ -769,6 +977,18 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Fired when the row itself is opened (not its menu) — drawer mode uses it to close. */
   onSelect?: () => void;
   showDate?: boolean;
+  /** Nesting: depth (0 = top level) indents the row; a parent shows a
+      chevron in place of its icon that toggles its children. */
+  depth?: number;
+  hasChildren?: boolean;
+  /** Direct-child count, shown as a badge when the parent is collapsed. */
+  childCount?: number;
+  expanded?: boolean;
+  onToggleExpand?: (id: string) => void;
+  onRemoveParent?: (id: string) => void;
+  /** Drag-to-nest: only feed rows are draggable; search/archived rows aren't. */
+  draggable?: boolean;
+  dnd?: RowDnd;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -822,25 +1042,66 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
     );
   }
 
+  const isDragSource = dnd?.draggingId === session.id;
+  const isDropTarget = !!dnd && dnd.dragOverId === session.id
+    && !!dnd.draggingId && dnd.draggingId !== session.id;
+
   return (
     <Link
       to={`/chat/${session.id}`}
       onClick={onSelect}
+      draggable={draggable || undefined}
+      onDragStart={draggable && dnd ? (e) => {
+        // Override the browser's default <a href> drag with our session id.
+        e.dataTransfer.setData('text/plain', session.id);
+        e.dataTransfer.effectAllowed = 'move';
+        dnd.onDragStart(session.id);
+      } : undefined}
+      onDragEnd={draggable && dnd ? () => dnd.onDragEnd() : undefined}
+      onDragOver={dnd ? (e) => {
+        if (!dnd.draggingId || dnd.draggingId === session.id) return;
+        e.preventDefault();            // allow the drop
+        e.dataTransfer.dropEffect = 'move';
+        dnd.onDragOver(session.id);
+      } : undefined}
+      onDragLeave={dnd ? () => dnd.onDragLeave(session.id) : undefined}
+      onDrop={dnd ? (e) => { e.preventDefault(); e.stopPropagation(); dnd.onDrop(session.id); } : undefined}
+      style={depth ? { paddingLeft: 12 + depth * 16 } : undefined}
       className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
-        }`}
+        }${isDropTarget ? ' ring-2 ring-inset ring-accent bg-accent/10' : ''}${isDragSource ? ' opacity-50' : ''}`}
     >
-      {session.review_loop
-        ? <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
-        : isImplementSession(session)
-        ? <Hammer size={13} className="shrink-0 text-hue-violet/60" />
-        : <MessageSquare size={13} className="shrink-0 opacity-50" />
-      }
+      {hasChildren ? (
+        <button
+          type="button"
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggleExpand?.(session.id); }}
+          className="shrink-0 -ml-0.5 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
+          title={expanded ? 'Collapse children' : 'Expand children'}
+        >
+          {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        </button>
+      ) : session.review_loop ? (
+        <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
+      ) : isImplementSession(session) ? (
+        <Hammer size={13} className="shrink-0 text-hue-violet/60" />
+      ) : (
+        <MessageSquare size={13} className="shrink-0 opacity-50" />
+      )}
       <div className="flex-1 min-w-0">
         <div className="truncate text-[13px]">{cleanTitle(session)}</div>
       </div>
+
+      {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
+      {hasChildren && !expanded && childCount > 0 && (
+        <span
+          className="shrink-0 text-[10px] text-text-faint/60 tabular-nums"
+          title={`${childCount} nested session${childCount !== 1 ? 's' : ''}`}
+        >
+          {childCount}
+        </span>
+      )}
 
       {/* Unsent draft marker */}
       {hasDraft && !isActive && (
@@ -932,6 +1193,20 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               >
                 <Archive size={14} />
                 Archive
+              </button>
+            )}
+            {!archived && session.parent_session_id && onRemoveParent && (
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  onRemoveParent(session.id);
+                }}
+                className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+              >
+                <Unlink size={14} />
+                Remove from parent
               </button>
             )}
             <div className="border-t border-border my-1" />

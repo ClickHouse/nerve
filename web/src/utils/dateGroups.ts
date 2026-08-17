@@ -55,6 +55,30 @@ export function saveCollapsedGroups(groups: Set<string>): void {
   } catch { /* quota exceeded / disabled — keep the in-memory state only */ }
 }
 
+const EXPANDED_PARENTS_KEY = 'nerve_sidebar_expanded_parents';
+
+/**
+ * Which parent sessions are expanded (their children shown), from localStorage.
+ * Empty by default — a parent starts collapsed and the user clicks its chevron
+ * to reveal its children. Keyed by parent session id.
+ */
+export function loadExpandedParents(): Set<string> {
+  try {
+    const raw = localStorage.getItem(EXPANDED_PARENTS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return new Set(asStrings(Array.isArray(parsed) ? parsed : parsed?.ids));
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveExpandedParents(ids: Set<string>): void {
+  try {
+    localStorage.setItem(EXPANDED_PARENTS_KEY, JSON.stringify({ ids: [...ids] }));
+  } catch { /* quota exceeded / disabled — keep the in-memory state only */ }
+}
+
 /**
  * Assign a session to a coarse recency bucket for the sidebar.
  *
