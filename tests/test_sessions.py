@@ -492,6 +492,17 @@ class TestArchiveAndCleanup:
         await sm.archive_session("cnt-2")
         assert await sm.count_archived_sessions() == 2
 
+    async def test_archived_excludes_system_sources(self, sm: SessionManager):
+        """Archived group holds conversations only; archived cron/hook excluded."""
+        await sm.get_or_create("arch-web", source="web")
+        await sm.archive_session("arch-web")
+        await sm.get_or_create("arch-cron", source="cron")
+        await sm.archive_session("arch-cron")
+        ids = {s["id"] for s in await sm.list_archived_sessions()}
+        assert "arch-web" in ids
+        assert "arch-cron" not in ids
+        assert await sm.count_archived_sessions() == 1
+
     async def test_star_archived_field_write_restores(self, sm: SessionManager, db: Database):
         """The update_session route composites star+unarchive by writing these
         fields together; verify that write restores the row to a live, starred

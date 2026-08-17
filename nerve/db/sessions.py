@@ -153,13 +153,13 @@ class SessionStore:
         """Archived sessions page, most recently archived first — lazily
         fetched when the sidebar Archived group is expanded."""
         return await self._page(
-            "SELECT * FROM sessions WHERE status = 'archived'"
+            f"SELECT * FROM sessions WHERE status = 'archived' AND source NOT IN {_SYSTEM_SQL}"
             " ORDER BY archived_at DESC", (), limit, offset,
         )
 
     async def count_archived_sessions(self) -> int:
-        """Count archived sessions (drives the collapsed badge + has_more)."""
-        return await self._count("status = 'archived'")
+        """Count archived conversation sessions (drives the collapsed badge + has_more)."""
+        return await self._count(f"status = 'archived' AND source NOT IN {_SYSTEM_SQL}")
 
     async def list_system_sessions(
         self, limit: int | None = None, offset: int = 0,
