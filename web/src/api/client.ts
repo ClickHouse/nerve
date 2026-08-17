@@ -350,6 +350,29 @@ export const api = {
         ...(reviewLoop ? { review_loop: reviewLoop } : {}),
       }),
     }),
+  // Run later — defer a composed prompt into a (freshly created) session
+  // without spending tokens now. Persists the prompt as the pending user
+  // message + a synthetic ack; timed delays schedule a one-shot wakeup.
+  runLater: (
+    sessionId: string,
+    message: string,
+    delay: string,
+    fileIds?: string[],
+    imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
+  ) =>
+    request<{ session_id: string; scheduled: boolean; ack: string; fire_at: string | null }>(
+      '/sessions/run-later',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          session_id: sessionId,
+          message,
+          delay,
+          ...(fileIds && fileIds.length ? { file_ids: fileIds } : {}),
+          ...(imageBlocks && imageBlocks.length ? { image_blocks: imageBlocks } : {}),
+        }),
+      },
+    ),
   listReviewLoops: (status?: string) =>
     request<{ loops: ReviewLoop[] }>(`/review-loops${status ? `?status=${status}` : ''}`),
   getReviewLoop: (loopId: string) =>

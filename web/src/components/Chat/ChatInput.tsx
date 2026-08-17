@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat } from 'lucide-react';
+import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from 'lucide-react';
 import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
@@ -18,6 +18,16 @@ const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; col
 
 // Actions that auto-focus the instruction input (need user input)
 const FOCUS_ACTIONS = new Set<QuoteAction>(['add', 'question', 'note']);
+
+// "Run later" submenu — exactly these four, in this order. The three timed
+// delays schedule a one-shot wakeup; "none" ("Just accept it") saves the
+// prompt for the user to run manually.
+const RUN_LATER_OPTIONS: Array<{ delay: string; label: string }> = [
+  { delay: '30m', label: 'Run in 30 mins' },
+  { delay: '1h', label: 'Run in 1 hour' },
+  { delay: '24h', label: 'Run in 24 hours' },
+  { delay: 'none', label: 'Just accept it' },
+];
 
 // Prompt rewrite — refine the first message of a new chat before sending.
 const REWRITE_PREF_KEY = 'nerve_prompt_rewrite';
@@ -49,6 +59,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  // "Run later" kebab menu (mirrors the SessionSidebar three-dots menu).
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [runLaterOpen, setRunLaterOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastInstructionRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -65,6 +79,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const setDraft = useChatStore(s => s.setDraft);
   const activeSession = useChatStore(s => s.activeSession);
   const ensureRealSession = useChatStore(s => s.ensureRealSession);
+  const runLater = useChatStore(s => s.runLater);
   const isNewChat = useChatStore(s => s.messages.length === 0);
 
   // Persist the composer draft, but NOT on every keystroke. Writing to the
@@ -364,6 +379,51 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     }
 
     dispatchSend(message);
+  };
+
+  // Close the kebab menu on an outside click (mirrors SessionSidebar).
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+        setRunLaterOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [menuOpen]);
+
+  /** Defer the composed message via a chosen "Run later" option, then clear
+   *  the composer exactly as a normal send does. */
+  const handleRunLater = (delay: string) => {
+    const message = composeMessage();
+    if (!message && attachments.length === 0) return;
+    const fileIds = attachments.filter(a => a.uploadedId).map(a => a.uploadedId!);
+    const imageBlocks = attachments
+      .filter(a => a.uploadedId && a.uploadedMeta?.file_type === 'image')
+      .map(a => ({
+        url: `/api/files/uploads/${a.uploadedId}`,
+        filename: a.uploadedMeta!.filename,
+        media_type: a.uploadedMeta!.media_type,
+      }));
+    setMenuOpen(false);
+    setRunLaterOpen(false);
+    // Fire the deferred create, then clear the composer synchronously — same
+    // ordering as dispatchSend so the carried draft ends up empty.
+    void runLater(
+      message, delay,
+      fileIds.length > 0 ? fileIds : undefined,
+      imageBlocks.length > 0 ? imageBlocks : undefined,
+    ).catch((e) => console.error('Run later failed:', e));
+    cancelDraftFlush();
+    setInput('');
+    historyIndexRef.current = -1;
+    historyStashRef.current = '';
+    setDraft(activeSession, '');
+    clearQuotes();
+    attachments.forEach(a => { if (a.preview) URL.revokeObjectURL(a.preview); });
+    setAttachments([]);
   };
 
   // Previously-sent user prompts of this chat, newest first (adjacent dupes dropped).
@@ -706,6 +766,45 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             // above them. Both are undone at `md`, back to a single row.
             className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-[15px] text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
+          {/* Run-later kebab — three-dots menu next to Send. Its submenu
+              defers the composed prompt into a new session without spending
+              tokens now (opens upward; the composer sits at the bottom). */}
+          <div className="relative shrink-0 order-2 md:order-none" ref={menuRef}>
+            <button
+              onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
+              disabled={disabled || isStreaming || rewriteActive}
+              className="w-10 h-10 text-text-muted hover:text-text-secondary rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0 disabled:opacity-30"
+              title="More options"
+            >
+              <MoreHorizontal size={18} />
+            </button>
+            {menuOpen && (
+              <div className="absolute right-0 bottom-full mb-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[170px]">
+                <button
+                  onClick={() => setRunLaterOpen(v => !v)}
+                  className="flex items-center justify-between gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+                >
+                  <span className="flex items-center gap-2.5"><Clock size={14} /> Run later</span>
+                  <ChevronRight size={14} className={`transition-transform ${runLaterOpen ? 'rotate-90' : ''}`} />
+                </button>
+                {runLaterOpen && (
+                  <div className="border-t border-border mt-1 pt-1">
+                    {RUN_LATER_OPTIONS.map(opt => (
+                      <button
+                        key={opt.delay}
+                        onClick={() => handleRunLater(opt.delay)}
+                        disabled={!canSend}
+                        className="w-full text-left px-3 py-1.5 pl-8 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors disabled:opacity-30"
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {isStreaming ? (
             <button
               onClick={onStop}

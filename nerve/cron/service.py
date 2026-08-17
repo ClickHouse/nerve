@@ -1337,6 +1337,10 @@ class CronService:
     def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
         """Spawn the engine run for a claimed wakeup with error logging."""
         prompt = _resolve_wakeup_prompt(wakeup["prompt"])
+        # "Run later" deferrals are scheduled dispatches — fire them through
+        # the cron source so they mirror plan_service/cron-dispatched runs;
+        # model-requested ScheduleWakeup rows keep the "wakeup" source.
+        source = "cron" if wakeup.get("reason") == "run-later" else "wakeup"
         logger.info(
             "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
         )
@@ -1344,7 +1348,7 @@ class CronService:
             self.engine.run(
                 session_id=session_id,
                 user_message=prompt,
-                source="wakeup",
+                source=source,
                 internal=True,
             )
         )

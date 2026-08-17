@@ -220,6 +220,14 @@ interface ChatState {
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
   sendMessage: (content: string) => void;
+  /** Defer a composed prompt into a new session without running the model
+   *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
+  runLater: (
+    content: string,
+    delay: string,
+    fileIds?: string[],
+    imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
+  ) => Promise<void>;
   /** Fetch selectable models for the composer picker (GET /api/models). */
   loadModels: () => Promise<void>;
   setNewChatBackend: (backend: string | null) => void;
@@ -933,6 +941,60 @@ export const useChatStore = create<ChatState>((set, get) => ({
         agentStatus: { state: 'idle' },
       }));
     }
+  },
+
+  runLater: async (content, delay, fileIds, imageBlocks) => {
+    // Build the optimistic block list once (pending user message shape).
+    const buildBlocks = (): import('../types/chat').MessageBlock[] => {
+      const blocks: import('../types/chat').MessageBlock[] = [];
+      if (content) blocks.push({ type: 'text', content });
+      if (imageBlocks) {
+        for (const img of imageBlocks) {
+          blocks.push({ type: 'image', url: img.url, filename: img.filename, media_type: img.media_type });
+        }
+      }
+      return blocks;
+    };
+    // Run later ALWAYS mints a brand-new session — it must never write the
+    // deferred prompt into the current chat (fresh, virtual, or existing).
+    // If a composer model/backend pick is in flight for a new chat, carry it
+    // onto the created row so the header badge is right from the first render.
+    const vs = get().virtualSession;
+    const effBackend = get().newChatBackend ?? null;
+    const pickedModel = effBackend
+      ? (get().newChatModels[effBackend] ?? null)
+      : null;
+    const real: Session = await api.createSession(
+      undefined, effBackend, undefined, null, pickedModel,
+    );
+    const res = await api.runLater(real.id, content, delay, fileIds, imageBlocks);
+    const now = new Date().toISOString();
+    set((state) => {
+      // Drop the transient new-chat state so we don't strand an empty virtual
+      // chat or leak its draft/model picks into the next new chat.
+      const drafts = { ...state.drafts };
+      if (vs) delete drafts[vs.id];
+      return {
+        sessions: [
+          { ...real, title: 'New chat', is_running: false, updated_at: now },
+          ...state.sessions,
+        ],
+        activeSession: real.id,
+        virtualSession: null,
+        newChatBackend: null,
+        newChatModels: {},
+        newChatReviewLoop: null,
+        drafts,
+        streamingBlocks: [],
+        isStreaming: false,
+        agentStatus: { state: 'idle' as const },
+        messages: [
+          { role: 'user' as const, blocks: buildBlocks(), created_at: now },
+          { role: 'assistant' as const, blocks: [{ type: 'text', content: res.ack }], created_at: now },
+        ],
+      };
+    });
+    if (vs) clearVirtualSession();
   },
 
   stopSession: () => {
