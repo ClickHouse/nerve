@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import gc
+import weakref
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,6 +27,15 @@ from apscheduler.events import (
 )
 
 from nerve.cron.service import _MISFIRE_GRACE_SECONDS, CronService
+
+# Enough cycles that a partial collection cannot be mistaken for none.
+_CYCLES = 500
+
+
+class _Cycle:
+    """Half of a two-object reference cycle: only the tracer can free it."""
+
+    __slots__ = ("peer", "__weakref__")
 
 
 def _make_service(tmp_path, db=None) -> CronService:
@@ -42,6 +52,20 @@ def _make_service(tmp_path, db=None) -> CronService:
         db = AsyncMock()
         db.log_cron_missed = AsyncMock(return_value=1)
     return CronService(config, AsyncMock(), db)
+
+
+async def _start_without_scheduling(svc: CronService) -> None:
+    """Run ``start()`` for its side effects on the scheduler object only.
+
+    Job loading, source runners, the catch-up task and the scheduler's own
+    ``start`` are stubbed, so what remains observable is the wiring ``start()``
+    performs -- which is what the listener tests are about.
+    """
+    with patch.object(svc, "_load_merged_jobs", return_value=[]), \
+            patch.object(svc, "_register_source_runners"), \
+            patch.object(svc, "_catchup_missed_jobs", AsyncMock()), \
+            patch.object(svc.scheduler, "start"):
+        await svc.start()
 
 
 # ---------------------------------------------------------------------------
@@ -186,13 +210,19 @@ class TestMissedRunListener:
         svc._on_job_missed(object())  # no job_id / scheduled_run_time
         svc.db.log_cron_missed.assert_not_awaited()
 
-    def test_only_the_missed_event_is_subscribed(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_only_the_missed_event_is_subscribed(self, tmp_path):
         """A max-instances skip is a different event CLASS: it carries
         `scheduled_run_times` (plural) and no singular attribute, so one handler
         for both would raise inside the scheduler. It is also far more frequent
-        than real runs, so logging it 1:1 would bury them."""
+        than real runs, so logging it 1:1 would bury them.
+
+        ``start()`` is driven so the subscription observed is the one production
+        registers -- asserting on a listener the test added itself would hold
+        even if ``start()`` registered none.
+        """
         svc = _make_service(tmp_path)
-        svc.scheduler.add_listener(svc._on_job_missed, EVENT_JOB_MISSED)
+        await _start_without_scheduling(svc)
 
         masks = [entry[1] for entry in svc.scheduler._listeners]
         assert masks and all(mask & EVENT_JOB_MISSED for mask in masks)
@@ -202,6 +232,28 @@ class TestMissedRunListener:
             EVENT_JOB_MAX_INSTANCES, "j", "default",
             [datetime.datetime.now(datetime.timezone.utc)])
         assert not hasattr(skip, "scheduled_run_time")
+
+    @pytest.mark.asyncio
+    async def test_the_subscription_is_the_one_start_registers(self, tmp_path):
+        """Reddens if the ``add_listener`` call is dropped from ``start()``."""
+        svc = _make_service(tmp_path)
+        assert svc.scheduler._listeners == []
+
+        await _start_without_scheduling(svc)
+
+        assert [entry[0] for entry in svc.scheduler._listeners] == [svc._on_job_missed]
+
+    @pytest.mark.asyncio
+    async def test_a_reload_does_not_double_subscribe(self, tmp_path):
+        """Two listeners would write two rows for one dropped run."""
+        svc = _make_service(tmp_path)
+        await _start_without_scheduling(svc)
+
+        with patch.object(svc, "_load_merged_jobs", return_value=[]), \
+                patch.object(svc, "_register_source_runners"):
+            await svc.reload()
+
+        assert len(svc.scheduler._listeners) == 1
 
 
 class TestMissedRowIsInert:
@@ -269,6 +321,72 @@ class TestTrimMemorySplit:
             fn()
         return {"generations": generations, "trims": len(trims)}
 
+    @staticmethod
+    def _generations_walked(fn) -> list[int]:
+        """Generations the real collector entered while ``fn`` ran.
+
+        Automatic collection is disabled so only the pass under test is
+        recorded, and ``_malloc_trim`` is stubbed to keep the observation to
+        the Python heap.
+        """
+        from nerve.memory.memu_bridge import MemUBridge
+
+        walked: list[int] = []
+
+        def record(phase, info):
+            if phase == "start":
+                walked.append(info["generation"])
+
+        gc.disable()
+        gc.callbacks.append(record)
+        try:
+            with patch.object(MemUBridge, "_malloc_trim"):
+                fn()
+        finally:
+            gc.callbacks.remove(record)
+            gc.enable()
+        return walked
+
+    @staticmethod
+    def _survivors(fn) -> tuple[int, int]:
+        """``(aged, young)`` unreachable cycles still alive after ``fn``.
+
+        ``aged`` cycles are forced into the oldest generation by collecting
+        three times while they are still referenced; ``young`` ones have never
+        survived a pass. Both are unreachable before ``fn`` runs, so whether
+        they die reports which generations the pass covered -- no timing.
+        """
+        from nerve.memory.memu_bridge import MemUBridge
+
+        def unreachable_cycles(count: int) -> tuple[list, list]:
+            strong, refs = [], []
+            for _ in range(count):
+                first, second = _Cycle(), _Cycle()
+                first.peer, second.peer = second, first
+                strong.append(first)
+                refs.append(weakref.ref(first))
+            return strong, refs
+
+        gc.disable()
+        try:
+            aged_strong, aged = unreachable_cycles(_CYCLES)
+            for _ in range(3):
+                gc.collect()             # age them into the oldest generation
+            aged_strong.clear()          # unreachable, but no longer young
+            young_strong, young = unreachable_cycles(_CYCLES)
+            young_strong.clear()
+
+            with patch.object(MemUBridge, "_malloc_trim"):
+                fn()
+
+            return (
+                sum(1 for ref in aged if ref() is not None),
+                sum(1 for ref in young if ref() is not None),
+            )
+        finally:
+            gc.enable()
+            gc.collect()
+
     def test_trim_memory_never_collects_every_generation(self):
         from nerve.memory.memu_bridge import MemUBridge
 
@@ -285,19 +403,43 @@ class TestTrimMemorySplit:
         assert seen["generations"] == [None]             # a full pass
         assert seen["trims"] == 1
 
-    def test_trim_cost_is_independent_of_heap_size(self):
-        """A generational pass must not walk the whole heap: that independence
-        is what makes it safe on the per-file path."""
-        held = [{"n": [float(i)] * 8} for i in range(60000)]
-        for d in held:
-            d["self"] = d                               # cycles for the tracer
-        try:
-            small = gc.collect(1)
-            held.extend({"n": [1.0] * 8, "self": None} for _ in range(60000))
-            assert gc.collect(1) >= 0 and small >= 0     # neither errors/scales
-        finally:
-            held.clear()
-            gc.collect()
+    def test_trim_skips_the_oldest_generation_that_release_walks(self):
+        """Cost is bounded because the oldest generation -- the one holding the
+        long-lived heap -- is never walked. Observed through ``gc.callbacks``,
+        which reports the generation each pass actually enters.
+
+        Reddens if ``_trim_memory`` calls ``gc.collect()``: the recorded
+        generation becomes the oldest and equals ``_release_memory``'s.
+        """
+        from nerve.memory.memu_bridge import MemUBridge
+
+        oldest = len(gc.get_threshold()) - 1
+
+        assert self._generations_walked(MemUBridge._trim_memory) == [1]
+        assert self._generations_walked(MemUBridge._release_memory) == [oldest]
+
+    def test_trim_leaves_the_aged_heap_untouched(self):
+        """The behavioural half: garbage aged into the oldest generation
+        survives a trim and dies under a release, so the pass really is
+        narrower rather than merely reported as such.
+
+        ``_release_memory`` is the negative control -- if its arm did not
+        reclaim, the fixture would not be producing collectable garbage and
+        the trim arm would prove nothing. Young garbage dies either way,
+        which is what makes the per-file path still reclaim what a memorize
+        just left behind.
+        """
+        from nerve.memory.memu_bridge import MemUBridge
+
+        aged_after_trim, young_after_trim = self._survivors(MemUBridge._trim_memory)
+        aged_after_release, young_after_release = self._survivors(
+            MemUBridge._release_memory,
+        )
+
+        assert aged_after_trim == _CYCLES        # oldest generation not walked
+        assert aged_after_release == 0           # control: it IS collectable
+        assert young_after_trim == 0             # the memorize leftovers still go
+        assert young_after_release == 0
 
     def test_malloc_trim_survives_a_missing_libc(self):
         from nerve.memory.memu_bridge import MemUBridge
@@ -309,26 +451,71 @@ class TestTrimMemorySplit:
 
 class TestPerFileIndexPathUsesTrim:
     """Which helper each call site reaches is part of the contract: the per-file
-    path must be cheap, and the periodic sweep must keep its OOM safeguard."""
+    path must be cheap, and the periodic sweep must keep its OOM safeguard.
 
-    def test_per_file_success_path_calls_trim_not_release(self):
-        import inspect
+    The two ``memorize_file`` paths are driven for real, so they redden if the
+    call site moves rather than only if its source text changes.
+    """
 
+    @staticmethod
+    def _bridge(tmp_path):
+        """Available bridge with a mocked service and no memU loop, so
+        ``_submit`` awaits inline and no retry sleeps."""
+        from nerve.config import MemoryConfig, NerveConfig
         from nerve.memory.memu_bridge import MemUBridge
 
-        src = inspect.getsource(MemUBridge.memorize_file)
-        assert "self._trim_memory()" in src
-        assert "_release_memory" not in src.split("return True")[0]
+        config = NerveConfig()
+        config.memory = MemoryConfig(
+            sqlite_dsn=f"sqlite:///{tmp_path / 'memu.sqlite'}",
+        )
+        config.anthropic_api_key = "test-key"
 
-    def test_retry_exhaustion_keeps_the_full_release(self):
-        import inspect
+        bridge = MemUBridge(config)
+        bridge._available = True
+        bridge._service = MagicMock()
+        bridge._MEMORIZE_RETRY_DELAY = 0
+        return bridge
 
+    @pytest.mark.asyncio
+    async def test_per_file_success_path_calls_trim_not_release(self, tmp_path):
+        """Reddens if the success path is reverted to ``_release_memory``."""
         from nerve.memory.memu_bridge import MemUBridge
 
-        tail = inspect.getsource(MemUBridge.memorize_file).rsplit("gave up after", 1)[-1]
-        assert "_release_memory" in tail
+        bridge = self._bridge(tmp_path)
+        bridge._service.memorize = AsyncMock(return_value={"items": []})
+        target = tmp_path / "note.txt"
+        target.write_text("knowledge: a fact")
+
+        with patch.object(MemUBridge, "_trim_memory") as trim, \
+                patch.object(MemUBridge, "_release_memory") as release:
+            assert await bridge.memorize_file(str(target)) is True
+
+        assert trim.call_count == 1
+        assert release.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_exhaustion_keeps_the_full_release(self, tmp_path):
+        """The cold path still pays for a full pass -- and the success path's
+        trim is not what is being observed here, since it never runs."""
+        from nerve.memory.memu_bridge import MemUBridge
+
+        bridge = self._bridge(tmp_path)
+        bridge._service.memorize = AsyncMock(side_effect=asyncio.TimeoutError())
+        target = tmp_path / "note.txt"
+        target.write_text("knowledge: a fact")
+
+        with patch.object(MemUBridge, "_trim_memory") as trim, \
+                patch.object(MemUBridge, "_release_memory") as release, \
+                patch.object(bridge, "_reset_llm_clients", AsyncMock()):
+            assert await bridge.memorize_file(str(target)) is False
+
+        assert release.call_count == 1
+        assert trim.call_count == 0
 
     def test_memorization_sweep_keeps_the_full_release(self):
+        """Text oracle by exception: driving the sweep needs a whole engine,
+        and the assertion is only that this call site was left alone.
+        """
         import inspect
 
         from nerve.agent.engine import AgentEngine
