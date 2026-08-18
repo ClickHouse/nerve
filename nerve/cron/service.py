@@ -12,6 +12,7 @@ from datetime import datetime, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 # tool clamps delays to >= 60s, so a 20s sweep keeps fire latency well under
 # the granularity the model can request.
 _WAKEUP_SWEEP_SECONDS = 20
+
+# How late a run may start before APScheduler drops it instead of running it.
+# Overrides a 1-second default that any I/O on the shared event loop can exceed.
+# Bounded, not None: a run delayed past usefulness should still be discarded.
+# Read when the scheduler is built, so changing it needs a restart.
+_MISFIRE_GRACE_SECONDS = 30
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
 # /loop command, so resolve them to a plain continuation instruction.
@@ -253,7 +260,16 @@ class CronService:
         self.engine = engine
         self.db = db
         self.timezone = ZoneInfo(config.timezone)
-        self.scheduler = AsyncIOScheduler(timezone=self.timezone)
+        # coalesce collapses a backlog of ticks into one run; max_instances=1 is
+        # what makes a job's `lock: true` hold across schedules.
+        self.scheduler = AsyncIOScheduler(
+            timezone=self.timezone,
+            job_defaults={
+                "misfire_grace_time": _MISFIRE_GRACE_SECONDS,
+                "coalesce": True,
+                "max_instances": 1,
+            },
+        )
         self._jobs: list[CronJob] = []
         # Ids from the last load that were refused for being reserved. Reported
         # by reload() so the operator hears about it through the same channel
@@ -350,6 +366,8 @@ class CronService:
             replace_existing=True,
         )
 
+        self.scheduler.add_listener(self._on_job_missed, EVENT_JOB_MISSED)
+
         self.scheduler.start()
         logger.info(
             "Cron service started with %d jobs + %d sources",
@@ -358,6 +376,38 @@ class CronService:
 
         # Catch up missed jobs in background (don't block startup)
         asyncio.create_task(self._catchup_missed_jobs())
+
+    def _on_job_missed(self, event) -> None:
+        """Record a run APScheduler dropped for starting too late.
+
+        Such a run never reaches _run_job_wrapper, so without this row nothing
+        distinguishes it from a run that was never scheduled.
+
+        Listeners are called synchronously on the event loop, so the write is
+        dispatched rather than awaited, and nothing may propagate out of here:
+        an exception would stop the remaining listeners.
+        """
+        try:
+            job_id = event.job_id
+            due = event.scheduled_run_time
+            logger.warning("Cron job %s missed its run at %s", job_id, due)
+            asyncio.create_task(self._record_missed_run(job_id, due))
+        except Exception as e:
+            logger.warning("Failed to handle missed-run event: %s", e)
+
+    async def _record_missed_run(self, job_id: str, due: datetime) -> None:
+        """Persist one missed run. Logging a drop must not itself break cron."""
+        try:
+            await self.db.log_cron_missed(
+                job_id,
+                due.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                error=(
+                    f"run dropped: not started within "
+                    f"{_MISFIRE_GRACE_SECONDS}s of its scheduled time"
+                ),
+            )
+        except Exception as e:
+            logger.warning("Failed to log missed run for %s: %s", job_id, e)
 
     async def reload(self) -> dict:
         """Re-read cron config and apply changes to the running scheduler.
