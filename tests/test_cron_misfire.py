@@ -110,8 +110,13 @@ class TestExecutorDropsLateRuns:
     """Isolate apscheduler's skip branch: with grace 1 a late run is dropped,
     with our grace it is executed.
 
-    Calls ``run_job`` -- the function that owns the misfire branch and the
+    Calls ``run_job`` -- the synchronous half of the misfire branch, and the
     ``continue`` that skips ``job.func``. No real scheduler, no waiting.
+
+    This class covers the branch a *synchronous* target would take. Nothing
+    this application schedules is synchronous, so the contract is carried by
+    ``TestAsyncExecutorDropsLateRuns`` below; this one guards the other half
+    of the same pair, which apscheduler keeps as duplicated code.
     """
 
     @staticmethod
@@ -153,6 +158,88 @@ class TestExecutorDropsLateRuns:
         )
         assert calls == []
         assert [e.code for e in events] == [EVENT_JOB_MISSED]
+
+
+class TestAsyncExecutorDropsLateRuns:
+    """The branch that actually drops this application's runs.
+
+    ``AsyncIOExecutor`` picks ``run_coroutine_job`` for a coroutine target and
+    ``run_job`` for anything else, and every job here is a coroutine -- so
+    these arms, not the synchronous ones above, carry the grace contract.
+    apscheduler keeps the two misfire blocks as separate copies, and
+    ``apscheduler>=3.11.0`` is pinned without an upper bound, so a change to
+    one copy is invisible to a test that drives the other.
+    """
+
+    @staticmethod
+    async def _run_with_grace(grace: int, seconds_late: float) -> tuple[list, list]:
+        from apscheduler.executors.base import run_coroutine_job
+
+        calls: list[str] = []
+
+        async def func() -> None:
+            calls.append("late-job")
+
+        job = MagicMock()
+        job.id = "late-job"
+        job.misfire_grace_time = grace
+        job.max_instances = 1
+        job.args, job.kwargs = (), {}
+        job.func = func
+
+        due = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=seconds_late,
+        )
+        events = await run_coroutine_job(job, "default", [due], __name__)
+        return calls, events
+
+    @pytest.mark.asyncio
+    async def test_one_second_grace_drops_a_late_run(self):
+        calls, events = await self._run_with_grace(grace=1, seconds_late=5)
+        assert calls == []
+        assert [e.code for e in events] == [EVENT_JOB_MISSED]
+
+    @pytest.mark.asyncio
+    async def test_our_grace_runs_it(self):
+        calls, events = await self._run_with_grace(
+            grace=_MISFIRE_GRACE_SECONDS, seconds_late=5,
+        )
+        assert calls == ["late-job"]
+        assert EVENT_JOB_MISSED not in [e.code for e in events]
+
+    @pytest.mark.asyncio
+    async def test_a_run_later_than_the_grace_is_still_dropped(self):
+        calls, events = await self._run_with_grace(
+            grace=_MISFIRE_GRACE_SECONDS, seconds_late=3600,
+        )
+        assert calls == []
+        assert [e.code for e in events] == [EVENT_JOB_MISSED]
+
+    def test_every_scheduled_target_takes_the_coroutine_path(self, tmp_path):
+        """Which of the two branches the grace has to hold on.
+
+        ``AsyncIOExecutor._do_submit_job`` routes on this predicate, so a
+        target that stops being a coroutine function moves production onto the
+        branch the async arms above do not cover.
+        """
+        from apscheduler.util import iscoroutinefunction_partial
+
+        svc = _make_service(tmp_path)
+        targets = (
+            svc._run_job_wrapper,
+            svc._cleanup_expired,
+            svc._sweep_wakeups,
+            svc._run_source_wrapper,
+        )
+        assert [iscoroutinefunction_partial(t) for t in targets] == [True] * 4
+
+    def test_the_predicate_discriminates(self, tmp_path):
+        """Control for the arm above: the predicate is not simply always True,
+        so passing it is evidence about the targets."""
+        from apscheduler.util import iscoroutinefunction_partial
+
+        assert not iscoroutinefunction_partial(lambda: None)
+        assert not iscoroutinefunction_partial(_make_service(tmp_path)._on_job_missed)
 
 
 # ---------------------------------------------------------------------------
