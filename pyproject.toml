@@ -13,6 +13,16 @@ dependencies = [
     "pyyaml>=6.0",
     "python-telegram-bot>=21.0",
     "claude-agent-sdk>=0.2.82",
+    # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
+    # rather than only through claude-agent-sdk. The upper bound is load-bearing:
+    # mcp 2.0.0 dropped the module-level `request_ctx` contextvar from
+    # mcp.server.lowlevel.server, which nerve/mcp_server/http.py imports at
+    # module scope, so an unbounded resolve breaks startup on every fresh
+    # install. claude-agent-sdk itself allows `mcp<3`, so nothing else in the
+    # tree caps it — this is the only place the bound can live. Lift it once
+    # nerve/mcp_server/ is ported to the 2.x request-context API.
+    # Floor mirrors claude-agent-sdk's own `mcp>=1.23.0`.
+    "mcp>=1.23,<2",
     "apscheduler>=3.11.0",
     "pyjwt>=2.10.0",
     "bcrypt>=4.2.0",
