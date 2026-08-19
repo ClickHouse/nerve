@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat } from 'lucide-react';
+import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, ChevronDown } from 'lucide-react';
 import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
@@ -634,6 +634,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               only this chat: virtual chats bind it at creation, real
               sessions PATCH their own row — never a global preference. */}
           {scopedModels.length > 1 && (
+            <div className="relative shrink-0">
             <select
               value={currentModel ?? ''}
               onChange={(e) => {
@@ -646,7 +647,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               }}
               disabled={disabled || isStreaming || rewriteActive}
               title="Model for this chat (other chats keep theirs)"
-              className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
+              className="appearance-none h-10 max-w-[170px] w-full pl-2.5 pr-8 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer disabled:opacity-30 truncate"
             >
               {/* A session may run on a model the picker no longer offers
                   (retired id, uninstalled Ollama model) — keep it visible
@@ -676,6 +677,11 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
                 </optgroup>
               )}
             </select>
+            <ChevronDown
+              size={16}
+              className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-text-muted"
+            />
+            </div>
           )}
 
           <input
