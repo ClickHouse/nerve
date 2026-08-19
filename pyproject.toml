@@ -13,6 +13,19 @@ dependencies = [
     "pyyaml>=6.0",
     "python-telegram-bot>=21.0",
     "claude-agent-sdk>=0.2.82",
+    # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
+    # rather than only through claude-agent-sdk. Both bounds are load-bearing:
+    # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
+    # callbacks, request context as a handler argument), which does not exist
+    # in 1.x, and 3.x has not been vetted. claude-agent-sdk allows `mcp<3` and
+    # supports either major, so nothing else in the tree constrains this —
+    # this is the only place the bounds can live.
+    "mcp>=2,<3",
+    # Used directly by nerve/mcp_server/server.py to validate tool arguments
+    # against each tool's inputSchema. mcp 1.x's call_tool decorator did this
+    # for us; the 2.x callback does not, so the check is ours now and the
+    # dependency is declared rather than borrowed from claude-agent-sdk.
+    "jsonschema>=4.20",
     "apscheduler>=3.11.0",
     "pyjwt>=2.10.0",
     "bcrypt>=4.2.0",
