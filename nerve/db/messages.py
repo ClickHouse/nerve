@@ -20,12 +20,20 @@ class MessageStore:
         external_id: str | None = None,
         native_turn_id: str | None = None,
         created_at: str | None = None,
+        bump_updated_at: bool = True,
     ) -> int:
         """Insert a message row. ``external_id`` enables idempotent ingest
         from external sources (Codex thread sync, MCP server).
 
         ``created_at`` lets external ingesters preserve original Codex
         timestamps. Defaults to ``CURRENT_TIMESTAMP`` for native callers.
+
+        ``bump_updated_at=False`` records the row without moving the
+        session's ``updated_at``: the sidebar sorts on that column, and a
+        turn nobody asked for (a fired wakeup, a background task settling)
+        must not shuffle the list under the user. ``message_count`` still
+        advances — the message is real, only the "last activity" clock is
+        left alone.
         """
         async with self._atomic():
             if created_at is not None:
@@ -51,11 +59,17 @@ class MessageStore:
                 ) as cursor:
                     msg_id = cursor.lastrowid
             # Update session timestamp and message counter
-            now = datetime.now(timezone.utc).isoformat()
-            await self.db.execute(
-                "UPDATE sessions SET updated_at = ?, message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
-                (now, session_id),
-            )
+            if bump_updated_at:
+                now = datetime.now(timezone.utc).isoformat()
+                await self.db.execute(
+                    "UPDATE sessions SET updated_at = ?, message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
+                    (now, session_id),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE sessions SET message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
+                    (session_id,),
+                )
         return msg_id
 
     async def get_native_turn_at_message(

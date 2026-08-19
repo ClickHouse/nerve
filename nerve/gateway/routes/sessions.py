@@ -160,13 +160,34 @@ def _page_size() -> int | None:
     return size if size and size > 0 else None
 
 
+async def _pending_wakeup_map(deps) -> dict[str, str]:
+    """``session_id -> fire_at`` for every pending wakeup, in one query.
+
+    ``ScheduleWakeup`` keeps at most one pending row per session, so a plain
+    map is enough. Enrichment: a failure dims the indicator, it must never
+    fail the listing.
+    """
+    try:
+        rows = await deps.db.list_pending_wakeups()
+    except Exception:  # noqa: BLE001 — enrichment must never break listing
+        return {}
+    return {r["session_id"]: r["fire_at"] for r in rows if r.get("session_id")}
+
+
 async def _decorate(deps, sessions: list[dict]) -> list[dict]:
     """Attach the live per-row bits every sidebar list needs."""
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
+    # Pending work: no turn is in flight, yet the session isn't idle either —
+    # a wakeup is scheduled, or a background task is still running inside its
+    # CLI. The sidebar keeps those parked sessions in the "Running" group
+    # (with their own dot colour) instead of dropping them to idle.
+    wakeup_at = await _pending_wakeup_map(deps)
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
+        s["pending_wakeup_at"] = wakeup_at.get(s["id"])
+        s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
     await _attach_review_loops(deps, sessions)
     return sessions
 
@@ -201,12 +222,7 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
     deps = get_deps()
     sessions = await deps.db.search_sessions(q.strip())
-    running_ids = deps.engine.sessions.get_running_ids()
-    awaiting_ids = get_awaiting_ids()
-    for s in sessions:
-        s["is_running"] = s["id"] in running_ids
-        s["awaiting_input"] = s["id"] in awaiting_ids
-    await _attach_review_loops(deps, sessions)
+    await _decorate(deps, sessions)
     return {"sessions": sessions}
 
 

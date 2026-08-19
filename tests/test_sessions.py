@@ -949,7 +949,11 @@ class TestUnarchiveRoute:
         cfg_mod._config = cfg
 
         sm = SessionManager(db)
-        engine = SimpleNamespace(config=cfg, sessions=sm)
+        engine = SimpleNamespace(
+            config=cfg, sessions=sm,
+            # _decorate asks the engine for live background work per row.
+            has_live_background_tasks=lambda sid: False,
+        )
         init_deps(engine=engine, db=db)  # type: ignore[arg-type]
 
         app = FastAPI()

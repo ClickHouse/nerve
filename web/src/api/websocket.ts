@@ -29,7 +29,11 @@ export type WSMessage =
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
   | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
   | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null }
-  | { type: 'session_running'; session_id: string; is_running: boolean }
+  // pending_wakeup_at / has_background_tasks ride along with every transition:
+  // a turn can end with the session still parked on scheduled or background
+  // work, and the sidebar redraws that row straight from the event (it skips
+  // the list refetch for the active session).
+  | { type: 'session_running'; session_id: string; is_running: boolean; pending_wakeup_at?: string | null; has_background_tasks?: boolean }
   | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }

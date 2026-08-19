@@ -42,6 +42,15 @@ function formatShortDate(dateStr: string): string {
 const byUpdatedDesc = (a: Session, b: Session) =>
   parseTimestamp(b.updated_at).getTime() - parseTimestamp(a.updated_at).getTime();
 
+/**
+ * Parked: no turn in flight, but the session is not done either — a wake-up is
+ * scheduled, or a background task is still running inside its CLI. Such a
+ * session counts as running (it stays in the pinned "Running" group and never
+ * falls back to idle); only its dot differs, so "working now" still reads
+ * apart from "will pick itself back up".
+ */
+const isParked = (s: Session) => !!s.pending_wakeup_at || !!s.has_background_tasks;
+
 /** Drag-to-nest wiring shared by every draggable session row. */
 type RowDnd = {
   draggingId: string | null;
@@ -264,7 +273,9 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
     const rest: Session[] = [];
     for (const s of topLevel) {
       const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
-      if (isRunning) running.push(s);
+      // Parked sessions count as running: work is still pending, it just
+      // isn't executing this second.
+      if (isRunning || isParked(s)) running.push(s);
       else if (s.starred) starred.push(s);
       else rest.push(s);
     }
@@ -824,6 +835,18 @@ function reviewLoopIconTone(status: string): string {
 }
 
 
+/** Tooltip for the parked dot: what exactly the session is waiting on. */
+function parkedTitle(session: Session): string {
+  const parts: string[] = [];
+  if (session.has_background_tasks) parts.push('Background job running');
+  if (session.pending_wakeup_at) {
+    const at = parseTimestamp(session.pending_wakeup_at);
+    parts.push(`Scheduled wake-up at ${at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+  }
+  return parts.join(' · ') || 'Waiting on pending work';
+}
+
+
 /** Pulsing dot for running sessions, solid dot for other notable states. */
 function StatusIndicator({ session, isActive, isRunning }: {
   session: Session;
@@ -881,9 +904,23 @@ function StatusIndicator({ session, isActive, isRunning }: {
     );
   }
 
-  // Error state: solid red
+  // Error state: solid red. Ranked above "parked" on purpose — a failed turn
+  // must not be masked by the background work it left behind.
   if (session.status === 'error') {
     return <span className="inline-flex rounded-full h-1.5 w-1.5 shrink-0 bg-red-500" />;
+  }
+
+  // Parked: no turn in flight, but a wake-up is scheduled or a background job
+  // is still running. Same pulsing dot as running (the session isn't done),
+  // in violet — the one hue no other indicator uses — so "working right now"
+  // stays distinguishable from "will pick itself back up".
+  if (isParked(session)) {
+    return (
+      <span className="relative flex h-2 w-2 shrink-0" title={parkedTitle(session)}>
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500" />
+      </span>
+    );
   }
 
   // Stopped: solid yellow
@@ -1007,10 +1044,11 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   // Unsent draft for this chat (hidden on the active one — its text is in the box).
   const hasDraft = useChatStore(s => !!(s.drafts[session.id] || '').trim());
   // Unread = updated since you last opened it (client-only, see readStorage).
-  // Never for the open session or a running one; feed-scoped via showUnread.
+  // Never for the open session or a running/parked one; feed-scoped via
+  // showUnread.
   const lastSeen = useChatStore(s => s.reads[session.id]);
   const readsBaseline = useChatStore(s => s.readsBaseline);
-  const isUnread = showUnread && !isActive && !isRunning
+  const isUnread = showUnread && !isActive && !isRunning && !isParked(session)
     && parseTimestamp(session.updated_at).getTime() > Math.max(lastSeen ?? 0, readsBaseline);
 
   // Close menu on outside click
