@@ -12,7 +12,25 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "pyyaml>=6.0",
     "python-telegram-bot>=21.0",
-    "claude-agent-sdk>=0.2.82",
+    # Floor raised from 0.2.82 for mcp 2.x: 0.2.140 is the first release whose
+    # own constraint is `mcp<3.0.0` (0.2.100 through 0.2.139 all declare
+    # `mcp<2.0.0`). It matters because the SDK builds the in-process MCP server
+    # that serves EVERY agent tool, so an SDK without 2.x support breaks the
+    # whole Claude backend, not just /mcp/v1. 0.2.82 is the dangerous case: it
+    # declares `mcp>=1.23.0` with no upper bound, so `0.2.82 + mcp 2.x` is a
+    # resolvable combination that cannot work.
+    "claude-agent-sdk>=0.2.140",
+    # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
+    # rather than only through claude-agent-sdk. Both bounds are load-bearing:
+    # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
+    # callbacks, request context as a handler argument), which does not exist
+    # in 1.x, and 3.x has not been vetted.
+    "mcp>=2,<3",
+    # Used directly by nerve/mcp_server/server.py to validate tool arguments
+    # against each tool's inputSchema. mcp 1.x's call_tool decorator did this
+    # for us; the 2.x callback does not, so the check is ours now and the
+    # dependency is declared rather than borrowed from claude-agent-sdk.
+    "jsonschema>=4.20",
     "apscheduler>=3.11.0",
     "pyjwt>=2.10.0",
     "bcrypt>=4.2.0",
