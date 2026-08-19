@@ -7,8 +7,17 @@ behaviour forks per runtime.
 
 The ``ctx_resolver`` callable is invoked per ``call_tool`` request to
 build a fresh :class:`ToolContext` for the satellite session that owns
-this MCP connection. It returns an awaitable so the resolver can fetch
-state from the DB on first use and cache it for subsequent calls.
+this MCP connection. It receives the request's
+:class:`~mcp.server.context.ServerRequestContext` — mcp 2.x hands that to
+handlers as an argument rather than exposing it through a contextvar — and
+returns an awaitable so the resolver can fetch state from the DB on first
+use and cache it for subsequent calls.
+
+Argument validation against each tool's ``inputSchema`` happens here,
+explicitly. mcp 1.x's ``@server.call_tool()`` decorator did it for us by
+default (``validate_input=True``); the 2.x ``on_call_tool`` callback does
+not, so relying on the library would have silently dropped validation on an
+endpoint external clients can reach.
 
 The ``audit_writer`` callable is invoked after every successful tool
 call to persist an ``external_tool_call`` event into ``session_events``.
@@ -21,15 +30,24 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
+import jsonschema
+from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+)
 
 from nerve.agent.tools import ToolContext, ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)
 
 
-CtxResolver = Callable[[], Awaitable[ToolContext]]
+CtxResolver = Callable[[ServerRequestContext], Awaitable[ToolContext]]
 AuditWriter = Callable[[ToolContext, str, dict, ToolResult, float, bool], Awaitable[None]]
 
 
@@ -67,46 +85,68 @@ def build_mcp_server(
     """
     import time
 
-    server: Server = Server(name=name, version=version)
+    def _error(message: str) -> CallToolResult:
+        """A failed call, shaped exactly like every other failure here."""
+        return CallToolResult(
+            content=[TextContent(type="text", text=message)],
+            isError=True,
+        )
 
-    @server.list_tools()
-    async def _list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name=spec.name,
-                description=spec.description,
-                inputSchema=spec.input_schema,
-            )
-            for spec in registry.list(include_hoa=include_hoa)
-        ]
+    async def _list_tools(
+        rctx: ServerRequestContext,
+        params: PaginatedRequestParams | None = None,
+    ) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name=spec.name,
+                    description=spec.description,
+                    inputSchema=spec.input_schema,
+                )
+                for spec in registry.list(include_hoa=include_hoa)
+            ]
+        )
 
-    @server.call_tool()
-    async def _call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
+    async def _call_tool(
+        rctx: ServerRequestContext,
+        params: CallToolRequestParams,
+    ) -> CallToolResult:
+        name = params.name
+        arguments: dict[str, Any] = dict(params.arguments or {})
+
         spec = registry.get(name)
         if spec is None:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Unknown tool: {name!r}")],
-                isError=True,
-            )
+            return _error(f"Unknown tool: {name!r}")
 
         # HoA gating: registry.list() filters by include_hoa, but a
         # malicious caller could still invoke a HoA tool by name. Enforce
         # the same allowlist here.
         if not include_hoa and name.startswith("hoa_"):
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Tool not available: {name!r}")],
-                isError=True,
-            )
+            return _error(f"Tool not available: {name!r}")
+
+        # Validate arguments against the tool's declared inputSchema before
+        # any handler sees them. mcp 1.x's call_tool decorator did this by
+        # default; the 2.x callback does not, and this endpoint is reachable
+        # by external clients, so the check lives here explicitly rather
+        # than depending on a library default.
+        if spec.input_schema:
+            try:
+                jsonschema.validate(instance=arguments, schema=spec.input_schema)
+            except jsonschema.ValidationError as e:
+                logger.info("Invalid arguments for %s: %s", name, e.message)
+                return _error(f"Invalid arguments for {name!r}: {e.message}")
+            except jsonschema.SchemaError:
+                # A malformed schema is our bug, not the caller's. Refuse the
+                # call rather than dispatching unvalidated arguments.
+                logger.exception("Tool %s has an invalid inputSchema", name)
+                return _error(f"Tool {name!r} has an invalid input schema")
 
         start = time.monotonic()
         try:
-            ctx = await ctx_resolver()
+            ctx = await ctx_resolver(rctx)
         except Exception as e:
             logger.exception("Failed to resolve ToolContext for %s", name)
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Context error: {e}")],
-                isError=True,
-            )
+            return _error(f"Context error: {e}")
 
         try:
             result = await spec.handler(ctx, arguments)
@@ -126,10 +166,7 @@ def build_mcp_server(
                     )
                 except Exception:
                     logger.exception("Audit writer failed for %s", name)
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Tool error: {e}")],
-                isError=True,
-            )
+            return _error(f"Tool error: {e}")
 
         duration_ms = (time.monotonic() - start) * 1000.0
         if audit_writer is not None:
@@ -161,4 +198,11 @@ def build_mcp_server(
 
         return CallToolResult(content=content, isError=result.is_error)
 
-    return server
+    # mcp 2.x registers handlers as constructor callbacks; the 1.x
+    # ``@server.list_tools()`` / ``@server.call_tool()`` decorators are gone.
+    return Server(
+        name=name,
+        version=version,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
