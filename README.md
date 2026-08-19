@@ -35,8 +35,8 @@ The installer handles everything — installs dependencies (Python, Node.js, uv)
 
 ```bash
 git clone https://github.com/ClickHouse/nerve.git && cd nerve
-uv venv --python 3.13 && source .venv/bin/activate
-uv pip install -e .
+uv sync                      # creates .venv from uv.lock
+source .venv/bin/activate
 cd web && npm ci && npm run build && cd ..
 nerve init
 nerve start -f

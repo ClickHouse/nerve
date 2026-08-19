@@ -36,10 +36,9 @@ cd nerve
 # 2. Add upstream remote
 git remote add upstream git@github.com:ClickHouse/nerve.git
 
-# 3. Set up Python environment
-python3 -m venv .venv
+# 3. Set up Python environment (uv sync creates .venv from uv.lock)
+uv sync --extra test
 source .venv/bin/activate
-pip install -e .
 
 # 4. Set up frontend
 cd web && npm install && cd ..
@@ -193,8 +192,10 @@ cd ~/nerve
 .venv/bin/pytest tests/test_sessions.py -v
 .venv/bin/pytest tests/test_db.py::TestClassName -v
 
-# Install/update dependencies after pyproject.toml changes
-.venv/bin/uv pip install -e .
+# After changing pyproject.toml dependencies: relock, then sync.
+# Commit uv.lock alongside pyproject.toml — CI runs `uv sync --locked`
+# and fails if the two have drifted apart.
+uv lock && uv sync --extra test
 
 # Health check
 .venv/bin/nerve doctor

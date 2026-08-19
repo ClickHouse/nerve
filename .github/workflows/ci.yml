@@ -26,10 +26,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pyproject says requires-python ">=3.12", but the pinned
-        # memu-py==1.4.0 dependency requires >=3.13, so 3.13 is the real
-        # floor (and what the dev environment runs). Add more versions here
-        # if that pin is ever relaxed.
+        # Matches pyproject's requires-python floor of >=3.13, which is set by
+        # the pinned memu-py==1.4.0. Add more versions here if that pin is ever
+        # relaxed and the floor drops.
         python-version: ["3.13"]
     steps:
       - name: Checkout
@@ -38,15 +37,32 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
+          # Pinned deliberately. uv owns the lockfile format (uv.lock records a
+          # `version` and `revision`) and it is also the tool asserting the lock
+          # is current, so letting CI float to whatever uv shipped this morning
+          # puts a moving part underneath the reproducibility this file exists to
+          # provide. Bump this alongside a `uv lock` refresh.
+          version: "0.12.0"
           enable-cache: true
-          # Key the uv cache on the dependency source (this repo has no uv.lock).
-          cache-dependency-glob: "pyproject.toml"
-
-      - name: Create virtual environment
-        run: uv venv --python ${{ matrix.python-version }}
+          # uv.lock is the single input that determines the resolution.
+          cache-dependency-glob: "uv.lock"
 
       - name: Install project and test dependencies
-        run: uv pip install -e ".[test]"
+        # `uv sync` resolves from uv.lock, creates .venv, and installs the
+        # project editable — so this run gets the same versions today and in six
+        # months. It also stops the cache deciding versions: before the lock, a
+        # restored cache carrying stale index metadata was the only reason CI
+        # kept resolving mcp 1.29.0 for three weeks after mcp 2.0.0 had broken
+        # every fresh install (#316).
+        #
+        # --locked asserts uv.lock is already in sync with pyproject.toml and
+        # fails if not, rather than silently re-locking. That is what makes this
+        # one job sufficient: any dependency change — added, removed, or
+        # re-bounded — invalidates the lock, so it cannot be merged without a
+        # relock, and the relock moves the pins that this job then tests. It
+        # does NOT fail merely because upstream published something new, since
+        # the lock is used as-is.
+        run: uv sync --extra test --locked --python ${{ matrix.python-version }}
 
       - name: Run test suite
         run: .venv/bin/pytest tests/ -v
