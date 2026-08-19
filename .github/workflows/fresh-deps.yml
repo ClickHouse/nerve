@@ -1,0 +1,110 @@
+name: Fresh dependency resolve
+
+# Answers one question the PR/push CI structurally cannot: "does a brand-new
+# install of Nerve still work today?"
+#
+# Nerve has no Python lockfile — pyproject.toml carries lower bounds only — so
+# what `uv pip install -e .` actually resolves changes silently as upstream
+# publishes new releases. ci.yml can't see that drift: it keys its uv cache on
+# pyproject.toml, and a restored cache carries stale index metadata, so an
+# unchanged pyproject means an unchanged resolution indefinitely.
+#
+# That blind spot is not hypothetical. mcp 2.0.0 (published 2026-07-28) removed
+# an API that nerve/mcp_server/http.py imports at module scope, breaking every
+# fresh install at startup — while CI stayed green for three weeks still
+# resolving mcp 1.29.0 from cache. It surfaced only when a user filed #316.
+#
+# So: resolve with the cache off and index metadata refreshed, then run the
+# suite. A failure here means "an upstream release broke a fresh install",
+# NOT "someone's PR broke the build" — the tree is unchanged, only the wider
+# ecosystem moved.
+#
+# The frontend is deliberately out of scope: web/package-lock.json plus `npm ci`
+# already pin it reproducibly. The gap being closed is Python-only.
+
+on:
+  schedule:
+    # 06:00 UTC daily. Detects drift within a day of an upstream release,
+    # for ~2 minutes of runner time.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+  # Also run when this workflow file itself changes. `schedule` and
+  # `workflow_dispatch` only fire for the copy on the default branch, so
+  # without this a change here couldn't be exercised until after it merged.
+  pull_request:
+    paths:
+      - ".github/workflows/fresh-deps.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fresh-deps-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fresh-resolve:
+    name: Fresh resolve + tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors ci.yml. memu-py==1.4.0 requires >=3.13, so 3.13 is the real
+        # floor despite pyproject's requires-python being >=3.12.
+        python-version: ["3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # The whole point of this workflow. Caching here would reintroduce
+          # exactly the stale-metadata blind spot it exists to cover.
+          enable-cache: false
+
+      - name: Create virtual environment
+        run: uv venv --python ${{ matrix.python-version }}
+
+      - name: Install project and test dependencies (no cache, fresh index)
+        # --refresh re-fetches index metadata rather than trusting anything
+        # local, so this resolves what a user installing today would get.
+        run: uv pip install -e ".[test]" --refresh
+
+      - name: Record resolved versions
+        # Publishes the full resolution to the run summary, so drift is
+        # reviewable even on a green run — and diffable between runs when
+        # something does break.
+        run: |
+          {
+            echo "## Resolved dependency versions"
+            echo
+            echo "Fresh resolve on $(date -u '+%Y-%m-%d %H:%M UTC'), no cache."
+            echo
+            echo '```'
+            uv pip freeze
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run test suite
+        run: .venv/bin/pytest tests/ -v
+
+      - name: Explain a failure
+        if: failure()
+        run: |
+          {
+            echo "## A fresh install of Nerve is broken"
+            echo
+            echo "This job installs with **no cache** and refreshed index"
+            echo "metadata, so it reflects what a user gets running"
+            echo '`uv pip install -e .` today.'
+            echo
+            echo "The repository tree did not change — an upstream release did."
+            echo "Check the resolved versions above against the last green run"
+            echo "to find which dependency moved, then add an upper bound in"
+            echo '`pyproject.toml` (or fix the incompatibility).'
+            echo
+            echo "Note that \`ci.yml\` can stay green while this fails: it"
+            echo "resolves from a cache keyed on \`pyproject.toml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
