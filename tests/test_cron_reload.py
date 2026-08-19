@@ -12,7 +12,7 @@ import pytest_asyncio
 import yaml
 
 from nerve.cron.service import CronService
-from nerve.cron.jobs import CronJob, is_reserved_job_id
+from nerve.cron.jobs import CronJob, is_reserved_job_id, load_jobs
 
 
 def _write_jobs(path: Path, jobs: list[dict]) -> None:
@@ -934,6 +934,366 @@ class TestReloadRoute:
             await reload_cron_jobs(user={})
         assert ei.value.status_code == 400
         assert "typo" in ei.value.detail
+
+
+# A cron file as people actually write them: comments above, beside and between
+# the jobs, a block-scalar prompt, and a flag that is absent on one job and
+# present on another. Every one of those is something a full re-dump destroys.
+_COMMENTED_FILE = """\
+# Parked templates — switch on when needed.
+jobs:
+  # Proposes only; it never acts.
+  - id: planner
+    schedule: "0 9 * * *"     # every morning
+    prompt: |
+      Review the board.
+      Mention enabled: true to be awkward.
+    enabled: false            # flip me
+
+  - id: sweeper
+    schedule: 2h
+    prompt: Sweep.
+"""
+
+
+class TestSetJobEnabledInFile:
+    """The YAML edit itself, independent of any scheduler."""
+
+    def test_flips_an_existing_flag_and_keeps_every_comment(self, tmp_path):
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(_COMMENTED_FILE, encoding="utf-8")
+
+        assert set_job_enabled_in_file(f, "planner", True) is True
+        out = f.read_text(encoding="utf-8")
+        for comment in (
+            "# Parked templates — switch on when needed.",
+            "# Proposes only; it never acts.",
+            "# every morning",
+            "# flip me",
+        ):
+            assert comment in out, f"lost {comment!r}"
+        # The flag changed, and the comment that trailed it stayed put.
+        assert "enabled: true            # flip me" in out
+        assert {j.id: j.enabled for j in load_jobs(f)} == {
+            "planner": True, "sweeper": True,
+        }
+
+    def test_a_prompt_mentioning_the_key_is_not_the_key(self, tmp_path):
+        """The edit is located by parsing, so prose about `enabled:` is safe.
+
+        This is the case that decides between parsing and pattern-matching: a
+        text search for the flag finds the prompt line first and corrupts the
+        prompt while reporting success.
+        """
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(_COMMENTED_FILE, encoding="utf-8")
+        set_job_enabled_in_file(f, "planner", True)
+
+        planner = next(j for j in load_jobs(f) if j.id == "planner")
+        assert "Mention enabled: true to be awkward." in planner.prompt
+        assert planner.enabled is True
+
+    def test_inserts_the_flag_when_the_job_has_none(self, tmp_path):
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(_COMMENTED_FILE, encoding="utf-8")
+
+        assert set_job_enabled_in_file(f, "sweeper", False) is True
+        assert {j.id: j.enabled for j in load_jobs(f)} == {
+            "planner": False, "sweeper": False,
+        }
+        # Aligned with its siblings, not with the `- ` that opens the item.
+        assert "\n    enabled: false\n" in f.read_text(encoding="utf-8")
+
+    def test_already_in_that_state_is_not_a_write(self, tmp_path):
+        """Reports no change and leaves the bytes alone, so the caller can skip
+        the reload and the rollback has nothing to undo."""
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(_COMMENTED_FILE, encoding="utf-8")
+        before = f.read_text(encoding="utf-8")
+
+        assert set_job_enabled_in_file(f, "planner", False) is False
+        assert f.read_text(encoding="utf-8") == before
+
+    def test_quoted_flag_becomes_a_real_boolean(self, tmp_path):
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(
+            'jobs:\n  - id: q\n    schedule: 1h\n    prompt: hi\n'
+            '    enabled: "true"\n',
+            encoding="utf-8",
+        )
+        set_job_enabled_in_file(f, "q", False)
+        assert load_jobs(f)[0].enabled is False
+
+    def test_edits_a_bare_top_level_list(self, tmp_path):
+        """The shape old installs still have — see load_jobs' compat branch."""
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text("- id: old\n  schedule: 1h\n  prompt: hi\n", encoding="utf-8")
+        assert set_job_enabled_in_file(f, "old", False) is True
+        assert load_jobs(f)[0].enabled is False
+
+    def test_file_without_a_trailing_newline(self, tmp_path):
+        from nerve.cron.jobs import set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text("jobs:\n  - id: t\n    schedule: 1h\n    prompt: hi", encoding="utf-8")
+        assert set_job_enabled_in_file(f, "t", False) is True
+        assert load_jobs(f)[0].enabled is False
+
+    def test_replaces_a_flow_style_flag_but_refuses_to_add_one(self, tmp_path):
+        from nerve.cron.jobs import JobEditError, set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(
+            "jobs:\n  - {id: f, schedule: 1h, prompt: hi, enabled: true}\n",
+            encoding="utf-8",
+        )
+        assert set_job_enabled_in_file(f, "f", False) is True
+        assert load_jobs(f)[0].enabled is False
+
+        # With no key to overwrite there is no line to insert into, so it says so
+        # instead of guessing.
+        f.write_text(
+            "jobs:\n  - {id: f, schedule: 1h, prompt: hi}\n", encoding="utf-8",
+        )
+        with pytest.raises(JobEditError, match="flow style"):
+            set_job_enabled_in_file(f, "f", False)
+
+    @pytest.mark.parametrize("content,match", [
+        ("", "empty"),
+        ("crons:\n  - id: x\n", "no 'jobs' list"),
+        ("jobs: {}\n", "not a list"),
+        ("jobs:\n  - id: other\n    schedule: 1h\n    prompt: hi\n", "no job"),
+    ])
+    def test_refuses_what_it_cannot_edit(self, tmp_path, content, match):
+        from nerve.cron.jobs import JobEditError, set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        f.write_text(content, encoding="utf-8")
+        with pytest.raises(JobEditError, match=match):
+            set_job_enabled_in_file(f, "wanted", True)
+
+    def test_unparseable_file_is_refused_not_overwritten(self, tmp_path):
+        from nerve.cron.jobs import JobEditError, set_job_enabled_in_file
+
+        f = tmp_path / "jobs.yaml"
+        broken = "jobs:\n  - id: x\n   bad indent: [\n"
+        f.write_text(broken, encoding="utf-8")
+        with pytest.raises(JobEditError, match="Cannot parse"):
+            set_job_enabled_in_file(f, "x", True)
+        assert f.read_text(encoding="utf-8") == broken
+
+
+class TestSetJobEnabled:
+    """The service method: persist, apply, and roll back together."""
+
+    @pytest.mark.asyncio
+    async def test_disable_writes_the_file_and_unschedules(self, svc):
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [_job_dict("j1"), _job_dict("j2")])
+        await service.reload()
+        assert service.scheduler.get_job("j1") is not None
+
+        result = await service.set_job_enabled("j1", False)
+        assert result["enabled"] is False and result["changed"] is True
+
+        # Both halves: the file for the next restart, the scheduler for now.
+        assert {j.id: j.enabled for j in load_jobs(jobs_file)} == {
+            "j1": False, "j2": True,
+        }
+        assert service.scheduler.get_job("j1") is None
+        assert service.scheduler.get_job("j2") is not None
+
+        # j2 keeps the *absence* of the key, rather than being handed an
+        # explicit `enabled: true` it never had. A re-dump of the document would
+        # have materialised one on every job in the file.
+        raw = {j["id"]: j for j in yaml.safe_load(jobs_file.read_text())["jobs"]}
+        assert raw["j1"]["enabled"] is False
+        assert "enabled" not in raw["j2"]
+
+    @pytest.mark.asyncio
+    async def test_enable_writes_the_file_and_schedules(self, svc):
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [_job_dict("j1", enabled=False)])
+        await service.reload()
+        assert service.scheduler.get_job("j1") is None
+
+        result = await service.set_job_enabled("j1", True)
+        assert result["enabled"] is True
+        assert service.scheduler.get_job("j1") is not None
+        assert load_jobs(jobs_file)[0].enabled is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_job_raises_value_error(self, svc):
+        service, _ = svc
+        with pytest.raises(ValueError, match="No such cron job"):
+            await service.set_job_enabled("nope", False)
+
+    @pytest.mark.asyncio
+    async def test_response_enabled_is_the_flag_not_the_reload_count(self, svc):
+        """`reload()`'s summary has an `enabled` too, and it is a count.
+
+        Spreading the summary into this response instead of nesting it replaces
+        the job's new state with the number of scheduled jobs — same key, wholly
+        different meaning, and a caller reading `enabled` gets a plausible
+        integer rather than the flag it asked to set.
+        """
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [_job_dict("j1"), _job_dict("j2")])
+        await service.reload()
+
+        result = await service.set_job_enabled("j1", False)
+        assert result["enabled"] is False
+        assert result["reload"]["enabled"] == 1  # j2 is still scheduled
+
+    @pytest.mark.asyncio
+    async def test_a_refused_reload_puts_the_file_back(self, svc, monkeypatch):
+        """The rollback that keeps the two halves from disagreeing.
+
+        A reload can fail for reasons that have nothing to do with the job being
+        toggled. If the file kept the new flag, it would claim the job is off
+        while the scheduler goes on firing it until something else reloads —
+        exactly the outcome an off switch may not produce.
+        """
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [_job_dict("j1")])
+        await service.reload()
+        before = jobs_file.read_text(encoding="utf-8")
+
+        from nerve.cron.service import InvalidScheduleError
+        monkeypatch.setattr(
+            service, "_reload_locked",
+            AsyncMock(side_effect=InvalidScheduleError("someone else's typo")),
+        )
+        with pytest.raises(InvalidScheduleError):
+            await service.set_job_enabled("j1", False)
+
+        assert jobs_file.read_text(encoding="utf-8") == before
+        assert service.scheduler.get_job("j1") is not None
+
+    @pytest.mark.asyncio
+    async def test_toggle_targets_the_file_the_job_came_from(self, svc, tmp_path):
+        """A user job shadowing a system one is the copy that got scheduled, so
+        it is the copy the edit has to land in."""
+        service, jobs_file = svc
+        system_file = service.config.cron.system_file
+        _write_jobs(system_file, [_job_dict("shared", schedule="4h")])
+        _write_jobs(jobs_file, [_job_dict("shared", schedule="1h")])
+        await service.reload()
+
+        await service.set_job_enabled("shared", False)
+
+        assert load_jobs(jobs_file)[0].enabled is False
+        # The losing copy is untouched.
+        assert load_jobs(system_file)[0].enabled is True
+
+    @pytest.mark.asyncio
+    async def test_toggles_a_system_job_in_the_system_file(self, svc):
+        service, jobs_file = svc
+        system_file = service.config.cron.system_file
+        _write_jobs(system_file, [_job_dict("sys")])
+        _write_jobs(jobs_file, [_job_dict("mine")])
+        await service.reload()
+
+        await service.set_job_enabled("sys", False)
+        assert load_jobs(system_file)[0].enabled is False
+        assert load_jobs(jobs_file)[0].enabled is True
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_reports_no_refusal_when_unlocked(self, svc):
+        service, jobs_file = svc
+        _write_jobs(jobs_file, [_job_dict("j1")])
+        await service.reload()
+        listed = await service.list_jobs()
+        assert listed[0]["toggle_refusal"] is None
+
+
+class TestToggleRoutes:
+    @pytest.mark.asyncio
+    async def test_enable_and_disable_call_through(self, monkeypatch):
+        import nerve.gateway.server as srv
+
+        from nerve.gateway.routes.cron import disable_cron_job, enable_cron_job
+
+        fake = MagicMock()
+        fake.set_job_enabled = AsyncMock(return_value={"job_id": "j1"})
+        monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
+
+        await enable_cron_job("j1", user={})
+        assert fake.set_job_enabled.await_args.args == ("j1", True)
+        await disable_cron_job("j1", user={})
+        assert fake.set_job_enabled.await_args.args == ("j1", False)
+
+    @pytest.mark.asyncio
+    async def test_503_when_no_service(self, monkeypatch):
+        import nerve.gateway.server as srv
+        from fastapi import HTTPException
+
+        from nerve.gateway.routes.cron import disable_cron_job
+
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        with pytest.raises(HTTPException) as ei:
+            await disable_cron_job("j1", user={})
+        assert ei.value.status_code == 503
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error,status", [
+        (ValueError("No such cron job: 'j1'"), 404),
+        (None, 403),   # LockdownError, built in the test body
+        (None, 400),   # JobEditError / ConfigError, ditto
+    ])
+    async def test_status_codes(self, monkeypatch, error, status):
+        import nerve.gateway.server as srv
+        from fastapi import HTTPException
+
+        from nerve.config import ConfigError, LockdownError
+        from nerve.gateway.routes.cron import disable_cron_job
+
+        if status == 403:
+            error = LockdownError("cannot write tracked config")
+        elif status == 400:
+            error = ConfigError("bad cron file")
+
+        fake = MagicMock()
+        fake.set_job_enabled = AsyncMock(side_effect=error)
+        monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
+        with pytest.raises(HTTPException) as ei:
+            await disable_cron_job("j1", user={})
+        assert ei.value.status_code == status
+
+    @pytest.mark.asyncio
+    async def test_schedule_typo_is_400_not_404(self, monkeypatch):
+        """ConfigError subclasses ValueError, so clause order decides this one.
+
+        With the broad ValueError clause first, a reload refused over somebody
+        else's schedule typo would come back as "no such job".
+        """
+        import nerve.gateway.server as srv
+        from fastapi import HTTPException
+
+        from nerve.cron.service import InvalidScheduleError
+        from nerve.gateway.routes.cron import disable_cron_job
+
+        fake = MagicMock()
+        fake.set_job_enabled = AsyncMock(
+            side_effect=InvalidScheduleError("Cron job 'other': bad minute"),
+        )
+        monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
+        with pytest.raises(HTTPException) as ei:
+            await disable_cron_job("j1", user={})
+        assert ei.value.status_code == 400
+        assert "other" in ei.value.detail
 
 
 class TestReservedIds:

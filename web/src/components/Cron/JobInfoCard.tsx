@@ -1,7 +1,10 @@
 import { Filter, FileText } from 'lucide-react';
 import type { CronJob } from '../../stores/cronStore';
 import { formatRelativeTime, formatSchedule } from './utils';
-import { ChatLink, JobTypeBadge, JobTypeIcon, RotateButton, TriggerButton } from './controls';
+import {
+  ChatLink, EnabledSwitch, JobTypeBadge, JobTypeIcon, RotateButton,
+  ToggleError, TriggerButton,
+} from './controls';
 
 export function JobInfoCard({ job }: { job: CronJob }) {
   return (
@@ -28,8 +31,12 @@ export function JobInfoCard({ job }: { job: CronJob }) {
           {job.last_session_id && <ChatLink sessionId={job.last_session_id} label="Open Chat" />}
           {job.enabled && job.session_mode === 'persistent' && <RotateButton jobId={job.id} />}
           {job.enabled && <TriggerButton jobId={job.id} />}
+          {/* Last, and never hidden by `enabled`: it is the way back on. */}
+          <span className="ml-1"><EnabledSwitch job={job} /></span>
         </div>
       </div>
+
+      <ToggleError jobId={job.id} />
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
         <div>

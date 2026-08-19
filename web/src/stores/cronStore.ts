@@ -17,6 +17,12 @@ export interface CronJob {
   next_run: string | null;
   /** Most recently active chat session for this job (cron:{id}[:{run}]). */
   last_session_id?: string | null;
+  /**
+   * Why this job's enabled flag cannot be toggled here, or null when it can.
+   * Set for source runners (they have no flag in the cron files) and under
+   * lockdown (the cron file is reviewed config, so the change belongs in a PR).
+   */
+  toggle_refusal?: string | null;
 }
 
 export interface CronLog {
@@ -40,6 +46,14 @@ interface CronState {
   loading: boolean;
   triggering: string | null;
   rotating: string | null;
+  toggling: string | null;
+  /**
+   * Why the last toggle failed, keyed by job id. A rejected toggle has to say
+   * so: the switch springs back to where it was, which on its own is
+   * indistinguishable from a click that never registered — and a 403 under
+   * lockdown is an expected answer, not a bug.
+   */
+  toggleErrors: Record<string, string>;
 
   loadJobs: () => Promise<void>;
   loadLogs: (offset?: number) => Promise<void>;
@@ -47,7 +61,27 @@ interface CronState {
   selectJob: (jobId: string | null) => void;
   triggerJob: (jobId: string) => Promise<void>;
   rotateSession: (jobId: string) => Promise<void>;
+  setJobEnabled: (jobId: string, enabled: boolean) => Promise<void>;
   refresh: () => Promise<void>;
+}
+
+/**
+ * The human-readable half of a failed `request()`, which throws
+ * `Error("<status>: <raw body>")` where the body is FastAPI's
+ * `{"detail": "..."}`. Falls back to the whole message when it is not that
+ * shape, so an unexpected failure is still shown rather than swallowed.
+ */
+function errorDetail(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const match = raw.match(/^\d+:\s*([\s\S]*)$/);
+  if (!match) return raw;
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (parsed && typeof parsed.detail === 'string') return parsed.detail;
+  } catch {
+    // Not JSON — fall through to the raw body.
+  }
+  return match[1] || raw;
 }
 
 export const useCronStore = create<CronState>((set, get) => ({
@@ -59,6 +93,8 @@ export const useCronStore = create<CronState>((set, get) => ({
   loading: false,
   triggering: null,
   rotating: null,
+  toggling: null,
+  toggleErrors: {},
 
   loadJobs: async () => {
     try {
@@ -116,6 +152,27 @@ export const useCronStore = create<CronState>((set, get) => ({
       console.error('Failed to rotate session:', e);
     } finally {
       set({ rotating: null });
+    }
+  },
+
+  setJobEnabled: async (jobId: string, enabled: boolean) => {
+    // Clear this job's previous complaint up front, so a retry that succeeds
+    // doesn't leave the old message sitting under a switch that now works.
+    set(s => {
+      const remaining = { ...s.toggleErrors };
+      delete remaining[jobId];
+      return { toggling: jobId, toggleErrors: remaining };
+    });
+    try {
+      await api.setCronJobEnabled(jobId, enabled);
+      // Reload the list rather than patching the flag locally: the server also
+      // recomputed next_run, and a disabled job has none.
+      await get().loadJobs();
+    } catch (e) {
+      console.error('Failed to toggle cron job:', e);
+      set(s => ({ toggleErrors: { ...s.toggleErrors, [jobId]: errorDetail(e) } }));
+    } finally {
+      set({ toggling: null });
     }
   },
 

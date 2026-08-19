@@ -61,6 +61,47 @@ async def trigger_cron_job(job_id: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@router.post("/api/cron/jobs/{job_id}/enable")
+async def enable_cron_job(job_id: str, user: dict = Depends(require_auth)):
+    """Enable a cron job in its cron file and schedule it, without a restart."""
+    return await _set_cron_job_enabled(job_id, True)
+
+
+@router.post("/api/cron/jobs/{job_id}/disable")
+async def disable_cron_job(job_id: str, user: dict = Depends(require_auth)):
+    """Disable a cron job in its cron file and unschedule it, without a restart."""
+    return await _set_cron_job_enabled(job_id, False)
+
+
+async def _set_cron_job_enabled(job_id: str, enabled: bool) -> dict:
+    """Shared body of the two toggle routes.
+
+    Status codes follow what the caller can do about it: 404 for a job that is
+    not there, 403 when lockdown reserves the file for a reviewed PR, and 400 for
+    a file this edit cannot be expressed in (flow style, no ``jobs`` list) or a
+    reload the new config cannot satisfy. None of the three is worth a retry —
+    each is fixed by editing YAML.
+    """
+    from nerve.config import ConfigError, LockdownError
+    from nerve.cron.jobs import JobEditError
+    from nerve.gateway.server import _cron_service
+
+    if not _cron_service:
+        raise HTTPException(status_code=503, detail="Cron service not available")
+
+    try:
+        return await _cron_service.set_job_enabled(job_id, enabled)
+    except LockdownError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    # Before the bare ValueError below, not after: ConfigError subclasses
+    # ValueError (and InvalidScheduleError subclasses ConfigError), so the
+    # broad clause first would report a schedule typo as a missing job.
+    except (JobEditError, ConfigError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
 @router.post("/api/cron/jobs/{job_id}/rotate")
 async def rotate_cron_session(job_id: str, user: dict = Depends(require_auth)):
     """Force-rotate a persistent cron session's context."""

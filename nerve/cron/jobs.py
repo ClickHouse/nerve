@@ -344,6 +344,199 @@ def load_jobs(
     return jobs
 
 
+class JobEditError(Exception):
+    """A cron file could not be edited in place, with the reason why.
+
+    Carries an operator-facing message: every raise site names the file and what
+    about it defeated the edit, because the answer is always "go and change that
+    line by hand" and the message is the only thing that says which line.
+    """
+
+
+def _find_jobs_sequence(root: yaml.Node, jobs_file: Path) -> yaml.SequenceNode:
+    """The node holding the job list, for either shape :func:`load_jobs` accepts.
+
+    ``jobs:`` under a mapping is the documented form; a bare top-level list is
+    the one old installs still have (see :func:`load_jobs`). Both are read at
+    startup, so both have to be editable — supporting only the first would give
+    those installs a toggle that returns success and changes nothing.
+    """
+    if isinstance(root, yaml.SequenceNode):
+        return root
+    if isinstance(root, yaml.MappingNode):
+        for key, value in root.value:
+            if isinstance(key, yaml.ScalarNode) and key.value == "jobs":
+                if not isinstance(value, yaml.SequenceNode):
+                    raise JobEditError(
+                        f"{jobs_file}: 'jobs' is not a list"
+                    )
+                return value
+    raise JobEditError(f"{jobs_file}: no 'jobs' list to edit")
+
+
+def _mapping_entry(
+    mapping: yaml.MappingNode, name: str,
+) -> tuple[yaml.ScalarNode, yaml.Node] | None:
+    """The ``(key, value)`` node pair for *name*, or ``None`` if absent."""
+    for key, value in mapping.value:
+        if isinstance(key, yaml.ScalarNode) and key.value == name:
+            return key, value
+    return None
+
+
+def set_job_enabled_in_file(
+    jobs_file: Path, job_id: str, enabled: bool,
+) -> bool:
+    """Flip one job's ``enabled`` flag in *jobs_file*. Returns whether it changed.
+
+    Rewrites the smallest span of text that carries the answer — the scalar after
+    ``enabled:``, or a single inserted line — rather than re-dumping the
+    document. :func:`save_jobs` is the other option and the wrong one for a
+    toggle: ``safe_dump`` cannot round-trip comments, so pausing one job would
+    silently delete every note in a hand-written cron file and materialize each
+    omitted default as an explicit key. The same reasoning, and the same choice,
+    as the settings writer in :mod:`nerve.bootstrap`.
+
+    Locating the span is left to the parser. ``yaml.compose`` gives every node
+    the offsets it occupied in the source, so the job is found by structure and
+    the edit lands at a real position — where matching ``enabled:`` by text or
+    indentation would be guessing, and would eventually guess on a job whose
+    prompt happens to contain the word.
+
+    The result is parsed and compared against the original before anything is
+    written: the requested flag must have moved and nothing else may have. A
+    surgical text edit that type-checks is still a text edit, and the cheap
+    structural check is what separates "the file now says what I meant" from
+    "the old value is gone".
+
+    Raises :class:`JobEditError` if the file can't be parsed, holds no such job,
+    or is shaped so the flag can't be placed.
+    """
+    try:
+        text = jobs_file.read_text(encoding="utf-8")
+    except OSError as e:
+        raise JobEditError(f"Cannot read {jobs_file}: {e}") from e
+
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as e:
+        raise JobEditError(f"Cannot parse {jobs_file}: {e}") from e
+    if root is None:
+        raise JobEditError(f"{jobs_file} is empty")
+
+    sequence = _find_jobs_sequence(root, jobs_file)
+
+    target: yaml.MappingNode | None = None
+    for item in sequence.value:
+        if not isinstance(item, yaml.MappingNode):
+            continue
+        found = _mapping_entry(item, "id")
+        if (
+            found is not None
+            and isinstance(found[1], yaml.ScalarNode)
+            and found[1].value == job_id
+        ):
+            target = item
+            break
+    if target is None:
+        raise JobEditError(f"{jobs_file} defines no job {job_id!r}")
+
+    literal = "true" if enabled else "false"
+    existing = _mapping_entry(target, "enabled")
+
+    if existing is not None:
+        _, value_node = existing
+        if not isinstance(value_node, yaml.ScalarNode):
+            raise JobEditError(
+                f"{jobs_file}: job {job_id!r} has a non-scalar 'enabled' value "
+                "— edit it by hand"
+            )
+        start, end = value_node.start_mark.index, value_node.end_mark.index
+        # Anything after `enabled:` on that line — a trailing comment most
+        # often — sits outside the scalar's span and survives untouched.
+        new_text = text[:start] + literal + text[end:]
+    else:
+        # No flag to overwrite, so one is added. It goes directly beneath `id:`,
+        # at the column the mapping's keys already use: the first key of a
+        # sequence item shares its line with the `- `, so taking the indent from
+        # `id` rather than from that line is what keeps the insert aligned with
+        # its siblings instead of with the dash.
+        if target.flow_style:
+            raise JobEditError(
+                f"{jobs_file}: job {job_id!r} is written in flow style "
+                "({...}) and has no 'enabled' key — add one by hand"
+            )
+        id_key, id_value = _mapping_entry(target, "id")  # type: ignore[misc]
+        indent = " " * id_key.start_mark.column
+        lines = text.splitlines(keepends=True)
+        at = id_value.end_mark.line + 1
+        # A file whose last line has no newline would otherwise get the new key
+        # appended to it.
+        if at > 0 and lines[at - 1] and not lines[at - 1].endswith("\n"):
+            lines[at - 1] += "\n"
+        lines.insert(at, f"{indent}enabled: {literal}\n")
+        new_text = "".join(lines)
+
+    if new_text == text:
+        return False
+
+    _verify_only_enabled_changed(text, new_text, job_id, enabled, jobs_file)
+
+    try:
+        jobs_file.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        raise JobEditError(f"Cannot write {jobs_file}: {e}") from e
+    return True
+
+
+def _verify_only_enabled_changed(
+    before: str, after: str, job_id: str, enabled: bool, jobs_file: Path,
+) -> None:
+    """Refuse an edit that did anything besides set *job_id*'s flag.
+
+    Compares the two documents as data: the target job's ``enabled`` must now be
+    *enabled*, and every other key of every job — including the rest of the
+    target's — must be identical. A span computed from stale offsets, a second
+    job sharing the id, a truncating write: each shows up here as a diff nobody
+    asked for, before the file is touched.
+    """
+    def jobs_of(text: str) -> list[dict]:
+        data = yaml.safe_load(text) or {}
+        raw = data.get("jobs", []) if isinstance(data, dict) else data
+        return [j for j in raw if isinstance(j, dict)] if isinstance(raw, list) else []
+
+    try:
+        old_jobs, new_jobs = jobs_of(before), jobs_of(after)
+    except yaml.YAMLError as e:
+        raise JobEditError(
+            f"{jobs_file}: editing job {job_id!r} would leave unparseable "
+            f"YAML ({e}) — file not written"
+        ) from e
+
+    if len(old_jobs) != len(new_jobs):
+        raise JobEditError(
+            f"{jobs_file}: editing job {job_id!r} changed the job count "
+            f"({len(old_jobs)} → {len(new_jobs)}) — file not written"
+        )
+
+    for old, new in zip(old_jobs, new_jobs):
+        is_target = old.get("id") == job_id
+        if is_target and new.get("enabled") is not enabled:
+            raise JobEditError(
+                f"{jobs_file}: setting job {job_id!r} to enabled={enabled} "
+                f"produced {new.get('enabled')!r} — file not written"
+            )
+        stripped_old = {k: v for k, v in old.items() if k != "enabled"}
+        stripped_new = {k: v for k, v in new.items() if k != "enabled"}
+        if stripped_old != stripped_new or (
+            not is_target and old.get("enabled") != new.get("enabled")
+        ):
+            raise JobEditError(
+                f"{jobs_file}: editing job {job_id!r} would also change job "
+                f"{old.get('id')!r} — file not written"
+            )
+
+
 def save_jobs(jobs: list[CronJob], jobs_file: Path) -> None:
     """Save cron jobs to a YAML file.
 

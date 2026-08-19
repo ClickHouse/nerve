@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone, tzinfo
+from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -21,9 +22,11 @@ from nerve.agent.engine import AgentEngine
 from nerve.config import ConfigError, NerveConfig
 from nerve.cron.jobs import (
     CronJob,
+    JobEditError,
     describe_reserved_job_ids,
     is_reserved_job_id,
     load_jobs,
+    set_job_enabled_in_file,
 )
 from nerve.db import Database
 
@@ -426,6 +429,101 @@ class CronService:
             GATE_REGISTRY.clear()
             GATE_REGISTRY.update(gates_before)
             raise
+
+    def job_source_file(self, job: CronJob) -> Path:
+        """The cron file *job* was loaded from, and the one a toggle writes.
+
+        Follows the merge in :meth:`_load_merged_jobs`: a user job shadowing a
+        system job of the same id is the one that got scheduled, so it is also
+        the one an edit has to land in. Writing the system file there would
+        change the copy that loses and leave the running job as it was.
+        """
+        if job.metadata.get("_source") == "system":
+            return self.config.cron.system_file
+        return self.config.cron.jobs_file
+
+    def toggle_refusal(self, job: CronJob) -> str | None:
+        """Why this job's enabled flag can't be toggled from the API, or ``None``.
+
+        Reported per job by :meth:`list_jobs` so the UI can render the control as
+        unavailable and say why, instead of offering a switch that fails when
+        pressed. Only lockdown refuses today, and it refuses by path: on a
+        migrated install the cron files are inside the reviewed config subtree,
+        where the answer is a reviewed PR rather than a live write.
+        """
+        from nerve.config import tracked_config_write_refusal
+
+        return tracked_config_write_refusal(self.job_source_file(job))
+
+    async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
+        """Persist *job_id*'s enabled flag, then apply it to the scheduler.
+
+        The pair has to be atomic in both directions, because the file is what
+        the next reload and the next restart read, and the scheduler is what
+        actually fires. So the write and the reload happen under the reload lock,
+        and a reload that refuses puts the file back: the alternative is a job
+        the YAML calls disabled that goes on running until something else
+        reloads, which is the one outcome an off switch may not produce.
+
+        A reload can refuse for reasons that have nothing to do with this job —
+        another job's schedule typo, a malformed file — and that is exactly when
+        the rollback earns its place. ``enabled`` is applied by
+        :meth:`_reload_from_disk` like any other field: newly disabled jobs are
+        unscheduled, newly enabled ones are given a trigger.
+
+        Returns this job's resulting state, whether the file needed changing, and
+        the reload summary under ``reload``. Raises ``ValueError`` for an unknown
+        job, :class:`JobEditError` if the file cannot carry the change, and
+        :class:`nerve.config.LockdownError` if it is tracked config.
+        """
+        from nerve.config import ensure_path_not_tracked_config
+
+        job = next((j for j in self._jobs if j.id == job_id), None)
+        if job is None:
+            raise ValueError(f"No such cron job: {job_id!r}")
+
+        target = self.job_source_file(job)
+        ensure_path_not_tracked_config(target, f"toggle cron job {job_id!r} in")
+
+        async with self._reload_lock:
+            try:
+                before = target.read_text(encoding="utf-8")
+            except OSError as e:
+                raise JobEditError(f"Cannot read {target}: {e}") from e
+
+            changed = set_job_enabled_in_file(target, job_id, enabled)
+            try:
+                summary = await self._reload_locked()
+            except BaseException:
+                # BaseException so a cancellation rolls back too — same reason
+                # _reload_locked restores the gate registry on one.
+                if changed:
+                    try:
+                        target.write_text(before, encoding="utf-8")
+                    except OSError:
+                        logger.exception(
+                            "Cron toggle of %s failed and %s could not be "
+                            "restored — the file now says enabled=%s while the "
+                            "scheduler is unchanged",
+                            job_id, target, enabled,
+                        )
+                raise
+
+        logger.info(
+            "Cron job %s %s via API (%s)",
+            job_id, "enabled" if enabled else "disabled",
+            "file updated" if changed else "file already said so",
+        )
+        return {
+            "job_id": job_id,
+            "enabled": enabled,
+            "changed": changed,
+            "file": str(target),
+            # Nested, not spread: reload()'s summary has an "enabled" of its own
+            # and it means the *count* of scheduled jobs. Spread, it would quietly
+            # replace this job's new state with a number.
+            "reload": summary,
+        }
 
     async def _reload_from_disk(
         self, gates_before: dict[str, type["CronGate"]],
@@ -1457,6 +1555,7 @@ class CronService:
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": last_session_id,
+                "toggle_refusal": self.toggle_refusal(job),
             })
 
         # Include source runners
@@ -1475,6 +1574,12 @@ class CronService:
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": None,
+                # A source runner exists because its sync section is configured
+                # and enabled; there is no per-runner flag in the cron files for
+                # a toggle to write.
+                "toggle_refusal": (
+                    "Source runners follow the sync config, not cron YAML"
+                ),
             })
 
         return result

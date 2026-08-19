@@ -1,7 +1,7 @@
 import { Timer } from 'lucide-react';
 import { useCronStore } from '../../stores/cronStore';
 import { chatPath, jobLabel } from './utils';
-import { ChatLink, TriggerButton, JobTypeIcon } from './controls';
+import { ChatLink, EnabledSwitch, TriggerButton, JobTypeIcon } from './controls';
 
 export function CronSidebar({ inDrawer = false, onSelect }: {
   inDrawer?: boolean;
@@ -64,6 +64,20 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
                 {job.enabled && (
                   <span className="opacity-0 group-hover:opacity-100 transition-opacity">
                     <TriggerButton jobId={job.id} small />
+                  </span>
+                )}
+                {/*
+                  Cron jobs only — a source runner has no flag in the cron files,
+                  so all it could show here is a permanently locked switch.
+                  Revealed on hover like the others while the job is on, but kept
+                  visible once it is off: that row is already dimmed, and a
+                  switch you have to hover to find is a poor way back on.
+                */}
+                {job.type === 'cron' && (
+                  <span className={job.enabled
+                    ? 'opacity-0 group-hover:opacity-100 transition-opacity'
+                    : ''}>
+                    <EnabledSwitch job={job} />
                   </span>
                 )}
               </span>
