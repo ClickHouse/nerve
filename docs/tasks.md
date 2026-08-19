@@ -35,6 +35,8 @@ Context and details here...
 
 Generated from date + slugified title: `2026-02-25-fix-auth-token-expiry`
 
+The slug is the title truncated to 40 characters, so two titles that differ only past that cut collide on the same day. `task_create` never writes over an existing task: an ID already held by a task row, or by a file in `active/` or `done/`, is skipped and the new task takes the next free suffix (`2026-02-25-fix-auth-token-expiry-2`). Completed tasks keep their IDs reserved, so a finished task is never resurrected as a new one. Past 99 suffixes on one base the create is refused instead. The response names the ID that was actually claimed — use that one, not an ID derived from the title.
+
 ## Statuses
 
 - `pending` — Not started
@@ -60,7 +62,7 @@ Generated from date + slugified title: `2026-02-25-fix-auth-token-expiry`
 1. **Primary: `source_url` exact match** — If the task has a `source_url` (e.g., a GitHub issue URL), checks for any existing task with the same URL. This is the most reliable dedup for source-generated tasks, since the agent may paraphrase titles differently each time.
 2. **Fallback: Fuzzy FTS5 search** — Uses OR semantics (any word can match) ranked by BM25 relevance. This catches similar tasks even with different wording — e.g., "database backup failed" matches "Fix database backup failure". Stop words and short tokens (≤1 char) are stripped to reduce noise.
 
-If matches are found, the tool returns them and refuses to create — the caller must re-invoke with `confirm_duplicate=true` to override.
+If matches are found, the tool returns them and refuses to create — the caller must re-invoke with `confirm_duplicate=true` to override. Confirming means "create a second task": the new task gets its own ID and file, and never replaces the one it resembles.
 
 ### Search
 
