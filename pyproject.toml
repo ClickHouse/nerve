@@ -3,7 +3,11 @@ name = "nerve"
 version = "0.1.0"
 description = "Personal AI assistant — lightweight, single-process, purpose-built"
 readme = "README.md"
-requires-python = ">=3.12"
+# 3.13, not 3.12: the pinned memu-py==1.4.0 requires >=3.13, so a 3.12 install
+# has never actually been resolvable — `uv pip install -e .` on 3.12 fails
+# outright. This says what was already true, and gives 3.12 users a clear error
+# instead of a confusing transitive dependency conflict.
+requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 
 dependencies = [
@@ -55,7 +59,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Test/dev dependencies. Install with: uv pip install -e ".[test]"
+# Test/dev dependencies. Install with: uv sync --extra test
 # Upper bounds guard CI against surprise major-version breaks (notably the
 # pytest-asyncio 1.x event_loop changes the suite's conftest relies on).
 test = [
@@ -67,7 +71,12 @@ test = [
 nerve = "nerve.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+# Bounded, not bare: uv.lock pins runtime dependencies but build backends are
+# resolved fresh in an isolated build environment on every install, so an
+# unpinned backend is a hole in "reproducible install". A major bound stops the
+# breaking-change class; exact pinning would need --build-constraint, which the
+# plain-pip path wouldn't honour anyway.
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

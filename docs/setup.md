@@ -7,18 +7,23 @@ The fastest way to get Nerve running:
 ```bash
 git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
-pip install -e .       # or: uv pip install -e .
+uv sync                       # creates .venv from uv.lock
+source .venv/bin/activate     # puts `nerve` on PATH
 cd web && npm install && npm run build && cd ..
-nerve init             # Interactive wizard — handles everything
+nerve init                    # Interactive wizard — handles everything
 nerve start
 ```
+
+`uv sync` creates `.venv` but does not activate it, so `nerve` is not on `PATH` until
+you do. If you'd rather not activate, prefix commands with `uv run` instead —
+`uv run nerve init`.
 
 The `nerve init` wizard walks you through deployment, mode selection, API keys, workspace setup, and cron configuration. Nothing is written until you confirm.
 
 ## Prerequisites
 
 ### Server deployment
-- Python 3.12+
+- Python 3.13+
 - Node.js 18+ (for web UI build)
 - Anthropic API key **or** Claude subscription (via CLIProxyAPI proxy)
 
@@ -34,12 +39,9 @@ The `nerve init` wizard walks you through deployment, mode selection, API keys, 
 git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
 
-# Create virtual environment
-uv venv
+# Create .venv and install Nerve at the locked versions
+uv sync
 source .venv/bin/activate
-
-# Install Nerve
-uv pip install -e .
 
 # Build web UI
 cd web && npm install && npm run build && cd ..
@@ -48,13 +50,16 @@ cd web && npm install && npm run build && cd ..
 nerve init
 ```
 
+`uv sync` installs the exact versions in `uv.lock` — see
+[Dependency versions](#dependency-versions) for how that is maintained.
+
 ### Option B: Docker
 
 ```bash
 git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
-pip install -e .   # Needed to run the wizard on the host
-nerve init         # Choose "docker" at the deployment step
+uv sync                    # Needed to run the wizard on the host
+uv run nerve init          # Choose "docker" at the deployment step
 ```
 
 The wizard handles everything: generates Dockerfile + docker-compose.yml, builds the image, starts the container, and continues setup inside it. You never write Docker files manually.
@@ -259,6 +264,116 @@ sudo systemctl start nerve
 sudo systemctl status nerve
 journalctl -u nerve -f
 ```
+
+## Dependency versions
+
+`uv.lock` pins the exact version of every dependency, transitive ones included.
+`uv sync` installs from it, so the same commit resolves to the same versions
+whenever and wherever you install. That is why `uv sync` is the documented install
+rather than `uv pip install -e .`.
+
+Two honest limits on "reproducible": the lock is universal but its entries carry
+platform and Python markers, so different platforms legitimately get different
+*files* for the same pinned versions; and artifacts are not vendored, so an
+air-gapped install still needs a populated uv cache or a local wheelhouse.
+
+```bash
+uv sync                    # runtime dependencies
+uv sync --extra test       # ...plus the test extra
+```
+
+`uv sync` creates and manages `.venv` itself, installs Nerve editable, and
+removes anything not in the lock — so the environment matches the lock exactly
+rather than accumulating leftovers.
+
+> **`uv pip install -e .` does not read `uv.lock`.** uv's pip-compatible layer has
+> no lockfile awareness, so that command resolves against the bounds in
+> `pyproject.toml` and can install different versions. It still works, and it is
+> what you want when deliberately testing against current upstream — but it is not
+> a reproducible install.
+
+### Upgrading an installation that predates the lockfile
+
+`nerve upgrade` runs the updater code that is **already loaded in memory**, then
+pulls. So the first upgrade across the commit that introduced `uv.lock` still uses
+the old, unpinned installer — the lock only takes effect from the *second* upgrade
+onward. Two consequences worth knowing before you run it:
+
+- That first upgrade resolves dependencies fresh, so it can pick up something newer than the lock intends.
+- If you are on Python 3.12, it will **fail after `git pull` has already advanced the checkout**, because the new `pyproject.toml` requires 3.13+. You are left with new source and an old environment.
+
+Either is straightforward to recover from — do the install step yourself, on 3.13+:
+
+```bash
+cd <your nerve checkout>
+uv sync --locked --inexact
+nerve restart
+```
+
+Subsequent `nerve upgrade` runs install from the lock automatically.
+
+### Changing a dependency
+
+Edit `pyproject.toml`, then relock and commit `uv.lock` alongside it:
+
+```bash
+uv lock
+```
+
+CI runs `uv sync --locked`, which fails if `uv.lock` and `pyproject.toml` have
+drifted apart — so a dependency change without a relock is caught rather than
+silently re-resolved.
+
+Relocking preserves existing pins, so it won't sweep in unrelated upgrades. To
+move one deliberately:
+
+```bash
+uv lock --upgrade-package mcp    # one dependency
+uv lock --upgrade                # everything
+```
+
+### How CI enforces this
+
+`ci.yml` installs with `uv sync --locked`, which does two jobs at once:
+
+- A PR is never broken by an upstream release that has nothing to do with it — the versions come from the lock.
+- A dependency change cannot merge without a relock. `--locked` fails if `uv.lock` disagrees with `pyproject.toml` for *any* reason: a dependency added, removed, or simply re-bounded. Since the relock then moves the pins, the versions CI tests are always the ones the change actually selects.
+
+That second property is why no separate unpinned CI job is needed. Widen a bound and
+the lock is invalidated; relock and the pin moves; CI tests the moved pin.
+
+### What is and isn't covered
+
+| Path | Installs from `uv.lock`? |
+|---|---|
+| `uv sync` (quick start, server install, `install.sh`) | yes |
+| `nerve upgrade` | yes — `uv sync --locked --inexact` when a `uv.lock` is present |
+| CI (`ci.yml`) | yes — `uv sync --locked` |
+| Docker | yes — the image installs from the lock at build time and the entrypoint syncs the project |
+| `uv pip install -e .` / plain `pip install -e .` | **no** — resolves from `pyproject.toml` bounds |
+
+Docker keeps its environment at `/opt/nerve-venv`, outside the `/nerve` bind mount,
+because a `.venv` under `/nerve` would be shadowed by the host's checkout (and a
+host-created one may not be Linux-compatible).
+
+> **Existing Docker deployments need one manual step.** `nerve init` does not
+> overwrite Docker files that already exist, so an install generated before this
+> change keeps its old pip-based `Dockerfile` and entrypoint. To pick up the locked
+> build, delete them and regenerate:
+>
+> ```bash
+> rm Dockerfile docker-entrypoint.sh
+> nerve init                       # choose "docker" again; regenerates both
+> docker compose build --no-cache
+> ```
+>
+> Keep `docker-compose.yml` — it is unchanged. Check any local edits you made to
+> the old files before deleting them.
+
+`nerve upgrade` uses `--inexact`, so it won't uninstall optional extras you added
+yourself, and `--frozen`, so it never rewrites `uv.lock` as a side effect of
+upgrading. If uv is missing, or the checkout has no `uv.lock`, it falls back to the
+previous `pip install -e .` behaviour.
 
 ## Troubleshooting
 
