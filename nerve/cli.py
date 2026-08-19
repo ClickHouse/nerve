@@ -655,16 +655,70 @@ def _find_source_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _pip_install_cmd(source_root: Path) -> list[str]:
-    """Return the command to (re)install Nerve from source in the current venv.
+def _dep_install_cmd(source_root: Path) -> tuple[list[str], dict[str, str]]:
+    """Command and env overrides to reinstall Nerve's deps in the current venv.
 
-    Prefers ``uv pip`` when available (faster), falls back to ``python -m pip``.
+    Prefers ``uv sync`` when uv is present and the checkout has a ``uv.lock``,
+    so an upgrade lands on the locked, CI-tested dependency set instead of
+    re-resolving against pyproject's bounds. That re-resolution is what made
+    ``nerve upgrade`` able to reintroduce a broken release even after one had
+    been diagnosed. Falls back to ``uv pip install -e .``, then
+    ``python -m pip install -e .``.
+
+    Returns ``(argv, extra_env)``; ``extra_env`` is empty for the fallbacks.
     """
     uv_bin = shutil.which("uv")
+    # A venv is required for the uv sync path: UV_PROJECT_ENVIRONMENT below
+    # points uv at sys.prefix, which is only a private environment when we're
+    # inside one. Pointing it at a system prefix would be actively harmful.
+    in_venv = sys.prefix != sys.base_prefix
+
+    if uv_bin and in_venv and (source_root / "uv.lock").exists():
+        return (
+            [
+                uv_bin, "sync",
+                # Locate the project regardless of cwd.
+                "--project", str(source_root),
+                # Install what uv.lock says, and refuse if the lock no longer
+                # matches pyproject.toml. `--locked` is the right assertion here
+                # rather than `--frozen`: both avoid rewriting the lock, but
+                # --frozen skips the freshness check entirely, so a checkout
+                # whose pyproject has drifted would be upgraded to a lock that
+                # doesn't describe it — silently. Failing tells the user their
+                # tree is inconsistent, which is information they need.
+                "--locked",
+                # Do NOT remove packages absent from the lock. `uv sync` is
+                # exact by default, which would silently uninstall optional
+                # extras the user chose to add — a regression against the
+                # purely additive `pip install -e .` this replaces.
+                "--inexact",
+            ],
+            # Target the venv Nerve is actually installed in. Without this uv
+            # syncs `<project>/.venv`, which needn't be the same directory, and
+            # VIRTUAL_ENV is unset when the binary is invoked directly
+            # (`.venv/bin/nerve upgrade`) rather than after activation.
+            {"UV_PROJECT_ENVIRONMENT": sys.prefix},
+        )
+    # Fallbacks resolve from pyproject's bounds, NOT the lock, so the upgrade is
+    # not reproducible. That is still better than refusing to upgrade at all —
+    # installs predating the lockfile, and any non-uv environment, depend on
+    # these paths — but it is worth saying out loud rather than degrading
+    # quietly, since an unpinned upgrade is exactly how #316 kept resurfacing.
+    if (source_root / "uv.lock").exists():
+        reason = "uv is not installed" if not uv_bin else "not running inside a virtualenv"
+        click.secho(
+            f"  warning: {reason}, so dependencies will be resolved fresh instead of "
+            f"from uv.lock. This upgrade is not reproducible.",
+            fg="yellow",
+        )
+
     if uv_bin:
         # ``uv pip`` targets the active venv via ``VIRTUAL_ENV`` / ``sys.executable``
-        return [uv_bin, "pip", "install", "-e", str(source_root), "--python", sys.executable]
-    return [sys.executable, "-m", "pip", "install", "-e", str(source_root)]
+        return (
+            [uv_bin, "pip", "install", "-e", str(source_root), "--python", sys.executable],
+            {},
+        )
+    return ([sys.executable, "-m", "pip", "install", "-e", str(source_root)], {})
 
 
 @main.command()
@@ -720,9 +774,10 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
     if no_deps:
         click.echo("\n[2/3] Skipping Python dependency install (--no-deps)")
     else:
-        cmd = _pip_install_cmd(source_root)
+        cmd, extra_env = _dep_install_cmd(source_root)
         click.echo(f"\n[2/3] Installing Python dependencies: {' '.join(cmd)}")
-        rc = subprocess.run(cmd, cwd=source_root).returncode
+        env = {**os.environ, **extra_env} if extra_env else None
+        rc = subprocess.run(cmd, cwd=source_root, env=env).returncode
         if rc != 0:
             raise click.ClickException("Python dependency install failed")
 

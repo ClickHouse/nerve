@@ -17,7 +17,10 @@ set -euo pipefail
 NERVE_REPO="https://github.com/ClickHouse/nerve.git"
 NERVE_BRANCH="${NERVE_BRANCH:-main}"
 INSTALL_DIR="${NERVE_INSTALL_DIR:-$HOME/nerve}"
-MIN_PYTHON_MINOR=12
+# 13, not 12: pyproject's requires-python is >=3.13 (set by memu-py==1.4.0).
+# Accepting 3.12 here meant the installer would provision a Python that then
+# failed at `uv pip install -e .` with an opaque dependency conflict.
+MIN_PYTHON_MINOR=13
 PREFERRED_PYTHON_MINOR=13
 # Vite 7 (see web/package.json) requires Node 20.19+ or 22.12+.
 MIN_NODE_VERSION="20.19.0"
@@ -53,7 +56,7 @@ confirm() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Compare versions: version_ge "3.13" "3.12" → true
+# Compare versions: version_ge "3.13" "3.13" → true
 version_ge() {
     local a="$1" b="$2"
     [ "$(printf '%s\n%s' "$a" "$b" | sort -V | head -n1)" = "$b" ]
@@ -194,11 +197,11 @@ ensure_uv() {
     success "uv $(uv --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 }
 
-# --- Dependency: Python 3.12+ ---
+# --- Dependency: Python 3.13+ ---
 
 ensure_python() {
-    # Check for existing Python >= 3.12
-    for candidate in python3.13 python3.12 python3; do
+    # Check for an existing Python >= 3.$MIN_PYTHON_MINOR
+    for candidate in python3.13 python3; do
         if command_exists "$candidate"; then
             local ver
             ver="$(get_python_version "$candidate")"
@@ -220,7 +223,7 @@ ensure_python() {
         fi
     fi
 
-    # Fallback: try 3.12
+    # Fallback: retry the minimum supported minor
     if uv python install "3.$MIN_PYTHON_MINOR" 2>/dev/null; then
         PYTHON_CMD="$(uv python find "3.$MIN_PYTHON_MINOR" 2>/dev/null || echo "")"
         if [ -n "$PYTHON_CMD" ]; then
@@ -234,7 +237,7 @@ ensure_python() {
 
     if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
         error "Cannot install Python: no sudo and uv python install failed."
-        error "Install Python 3.12+ manually and re-run."
+        error "Install Python 3.13+ manually and re-run."
         exit 1
     fi
 
@@ -268,17 +271,29 @@ ensure_python() {
             ;;
         *)
             error "Don't know how to install Python on $DISTRO."
-            error "Install Python 3.12+ manually and re-run."
+            error "Install Python 3.13+ manually and re-run."
             exit 1
             ;;
     esac
 
     if [ -z "${PYTHON_CMD:-}" ] || ! command_exists "$PYTHON_CMD"; then
-        error "Failed to install Python. Install Python 3.12+ manually and re-run."
+        error "Failed to install Python. Install Python 3.13+ manually and re-run."
         exit 1
     fi
 
-    success "Python $(get_python_version "$PYTHON_CMD") installed via system packages"
+    # Existence alone isn't enough. The fallback chains above can settle on an
+    # older interpreter (dnf/zypper try python3.13, then python3.12, then plain
+    # python3), and an interpreter below the floor fails much later at
+    # `uv pip install -e .` with an opaque transitive dependency conflict.
+    # Fail here, where the cause is obvious, instead.
+    installed_py_ver="$(get_python_version "$PYTHON_CMD")"
+    if ! version_ge "$installed_py_ver" "3.$MIN_PYTHON_MINOR"; then
+        error "Installed Python $installed_py_ver is below the required 3.$MIN_PYTHON_MINOR."
+        error "Install Python 3.$MIN_PYTHON_MINOR+ manually and re-run."
+        exit 1
+    fi
+
+    success "Python $installed_py_ver installed via system packages"
 }
 
 # --- Dependency: Node.js 18+ ---
@@ -389,17 +404,20 @@ setup_python_env() {
 
     cd "$INSTALL_DIR" || exit 1
 
-    if [ ! -d ".venv" ]; then
-        info "Creating virtualenv..."
-        uv venv --python "3.$PREFERRED_PYTHON_MINOR" 2>/dev/null \
-            || uv venv --python "3.$MIN_PYTHON_MINOR" 2>/dev/null \
-            || uv venv
-    else
-        info "Using existing virtualenv"
-    fi
-
-    info "Installing dependencies..."
-    uv pip install -e . --quiet
+    # `uv sync` creates and manages .venv itself, so there's no separate venv
+    # step: it installs the exact versions in uv.lock and Nerve editable.
+    # Locked rather than re-resolved, so a fresh install gets the dependency set
+    # that CI actually tested.
+    # --locked: install the committed lock, and fail rather than silently
+    #   re-resolving and rewriting uv.lock in the user's checkout.
+    # --inexact: this script doubles as an upgrade path for an existing install,
+    #   and `uv sync` is exact by default — without this, rerunning it would
+    #   uninstall anything the user added on top (optional extras, local tools).
+    info "Installing dependencies from uv.lock..."
+    local sync_flags=(--locked --inexact --quiet)
+    uv sync "${sync_flags[@]}" --python "3.$PREFERRED_PYTHON_MINOR" 2>/dev/null \
+        || uv sync "${sync_flags[@]}" --python "3.$MIN_PYTHON_MINOR" 2>/dev/null \
+        || uv sync "${sync_flags[@]}"
     success "Python environment ready"
 }
 

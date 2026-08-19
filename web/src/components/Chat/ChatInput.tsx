@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from 'lucide-react';
+import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
+import { findSessionById } from '../../utils/findSession';
 import { PromptRewriteCard } from './PromptRewriteCard';
 import { BackendSelector } from './BackendSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
@@ -114,9 +115,13 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const backendDefault = useChatStore(s => s.backendDefault);
   const chosenBackend = newChatBackend ?? backendDefault;
   const sessions = useChatStore(s => s.sessions);
+  const archivedSessions = useChatStore(s => s.archivedSessions);
+  const systemSessions = useChatStore(s => s.systemSessions);
+  // The active session row may live in the feed or a lazy archived/system group.
+  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
   const activeBackend = isVirtualChat
     ? (chosenBackend ?? 'claude')
-    : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
+    : (activeSessionRow?.backend ?? 'claude');
 
   // ── Model picker (per-chat) ──
   // A virtual chat's pick lives in newChatModels until the session is
@@ -132,7 +137,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const modelsDefault = modelDefaults[activeBackend] ?? null;
   const currentModel = isVirtualChat
     ? (newChatModels[activeBackend] ?? modelsDefault)
-    : (sessions.find(s => s.id === activeSession)?.model ?? modelsDefault);
+    : (activeSessionRow?.model ?? modelsDefault);
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -689,6 +694,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               only this chat: virtual chats bind it at creation, real
               sessions PATCH their own row — never a global preference. */}
           {scopedModels.length > 1 && (
+            <div className="relative shrink-0">
             <select
               value={currentModel ?? ''}
               onChange={(e) => {
@@ -701,7 +707,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               }}
               disabled={disabled || isStreaming || rewriteActive}
               title="Model for this chat (other chats keep theirs)"
-              className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
+              className="appearance-none h-10 max-w-[170px] w-full pl-2.5 pr-8 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer disabled:opacity-30 truncate"
             >
               {/* A session may run on a model the picker no longer offers
                   (retired id, uninstalled Ollama model) — keep it visible
@@ -731,6 +737,11 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
                 </optgroup>
               )}
             </select>
+            <ChevronDown
+              size={16}
+              className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-text-muted"
+            />
+            </div>
           )}
 
           <input

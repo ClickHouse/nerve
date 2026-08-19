@@ -1281,6 +1281,7 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.interactive_archive_after_hours` | int | `0` | Auto-close interactive (web/telegram/…) sessions after this many idle hours (`0` = disabled; opt-in). Cron/persistent sessions are unaffected. |
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
+| `sessions.sidebar_page_size` | int | `50` | Rows per sidebar request: caps the conversation feed and sizes one lazy Archived/System page. `0` = unlimited (a group loads in a single request). Starred sessions are exempt and always returned in full. |
 
 **Starred sessions are exempt from all auto-archival.** A session starred via
 the star toggle (web sidebar, or the Telegram `/sessions` list / `/star`) is

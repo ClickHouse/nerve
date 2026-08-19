@@ -154,17 +154,44 @@ async def _attach_review_loops(deps, sessions: list[dict]) -> None:
             s["review_loop"] = _loop_summary(lp)
 
 
-@router.get("/api/sessions")
-async def list_sessions(user: dict = Depends(require_auth)):
-    deps = get_deps()
-    sessions = await deps.engine.sessions.list_sessions()
+def _page_size() -> int | None:
+    """Sidebar page size from config; ``None`` when configured unlimited."""
+    size = get_config().sessions.sidebar_page_size
+    return size if size and size > 0 else None
+
+
+async def _decorate(deps, sessions: list[dict]) -> list[dict]:
+    """Attach the live per-row bits every sidebar list needs."""
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
     await _attach_review_loops(deps, sessions)
-    return {"sessions": sessions}
+    return sessions
+
+
+def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> dict:
+    """``has_more``/``next_offset`` for the client's '...' control."""
+    seen = offset + len(page)
+    return {"has_more": limit is not None and seen < total, "next_offset": seen}
+
+
+@router.get("/api/sessions")
+async def list_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_conversation_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_conversation_sessions()
+    sessions = page if offset else await deps.engine.sessions.list_starred_sessions() + page
+    await _decorate(deps, sessions)
+    return {
+        "sessions": sessions,
+        "archived_count": await deps.engine.sessions.count_archived_sessions(),
+        "system_count": await deps.engine.sessions.count_system_sessions(),
+        **_page_meta(page, offset, total, limit),
+    }
 
 
 @router.get("/api/sessions/search")
@@ -181,6 +208,28 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
         s["awaiting_input"] = s["id"] in awaiting_ids
     await _attach_review_loops(deps, sessions)
     return {"sessions": sessions}
+
+
+@router.get("/api/sessions/archived")
+async def list_archived_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """One page of archived sessions — fetched only when the group is expanded."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_archived_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_archived_sessions()
+    await _decorate(deps, page)
+    return {"sessions": page, **_page_meta(page, offset, total, limit)}
+
+
+@router.get("/api/sessions/system")
+async def list_system_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """One page of system (cron/hook) sessions — fetched only when expanded."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_system_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_system_sessions()
+    await _decorate(deps, page)
+    return {"sessions": page, **_page_meta(page, offset, total, limit)}
 
 
 @router.post("/api/sessions")
@@ -317,9 +366,33 @@ async def get_messages(session_id: str, limit: int = 500, user: dict = Depends(r
     return {"messages": messages, "last_usage": last_usage}
 
 
+async def _would_create_cycle(db, child_id: str, new_parent_id: str) -> bool:
+    """True if making ``child_id`` a child of ``new_parent_id`` forms a loop.
+
+    Walks up the ancestor chain from the proposed parent; reaching ``child_id``
+    means the drop would nest a session under its own descendant. The seen-set
+    also breaks any pre-existing cycle so the walk always terminates.
+    """
+    seen: set[str] = set()
+    cursor: str | None = new_parent_id
+    while cursor:
+        if cursor == child_id:
+            return True
+        if cursor in seen:
+            break
+        seen.add(cursor)
+        row = await db.get_session(cursor)
+        cursor = row.get("parent_session_id") if row else None
+    return False
+
+
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
-    """Update session fields (title, starred, model).
+    """Update session fields (title, starred, model, parent_session_id).
+
+    ``parent_session_id`` is the sidebar drag-to-nest relationship (null clears
+    it → top-level). It is display-only: guarded against self/cycle links and
+    against the ``created`` fork window so a drag never alters execution.
 
     ``model`` re-points THIS session only — the composer's picker is
     per-chat, not a global preference. The engine re-reads the session
@@ -355,9 +428,37 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
             except BackendError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
         fields["model"] = requested_model
+    if "parent_session_id" in req:
+        raw = req["parent_session_id"]
+        new_parent = str(raw).strip() if raw not in (None, "") else None
+        if new_parent is not None:
+            if new_parent == session_id:
+                raise HTTPException(status_code=400, detail="A session cannot be its own parent")
+            if not await deps.db.get_session(new_parent):
+                raise HTTPException(status_code=404, detail="Parent session not found")
+            # Fork-window guard: the engine reads parent_session_id to fork a
+            # brand-new session's first turn ONLY while status == 'created'.
+            # Refuse to set a parent in that window so a display drag can never
+            # turn a not-yet-started session into a fork. Anything already run
+            # (everything draggable in the sidebar) is unaffected.
+            if session.get("status") == "created":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Send a first message before nesting this session",
+                )
+            if await _would_create_cycle(deps.db, session_id, new_parent):
+                raise HTTPException(status_code=400, detail="That drop would create a cycle")
+        fields["parent_session_id"] = new_parent
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
+    # Starring an archived session restores it via the shared unarchive path (logs "unarchived", bumps updated_at) before the star write, so the star->project hook fires on a live session.
+    if fields.get("starred") == 1 and session.get("status") == "archived":
+        if deps.engine:
+            await deps.engine.sessions.unarchive_session(session_id)
+        else:
+            fields["status"] = "idle"
+            fields["archived_at"] = None
     await deps.db.update_session_fields(session_id, fields)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
@@ -591,10 +692,31 @@ async def resume_session(session_id: str, user: dict = Depends(require_auth)):
 
 @router.post("/api/sessions/{session_id}/archive")
 async def archive_session(session_id: str, user: dict = Depends(require_auth)):
-    """Archive a session (soft delete)."""
+    """Archive a session and its entire descendant subtree (soft delete).
+
+    Cascade is the default: children, grandchildren and deeper are archived
+    bottom-up. Returns a structured report of which session ids were archived
+    vs skipped (with reasons) so a still-running descendant never silently
+    leaves an archived-parent-with-active-child orphan.
+    """
     deps = get_deps()
-    await deps.engine.sessions.archive_session(session_id)
-    return {"archived": True}
+    result = await deps.engine.sessions.archive_session_cascade(session_id)
+    return {
+        "archived": True,
+        "archived_ids": result["archived"],
+        "skipped": result["skipped"],
+    }
+
+
+@router.post("/api/sessions/{session_id}/unarchive")
+async def unarchive_session(session_id: str, user: dict = Depends(require_auth)):
+    """Restore an archived session (Archived group → Unarchive / Star)."""
+    deps = get_deps()
+    try:
+        await deps.engine.sessions.unarchive_session(session_id)
+        return {"unarchived": True}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/api/sessions/{session_id}/events")

@@ -443,6 +443,179 @@ class TestArchiveAndCleanup:
         assert session["status"] == "archived"
         assert session["archived_at"] is not None
 
+    async def test_unarchive_session(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("unarch-1")
+        await sm.archive_session("unarch-1")
+        await sm.unarchive_session("unarch-1")
+        session = await db.get_session("unarch-1")
+        assert session["status"] == "idle"
+        assert session["archived_at"] is None
+
+    async def test_unarchive_logs_event(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("unarch-ev")
+        await sm.archive_session("unarch-ev")
+        await sm.unarchive_session("unarch-ev")
+        events = await db.get_session_events("unarch-ev")
+        assert any(e["event_type"] == "unarchived" for e in events)
+
+    async def test_unarchive_refreshes_updated_at(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("unarch-ts")
+        old = "2000-01-01T00:00:00+00:00"
+        await db._write("UPDATE sessions SET updated_at = ? WHERE id = ?", (old, "unarch-ts"))
+        await sm.archive_session("unarch-ts")
+        await db._write("UPDATE sessions SET updated_at = ? WHERE id = ?", (old, "unarch-ts"))
+        await sm.unarchive_session("unarch-ts")
+        session = await db.get_session("unarch-ts")
+        assert session["updated_at"] > old
+
+    async def test_unarchive_missing_raises(self, sm: SessionManager):
+        with pytest.raises(ValueError):
+            await sm.unarchive_session("does-not-exist")
+
+    async def test_list_archived_only_archived(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("keep-live")
+        await db.update_session_fields("keep-live", {"status": "idle"})
+        await sm.get_or_create("arch-listed")
+        await sm.archive_session("arch-listed")
+        archived_ids = {s["id"] for s in await sm.list_archived_sessions()}
+        assert "arch-listed" in archived_ids
+        assert "keep-live" not in archived_ids
+        # The default sidebar feed (list_sessions) must still exclude archived.
+        live_ids = {s["id"] for s in await sm.list_sessions()}
+        assert "arch-listed" not in live_ids
+
+    async def test_count_archived_sessions(self, sm: SessionManager):
+        assert await sm.count_archived_sessions() == 0
+        await sm.get_or_create("cnt-1")
+        await sm.archive_session("cnt-1")
+        await sm.get_or_create("cnt-2")
+        await sm.archive_session("cnt-2")
+        assert await sm.count_archived_sessions() == 2
+
+    async def test_archived_excludes_system_sources(self, sm: SessionManager):
+        """Archived group holds conversations only; archived cron/hook excluded."""
+        await sm.get_or_create("arch-web", source="web")
+        await sm.archive_session("arch-web")
+        await sm.get_or_create("arch-cron", source="cron")
+        await sm.archive_session("arch-cron")
+        ids = {s["id"] for s in await sm.list_archived_sessions()}
+        assert "arch-web" in ids
+        assert "arch-cron" not in ids
+        assert await sm.count_archived_sessions() == 1
+
+    async def test_star_archived_field_write_restores(self, sm: SessionManager, db: Database):
+        """The update_session route composites star+unarchive; verify the write restores the row to a live, starred state."""
+        await sm.get_or_create("star-arch")
+        await sm.archive_session("star-arch")
+        await db.update_session_fields(
+            "star-arch", {"starred": 1, "status": "idle", "archived_at": None},
+        )
+        session = await db.get_session("star-arch")
+        assert session["starred"] == 1
+        assert session["status"] == "idle"
+        assert session["archived_at"] is None
+
+    async def test_feed_excludes_system_and_archived(self, sm: SessionManager):
+        await sm.get_or_create("feed-web", source="web")
+        await sm.get_or_create("feed-cron", source="cron")
+        await sm.get_or_create("feed-arch", source="web")
+        await sm.archive_session("feed-arch")
+        ids = {s["id"] for s in await sm.list_conversation_sessions()}
+        assert "feed-web" in ids
+        assert "feed-cron" not in ids   # system source excluded from the feed
+        assert "feed-arch" not in ids   # archived excluded
+
+    async def test_feed_keeps_unknown_sources(self, sm: SessionManager):
+        """Sources split by exclusion: anything not cron/hook is a conversation, so a new source can never render nowhere."""
+        await sm.get_or_create("feed-workflow", source="workflow")
+        await sm.get_or_create("feed-external", source="external")
+        ids = {s["id"] for s in await sm.list_conversation_sessions()}
+        assert {"feed-workflow", "feed-external"} <= ids
+
+    async def test_feed_is_unbounded_by_default(self, sm: SessionManager):
+        # Regression: the old sidebar feed capped non-starred sessions at 50.
+        for i in range(55):
+            await sm.get_or_create(f"many-{i}", source="web")
+        feed = await sm.list_conversation_sessions()
+        assert len([s for s in feed if s["id"].startswith("many-")]) == 55
+
+    async def test_feed_page_window_ignores_system(self, sm: SessionManager):
+        """The window applies AFTER system rows are excluded, so cron churn can never displace conversations."""
+        for i in range(6):
+            await sm.get_or_create(f"chat-{i}", source="web")
+        for i in range(30):                      # cron churn arrives afterwards
+            await sm.get_or_create(f"cronrun-{i}", source="cron")
+        await sm.get_or_create("late-chat", source="web")
+        page = await sm.list_conversation_sessions(limit=5)
+        assert len(page) == 5                    # 5 conversations, not 5 rows of cron
+        assert all(s["source"] == "web" for s in page)
+        assert "late-chat" in {s["id"] for s in page}
+
+    async def test_feed_pages_do_not_overlap(self, sm: SessionManager):
+        for i in range(12):
+            await sm.get_or_create(f"page-{i:02d}", source="web")
+        first = await sm.list_conversation_sessions(limit=5, offset=0)
+        second = await sm.list_conversation_sessions(limit=5, offset=5)
+        rest = await sm.list_conversation_sessions(limit=5, offset=10)
+        assert len(first) == len(second) == 5
+        assert len(rest) == 2
+        ids = [s["id"] for s in first + second + rest]
+        assert len(set(ids)) == 12                      # no overlap, no gaps
+        assert await sm.count_conversation_sessions() == 12
+
+    async def test_starred_never_truncated(self, sm: SessionManager, db: Database):
+        """Starred rows are off-budget: excluded from the page window and returned in full however small the page size is."""
+        for i in range(8):
+            await sm.get_or_create(f"star-{i}", source="web")
+            await db.update_session_fields(f"star-{i}", {"starred": 1})
+        for i in range(4):
+            await sm.get_or_create(f"plain-{i}", source="web")
+        assert len(await sm.list_starred_sessions()) == 8
+        page = await sm.list_conversation_sessions(limit=2)
+        assert len(page) == 2
+        assert all(s["starred"] == 0 for s in page)     # starred don't eat the window
+        assert await sm.count_conversation_sessions() == 4
+
+    async def test_starred_system_session_is_pinned_not_hidden(
+        self, sm: SessionManager, db: Database,
+    ):
+        """Starring a cron session pins it in the feed and drops it from the System page, so every session shows in exactly one place."""
+        await sm.get_or_create("star-cron", source="cron")
+        await db.update_session_fields("star-cron", {"starred": 1})
+        assert "star-cron" in {s["id"] for s in await sm.list_starred_sessions()}
+        assert "star-cron" not in {s["id"] for s in await sm.list_system_sessions()}
+        assert await sm.count_system_sessions() == 0
+
+    async def test_system_and_archived_paginate(self, sm: SessionManager):
+        for i in range(7):
+            await sm.get_or_create(f"psys-{i}", source="cron")
+        for i in range(6):
+            await sm.get_or_create(f"parch-{i}", source="web")
+            await sm.archive_session(f"parch-{i}")
+        assert len(await sm.list_system_sessions(limit=3)) == 3
+        assert len(await sm.list_system_sessions(limit=3, offset=6)) == 1
+        assert await sm.count_system_sessions() == 7
+        assert len(await sm.list_archived_sessions(limit=4)) == 4
+        assert len(await sm.list_archived_sessions(limit=4, offset=4)) == 2
+        assert await sm.count_archived_sessions() == 6
+
+    async def test_list_system_only_system(self, sm: SessionManager):
+        await sm.get_or_create("sys-cron", source="cron")
+        await sm.get_or_create("sys-hook", source="hook")
+        await sm.get_or_create("sys-web", source="web")
+        ids = {s["id"] for s in await sm.list_system_sessions()}
+        assert {"sys-cron", "sys-hook"} <= ids
+        assert "sys-web" not in ids
+
+    async def test_count_system_sessions(self, sm: SessionManager):
+        assert await sm.count_system_sessions() == 0
+        await sm.get_or_create("c-cron", source="cron")
+        await sm.get_or_create("c-hook", source="hook")
+        await sm.get_or_create("c-web", source="web")
+        await sm.get_or_create("c-arch", source="cron")
+        await sm.archive_session("c-arch")
+        assert await sm.count_system_sessions() == 2   # archived cron excluded
+
     async def test_archive_disconnects_client(self, sm: SessionManager):
         await sm.get_or_create("arch-2")
         # Simulate a client
@@ -753,6 +926,133 @@ class TestRegisterTaskRaceCondition:
         assert "RACE_BUG" not in call_log
         assert "run_started" in call_log
         assert "run_finished" in call_log
+
+
+@pytest.mark.asyncio
+class TestUnarchiveRoute:
+    """HTTP contract for POST /api/sessions/{id}/unarchive."""
+
+    @pytest_asyncio.fixture
+    async def setup(self, db: Database):
+        from types import SimpleNamespace
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import nerve.config as cfg_mod
+        from nerve.config import NerveConfig
+        from nerve.gateway.routes._deps import init_deps
+        from nerve.gateway.routes.sessions import router as sessions_router
+
+        cfg = NerveConfig()
+        cfg.auth.jwt_secret = ""      # require_auth becomes a no-op
+        cfg_mod._config = cfg
+
+        sm = SessionManager(db)
+        engine = SimpleNamespace(config=cfg, sessions=sm)
+        init_deps(engine=engine, db=db)  # type: ignore[arg-type]
+
+        app = FastAPI()
+        app.include_router(sessions_router)
+        yield SimpleNamespace(client=TestClient(app), db=db, sm=sm, cfg=cfg)
+
+        cfg_mod._config = None
+
+    async def test_unarchive_nonexistent_returns_404(self, setup):
+        resp = setup.client.post("/api/sessions/does-not-exist/unarchive")
+        assert resp.status_code == 404
+
+    async def test_star_archived_restores_via_shared_path(self, setup):
+        await setup.sm.get_or_create("star-arch")
+        await setup.sm.archive_session("star-arch")
+        resp = setup.client.patch("/api/sessions/star-arch", json={"starred": True})
+        assert resp.status_code == 200
+        session = await setup.db.get_session("star-arch")
+        assert session["status"] == "idle"
+        assert session["starred"] == 1
+        assert session["archived_at"] is None
+        events = await setup.db.get_session_events("star-arch")
+        assert any(e["event_type"] == "unarchived" for e in events)
+
+
+@pytest.mark.asyncio
+class TestArchiveCascade:
+    """Archiving a session cascades to its whole descendant subtree."""
+
+    async def _tree(self, db: Database):
+        """Build root -> {a -> a1, b} (a1 is a grandchild)."""
+        await db.create_session("root", source="web")
+        await db.create_session("a", source="web", parent_session_id="root")
+        await db.create_session("b", source="web", parent_session_id="root")
+        await db.create_session("a1", source="web", parent_session_id="a")
+
+    async def _status(self, db: Database, sid: str) -> str:
+        return (await db.get_session(sid))["status"]
+
+    async def test_multilevel_tree_archived_wholesale(
+        self, sm: SessionManager, db: Database,
+    ):
+        await self._tree(db)
+        result = await sm.archive_session_cascade("root")
+
+        # Every node in the subtree is archived.
+        for sid in ("root", "a", "b", "a1"):
+            assert await self._status(db, sid) == SessionStatus.ARCHIVED.value
+        assert set(result["archived"]) == {"root", "a", "b", "a1"}
+        assert result["skipped"] == []
+
+    async def test_bottom_up_order_children_before_parents(
+        self, sm: SessionManager, db: Database,
+    ):
+        await self._tree(db)
+        result = await sm.archive_session_cascade("root")
+        order = result["archived"]
+        # Deepest descendants archived before their ancestors; target last.
+        assert order.index("a1") < order.index("a")
+        assert order.index("a") < order.index("root")
+        assert order.index("b") < order.index("root")
+        assert order[-1] == "root"
+
+    async def test_partial_failure_no_orphaned_archived_parent(
+        self, sm: SessionManager, db: Database,
+    ):
+        """A running grandchild blocks itself AND its un-archived ancestors,
+        while the fully-archivable sibling subtree still completes."""
+        await self._tree(db)
+        sm.mark_running("a1")  # deepest node cannot be archived
+
+        result = await sm.archive_session_cascade("root")
+
+        # a1 running -> skipped; its ancestors a and root left active (no orphan).
+        assert await self._status(db, "a1") != SessionStatus.ARCHIVED.value
+        assert await self._status(db, "a") != SessionStatus.ARCHIVED.value
+        assert await self._status(db, "root") != SessionStatus.ARCHIVED.value
+        # Sibling subtree b has no blocked descendant -> still archived.
+        assert await self._status(db, "b") == SessionStatus.ARCHIVED.value
+
+        assert "b" in result["archived"]
+        assert {"root", "a", "a1"}.isdisjoint(result["archived"])
+        skipped_ids = {s["id"] for s in result["skipped"]}
+        assert {"root", "a", "a1"} == skipped_ids
+        # No archived session retains an active (non-archived) descendant.
+        for sid in result["archived"]:
+            for child in await db.list_child_sessions(sid):
+                assert child["status"] == SessionStatus.ARCHIVED.value
+
+    async def test_cycle_guard_terminates(self, sm: SessionManager, db: Database):
+        """A malformed parent cycle must not hang the descendant walk.
+
+        The seen-set guarantees termination; every node is accounted for in
+        the structured result (archived or skipped), and the call returns.
+        """
+        await db.create_session("c1", source="web")
+        await db.create_session("c2", source="web", parent_session_id="c1")
+        # Force a cycle: c1's parent points back at its own child c2.
+        await db.update_session_fields("c1", {"parent_session_id": "c2"})
+
+        result = await asyncio.wait_for(sm.archive_session_cascade("c1"), timeout=5)
+        accounted = set(result["archived"]) | {s["id"] for s in result["skipped"]}
+        assert {"c1", "c2"} == accounted
 
 
 class MockClient:

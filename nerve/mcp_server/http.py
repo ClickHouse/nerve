@@ -29,7 +29,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Callable
 
-from mcp.server.lowlevel.server import request_ctx
+from mcp.server.context import ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
@@ -71,22 +71,28 @@ async def _send_status(send: Send, status: int, message: str) -> None:
     await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
-def _resolve_client_info() -> tuple[str | None, str | None, str | None]:
-    """Read client metadata from the active MCP request context.
+def _resolve_client_info(
+    rctx: ServerRequestContext | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Read client metadata from the supplied MCP request context.
 
     Returns ``(client_name, mcp_session_id, request_path)`` — any field
     may be ``None`` if the corresponding data isn't available (e.g.
     during the very first ``initialize`` call the session may not yet
     have ``client_params``).
+
+    mcp 2.x hands the request context to handlers as an argument rather
+    than exposing it through a contextvar, so callers thread it down from
+    the handler. ``None`` is accepted for callers with no live request.
     """
-    try:
-        rctx = request_ctx.get()
-    except LookupError:
+    if rctx is None:
         return None, None, None
 
     client_name: str | None = None
     if rctx.session and rctx.session.client_params:
-        info = rctx.session.client_params.clientInfo
+        # mcp 2.x exposes the model fields as snake_case in Python; the wire
+        # form is still camelCase (`clientInfo`) via the alias generator.
+        info = rctx.session.client_params.client_info
         if info is not None:
             client_name = info.name
 
@@ -105,6 +111,7 @@ def _resolve_client_info() -> tuple[str | None, str | None, str | None]:
 
 def _bound_identity_from_request(
     config: "NerveConfig",
+    rctx: ServerRequestContext | None,
 ) -> tuple[str | None, dict[str, str]]:
     """Session id bound into the request's bearer token, if any.
 
@@ -120,9 +127,7 @@ def _bound_identity_from_request(
     """
     if not config.auth.jwt_secret:
         return None, {}
-    try:
-        rctx = request_ctx.get()
-    except LookupError:
+    if rctx is None:
         return None, {}
     request = getattr(rctx, "request", None)
     if request is None:
@@ -150,28 +155,34 @@ def _bound_identity_from_request(
     return bound_session_id(payload), runtime
 
 
-def _bound_session_from_request(config: "NerveConfig") -> str | None:
+def _bound_session_from_request(
+    config: "NerveConfig",
+    rctx: ServerRequestContext | None,
+) -> str | None:
     """Backward-compatible session-only view used by tests/callers."""
-    return _bound_identity_from_request(config)[0]
+    return _bound_identity_from_request(config, rctx)[0]
 
 
 def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver):
     """Build the per-call_tool ``ToolContext`` resolver closure.
 
-    The Server's ``call_tool`` handler invokes this for every tool call
-    to attribute the call to the correct session: a session-bound token
-    (backend-managed agents) binds directly to its engine session;
-    everything else goes through satellite attribution. Per-call
+    The Server's ``call_tool`` handler invokes this for every tool call,
+    passing the request's ``ServerRequestContext``, to attribute the call
+    to the correct session: a session-bound token (backend-managed
+    agents) binds directly to its engine session; everything else goes
+    through satellite attribution. Per-call
     resolution is cheap (the satellite session id is deterministic and
     the underlying ``get_session`` / ``create_session`` check is O(1)
     on the indexed primary key).
     """
 
-    async def _resolve() -> ToolContext:
-        session_id, runtime_metadata = _bound_identity_from_request(engine.config)
+    async def _resolve(rctx: ServerRequestContext | None = None) -> ToolContext:
+        session_id, runtime_metadata = _bound_identity_from_request(
+            engine.config, rctx
+        )
 
         if session_id is None:
-            client_name, mcp_session_id, _ = _resolve_client_info()
+            client_name, mcp_session_id, _ = _resolve_client_info(rctx)
 
             if mcp_session_id is None:
                 # Stateless requests / pre-initialize calls can land here.

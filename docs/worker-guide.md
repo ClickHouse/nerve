@@ -8,8 +8,8 @@ Worker mode deploys Nerve as a task-focused autonomous agent. Give it a job desc
 # Clone and install
 git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
-uv venv && source .venv/bin/activate
-uv pip install -e .
+uv sync
+source .venv/bin/activate
 
 # Initialize in worker mode
 nerve init --mode worker

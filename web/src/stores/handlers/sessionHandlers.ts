@@ -219,7 +219,7 @@ export function handleSessionArchived(
 
 export function handleSessionRunning(
   msg: Extract<WSMessage, { type: 'session_running' }>,
-  _get: Get,
+  get: Get,
   set: Set,
 ): void {
   // Global broadcast: a session started or stopped running
@@ -275,6 +275,17 @@ export function handleSessionRunning(
     }
     return updates;
   });
+
+  // A backgrounded feed session that just STOPPED may have produced new content;
+  // its updated_at only refreshes via loadSessions() (session_running carries
+  // just is_running), so pull a fresh list to keep the unread marker accurate.
+  // Scoped: skip the active session (its own stream reloads) and cron/system
+  // churn (session ids that never enter the `sessions` feed).
+  if (!msg.is_running
+      && msg.session_id !== get().activeSession
+      && get().sessions.some(sess => sess.id === msg.session_id)) {
+    get().loadSessions();
+  }
 }
 
 export function handleSessionAwaitingInput(

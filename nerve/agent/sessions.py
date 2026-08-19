@@ -661,12 +661,15 @@ class SessionManager:
 
     async def archive_session(self, session_id: str) -> None:
         """Archive a session: memorize, disconnect client, update status."""
-        # Memorize before losing the context
+        # Memorize in the background: memU indexing can take ~90s; awaiting it
+        # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
-            try:
-                await self._on_memorize(session_id)
-            except Exception as e:
-                logger.warning("Memorize before archive failed for %s: %s", session_id, e)
+            async def _memorize_bg(sid: str = session_id) -> None:
+                try:
+                    await self._on_memorize(sid)
+                except Exception as e:
+                    logger.warning("Background memorize for %s failed: %s", sid, e)
+            asyncio.create_task(_memorize_bg())
 
         client = self.remove_client(session_id)
         if client:
@@ -683,6 +686,123 @@ class SessionManager:
         })
         await self.db.log_session_event(session_id, "archived", {})
         logger.info("Archived session %s", session_id)
+
+    async def _resolve_descendants(self, root_id: str) -> list[str]:
+        """Every session in ``root_id``'s subtree, discovery order (root first).
+
+        Walks children via ``parent_session_id`` breadth-first with a seen-set
+        cycle guard (same pattern as the drag-to-nest guard) so a malformed
+        parent loop still terminates. Because a parent is always discovered
+        before its children, reversing this list yields a bottom-up order.
+        """
+        order: list[str] = []
+        seen: set[str] = set()
+        queue: list[str] = [root_id]
+        while queue:
+            cur = queue.pop(0)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            order.append(cur)
+            for child in await self.db.list_child_sessions(cur):
+                cid = child.get("id")
+                if cid and cid not in seen:
+                    queue.append(cid)
+        return order
+
+    async def archive_session_cascade(self, session_id: str) -> dict:
+        """Archive a session and its ENTIRE descendant subtree, bottom-up.
+
+        The default archive behavior. Resolves the full descendant set up front,
+        then archives deepest-first so no archived session is ever briefly left
+        with a still-active descendant. Fault tolerant: a node that cannot be
+        archived (e.g. currently running) is skipped, and its un-archived
+        ancestors are left alone — never producing an archived parent over an
+        active child. Fully-archivable sibling subtrees still complete.
+
+        Returns ``{"archived": [ids], "skipped": [{"id", "reason"}]}``.
+        """
+        # Compute the whole subtree BEFORE mutating anything.
+        order = await self._resolve_descendants(session_id)
+        children_of: dict[str, list[str]] = {sid: [] for sid in order}
+        # Build parent->children within the resolved set.
+        subtree = set(order)
+        for sid in order:
+            for child in await self.db.list_child_sessions(sid):
+                cid = child.get("id")
+                if cid in subtree:
+                    children_of[sid].append(cid)
+
+        archived: list[str] = []
+        skipped: dict[str, str] = {}
+        # Bottom-up: children precede parents in the reversed discovery order.
+        for sid in reversed(order):
+            # Refuse to archive over a descendant that did not archive.
+            blocking = [c for c in children_of.get(sid, []) if c not in archived]
+            if blocking:
+                skipped[sid] = f"descendant(s) not archived: {', '.join(blocking)}"
+                continue
+            if self.is_running(sid):
+                skipped[sid] = "session is running"
+                continue
+            try:
+                await self.archive_session(sid)
+                archived.append(sid)
+            except Exception as e:  # keep going; sibling subtrees still complete
+                logger.warning("Cascade archive failed for %s: %s", sid, e)
+                skipped[sid] = str(e)
+        return {
+            "archived": archived,
+            "skipped": [{"id": sid, "reason": reason} for sid, reason in skipped.items()],
+        }
+
+    async def unarchive_session(self, session_id: str) -> None:
+        """Restore an archived session to ``idle`` so it's resumable again."""
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        await self.db.update_session_fields(session_id, {
+            "status": SessionStatus.IDLE.value,
+            "archived_at": None,
+        })
+        # Bump updated_at so the unarchived session sorts to the top of the feed.
+        await self.db.touch_session(session_id)
+        await self.db.log_session_event(session_id, "unarchived", {})
+        logger.info("Unarchived session %s", session_id)
+
+    async def list_starred_sessions(self) -> list[dict]:
+        """Starred, non-archived sessions — always returned, never truncated."""
+        return await self.db.list_starred_sessions()
+
+    async def list_conversation_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """One page of the sidebar feed — non-archived, non-system, non-starred."""
+        return await self.db.list_conversation_sessions(limit=limit, offset=offset)
+
+    async def count_conversation_sessions(self) -> int:
+        """Number of pageable conversations (drives the feed's has_more)."""
+        return await self.db.count_conversation_sessions()
+
+    async def list_archived_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """One page of archived sessions for the sidebar's lazy Archived group."""
+        return await self.db.list_archived_sessions(limit=limit, offset=offset)
+
+    async def count_archived_sessions(self) -> int:
+        """Number of archived sessions (cheap badge count)."""
+        return await self.db.count_archived_sessions()
+
+    async def list_system_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """One page of system (cron/hook) sessions for the lazy System group."""
+        return await self.db.list_system_sessions(limit=limit, offset=offset)
+
+    async def count_system_sessions(self) -> int:
+        """Number of pageable system sessions (cheap badge count)."""
+        return await self.db.count_system_sessions()
 
     async def run_cleanup(
         self,

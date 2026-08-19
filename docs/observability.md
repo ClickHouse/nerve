@@ -125,7 +125,7 @@ key).
 - **Spans aren't appearing.** Check `/api/observability/status` —
   if `auth_ok: false`, the keys are wrong. If `enabled: false` despite
   keys being set, look at startup logs for an `ImportError` on the
-  `langfuse` package itself (run `uv pip install -e .` to refresh).
+  `langfuse` package itself (run `uv sync` to refresh).
 - **Spans are tagged but session_id is missing.** That can happen if the
   installed Langfuse SDK doesn't accept `session_id=` kwarg in
   `propagate_attributes`. Upgrade to a newer Langfuse Python SDK.

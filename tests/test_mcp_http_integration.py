@@ -183,3 +183,115 @@ def test_mcp_list_tools(app_with_mcp):
         assert "notify" in names
         # HoA tools excluded by default.
         assert not any(n.startswith("hoa_") for n in names)
+
+
+def test_mcp_call_tool_attributes_to_satellite_session(app_with_mcp):
+    """``tools/call`` over real HTTP, asserting satellite attribution.
+
+    This is the only flow that exercises the ``ServerRequestContext`` mcp 2.x
+    hands to handlers: ``build_ctx_resolver`` reads the bearer token and the
+    client's ``clientInfo`` off it to decide which session a call belongs to.
+    Every unit test passes a stand-in context object, so a real request through
+    the transport is the only thing that proves that wiring end to end — and
+    the resulting session id is the observable proof the context arrived
+    populated rather than empty.
+    """
+    from nerve.agent.tools import ToolResult, ToolSpec
+    from nerve.gateway import server as gw
+
+    with TestClient(app_with_mcp) as client:
+        async def _probe(ctx, args):
+            return ToolResult.text(f"probe:{ctx.session_id}")
+
+        # Registered on the live registry the manager closes over; lookup
+        # happens per call, so a late registration is visible.
+        gw._engine.registry.register(ToolSpec(
+            name="probe_attribution",
+            description="report the resolved session id",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=_probe,
+        ))
+
+        init_resp = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "probe-client", "version": "0.1"},
+            },
+        })
+        sid = init_resp.headers["mcp-session-id"]
+
+        notif_resp = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        }, session_id=sid)
+        assert notif_resp.status_code in (200, 202), notif_resp.text
+
+        call_resp = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "probe_attribution", "arguments": {}},
+        }, session_id=sid)
+        assert call_resp.status_code == 200, call_resp.text
+        body = _parse_response(call_resp)
+        assert "error" not in body, body
+        result = body["result"]
+        assert not result.get("isError"), result
+
+        text = result["content"][0]["text"]
+        # external:<sanitized client_name>:<identifier> — the client name comes
+        # from the initialize handshake above, so seeing it here means the
+        # request context reached the resolver intact.
+        assert text.startswith("probe:external:"), text
+        assert "probe-client" in text, text
+
+
+def test_mcp_call_tool_rejects_invalid_arguments(app_with_mcp):
+    """Schema validation is enforced on the real transport, not just in unit tests.
+
+    mcp 1.x validated arguments inside its ``call_tool`` decorator; the 2.x
+    callback does not, so ``build_mcp_server`` does it. Worth asserting over
+    HTTP because this endpoint is the one external clients can reach.
+    """
+    from nerve.agent.tools import ToolResult, ToolSpec
+    from nerve.gateway import server as gw
+
+    with TestClient(app_with_mcp) as client:
+        calls: list[dict] = []
+
+        async def _typed(ctx, args):
+            calls.append(args)
+            return ToolResult.text("should not run")
+
+        gw._engine.registry.register(ToolSpec(
+            name="probe_typed",
+            description="requires an integer count",
+            input_schema={
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+            },
+            handler=_typed,
+        ))
+
+        init_resp = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "probe-client", "version": "0.1"},
+            },
+        })
+        sid = init_resp.headers["mcp-session-id"]
+        _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        }, session_id=sid)
+
+        call_resp = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "probe_typed", "arguments": {"count": "nope"}},
+        }, session_id=sid)
+        assert call_resp.status_code == 200, call_resp.text
+        result = _parse_response(call_resp)["result"]
+        assert result["isError"] is True, result
+        assert "Invalid arguments" in result["content"][0]["text"]
+        assert calls == [], "handler ran despite invalid arguments"

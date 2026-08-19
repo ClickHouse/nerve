@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+# Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
+SYSTEM_SOURCES = ("cron", "hook")
+_SYSTEM_SQL = "('" + "', '".join(SYSTEM_SOURCES) + "')"
+
 
 class SessionStore:
     """Mixin providing session CRUD and lifecycle operations."""
@@ -125,6 +129,73 @@ class SessionStore:
         async with self.db.execute(sql, params) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+    async def _page(self, sql: str, params: tuple, limit: int | None, offset: int) -> list[dict]:
+        """Run a sidebar list query with an optional page window (``limit=None`` = unbounded, LIMIT/OFFSET omitted)."""
+        if limit is None:
+            async with self.db.execute(sql, params) as cursor:
+                return [dict(row) async for row in cursor]
+        async with self.db.execute(
+            f"{sql} LIMIT ? OFFSET ?", (*params, limit, max(0, offset)),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def _count(self, where: str) -> int:
+        async with self.db.execute(f"SELECT COUNT(*) FROM sessions WHERE {where}") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+    async def list_starred_sessions(self) -> list[dict]:
+        """Every non-archived starred session, newest first — NEVER truncated (off-budget for the page size, any source)."""
+        return await self._page(
+            "SELECT * FROM sessions WHERE starred = 1 AND status != 'archived'"
+            " ORDER BY updated_at DESC", (), None, 0,
+        )
+
+    async def list_conversation_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """Main sidebar feed page: non-archived, non-system, non-starred (window applied after excluding system sources)."""
+        return await self._page(
+            "SELECT * FROM sessions"
+            f" WHERE status != 'archived' AND starred = 0 AND source NOT IN {_SYSTEM_SQL}"
+            " ORDER BY updated_at DESC", (), limit, offset,
+        )
+
+    async def count_conversation_sessions(self) -> int:
+        """Pageable conversations (drives the feed's has_more)."""
+        return await self._count(
+            f"status != 'archived' AND starred = 0 AND source NOT IN {_SYSTEM_SQL}",
+        )
+
+    async def list_archived_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """Archived sessions page, most recently archived first — lazily fetched when the sidebar Archived group is expanded."""
+        return await self._page(
+            f"SELECT * FROM sessions WHERE status = 'archived' AND source NOT IN {_SYSTEM_SQL}"
+            " ORDER BY archived_at DESC", (), limit, offset,
+        )
+
+    async def count_archived_sessions(self) -> int:
+        """Count archived conversation sessions (drives the collapsed badge + has_more)."""
+        return await self._count(f"status = 'archived' AND source NOT IN {_SYSTEM_SQL}")
+
+    async def list_system_sessions(
+        self, limit: int | None = None, offset: int = 0,
+    ) -> list[dict]:
+        """System sessions page (cron/hook), newest first — lazily fetched when the sidebar System group is expanded (starred rows excluded)."""
+        return await self._page(
+            "SELECT * FROM sessions"
+            f" WHERE status != 'archived' AND starred = 0 AND source IN {_SYSTEM_SQL}"
+            " ORDER BY updated_at DESC", (), limit, offset,
+        )
+
+    async def count_system_sessions(self) -> int:
+        """Count pageable system sessions (drives the badge + has_more)."""
+        return await self._count(
+            f"status != 'archived' AND starred = 0 AND source IN {_SYSTEM_SQL}",
+        )
 
     async def search_sessions(self, query: str, limit: int = 100) -> list[dict]:
         """Search sessions by title (LIKE match), across all non-archived sessions."""
@@ -337,6 +408,18 @@ class SessionStore:
         async with self.db.execute(
             f"SELECT * FROM sessions WHERE status IN ({placeholders})",
             tuple(statuses),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def list_child_sessions(self, parent_id: str) -> list[dict]:
+        """Direct children of ``parent_id`` (the sidebar nesting relationship).
+
+        Returns full rows regardless of status so an archive cascade sees the
+        whole subtree; callers walk this recursively to resolve descendants.
+        """
+        async with self.db.execute(
+            "SELECT * FROM sessions WHERE parent_session_id = ?",
+            (parent_id,),
         ) as cursor:
             return [dict(row) async for row in cursor]
 

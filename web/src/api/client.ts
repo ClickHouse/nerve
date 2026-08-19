@@ -1,5 +1,13 @@
 const API_BASE = '/api';
 
+/** One page of a lazily-loaded sidebar group (Archived / System). */
+export interface Page {
+  sessions: any[];
+  /** More rows exist past next_offset — the sidebar renders its '...' row. */
+  has_more: boolean;
+  next_offset: number;
+}
+
 export interface TaskStatusDef {
   name: string;
   label: string;
@@ -332,7 +340,13 @@ export const api = {
     }>('/models'),
 
   // Sessions
-  listSessions: () => request<{ sessions: any[] }>('/sessions'),
+  listSessions: (offset = 0) =>
+    request<{ sessions: any[]; archived_count: number; system_count: number; has_more: boolean; next_offset: number }>(
+      `/sessions?offset=${offset}`),
+  listArchivedSessions: (offset = 0) =>
+    request<Page>(`/sessions/archived?offset=${offset}`),
+  listSystemSessions: (offset = 0) =>
+    request<Page>(`/sessions/system?offset=${offset}`),
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
@@ -391,7 +405,7 @@ export const api = {
     ),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
-  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string }) =>
+  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getMessages: (sessionId: string, limit = 100) =>
     request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
@@ -404,6 +418,8 @@ export const api = {
     request<any>(`/sessions/${id}/resume`, { method: 'POST' }),
   archiveSession: (id: string) =>
     request<any>(`/sessions/${id}/archive`, { method: 'POST' }),
+  unarchiveSession: (id: string) =>
+    request<any>(`/sessions/${id}/unarchive`, { method: 'POST' }),
   getSessionStatus: (id: string) =>
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>

@@ -125,20 +125,16 @@ class TestCtxBinding:
             query_params={},
         )
         fake_rctx = SimpleNamespace(request=fake_request, session=None)
-        cv_token = mcp_http.request_ctx.set(fake_rctx)
-        try:
-            assert mcp_http._bound_session_from_request(cfg) == "engine-sess-7"
+        assert mcp_http._bound_session_from_request(cfg, fake_rctx) == "engine-sess-7"
 
-            # Plain token → no binding (satellite path).
-            fake_request.headers = _Headers(
-                {"authorization": f"Bearer {create_token(SECRET)}"},
-            )
-            assert mcp_http._bound_session_from_request(cfg) is None
-        finally:
-            mcp_http.request_ctx.reset(cv_token)
+        # Plain token → no binding (satellite path).
+        fake_request.headers = _Headers(
+            {"authorization": f"Bearer {create_token(SECRET)}"},
+        )
+        assert mcp_http._bound_session_from_request(cfg, fake_rctx) is None
 
-        # No request context set → no binding.
-        assert mcp_http._bound_session_from_request(cfg) is None
+        # No request context → no binding.
+        assert mcp_http._bound_session_from_request(cfg, None) is None
 
     @pytest.mark.asyncio
     async def test_worker_token_adds_runtime_attribution(self, tmp_path):
@@ -162,13 +158,9 @@ class TestCtxBinding:
             headers=_Headers({"authorization": f"Bearer {token}"}),
             query_params={},
         )
-        cv_token = mcp_http.request_ctx.set(
-            SimpleNamespace(request=fake_request, session=None),
+        session_id, runtime = mcp_http._bound_identity_from_request(
+            cfg, SimpleNamespace(request=fake_request, session=None),
         )
-        try:
-            session_id, runtime = mcp_http._bound_identity_from_request(cfg)
-        finally:
-            mcp_http.request_ctx.reset(cv_token)
         assert session_id == "engine-sess-8"
         assert runtime == {"worker_id": worker_id, "runtime": "ultracode"}
         payload = decode_mcp_token(token, SECRET)
@@ -181,4 +173,4 @@ class TestCtxBinding:
 
         cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
         cfg.auth.jwt_secret = ""
-        assert mcp_http._bound_session_from_request(cfg) is None
+        assert mcp_http._bound_session_from_request(cfg, None) is None
