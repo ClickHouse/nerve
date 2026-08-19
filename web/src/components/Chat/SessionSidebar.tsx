@@ -506,7 +506,10 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto">
+      {/* overflow-x-hidden: this list only ever scrolls vertically. Rows
+          truncate, so anything sticking out sideways is a layout slip, not
+          content the user needs to reach by scrolling. */}
+      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
         {/* Search results mode */}
         {isSearching ? (
           <div>
@@ -772,7 +775,10 @@ function MoreRow({ onClick }: { onClick: () => void }) {
     <button
       onClick={onClick}
       title="Load more"
-      className="w-full px-3 py-1 mx-1 text-left text-[12px] leading-none tracking-widest text-text-faint hover:text-text-muted hover:bg-surface-raised rounded-md cursor-pointer transition-colors"
+      // Width has to leave room for its own margins: plain `w-full` + `mx-1`
+      // is 100% + 8px, which overflows the list and puts a horizontal
+      // scrollbar under the whole panel (mx-1 = 0.25rem a side).
+      className="w-[calc(100%-0.5rem)] px-3 py-1 mx-1 text-left text-[12px] leading-none tracking-widest text-text-faint hover:text-text-muted hover:bg-surface-raised rounded-md cursor-pointer transition-colors"
     >
       ...
     </button>
