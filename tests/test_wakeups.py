@@ -167,6 +167,23 @@ class TestWakeupSweep:
         assert await svc.db.list_pending_wakeups("s1") == []
 
     @pytest.mark.asyncio
+    async def test_run_later_wakeup_fires_with_cron_source(self, svc):
+        # A deferred "Run later" wakeup must dispatch through the cron
+        # source (mirroring plan_service/cron dispatch), not "wakeup".
+        await svc.db.add_wakeup(
+            "s1", prompt="deferred prompt", fire_at=_past(), reason="run-later",
+        )
+
+        await svc._sweep_wakeups()
+        await asyncio.sleep(0.05)
+
+        svc.engine.run.assert_awaited_once()
+        kwargs = svc.engine.run.await_args.kwargs
+        assert kwargs["source"] == "cron"
+        assert kwargs["user_message"] == "deferred prompt"
+        assert kwargs["internal"] is True
+
+    @pytest.mark.asyncio
     async def test_skips_running_session(self, svc):
         svc.engine.sessions.is_running = MagicMock(return_value=True)
         await svc.db.add_wakeup("s1", prompt="ping", fire_at=_past())
