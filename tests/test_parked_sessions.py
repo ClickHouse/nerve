@@ -17,6 +17,7 @@ Three layers:
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -162,6 +163,20 @@ class TestEnginePendingWork:
             "t1": {"task_id": "t1", "status": "completed"},
         }
         assert engine.has_live_background_tasks("s1") is False
+
+    @pytest.mark.parametrize("func", ["run", "_run_inner", "_finalize_turn"])
+    def test_freezing_is_opt_in_per_call_site(self, func):
+        """Turns bump by default; a caller has to ask for the freeze.
+
+        Deliberately not inferred from ``internal`` — that flag only means
+        "don't persist the trigger message", and several internal turns are
+        user-requested (a run-later deferral, the star-project hook). Those
+        must keep floating their session to the top of the sidebar.
+        """
+        param = inspect.signature(
+            getattr(AgentEngine, func),
+        ).parameters["bump_updated_at"]
+        assert param.default is True
 
 
 # --------------------------------------------------------------------------- #

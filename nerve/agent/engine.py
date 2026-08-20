@@ -2421,6 +2421,7 @@ class AgentEngine:
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
+        bump_updated_at: bool = True,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -2432,6 +2433,14 @@ class AgentEngine:
                     ``media_type``, and ``data`` (base64-encoded).
             image_refs: Optional metadata about uploaded files for persisting
                         in the user message blocks column (web uploads only).
+            bump_updated_at: Whether the turn counts as activity that re-sorts
+                      the sidebar. Callers pass False for a turn the user
+                      never asked for — a self-scheduled ``ScheduleWakeup``
+                      loop tick — so a session working through a loop keeps
+                      its place in the list. Deliberately NOT inferred from
+                      ``internal``: that flag only means "don't persist the
+                      trigger message", and plenty of internal turns (a
+                      run-later deferral, the star hook) are user-requested.
         """
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
@@ -2462,6 +2471,7 @@ class AgentEngine:
                         effort_override=effort_override,
                         internal=internal, images=images,
                         image_refs=image_refs,
+                        bump_updated_at=bump_updated_at,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -2505,6 +2515,7 @@ class AgentEngine:
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
+        bump_updated_at: bool = True,
     ) -> str:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source)
@@ -2854,12 +2865,8 @@ class AgentEngine:
         # run_in_background task settles, the CLI runs an autonomous turn
         # which the idle stream watcher drains to the UI — no Nerve-side
         # output-file polling needed (the old regex watcher lived here).
-        #
-        # ``internal`` turns carry a synthetic trigger nobody typed (a fired
-        # wakeup, a restart continuation, a star hook): they resume work the
-        # session was already doing, so they must not re-sort the sidebar.
         await self._finalize_turn(
-            session_id, st, channel, bump_updated_at=not internal,
+            session_id, st, channel, bump_updated_at=bump_updated_at,
         )
 
         return st.full_response_text
