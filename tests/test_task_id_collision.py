@@ -419,9 +419,15 @@ class TestSlugCollision:
     async def test_distinct_titles_keep_unsuffixed_ids(self, db: Database, tmp_path):
         """Unchanged behaviour: no collision, no suffix."""
         ctx = _ctx(db, tmp_path)
-        first = await _create(ctx, "Rotate the staging credentials", "x")
-        second = await _create(ctx, "Backfill the audit table", "y")
+        titles = ("Rotate the staging credentials", "Backfill the audit table")
+        ids = [task_handlers._make_task_id(t, ctx) for t in titles]
+        assert len(set(ids)) == 2, f"harness: titles no longer distinct ({ids})"
 
-        assert "-2" not in first.splitlines()[0]
-        assert "-2" not in second.splitlines()[0]
-        assert len(_ids(tmp_path, "active")) == 2
+        # Assert the id is reported verbatim rather than searching the line for
+        # "-2": ids carry a date prefix, so that substring matches 2026-08-20
+        # and every other day from the 20th on. A collision suffix would put a
+        # "-2" where this expects the space before "(status: ...)".
+        for title, task_id in zip(titles, ids):
+            assert f"Task created: {task_id} " in await _create(ctx, title, "x")
+
+        assert _ids(tmp_path, "active") == sorted(ids)
