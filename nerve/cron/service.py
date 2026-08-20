@@ -1340,7 +1340,8 @@ class CronService:
         # "Run later" deferrals are scheduled dispatches — fire them through
         # the cron source so they mirror plan_service/cron-dispatched runs;
         # model-requested ScheduleWakeup rows keep the "wakeup" source.
-        source = "cron" if wakeup.get("reason") == "run-later" else "wakeup"
+        run_later = wakeup.get("reason") == "run-later"
+        source = "cron" if run_later else "wakeup"
         logger.info(
             "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
         )
@@ -1350,6 +1351,11 @@ class CronService:
                 user_message=prompt,
                 source=source,
                 internal=True,
+                # A run-later deferral is a message the user wrote and asked
+                # to be delivered now, so it belongs back at the top of the
+                # sidebar. A model's own ScheduleWakeup tick is the session
+                # continuing its own loop — it keeps its place in the list.
+                bump_updated_at=run_later,
             )
         )
 

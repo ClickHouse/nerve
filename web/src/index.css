@@ -209,6 +209,9 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--theme-border-subtle); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--theme-border); }
+/* Where a horizontal and a vertical scrollbar meet, WebKit paints the corner
+   with its own default (near-white) — a bright dot on a dark panel. */
+::-webkit-scrollbar-corner { background: transparent; }
 
 /* ── Chat message backgrounds ── */
 /* Dark: assistant messages sink slightly below the chat bg; user prompts rise

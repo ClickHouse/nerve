@@ -579,12 +579,19 @@ class SessionManager:
         thinking: str | None = None,
         blocks: list | None = None,
         native_turn_id: str | None = None,
+        bump_updated_at: bool = True,
     ) -> int:
-        """Add a message to a session's history."""
+        """Add a message to a session's history.
+
+        ``bump_updated_at=False`` records the message without moving the
+        session's place in the sidebar — see
+        :meth:`nerve.db.messages.MessageStore.add_message`.
+        """
         return await self.db.add_message(
             session_id, role, content, channel=channel,
             thinking=thinking, blocks=blocks,
             native_turn_id=native_turn_id,
+            bump_updated_at=bump_updated_at,
         )
 
     async def get_conversation_history(
