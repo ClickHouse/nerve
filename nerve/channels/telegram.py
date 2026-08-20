@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
@@ -457,6 +457,179 @@ def build_session_tail_view(
     return text, InlineKeyboardMarkup(rows)
 
 
+# Inline-keyboard /plans rendering ---------------------------------------- #
+# The plan review queue (WebUI parity for chat): list → detail → approve /
+# decline / revise, all tap-driven so nothing needs a copy-pasted plan id.
+_PLANS_PAGE_SIZE = 8            # plans shown per /plans page; ⬅️/➡️ page the rest
+_PLAN_LABEL_MAX = 40           # Telegram wraps long button labels poorly
+_PLAN_BODY_MAX = 3400          # plan body clip (raw) — keeps the HTML card < 4096
+_PLAN_STATUS_EMOJI = {
+    "pending": "🟠",           # awaiting your review — the actionable state
+    "implementing": "⚙️",      # approved, an impl session is running
+    "declined": "🚫",
+    "superseded": "🗂",
+    "failed": "⚠️",
+}
+
+
+def _plan_label(plan: dict) -> str:
+    """Button label for one plan: status emoji + task title, version if > 1."""
+    emoji = _PLAN_STATUS_EMOJI.get(plan.get("status") or "", "•")
+    title = (plan.get("task_title") or plan.get("task_id") or "?").strip()
+    ver = plan.get("version") or 1
+    suffix = f"  v{ver}" if int(ver) > 1 else ""
+    room = _PLAN_LABEL_MAX - len(suffix) - 2   # 2 ≈ emoji + space
+    if len(title) > room:
+        title = title[: room - 1] + "…"
+    return f"{emoji} {title}{suffix}"
+
+
+def build_plans_view(
+    plans: list[dict],
+    *,
+    offset: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render the /plans review queue (pure, sync — unit-testable).
+
+    One tap-to-open button per plan (the plan id rides in ``callback_data``
+    as ``plan:view:<id>``), pending listed ahead of implementing. ``⬅️``/``➡️``
+    page via ``plan:list:<offset>`` when more exist, and a trailing
+    ``🔄 Refresh`` button (``plan:list:0``) is always present so the keyboard
+    is never empty and the queue can be re-pulled after acting on a plan.
+    Returns ``(message_text, keyboard)``.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in plans[:_PLANS_PAGE_SIZE]:
+        pid = p.get("id")
+        cb = f"plan:view:{pid}"
+        # callback_data is capped at 64 bytes by Telegram; plan ids are short
+        # (``plan-xxxxxxxx``) but guard defensively so a button always works.
+        if not pid or len(cb.encode("utf-8")) > 64:
+            continue
+        rows.append([InlineKeyboardButton(_plan_label(p), callback_data=cb)])
+    shown = len(rows)
+
+    # Pager row — only the arrows that lead somewhere.
+    nav: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(
+            "⬅️ Prev",
+            callback_data=f"plan:list:{max(0, offset - _PLANS_PAGE_SIZE)}",
+        ))
+    if has_next:
+        nav.append(InlineKeyboardButton(
+            "➡️ More",
+            callback_data=f"plan:list:{offset + _PLANS_PAGE_SIZE}",
+        ))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="plan:list:0")])
+
+    if shown:
+        text = "🗒 Plans awaiting your review — tap one to read, approve, or decline."
+        if offset or has_next:
+            text += f"\nPage {offset // _PLANS_PAGE_SIZE + 1}"
+        text += "\n🟠 pending · ⚙️ implementing"
+    elif has_prev:
+        text = "No more plans — tap ⬅️ Prev to go back."
+    else:
+        text = "✅ No plans awaiting review — nothing to approve right now."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def build_plan_detail_view(
+    plan: dict,
+    *,
+    tzname: str | None = None,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render one plan (HTML) with its review actions.
+
+    The plan body is an *expandable blockquote* — long plans collapse to a
+    few lines and expand in place on tap, and the whole card is clipped to
+    stay under Telegram's 4096-char limit. A ``pending`` plan gets Approve /
+    Decline / Revise buttons; any other status is read-only (with its impl
+    session shown when present). Send/edit with ``ParseMode.HTML``. Returns
+    ``(html_text, keyboard)``.
+    """
+    tz = _safe_zone(tzname)
+    pid = str(plan.get("id") or "?")
+    status = plan.get("status") or "?"
+    emoji = _PLAN_STATUS_EMOJI.get(status, "•")
+    task_title = _html.escape(str(plan.get("task_title") or plan.get("task_id") or "?"))
+    version = plan.get("version") or 1
+    ptype = plan.get("plan_type") or "generic"
+
+    header = (
+        f"🗒 <b>{task_title}</b>\n"
+        f"{emoji} {status} · plan <code>{_html.escape(pid)}</code> v{version}"
+    )
+    if ptype and ptype != "generic":
+        header += f" · {_html.escape(str(ptype))}"
+    created = plan.get("created_at") or ""
+    if created:
+        day, hm = _fmt_local(created, tz)
+        if day:
+            header += f"\n<i>proposed {day} {hm}</i>"
+    if plan.get("impl_session_id"):
+        header += f"\nimpl: <code>{_html.escape(str(plan['impl_session_id']))}</code>"
+    if plan.get("feedback"):
+        header += f"\n<b>Revision feedback:</b> {_clip(str(plan['feedback']), 300)}"
+
+    body = _clip(str(plan.get("content") or ""), _PLAN_BODY_MAX)
+    text = f"{header}\n\n<blockquote expandable>{body}</blockquote>"
+    if len(text) > 4096:                       # defensive final clamp
+        text = text[:4093] + "…"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if status == "pending":
+        rows.append([
+            InlineKeyboardButton("✅ Approve", callback_data=f"plan:approve:{pid}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"plan:decline:{pid}"),
+        ])
+        rows.append([InlineKeyboardButton("✍️ Revise", callback_data=f"plan:revise:{pid}")])
+    rows.append([InlineKeyboardButton("🗒 Plans", callback_data="plan:list:0")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def build_plan_confirm_view(
+    plan: dict, action: str,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Confirmation card for a consequential action (approve/decline).
+
+    Both actions are one-way (approve spawns an implementation session;
+    decline closes the task), so a fat-finger tap gets a second step. Plain
+    text (no parse mode). ``◀️ Back`` returns to the plan detail. Returns
+    ``(message_text, keyboard)``.
+    """
+    pid = str(plan.get("id") or "?")
+    title = (plan.get("task_title") or plan.get("task_id") or "?")
+    if action == "approve":
+        text = (
+            f"✅ Approve the plan for “{title}”?\n\n"
+            "This starts an implementation session that carries out the plan."
+        )
+        rows = [
+            [InlineKeyboardButton(
+                "✅ Yes, approve & implement", callback_data=f"plan:approveok:{pid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data=f"plan:view:{pid}")],
+        ]
+    else:  # decline
+        text = (
+            f"❌ Decline the plan for “{title}”?\n\n"
+            "This closes the task as done. To ask for a new version instead, "
+            "go back and use ✍️ Revise."
+        )
+        rows = [
+            [InlineKeyboardButton(
+                "🗑 Yes, decline & close", callback_data=f"plan:declineok:{pid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data=f"plan:view:{pid}")],
+        ]
+    return text, InlineKeyboardMarkup(rows)
+
+
 class TelegramChannel(BaseChannel):
     """Telegram bot channel.
 
@@ -485,6 +658,10 @@ class TelegramChannel(BaseChannel):
         self._message_cache_max = 200
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
+        # /plans revise flow: chat_id -> (plan_id, force_reply_prompt_message_id).
+        # A reply to that prompt is treated as revision feedback, not a message
+        # for the agent (see _handle_message).
+        self._pending_plan_revision: dict[int, tuple[str, int]] = {}
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
@@ -559,6 +736,7 @@ class TelegramChannel(BaseChannel):
         app.add_handler(CommandHandler("pair", self._handle_pair))
         app.add_handler(CommandHandler("session", self._handle_session))
         app.add_handler(CommandHandler("sessions", self._handle_sessions))
+        app.add_handler(CommandHandler("plans", self._handle_plans))
         app.add_handler(CommandHandler("star", self._handle_star))
         app.add_handler(CommandHandler("unstar", self._handle_unstar))
         app.add_handler(CommandHandler("new", self._handle_new_session))
@@ -1165,6 +1343,255 @@ class TelegramChannel(BaseChannel):
         text, markup = await self._sessions_view_for(channel_key)
         await update.message.reply_text(text, reply_markup=markup)
 
+    # ------------------------------------------------------------------ #
+    #  /plans — review queue (approve / decline / revise from chat)        #
+    # ------------------------------------------------------------------ #
+
+    async def _plans_view_for(
+        self, offset: int = 0,
+    ) -> "tuple[str, InlineKeyboardMarkup]":
+        """Build the /plans review-queue view for the given page.
+
+        Plans are global (not chat-scoped), matching the WebUI: pending ones
+        (the actionable state) are listed ahead of implementing ones, each
+        already newest-first from the store. We fetch both statuses and
+        paginate in memory — the queue is small — and fetch one extra past the
+        page to learn whether a further page exists.
+        """
+        offset = max(0, offset)
+        pending = await self.router.list_plans(status="pending", limit=200)
+        implementing = await self.router.list_plans(status="implementing", limit=200)
+        plans = pending + implementing
+        page = plans[offset:offset + _PLANS_PAGE_SIZE]
+        has_next = offset + _PLANS_PAGE_SIZE < len(plans)
+        return build_plans_view(
+            page, offset=offset, has_prev=offset > 0, has_next=has_next,
+        )
+
+    async def _handle_plans(self, update: Update, context: Any) -> None:
+        """Handle /plans — native inline keyboard to review pending plans.
+
+        Each plan is a tap-to-open button; the plan id rides in the button's
+        callback_data, so approving/declining never needs a copy-pasted id.
+        """
+        self._touch()
+        if not self._is_authorized(update.effective_user.id):
+            return
+        text, markup = await self._plans_view_for()
+        await update.message.reply_text(text, reply_markup=markup)
+
+    async def _edit_plans_list(self, query: Any, offset: int = 0) -> None:
+        """Replace the current card with the plans list at ``offset``."""
+        text, markup = await self._plans_view_for(offset)
+        await self._safe_edit(query, text, markup)
+
+    async def _edit_plan_detail(self, query: Any, plan_id: str) -> None:
+        """Render a plan's detail (HTML) into the card in place."""
+        plan = await self.router.get_plan(plan_id)
+        if not plan:
+            await self._edit_plans_list(query)
+            return
+        text, markup = build_plan_detail_view(plan, tzname=self.config.timezone)
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _handle_plan_button(self, query: Any) -> None:
+        """Handle /plans inline-keyboard presses.
+
+        callback_data forms:
+          ``plan:list:<offset>``   — (re)show the review queue at a page
+          ``plan:view:<id>``       — show a plan's detail + action buttons
+          ``plan:approve:<id>``    — confirm-approve card
+          ``plan:approveok:<id>``  — approve (spawns an implementation session)
+          ``plan:decline:<id>``    — confirm-decline card
+          ``plan:declineok:<id>``  — decline (closes the task as done)
+          ``plan:revise:<id>``     — prompt (ForceReply) for revision feedback
+        """
+        if not query.message:
+            await query.answer()
+            return
+        parts = query.data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        arg = parts[2] if len(parts) > 2 else ""
+
+        if action == "list":
+            try:
+                off = max(0, int(arg))
+            except ValueError:
+                off = 0
+            await query.answer()
+            await self._edit_plans_list(query, off)
+            return
+
+        if action == "view":
+            await query.answer()
+            await self._edit_plan_detail(query, arg)
+            return
+
+        if action in ("approve", "decline"):
+            plan = await self.router.get_plan(arg)
+            if not plan:
+                await query.answer("That plan is no longer available", show_alert=True)
+                await self._edit_plans_list(query)
+                return
+            if plan.get("status") != "pending":
+                await query.answer(
+                    f"Plan is {plan.get('status')} — no longer actionable",
+                    show_alert=True,
+                )
+                await self._edit_plan_detail(query, arg)
+                return
+            await query.answer()
+            text, markup = build_plan_confirm_view(plan, action)
+            await self._safe_edit(query, text, markup)
+            return
+
+        if action == "approveok":
+            await self._do_plan_approve(query, arg)
+            return
+        if action == "declineok":
+            await self._do_plan_decline(query, arg)
+            return
+        if action == "revise":
+            await self._start_plan_revise(query, arg)
+            return
+
+        await query.answer()
+
+    async def _do_plan_approve(self, query: Any, plan_id: str) -> None:
+        """Approve via the shared service, then confirm on the card."""
+        from nerve.agent.plan_service import (
+            PlanNotFound,
+            PlanNotPending,
+            TaskNotFound,
+            approve_plan,
+        )
+        try:
+            result = await approve_plan(
+                db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
+            )
+        except (PlanNotFound, TaskNotFound):
+            await query.answer("That plan is no longer available", show_alert=True)
+            await self._edit_plans_list(query)
+            return
+        except PlanNotPending as exc:
+            await query.answer(str(exc), show_alert=True)
+            await self._edit_plan_detail(query, plan_id)
+            return
+        await query.answer("Approved — implementation started")
+        impl = _html.escape(str(result.get("impl_session_id") or "?"))
+        text = (
+            "✅ <b>Plan approved.</b>\n"
+            f"Implementation session <code>{impl}</code> started."
+        )
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗒 Plans", callback_data="plan:list:0")]]
+        )
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _do_plan_decline(self, query: Any, plan_id: str) -> None:
+        """Decline via the shared service, then confirm on the card."""
+        from nerve.agent.plan_service import (
+            PlanNotFound,
+            PlanNotPending,
+            TaskNotFound,
+            decline_plan,
+        )
+        try:
+            await decline_plan(
+                db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
+            )
+        except (PlanNotFound, TaskNotFound):
+            await query.answer("That plan is no longer available", show_alert=True)
+            await self._edit_plans_list(query)
+            return
+        except PlanNotPending as exc:
+            await query.answer(str(exc), show_alert=True)
+            await self._edit_plan_detail(query, plan_id)
+            return
+        await query.answer("Declined — task closed")
+        text = "🗑 <b>Plan declined.</b>\nThe related task was closed as done."
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗒 Plans", callback_data="plan:list:0")]]
+        )
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _start_plan_revise(self, query: Any, plan_id: str) -> None:
+        """Ask for revision feedback via a ForceReply prompt.
+
+        The next message that *replies to* this prompt is captured as feedback
+        in ``_handle_message`` and dispatched to the planner — Telegram's
+        native way to collect a text argument after a button press.
+        """
+        plan = await self.router.get_plan(plan_id)
+        if not plan or plan.get("status") != "pending":
+            await query.answer(
+                "Only pending plans can be revised", show_alert=True,
+            )
+            await self._edit_plan_detail(query, plan_id)
+            return
+        await query.answer()
+        title = plan.get("task_title") or plan.get("task_id") or plan_id
+        prompt = await query.message.reply_text(
+            f"✍️ Reply to this message with revision feedback for the plan "
+            f"“{title}”.\nThe planner will produce a new version from your notes.",
+            reply_markup=ForceReply(input_field_placeholder="What should change?"),
+        )
+        self._pending_plan_revision[query.message.chat.id] = (
+            plan_id, prompt.message_id,
+        )
+
+    async def _submit_plan_revision(
+        self, update: Update, plan_id: str, feedback: str,
+    ) -> None:
+        """Dispatch captured revision feedback to the planner session."""
+        from nerve.agent.plan_service import (
+            PlanNotFound,
+            PlanNotPending,
+            TaskNotFound,
+            request_plan_revision,
+        )
+        try:
+            result = await request_plan_revision(
+                db=self.router.engine.db, engine=self.router.engine,
+                plan_id=plan_id, feedback=feedback,
+            )
+        except (PlanNotFound, TaskNotFound):
+            await update.message.reply_text("That plan no longer exists.")
+            return
+        except (PlanNotPending, ValueError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(
+            f"✍️ Revision requested for plan {plan_id}. Feedback sent to the "
+            f"planner ({result['session_id']}); a new version will appear in /plans."
+        )
+
+    async def _maybe_consume_plan_revision(self, update: Update) -> bool:
+        """Consume a reply to a /plans revise prompt as revision feedback.
+
+        Returns True (message handled — do not route to the agent) only when
+        this chat has a pending revise prompt AND this message replies to that
+        exact prompt. Any other message falls through to normal routing.
+        """
+        chat = update.effective_chat
+        msg = update.message
+        if not chat or not msg:
+            return False
+        pending = self._pending_plan_revision.get(chat.id)
+        if not pending:
+            return False
+        reply_to = getattr(msg, "reply_to_message", None)
+        if not reply_to or reply_to.message_id != pending[1]:
+            return False
+        plan_id, _prompt_id = pending
+        self._pending_plan_revision.pop(chat.id, None)
+        feedback = (msg.text or "").strip()
+        if not feedback:
+            await msg.reply_text("No feedback given — revision cancelled.")
+            return True
+        await self._submit_plan_revision(update, plan_id, feedback)
+        return True
+
     async def _handle_star(self, update: Update, context: Any) -> None:
         """Handle /star — star the current session so it never auto-closes."""
         await self._set_current_starred(update, True)
@@ -1557,6 +1984,11 @@ class TelegramChannel(BaseChannel):
         if not self._is_authorized(update.effective_user.id):
             return
 
+        # A reply to a /plans "Revise" ForceReply prompt is revision feedback,
+        # not a message for the agent. Intercept before any routing.
+        if await self._maybe_consume_plan_revision(update):
+            return
+
         # Media group (album) — collect all parts before processing
         if update.message.media_group_id:
             await self._collect_media_group(update)
@@ -1938,6 +2370,11 @@ class TelegramChannel(BaseChannel):
             or query.data.startswith("sesstail:")
         ):
             await self._handle_session_button(query)
+            return
+
+        # /plans inline keyboard: list/view/approve/decline/revise.
+        if query.data.startswith("plan:"):
+            await self._handle_plan_button(query)
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"
