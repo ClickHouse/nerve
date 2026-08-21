@@ -132,7 +132,7 @@ Scheduled AI sessions via APScheduler. Three session modes:
 | **Persistent** | Accumulates context across runs. Optional rotation to manage token usage. Reminder mode for lightweight follow-ups. |
 | **Main** | Runs inside the user's primary conversation — full context access. |
 
-Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (15min), `task-planner` (4h). Worker mode ships with `skill-reviser`, `skill-extractor`, and `task-planner` by default; additional crons are configured during onboarding.
+Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `pr-feedback-harvester` (weekly), `inbox-processor` (15min), `task-planner` (4h). Worker mode ships with `skill-reviser`, `skill-extractor`, `pr-feedback-harvester`, and `task-planner` by default; additional crons are configured during onboarding.
 
 ### 📡 Source Sync
 
@@ -191,6 +191,7 @@ workspace/skills/
 - Progressive disclosure: only name + description in system prompt; full content loaded on demand
 - `skill-extractor` cron proposes new skills from repeated workflows
 - `skill-reviser` cron reviews existing skills for accuracy
+- `pr-feedback-harvester` cron turns review feedback on the agent's own PRs into skill updates
 - Usage statistics tracked per skill
 
 ### 📐 Plans
