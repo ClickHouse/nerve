@@ -69,6 +69,34 @@ Notes:
 - `show_session_label` is **restart-only**: changing it and reloading has no
   effect until the daemon restarts.
 
+### Turning a job on and off
+
+Each cron job has an on/off switch in the web UI (**Cron Jobs** — in the job list
+and on the selected job's card). It is a thin wrapper over the reload above:
+
+`POST /api/cron/jobs/<id>/enable` · `POST /api/cron/jobs/<id>/disable`
+
+Both write `enabled:` for that one job in whichever file it was loaded from, then
+reload, so the change survives a restart instead of lasting until the next one.
+
+- Only the flag is rewritten — the scalar after `enabled:`, or one inserted line.
+  Comments, key order and formatting elsewhere in the file are preserved, and a
+  job that never had an `enabled:` key does not gain one until you toggle it.
+- The write and the reload are **atomic together**. If the reload is refused —
+  because of another job's typo, say — the file is put back, so it can never
+  claim a job is off while the scheduler keeps firing it.
+- A job defined in both files is edited in the one that **won** the merge
+  (`jobs.yaml`), leaving the shadowed `system.yaml` copy alone.
+- **Source runners have no switch.** They exist because their `sync` section is
+  enabled; turn them off there.
+- Under [lockdown](config.md#lockdown-remote-only-read-only) the cron files are
+  reviewed config, so the switch is disabled and the API answers `403`. Change
+  `enabled:` in the config repo and open a PR.
+
+Failures come back as `404` (no such job), `403` (lockdown) or `400` — the last
+covering a file this edit cannot be expressed in, such as a job written in flow
+style (`- {id: x, ...}`) that has no `enabled:` key to overwrite.
+
 ## Job Definition
 
 ```yaml

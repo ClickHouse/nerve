@@ -1477,6 +1477,39 @@ class TestLockdownTrackedConfigWrites:
             save_jobs([], ws / "config" / "cron" / "jobs.yaml")
 
     @pytest.mark.asyncio
+    async def test_cron_toggle_is_guarded_and_leaves_the_file_alone(
+        self, tmp_path, monkeypatch,
+    ):
+        """The UI's off switch writes tracked cron config, so lockdown owns it.
+
+        Asserts the file as well as the raise: a guard that refuses after writing
+        is not a guard, and writing the flag is the whole point of the method.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from nerve.cron.jobs import CronJob
+        from nerve.cron.service import CronService
+
+        ws = tmp_path / "ws"
+        cron_dir = ws / "config" / "cron"
+        cron_dir.mkdir(parents=True)
+        jobs_file = cron_dir / "jobs.yaml"
+        original = "jobs:\n  - id: j1\n    schedule: 1h\n    prompt: hi\n"
+        jobs_file.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
+
+        config = MagicMock()
+        config.timezone = "UTC"
+        config.cron.jobs_file = jobs_file
+        config.cron.system_file = cron_dir / "system.yaml"
+        service = CronService(config, AsyncMock(), AsyncMock())
+        service._jobs = [CronJob(id="j1", schedule="1h", prompt="hi")]
+
+        with pytest.raises(LockdownError):
+            await service.set_job_enabled("j1", False)
+        assert jobs_file.read_text(encoding="utf-8") == original
+
+    @pytest.mark.asyncio
     async def test_task_route_cannot_be_pointed_at_tracked_config(self, tmp_path, monkeypatch):
         """``task["file_path"]`` is a stored path joined to the workspace. Today
         the indexer only ever fills it from a glob of ``tasks/``, so this is depth

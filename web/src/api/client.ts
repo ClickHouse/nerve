@@ -653,6 +653,18 @@ export const api = {
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/rotate`, { method: 'POST' }),
+  setCronJobEnabled: (jobId: string, enabled: boolean) =>
+    request<{
+      job_id: string;
+      enabled: boolean;
+      /** False when the file already said so and only the reload ran. */
+      changed: boolean;
+      file: string;
+      reload: { added: string[]; removed: string[]; updated: string[] };
+    }>(
+      `/cron/jobs/${encodeURIComponent(jobId)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' },
+    ),
 
   // Skills
   listSkills: () => request<{ skills: any[] }>('/skills'),

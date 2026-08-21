@@ -1,9 +1,9 @@
 import { Link } from 'react-router-dom';
 import {
   RotateCw, Play, Loader2, Clock, Inbox, MessageSquare,
-  CheckCircle2, XCircle,
+  CheckCircle2, XCircle, Lock,
 } from 'lucide-react';
-import { useCronStore } from '../../stores/cronStore';
+import { useCronStore, type CronJob } from '../../stores/cronStore';
 import { chatPath } from './utils';
 
 export function JobTypeIcon({ type }: { type: string }) {
@@ -80,6 +80,66 @@ export function TriggerButton({ jobId, small = false }: { jobId: string; small?:
       {isTriggering ? <Loader2 size={small ? 12 : 14} className="animate-spin" /> : <Play size={small ? 12 : 14} />}
       {!small && !isTriggering && <span>Run</span>}
     </button>
+  );
+}
+
+/**
+ * On/off switch for a cron job's `enabled` flag.
+ *
+ * Same track-and-knob shape as the skills toggle, so the two read as one
+ * control rather than two conventions. Rendered as a real `switch` with
+ * `aria-checked` because that is what it is; the visual is unchanged.
+ *
+ * A job the server says cannot be toggled gets a locked, non-interactive
+ * switch whose tooltip is the server's reason — a control that is visibly
+ * unavailable beats one that looks live and fails on click.
+ */
+export function EnabledSwitch({ job }: { job: CronJob }) {
+  const { toggling, setJobEnabled } = useCronStore();
+  const pending = toggling === job.id;
+  const refusal = job.toggle_refusal;
+  const locked = Boolean(refusal);
+
+  const label = locked
+    ? refusal!
+    : `${job.enabled ? 'Disable' : 'Enable'} ${job.id}`;
+
+  return (
+    <span className="flex items-center gap-1 shrink-0">
+      <button
+        role="switch"
+        aria-checked={job.enabled}
+        aria-label={label}
+        disabled={locked || pending}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (locked || pending) return;
+          setJobEnabled(job.id, !job.enabled);
+        }}
+        onAuxClick={(e) => e.stopPropagation()}
+        className={`w-8 h-4 rounded-full transition-colors flex items-center shrink-0
+          ${job.enabled ? 'bg-emerald-600 justify-end' : 'bg-border-subtle justify-start'}
+          ${locked ? 'opacity-40 cursor-not-allowed'
+            : pending ? 'opacity-50 cursor-wait' : 'cursor-pointer'}`}
+        title={label}
+      >
+        <div className="w-3 h-3 rounded-full bg-white mx-0.5" />
+      </button>
+      {locked && <Lock size={11} className="text-text-faint" aria-hidden="true" />}
+    </span>
+  );
+}
+
+/** The reason the last toggle of *jobId* was rejected, if it was. */
+export function ToggleError({ jobId }: { jobId: string }) {
+  const message = useCronStore(s => s.toggleErrors[jobId]);
+  if (!message) return null;
+  return (
+    <div role="alert"
+      className="mt-2 flex items-start gap-1.5 text-[12px] text-hue-red">
+      <XCircle size={12} className="mt-0.5 shrink-0" />
+      <span className="min-w-0 break-words">{message}</span>
+    </div>
   );
 }
 
