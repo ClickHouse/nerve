@@ -1,3 +1,8 @@
+import type { FileDiff } from '../types/chat';
+import type {
+  Review, ReviewThread, ReviewComment, ReviewRepo, ReviewChangedFile,
+} from '../types/review';
+
 const API_BASE = '/api';
 
 /** One page of a lazily-loaded sidebar group (Archived / System). */
@@ -424,6 +429,51 @@ export const api = {
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+
+  // Code review (local git worktree review panel)
+  reviewRepos: () => request<{ repos: ReviewRepo[] }>('/review/repos'),
+  reviewChanged: (worktree: string, base = 'HEAD') =>
+    request<{ worktree: string; repo_root: string; base: string; files: ReviewChangedFile[] }>(
+      `/review/changed?${new URLSearchParams({ worktree, base })}`,
+    ),
+  reviewDiff: (worktree: string, path: string, base = 'HEAD') =>
+    request<FileDiff>(`/review/diff?${new URLSearchParams({ worktree, path, base })}`),
+  reviewFile: (worktree: string, path: string) =>
+    request<{ path: string; content: string | null; binary: boolean; too_large: boolean }>(
+      `/review/file?${new URLSearchParams({ worktree, path })}`,
+    ),
+  listReviews: (params?: { status?: string; session?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set('status', params.status);
+    if (params?.session) qs.set('session', params.session);
+    const q = qs.toString();
+    return request<{ reviews: Review[] }>(`/reviews${q ? '?' + q : ''}`);
+  },
+  createReview: (data: {
+    worktree: string; branch?: string | null; base_ref?: string;
+    target_session_id?: string | null; created_by?: string; title?: string;
+  }) => request<Review>('/reviews', { method: 'POST', body: JSON.stringify(data) }),
+  getReview: (id: string) => request<Review>(`/reviews/${id}`),
+  patchReview: (id: string, data: { title?: string; status?: string; target_session_id?: string | null }) =>
+    request<Review>(`/reviews/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteReview: (id: string) =>
+    request<{ deleted: boolean }>(`/reviews/${id}`, { method: 'DELETE' }),
+  addReviewThread: (id: string, data: {
+    file_path: string; side?: string; line_start?: number | null; line_end?: number | null;
+    anchor_snippet?: string | null; body?: string; author?: string;
+  }) => request<{ thread: ReviewThread; target_session_id: string | null }>(
+    `/reviews/${id}/threads`, { method: 'POST', body: JSON.stringify(data) },
+  ),
+  addReviewComment: (id: string, threadId: string, data: { body: string; author?: string }) =>
+    request<{ comment: ReviewComment; target_session_id: string | null }>(
+      `/reviews/${id}/threads/${threadId}/comments`, { method: 'POST', body: JSON.stringify(data) },
+    ),
+  resolveReviewThread: (id: string, threadId: string) =>
+    request<{ resolved: boolean }>(`/reviews/${id}/threads/${threadId}/resolve`, { method: 'POST' }),
+  submitReview: (id: string, summary: string) =>
+    request<{ submitted: number; target_session_id: string | null }>(
+      `/reviews/${id}/submit`, { method: 'POST', body: JSON.stringify({ summary }) },
+    ),
 
   // Chat (non-streaming)
   chat: (message: string, sessionId?: string) =>
