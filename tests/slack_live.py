@@ -584,13 +584,14 @@ async def wait_until_receiving(
             )
 
 
-def ignore_replays(channel) -> None:
-    """Make *channel* skip envelopes Slack is redelivering.
+def ignore_stale_events(channel) -> None:
+    """Make *channel* skip retries and events too old for the current test.
 
-    Tests only ever wait for a message they just posted, and a retried
-    envelope is at least a minute old — so it is always another test's, or
-    another run's, and letting it through is how one run's messages came to
-    appear in another's assertions.
+    Tests only ever wait for a message they just posted. A retried envelope,
+    or any Events API callback older than ``EVENT_TIMEOUT``, therefore belongs
+    to an earlier test or run. Slack has also delivered old callbacks without
+    ``retry_attempt`` metadata, so checking the documented top-level
+    ``event_time`` closes the hole that checking retry metadata alone leaves.
 
     Production does the opposite on purpose: a retry is how a message
     survives a restart, so the channel must handle it there. This is a
@@ -601,8 +602,15 @@ def ignore_replays(channel) -> None:
     listeners = channel._client.socket_mode_request_listeners
     installed = list(listeners)
 
-    async def drop_replays(sock, req):
-        if req.retry_attempt:
+    async def drop_stale(sock, req):
+        payload = req.payload or {}
+        event_time = payload.get("event_time")
+        try:
+            too_old = time.time() - float(event_time) > EVENT_TIMEOUT
+        except (TypeError, ValueError):
+            too_old = False
+
+        if req.retry_attempt or too_old:
             await sock.send_socket_mode_response(
                 SocketModeResponse(envelope_id=req.envelope_id),
             )
@@ -615,7 +623,7 @@ def ignore_replays(channel) -> None:
         for fn in installed:
             await fn(sock, req)
 
-    listeners[:] = [drop_replays]
+    listeners[:] = [drop_stale]
 
 
 def build_channel(

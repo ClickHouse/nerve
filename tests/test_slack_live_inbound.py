@@ -52,7 +52,7 @@ from tests.slack_live import (
     build_channel,
     make_client,
     wait_until_quiet,
-    ignore_replays,
+    ignore_stale_events,
     wait_until_receiving,
     requires_inbound,
     requires_outbound,
@@ -124,10 +124,10 @@ async def _connected_channel():
         RecordingRouter(), diagnostics_label="inbound",
     )
     await channel.start()
-    # Order matters. Replays are dropped first so the readiness probe cannot
-    # be satisfied by an old envelope, then readiness waits for the probe's
-    # own ts to prove Slack is delivering fresh events to this socket.
-    ignore_replays(channel)
+    # Order matters. Old events are dropped first so a readiness retry cannot
+    # reach the router, then readiness waits for the probe's own ts to prove
+    # Slack is delivering fresh events to this socket.
+    ignore_stale_events(channel)
     await wait_until_receiving(channel._client)
     await wait_until_quiet(channel)
     try:

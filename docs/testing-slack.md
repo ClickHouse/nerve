@@ -31,6 +31,9 @@ handshakes and connection counts, readiness-probe latency, retry attempt/reason
 and event age, quiet waits, and an aggregate summary by envelope type. The
 diagnostics deliberately omit tokens, channel/user ids, envelope ids, and
 message text, so a failed run can be shared without exposing workspace data.
+The inbound harness rejects both marked retries and callbacks whose documented
+`event_time` predates the current test window; Slack has produced old callbacks
+without retry metadata, so either signal alone is insufficient.
 
 | Variable | Value | Needed for |
 |---|---|---|

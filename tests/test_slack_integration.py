@@ -18,7 +18,11 @@ import pytest_asyncio
 from nerve.channels.slack import SlackChannel
 from nerve.config import NerveConfig, SlackConfig
 from tests.fake_slack import FakeSlack
-from tests.slack_live import ignore_replays, start_event_sink, wait_until_receiving
+from tests.slack_live import (
+    ignore_stale_events,
+    start_event_sink,
+    wait_until_receiving,
+)
 
 
 def _config(**slack_kwargs) -> NerveConfig:
@@ -60,9 +64,17 @@ class TestSocketMode:
         sink = await start_event_sink(
             "xoxb-fake", "xapp-fake", diagnostics_label="fake-sink",
         )
+        routed: list[str] = []
+
+        async def route(_client, req):
+            event = (req.payload or {}).get("event") or {}
+            if event.get("ts"):
+                routed.append(event["ts"])
+
+        sink.socket_mode_request_listeners.append(route)
         channel = MagicMock()
         channel._client = sink
-        ignore_replays(channel)
+        ignore_stale_events(channel)
         try:
             class ProbeClient:
                 posts = 0
@@ -103,10 +115,12 @@ class TestSocketMode:
             )
             await slack.push("events_api", {
                 "event_time": time.time() - 30,
-                "event": {"type": "message", "ts": str(time.time())},
+                "event": {"type": "message", "ts": "3.1"},
             })
             await slack.settle()
             assert len(slack.acks) == 5
+            assert "1.1" not in routed, "a marked retry reached the router"
+            assert "3.1" not in routed, "an unmarked stale event reached the router"
         finally:
             await sink.close()
             sink._live_diagnostics.emit_summary()
