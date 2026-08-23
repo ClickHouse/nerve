@@ -419,8 +419,14 @@ class NotificationService:
         notification_id: str,
         answer: str,
         answered_by: str,
+        actor: str | None = None,
     ) -> bool:
         """Process a user's answer to a question or approval.
+
+        ``answered_by`` is the transport and is routed on downstream, so the
+        person behind the answer travels beside it in ``actor`` — a Slack
+        member id, for example. It is persisted in the row's metadata,
+        carried into the approval audit record, and broadcast to the UI.
 
         - For ``type=approval`` rows: look up the dispatcher in the
           handler registry, run it, audit-log the outcome, then flip
@@ -438,16 +444,17 @@ class NotificationService:
 
         if notif.get("type") == "approval":
             return await self._handle_approval_answer(
-                notif, answer, answered_by,
+                notif, answer, answered_by, actor,
             )
 
         success = await self.db.answer_notification(
-            notification_id, answer, answered_by,
+            notification_id, answer, answered_by, actor=actor,
         )
         if not success:
             return False
 
         session_id = notif["session_id"]
+        attribution = {"answered_by_actor": actor} if actor else {}
 
         from nerve.agent.streaming import broadcaster
 
@@ -468,6 +475,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                **attribution,
             })
             return True
 
@@ -483,6 +491,7 @@ class NotificationService:
             "answer": answer,
             "answered_by": answered_by,
             "content": injected_message,
+            **attribution,
         })
 
         # Dispatch unconditionally — ``engine.run`` serializes per
@@ -510,6 +519,7 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            **attribution,
         })
 
         return True
@@ -519,6 +529,7 @@ class NotificationService:
         notif: dict[str, Any],
         answer: str,
         answered_by: str,
+        actor: str | None = None,
     ) -> bool:
         """Route an approval answer through the dispatcher registry."""
         notification_id = notif["id"]
@@ -580,7 +591,12 @@ class NotificationService:
                     },
                 )
 
-        await self._append_approval_audit(result.audit_event)
+        # Stamped here rather than in each dispatcher: who decided is a
+        # property of the answer, not of what the dispatcher did with it.
+        attribution: dict[str, Any] = {"answered_by": answered_by}
+        if actor:
+            attribution["answered_by_actor"] = actor
+        await self._append_approval_audit({**result.audit_event, **attribution})
 
         # Snooze keeps the row pending and stamps ``redeliver_at`` so
         # the periodic maintenance tick (:meth:`redeliver_due`) fans it
@@ -614,7 +630,7 @@ class NotificationService:
             )
         else:
             await self.db.answer_notification(
-                notification_id, answer, answered_by,
+                notification_id, answer, answered_by, actor=actor,
             )
 
         from nerve.agent.streaming import broadcaster
@@ -623,9 +639,9 @@ class NotificationService:
             "notification_id": notification_id,
             "session_id": session_id,
             "answer": answer,
-            "answered_by": answered_by,
             "approval_status": "snoozed" if snoozed else "answered",
             "dispatch_ok": result.ok,
+            **attribution,
         }
         if snoozed:
             payload["snooze_until"] = snooze_until

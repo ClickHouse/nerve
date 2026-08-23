@@ -6,6 +6,17 @@ import json
 from datetime import datetime, timezone
 
 
+def _loads_object(raw: object) -> dict:
+    """Parse a JSON column into a dict, tolerating NULL and bad values."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 class NotificationStore:
     """Mixin providing notification CRUD operations."""
 
@@ -97,20 +108,35 @@ class NotificationStore:
 
     async def answer_notification(
         self, notification_id: str, answer: str, answered_by: str,
+        actor: str | None = None,
     ) -> bool:
+        """Record an answer.
+
+        ``answered_by`` names the transport (``web``, ``telegram``,
+        ``slack``) and several callers route on it, so the person is kept
+        beside it in ``metadata.answered_by_actor`` rather than folded into
+        the same string. In a shared workspace that is the only record of
+        which member approved an action.
+        """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
             async with self.db.execute(
-                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                """SELECT metadata FROM notifications
+                   WHERE id = ? AND status = 'pending'""",
                 (notification_id,),
             ) as cursor:
-                if not await cursor.fetchone():
+                row = await cursor.fetchone()
+                if not row:
                     return False
+                metadata = _loads_object(row[0])
+            if actor:
+                metadata["answered_by_actor"] = actor
             await self.db.execute(
                 """UPDATE notifications
-                   SET answer = ?, answered_by = ?, answered_at = ?, status = 'answered'
+                   SET answer = ?, answered_by = ?, answered_at = ?,
+                       status = 'answered', metadata = ?
                    WHERE id = ?""",
-                (answer, answered_by, now, notification_id),
+                (answer, answered_by, now, json.dumps(metadata), notification_id),
             )
         return True
 

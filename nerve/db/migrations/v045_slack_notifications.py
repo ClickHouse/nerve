@@ -1,4 +1,4 @@
-"""V43: Slack delivery ids on notifications."""
+"""V45: Slack delivery ids on notifications."""
 
 from __future__ import annotations
 
@@ -23,4 +23,4 @@ async def up(db: aiosqlite.Connection) -> None:
         await db.execute(
             f"ALTER TABLE notifications ADD COLUMN {name} {decl}",
         )
-    logger.info("V43 migration: notifications carries Slack delivery ids")
+    logger.info("V45 migration: notifications carries Slack delivery ids")

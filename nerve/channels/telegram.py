@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
-import io
 import html as _html
 import logging
 import re
@@ -18,7 +17,6 @@ import socket
 import subprocess
 import sys
 import time
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
@@ -28,6 +26,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
+from nerve.channels.archives import (
+    IMAGE_EXT_TO_MIME,
+    MAX_TEXT_SIZE,
+    TEXT_EXTENSIONS,
+    extract_zip,
+)
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
@@ -1356,26 +1360,18 @@ class TelegramChannel(BaseChannel):
         "application/csv",
     }
 
-    # Extensions treated as text when MIME type is missing or generic
-    _TEXT_EXTENSIONS: set[str] = {
-        ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
-        ".toml", ".xml", ".html", ".htm", ".css", ".scss", ".less",
-        ".md", ".rst", ".csv", ".tsv", ".sql", ".sh", ".bash", ".zsh",
-        ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
-        ".swift", ".lua", ".r", ".m", ".pl", ".php", ".env", ".ini", ".cfg",
-        ".conf", ".log", ".diff", ".patch", ".vue", ".svelte",
-    }
+    # Extensions treated as text when MIME type is missing or generic. Shared
+    # with the Slack channel and with the archive unpacker, so a file type
+    # read inline here is read inline everywhere.
+    _TEXT_EXTENSIONS = TEXT_EXTENSIONS
 
     _IMAGE_MIMES: set[str] = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
     _ARCHIVE_MIMES: set[str] = {"application/zip", "application/x-zip-compressed"}
 
-    _IMAGE_EXT_TO_MIME: dict[str, str] = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
-    }
+    _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 
-    _MAX_TEXT_SIZE: int = 512 * 1024       # 512 KB — inline text cap
+    _MAX_TEXT_SIZE: int = MAX_TEXT_SIZE    # 512 KB — inline text cap
     _MAX_DOWNLOAD_SIZE: int = 20_000_000   # ~20 MB — Telegram Bot API limit
 
     async def _extract_document(
@@ -1469,7 +1465,12 @@ class TelegramChannel(BaseChannel):
     async def _extract_zip(
         self, doc: Any, file_name: str, meta_line: str,
     ) -> tuple[list[dict[str, str]], str]:
-        """Extract ZIP archive contents — text inline, images/PDFs as blocks."""
+        """Extract ZIP archive contents — text inline, images/PDFs as blocks.
+
+        The 20 MB download cap is on the compressed archive, so the bounds on
+        what it expands to live in :mod:`nerve.channels.archives`, shared with
+        the Slack channel.
+        """
         try:
             tg_file = await doc.get_file()
             data = await tg_file.download_as_bytearray()
@@ -1477,79 +1478,7 @@ class TelegramChannel(BaseChannel):
             logger.warning("Failed to download ZIP %s: %s", file_name, e)
             return [], meta_line
 
-        buf = io.BytesIO(bytes(data))
-        if not zipfile.is_zipfile(buf):
-            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-        buf.seek(0)
-
-        blocks: list[dict[str, str]] = []
-        parts: list[str] = [meta_line]
-
-        try:
-            with zipfile.ZipFile(buf) as zf:
-                entries = [
-                    i for i in zf.infolist()
-                    if not i.is_dir() and not i.filename.startswith("__MACOSX/")
-                ]
-                parts.append(f"Archive contains {len(entries)} file(s):")
-
-                total_text = 0
-                for info in entries:
-                    ename = info.filename
-                    esize = info.file_size
-                    eext = ""
-                    if "." in ename.rsplit("/", 1)[-1]:
-                        eext = "." + ename.rsplit(".", 1)[-1].lower()
-
-                    is_text = eext in self._TEXT_EXTENSIONS
-                    is_image = eext in self._IMAGE_EXT_TO_MIME
-                    is_pdf = eext == ".pdf"
-
-                    if is_text and total_text + esize <= self._MAX_TEXT_SIZE:
-                        try:
-                            raw = zf.read(info.filename)
-                            total_text += len(raw)
-                            text_content = raw.decode("utf-8", errors="replace")
-                            parts.append(
-                                f"--- {ename} ({esize} bytes) ---\n"
-                                f"```\n{text_content}\n```"
-                            )
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    elif is_text:
-                        parts.append(f"- {ename} ({esize} bytes) [text, too large to inline]")
-                    elif is_image:
-                        try:
-                            raw = zf.read(info.filename)
-                            img_mime = self._IMAGE_EXT_TO_MIME.get(eext, "image/png")
-                            blocks.append({
-                                "type": "base64",
-                                "media_type": img_mime,
-                                "data": base64.b64encode(raw).decode("utf-8"),
-                            })
-                            parts.append(f"- {ename} ({esize} bytes) [image]")
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    elif is_pdf:
-                        try:
-                            raw = zf.read(info.filename)
-                            blocks.append({
-                                "type": "base64",
-                                "media_type": "application/pdf",
-                                "data": base64.b64encode(raw).decode("utf-8"),
-                            })
-                            parts.append(f"- {ename} ({esize} bytes) [PDF]")
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    else:
-                        parts.append(f"- {ename} ({esize} bytes)")
-        except zipfile.BadZipFile:
-            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-        except RuntimeError as e:
-            # Password-protected archives
-            return [], f"{meta_line}\n(Cannot extract: {e})"
-
-        return blocks, "\n".join(parts)
+        return extract_zip(bytes(data), meta_line)
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""

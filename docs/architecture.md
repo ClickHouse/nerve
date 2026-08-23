@@ -79,6 +79,7 @@ Abstract communication layer with three components:
 - **StreamAdapter** — translates `StreamBroadcaster` events into channel-appropriate output (edit-in-place for Telegram, accumulated send for simple channels). Created per inbound message.
 
 - **AccessPolicy** (`access.py`) — allow/deny guardrails for senders and conversations, applied by a channel before a message becomes an `InboundMessage`. Deny wins, a non-empty allow list is a gate, and a policy with no allow patterns refuses everything. Same semantics as the inbox filters in `nerve/sources/filters.py`.
+- **Archives** (`archives.py`) — bounded one-level ZIP unpacking shared by Telegram and Slack. The download cap is on compressed bytes, so entry count, per-entry and aggregate uncompressed size, and compression ratio are all checked against the archive directory before an entry is read.
 
 Implementations:
 - **Telegram** — python-telegram-bot v21+ with partial message streaming (edit-in-place, 1.5s rate limit), inline keyboard buttons for notification questions, `/reply` command for free-text answers

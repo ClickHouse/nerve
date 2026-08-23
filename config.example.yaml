@@ -111,6 +111,9 @@ telegram:
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
 
 slack:
+  # Omitting this key leaves Slack off until both tokens below are set, so an
+  # install that does not use Slack never has to say so. Set it to true to be
+  # told about a missing token instead of having the channel stay down.
   enabled: false
   # Socket Mode — the bot dials out, so no public URL is needed. Both tokens
   # go in config.local.yaml:
@@ -136,11 +139,13 @@ slack:
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
   # Which /nerve subcommands the workspace may run. Chatting and notification
   # buttons are not commands, so they are unaffected.
-  #   omitted  — sessions, new, stop, star, unstar, reply
+  #   omitted  — new, stop, star, unstar
   #   []       — no slash commands at all
   #   [all]    — everything, including doctor and restart
   # doctor prints host health into a shared workspace and restart lets anyone
-  # on the allow list bounce the daemon, so both are opt-in.
+  # on the allow list bounce the daemon. sessions and reply reach every
+  # session in the instance, Telegram and web ones included, and are not
+  # scoped to the caller. All four are opt-in.
   # commands: [sessions, new, stop, reply]
 
 # Quiet hours (local timezone)

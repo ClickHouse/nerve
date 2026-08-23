@@ -1077,7 +1077,7 @@ users are ignored.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `slack.enabled` | bool | `true` | Enable the Slack bot |
+| `slack.enabled` | bool | see below | Enable the Slack bot |
 | `slack.bot_token` | string | - | Bot User OAuth Token (`xoxb-…`) |
 | `slack.app_token` | string | - | App-Level Token for Socket Mode (`xapp-…`) |
 | `slack.allow_users` | list[str] | `[]` | Senders allowed to reach the agent |
@@ -1090,6 +1090,14 @@ users are ignored.
 
 Both tokens are secrets — put them in `config.local.yaml`. Changing either
 needs a restart; the four guardrail lists take effect on reload.
+
+Slack is opt-in. Without an explicit `slack.enabled`, the channel is on only
+when both tokens are set, so a configuration that predates Slack — one with
+no `slack` section at all — stays off and `nerve doctor` says nothing about
+it. Set `enabled: true` to be told about missing tokens instead of having the
+channel quietly stay down. Under lockdown the channel is off unless
+`enabled: true` is explicit, because lockdown drops the machine-local layer
+that decides whether this box answers Slack.
 
 ### Setting up the Slack app
 
@@ -1234,12 +1242,23 @@ slack:
   commands: [all]                  # everything, including doctor and restart
 ```
 
-Omitting the key gives `sessions, new, stop, star, unstar, reply`.
-**`doctor` and `restart` are off unless you ask for them**: the first prints
-host health into a shared workspace, and the second lets anyone on the allow
-list bounce the daemon. An unknown name is dropped with a warning rather than
-refused, since the key exists to narrow access and a typo should not stop the
-daemon booting.
+Omitting the key gives `new, stop, star, unstar`. Four subcommands are off
+unless you ask for them:
+
+- **`doctor`** prints host health into a shared workspace.
+- **`restart`** lets anyone on the allow list bounce the daemon.
+- **`sessions`** lists every session in the instance, Telegram and web ones
+  included, and attaches the one you pick to your own Slack conversation.
+- **`reply`** answers the latest pending question anywhere in the instance.
+
+The last two are not scoped to the caller. Nerve has no ownership model for
+Slack yet, so with `allow_channels: [dm]` any member of the workspace who may
+DM the bot could otherwise enumerate someone else's private session, continue
+it, or answer a question that was never theirs. Turn them on in a workspace
+where everyone on the allow list is trusted with every session.
+
+An unknown name is dropped with a warning rather than refused, since the key
+exists to narrow access and a typo should not stop the daemon booting.
 
 `/nerve help` lists only what is enabled, and a disabled command says it is
 turned off rather than pretending not to exist.
@@ -1250,11 +1269,19 @@ Slack refuses them outright — it answers *"/nerve is not supported in
 threads"* — and the payload carries no thread reference. So a command run at
 channel level has to work out which thread you meant.
 
-`/nerve stop` and `/nerve star` therefore resolve across every live session in
-the channel, not just the channel-level one. With one session live they act on
-it and name it; with several they show a picker rather than guess, since
-stopping someone else's thread silently is worse than asking. With none they
-say so.
+`/nerve stop`, `/nerve star` and `/nerve unstar` therefore resolve across
+every live session in the channel, not just the channel-level one. With one
+session live they act on it and name it; with several they show a picker
+rather than guess, since acting on someone else's thread silently is worse
+than asking. With none they say so.
+
+`/nerve new` and `/nerve sessions` cannot work that way, because both have to
+*bind* a session to a conversation and only a thread id identifies one. In a
+channel with `reply_in_thread` on they refuse and say why. Nothing is lost:
+each new mention in such a channel already opens its own thread and its own
+session, and `/nerve stop` ends one. Both commands work normally in a direct
+message and in a channel with `reply_in_thread: false`, where an ordinary
+message routes to the channel-level key the command can name.
 
 ### Testing against a real workspace
 

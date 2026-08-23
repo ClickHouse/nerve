@@ -25,15 +25,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
-import io
 import logging
 import re
 import time
-import zipfile
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
 from nerve.channels.access import AccessPolicy, Identity, needs_name_resolution
+from nerve.channels.archives import (
+    IMAGE_EXT_TO_MIME,
+    MAX_TEXT_SIZE,
+    TEXT_EXTENSIONS,
+    extract_zip,
+)
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
@@ -71,6 +75,10 @@ _NAME_CACHE_TTL = 600.0
 _MAX_INFLIGHT = 100
 # Slack renders at most 25 elements in one actions block.
 _MAX_ACTION_ELEMENTS = 25
+# Star picker action ids: ``starpick:<1|0>:<session id>``. Distinct from the
+# session card's ``sessstar:`` toggle, which flips whatever the row holds —
+# a picker has to set the state the command asked for.
+_STAR_ACTION_PREFIX = "starpick:"
 
 # Message subtypes that are not a person talking. ``file_share`` and
 # ``thread_broadcast`` are absent on purpose: the first is a real message that
@@ -91,21 +99,11 @@ _IGNORED_SUBTYPES = frozenset({
     "channel_unarchive",
 })
 
-_MAX_TEXT_SIZE = 512 * 1024        # inline text cap
+_MAX_TEXT_SIZE = MAX_TEXT_SIZE     # inline text cap
 _MAX_DOWNLOAD_SIZE = 20_000_000    # refuse to pull anything larger into a prompt
 
-_TEXT_EXTENSIONS: frozenset[str] = frozenset({
-    ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
-    ".toml", ".xml", ".html", ".htm", ".css", ".scss", ".less",
-    ".md", ".rst", ".csv", ".tsv", ".sql", ".sh", ".bash", ".zsh",
-    ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
-    ".swift", ".lua", ".r", ".m", ".pl", ".php", ".env", ".ini", ".cfg",
-    ".conf", ".log", ".diff", ".patch", ".vue", ".svelte",
-})
-_IMAGE_EXT_TO_MIME: dict[str, str] = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
-}
+_TEXT_EXTENSIONS = TEXT_EXTENSIONS
+_IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 
 # Unicode emoji → Slack short name. The agent's set_reaction tool speaks the
 # Telegram reaction vocabulary; reactions.add only accepts short names. An
@@ -395,6 +393,11 @@ def build_sessions_blocks(
     return blocks
 
 
+# One section block holds 3000 chars, and one message holds 50 blocks. The
+# section budget leaves room for the option rows below them.
+_MAX_SECTION_LEN = 3000
+_MAX_SECTION_BLOCKS = 45
+
 # Slack renders a styled button in green or red. Keys are the canonical
 # approval ``value`` strings that NotificationService sends.
 _APPROVAL_STYLES: dict[str, str] = {
@@ -414,11 +417,23 @@ def build_notification_blocks(
     button's ``value`` field and the notification id in ``action_id``;
     Slack allows 2000 chars for each, so neither needs the truncation
     Telegram's 64-byte ``callback_data`` forces.
+
+    3000 characters is the limit on one section, not on the message, so a
+    long body is spread over several sections at line boundaries. Only a
+    body past the whole-message block limit loses anything, and it says so.
     """
-    blocks: list[dict[str, Any]] = [{
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": _md_to_slack(text)[:3000]},
-    }]
+    chunks = split_message(_md_to_slack(text), _MAX_SECTION_LEN)
+    if len(chunks) > _MAX_SECTION_BLOCKS:
+        dropped = sum(len(c) for c in chunks[_MAX_SECTION_BLOCKS - 1:])
+        chunks = chunks[: _MAX_SECTION_BLOCKS - 1]
+        chunks.append(
+            f"_… {dropped} more characters — open the notification in the "
+            "web UI to read the rest._",
+        )
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+        for chunk in chunks
+    ]
     elements = [
         {
             "type": "button",
@@ -1160,7 +1175,7 @@ class SlackChannel(BaseChannel):
                 if data is None:
                     parts.append(meta)
                     continue
-                zip_blocks, zip_text = _extract_zip(data, meta)
+                zip_blocks, zip_text = extract_zip(data, meta)
                 blocks.extend(zip_blocks)
                 parts.append(zip_text)
                 continue
@@ -1379,6 +1394,15 @@ class SlackChannel(BaseChannel):
             )
             return
 
+        # `sessions` and `new` bind a session to the command's own key. In a
+        # threaded channel nothing ever reads that key, so they would answer
+        # as if they had worked and change nothing.
+        if sub in ("sessions", "new") and not self._binds_to_channel_key(channel_id):
+            await self._respond_ephemeral(
+                channel_id, user_id, self._THREADED_CHANNEL_REFUSAL.format(sub=sub),
+            )
+            return
+
         if sub == "sessions":
             await self._send_sessions_view(channel_id, user_id, channel_key)
         elif sub == "new":
@@ -1432,6 +1456,31 @@ class SlackChannel(BaseChannel):
             return "No `/nerve` commands are enabled for this workspace."
         return "*Nerve commands*\n" + "\n".join(line for _, line in lines)
 
+    _THREADED_CHANNEL_REFUSAL = (
+        "`/nerve {sub}` needs a thread to bind the session to, and Slack does "
+        "not run `/nerve` inside one. Every new mention in this channel "
+        "already opens its own thread and its own session. Use `/nerve stop` "
+        "to end one, or set `slack.reply_in_thread: false` to keep a single "
+        "session per channel."
+    )
+
+    def _binds_to_channel_key(self, channel_id: str) -> bool:
+        """Whether ordinary messages here land on the command's own key.
+
+        A slash command carries no thread reference, so it can only name
+        ``slack:<channel>``. A direct message routes there, and so does a
+        channel message while ``reply_in_thread`` is off. With it on, a
+        channel message opens a thread and routes to
+        ``slack:<channel>:<ts>`` instead, so a session bound at channel level
+        is never read again: the command reports success and the next message
+        starts somewhere else.
+        """
+        if not channel_id:
+            return False
+        if channel_id.startswith("D"):
+            return True
+        return not self.config.slack.reply_in_thread
+
     async def _cmd_new(
         self, channel_id: str, user_id: str, channel_key: str, args: list[str],
     ) -> None:
@@ -1480,6 +1529,50 @@ class SlackChannel(BaseChannel):
         label = f"{title} ({where})"
         return label[:74] + "…" if len(label) > 75 else label
 
+    def _session_picker_blocks(
+        self,
+        candidates: list[dict[str, Any]],
+        prompt: str,
+        action_prefix: str,
+        style: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """One button per live session, so the caller names the target.
+
+        Slack does not allow ``/nerve`` inside a thread, so a command cannot
+        say which of a channel's threads was meant. Asking is safer than
+        acting on whichever row the query returned first.
+        """
+        return [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*{len(candidates)} sessions are live in this "
+                        f"channel.* {prompt}"
+                    ),
+                },
+            },
+            *[
+                {
+                    "type": "actions",
+                    "block_id": f"{action_prefix}row:{row['session_id']}",
+                    "elements": [{
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": self._session_choice_label(row),
+                            "emoji": True,
+                        },
+                        "action_id": f"{action_prefix}{row['session_id']}",
+                        "value": row["session_id"],
+                        **({"style": style} if style else {}),
+                    }],
+                }
+                for row in candidates[:_MAX_ACTION_ELEMENTS]
+            ],
+        ]
+
     async def _cmd_stop(
         self, channel_id: str, user_id: str, channel_key: str,
     ) -> None:
@@ -1494,42 +1587,12 @@ class SlackChannel(BaseChannel):
             await self._stop_and_report(channel_id, user_id, candidates[0])
             return
 
-        # Several threads are live and the command cannot say which was
-        # meant. Ask instead of stopping someone else's turn.
         await self._respond_ephemeral_blocks(
             channel_id, user_id,
             text="Which session should I stop?",
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"*{len(candidates)} sessions are live in this "
-                            "channel.* Slack does not allow `/nerve` inside a "
-                            "thread, so pick the one to stop:"
-                        ),
-                    },
-                },
-                *[
-                    {
-                        "type": "actions",
-                        "block_id": f"stop_row:{row['session_id']}",
-                        "elements": [{
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": self._session_choice_label(row),
-                                "emoji": True,
-                            },
-                            "action_id": f"sessstop:{row['session_id']}",
-                            "value": row["session_id"],
-                            "style": "danger",
-                        }],
-                    }
-                    for row in candidates[:_MAX_ACTION_ELEMENTS]
-                ],
-            ],
+            blocks=self._session_picker_blocks(
+                candidates, "Pick the one to stop:", "sessstop:", style="danger",
+            ),
         )
 
     async def _stop_and_report(
@@ -1552,22 +1615,44 @@ class SlackChannel(BaseChannel):
         # Same thread-blindness as stop: resolve across the conversation
         # rather than the command's own key, which usually owns nothing.
         candidates = await self._live_sessions_for_channel(channel_id)
+        verb = "star" if starred else "unstar"
         if not candidates:
             await self._respond_ephemeral(
-                channel_id, user_id, "No active session to star in this channel.",
+                channel_id, user_id,
+                f"No active session to {verb} in this channel.",
             )
             return
-        current = candidates[0]["session_id"]
+
+        if len(candidates) == 1:
+            await self._star_and_report(
+                channel_id, user_id, candidates[0]["session_id"], starred,
+            )
+            return
+
+        await self._respond_ephemeral_blocks(
+            channel_id, user_id,
+            text=f"Which session should I {verb}?",
+            blocks=self._session_picker_blocks(
+                candidates,
+                f"Pick the one to {verb}:",
+                f"{_STAR_ACTION_PREFIX}{int(starred)}:",
+            ),
+        )
+
+    async def _star_and_report(
+        self, channel_id: str, user_id: str, session_id: str, starred: bool,
+    ) -> None:
+        """Star or unstar one session and name it in the reply."""
         try:
-            await self.router.set_session_starred(current, starred)
+            await self.router.set_session_starred(session_id, starred)
         except ValueError as e:
             await self._respond_ephemeral(channel_id, user_id, str(e))
             return
         await self._respond_ephemeral(
             channel_id, user_id,
-            f"⭐ Starred `{current}` — it won't auto-close when idle."
+            f"⭐ Starred `{session_id}` — it won't auto-close when idle."
             if starred
-            else f"☆ Unstarred `{current}` — normal auto-close applies.",
+            else f"☆ Unstarred `{session_id}` — normal auto-close applies.",
         )
 
     async def _cmd_reply(self, channel_id: str, user_id: str, answer: str) -> None:
@@ -1589,6 +1674,7 @@ class SlackChannel(BaseChannel):
             return
         ok = await self._notification_service.handle_answer(
             notification_id=pending[0]["id"], answer=answer, answered_by="slack",
+            actor=user_id or None,
         )
         await self._respond_ephemeral(
             channel_id, user_id,
@@ -1689,6 +1775,10 @@ class SlackChannel(BaseChannel):
             )
             return
 
+        if action_id.startswith(_STAR_ACTION_PREFIX):
+            await self._handle_star_button(action_id, value, response_url)
+            return
+
         if action_id.startswith("sess:") or action_id.startswith("sessstar:"):
             await self._handle_session_button(
                 action_id, value, channel_id, user_id, response_url,
@@ -1700,6 +1790,29 @@ class SlackChannel(BaseChannel):
                 action_id, value, payload, response_url,
             )
 
+    async def _handle_star_button(
+        self, action_id: str, value: str, response_url: str,
+    ) -> None:
+        """Star or unstar the session picked from the `/nerve star` card."""
+        parts = action_id.split(":", 2)
+        if len(parts) < 3:
+            return
+        starred = parts[1] == "1"
+        session_id = value or parts[2]
+        try:
+            await self.router.set_session_starred(session_id, starred)
+        except ValueError:
+            await self._replace_via_url(
+                response_url, "That session is no longer available.",
+            )
+            return
+        await self._replace_via_url(
+            response_url,
+            f"⭐ Starred `{session_id}`."
+            if starred
+            else f"☆ Unstarred `{session_id}`.",
+        )
+
     async def _handle_session_button(
         self,
         action_id: str,
@@ -1710,6 +1823,19 @@ class SlackChannel(BaseChannel):
     ) -> None:
         """Switch, create, or star a session from the switcher card."""
         channel_key = f"slack:{format_target(channel_id)}"
+
+        # A card posted before `reply_in_thread` was turned on, or one kept
+        # open in a threaded channel, would bind the session to a key no
+        # message ever reads. Starring does not touch the mapping, so it is
+        # still allowed.
+        if not action_id.startswith("sessstar:") and not self._binds_to_channel_key(
+            channel_id,
+        ):
+            await self._replace_via_url(
+                response_url,
+                self._THREADED_CHANNEL_REFUSAL.format(sub="sessions"),
+            )
+            return
 
         if action_id.startswith("sessstar:"):
             try:
@@ -1751,8 +1877,10 @@ class SlackChannel(BaseChannel):
             await self._replace_via_url(response_url, "Service unavailable.")
             return
 
+        actor = (payload.get("user") or {}).get("id") or ""
         success = await self._notification_service.handle_answer(
             notification_id=notification_id, answer=answer, answered_by="slack",
+            actor=actor or None,
         )
         if not success:
             await self._replace_via_url(
@@ -1760,18 +1888,28 @@ class SlackChannel(BaseChannel):
             )
             return
 
-        original = ""
-        for block in (payload.get("message") or {}).get("blocks") or []:
-            if block.get("type") == "section":
-                original = (block.get("text") or {}).get("text") or ""
-                break
+        # The card's section text is the mrkdwn Slack already stores. Running
+        # it through the Markdown converter a second time turns *bold* into
+        # _italic_ and escapes the link markup, so it is carried across
+        # verbatim and only the status line is converted.
+        original = "\n".join(
+            (block.get("text") or {}).get("text") or ""
+            for block in (payload.get("message") or {}).get("blocks") or []
+            if block.get("type") == "section"
+        ).strip("\n")
 
-        status = f"✅ Answered: {answer}"
+        status = f"✅ Answered: {_md_to_slack(answer)}"
         snoozed_until = await self._get_snoozed_until(notification_id)
         if snoozed_until:
             status = f"💤 Snoozed until {snoozed_until} — will resurface"
+        # Written as raw mention markup: the converter would escape it, and
+        # the card is the only place a reader sees who pressed the button.
+        if actor:
+            status += f" (by <@{actor}>)"
         await self._replace_via_url(
-            response_url, f"{original}\n\n{status}" if original else status,
+            response_url,
+            f"{original}\n\n{status}" if original else status,
+            already_mrkdwn=True,
         )
 
     async def _get_snoozed_until(self, notification_id: str) -> str | None:
@@ -1797,12 +1935,20 @@ class SlackChannel(BaseChannel):
             return None
 
     async def _replace_via_url(
-        self, response_url: str, text: str, blocks: list[dict] | None = None,
+        self,
+        response_url: str,
+        text: str,
+        blocks: list[dict] | None = None,
+        already_mrkdwn: bool = False,
     ) -> None:
         """Replace the card a button lives on.
 
         ``response_url`` is the only way to edit an ephemeral message, and it
         works for in-channel cards too, so both paths use it.
+
+        ``already_mrkdwn`` says *text* came back off a card Slack rendered,
+        so it must go out untouched. Converting it again reads the mrkdwn as
+        Markdown and rewrites the message.
         """
         if not response_url:
             return
@@ -1810,7 +1956,7 @@ class SlackChannel(BaseChannel):
 
         body: dict[str, Any] = {
             "replace_original": True,
-            "text": _md_to_slack(text) if not blocks else text,
+            "text": text if (blocks or already_mrkdwn) else _md_to_slack(text),
         }
         if blocks:
             body["blocks"] = blocks
@@ -1819,66 +1965,3 @@ class SlackChannel(BaseChannel):
                 await client.post(response_url, json=body)
         except Exception as e:
             logger.debug("Slack response_url update failed: %s", e)
-
-
-def _extract_zip(data: bytes, meta_line: str) -> tuple[list[dict[str, str]], str]:
-    """Unpack a ZIP one level — text inline, images and PDFs as blocks."""
-    buf = io.BytesIO(data)
-    if not zipfile.is_zipfile(buf):
-        return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-    buf.seek(0)
-
-    blocks: list[dict[str, str]] = []
-    parts: list[str] = [meta_line]
-    try:
-        with zipfile.ZipFile(buf) as zf:
-            entries = [
-                i for i in zf.infolist()
-                if not i.is_dir() and not i.filename.startswith("__MACOSX/")
-            ]
-            parts.append(f"Archive contains {len(entries)} file(s):")
-            total_text = 0
-            for info in entries:
-                name = info.filename
-                size = info.file_size
-                ext = ""
-                if "." in name.rsplit("/", 1)[-1]:
-                    ext = "." + name.rsplit(".", 1)[-1].lower()
-
-                if ext in _TEXT_EXTENSIONS and total_text + size <= _MAX_TEXT_SIZE:
-                    try:
-                        raw = zf.read(info.filename)
-                        total_text += len(raw)
-                        parts.append(
-                            f"--- {name} ({size} bytes) ---\n"
-                            f"```\n{raw.decode('utf-8', errors='replace')}\n```"
-                        )
-                    except Exception:
-                        parts.append(f"- {name} ({size} bytes) [read error]")
-                elif ext in _TEXT_EXTENSIONS:
-                    parts.append(f"- {name} ({size} bytes) [text, too large to inline]")
-                elif ext in _IMAGE_EXT_TO_MIME or ext == ".pdf":
-                    try:
-                        raw = zf.read(info.filename)
-                        blocks.append({
-                            "type": "base64",
-                            "media_type": (
-                                "application/pdf" if ext == ".pdf"
-                                else _IMAGE_EXT_TO_MIME[ext]
-                            ),
-                            "data": base64.b64encode(raw).decode("utf-8"),
-                        })
-                        parts.append(
-                            f"- {name} ({size} bytes) "
-                            f"[{'PDF' if ext == '.pdf' else 'image'}]"
-                        )
-                    except Exception:
-                        parts.append(f"- {name} ({size} bytes) [read error]")
-                else:
-                    parts.append(f"- {name} ({size} bytes)")
-    except zipfile.BadZipFile:
-        return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-    except RuntimeError as e:
-        return [], f"{meta_line}\n(Cannot extract: {e})"
-
-    return blocks, "\n".join(parts)

@@ -966,7 +966,35 @@ class TestCommandExposure:
         enabled = self._ch().enabled_commands
         assert "doctor" not in enabled
         assert "restart" not in enabled
-        assert {"sessions", "new", "stop", "reply"} <= enabled
+        assert {"new", "stop", "star", "unstar"} <= enabled
+
+    def test_globally_scoped_commands_are_off_by_default(self):
+        # sessions lists and attaches every session in the instance, and
+        # reply answers whichever question is pending anywhere. In a
+        # workspace where several people may DM the bot, that is one
+        # member reading and continuing another's work.
+        enabled = self._ch().enabled_commands
+        assert "sessions" not in enabled
+        assert "reply" not in enabled
+
+    @pytest.mark.asyncio
+    async def test_sessions_is_refused_unless_it_was_asked_for(self):
+        channel = self._ch()
+        channel.router.list_sessions = AsyncMock(return_value=[])
+        said = await self._run(channel, "sessions")
+        assert "turned off" in said
+        channel.router.list_sessions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reply_is_refused_unless_it_was_asked_for(self):
+        channel = self._ch()
+        channel._notification_service = MagicMock()
+        said = await self._run(channel, "reply yes")
+        assert "turned off" in said
+
+    def test_both_are_still_available_on_request(self):
+        enabled = self._ch(commands=["sessions", "reply"]).enabled_commands
+        assert enabled == frozenset({"sessions", "reply"})
 
     def test_an_explicit_list_narrows_the_set(self):
         assert self._ch(commands=["reply"]).enabled_commands == frozenset({"reply"})
@@ -1007,3 +1035,474 @@ class TestCommandExposure:
     @pytest.mark.asyncio
     async def test_help_says_so_when_nothing_is_enabled(self):
         assert "No `/nerve` commands" in await self._run(self._ch(commands=[]), "help")
+
+
+class TestCommandsBindTheKeyMessagesRead:
+    """A slash command can only name ``slack:<channel>``.
+
+    With ``reply_in_thread`` on, a channel message opens a thread and routes
+    to ``slack:<channel>:<ts>``, so a session bound at channel level was
+    never read again: `/nerve new` reported a new session, left the running
+    thread alone, and the next mention started somewhere else.
+    """
+
+    def _ch(self, **kw):
+        channel = _channel(allow_users=["U1"], **kw)
+        channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+        channel.router.create_session = AsyncMock(return_value="s-new")
+        channel.router.switch_session = AsyncMock()
+        channel.router.engine.stop_session = AsyncMock(return_value=True)
+        channel.router.list_sessions = AsyncMock(return_value=[])
+        return channel
+
+    async def _route(self, bot, **event) -> str:
+        """The channel key an ordinary message in this conversation lands on."""
+        base = {"type": "message", "user": "U1", "text": "<@U0BOT> hi"}
+        await bot._handle_message_event({**base, **event})
+        return bot.router.handle_message.await_args[0][0].channel_key
+
+    async def _run(self, channel, channel_id, text) -> str:
+        await channel._handle_slash_command({
+            "user_id": "U1", "channel_id": channel_id, "text": text,
+        })
+        return channel._web.chat_postEphemeral.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_dm_command_binds_the_key_a_dm_message_reads(self):
+        channel = self._ch()
+        routed = await self._route(
+            channel, channel="D1", channel_type="im", ts="1.1",
+        )
+        await self._run(channel, "D1", "new")
+        bound = channel.router.create_session.await_args[0][0]
+        assert bound == routed == "slack:D1"
+
+    @pytest.mark.asyncio
+    async def test_a_dm_thread_keeps_a_session_of_its_own(self):
+        # A reply inside a DM thread is its own conversation, so it does not
+        # pick up what the command bound to the DM itself.
+        channel = self._ch()
+        routed = await self._route(
+            channel, channel="D1", channel_type="im", ts="1.2", thread_ts="1.0",
+        )
+        assert routed == "slack:D1:1.0"
+
+    @pytest.mark.asyncio
+    async def test_a_threaded_channel_refuses_rather_than_orphaning_a_session(self):
+        channel = self._ch()
+        routed = await self._route(
+            channel, channel="C1", channel_type="channel", ts="1.1",
+        )
+        assert routed == "slack:C1:1.1"
+
+        said = await self._run(channel, "C1", "new")
+        channel.router.create_session.assert_not_called()
+        channel.router.engine.stop_session.assert_not_called()
+        assert "needs a thread" in said
+
+    @pytest.mark.asyncio
+    async def test_a_thread_reply_is_not_stopped_by_a_channel_command(self):
+        channel = self._ch()
+        await self._route(
+            channel, channel="C1", channel_type="channel",
+            ts="1.2", thread_ts="1.0",
+        )
+        await self._run(channel, "C1", "new")
+        channel.router.engine.stop_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unthreaded_channel_binds_the_key_a_message_reads(self):
+        channel = self._ch(reply_in_thread=False)
+        routed = await self._route(
+            channel, channel="C1", channel_type="channel", ts="1.1",
+        )
+        await self._run(channel, "C1", "new")
+        bound = channel.router.create_session.await_args[0][0]
+        assert bound == routed == "slack:C1"
+
+    @pytest.mark.asyncio
+    async def test_an_unthreaded_thread_reply_shares_the_channel_session(self):
+        channel = self._ch(reply_in_thread=False)
+        routed = await self._route(
+            channel, channel="C1", channel_type="channel",
+            ts="1.2", thread_ts="1.0",
+        )
+        assert routed == "slack:C1"
+
+    @pytest.mark.asyncio
+    async def test_the_session_picker_is_refused_in_a_threaded_channel(self):
+        # Its selection is written under the channel-level key too.
+        channel = self._ch(commands=["sessions"])
+        said = await self._run(channel, "C1", "sessions")
+        channel.router.list_sessions.assert_not_called()
+        assert "needs a thread" in said
+
+    @pytest.mark.asyncio
+    async def test_the_session_picker_still_opens_in_a_dm(self):
+        channel = self._ch(commands=["sessions"])
+        channel.router.get_last_session = AsyncMock(return_value=None)
+        await self._run(channel, "D1", "sessions")
+        channel.router.list_sessions.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_picker_button_refuses_to_bind_in_a_threaded_channel(self):
+        channel = self._ch(commands=["sessions"])
+        channel._replace_via_url = AsyncMock()
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "sess:s9", "value": "s9"}],
+        })
+        channel.router.switch_session.assert_not_called()
+        assert "needs a thread" in channel._replace_via_url.await_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_a_picker_button_still_switches_in_a_dm(self):
+        channel = self._ch(commands=["sessions"])
+        channel._replace_via_url = AsyncMock()
+        channel.router.get_last_session = AsyncMock(return_value=None)
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "D1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "sess:s9", "value": "s9"}],
+        })
+        channel.router.switch_session.assert_awaited_once_with("slack:D1", "s9")
+
+    @pytest.mark.asyncio
+    async def test_starring_from_the_card_works_in_a_threaded_channel(self):
+        # Starring changes no mapping, so the thread guard must not block it.
+        channel = self._ch(commands=["sessions"])
+        channel._replace_via_url = AsyncMock()
+        channel.router.toggle_session_starred = AsyncMock(return_value=True)
+        channel.router.get_last_session = AsyncMock(return_value=None)
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "sessstar:s9", "value": "s9"}],
+        })
+        channel.router.toggle_session_starred.assert_awaited_once_with("s9")
+
+
+class TestStarPicker:
+    """`/nerve star` used to act on ``candidates[0]``.
+
+    `/nerve stop` shows a picker and the documentation said both did, so a
+    star landed on whichever thread the query returned first.
+    """
+
+    def _ch(self, sessions):
+        channel = _channel(allow_users=["U1"])
+        channel.router.list_conversation_sessions = AsyncMock(return_value=sessions)
+        channel.router.set_session_starred = AsyncMock(return_value=True)
+        channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+        return channel
+
+    @staticmethod
+    def _row(sid, thread=None, title=None):
+        key = f"slack:C1:{thread}" if thread else "slack:C1"
+        return {"channel_key": key, "session_id": sid, "title": title or sid}
+
+    @pytest.mark.asyncio
+    async def test_nothing_live_says_so_plainly(self):
+        channel = self._ch([])
+        await channel._cmd_star("C1", "U1", "slack:C1", True)
+        channel.router.set_session_starred.assert_not_called()
+        said = channel._web.chat_postEphemeral.await_args.kwargs["text"]
+        assert "No active session to star" in said
+
+    @pytest.mark.asyncio
+    async def test_nothing_live_names_the_unstar_verb(self):
+        channel = self._ch([])
+        await channel._cmd_star("C1", "U1", "slack:C1", False)
+        said = channel._web.chat_postEphemeral.await_args.kwargs["text"]
+        assert "unstar" in said
+
+    @pytest.mark.asyncio
+    async def test_one_candidate_is_starred_and_named(self):
+        channel = self._ch([self._row("s1", thread="1.0")])
+        await channel._cmd_star("C1", "U1", "slack:C1", True)
+        channel.router.set_session_starred.assert_awaited_once_with("s1", True)
+        assert "s1" in channel._web.chat_postEphemeral.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_several_candidates_ask_instead_of_guessing(self):
+        channel = self._ch([
+            self._row("s1", thread="1.0", title="Deploy"),
+            self._row("s2", thread="2.0", title="Triage"),
+        ])
+        await channel._cmd_star("C1", "U1", "slack:C1", True)
+        channel.router.set_session_starred.assert_not_called()
+        blocks = channel._web.chat_postEphemeral.await_args.kwargs["blocks"]
+        action_ids = [
+            e["action_id"]
+            for b in blocks if b["type"] == "actions" for e in b["elements"]
+        ]
+        assert action_ids == ["starpick:1:s1", "starpick:1:s2"]
+
+    @pytest.mark.asyncio
+    async def test_the_unstar_picker_carries_the_state_it_will_set(self):
+        # The session card's own toggle flips whatever the row holds; a
+        # picker has to set what the command asked for.
+        channel = self._ch([
+            self._row("s1", thread="1.0"), self._row("s2", thread="2.0"),
+        ])
+        await channel._cmd_star("C1", "U1", "slack:C1", False)
+        blocks = channel._web.chat_postEphemeral.await_args.kwargs["blocks"]
+        action_ids = [
+            e["action_id"]
+            for b in blocks if b["type"] == "actions" for e in b["elements"]
+        ]
+        assert action_ids == ["starpick:0:s1", "starpick:0:s2"]
+
+    @pytest.mark.asyncio
+    async def test_the_picker_button_stars_the_chosen_session(self):
+        channel = self._ch([])
+        channel._replace_via_url = AsyncMock()
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "starpick:1:s2", "value": "s2"}],
+        })
+        channel.router.set_session_starred.assert_awaited_once_with("s2", True)
+
+    @pytest.mark.asyncio
+    async def test_the_picker_button_unstars_the_chosen_session(self):
+        channel = self._ch([])
+        channel._replace_via_url = AsyncMock()
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "starpick:0:s2", "value": "s2"}],
+        })
+        channel.router.set_session_starred.assert_awaited_once_with("s2", False)
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_session_is_reported_not_raised(self):
+        channel = self._ch([])
+        channel._replace_via_url = AsyncMock()
+        channel.router.set_session_starred = AsyncMock(side_effect=ValueError("gone"))
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "starpick:1:s2", "value": "s2"}],
+        })
+        assert "no longer available" in channel._replace_via_url.await_args[0][1]
+
+
+class TestNotificationSections:
+    """3000 characters is the limit on one section, not on the message.
+
+    Slicing there dropped everything past it with no sign anything was
+    missing, while Block Kit allows the content to be spread over several
+    sections instead.
+    """
+
+    @staticmethod
+    def _sections(blocks) -> list[str]:
+        return [b["text"]["text"] for b in blocks if b["type"] == "section"]
+
+    def test_content_just_below_the_limit_is_one_section(self):
+        assert len(self._sections(build_notification_blocks("x" * 2999, "n1"))) == 1
+
+    def test_content_exactly_at_the_limit_is_one_section(self):
+        assert len(self._sections(build_notification_blocks("x" * 3000, "n1"))) == 1
+
+    def test_content_one_past_the_limit_is_split_not_cut(self):
+        sections = self._sections(build_notification_blocks("x" * 3001, "n1"))
+        assert len(sections) == 2
+        assert "".join(sections) == "x" * 3001
+
+    def test_a_long_body_keeps_every_line(self):
+        body = "\n".join(f"line {i:04d}" for i in range(800))
+        sections = self._sections(build_notification_blocks(body, "n1"))
+        assert len(sections) > 1
+        assert "\n".join(sections) == body
+
+    def test_every_section_fits_slacks_limit(self):
+        body = "\n".join(f"line {i:04d}" for i in range(2000))
+        sections = self._sections(build_notification_blocks(body, "n1"))
+        assert all(len(s) <= 3000 for s in sections)
+
+    def test_the_option_buttons_still_follow_the_text(self):
+        blocks = build_notification_blocks(
+            "y" * 7000, "n1", [("Approve", "approve")],
+        )
+        assert blocks[-1]["type"] == "actions"
+        assert blocks[-1]["elements"][0]["action_id"] == "notif:n1:approve"
+
+    def test_a_body_past_the_block_limit_says_what_it_dropped(self):
+        # 50 blocks is a hard limit on the whole message, so the only
+        # content that can be lost is content Slack would refuse anyway.
+        import nerve.channels.slack as slack_module
+
+        blocks = build_notification_blocks("z" * 400_000, "n1")
+        sections = self._sections(blocks)
+        assert len(sections) == slack_module._MAX_SECTION_BLOCKS
+        assert "more characters" in sections[-1]
+
+
+class _CapturedPosts:
+    """Stand-in for ``httpx.AsyncClient`` recording response_url bodies."""
+
+    def __init__(self) -> None:
+        self.bodies: list[dict] = []
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, json=None):
+        self.bodies.append(json)
+
+
+class TestNotificationCardRoundTrip:
+    """The card's section text is the mrkdwn Slack already stores.
+
+    Running it back through the Markdown converter when the button was
+    pressed turned *bold* into _italic_ and escaped the link markup, so the
+    message visibly changed on answering.
+    """
+
+    RAW = (
+        "## Deploy to production\n"
+        "**Ship it?** See [the run](https://ci.example.com/x?a=1&b=2).\n"
+        "Threshold is a < b & c > d, ask <@U9>."
+    )
+
+    async def _answer(self, monkeypatch, raw: str = RAW):
+        import httpx
+
+        posts = _CapturedPosts()
+        monkeypatch.setattr(httpx, "AsyncClient", posts)
+
+        channel = _channel(allow_users=["U1"])
+        service = MagicMock()
+        service.handle_answer = AsyncMock(return_value=True)
+        service.db.get_notification = AsyncMock(return_value=None)
+        channel._notification_service = service
+
+        blocks = build_notification_blocks(raw, "n1", [("Approve", "approve")])
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "notif:n1:approve", "value": "approve"}],
+            "message": {"blocks": blocks},
+        })
+        return channel, blocks, posts.bodies[-1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_the_card_text_is_carried_across_unchanged(self, monkeypatch):
+        _, blocks, updated = await self._answer(monkeypatch)
+        original = blocks[0]["text"]["text"]
+        assert updated.startswith(original)
+
+    @pytest.mark.asyncio
+    async def test_a_heading_stays_bold_instead_of_turning_italic(self, monkeypatch):
+        _, _, updated = await self._answer(monkeypatch)
+        assert "*Deploy to production*" in updated
+        assert "_Deploy to production_" not in updated
+
+    @pytest.mark.asyncio
+    async def test_bold_stays_bold(self, monkeypatch):
+        _, _, updated = await self._answer(monkeypatch)
+        assert "*Ship it?*" in updated
+        assert "_Ship it?_" not in updated
+
+    @pytest.mark.asyncio
+    async def test_a_link_with_query_parameters_survives(self, monkeypatch):
+        _, _, updated = await self._answer(monkeypatch)
+        assert "<https://ci.example.com/x?a=1&amp;b=2|the run>" in updated
+        assert "&lt;https://" not in updated
+
+    @pytest.mark.asyncio
+    async def test_escaping_is_not_applied_twice(self, monkeypatch):
+        _, _, updated = await self._answer(monkeypatch)
+        assert "a &lt; b &amp; c &gt; d" in updated
+        assert "&amp;lt;" not in updated
+        assert "&amp;amp;" not in updated
+
+    @pytest.mark.asyncio
+    async def test_a_mention_keeps_the_escaping_it_was_sent_with(self, monkeypatch):
+        _, _, updated = await self._answer(monkeypatch)
+        assert "&lt;@U9&gt;" in updated
+
+    @pytest.mark.asyncio
+    async def test_the_answer_is_appended(self, monkeypatch):
+        _, _, updated = await self._answer(monkeypatch)
+        assert "✅ Answered: approve" in updated
+
+    @pytest.mark.asyncio
+    async def test_a_split_card_keeps_every_section(self, monkeypatch):
+        body = "\n".join(f"line {i:04d}" for i in range(800))
+        _, blocks, updated = await self._answer(monkeypatch, raw=body)
+        assert updated.startswith(body)
+
+
+class TestApprovalAttribution:
+    """`answered_by="slack"` alone loses which member pressed the button."""
+
+    async def _press(self, action_id="notif:n1:approve", value="approve"):
+        channel = _channel(allow_users=["U0123ABC"])
+        channel._replace_via_url = AsyncMock()
+        service = MagicMock()
+        service.handle_answer = AsyncMock(return_value=True)
+        service.db.get_notification = AsyncMock(return_value=None)
+        channel._notification_service = service
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U0123ABC"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": action_id, "value": value}],
+            "message": {"blocks": build_notification_blocks("Ship it?", "n1")},
+        })
+        return channel, service
+
+    @pytest.mark.asyncio
+    async def test_the_button_press_carries_the_slack_member_id(self):
+        _, service = await self._press()
+        kwargs = service.handle_answer.await_args.kwargs
+        assert kwargs["answered_by"] == "slack"
+        assert kwargs["actor"] == "U0123ABC"
+
+    @pytest.mark.asyncio
+    async def test_the_settled_card_names_who_answered(self):
+        channel, _ = await self._press()
+        assert "(by <@U0123ABC>)" in channel._replace_via_url.await_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_the_reply_command_carries_the_member_id_too(self):
+        channel = _channel(allow_users=["U0123ABC"], commands=["reply"])
+        channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+        service = MagicMock()
+        service.db.list_notifications = AsyncMock(
+            return_value=[{"id": "n1", "title": "pick one"}],
+        )
+        service.handle_answer = AsyncMock(return_value=True)
+        channel._notification_service = service
+
+        await channel._handle_slash_command({
+            "user_id": "U0123ABC", "channel_id": "D1", "text": "reply yes",
+        })
+        kwargs = service.handle_answer.await_args.kwargs
+        assert kwargs["answered_by"] == "slack"
+        assert kwargs["actor"] == "U0123ABC"
