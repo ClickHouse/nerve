@@ -18,6 +18,7 @@ from nerve.config import (
     CronConfig,
     NerveConfig,
     ProxyConfig,
+    SlackConfig,
     SSLConfig,
     TelegramConfig,
     WorkflowRunsConfig,
@@ -198,6 +199,86 @@ class TestTelegramDmPolicy:
     def test_allowed_users_coerced_to_int(self):
         cfg = TelegramConfig.from_dict({"allowed_users": ["123", 456]})
         assert cfg.allowed_users == [123, 456]
+
+
+class TestSlackIsOptIn:
+    """Slack must not switch itself on for installations that predate it.
+
+    Every existing config has no ``slack`` section. Reading that as enabled
+    made ``nerve doctor`` report missing tokens and exit 1 on all of them.
+    """
+
+    def test_a_config_with_no_slack_section_is_disabled(self):
+        assert NerveConfig.from_dict({"model": "x"}).slack.enabled is False
+
+    def test_an_empty_slack_section_is_disabled(self):
+        assert SlackConfig.from_dict({}).enabled is False
+
+    def test_a_section_without_tokens_is_disabled(self):
+        assert SlackConfig.from_dict({"allow_users": ["U0123ABC"]}).enabled is False
+
+    def test_both_tokens_turn_it_on_without_an_enabled_key(self):
+        cfg = SlackConfig.from_dict({"bot_token": "xoxb-1", "app_token": "xapp-1"})
+        assert cfg.enabled is True
+
+    def test_one_token_alone_is_not_enough(self):
+        assert SlackConfig.from_dict({"bot_token": "xoxb-1"}).enabled is False
+
+    def test_an_explicit_false_wins_over_the_tokens(self):
+        cfg = SlackConfig.from_dict({
+            "enabled": False, "bot_token": "xoxb-1", "app_token": "xapp-1",
+        })
+        assert cfg.enabled is False
+
+    def test_an_explicit_true_is_honoured_without_tokens(self):
+        # Someone who asks for Slack and forgets the tokens should be told
+        # so by the doctor, not silently left with the channel off.
+        assert SlackConfig.from_dict({"enabled": True}).enabled is True
+
+    def test_lockdown_keeps_a_token_bearing_section_off(self):
+        # Lockdown drops the machine-local layer that decides whether this
+        # box answers Slack, so shared settings alone must not start it.
+        cfg = SlackConfig.from_dict(
+            {"bot_token": "xoxb-1", "app_token": "xapp-1"}, locked=True,
+        )
+        assert cfg.enabled is False
+
+    def test_an_unreadable_value_falls_back_to_off(self):
+        cfg = SlackConfig.from_dict({
+            "enabled": "${SLACK_ON}", "bot_token": "xoxb-1", "app_token": "xapp-1",
+        })
+        assert cfg.enabled is False
+
+    def test_the_doctor_says_nothing_about_an_unconfigured_slack(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({"model": "x"}))
+        assert "Slack enabled but" not in report
+        assert "[--] Slack disabled" in report
+
+    def test_the_doctor_still_reports_missing_tokens_when_asked_for(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({"slack": {"enabled": True}}))
+        assert "[ERR] Slack enabled but bot_token, app_token not set" in report
+
+
+class TestSlackDefaultCommands:
+    def test_globally_scoped_commands_are_off_by_default(self):
+        # Both reach every session in the instance, web and Telegram
+        # included, and Slack has no ownership model to narrow them to the
+        # caller. Listing them in slack.commands turns them back on.
+        from nerve.config import SLACK_DEFAULT_COMMANDS
+
+        assert "sessions" not in SLACK_DEFAULT_COMMANDS
+        assert "reply" not in SLACK_DEFAULT_COMMANDS
+
+    def test_they_are_still_available_on_request(self):
+        from nerve.config import SLACK_ALL_COMMANDS
+
+        cfg = SlackConfig.from_dict({"commands": ["sessions", "reply"]})
+        assert cfg.commands == ["sessions", "reply"]
+        assert {"sessions", "reply"} <= set(SLACK_ALL_COMMANDS)
 
 
 class TestAppendTelegramAllowedUser:
