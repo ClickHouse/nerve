@@ -441,6 +441,20 @@ class ChannelRouter:
             limit=limit, offset=offset, current_id=current_id,
         )
 
+    async def list_conversation_sessions(
+        self, channel_key_prefix: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Live sessions belonging to one conversation, newest first.
+
+        ``get_last_session`` answers for an exact channel key. A channel that
+        keys a session per thread needs the set, which is what a command
+        arriving without thread context has to choose between.
+        """
+        return await self.engine.db.list_channel_sessions_by_prefix(
+            channel_key_prefix, limit=limit,
+            exclude_statuses=("archived", "stopped"),
+        )
+
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
         return await self.engine.sessions.set_starred(session_id, starred)

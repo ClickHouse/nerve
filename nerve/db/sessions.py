@@ -392,6 +392,40 @@ class SessionStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def list_channel_sessions_by_prefix(
+        self, prefix: str, limit: int = 20, exclude_statuses: tuple[str, ...] = (),
+    ) -> list[dict]:
+        """Live channel-session mappings whose key starts with *prefix*.
+
+        One conversation can own several sessions — a Slack channel with
+        ``reply_in_thread`` on keys one per thread — and a caller holding
+        only the conversation needs all of them. Rows are newest-first, and
+        the join to ``sessions`` carries the title and status a caller needs
+        to name the choice. ``session_id`` is a foreign key, so the row is
+        always there.
+
+        The escape is deliberate: a channel key is opaque, and an unescaped
+        ``_`` or ``%`` in one would silently widen the match to other
+        conversations.
+        """
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        sql = """
+            SELECT cs.channel_key, cs.session_id, cs.updated_at,
+                   s.title, s.status, s.starred
+            FROM channel_sessions cs
+            JOIN sessions s ON s.id = cs.session_id
+            WHERE cs.channel_key LIKE ? ESCAPE '\\'
+        """
+        params: list = [f"{escaped}%"]
+        if exclude_statuses:
+            placeholders = ",".join("?" for _ in exclude_statuses)
+            sql += f" AND s.status NOT IN ({placeholders})"
+            params.extend(exclude_statuses)
+        sql += " ORDER BY cs.updated_at DESC LIMIT ?"
+        params.append(limit)
+        async with self.db.execute(sql, tuple(params)) as cursor:
+            return [dict(row) async for row in cursor]
+
     async def set_channel_session(self, channel_key: str, session_id: str) -> None:
         """Persist a channel-to-session mapping."""
         now = datetime.now(timezone.utc).isoformat()

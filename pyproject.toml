@@ -16,6 +16,10 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "pyyaml>=6.0",
     "python-telegram-bot>=21.0",
+    "slack-sdk>=3.33.0",
+    # Socket Mode's asyncio client is the aiohttp one; slack-sdk leaves the
+    # transport dependency to the caller.
+    "aiohttp>=3.10",
     # Floor raised from 0.2.82 for mcp 2.x: 0.2.140 is the first release whose
     # own constraint is `mcp<3.0.0` (0.2.100 through 0.2.139 all declare
     # `mcp<2.0.0`). It matters because the SDK builds the in-process MCP server
