@@ -1259,6 +1259,19 @@ Mode delivers an event to only one connection per app, so each instance needs
 its **own app** — a second instance sharing one app's tokens would take events
 away from the first rather than run beside it.
 
+### Notifications
+
+Add `slack` to `notifications.channels` to deliver questions and approvals
+as Block Kit cards with buttons.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.slack_channel_id` | string | `""` | Conversation for notifications; falls back to the first literal channel id in `slack.allow_channels` |
+
+The fallback only accepts a real channel id. A list of names and globs — or
+one holding just `dm` — resolves to nothing, and Slack notifications are
+skipped with a warning rather than posted to a made-up target.
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
