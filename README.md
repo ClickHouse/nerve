@@ -218,7 +218,7 @@ Revisions happen in the same persistent planner session — full context preserv
 
 ### 🔔 Notifications
 
-Async communication between agent and human, delivered to both web UI and Telegram.
+Async communication between agent and human, delivered to the web UI, Telegram, and Slack.
 
 - **`notify`** — Fire-and-forget alerts (status updates, completions, reminders)
 - **`ask_user`** — Questions with predefined options, rendered as buttons
