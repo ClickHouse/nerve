@@ -9,6 +9,8 @@ the ack contract, and the shape of the calls actually put on the wire.
 from __future__ import annotations
 
 import copy
+import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,6 +19,11 @@ import pytest_asyncio
 from nerve.channels.slack import SlackChannel
 from nerve.config import NerveConfig, SlackConfig
 from tests.fake_slack import FakeSlack
+from tests.slack_live import (
+    ignore_stale_events,
+    start_event_sink,
+    wait_until_receiving,
+)
 
 
 def _config(**slack_kwargs) -> NerveConfig:
@@ -51,6 +58,92 @@ async def _started(server: FakeSlack, monkeypatch, **slack_kwargs):
 
 @pytest.mark.asyncio
 class TestSocketMode:
+    async def test_an_ack_only_sink_consumes_events_without_dispatching(
+        self, slack, monkeypatch, capsys,
+    ):
+        slack.patch_client(monkeypatch)
+        sink = await start_event_sink(
+            "xoxb-fake", "xapp-fake", diagnostics_label="fake-sink",
+        )
+        routed: list[str] = []
+
+        async def route(_client, req):
+            event = (req.payload or {}).get("event") or {}
+            if event.get("ts"):
+                routed.append(event["ts"])
+
+        sink.socket_mode_request_listeners.append(route)
+        channel = MagicMock()
+        channel._client = sink
+        ignore_stale_events(channel)
+        try:
+            class ProbeClient:
+                posts = 0
+
+                async def chat_postMessage(self, **kwargs):
+                    self.posts += 1
+                    ts = f"1.{self.posts}"
+                    event = {
+                        "type": "message", "channel": kwargs["channel"],
+                        "channel_type": "channel", "user": "U0BOT",
+                        "ts": ts, "text": kwargs["text"],
+                    }
+                    if self.posts == 2:
+                        # The first probe missed the immediate attempts and
+                        # arrives only as a retry. Readiness must ack it before
+                        # returning, or its next retry poisons a later run.
+                        await slack.push_event(
+                            {**event, "ts": "1.1"},
+                            retry_attempt=2,
+                            retry_reason="timeout",
+                        )
+                        await slack.push_event(event)
+                    return {"ok": True, "ts": ts}
+
+                async def chat_delete(self, **kwargs):
+                    await slack.push_event({
+                        "type": "message", "subtype": "message_deleted",
+                        "channel": kwargs["channel"], "ts": "2.1",
+                        "deleted_ts": kwargs["ts"],
+                    })
+                    return {"ok": True}
+
+            await wait_until_receiving(
+                sink,
+                timeout=2.0,
+                web_client=ProbeClient(),
+                probe_interval=0.05,
+            )
+            await slack.push("events_api", {
+                "event_time": time.time() - 30,
+                "event": {"type": "message", "ts": "3.1"},
+            })
+            await slack.settle()
+            assert len(slack.acks) == 5
+            assert "1.1" not in routed, "a marked retry reached the router"
+            assert "3.1" not in routed, "an unmarked stale event reached the router"
+        finally:
+            await sink.close()
+            sink._live_diagnostics.emit_summary()
+
+        output = capsys.readouterr().out
+        records = [
+            json.loads(line.removeprefix("SLACK_LIVE "))
+            for line in output.splitlines()
+            if line.startswith("SLACK_LIVE ")
+        ]
+        events = {record["event"] for record in records}
+        assert {
+            "socket_hello",
+            "retry_envelope",
+            "delayed_unmarked_envelope",
+            "probe_missed",
+            "delivery_barrier_complete",
+            "socket_summary",
+        } <= events
+        assert "xoxb-fake" not in output
+        assert "nerve socket readiness probe" not in output
+
     async def test_the_channel_connects_and_learns_its_own_id(
         self, slack, monkeypatch,
     ):
