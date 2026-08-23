@@ -9,6 +9,7 @@ the ack contract, and the shape of the calls actually put on the wire.
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -100,8 +101,12 @@ class TestSocketMode:
                 web_client=ProbeClient(),
                 probe_interval=0.05,
             )
+            await slack.push("events_api", {
+                "event_time": time.time() - 30,
+                "event": {"type": "message", "ts": str(time.time())},
+            })
             await slack.settle()
-            assert len(slack.acks) == 4
+            assert len(slack.acks) == 5
         finally:
             await sink.close()
             sink._live_diagnostics.emit_summary()
@@ -116,6 +121,7 @@ class TestSocketMode:
         assert {
             "socket_hello",
             "retry_envelope",
+            "delayed_unmarked_envelope",
             "probe_missed",
             "delivery_barrier_complete",
             "socket_summary",

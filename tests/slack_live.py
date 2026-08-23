@@ -123,6 +123,7 @@ class SocketDiagnostics:
     fresh: int = 0
     retry_attempts: Counter[int] = field(default_factory=Counter)
     event_types: Counter[str] = field(default_factory=Counter)
+    delayed_envelopes: int = 0
     max_event_age_seconds: float = 0.0
     _clients: int = 0
 
@@ -162,12 +163,21 @@ class SocketDiagnostics:
                 self.fresh += 1
 
             event_age = None
-            event_ts = slack_event.get("event_ts") or slack_event.get("ts")
+            timestamp_source = "event_time"
+            event_ts = payload.get("event_time")
+            if event_ts is None:
+                timestamp_source = "event_ts"
+                event_ts = slack_event.get("event_ts")
+            if event_ts is None:
+                timestamp_source = "message_ts"
+                event_ts = slack_event.get("ts")
             try:
                 event_age = max(0.0, time.time() - float(event_ts))
                 self.max_event_age_seconds = max(
                     self.max_event_age_seconds, event_age,
                 )
+                if event_age > 5.0:
+                    self.delayed_envelopes += 1
             except (TypeError, ValueError):
                 pass
 
@@ -182,6 +192,15 @@ class SocketDiagnostics:
                     event_age_seconds=(
                         round(event_age, 3) if event_age is not None else None
                     ),
+                )
+            elif event_age is not None and event_age > 5.0:
+                self.emit(
+                    "delayed_unmarked_envelope",
+                    request_type=req.type,
+                    event_type=event_type,
+                    event_subtype=subtype,
+                    event_age_seconds=round(event_age, 3),
+                    timestamp_source=timestamp_source,
                 )
 
         socket.message_listeners.append(observe_message)
@@ -201,6 +220,7 @@ class SocketDiagnostics:
             retried=sum(self.retry_attempts.values()),
             retry_attempts=dict(sorted(self.retry_attempts.items())),
             event_types=dict(sorted(self.event_types.items())),
+            delayed_envelopes=self.delayed_envelopes,
             max_event_age_seconds=round(self.max_event_age_seconds, 3),
         )
 
