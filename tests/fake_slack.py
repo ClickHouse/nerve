@@ -113,22 +113,45 @@ class FakeSlack:
         """Block until the bot has opened its socket."""
         await asyncio.wait_for(self._connected.wait(), timeout)
 
-    async def push(self, envelope_type: str, payload: dict[str, Any]) -> str:
+    async def push(
+        self,
+        envelope_type: str,
+        payload: dict[str, Any],
+        *,
+        retry_attempt: int | None = None,
+        retry_reason: str | None = None,
+    ) -> str:
         """Push one Socket Mode envelope at the bot. Returns its envelope id."""
         await self.wait_connected()
         assert self._ws is not None
         envelope_id = str(uuid.uuid4())
-        await self._ws.send_str(json.dumps({
+        envelope = {
             "type": envelope_type,
             "envelope_id": envelope_id,
             "payload": payload,
             "accepts_response_payload": False,
-        }))
+        }
+        if retry_attempt is not None:
+            envelope["retry_attempt"] = retry_attempt
+        if retry_reason is not None:
+            envelope["retry_reason"] = retry_reason
+        await self._ws.send_str(json.dumps(envelope))
         return envelope_id
 
-    async def push_event(self, event: dict[str, Any]) -> str:
+    async def push_event(
+        self,
+        event: dict[str, Any],
+        *,
+        retry_attempt: int | None = None,
+        retry_reason: str | None = None,
+    ) -> str:
         """Push an Events API event (the common case)."""
-        return await self.push("events_api", {"event": event})
+        return await self.push(
+            "events_api",
+            {"event": event},
+            retry_attempt=retry_attempt,
+            retry_reason=retry_reason,
+        )
 
     # -- the Web API ---------------------------------------------------- #
 
