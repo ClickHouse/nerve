@@ -2041,6 +2041,7 @@ class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(default_factory=lambda: ["web", "telegram"])
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
+    slack_channel_id: str = ""                # Target conversation; falls back to a literal id in slack.allow_channels
     default_expiry_hours: int = 48            # Auto-expire unanswered questions
     max_redeliveries: int = 3                 # Per-row cap on snooze/re-delivery cycles
     priority_prefixes: dict[str, str] = field(default_factory=lambda: {
@@ -2059,6 +2060,7 @@ class NotificationsConfig:
         return cls(
             channels=d.get("channels", ["web", "telegram"]),
             telegram_chat_id=d.get("telegram_chat_id"),
+            slack_channel_id=str(d.get("slack_channel_id") or ""),
             default_expiry_hours=d.get("default_expiry_hours", 48),
             max_redeliveries=d.get("max_redeliveries", 3),
             priority_prefixes=d.get("priority_prefixes", {

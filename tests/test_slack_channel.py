@@ -2050,6 +2050,13 @@ class TestApprovalAttribution:
         return channel, service
 
     @pytest.mark.asyncio
+    async def test_the_button_press_carries_the_slack_member_id(self):
+        _, service = await self._press()
+        kwargs = service.handle_answer.await_args.kwargs
+        assert kwargs["answered_by"] == "slack"
+        assert kwargs["actor"] == "U0123ABC"
+
+    @pytest.mark.asyncio
     async def test_the_settled_card_names_who_answered(self):
         channel, service = await self._press()
         assert "(by <@U0123ABC>)" in channel._replace_via_url.await_args[0][1]
