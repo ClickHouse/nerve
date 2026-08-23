@@ -47,6 +47,7 @@ from tests.slack_live import (
     USER_TOKEN,
     Posted,
     RecordingRouter,
+    INITIAL_DRAIN_QUIET_SECONDS,
     SOCKET_DRAIN_SECONDS,
     build_channel,
     make_client,
@@ -121,7 +122,10 @@ async def _connected_channel():
     channel, cfg = build_channel(RecordingRouter())
     await channel.start()
     await wait_until_receiving(channel)
-    await wait_until_quiet(channel)
+    # Drain whatever the previous run left queued before any test runs.
+    await wait_until_quiet(
+        channel, quiet_for=INITIAL_DRAIN_QUIET_SECONDS, timeout=180.0,
+    )
     try:
         yield channel, cfg
     finally:

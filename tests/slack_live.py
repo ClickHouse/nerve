@@ -98,6 +98,15 @@ SOCKET_DRAIN_SECONDS = 2.5
 # can be reading someone else's exhaust.
 SOCKET_QUIET_SECONDS = 1.5
 
+# The quiet needed before the first test, which is a different problem
+# from the quiet needed between tests. A run leaves events queued behind
+# it — the outbound suite posts for a minute with nothing listening — and
+# Slack replays that to the next connection at its own pace, with gaps.
+# A short threshold is satisfied by one of those gaps and the replay then
+# lands in the middle of the first test, which is how one run's messages
+# came to fail the next run.
+INITIAL_DRAIN_QUIET_SECONDS = 8.0
+
 
 def unique_marker() -> str:
     """A token no other test or earlier run will carry."""

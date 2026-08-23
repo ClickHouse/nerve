@@ -1,0 +1,100 @@
+name: Slack live integration
+
+# Kept out of ci.yml because it needs a concurrency policy the rest of CI
+# must not have. These tests drive one real Slack workspace, and Slack hands
+# each event to exactly one of an app's open Socket Mode connections — so two
+# runs at once steal each other's messages, and collide on reactions and on
+# deleting each other's posts. The workspace is the shared resource, not the
+# branch, so the lock below is global rather than per-ref.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One run at a time, across every branch and pull request.
+#
+# cancel-in-progress is false on purpose, the opposite of ci.yml. Killing a
+# run mid-flight leaves envelopes unacked and messages undeleted, and Slack
+# redelivers an unacked envelope — so a cancelled run does not just lose its
+# own result, it poisons the next one. Queueing is the cheaper failure: the
+# suite takes about three minutes.
+#
+# Note the GitHub behaviour this cannot avoid: only one run may be pending
+# per group, so a third run arriving while one is executing and one is queued
+# cancels the queued one. It is not lost work, it is a skipped check, and
+# re-running the job is enough.
+concurrency:
+  group: slack-live-workspace
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  slack-live-tests:
+    name: Slack live integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The constraint is forks, not pull requests: a fork cannot read the
+    # secrets, so the job would have nothing to run against. A pull request
+    # from a branch in this repository can, and is exactly where the result
+    # is worth having — waiting until merge means finding out too late.
+    #
+    # A clone without the secrets configured skips every test rather than
+    # failing, so this stays green outside ClickHouse/nerve.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Kept in step with the backend job above; bump both together.
+          version: "0.12.0"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install project and test dependencies
+        run: uv sync --extra test --locked --python "3.13"
+
+      # Inbound first, and in its own process. The outbound tests post,
+      # react and upload for a minute with no socket listening, so Slack
+      # queues all of it and replays the backlog to the next connection that
+      # appears. Running them first put every inbound event behind that
+      # queue: messages arrived a whole test late. Order matters as much as
+      # the process split. `if: always()` so a failure in the first still
+      # reports the second rather than hiding it.
+      # Clear the queue before anything reads from it. Slack holds events
+      # that happen while no socket is open and replays them to the next
+      # connection, so a previous run — especially one that failed or was
+      # cancelled before its cleanup — leaves messages that surface here and
+      # fail whichever test is unlucky. Draining first breaks that cycle.
+      - name: Drain queued Slack events
+        env:
+          NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
+          NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
+        run: .venv/bin/python scripts/drain_slack_events.py
+
+      - name: Run live Slack tests (inbound)
+        env:
+          NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
+          NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
+          NERVE_SLACK_TEST_CHANNEL: ${{ secrets.NERVE_SLACK_TEST_CHANNEL }}
+          NERVE_SLACK_TEST_USER_TOKEN: ${{ secrets.NERVE_SLACK_TEST_USER_TOKEN }}
+        run: .venv/bin/pytest tests/test_slack_live_inbound.py -v
+
+      - name: Run live Slack tests (outbound)
+        if: always()
+        env:
+          NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
+          NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
+          NERVE_SLACK_TEST_CHANNEL: ${{ secrets.NERVE_SLACK_TEST_CHANNEL }}
+          NERVE_SLACK_TEST_USER_TOKEN: ${{ secrets.NERVE_SLACK_TEST_USER_TOKEN }}
+          NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL }}
+        run: .venv/bin/pytest tests/test_slack_live.py -v
