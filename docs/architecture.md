@@ -93,8 +93,8 @@ Async notification system for agent→user communication:
 - **`notify` tool** — fire-and-forget notifications (status updates, alerts, reminders)
 - **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
-- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons for questions
-- **Answer routing** — answers from any channel (web UI, Telegram inline button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
+- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
+- **Answer routing** — answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
 - **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
 
 ### Cron Service (`nerve/cron/`)
