@@ -2,7 +2,7 @@
 
 Coordinates between MCP tools (agent-side), channels (delivery), and the
 answer routing mechanism (user-side). Supports fire-and-forget notifications,
-async questions with multi-channel delivery (web UI + Telegram), and
+async questions with multi-channel delivery (web UI + Telegram + Slack), and
 ``approval``-kind notifications that route to a server-side dispatcher when
 the user picks an inline option (see ``nerve.notifications.handlers``).
 """
@@ -850,6 +850,19 @@ class NotificationService:
                             telegram_message_id=str(msg_id),
                         )
                     return "telegram" if msg_id else None
+                elif channel_name == "slack":
+                    msg_id = await self._deliver_slack(
+                        notification_id, session_id, notif_type,
+                        title, body, priority, options,
+                        option_labels=option_labels,
+                    )
+                    if not msg_id:
+                        return None
+                    await self.db.update_notification(
+                        notification_id,
+                        slack_message_id=str(msg_id),
+                    )
+                    return "slack"
             except Exception as e:
                 logger.error(
                     "Failed to deliver %s to %s: %s",
@@ -972,14 +985,15 @@ class NotificationService:
             return None
         return channel._app.bot
 
-    def _build_telegram_text(
+    def _build_notification_text(
         self, session_id: str, title: str, body: str, priority: str,
     ) -> str:
-        """Compose the Telegram message text for a notification.
+        """Compose the chat message text for a notification.
 
-        Shared by the initial delivery, the re-delivery tick, and the
-        expiry edit (which rebuilds the original text to append a
-        status line).
+        Shared by Telegram and Slack, and within each by the initial
+        delivery, the re-delivery tick, and the expiry edit (which rebuilds
+        the original text to append a status line). Markdown is converted
+        per channel at send time.
         """
         priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
         if title:
@@ -1014,7 +1028,7 @@ class NotificationService:
         if not chat_id:
             return None
 
-        text = self._build_telegram_text(session_id, title, body, priority)
+        text = self._build_notification_text(session_id, title, body, priority)
 
         if notif_type in ("question", "approval") and options:
             button_labels: list[tuple[str, str]] = []
@@ -1124,6 +1138,133 @@ class NotificationService:
         )
 
         return str(msg.message_id)
+
+    # ------------------------------------------------------------------ #
+    #  Slack delivery                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _get_slack_channel(self):
+        """Get the connected SlackChannel, or None if unavailable."""
+        channel = self.engine.router.get_channel("slack")
+        if not channel or getattr(channel, "_web", None) is None:
+            return None
+        return channel
+
+    def _resolve_slack_channel_id(self) -> str | None:
+        """Resolve the Slack conversation for notification delivery.
+
+        Falls back to the first entry of ``slack.allow_channels`` that is a
+        literal Slack id. A glob cannot be posted to, and neither can a
+        channel *name* or the synthetic ``dm`` marker the guardrails match
+        on — so a list without a real id resolves to nothing and the operator
+        must set ``notifications.slack_channel_id``.
+        """
+        from nerve.channels.slack import is_slack_id
+
+        configured = self.config.notifications.slack_channel_id
+        if configured:
+            return configured
+        for entry in self.config.slack.allow_channels:
+            if entry and is_slack_id(entry):
+                return entry
+        logger.warning(
+            "No notifications.slack_channel_id set and slack.allow_channels "
+            "holds no literal channel id — Slack notifications cannot be "
+            "delivered",
+        )
+        return None
+
+    async def _deliver_slack(
+        self,
+        notification_id: str,
+        session_id: str,
+        notif_type: str,
+        title: str,
+        body: str,
+        priority: str,
+        options: list[str] | None,
+        option_labels: dict[str, str] | None = None,
+    ) -> str | None:
+        """Send a notification to Slack, with Block Kit buttons for answers."""
+        channel = self._get_slack_channel()
+        if not channel:
+            logger.warning(
+                "Slack channel not available for notification %s", notification_id,
+            )
+            return None
+
+        target = self._resolve_slack_channel_id()
+        if not target:
+            return None
+
+        from nerve.channels.slack import build_notification_blocks
+
+        text = self._build_notification_text(session_id, title, body, priority)
+
+        button_options: list[tuple[str, str]] = []
+        if notif_type in ("question", "approval") and options:
+            for value in options:
+                if notif_type == "approval":
+                    label = (
+                        (option_labels or {}).get(value)
+                        or value.replace("_", " ").title()
+                    )
+                    emoji = _APPROVAL_EMOJIS.get(value, "")
+                    rendered = f"{emoji} {label}".strip() if emoji else label
+                else:
+                    rendered = value
+                button_options.append((rendered, value))
+
+        blocks = build_notification_blocks(
+            text, notification_id, button_options or None,
+        )
+        msg_id = await channel._post(target, text, blocks)
+
+        if msg_id:
+            channel._cache_message(msg_id, target, text)
+            await self.db.update_notification(
+                notification_id, slack_channel_id=target,
+            )
+        return msg_id
+
+    async def _edit_slack_expired(self, notif: dict[str, Any]) -> None:
+        """Best-effort edit of the Slack card to show it expired.
+
+        Rebuilds the original text from the row and appends the status line,
+        dropping the now-dead buttons. All failures are swallowed by design.
+        """
+        message_id = notif.get("slack_message_id")
+        if not message_id:
+            return
+        channel = self._get_slack_channel()
+        if not channel:
+            return
+        target = notif.get("slack_channel_id") or self._resolve_slack_channel_id()
+        if not target:
+            return
+
+        from nerve.channels.slack import _md_to_slack, parse_target
+
+        text = self._build_notification_text(
+            notif["session_id"],
+            notif.get("title") or "",
+            notif.get("body") or "",
+            notif.get("priority") or "normal",
+        )
+        text += "\n\n⏰ Expired unanswered"
+
+        channel_id, _ = parse_target(target)
+        try:
+            await channel._web.chat_update(
+                channel=channel_id,
+                ts=str(message_id),
+                text=_md_to_slack(text),
+                blocks=[],
+            )
+        except Exception as exc:
+            logger.debug(
+                "slack expiry edit failed for %s: %s", notif["id"], exc,
+            )
 
     # ------------------------------------------------------------------ #
     #  Maintenance (called by the periodic background tick)                #
@@ -1270,8 +1411,9 @@ class NotificationService:
                     "expiry broadcast failed for %s: %s", notif["id"], exc,
                 )
 
-            # Telegram: mark the card expired, drop dead buttons.
+            # Chat channels: mark the card expired, drop dead buttons.
             await self._edit_telegram_expired(notif)
+            await self._edit_slack_expired(notif)
 
             # Approvals: the proposer is the mechanical pipeline, not a
             # conversation — record the expiry in its audit log.
@@ -1378,7 +1520,7 @@ class NotificationService:
         if not chat_id:
             return
 
-        text = self._build_telegram_text(
+        text = self._build_notification_text(
             notif["session_id"],
             notif.get("title") or "",
             notif.get("body") or "",

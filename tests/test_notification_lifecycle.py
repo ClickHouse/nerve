@@ -613,3 +613,123 @@ class TestExpiryReporting:
         assert notif["status"] == "expired"
         # HTML attempt + plain-text fallback, both swallowed.
         assert bot.edit_message_text.await_count == 2
+
+
+# ----------------------------------------------------------------------
+#  Answer attribution
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAnswerAttribution:
+    """A shared workspace needs to know which member approved an action.
+
+    ``answered_by`` names the transport and the injection path routes on
+    it, so the person travels beside it in the row's metadata rather than
+    inside the same string.
+    """
+
+    async def test_a_question_answer_records_the_actor(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        assert await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        notif = await db.get_notification(result["notification_id"])
+        assert notif["answered_by"] == "slack"
+        assert json.loads(notif["metadata"])["answered_by_actor"] == "U0123ABC"
+
+    async def test_the_transport_still_names_the_channel_on_its_own(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # engine.run is handed answered_by as the channel name, so folding
+        # the member id into that string would route the reply nowhere.
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        await asyncio.sleep(0)
+        kwargs = fake_engine.run.call_args.kwargs
+        assert kwargs["channel"] == "slack"
+        assert kwargs["source"] == "notification:slack"
+
+    async def test_an_answer_with_no_actor_leaves_the_metadata_alone(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(result["notification_id"], "yes", "web")
+        notif = await db.get_notification(result["notification_id"])
+        assert "answered_by_actor" not in json.loads(notif["metadata"])
+
+    async def test_existing_metadata_survives_the_answer(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # The column also carries option_labels, which the Telegram and web
+        # renderers read after the row is answered.
+        await db.create_session("s1")
+        await db.create_notification(
+            notification_id="n1", session_id="s1", type="question",
+            title="t", metadata={"option_labels": {"yes": "Ship it"}},
+        )
+        svc = NotificationService(fake_config, db, fake_engine)
+
+        await svc.handle_answer("n1", "yes", "slack", actor="U0123ABC")
+        metadata = json.loads((await db.get_notification("n1"))["metadata"])
+        assert metadata["option_labels"] == {"yes": "Ship it"}
+        assert metadata["answered_by_actor"] == "U0123ABC"
+
+    async def test_the_actor_reaches_the_web_broadcast(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        answered = [
+            m for _, m in patch_broadcaster
+            if m.get("type") == "notification_answered"
+        ]
+        assert answered
+        assert answered[-1]["answered_by"] == "slack"
+        assert answered[-1]["answered_by_actor"] == "U0123ABC"
+
+    async def test_an_approval_audit_record_names_the_actor(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+        audit_workspace,
+    ):
+        await db.create_session("s1")
+        _handlers.register("attribution-test", lambda *a: _handlers.DispatchResult(
+            ok=True,
+            audit_event={
+                "event": "approval-acted",
+                "target_kind": "attribution-test",
+                "decision": "approve",
+                "ok": True,
+            },
+        ))
+        svc = NotificationService(fake_config, db, fake_engine)
+        nid = await _make_approval(
+            svc, db, target_kind="attribution-test",
+        )
+
+        await svc.handle_answer(nid, "approve", "slack", actor="U0123ABC")
+        records = read_audit_jsonl(
+            audit_workspace / ".nerve" / "mechanical-actions",
+        )
+        acted = [r for r in records if r.get("event") == "approval-acted"]
+        assert acted
+        assert acted[-1]["answered_by"] == "slack"
+        assert acted[-1]["answered_by_actor"] == "U0123ABC"
