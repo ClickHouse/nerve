@@ -110,6 +110,39 @@ telegram:
   # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
 
+slack:
+  enabled: false
+  # Socket Mode — the bot dials out, so no public URL is needed. Both tokens
+  # go in config.local.yaml:
+  #   bot_token: xoxb-…   (OAuth & Permissions → Bot User OAuth Token)
+  #   app_token: xapp-…   (Basic Information → App-Level Tokens, connections:write)
+  #
+  # Access guardrails. Patterns match a Slack id (U0123ABC / C0456DEF), a
+  # handle, a display name, an email, or a channel name — case-insensitive,
+  # with globs. Deny always beats allow. A direct message is matched under
+  # the synthetic channel name "dm".
+  #
+  # With no allow list at all the bot refuses every message. That is
+  # deliberate: an open bot in a workspace is full agent access for anyone
+  # in it. Set at least one of these.
+  # allow_users: ["U0123ABC", "alex.soffronow"]
+  # deny_users: ["*-bot"]
+  # allow_channels: ["dm", "eng-*", "C0456DEF"]
+  # deny_channels: ["*-random", "*-social"]
+  #
+  # Each thread becomes its own session and replies stay in-thread. Off means
+  # one session per channel and replies at channel level.
+  reply_in_thread: true
+  stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  # Which /nerve subcommands the workspace may run. Chatting and notification
+  # buttons are not commands, so they are unaffected.
+  #   omitted  — sessions, new, stop, star, unstar, reply
+  #   []       — no slash commands at all
+  #   [all]    — everything, including doctor and restart
+  # doctor prints host health into a shared workspace and restart lets anyone
+  # on the allow list bounce the daemon, so both are opt-in.
+  # commands: [sessions, new, stop, reply]
+
 # Quiet hours (local timezone)
 quiet_start: "02:00"
 quiet_end: "12:00"

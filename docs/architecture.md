@@ -78,8 +78,11 @@ Abstract communication layer with three components:
 - **ChannelRouter** — centralized session resolution, streaming adapter lifecycle, interactive tool routing, and cron output delivery. Replaces per-channel session management.
 - **StreamAdapter** — translates `StreamBroadcaster` events into channel-appropriate output (edit-in-place for Telegram, accumulated send for simple channels). Created per inbound message.
 
+- **AccessPolicy** (`access.py`) — allow/deny guardrails for senders and conversations, applied by a channel before a message becomes an `InboundMessage`. Deny wins, a non-empty allow list is a gate, and a policy with no allow patterns refuses everything. Same semantics as the inbox filters in `nerve/sources/filters.py`.
+
 Implementations:
 - **Telegram** — python-telegram-bot v21+ with partial message streaming (edit-in-place, 1.5s rate limit), inline keyboard buttons for notification questions, `/reply` command for free-text answers
+- **Slack** — slack_sdk Socket Mode (outbound WebSocket, no public URL) with partial streaming via `chat.update`, Block Kit buttons, `/nerve` slash command, and per-thread sessions. Guarded by `AccessPolicy`; in channels it answers only on mention or in a thread it already owns.
 - **Web** — Passive channel using gateway WebSocket
 
 Adding a new channel (Discord, WhatsApp, etc.) requires implementing ~5 methods and zero session/routing logic.
@@ -89,8 +92,8 @@ Async notification system for agent→user communication:
 - **`notify` tool** — fire-and-forget notifications (status updates, alerts, reminders)
 - **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
-- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons for questions
-- **Answer routing** — answers from any channel (web UI, Telegram inline button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
+- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
+- **Answer routing** — answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
 - **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
 
 ### Cron Service (`nerve/cron/`)
