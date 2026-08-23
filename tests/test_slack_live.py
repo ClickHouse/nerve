@@ -32,6 +32,7 @@ from nerve.channels.slack import (
 )
 from tests.slack_live import (
     BOT_TOKEN,
+    HAVE_OUTBOUND,
     NO_EMAIL_BOT_TOKEN,
     TEST_CHANNEL,
     USER_TOKEN,
@@ -39,6 +40,8 @@ from tests.slack_live import (
     make_client,
     requires_no_email_token,
     requires_outbound,
+    start_event_sink,
+    wait_until_receiving,
 )
 
 # One event loop for the whole module. The fixtures below hold aiohttp
@@ -50,6 +53,34 @@ pytestmark = pytest.mark.asyncio(loop_scope="module")
 # ---------------------------------------------------------------------- #
 #  Fixtures                                                               #
 # ---------------------------------------------------------------------- #
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
+async def _ack_outbound_events():
+    """Keep this module's Web API mutations from poisoning a later run.
+
+    Each post, edit, reaction, upload, and cleanup can produce a Socket Mode
+    envelope.  With no socket open Slack retries those envelopes at +60s and
+    again around +5min; the pending retries are what made a later inbound
+    connection miss fresh events.  The sink shares this module's lifecycle,
+    so it is connected before the first mutation and closes after cleanup.
+    """
+    if not HAVE_OUTBOUND:
+        yield
+        return
+
+    sink = await start_event_sink()
+    try:
+        # A WebSocket handshake is not sufficient when an older retry schedule
+        # exists.  Prove Slack is routing fresh events here before tests post.
+        await wait_until_receiving(sink)
+        yield
+        # Fence fixture cleanup as well: Posted deletes messages after the
+        # tests, and closing before those events arrive would recreate the
+        # exact backlog this fixture exists to prevent.
+        await wait_until_receiving(sink)
+    finally:
+        await sink.close()
 
 
 @pytest_asyncio.fixture(loop_scope="module")
@@ -69,7 +100,7 @@ async def human():
 
 
 @pytest_asyncio.fixture(loop_scope="module")
-async def posted(bot):
+async def posted(bot, _ack_outbound_events):
     """Track messages the test creates and delete them afterwards."""
     tracker = Posted()
     yield tracker

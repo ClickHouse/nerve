@@ -16,6 +16,7 @@ import pytest_asyncio
 from nerve.channels.slack import SlackChannel
 from nerve.config import NerveConfig, SlackConfig
 from tests.fake_slack import FakeSlack
+from tests.slack_live import start_event_sink, wait_until_receiving
 
 
 def _config(**slack_kwargs) -> NerveConfig:
@@ -50,6 +51,54 @@ async def _started(server: FakeSlack, monkeypatch, **slack_kwargs):
 
 @pytest.mark.asyncio
 class TestSocketMode:
+    async def test_an_ack_only_sink_consumes_events_without_dispatching(
+        self, slack, monkeypatch,
+    ):
+        slack.patch_client(monkeypatch)
+        sink = await start_event_sink("xoxb-fake", "xapp-fake")
+        try:
+            class ProbeClient:
+                posts = 0
+
+                async def chat_postMessage(self, **kwargs):
+                    self.posts += 1
+                    ts = f"1.{self.posts}"
+                    event = {
+                        "type": "message", "channel": kwargs["channel"],
+                        "channel_type": "channel", "user": "U0BOT",
+                        "ts": ts, "text": kwargs["text"],
+                    }
+                    if self.posts == 2:
+                        # The first probe missed the immediate attempts and
+                        # arrives only as a retry. Readiness must ack it before
+                        # returning, or its next retry poisons a later run.
+                        await slack.push_event(
+                            {**event, "ts": "1.1"},
+                            retry_attempt=2,
+                            retry_reason="timeout",
+                        )
+                        await slack.push_event(event)
+                    return {"ok": True, "ts": ts}
+
+                async def chat_delete(self, **kwargs):
+                    await slack.push_event({
+                        "type": "message", "subtype": "message_deleted",
+                        "channel": kwargs["channel"], "ts": "2.1",
+                        "deleted_ts": kwargs["ts"],
+                    })
+                    return {"ok": True}
+
+            await wait_until_receiving(
+                sink,
+                timeout=2.0,
+                web_client=ProbeClient(),
+                probe_interval=0.05,
+            )
+            await slack.settle()
+            assert len(slack.acks) == 4
+        finally:
+            await sink.close()
+
     async def test_the_channel_connects_and_learns_its_own_id(
         self, slack, monkeypatch,
     ):

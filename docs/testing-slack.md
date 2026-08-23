@@ -15,15 +15,16 @@ keystroke to an `InboundMessage`. Every test skips unless the credentials are
 set, so the ordinary suite is unaffected.
 
 ```bash
-pytest tests/test_slack_live.py          # outbound: Web API only
+pytest tests/test_slack_live.py          # outbound: Web API + ack-only event sink
 pytest tests/test_slack_live_inbound.py  # inbound: holds a Socket Mode connection
 ```
 
 **Run them as two processes.** Slack gives each event to exactly one of an
-app's open Socket Mode connections, and replays whatever queued while none
-was listening. The outbound tests spend a minute posting, reacting and
-uploading, so in one process the first inbound test reads that backlog
-instead of its own message.
+app's open Socket Mode connections. The outbound process holds an ack-only
+connection while it posts, reacts, uploads, and cleans up; without that sink,
+Slack retries every undelivered envelope at +60 seconds and again around five
+minutes, which can make a later inbound connection deaf to fresh events. The
+process split ensures the sink can never steal an inbound test event.
 
 | Variable | Value | Needed for |
 |---|---|---|

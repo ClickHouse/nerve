@@ -91,11 +91,10 @@ EVENT_TIMEOUT = 20.0
 # connections, so an overlap silently steals events from the new test.
 SOCKET_DRAIN_SECONDS = 2.5
 
-# After connecting, wait until the socket has been this quiet before
-# treating the next arrival as the test's own. Slack queues events that
-# happened while nothing was listening and delivers the backlog to the
-# connection that turns up, so a test posting straight after a handshake
-# can be reading someone else's exhaust.
+# After connecting, wait until the socket has been this quiet before treating
+# the next arrival as the test's own. Slack retries events that had no listener
+# on a fixed schedule, so a test posting amid a retry burst can otherwise read
+# someone else's exhaust.
 SOCKET_QUIET_SECONDS = 1.5
 
 
@@ -213,10 +212,10 @@ async def wait_until_quiet(
     """Block until no envelope has arrived for *quiet_for* seconds.
 
     Adaptive where a fixed sleep is not: instant on a clean socket, and
-    patient when Slack is replaying a backlog. The timeout is generous
-    because a backlog is exactly when this matters, and returning early
-    leaves the replay still streaming — which is how a test came to read a
-    message posted by the one before it.
+    patient while scheduled retries are arriving. The timeout is generous
+    because a retry burst is exactly when this matters, and returning early
+    leaves it streaming — which is how a test came to read a message posted
+    by the one before it.
 
     Raises rather than returning quietly on timeout. Giving up silently
     turns a socket that never settles into a confusing assertion three
@@ -232,11 +231,43 @@ async def wait_until_quiet(
         await asyncio.sleep(0.2)
     raise AssertionError(
         f"the Slack socket never went quiet for {quiet_for}s within "
-        f"{timeout}s — a backlog is still draining",
+        f"{timeout}s — scheduled retries are still arriving",
     )
 
 
-async def wait_until_receiving(channel, timeout: float = 180.0) -> None:
+async def start_event_sink(
+    bot_token: str = BOT_TOKEN, app_token: str = APP_TOKEN,
+):
+    """Open a Socket Mode client that acknowledges and discards every envelope.
+
+    Slack retries events that have no listener, and a run of the outbound live
+    tests produces dozens of them.  Those retries used to make the next run's
+    inbound socket intermittently deaf to fresh messages.  Keeping this client
+    beside the outbound tests prevents that retry schedule at its source.
+    """
+    from slack_sdk.socket_mode.aiohttp import SocketModeClient
+    from slack_sdk.socket_mode.response import SocketModeResponse
+
+    socket = SocketModeClient(
+        app_token=app_token,
+        web_client=make_client(bot_token),
+        auto_reconnect_enabled=True,
+    )
+
+    async def acknowledge(client, req):
+        await client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=req.envelope_id),
+        )
+
+    socket.socket_mode_request_listeners.append(acknowledge)
+    await socket.connect()
+    return socket
+
+
+async def wait_until_receiving(
+    socket, timeout: float = 180.0, web_client=None,
+    probe_interval: float = 15.0,
+) -> None:
     """Block until Slack is delivering *fresh* events to this connection.
 
     Slack does not hold undelivered events in a queue; it retries them on a
@@ -249,22 +280,31 @@ async def wait_until_receiving(channel, timeout: float = 180.0) -> None:
     least a minute old and often belongs to an earlier run, and accepting
     one declares the socket ready while it is still black-holing. This posts
     a probe and waits for *that message's own ts*, unretried, re-probing
-    until it lands.
+    until it lands.  It also waits for the probe's deletion event, making the
+    round trip a teardown fence: once this returns, it has not left its own
+    final mutation unacknowledged behind it.
     """
-    client = make_client(BOT_TOKEN)
+    client = web_client or socket.web_client
+    seen_any: set[str] = set()
     seen_fresh: set[str] = set()
+    seen_fresh_deletes: set[str] = set()
 
     # Wrap the listener list rather than channel._on_request: attribute
     # access builds a fresh bound method each time, so an identity check
     # against one never matches and the swap silently does nothing.
-    listeners = channel._client.socket_mode_request_listeners
+    listeners = socket.socket_mode_request_listeners
     installed = list(listeners)
 
     async def watch(sock, req):
         payload = req.payload or {}
         event = payload.get("event") or {}
-        if not req.retry_attempt and event.get("ts"):
-            seen_fresh.add(event["ts"])
+        if event.get("ts"):
+            seen_any.add(event["ts"])
+        if not req.retry_attempt:
+            if event.get("ts"):
+                seen_fresh.add(event["ts"])
+            if event.get("deleted_ts"):
+                seen_fresh_deletes.add(event["deleted_ts"])
         for fn in installed:
             await fn(sock, req)
 
@@ -272,33 +312,65 @@ async def wait_until_receiving(channel, timeout: float = 180.0) -> None:
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    probes: list[str] = []
+    deleted: set[str] = set()
     try:
         while loop.time() < deadline:
             probe = await client.chat_postMessage(
                 channel=TEST_CHANNEL, text="nerve socket readiness probe",
             )
             ts = probe["ts"]
-            settle = loop.time() + 15.0
+            probes.append(ts)
+            settle = min(deadline, loop.time() + probe_interval)
             while loop.time() < settle:
                 if ts in seen_fresh:
-                    try:
-                        await client.chat_delete(channel=TEST_CHANNEL, ts=ts)
-                    except Exception:
-                        pass
-                    return
+                    break
                 await asyncio.sleep(0.2)
+            if ts in seen_fresh:
+                break
+        else:
+            raise AssertionError(
+                f"Slack was still not delivering fresh events after {timeout}s. "
+                "A backlog of retries from an earlier run keeps a new socket "
+                "deaf for 20-30s; longer than that suggests something else.",
+            )
+
+        # A failed probe has already missed Slack's immediate attempts and is
+        # scheduled to come back at +60s.  Closing while that retry is pending
+        # would make the readiness check itself poison the next run.  Keep the
+        # socket open until every probe has arrived and been acknowledged.
+        while loop.time() < deadline and not set(probes) <= seen_any:
+            await asyncio.sleep(0.2)
+        missing = set(probes) - seen_any
+        if missing:
+            raise AssertionError(
+                f"Slack became ready, but {len(missing)} readiness probe(s) "
+                f"were still awaiting retry after {timeout}s",
+            )
+
+        for probe_ts in probes:
+            await client.chat_delete(channel=TEST_CHANNEL, ts=probe_ts)
+            deleted.add(probe_ts)
+
+        # Do not close a socket immediately after deleting the fence: the Web
+        # API response wins the race with its Socket Mode event.  That race
+        # used to create one last retry after otherwise-clean fixture teardown.
+        while loop.time() < deadline and not deleted <= seen_fresh_deletes:
+            await asyncio.sleep(0.2)
+        missing = deleted - seen_fresh_deletes
+        if missing:
+            raise AssertionError(
+                f"Slack did not deliver {len(missing)} readiness-probe "
+                f"deletion event(s) within {timeout}s",
+            )
+        return
+    finally:
+        for probe_ts in set(probes) - deleted:
             try:
-                await client.chat_delete(channel=TEST_CHANNEL, ts=ts)
+                await client.chat_delete(channel=TEST_CHANNEL, ts=probe_ts)
             except Exception:
                 pass
-    finally:
         listeners[:] = installed
-
-    raise AssertionError(
-        f"Slack was still not delivering fresh events after {timeout}s. A "
-        "backlog of retries from an earlier run keeps a new socket deaf for "
-        "20-30s; longer than that suggests something else.",
-    )
 
 
 def ignore_replays(channel) -> None:

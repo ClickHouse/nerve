@@ -9,11 +9,11 @@ accepted, whether an emoji short name exists, whether ``users.info`` really
 withholds an email rather than failing, and whether an event makes the whole
 trip from a human's keystroke to an InboundMessage.
 
-These hold a Socket Mode connection, which is why they are kept apart
-from the outbound tests. Slack gives each event to exactly one of an
-app's open connections and replays whatever queued while none was
-listening, so a minute of outbound API traffic in the same process
-leaves a backlog the first test here reads instead of its own message.
+These hold a Socket Mode connection, which is why they are kept apart from
+the outbound tests. Slack gives each event to exactly one of an app's open
+connections. The outbound module uses its own ack-only socket so its Web API
+traffic cannot schedule future retries; a separate process ensures that sink
+can never steal one of the inbound events asserted here.
 
 Run with::
 
@@ -24,8 +24,9 @@ connection rather than the routing, and prefer diagnosing it to muting it —
 every time this suite has looked flaky it has been describing something real.
 The two causes found so far were a connection per test, which lost events
 into the gap where Slack had not yet started routing to the new socket, and
-outbound API traffic in the same process, whose queued events Slack replayed
-down this one. Hence a single shared connection, and a separate file.
+outbound API traffic with no listener, whose scheduled retries made a later
+socket deaf. Hence a single shared connection here, and an ack-only connection
+around the outbound file.
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ async def human():
 
 
 @pytest_asyncio.fixture(loop_scope="module")
-async def posted(bot):
+async def posted(bot, _connected_channel):
     """Track messages the test creates and delete them afterwards."""
     tracker = Posted()
     yield tracker
@@ -115,9 +116,9 @@ async def _connected_channel():
     resolves its config per event, so a test can retarget the guardrails
     between messages — the same property a config reload depends on.
 
-    This needs the outbound tests to live in another file. Sharing was tried
-    while they ran in this process and failed, because a minute of their API
-    traffic queues events that Slack replays down this socket.
+    This needs the outbound tests to live in another process. Their ack-only
+    socket would otherwise be a second connection competing for exactly the
+    inbound events this module asserts.
     """
     channel, cfg = build_channel(RecordingRouter())
     await channel.start()
@@ -125,11 +126,15 @@ async def _connected_channel():
     # be satisfied by an old envelope, then readiness waits for the probe's
     # own ts to prove Slack is delivering fresh events to this socket.
     ignore_replays(channel)
-    await wait_until_receiving(channel)
+    await wait_until_receiving(channel._client)
     await wait_until_quiet(channel)
     try:
         yield channel, cfg
     finally:
+        # The Posted fixture deletes its messages before this module-scoped
+        # connection tears down. Fence those final mutations so closing the
+        # socket cannot seed the next run with a retry schedule.
+        await wait_until_receiving(channel._client)
         await channel.stop()
 
 
@@ -172,39 +177,6 @@ class TestTransport:
         channel, _ = await live_channel(router, allow_users=["U0000000"])
         assert is_slack_id(channel._bot_user_id)
         assert await channel._client.is_connected()
-
-    async def test_the_watchdog_restores_a_dropped_socket(self):
-        # This one owns its connection instead of borrowing the shared one:
-        # it breaks the socket on purpose, and the reconnect leaves two
-        # connections briefly. Slack hands each event to exactly one of an
-        # app's connections, so doing that to the shared channel stole
-        # events from whichever test ran next.
-        import nerve.channels.slack as slack_module
-
-        router = RecordingRouter()
-        channel, _ = build_channel(router, allow_users=["U0000000"])
-        await channel.start()
-        original = slack_module.WATCHDOG_INTERVAL
-        slack_module.WATCHDOG_INTERVAL = 1
-        try:
-            await channel._client.disconnect()
-            await asyncio.sleep(0.5)
-            assert not await channel._client.is_connected()
-
-            deadline = time.monotonic() + EVENT_TIMEOUT
-            while time.monotonic() < deadline:
-                if await channel._client.is_connected():
-                    break
-                await asyncio.sleep(0.5)
-            assert await channel._client.is_connected(), (
-                "the socket stayed down; the watchdog did not recover it"
-            )
-        finally:
-            slack_module.WATCHDOG_INTERVAL = original
-            await channel.stop()
-            # Let Slack drop this connection before the next test relies on
-            # the shared one receiving everything.
-            await asyncio.sleep(SOCKET_DRAIN_SECONDS)
 
 
 # ---------------------------------------------------------------------- #
@@ -413,3 +385,39 @@ class TestGuardrailsAgainstRealSlack:
         assert ":tada:" in msg.text
 
 
+@requires_outbound
+class TestReconnectWatchdog:
+    async def test_the_watchdog_restores_a_dropped_socket(self):
+        """Exercise reconnect only after tests that need exclusive delivery.
+
+        This test owns its connection because it deliberately breaks it. Its
+        reconnect briefly overlaps the module's shared socket, and Slack may
+        hand an event to either connection, so running this test earlier can
+        perturb an otherwise-correct inbound assertion.
+        """
+        import nerve.channels.slack as slack_module
+
+        router = RecordingRouter()
+        channel, _ = build_channel(router, allow_users=["U0000000"])
+        await channel.start()
+        original = slack_module.WATCHDOG_INTERVAL
+        slack_module.WATCHDOG_INTERVAL = 1
+        try:
+            await channel._client.disconnect()
+            await asyncio.sleep(0.5)
+            assert not await channel._client.is_connected()
+
+            deadline = time.monotonic() + EVENT_TIMEOUT
+            while time.monotonic() < deadline:
+                if await channel._client.is_connected():
+                    break
+                await asyncio.sleep(0.5)
+            assert await channel._client.is_connected(), (
+                "the socket stayed down; the watchdog did not recover it"
+            )
+        finally:
+            slack_module.WATCHDOG_INTERVAL = original
+            await channel.stop()
+            # Let Slack drop this connection before module fixture cleanup
+            # relies on the shared socket receiving every deletion event.
+            await asyncio.sleep(SOCKET_DRAIN_SECONDS)

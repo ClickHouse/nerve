@@ -63,13 +63,13 @@ jobs:
       - name: Install project and test dependencies
         run: uv sync --extra test --locked --python "3.13"
 
-      # Inbound first, and in its own process. The outbound tests post,
-      # react and upload for a minute with no socket listening, so Slack
-      # queues all of it and replays the backlog to the next connection that
-      # appears. Running them first put every inbound event behind that
-      # queue: messages arrived a whole test late. Order matters as much as
-      # the process split. `if: always()` so a failure in the first still
-      # reports the second rather than hiding it.
+      # Inbound first, and in its own process. The outbound module now keeps
+      # an ack-only socket open around all of its Web API mutations, which
+      # prevents it from scheduling retries that poison the next run. Keep
+      # inbound first for retry schedules left by older revisions or an
+      # interrupted job, and keep the process split so the outbound sink can
+      # never steal an inbound test event. `if: always()` on outbound means a
+      # failure in the first step still reports the second.
       - name: Run live Slack tests (inbound)
         env:
           NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
