@@ -999,6 +999,144 @@ class TelegramConfig:
         )
 
 
+# Every `/nerve` subcommand, and the set enabled when the operator says
+# nothing. Kept here rather than in the channel so config validation can
+# name them without importing the transport.
+SLACK_ALL_COMMANDS: tuple[str, ...] = (
+    "sessions", "new", "stop", "star", "unstar", "reply", "doctor", "restart",
+)
+# `sessions` and `reply` are absent on purpose. Both reach every session in
+# the instance, including web and Telegram ones, and Slack has no ownership
+# model yet to narrow them to the caller. In a workspace where several people
+# may DM the bot that would let any of them list, attach to, continue, or
+# answer someone else's work. List them in `slack.commands` to turn them on.
+SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
+    "new", "stop", "star", "unstar",
+)
+
+
+def _slack_commands(raw: object) -> list[str] | None:
+    """Normalize ``slack.commands``.
+
+    ``None`` (absent) keeps the default set; ``[]`` disables the slash
+    command. ``"all"`` as the sole entry means every known subcommand, so a
+    trusted workspace does not have to list them.
+
+    An unknown name is dropped with a warning rather than refused: the whole
+    point of the key is to *narrow* what a workspace can reach, and a typo
+    that stopped the daemon booting would be a worse failure than a command
+    that stays off.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "slack.commands must be a list — ignoring %r and keeping the "
+            "default set", raw,
+        )
+        return None
+
+    names = [str(v).strip().lstrip("/").lower() for v in raw if str(v).strip()]
+    if names == ["all"] or names == ["*"]:
+        return list(SLACK_ALL_COMMANDS)
+
+    kept, unknown = [], []
+    for name in names:
+        (kept if name in SLACK_ALL_COMMANDS else unknown).append(name)
+    if unknown:
+        logger.warning(
+            "slack.commands has no such subcommand(s): %s — known ones are %s",
+            ", ".join(sorted(set(unknown))), ", ".join(SLACK_ALL_COMMANDS),
+        )
+    return kept
+
+
+@dataclass
+class SlackConfig:
+    """Slack bot channel — Socket Mode transport plus access guardrails.
+
+    The allow/deny lists are the whole authorization story: Slack has no
+    pairing step, because a workspace already decides who can reach the bot
+    at all. Patterns match a Slack id (``U0123ABC``), a handle, a display
+    name, an email, or a channel name, case-insensitively and with globs
+    (``eng-*``). See :mod:`nerve.channels.access` for the semantics — deny
+    wins, a non-empty allow list is a gate, and a policy with no allow
+    patterns at all refuses everything.
+    """
+
+    # Off until the workspace is set up. Slack reaches an installation that
+    # never asked for it, so an absent or credential-less section resolves to
+    # disabled and `nerve doctor` stays quiet about a channel nobody uses.
+    enabled: bool = False
+    bot_token: str = ""      # xoxb-… — Web API calls
+    app_token: str = ""      # xapp-… — Socket Mode connection
+    allow_users: list[str] = field(default_factory=list)
+    deny_users: list[str] = field(default_factory=list)
+    allow_channels: list[str] = field(default_factory=list)
+    deny_channels: list[str] = field(default_factory=list)
+    stream_mode: str = "partial"
+    # Reply inside the thread the message came from, and treat each thread as
+    # its own session. Off means every message in a channel shares one session
+    # and replies land at channel level.
+    reply_in_thread: bool = True
+    # Which `/nerve` subcommands the workspace may run. None keeps the
+    # default set, which acts only on this channel's own sessions; an empty
+    # list turns the slash command off entirely. `doctor` and `restart` are
+    # operator tools and are opt-in: the first prints host health into a
+    # shared workspace, and the second lets anyone on the allow list bounce
+    # the daemon. `sessions` and `reply` are opt-in too, because they reach
+    # every session in the instance.
+    # See SLACK_ALL_COMMANDS / SLACK_DEFAULT_COMMANDS.
+    commands: list[str] | None = None
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict, locked: bool = False) -> SlackConfig:
+        stream_mode = d.get("stream_mode", "partial")
+        if stream_mode not in ("partial", "full"):
+            logger.warning(
+                "slack.stream_mode %r is not one of ('partial', 'full') — "
+                "falling back to 'partial'",
+                stream_mode,
+            )
+            stream_mode = "partial"
+        bot_token = d.get("bot_token", "")
+        app_token = d.get("app_token", "")
+        # Slack is opt-in. An installation that predates the channel has no
+        # `slack` section at all, and reading that as "on" makes `nerve
+        # doctor` fail on every one of them over credentials nobody meant to
+        # set. Without an explicit `enabled`, the section counts as switched
+        # on only once both Socket Mode tokens are there.
+        #
+        # Lockdown still wins, for the reason TelegramConfig.from_dict gives:
+        # whether a box answers Slack is a per-machine decision written to the
+        # machine-local config.yaml, and lockdown drops that layer. Shared
+        # settings carrying a token this box can resolve must not start
+        # serving a workspace on their own.
+        #
+        # An unparseable value falls back to off rather than to the declared
+        # default, so `enabled: ${SLACK_ON:-nope}` cannot turn the bot on.
+        enabled = (
+            _as_bool(d["enabled"], False, label="SlackConfig.enabled")
+            if "enabled" in d
+            else bool(bot_token and app_token) and not locked
+        )
+        return cls(
+            enabled=enabled,
+            bot_token=bot_token,
+            app_token=app_token,
+            allow_users=d.get("allow_users") or [],
+            deny_users=d.get("deny_users") or [],
+            allow_channels=d.get("allow_channels") or [],
+            deny_channels=d.get("deny_channels") or [],
+            stream_mode=stream_mode,
+            reply_in_thread=d.get("reply_in_thread", True),
+            commands=_slack_commands(d.get("commands")),
+        )
+
+
 @dataclass
 class TelegramSyncConfig:
     enabled: bool = True
@@ -2600,6 +2738,7 @@ class NerveConfig:
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    slack: SlackConfig = field(default_factory=SlackConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
@@ -2828,6 +2967,7 @@ class NerveConfig:
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
+            slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),

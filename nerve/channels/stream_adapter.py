@@ -170,8 +170,14 @@ class StreamAdapter:
                     await self.channel.delete_message(self.target, placeholder_id)
                 except Exception:
                     pass  # Duplicate is better than lost response
-        elif not self._supports_streaming:
-            # Non-streaming channel: send the accumulated response as one message
+        elif not self._supports_streaming or (
+            self._supports_edit and not self._placeholder_id
+        ):
+            # Non-streaming channel, or an edit-in-place channel whose
+            # placeholder never got created: send the accumulated response as
+            # one message. Without the second case a channel that reports a
+            # failed placeholder as None drops the entire reply — it matches
+            # neither the edit branch above nor a non-streaming channel.
             text = self._normalize_text(self._buffer)
             if text:
                 formatted = self.channel.format_response(text)
