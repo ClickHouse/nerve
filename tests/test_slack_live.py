@@ -69,7 +69,7 @@ async def _ack_outbound_events():
         yield
         return
 
-    sink = await start_event_sink()
+    sink = await start_event_sink(diagnostics_label="outbound")
     try:
         # A WebSocket handshake is not sufficient when an older retry schedule
         # exists.  Prove Slack is routing fresh events here before tests post.
@@ -81,6 +81,7 @@ async def _ack_outbound_events():
         await wait_until_receiving(sink)
     finally:
         await sink.close()
+        sink._live_diagnostics.emit_summary()
 
 
 @pytest_asyncio.fixture(loop_scope="module")

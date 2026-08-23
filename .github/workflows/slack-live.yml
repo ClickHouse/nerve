@@ -76,7 +76,9 @@ jobs:
           NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
           NERVE_SLACK_TEST_CHANNEL: ${{ secrets.NERVE_SLACK_TEST_CHANNEL }}
           NERVE_SLACK_TEST_USER_TOKEN: ${{ secrets.NERVE_SLACK_TEST_USER_TOKEN }}
-        run: .venv/bin/pytest tests/test_slack_live_inbound.py -v
+        # -s exposes the credential-free `SLACK_LIVE {json}` diagnostics from
+        # the harness even on successful runs; pytest otherwise captures them.
+        run: .venv/bin/pytest tests/test_slack_live_inbound.py -v -s
 
       - name: Run live Slack tests (outbound)
         if: always()
@@ -86,4 +88,4 @@ jobs:
           NERVE_SLACK_TEST_CHANNEL: ${{ secrets.NERVE_SLACK_TEST_CHANNEL }}
           NERVE_SLACK_TEST_USER_TOKEN: ${{ secrets.NERVE_SLACK_TEST_USER_TOKEN }}
           NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL }}
-        run: .venv/bin/pytest tests/test_slack_live.py -v
+        run: .venv/bin/pytest tests/test_slack_live.py -v -s

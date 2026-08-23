@@ -22,8 +22,11 @@ Two tiers:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -96,6 +99,110 @@ SOCKET_DRAIN_SECONDS = 2.5
 # on a fixed schedule, so a test posting amid a retry burst can otherwise read
 # someone else's exhaust.
 SOCKET_QUIET_SECONDS = 1.5
+
+
+def live_diagnostic(event: str, **fields: Any) -> None:
+    """Emit one machine-readable, credential-free live-test diagnostic."""
+    payload = {
+        "event": event,
+        "pid": os.getpid(),
+        "time": round(time.time(), 3),
+        **fields,
+    }
+    print(f"SLACK_LIVE {json.dumps(payload, sort_keys=True)}", flush=True)
+
+
+@dataclass
+class SocketDiagnostics:
+    """Observe a live-test socket without changing its acknowledgement path."""
+
+    label: str
+    started_at: float = field(default_factory=time.monotonic)
+    connections: int = 0
+    envelopes: int = 0
+    fresh: int = 0
+    retry_attempts: Counter[int] = field(default_factory=Counter)
+    event_types: Counter[str] = field(default_factory=Counter)
+    max_event_age_seconds: float = 0.0
+    _clients: int = 0
+
+    def emit(self, event: str, **fields: Any) -> None:
+        live_diagnostic(event, socket=self.label, **fields)
+
+    def attach(self, socket) -> None:
+        """Attach passive listeners before *socket* connects."""
+        self._clients += 1
+        client_number = self._clients
+
+        async def observe_message(_client, message, _raw):
+            kind = message.get("type")
+            if kind == "hello":
+                self.connections += 1
+                self.emit(
+                    "socket_hello",
+                    client=client_number,
+                    num_connections=message.get("num_connections"),
+                    host=(message.get("debug_info") or {}).get("host"),
+                )
+        async def observe_request(_client, req):
+            self.envelopes += 1
+            payload = req.payload or {}
+            slack_event = payload.get("event") or {}
+            event_type = slack_event.get("type") or "none"
+            subtype = slack_event.get("subtype")
+            kind = f"{req.type}/{event_type}"
+            if subtype:
+                kind += f"/{subtype}"
+            self.event_types[kind] += 1
+
+            attempt = req.retry_attempt or 0
+            if attempt:
+                self.retry_attempts[attempt] += 1
+            else:
+                self.fresh += 1
+
+            event_age = None
+            event_ts = slack_event.get("event_ts") or slack_event.get("ts")
+            try:
+                event_age = max(0.0, time.time() - float(event_ts))
+                self.max_event_age_seconds = max(
+                    self.max_event_age_seconds, event_age,
+                )
+            except (TypeError, ValueError):
+                pass
+
+            if attempt:
+                self.emit(
+                    "retry_envelope",
+                    attempt=attempt,
+                    reason=req.retry_reason,
+                    request_type=req.type,
+                    event_type=event_type,
+                    event_subtype=subtype,
+                    event_age_seconds=(
+                        round(event_age, 3) if event_age is not None else None
+                    ),
+                )
+
+        socket.message_listeners.append(observe_message)
+        socket.socket_mode_request_listeners.append(observe_request)
+        socket._live_diagnostics = self
+        socket._live_diagnostics_request_listener = observe_request
+        self.emit("socket_client_built", client=client_number)
+
+    def emit_summary(self) -> None:
+        self.emit(
+            "socket_summary",
+            duration_seconds=round(time.monotonic() - self.started_at, 3),
+            clients=self._clients,
+            connections=self.connections,
+            envelopes=self.envelopes,
+            fresh=self.fresh,
+            retried=sum(self.retry_attempts.values()),
+            retry_attempts=dict(sorted(self.retry_attempts.items())),
+            event_types=dict(sorted(self.event_types.items())),
+            max_event_age_seconds=round(self.max_event_age_seconds, 3),
+        )
 
 
 
@@ -221,14 +328,26 @@ async def wait_until_quiet(
     turns a socket that never settles into a confusing assertion three
     tests later.
     """
-    import time
-
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    started = loop.time()
+    diagnostics = getattr(channel._client, "_live_diagnostics", None)
     while loop.time() < deadline:
         if time.monotonic() - channel._last_event_time >= quiet_for:
+            if diagnostics:
+                diagnostics.emit(
+                    "socket_quiet",
+                    quiet_for_seconds=quiet_for,
+                    waited_seconds=round(loop.time() - started, 3),
+                )
             return
         await asyncio.sleep(0.2)
+    if diagnostics:
+        diagnostics.emit(
+            "socket_quiet_timeout",
+            quiet_for_seconds=quiet_for,
+            waited_seconds=round(loop.time() - started, 3),
+        )
     raise AssertionError(
         f"the Slack socket never went quiet for {quiet_for}s within "
         f"{timeout}s — scheduled retries are still arriving",
@@ -236,7 +355,9 @@ async def wait_until_quiet(
 
 
 async def start_event_sink(
-    bot_token: str = BOT_TOKEN, app_token: str = APP_TOKEN,
+    bot_token: str = BOT_TOKEN,
+    app_token: str = APP_TOKEN,
+    diagnostics_label: str | None = None,
 ):
     """Open a Socket Mode client that acknowledges and discards every envelope.
 
@@ -260,7 +381,12 @@ async def start_event_sink(
         )
 
     socket.socket_mode_request_listeners.append(acknowledge)
+    if diagnostics_label:
+        SocketDiagnostics(diagnostics_label).attach(socket)
     await socket.connect()
+    diagnostics = getattr(socket, "_live_diagnostics", None)
+    if diagnostics:
+        diagnostics.emit("socket_connect_returned")
     return socket
 
 
@@ -285,9 +411,23 @@ async def wait_until_receiving(
     final mutation unacknowledged behind it.
     """
     client = web_client or socket.web_client
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + timeout
+    diagnostics = getattr(socket, "_live_diagnostics", None)
     seen_any: set[str] = set()
     seen_fresh: set[str] = set()
     seen_fresh_deletes: set[str] = set()
+    arrivals: dict[str, tuple[float, int, str | None]] = {}
+    deletion_arrivals: dict[str, float] = {}
+    probe_posted: dict[str, float] = {}
+    probes: list[str] = []
+    deleted: set[str] = set()
+    deletion_sent: dict[str, float] = {}
+    completed = False
+
+    if diagnostics:
+        diagnostics.emit("delivery_barrier_started", timeout_seconds=timeout)
 
     # Wrap the listener list rather than channel._on_request: attribute
     # access builds a fresh bound method each time, so an identity check
@@ -300,27 +440,31 @@ async def wait_until_receiving(
         event = payload.get("event") or {}
         if event.get("ts"):
             seen_any.add(event["ts"])
+            arrivals.setdefault(
+                event["ts"],
+                (loop.time(), req.retry_attempt or 0, req.retry_reason),
+            )
         if not req.retry_attempt:
             if event.get("ts"):
                 seen_fresh.add(event["ts"])
             if event.get("deleted_ts"):
                 seen_fresh_deletes.add(event["deleted_ts"])
+                deletion_arrivals.setdefault(event["deleted_ts"], loop.time())
         for fn in installed:
             await fn(sock, req)
 
     listeners[:] = [watch]
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    probes: list[str] = []
-    deleted: set[str] = set()
     try:
         while loop.time() < deadline:
+            post_started = loop.time()
             probe = await client.chat_postMessage(
                 channel=TEST_CHANNEL, text="nerve socket readiness probe",
             )
             ts = probe["ts"]
             probes.append(ts)
+            probe_posted[ts] = post_started
+            if diagnostics:
+                diagnostics.emit("probe_posted", probe=len(probes))
             settle = min(deadline, loop.time() + probe_interval)
             while loop.time() < settle:
                 if ts in seen_fresh:
@@ -328,6 +472,16 @@ async def wait_until_receiving(
                 await asyncio.sleep(0.2)
             if ts in seen_fresh:
                 break
+            if diagnostics:
+                arrived = arrivals.get(ts)
+                diagnostics.emit(
+                    "probe_missed",
+                    probe=len(probes),
+                    waited_seconds=round(loop.time() - probe_posted[ts], 3),
+                    arrived=arrived is not None,
+                    retry_attempt=arrived[1] if arrived else None,
+                    retry_reason=arrived[2] if arrived else None,
+                )
         else:
             raise AssertionError(
                 f"Slack was still not delivering fresh events after {timeout}s. "
@@ -348,7 +502,21 @@ async def wait_until_receiving(
                 f"were still awaiting retry after {timeout}s",
             )
 
+        if diagnostics:
+            for number, probe_ts in enumerate(probes, start=1):
+                arrived_at, retry_attempt, retry_reason = arrivals[probe_ts]
+                diagnostics.emit(
+                    "probe_arrived",
+                    probe=number,
+                    latency_seconds=round(
+                        arrived_at - probe_posted[probe_ts], 3,
+                    ),
+                    retry_attempt=retry_attempt,
+                    retry_reason=retry_reason,
+                )
+
         for probe_ts in probes:
+            deletion_sent[probe_ts] = loop.time()
             await client.chat_delete(channel=TEST_CHANNEL, ts=probe_ts)
             deleted.add(probe_ts)
 
@@ -363,6 +531,21 @@ async def wait_until_receiving(
                 f"Slack did not deliver {len(missing)} readiness-probe "
                 f"deletion event(s) within {timeout}s",
             )
+        completed = True
+        if diagnostics:
+            deletion_latencies = [
+                max(0.0, deletion_arrivals[probe_ts] - deletion_sent[probe_ts])
+                for probe_ts in deleted
+            ]
+            diagnostics.emit(
+                "delivery_barrier_complete",
+                duration_seconds=round(loop.time() - started, 3),
+                probes=len(probes),
+                missed_probes=max(0, len(probes) - 1),
+                max_deletion_latency_seconds=round(
+                    max(deletion_latencies, default=0.0), 3,
+                ),
+            )
         return
     finally:
         for probe_ts in set(probes) - deleted:
@@ -371,6 +554,14 @@ async def wait_until_receiving(
             except Exception:
                 pass
         listeners[:] = installed
+        if diagnostics and not completed:
+            diagnostics.emit(
+                "delivery_barrier_failed",
+                duration_seconds=round(loop.time() - started, 3),
+                probes=len(probes),
+                probes_arrived=len(set(probes) & seen_any),
+                deletions_arrived=len(set(probes) & seen_fresh_deletes),
+            )
 
 
 def ignore_replays(channel) -> None:
@@ -395,6 +586,11 @@ def ignore_replays(channel) -> None:
             await sock.send_socket_mode_response(
                 SocketModeResponse(envelope_id=req.envelope_id),
             )
+            observer = getattr(
+                sock, "_live_diagnostics_request_listener", None,
+            )
+            if observer:
+                await observer(sock, req)
             return
         for fn in installed:
             await fn(sock, req)
@@ -402,7 +598,11 @@ def ignore_replays(channel) -> None:
     listeners[:] = [drop_replays]
 
 
-def build_channel(router: RecordingRouter, **slack_kwargs):
+def build_channel(
+    router: RecordingRouter,
+    diagnostics_label: str | None = None,
+    **slack_kwargs,
+):
     """A SlackChannel wired to the live workspace with the given guardrails."""
     from nerve.channels.slack import SlackChannel
     from nerve.config import NerveConfig, SlackConfig
@@ -416,4 +616,15 @@ def build_channel(router: RecordingRouter, **slack_kwargs):
     )
     channel = SlackChannel(lambda: cfg, router)  # type: ignore[arg-type]
     router.channel = channel
+    if diagnostics_label:
+        diagnostics = SocketDiagnostics(diagnostics_label)
+        build_socket_client = channel._build_socket_client
+
+        def build_instrumented_socket():
+            socket = build_socket_client()
+            diagnostics.attach(socket)
+            return socket
+
+        channel._build_socket_client = build_instrumented_socket
+        channel._live_diagnostics = diagnostics
     return channel, cfg

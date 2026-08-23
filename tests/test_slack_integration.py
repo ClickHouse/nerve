@@ -8,6 +8,7 @@ the ack contract, and the shape of the calls actually put on the wire.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,7 +17,7 @@ import pytest_asyncio
 from nerve.channels.slack import SlackChannel
 from nerve.config import NerveConfig, SlackConfig
 from tests.fake_slack import FakeSlack
-from tests.slack_live import start_event_sink, wait_until_receiving
+from tests.slack_live import ignore_replays, start_event_sink, wait_until_receiving
 
 
 def _config(**slack_kwargs) -> NerveConfig:
@@ -52,10 +53,15 @@ async def _started(server: FakeSlack, monkeypatch, **slack_kwargs):
 @pytest.mark.asyncio
 class TestSocketMode:
     async def test_an_ack_only_sink_consumes_events_without_dispatching(
-        self, slack, monkeypatch,
+        self, slack, monkeypatch, capsys,
     ):
         slack.patch_client(monkeypatch)
-        sink = await start_event_sink("xoxb-fake", "xapp-fake")
+        sink = await start_event_sink(
+            "xoxb-fake", "xapp-fake", diagnostics_label="fake-sink",
+        )
+        channel = MagicMock()
+        channel._client = sink
+        ignore_replays(channel)
         try:
             class ProbeClient:
                 posts = 0
@@ -98,6 +104,24 @@ class TestSocketMode:
             assert len(slack.acks) == 4
         finally:
             await sink.close()
+            sink._live_diagnostics.emit_summary()
+
+        output = capsys.readouterr().out
+        records = [
+            json.loads(line.removeprefix("SLACK_LIVE "))
+            for line in output.splitlines()
+            if line.startswith("SLACK_LIVE ")
+        ]
+        events = {record["event"] for record in records}
+        assert {
+            "socket_hello",
+            "retry_envelope",
+            "probe_missed",
+            "delivery_barrier_complete",
+            "socket_summary",
+        } <= events
+        assert "xoxb-fake" not in output
+        assert "nerve socket readiness probe" not in output
 
     async def test_the_channel_connects_and_learns_its_own_id(
         self, slack, monkeypatch,

@@ -26,6 +26,12 @@ Slack retries every undelivered envelope at +60 seconds and again around five
 minutes, which can make a later inbound connection deaf to fresh events. The
 process split ensures the sink can never steal an inbound test event.
 
+CI prints structured lines prefixed with `SLACK_LIVE`. They record Socket Mode
+handshakes and connection counts, readiness-probe latency, retry attempt/reason
+and event age, quiet waits, and an aggregate summary by envelope type. The
+diagnostics deliberately omit tokens, channel/user ids, envelope ids, and
+message text, so a failed run can be shared without exposing workspace data.
+
 | Variable | Value | Needed for |
 |---|---|---|
 | `NERVE_SLACK_TEST_BOT_TOKEN` | `xoxb-…` | everything |

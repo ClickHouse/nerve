@@ -120,7 +120,9 @@ async def _connected_channel():
     socket would otherwise be a second connection competing for exactly the
     inbound events this module asserts.
     """
-    channel, cfg = build_channel(RecordingRouter())
+    channel, cfg = build_channel(
+        RecordingRouter(), diagnostics_label="inbound",
+    )
     await channel.start()
     # Order matters. Replays are dropped first so the readiness probe cannot
     # be satisfied by an old envelope, then readiness waits for the probe's
@@ -134,8 +136,11 @@ async def _connected_channel():
         # The Posted fixture deletes its messages before this module-scoped
         # connection tears down. Fence those final mutations so closing the
         # socket cannot seed the next run with a retry schedule.
-        await wait_until_receiving(channel._client)
-        await channel.stop()
+        try:
+            await wait_until_receiving(channel._client)
+        finally:
+            await channel.stop()
+            channel._live_diagnostics.emit_summary()
 
 
 @pytest_asyncio.fixture(loop_scope="module")
@@ -398,7 +403,11 @@ class TestReconnectWatchdog:
         import nerve.channels.slack as slack_module
 
         router = RecordingRouter()
-        channel, _ = build_channel(router, allow_users=["U0000000"])
+        channel, _ = build_channel(
+            router,
+            diagnostics_label="watchdog",
+            allow_users=["U0000000"],
+        )
         await channel.start()
         original = slack_module.WATCHDOG_INTERVAL
         slack_module.WATCHDOG_INTERVAL = 1
@@ -418,6 +427,7 @@ class TestReconnectWatchdog:
         finally:
             slack_module.WATCHDOG_INTERVAL = original
             await channel.stop()
+            channel._live_diagnostics.emit_summary()
             # Let Slack drop this connection before module fixture cleanup
             # relies on the shared socket receiving every deletion event.
             await asyncio.sleep(SOCKET_DRAIN_SECONDS)
