@@ -1,0 +1,346 @@
+"""Live Slack integration tests.
+
+Everything here skips unless the credentials in :data:`tests.slack_live.SETUP`
+are present, so the ordinary suite and CI on a fork are unaffected.
+
+The unit tests already prove the channel is self-consistent. These exist for
+the claims that only Slack can settle: whether a Block Kit payload is
+accepted, whether an emoji short name exists, whether ``users.info`` really
+withholds an email rather than failing, and whether an event makes the whole
+trip from a human's keystroke to an InboundMessage.
+
+Run just these with::
+
+    pytest tests/test_slack_live.py -v
+"""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+
+from nerve.channels.slack import (
+    _EMOJI_TO_SLACK,
+    MAX_MSG_LEN,
+    _md_to_slack,
+    build_notification_blocks,
+    format_target,
+    is_slack_id,
+    split_message,
+    SlackChannel,
+)
+from tests.slack_live import (
+    BOT_TOKEN,
+    HAVE_OUTBOUND,
+    NO_EMAIL_BOT_TOKEN,
+    TEST_CHANNEL,
+    USER_TOKEN,
+    Posted,
+    RecordingRouter,
+    build_channel,
+    make_client,
+    requires_no_email_token,
+    requires_outbound,
+    start_event_sink,
+    wait_until_receiving,
+)
+
+# One event loop for the whole module. The fixtures below hold aiohttp
+# sessions, and a per-function loop leaves those bound to a loop that has
+# already closed.
+pytestmark = pytest.mark.asyncio(loop_scope="module")
+
+
+async def test_the_diagnostics_wrapper_preserves_socket_builder_arguments(
+    monkeypatch,
+):
+    calls = []
+    socket = SimpleNamespace(
+        message_listeners=[],
+        socket_mode_request_listeners=[],
+    )
+
+    def build_socket(_channel, *, app_token=None, web_client=None):
+        calls.append((app_token, web_client))
+        return socket
+
+    monkeypatch.setattr(SlackChannel, "_build_socket_client", build_socket)
+    channel, _ = build_channel(
+        RecordingRouter(), diagnostics_label="wrapper-test",
+    )
+    web_client = object()
+
+    assert channel._build_socket_client(
+        app_token="xapp-test", web_client=web_client,
+    ) is socket
+    assert calls == [("xapp-test", web_client)]
+
+
+# ---------------------------------------------------------------------- #
+#  Fixtures                                                               #
+# ---------------------------------------------------------------------- #
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
+async def _ack_outbound_events():
+    """Keep this module's Web API mutations from poisoning a later run.
+
+    Each post, edit, reaction, upload, and cleanup can produce a Socket Mode
+    envelope.  With no socket open Slack retries those envelopes at +60s and
+    again around +5min; the pending retries are what made a later inbound
+    connection miss fresh events.  The sink shares this module's lifecycle,
+    so it is connected before the first mutation and closes after cleanup.
+    """
+    if not HAVE_OUTBOUND:
+        yield
+        return
+
+    sink = await start_event_sink(diagnostics_label="outbound")
+    try:
+        # A WebSocket handshake is not sufficient when an older retry schedule
+        # exists.  Prove Slack is routing fresh events here before tests post.
+        await wait_until_receiving(sink)
+        yield
+        # Fence fixture cleanup as well: Posted deletes messages after the
+        # tests, and closing before those events arrive would recreate the
+        # exact backlog this fixture exists to prevent.
+        await wait_until_receiving(sink)
+    finally:
+        await sink.close()
+        sink._live_diagnostics.emit_summary()
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def bot():
+    """A Web API client on the bot token."""
+    if not BOT_TOKEN:
+        pytest.skip("no bot token")
+    yield make_client(BOT_TOKEN)
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def human():
+    """A Web API client on the user token, for posting as a person."""
+    if not USER_TOKEN:
+        pytest.skip("no user token")
+    yield make_client(USER_TOKEN)
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def posted(bot, _ack_outbound_events):
+    """Track messages the test creates and delete them afterwards."""
+    tracker = Posted()
+    yield tracker
+    for token, entries in ((BOT_TOKEN, tracker.bot), (USER_TOKEN, tracker.user)):
+        if not token or not entries:
+            continue
+        client = make_client(token)
+        for channel, ts in entries:
+            try:
+                await client.chat_delete(channel=channel, ts=ts)
+            except Exception:
+                pass  # A test that already deleted it, or a stale ts.
+
+
+# ---------------------------------------------------------------------- #
+#  Outbound — what Slack accepts                                          #
+# ---------------------------------------------------------------------- #
+
+
+@requires_outbound
+class TestSlackAcceptsWhatWeSend:
+    async def test_the_bot_authenticates_and_the_channel_id_is_real(self, bot):
+        auth = await bot.auth_test()
+        assert auth["ok"]
+        assert is_slack_id(auth["user_id"]), auth["user_id"]
+        info = await bot.conversations_info(channel=TEST_CHANNEL)
+        assert info["ok"], "the bot must be invited to NERVE_SLACK_TEST_CHANNEL"
+
+    async def test_converted_markdown_survives_a_round_trip(self, bot, posted):
+        source = (
+            "## Heading\n"
+            "**bold** and *italic* and `code`\n"
+            "- bullet one\n"
+            "- bullet two\n"
+            "[docs](https://example.com/a?x=1&y=2)\n"
+            "```\nliteral **not bold**\n```\n"
+            "a < b & c > d"
+        )
+        sent = _md_to_slack(source)
+        resp = await bot.chat_postMessage(channel=TEST_CHANNEL, text=sent)
+        posted.note_bot(TEST_CHANNEL, resp["ts"])
+
+        history = await bot.conversations_history(
+            channel=TEST_CHANNEL, latest=resp["ts"], inclusive=True, limit=1,
+        )
+        stored = history["messages"][0]["text"]
+        # Slack stores mrkdwn verbatim. A mismatch means the converter emitted
+        # something Slack rewrote, which is the bug the fake cannot see.
+        assert stored == sent
+
+    async def test_a_long_reply_splits_into_messages_slack_accepts(
+        self, bot, posted,
+    ):
+        body = "\n".join(f"line {i} " + "x" * 60 for i in range(200))
+        chunks = split_message(body, MAX_MSG_LEN)
+        assert len(chunks) > 1, "test needs a body that actually splits"
+        for chunk in chunks:
+            resp = await bot.chat_postMessage(
+                channel=TEST_CHANNEL, text=_md_to_slack(chunk),
+            )
+            posted.note_bot(TEST_CHANNEL, resp["ts"])
+            assert resp["ok"]
+
+    async def test_a_notification_card_is_valid_block_kit(self, bot, posted):
+        blocks = build_notification_blocks(
+            "Deploy to production?", "n-live-1",
+            [("✅ Approve", "approve"), ("❌ Decline", "decline"),
+             ("💤 Snooze 24h", "snooze_24h")],
+        )
+        resp = await bot.chat_postMessage(
+            channel=TEST_CHANNEL, text="Deploy to production?", blocks=blocks,
+        )
+        posted.note_bot(TEST_CHANNEL, resp["ts"])
+        assert resp["ok"]
+
+    async def test_a_long_option_list_is_chunked_below_the_actions_limit(
+        self, bot, posted,
+    ):
+        # Slack rejects the whole message with invalid_blocks past 25
+        # elements in one actions block. Its validator is the authority here,
+        # not our arithmetic.
+        options = [(f"Option {i}", f"v{i}") for i in range(60)]
+        blocks = build_notification_blocks("Pick one", "n-live-2", options)
+        resp = await bot.chat_postMessage(
+            channel=TEST_CHANNEL, text="Pick one", blocks=blocks,
+        )
+        posted.note_bot(TEST_CHANNEL, resp["ts"])
+        assert resp["ok"]
+
+    async def test_clearing_blocks_removes_the_buttons(self, bot, posted):
+        # The notification-expiry path relies on blocks=[] dropping the dead
+        # buttons rather than being ignored as falsy.
+        blocks = build_notification_blocks(
+            "Answer me", "n-live-3", [("Yes", "yes"), ("No", "no")],
+        )
+        resp = await bot.chat_postMessage(
+            channel=TEST_CHANNEL, text="Answer me", blocks=blocks,
+        )
+        posted.note_bot(TEST_CHANNEL, resp["ts"])
+
+        await bot.chat_update(
+            channel=TEST_CHANNEL, ts=resp["ts"],
+            text="Answer me\n\n⏰ Expired unanswered", blocks=[],
+        )
+        history = await bot.conversations_history(
+            channel=TEST_CHANNEL, latest=resp["ts"], inclusive=True, limit=1,
+        )
+        message = history["messages"][0]
+        # Slack does not leave the message block-less: it synthesises a
+        # rich_text block from the new text. What must be gone is the
+        # actions block, because that is what carries the dead buttons.
+        kinds = {b.get("type") for b in message.get("blocks") or []}
+        assert "actions" not in kinds, f"expired card still has buttons: {kinds}"
+        assert "Expired" in message["text"]
+
+    async def test_every_mapped_emoji_short_name_exists(self, bot, posted):
+        """Every entry in the emoji table must be a name Slack knows.
+
+        The table is hand-written, and a wrong short name fails at
+        ``reactions.add`` with ``invalid_name``, which the production path
+        swallows — the agent's reaction just never appears.
+
+        Reactions are spread over several anchor messages because Slack caps
+        the distinct reactions on one message at about two dozen, and one
+        test reports every bad name at once rather than making you re-run to
+        find the next.
+        """
+        per_anchor = 15
+        items = sorted(set(_EMOJI_TO_SLACK.items()), key=lambda kv: kv[1])
+        rejected: list[str] = []
+
+        for start in range(0, len(items), per_anchor):
+            anchor = await bot.chat_postMessage(
+                channel=TEST_CHANNEL, text=f"emoji probe {start}",
+            )
+            posted.note_bot(TEST_CHANNEL, anchor["ts"])
+            for emoji, name in items[start:start + per_anchor]:
+                try:
+                    await bot.reactions_add(
+                        channel=TEST_CHANNEL, timestamp=anchor["ts"], name=name,
+                    )
+                except Exception as exc:
+                    if "already_reacted" not in str(exc):
+                        rejected.append(f"{emoji} → :{name}: ({exc})")
+                await asyncio.sleep(0.3)
+
+        assert not rejected, "Slack rejected these reactions:\n" + "\n".join(rejected)
+
+    async def test_a_file_upload_lands_in_the_conversation(
+        self, bot, tmp_path, posted,
+    ):
+        from nerve.channels.slack import SlackChannel
+        from nerve.config import NerveConfig, SlackConfig
+
+        path = tmp_path / "report.txt"
+        path.write_text("nerve live upload\n", encoding="utf-8")
+
+        cfg = NerveConfig()
+        cfg.slack = SlackConfig(bot_token=BOT_TOKEN, app_token="unused")
+        channel = SlackChannel(lambda: cfg, router=None)  # type: ignore[arg-type]
+        channel._web = bot
+        assert await channel.send_file(format_target(TEST_CHANNEL), str(path))
+
+    async def test_streaming_edits_then_removes_the_placeholder(
+        self, bot, posted,
+    ):
+        placeholder = await bot.chat_postMessage(channel=TEST_CHANNEL, text="⏳")
+        ts = placeholder["ts"]
+        for fragment in ("partial one", "partial one and two"):
+            await bot.chat_update(
+                channel=TEST_CHANNEL, ts=ts, text=_md_to_slack(fragment),
+            )
+            await asyncio.sleep(1.2)   # the per-channel chat.update limit
+        final = await bot.chat_postMessage(channel=TEST_CHANNEL, text="final answer")
+        posted.note_bot(TEST_CHANNEL, final["ts"])
+        await bot.chat_delete(channel=TEST_CHANNEL, ts=ts)
+
+        history = await bot.conversations_history(
+            channel=TEST_CHANNEL, latest=ts, inclusive=True, limit=1,
+        )
+        assert not history["messages"] or history["messages"][0]["ts"] != ts
+
+
+# ---------------------------------------------------------------------- #
+#  Scope behaviour — the premise the deny-list rule rests on              #
+# ---------------------------------------------------------------------- #
+
+
+@requires_outbound
+@requires_no_email_token
+class TestScopeOmission:
+    async def test_users_info_omits_email_without_the_scope_instead_of_failing(
+        self, bot,
+    ):
+        """A token without ``users:read.email`` still gets a 200.
+
+        This is why an email deny rule cannot be trusted on a short response:
+        the absent field looks exactly like a user who has no email, so the
+        rule matches nothing and would admit the person it names. The channel
+        refuses instead, and this test is what says that premise is real.
+        """
+        auth = await bot.auth_test()
+        with_scope = await bot.users_info(user=auth["user_id"])
+        assert with_scope["user"]["profile"].get("email"), (
+            "the main bot token needs users:read.email for this comparison"
+        )
+
+        limited = make_client(NO_EMAIL_BOT_TOKEN)
+        response = await limited.users_info(user=auth["user_id"])
+        assert response["ok"], "expected a successful response, not an error"
+        assert not response["user"]["profile"].get("email"), (
+            "the no-email token returned an email; it still has the scope"
+        )
