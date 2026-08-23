@@ -98,14 +98,6 @@ SOCKET_DRAIN_SECONDS = 2.5
 # can be reading someone else's exhaust.
 SOCKET_QUIET_SECONDS = 1.5
 
-# The quiet needed before the first test, which is a different problem
-# from the quiet needed between tests. A run leaves events queued behind
-# it — the outbound suite posts for a minute with nothing listening — and
-# Slack replays that to the next connection at its own pace, with gaps.
-# A short threshold is satisfied by one of those gaps and the replay then
-# lands in the middle of the first test, which is how one run's messages
-# came to fail the next run.
-INITIAL_DRAIN_QUIET_SECONDS = 8.0
 
 
 def unique_marker() -> str:
@@ -158,15 +150,18 @@ class RecordingRouter:
         self._arrived = asyncio.Event()
 
     async def handle_message(self, msg: Any) -> str:
-        self.messages.append(msg)
         self._sessions.setdefault(msg.channel_key, f"s{len(self._sessions)}")
-        self._arrived.set()
         if self.reply_text and self.channel is not None:
             from nerve.channels.base import OutboundMessage
 
             await self.channel.send(
                 OutboundMessage(target=msg.sender_id, text=self.reply_text),
             )
+        # Recorded last, so a test woken by wait_for_message can rely on the
+        # reply already being posted. Recording first let a test read the
+        # thread before the bot had answered it.
+        self.messages.append(msg)
+        self._arrived.set()
         return self.reply_text or "ok"
 
     async def get_last_session(self, channel_key: str) -> str | None:
@@ -241,47 +236,98 @@ async def wait_until_quiet(
     )
 
 
-async def wait_until_receiving(channel, timeout: float = 60.0) -> None:
-    """Block until Slack is actually routing events to this connection.
+async def wait_until_receiving(channel, timeout: float = 180.0) -> None:
+    """Block until Slack is delivering *fresh* events to this connection.
 
-    A completed handshake is not the same as being the connection Slack
-    delivers to; there is a window after connecting where events go
-    elsewhere or are held. Quiet does not distinguish "nothing is happening"
-    from "nothing is reaching us", so this proves the path instead: post a
-    message as the bot and wait for the channel to see *any* envelope.
+    Slack does not hold undelivered events in a queue; it retries them on a
+    schedule — immediately, then again at +60s and ~+5min, each marked with
+    a ``retry_attempt``. While retries are outstanding a newly opened socket
+    is deaf to new events for roughly 20-30 seconds: anything posted in that
+    window misses the first attempts and only comes back a minute later.
 
-    The probe is the bot's own message, which the channel filters out before
-    the router — but ``_on_request`` still stamps ``_last_event_time``, so
-    the stamp moving is the proof, and no test router is disturbed.
+    So readiness cannot be "an envelope arrived". A retried envelope is at
+    least a minute old and often belongs to an earlier run, and accepting
+    one declares the socket ready while it is still black-holing. This posts
+    a probe and waits for *that message's own ts*, unretried, re-probing
+    until it lands.
     """
     client = make_client(BOT_TOKEN)
+    seen_fresh: set[str] = set()
+
+    # Wrap the listener list rather than channel._on_request: attribute
+    # access builds a fresh bound method each time, so an identity check
+    # against one never matches and the swap silently does nothing.
+    listeners = channel._client.socket_mode_request_listeners
+    installed = list(listeners)
+
+    async def watch(sock, req):
+        payload = req.payload or {}
+        event = payload.get("event") or {}
+        if not req.retry_attempt and event.get("ts"):
+            seen_fresh.add(event["ts"])
+        for fn in installed:
+            await fn(sock, req)
+
+    listeners[:] = [watch]
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-
-    while loop.time() < deadline:
-        before = channel._last_event_time
-        probe = await client.chat_postMessage(
-            channel=TEST_CHANNEL, text="nerve socket readiness probe",
-        )
-        settle = loop.time() + 10.0
-        while loop.time() < settle:
-            if channel._last_event_time > before:
-                try:
-                    await client.chat_delete(
-                        channel=TEST_CHANNEL, ts=probe["ts"],
-                    )
-                except Exception:
-                    pass
-                return
-            await asyncio.sleep(0.2)
-        try:
-            await client.chat_delete(channel=TEST_CHANNEL, ts=probe["ts"])
-        except Exception:
-            pass
+    try:
+        while loop.time() < deadline:
+            probe = await client.chat_postMessage(
+                channel=TEST_CHANNEL, text="nerve socket readiness probe",
+            )
+            ts = probe["ts"]
+            settle = loop.time() + 15.0
+            while loop.time() < settle:
+                if ts in seen_fresh:
+                    try:
+                        await client.chat_delete(channel=TEST_CHANNEL, ts=ts)
+                    except Exception:
+                        pass
+                    return
+                await asyncio.sleep(0.2)
+            try:
+                await client.chat_delete(channel=TEST_CHANNEL, ts=ts)
+            except Exception:
+                pass
+    finally:
+        listeners[:] = installed
 
     raise AssertionError(
-        f"Slack never routed an event to this connection within {timeout}s",
+        f"Slack was still not delivering fresh events after {timeout}s. A "
+        "backlog of retries from an earlier run keeps a new socket deaf for "
+        "20-30s; longer than that suggests something else.",
     )
+
+
+def ignore_replays(channel) -> None:
+    """Make *channel* skip envelopes Slack is redelivering.
+
+    Tests only ever wait for a message they just posted, and a retried
+    envelope is at least a minute old — so it is always another test's, or
+    another run's, and letting it through is how one run's messages came to
+    appear in another's assertions.
+
+    Production does the opposite on purpose: a retry is how a message
+    survives a restart, so the channel must handle it there. This is a
+    test-harness concern only.
+    """
+    from slack_sdk.socket_mode.response import SocketModeResponse
+
+    listeners = channel._client.socket_mode_request_listeners
+    installed = list(listeners)
+
+    async def drop_replays(sock, req):
+        if req.retry_attempt:
+            await sock.send_socket_mode_response(
+                SocketModeResponse(envelope_id=req.envelope_id),
+            )
+            return
+        for fn in installed:
+            await fn(sock, req)
+
+    listeners[:] = [drop_replays]
 
 
 def build_channel(router: RecordingRouter, **slack_kwargs):

@@ -70,17 +70,6 @@ jobs:
       # queue: messages arrived a whole test late. Order matters as much as
       # the process split. `if: always()` so a failure in the first still
       # reports the second rather than hiding it.
-      # Clear the queue before anything reads from it. Slack holds events
-      # that happen while no socket is open and replays them to the next
-      # connection, so a previous run — especially one that failed or was
-      # cancelled before its cleanup — leaves messages that surface here and
-      # fail whichever test is unlucky. Draining first breaks that cycle.
-      - name: Drain queued Slack events
-        env:
-          NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
-          NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
-        run: .venv/bin/python scripts/drain_slack_events.py
-
       - name: Run live Slack tests (inbound)
         env:
           NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
