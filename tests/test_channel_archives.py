@@ -158,7 +158,27 @@ class TestDecompressionBounds:
 
 
 @pytest.mark.asyncio
-class TestTelegramUsesTheBounds:
+class TestChannelsShareTheBounds:
+    async def test_slack_refuses_a_bomb_in_an_attachment(self, monkeypatch):
+        from nerve.channels.slack import SlackChannel
+        from nerve.config import NerveConfig, SlackConfig
+
+        cfg = NerveConfig()
+        cfg.slack = SlackConfig(
+            enabled=True, bot_token="xoxb-t", app_token="xapp-t",
+        )
+        channel = SlackChannel(lambda: cfg, router=MagicMock())
+        channel._download_file = AsyncMock(
+            return_value=_zip({"bomb.png": b"\x00" * 4_000_000}),
+        )
+
+        text, blocks = await channel._extract_files([{
+            "name": "payload.zip", "mimetype": "application/zip",
+            "size": 5000, "url_private_download": "https://files.slack.test/x",
+        }])
+        assert blocks == []
+        assert "compression ratio too high" in text
+
     async def test_telegram_refuses_a_bomb_in_a_document(self):
         from nerve.channels.telegram import TelegramChannel
         from nerve.config import NerveConfig
