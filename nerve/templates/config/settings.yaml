@@ -36,8 +36,8 @@
 # `workspace:` at a tree that isn't locked. Setting it here alone does not survive
 # that.
 # Anything `nerve init` writes to config.yaml has to be restated here to survive
-# locking: notably telegram.enabled, which a locked instance treats as OFF unless
-# this file says otherwise.
+# locking: notably telegram.enabled and slack.enabled, which a locked instance
+# treats as OFF unless this file says otherwise.
 # lockdown: true
 
 # timezone: America/New_York

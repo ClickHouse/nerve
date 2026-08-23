@@ -87,6 +87,9 @@ _RESTART_ONLY_PATHS = (
     "mcp_endpoint.path",
     "memory",
     "proxy",
+    "slack.app_token",
+    "slack.bot_token",
+    "slack.enabled",
     "sync.codex",
     "telegram.allowed_users",
     "telegram.bot_token",
@@ -106,6 +109,8 @@ _SECRET_PATHS = frozenset({
     "auth.jwt_secret",
     "langfuse.public_key",
     "langfuse.secret_key",
+    "slack.app_token",
+    "slack.bot_token",
     "telegram.bot_token",
 })
 
