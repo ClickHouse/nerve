@@ -122,15 +122,16 @@ slack:
   #
   # Access guardrails. Patterns match a Slack id (U0123ABC / C0456DEF), a
   # handle, a display name, an email, or a channel name — case-insensitive,
-  # with globs. Deny always beats allow. A direct message is matched under
-  # the synthetic channel name "dm".
+  # with globs. Deny always beats allow. Direct messages are a separate,
+  # explicit opt-in.
   #
-  # With no allow list at all the bot refuses every message. That is
+  # With no allow grant at all the bot refuses every message. That is
   # deliberate: an open bot in a workspace is full agent access for anyone
-  # in it. Set at least one of these.
+  # in it. Allow specific users, direct messages, and/or specific channels.
   # allow_users: ["U0123ABC", "alex.soffronow"]
   # deny_users: ["*-bot"]
-  # allow_channels: ["dm", "eng-*", "C0456DEF"]
+  allow_direct_messages: false
+  # allow_channels: ["eng-*", "C0456DEF"]
   # deny_channels: ["*-random", "*-social"]
   #
   # Each thread becomes its own session and replies stay in-thread. Off means

@@ -1057,13 +1057,13 @@ def _slack_commands(raw: object) -> list[str] | None:
 class SlackConfig:
     """Slack bot channel — Socket Mode transport plus access guardrails.
 
-    The allow/deny lists are the whole authorization story: Slack has no
-    pairing step, because a workspace already decides who can reach the bot
-    at all. Patterns match a Slack id (``U0123ABC``), a handle, a display
-    name, an email, or a channel name, case-insensitively and with globs
-    (``eng-*``). See :mod:`nerve.channels.access` for the semantics — deny
-    wins, a non-empty allow list is a gate, and a policy with no allow
-    patterns at all refuses everything.
+    Slack has no pairing step, because a workspace already decides who can
+    reach the bot at all. Direct messages are an explicit opt-in; sender and
+    channel patterns match a Slack id (``U0123ABC``), handle, display name,
+    email, or channel name case-insensitively and with globs (``eng-*``).
+    See :mod:`nerve.channels.access` for the semantics — deny wins, a
+    non-empty allow list is a gate, and a policy with no allow grant at all
+    refuses everything.
     """
 
     # Off until the workspace is set up. Slack reaches an installation that
@@ -1074,6 +1074,9 @@ class SlackConfig:
     app_token: str = ""      # xapp-… — Socket Mode connection
     allow_users: list[str] = field(default_factory=list)
     deny_users: list[str] = field(default_factory=list)
+    # Direct messages are a distinct conversation kind, not a channel name.
+    # Keep them opt-in even when a sender allow-list grants access elsewhere.
+    allow_direct_messages: bool = False
     allow_channels: list[str] = field(default_factory=list)
     deny_channels: list[str] = field(default_factory=list)
     stream_mode: str = "partial"
@@ -1129,6 +1132,7 @@ class SlackConfig:
             app_token=app_token,
             allow_users=d.get("allow_users") or [],
             deny_users=d.get("deny_users") or [],
+            allow_direct_messages=d.get("allow_direct_messages", False),
             allow_channels=d.get("allow_channels") or [],
             deny_channels=d.get("deny_channels") or [],
             stream_mode=stream_mode,

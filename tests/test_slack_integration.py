@@ -66,6 +66,7 @@ class TestSocketMode:
     ):
         channel, router = await _started(
             slack, monkeypatch, allow_users=["U1"],
+            allow_direct_messages=True,
         )
         old_client = channel._client
         try:
@@ -110,7 +111,10 @@ class TestSocketMode:
     async def test_every_envelope_is_acked(self, slack, monkeypatch):
         # Slack redelivers anything unacked within three seconds, and an
         # agent turn is far longer than that.
-        channel, router = await _started(slack, monkeypatch, allow_users=["U1"])
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"],
+            allow_direct_messages=True,
+        )
         try:
             envelope_id = await slack.push_event({
                 "type": "message", "channel": "D1", "channel_type": "im",
@@ -127,7 +131,10 @@ class TestSocketMode:
     ):
         # A refusal must not look like a delivery failure, or Slack retries
         # the same rejected message until it gives up.
-        channel, router = await _started(slack, monkeypatch, allow_users=["U-other"])
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U-other"],
+            allow_direct_messages=True,
+        )
         try:
             envelope_id = await slack.push_event({
                 "type": "message", "channel": "D1", "channel_type": "im",
@@ -150,7 +157,10 @@ class TestConversation:
     async def test_a_direct_message_produces_a_reply_in_the_dm(
         self, slack, monkeypatch,
     ):
-        channel, router = await _started(slack, monkeypatch, allow_users=["U1"])
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"],
+            allow_direct_messages=True,
+        )
         try:
             async def _reply(msg):
                 from nerve.channels.base import OutboundMessage
@@ -203,6 +213,7 @@ class TestConversation:
         }
         channel, router = await _started(
             slack, monkeypatch, allow_users=["alex.soffronow"],
+            allow_direct_messages=True,
         )
         try:
             await slack.push_event({
@@ -247,6 +258,7 @@ class TestConversation:
         slack.errors["users.info"] = "missing_scope"
         channel, router = await _started(
             slack, monkeypatch, allow_users=["U1"], deny_users=["*-bot"],
+            allow_direct_messages=True,
         )
         try:
             await slack.push_event({

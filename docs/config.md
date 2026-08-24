@@ -245,7 +245,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.bot_token`, `.app_token`, `.allow_users`, `.deny_users`, `.allow_channels`, `.deny_channels`, `.reply_in_thread`, `.stream_mode` | ✅ token changes reconnect the running transport; a failed rotation restores the previous connection and is reported as a reload error. The other settings are read per event, so tightening a guardrail takes effect on the next message |
+| `slack.bot_token`, `.app_token`, `.allow_users`, `.deny_users`, `.allow_direct_messages`, `.allow_channels`, `.deny_channels`, `.reply_in_thread`, `.stream_mode` | ✅ token changes reconnect the running transport; a failed rotation restores the previous connection and is reported as a reload error. The other settings are read per event, so tightening a guardrail takes effect on the next message |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -1082,6 +1082,7 @@ users are ignored.
 | `slack.app_token` | string | - | App-Level Token for Socket Mode (`xapp-…`) |
 | `slack.allow_users` | list[str] | `[]` | Senders allowed to reach the agent |
 | `slack.deny_users` | list[str] | `[]` | Senders always refused |
+| `slack.allow_direct_messages` | bool | `false` | Allow direct-message conversations |
 | `slack.allow_channels` | list[str] | `[]` | Conversations the agent answers in |
 | `slack.deny_channels` | list[str] | `[]` | Conversations always refused |
 | `slack.reply_in_thread` | bool | `true` | One session per thread; replies stay in-thread |
@@ -1089,7 +1090,7 @@ users are ignored.
 | `slack.commands` | list[str] | see below | Which `/nerve` subcommands the workspace may run |
 
 Both tokens are secrets — put them in `config.local.yaml`. Changing either
-reconnects Slack on reload; the four guardrail lists also take effect then.
+reconnects Slack on reload; the access guardrails also take effect then.
 
 Slack is opt-in. Without an explicit `slack.enabled`, the channel is on only
 when both tokens are set, so a configuration that predates Slack — one with
@@ -1113,7 +1114,7 @@ Socket Mode means the bot dials out to Slack, so Nerve needs no public URL.
    Without it the direct-message conversation with the bot is read-only and
    Slack refuses every DM with `restricted_action_read_only_channel`. The
    manifest cannot set this.
-5. Set at least one allow list (see below), then restart Nerve.
+5. Configure at least one access grant (see below), then restart Nerve.
 
 ```yaml
 display_information:
@@ -1172,18 +1173,20 @@ the member id if you would rather not grant the scope.
 
 ### Guardrails
 
-The allow/deny lists are the whole authorization story — there is no pairing
-step, because the workspace already decides who can reach the bot at all.
+These guardrails are the whole authorization story — there is no pairing step,
+because the workspace already decides who can reach the bot at all.
 
 A pattern matches a Slack id (`U0123ABC`, `C0456DEF`), a handle, a display
 name, an email, or a channel name. Matching is case-insensitive and supports
-globs. A direct message is matched under the synthetic channel name `dm`.
+globs. Direct messages are controlled separately by
+`allow_direct_messages`; they are refused by default.
 
 ```yaml
 slack:
   allow_users: ["U0123ABC", "alex.soffronow"]
   deny_users: ["*-bot"]
-  allow_channels: ["dm", "eng-*"]
+  allow_direct_messages: true
+  allow_channels: ["eng-*"]
   deny_channels: ["*-social"]
 ```
 
@@ -1196,14 +1199,18 @@ Rules, per list:
 - **An empty allow list means "anything not denied".**
 
 The sender and the conversation are checked independently and both must
-pass. `allow_users` alone lets those people talk to the agent anywhere;
-`allow_channels` alone lets anyone in those channels talk to it.
+pass. Direct messages require `allow_direct_messages: true`, and sender
+allow/deny rules still apply to them. That setting alone admits any workspace
+member who can DM the bot, just as `allow_channels` alone admits anyone in
+those channels. `allow_users` alone lets those people talk in shared channels,
+but does not enable direct messages.
 
 Two failure modes are closed on purpose:
 
-- **No allow list at all refuses everything.** A deny list is not an opt-in.
-  An unconfigured bot logs a warning at startup and answers nobody, rather
-  than handing the whole workspace full agent access.
+- **No allow grant at all refuses everything.** A deny list is not an opt-in.
+  With both allow lists empty and `allow_direct_messages: false`, the bot logs
+  a warning at startup and answers nobody rather than handing the whole
+  workspace full agent access.
 - **A name that cannot be looked up is refused** when a deny list is set.
   This covers a lookup that failed *and* one that succeeded while omitting an
   alias the rules need. An allow list already fails closed on an unknown
@@ -1252,8 +1259,8 @@ unless you ask for them:
 - **`reply`** answers the latest pending question anywhere in the instance.
 
 The last two are not scoped to the caller. Nerve has no ownership model for
-Slack yet, so with `allow_channels: [dm]` any member of the workspace who may
-DM the bot could otherwise enumerate someone else's private session, continue
+Slack yet, so with `allow_direct_messages: true` any permitted member of the
+workspace could otherwise enumerate someone else's private session, continue
 it, or answer a question that was never theirs. Turn them on in a workspace
 where everyone on the allow list is trusted with every session.
 

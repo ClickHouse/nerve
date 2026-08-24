@@ -247,12 +247,15 @@ class TestCapabilities:
         assert constraints.min_edit_interval >= 1.0
 
     def test_the_policy_follows_a_config_reload(self):
-        # The channel outlives a reload, so the lists are read per use.
+        # The channel outlives a reload, so every guardrail is read per use.
         cfg = _config(allow_users=["U1"])
         channel = SlackChannel(lambda: cfg, router=MagicMock())
         assert channel.policy.users.allow == ["U1"]
+        assert channel.policy.allow_direct_messages is False
         cfg.slack.allow_users = ["U2"]
+        cfg.slack.allow_direct_messages = True
         assert channel.policy.users.allow == ["U2"]
+        assert channel.policy.allow_direct_messages is True
 
 
 class TestAuthorization:
@@ -265,14 +268,16 @@ class TestAuthorization:
 
     @pytest.mark.asyncio
     async def test_an_id_allow_list_needs_no_name_lookup(self):
-        channel = _channel(allow_users=["U0123ABC"])
+        channel = _channel(
+            allow_users=["U0123ABC"], allow_direct_messages=True,
+        )
         channel._web.users_info = AsyncMock()
         assert await channel._authorize("U0123ABC", "D1", "im")
         channel._web.users_info.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_handle_allow_list_resolves_the_name(self):
-        channel = _channel(allow_users=["alex"])
+        channel = _channel(allow_users=["alex"], allow_direct_messages=True)
         channel._web.users_info = AsyncMock(
             return_value={"user": {"name": "alex", "profile": {}}},
         )
@@ -280,13 +285,16 @@ class TestAuthorization:
 
     @pytest.mark.asyncio
     async def test_a_failed_lookup_with_a_deny_list_refuses(self):
-        channel = _channel(allow_users=["U1"], deny_users=["*-bot"])
+        channel = _channel(
+            allow_users=["U1"], deny_users=["*-bot"],
+            allow_direct_messages=True,
+        )
         channel._web.users_info = AsyncMock(side_effect=RuntimeError("no scope"))
         assert not await channel._authorize("U1", "D1", "im")
 
     @pytest.mark.asyncio
     async def test_resolved_names_are_cached(self):
-        channel = _channel(allow_users=["alex"])
+        channel = _channel(allow_users=["alex"], allow_direct_messages=True)
         channel._web.users_info = AsyncMock(
             return_value={"user": {"name": "alex", "profile": {}}},
         )
@@ -295,15 +303,29 @@ class TestAuthorization:
         assert channel._web.users_info.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_a_direct_message_is_matched_as_dm(self):
-        channel = _channel(allow_users=["U1"], allow_channels=["dm"])
+    async def test_direct_messages_are_refused_by_default(self):
+        channel = _channel(allow_users=["U1"])
+        channel._web.users_info = AsyncMock()
+        assert not await channel._authorize("U1", "D1", "im")
+        channel._web.users_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_direct_message_setting_allows_them(self):
+        channel = _channel(
+            allow_users=["U1"], allow_direct_messages=True,
+        )
         assert await channel._authorize("U1", "D1", "im")
+
+    @pytest.mark.asyncio
+    async def test_dm_is_not_a_magic_channel_name(self):
+        channel = _channel(allow_users=["U1"], allow_channels=["dm"])
+        assert not await channel._authorize("U1", "D1", "im")
 
 
 class TestMessageEvents:
     @pytest.mark.asyncio
     async def test_a_direct_message_reaches_the_router(self):
-        channel = _channel(allow_users=["U1"])
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
         await channel._handle_message_event({
             "type": "message", "channel": "D1", "channel_type": "im",
             "user": "U1", "ts": "1.1", "text": "hello",
@@ -316,7 +338,9 @@ class TestMessageEvents:
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_sender_never_reaches_the_router(self):
-        channel = _channel(allow_users=["U-other"])
+        channel = _channel(
+            allow_users=["U-other"], allow_direct_messages=True,
+        )
         await channel._handle_message_event({
             "type": "message", "channel": "D1", "channel_type": "im",
             "user": "U1", "ts": "1.1", "text": "hello",
@@ -325,7 +349,9 @@ class TestMessageEvents:
 
     @pytest.mark.asyncio
     async def test_the_bots_own_message_is_ignored(self):
-        channel = _channel(allow_users=["U0BOT"])
+        channel = _channel(
+            allow_users=["U0BOT"], allow_direct_messages=True,
+        )
         await channel._handle_message_event({
             "type": "message", "channel": "D1", "channel_type": "im",
             "user": "U0BOT", "ts": "1.1", "text": "hi",
@@ -411,7 +437,7 @@ class TestMessageEvents:
     @pytest.mark.asyncio
     async def test_a_redelivered_event_runs_once(self):
         # Slack retries anything it thinks was not acked.
-        channel = _channel(allow_users=["U1"])
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
         event = {
             "type": "message", "channel": "D1", "channel_type": "im",
             "user": "U1", "ts": "1.1", "text": "hello",
@@ -433,7 +459,7 @@ class TestMessageEvents:
 
     @pytest.mark.asyncio
     async def test_an_empty_message_is_dropped(self):
-        channel = _channel(allow_users=["U1"])
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
         await channel._handle_message_event({
             "type": "message", "channel": "D1", "channel_type": "im",
             "user": "U1", "ts": "1.1", "text": "",
@@ -444,7 +470,7 @@ class TestMessageEvents:
 class TestReactionEvents:
     @pytest.mark.asyncio
     async def test_a_reaction_on_a_known_message_reaches_the_router(self):
-        channel = _channel(allow_users=["U1"])
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
         channel._cache_message("1.1", "D1", "the original")
         await channel._handle_reaction_event({
             "type": "reaction_added", "user": "U1", "reaction": "tada",
@@ -466,7 +492,9 @@ class TestReactionEvents:
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_reaction_is_ignored(self):
-        channel = _channel(allow_users=["U-other"])
+        channel = _channel(
+            allow_users=["U-other"], allow_direct_messages=True,
+        )
         channel._cache_message("1.1", "D1", "the original")
         await channel._handle_reaction_event({
             "type": "reaction_added", "user": "U1", "reaction": "tada",
@@ -526,7 +554,7 @@ class TestOutbound:
 
     @pytest.mark.asyncio
     async def test_the_typing_ack_reacts_to_the_message_being_answered(self):
-        channel = _channel(allow_users=["U1"])
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
         await channel._handle_message_event({
             "type": "message", "channel": "D1", "channel_type": "im",
             "user": "U1", "ts": "1.1", "text": "hello",
@@ -705,7 +733,10 @@ class TestGuardrailRegressions:
     async def test_a_missing_email_refuses_an_email_deny_rule(self):
         # users.info answers 200 without profile.email when the token lacks
         # users:read.email, so the deny pattern silently matched nothing.
-        channel = _channel(allow_users=["U999"], deny_users=["blocked@x.com"])
+        channel = _channel(
+            allow_users=["U999"], deny_users=["blocked@x.com"],
+            allow_direct_messages=True,
+        )
         channel._web.users_info = AsyncMock(return_value={
             "user": {"id": "U999", "name": "blocked", "profile": {}},
         })
@@ -713,7 +744,10 @@ class TestGuardrailRegressions:
 
     @pytest.mark.asyncio
     async def test_an_email_deny_rule_still_works_with_the_scope(self):
-        channel = _channel(allow_users=["*"], deny_users=["blocked@x.com"])
+        channel = _channel(
+            allow_users=["*"], deny_users=["blocked@x.com"],
+            allow_direct_messages=True,
+        )
         channel._web.users_info = AsyncMock(return_value={
             "user": {"id": "U9", "name": "b", "profile": {"email": "blocked@x.com"}},
         })
@@ -721,7 +755,10 @@ class TestGuardrailRegressions:
 
     @pytest.mark.asyncio
     async def test_an_innocent_user_is_not_caught_by_an_email_deny_rule(self):
-        channel = _channel(allow_users=["*"], deny_users=["blocked@x.com"])
+        channel = _channel(
+            allow_users=["*"], deny_users=["blocked@x.com"],
+            allow_direct_messages=True,
+        )
         channel._web.users_info = AsyncMock(return_value={
             "user": {"id": "U1", "name": "ok", "profile": {"email": "ok@x.com"}},
         })
@@ -996,7 +1033,9 @@ class TestSlashCommandsAreThreadBlind:
 
 class TestCommandExposure:
     def _ch(self, **kw):
-        channel = _channel(allow_users=["U1"], **kw)
+        channel = _channel(
+            allow_users=["U1"], allow_direct_messages=True, **kw,
+        )
         channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
         return channel
 
@@ -1093,7 +1132,9 @@ class TestCommandsBindTheKeyMessagesRead:
     """
 
     def _ch(self, **kw):
-        channel = _channel(allow_users=["U1"], **kw)
+        channel = _channel(
+            allow_users=["U1"], allow_direct_messages=True, **kw,
+        )
         channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
         channel.router.create_session = AsyncMock(return_value="s-new")
         channel.router.switch_session = AsyncMock()
