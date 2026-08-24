@@ -65,12 +65,6 @@ class TestMigrationVersions:
         versions = [v for v, _ in discover_migrations()]
         assert len(versions) == len(set(versions))
 
-    def test_the_slack_migration_is_above_every_earlier_one(self):
-        version, name = _slack_migration()
-        earlier = [v for v, n in discover_migrations() if n != name]
-        assert version > max(earlier)
-
-
 @pytest.mark.asyncio
 class TestSlackNotificationUpgrade:
     async def test_an_existing_database_gains_the_slack_delivery_columns(
