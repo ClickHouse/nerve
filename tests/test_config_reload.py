@@ -767,6 +767,141 @@ class TestTighteningActuallyTightens:
         assert "new-secret" not in summary["restart_required"]
 
 
+class TestSlackCredentialReload:
+    @staticmethod
+    def _body(bot_token, app_token, allow_user=None):
+        allow = f"  allow_users: [{allow_user}]\n" if allow_user else ""
+        return (
+            "slack:\n"
+            "  enabled: true\n"
+            f"  bot_token: {bot_token}\n"
+            f"  app_token: {app_token}\n"
+            f"{allow}"
+        )
+
+    @classmethod
+    def _running_channel(
+        cls, config_dir, workspace, monkeypatch,
+        bot_token="xoxb-old", app_token="xapp-old", allow_user=None,
+    ):
+        import nerve.config as cfgmod
+        from nerve.channels.slack import SlackChannel
+
+        _write_config(
+            config_dir, workspace,
+            cls._body(bot_token, app_token, allow_user),
+        )
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+        channel = SlackChannel(cfgmod.get_config, router=MagicMock())
+        channel._active_bot_token = bot_token
+        channel._active_app_token = app_token
+        return channel
+
+    @staticmethod
+    def _engine(channel):
+        router = MagicMock()
+        router.get_channel.return_value = channel
+        return SimpleNamespace(
+            router=router,
+            reload_mcp_config=AsyncMock(return_value=[]),
+            _skill_manager=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_tokens_rotate_the_running_transport(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(config_dir, ws, monkeypatch)
+
+        async def rotate(bot_token, app_token):
+            channel._active_bot_token = bot_token
+            channel._active_app_token = app_token
+
+        channel.reload_credentials = AsyncMock(side_effect=rotate)
+        engine = self._engine(channel)
+
+        _write_config(
+            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+        )
+        summary = await reload_all(engine, None, config_dir)
+
+        channel.reload_credentials.assert_awaited_once_with(
+            "xoxb-new", "xapp-new",
+        )
+        assert summary["slack"] == "credentials reloaded"
+        assert "slack.bot_token" not in summary.get("restart_required", "")
+        assert "slack.app_token" not in summary.get("restart_required", "")
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_enabling_the_channel_still_requires_a_restart(
+        self, tmp_path, monkeypatch,
+    ):
+        import nerve.config as cfgmod
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws)
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+
+        _write_config(
+            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+        )
+        summary = await reload_all(self._engine(None), None, config_dir)
+
+        assert "slack.enabled" in summary["restart_required"]
+        assert "slack" not in summary
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_guardrail_only_reload_does_not_reconnect(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(
+            config_dir, ws, monkeypatch,
+            "xoxb-same", "xapp-same", "U0000001",
+        )
+        channel.reload_credentials = AsyncMock()
+
+        _write_config(config_dir, ws, self._body(
+            "xoxb-same", "xapp-same", "U0000002",
+        ))
+        summary = await reload_all(self._engine(channel), None, config_dir)
+
+        channel.reload_credentials.assert_not_awaited()
+        assert "slack" not in summary
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rotation_is_redacted_and_retryable(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(config_dir, ws, monkeypatch)
+        channel.reload_credentials = AsyncMock(side_effect=RuntimeError(
+            "could not use xoxb-new with xapp-new",
+        ))
+        engine = self._engine(channel)
+
+        _write_config(
+            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+        )
+        first = await reload_all(engine, None, config_dir)
+        second = await reload_all(engine, None, config_dir)
+
+        assert channel.reload_credentials.await_count == 2
+        for summary in (first, second):
+            failure = reload_failures(summary)["slack"]
+            assert "xoxb-new" not in failure
+            assert "xapp-new" not in failure
+            assert failure == "could not use <redacted> with <redacted>"
+
+
 class TestReloadRoute:
     @pytest.mark.asyncio
     async def test_route_returns_summary(self, tmp_path, monkeypatch):

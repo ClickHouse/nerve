@@ -245,7 +245,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.allow_users`, `.deny_users`, `.allow_channels`, `.deny_channels`, `.reply_in_thread`, `.stream_mode` | ✅ read per event, so tightening a guardrail takes effect on the next message. The two tokens do not follow it (see the restart table) |
+| `slack.bot_token`, `.app_token`, `.allow_users`, `.deny_users`, `.allow_channels`, `.deny_channels`, `.reply_in_thread`, `.stream_mode` | ✅ token changes reconnect the running transport; a failed rotation restores the previous connection and is reported as a reload error. The other settings are read per event, so tightening a guardrail takes effect on the next message |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -280,7 +280,7 @@ reload cannot inspect, and are documented here only.
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
-| `slack.enabled`, `.bot_token`, `.app_token` | both tokens were handed to the Socket Mode transport when it connected, and the connection outlives a reload. The four allow/deny lists are read per event and do follow a reload (see the table above) |
+| `slack.enabled` | the channel object is created and registered only at startup. Tokens and the four allow/deny lists do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1089,7 +1089,7 @@ users are ignored.
 | `slack.commands` | list[str] | see below | Which `/nerve` subcommands the workspace may run |
 
 Both tokens are secrets — put them in `config.local.yaml`. Changing either
-needs a restart; the four guardrail lists take effect on reload.
+reconnects Slack on reload; the four guardrail lists also take effect then.
 
 Slack is opt-in. Without an explicit `slack.enabled`, the channel is on only
 when both tokens are set, so a configuration that predates Slack — one with
