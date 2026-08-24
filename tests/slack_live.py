@@ -231,6 +231,14 @@ def unique_marker() -> str:
     return f"nvz{uuid.uuid4().hex[:10]}"
 
 
+def direct_message_guardrails(user_id: str) -> dict[str, object]:
+    """The explicit access settings every live DM contract must use."""
+    return {
+        "allow_users": [user_id],
+        "allow_direct_messages": True,
+    }
+
+
 def make_client(token: str):
     """A Web API client with 429 retry, so a slow test does not go flaky."""
     from slack_sdk.http_retry.builtin_async_handlers import (
