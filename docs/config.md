@@ -1240,16 +1240,14 @@ that channel's active thread sessions. Commands work normally in DMs.
 
 ### Notifications
 
-Add `slack` to `notifications.channels` to deliver questions and approvals
-as Block Kit cards with buttons.
+Add `slack` to `notifications.channels` to send question and approval cards.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `notifications.slack_channel_id` | string | `""` | Conversation for notifications; falls back to the first literal channel id in `slack.allow_channels` |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
 
-The fallback only accepts a real channel id. A list of names and globs resolves
-to nothing, and Slack notifications are skipped with a warning rather than
-posted to a made-up target.
+Names and globs are not resolved for this fallback. Without a literal channel
+ID, delivery is skipped with a warning.
 
 ## Quiet Hours
 
