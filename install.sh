@@ -7,9 +7,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh | bash
 #
 # Environment variables:
-#   NERVE_INSTALL_DIR  — Where to clone the repo (default: ~/nerve)
-#   NERVE_BRANCH       — Git branch to install (default: main)
-#   NERVE_YES          — Set to 1 to skip all confirmations
+#   NERVE_INSTALL_DIR      — Where to clone the repo (default: ~/nerve)
+#   NERVE_BRANCH           — Git branch to install (default: main)
+#   NERVE_YES              — Set to 1 to skip all confirmations
+#   NERVE_NON_INTERACTIVE  — Set to 1 for unattended install: implies NERVE_YES,
+#                            configures from env (see docs/setup.md), never prompts
+#   NERVE_START            — Set to 1 to start the daemon after an unattended
+#                            install; leave unset when a service manager owns it
 #
 set -euo pipefail
 
@@ -24,7 +28,9 @@ MIN_PYTHON_MINOR=13
 PREFERRED_PYTHON_MINOR=13
 # Vite 7 (see web/package.json) requires Node 20.19+ or 22.12+.
 MIN_NODE_VERSION="20.19.0"
+NON_INTERACTIVE="${NERVE_NON_INTERACTIVE:-0}"
 AUTO_YES="${NERVE_YES:-0}"
+[ "$NON_INTERACTIVE" = "1" ] && AUTO_YES=1
 IS_UPGRADE=0
 
 # --- Colors ---
@@ -499,6 +505,15 @@ run_init() {
         return
     fi
 
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+        step "Running Nerve setup (non-interactive)"
+        cd "$INSTALL_DIR" || exit 1
+        # Fail loudly: a half-configured unattended install is worse than none.
+        "$nerve_bin" -c "$INSTALL_DIR" init --non-interactive
+        INIT_COMPLETED=1
+        return
+    fi
+
     # Clear boundary between installation and configuration: everything is
     # installed at this point — the wizard is optional and resumable.
     printf "\n"
@@ -535,8 +550,14 @@ offer_start() {
     if [ "$INIT_COMPLETED" != "1" ] || [ "$IS_UPGRADE" = "1" ]; then
         return
     fi
+    # Unattended installs are usually followed by a service manager owning the
+    # process, so starting a stray daemon here is wrong unless asked for.
+    if [ "$NON_INTERACTIVE" = "1" ] && [ "${NERVE_START:-0}" != "1" ]; then
+        info "Not starting Nerve (set NERVE_START=1 to start it here)"
+        return
+    fi
     printf "\n"
-    if ! confirm "Start Nerve now?"; then
+    if [ "$NON_INTERACTIVE" != "1" ] && ! confirm "Start Nerve now?"; then
         return
     fi
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
@@ -605,12 +626,15 @@ Usage:
   curl -fsSL .../install.sh | bash -s -- --yes
 
 Options:
-  --yes, -y       Skip all confirmation prompts
+  --yes, -y             Skip all confirmation prompts
+  --non-interactive     Unattended install; configure from environment
 
 Environment variables:
-  NERVE_INSTALL_DIR   Where to clone (default: ~/nerve)
-  NERVE_BRANCH        Git branch (default: main)
-  NERVE_YES           Set to 1 to skip confirmations
+  NERVE_INSTALL_DIR     Where to clone (default: ~/nerve)
+  NERVE_BRANCH          Git branch (default: main)
+  NERVE_YES             Set to 1 to skip confirmations
+  NERVE_NON_INTERACTIVE Set to 1 for unattended install (implies NERVE_YES)
+  NERVE_START           Set to 1 to start the daemon after unattended install
 
 EOF
 }
@@ -622,13 +646,19 @@ main() {
     for arg in "$@"; do
         case "$arg" in
             --yes|-y) AUTO_YES=1 ;;
+            --non-interactive) NON_INTERACTIVE=1; AUTO_YES=1 ;;
             --help|-h) usage; exit 0 ;;
         esac
     done
 
     # When piped via curl | bash, stdin is the pipe (EOF after script).
-    # Reclaim the terminal for all interactive prompts.
-    if [ ! -t 0 ] && [ -e /dev/tty ]; then
+    # Reclaim the terminal for all interactive prompts. The read test matters:
+    # under cloud-init and other daemons /dev/tty exists but there is no
+    # controlling terminal, so the open fails with ENXIO and set -e ends the
+    # install before it starts.
+    # Probe in a subshell: a failed `exec` redirection ends a non-interactive
+    # shell on POSIX-mode shells, where `||` would not get a chance to run.
+    if [ "$NON_INTERACTIVE" != "1" ] && [ ! -t 0 ] && (exec < /dev/tty) 2>/dev/null; then
         exec < /dev/tty
     fi
 

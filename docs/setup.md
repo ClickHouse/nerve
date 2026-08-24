@@ -103,6 +103,40 @@ The container paths are not conventions — the generated Dockerfile sets
 `NERVE_HOME=/root/.nerve` and `NERVE_WORKSPACE=/root/nerve-workspace`
 explicitly. Point them elsewhere and the mounts must follow.
 
+## Unattended installation
+
+For cloud-init, Ansible, image builds and other places with no terminal, run the installer with `--non-interactive` (or `NERVE_NON_INTERACTIVE=1`). It implies `NERVE_YES=1`, never prompts, and finishes with `nerve init --non-interactive`, which reads its configuration from the environment.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh \
+  | NERVE_NON_INTERACTIVE=1 \
+    NERVE_INSTALL_DIR=/home/agent/nerve \
+    NERVE_MODE=worker \
+    NERVE_WORKSPACE=/home/agent/nerve-workspace \
+    NERVE_TIMEZONE=UTC \
+    NERVE_PROVIDER=bedrock \
+    NERVE_AWS_REGION=eu-central-1 \
+    bash
+```
+
+The daemon is not started: unattended installs are normally followed by a service manager that owns the process (see [systemd Service](#systemd-service-optional)). Set `NERVE_START=1` to start it from the installer instead.
+
+Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NERVE_MODE` | `personal` | `personal` or `worker` |
+| `NERVE_WORKSPACE` | `~/nerve-workspace` | Workspace directory |
+| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
+| `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
+| `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
+| `NERVE_PASSWORD` | unset | Web UI password; unset means no authentication |
+| `NERVE_TASK` | unset | Worker mode task description |
+| `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
+| `GH_TOKEN` | unset | GitHub integration |
+
+A re-run over an existing install keeps the configuration and only upgrades the code.
+
 ## Re-running `nerve init`
 
 You can re-run `nerve init` at any time — it's safe on existing installations.
