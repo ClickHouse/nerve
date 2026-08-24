@@ -547,6 +547,9 @@ class TestOutbound:
 
         monkeypatch.setattr(slack_module, "WATCHDOG_INTERVAL", 0.01)
         channel = _channel()
+        channel._active_app_token = "xapp-active"
+        channel.config.slack.app_token = "xapp-new-in-config"
+        active_web = channel._web
         dead = MagicMock()
         dead.is_connected = AsyncMock(return_value=False)
         dead.close = AsyncMock()
@@ -571,6 +574,87 @@ class TestOutbound:
         # connection only, so a leftover one quietly takes a share of them.
         dead.close.assert_awaited()
         assert channel._client is fresh
+        channel._build_socket_client.assert_called_once_with(
+            app_token="xapp-active", web_client=active_web,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_new_socket_restores_the_previous_credentials(self):
+        channel = _channel()
+        events = []
+
+        old_web = channel._web
+        old_client = MagicMock()
+
+        async def close_old():
+            events.append("old closed")
+
+        old_client.close = AsyncMock(side_effect=close_old)
+        channel._client = old_client
+        channel._active_bot_token = "xoxb-old"
+        channel._active_app_token = "xapp-old"
+        channel._bot_user_id = "U0OLD"
+        channel._bot_id = "B0OLD"
+
+        candidate_web = MagicMock()
+        candidate = MagicMock()
+
+        async def connect_candidate():
+            events.append("candidate connected")
+            raise RuntimeError("invalid app token")
+
+        async def close_candidate():
+            events.append("candidate closed")
+
+        candidate.connect = AsyncMock(side_effect=connect_candidate)
+        candidate.close = AsyncMock(side_effect=close_candidate)
+        channel._prepare_transport = AsyncMock(return_value=(
+            candidate_web,
+            candidate,
+            {"user_id": "U0NEW", "bot_id": "B0NEW"},
+        ))
+
+        rollback = MagicMock()
+
+        async def connect_rollback():
+            events.append("rollback connected")
+
+        rollback.connect = AsyncMock(side_effect=connect_rollback)
+        channel._build_socket_client = MagicMock(return_value=rollback)
+
+        with pytest.raises(RuntimeError, match="previous connection was restored"):
+            await channel.reload_credentials("xoxb-new", "xapp-new")
+
+        assert events == [
+            "old closed",
+            "candidate connected",
+            "candidate closed",
+            "rollback connected",
+        ]
+        assert channel._client is rollback
+        assert channel._web is old_web
+        assert channel._active_bot_token == "xoxb-old"
+        assert channel._active_app_token == "xapp-old"
+        assert channel._bot_user_id == "U0OLD"
+        assert channel._bot_id == "B0OLD"
+        assert channel.needs_credential_reload("xoxb-new", "xapp-new")
+
+    @pytest.mark.asyncio
+    async def test_a_socket_handshake_cannot_hold_reload_open_forever(
+        self, monkeypatch,
+    ):
+        import nerve.channels.slack as slack_module
+
+        monkeypatch.setattr(slack_module, "SOCKET_CONNECT_TIMEOUT", 0.01)
+        client = MagicMock()
+
+        async def never_connect():
+            await asyncio.sleep(30)
+
+        client.connect = AsyncMock(side_effect=never_connect)
+
+        with pytest.raises(RuntimeError, match="connection timed out"):
+            await SlackChannel._connect_socket(client)
 
     @pytest.mark.asyncio
     async def test_send_file_refuses_without_a_target(self):
