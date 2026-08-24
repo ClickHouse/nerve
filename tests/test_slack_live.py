@@ -41,6 +41,7 @@ from tests.slack_live import (
     Posted,
     RecordingRouter,
     build_channel,
+    direct_message_guardrails,
     make_client,
     requires_no_email_token,
     requires_outbound,
@@ -77,6 +78,13 @@ async def test_the_diagnostics_wrapper_preserves_socket_builder_arguments(
         app_token="xapp-test", web_client=web_client,
     ) is socket
     assert calls == [("xapp-test", web_client)]
+
+
+async def test_live_direct_messages_use_the_explicit_guardrail():
+    assert direct_message_guardrails("U123") == {
+        "allow_users": ["U123"],
+        "allow_direct_messages": True,
+    }
 
 
 # ---------------------------------------------------------------------- #
