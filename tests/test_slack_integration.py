@@ -61,6 +61,52 @@ class TestSocketMode:
         finally:
             await channel.stop()
 
+    async def test_credentials_rotate_on_the_running_channel(
+        self, slack, monkeypatch,
+    ):
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"],
+        )
+        old_client = channel._client
+        try:
+            await channel.reload_credentials("xoxb-replaced", "xapp-replaced")
+
+            assert channel._client is not old_client
+            assert not await old_client.is_connected()
+            assert await channel._client.is_connected()
+            assert channel._web.token == "xoxb-replaced"
+            assert channel._active_app_token == "xapp-replaced"
+
+            await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "after rotation",
+            })
+            await slack.settle()
+            router.handle_message.assert_called_once()
+        finally:
+            await channel.stop()
+
+    @pytest.mark.parametrize(("failed_method", "bot_token", "app_token"), [
+        ("auth.test", "xoxb-invalid", "xapp-replaced"),
+        ("apps.connections.open", "xoxb-replaced", "xapp-invalid"),
+    ])
+    async def test_invalid_new_credentials_keep_the_old_connection(
+        self, slack, monkeypatch, failed_method, bot_token, app_token,
+    ):
+        channel, _ = await _started(slack, monkeypatch, allow_users=["U1"])
+        old_client = channel._client
+        slack.errors[failed_method] = "invalid_auth"
+        try:
+            with pytest.raises(RuntimeError, match="token failed validation"):
+                await channel.reload_credentials(bot_token, app_token)
+
+            assert channel._client is old_client
+            assert await old_client.is_connected()
+            assert channel._active_bot_token == "xoxb-fake"
+            assert channel._active_app_token == "xapp-fake"
+        finally:
+            await channel.stop()
+
     async def test_every_envelope_is_acked(self, slack, monkeypatch):
         # Slack redelivers anything unacked within three seconds, and an
         # agent turn is far longer than that.

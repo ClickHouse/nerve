@@ -64,6 +64,10 @@ EDIT_INTERVAL = 1.2
 # Watchdog: check every 30s, log heartbeat every ~5 min.
 WATCHDOG_INTERVAL = 30
 WATCHDOG_HEARTBEAT_EVERY = 10
+# The SDK retries a rejected Socket Mode handshake forever. A reload must
+# return a failure and restore the previous transport instead of hanging the
+# config endpoint indefinitely.
+SOCKET_CONNECT_TIMEOUT = 30
 # Bounded caches: event dedupe, message text for reaction context, resolved names.
 _DEDUPE_MAX = 500
 _MESSAGE_CACHE_MAX = 200
@@ -474,6 +478,13 @@ class SlackChannel(BaseChannel):
         self.router = router
         self._client: Any = None            # AsyncSocketModeClient
         self._web: Any = None               # AsyncWebClient
+        # The config object is hot, but a connected transport must use one
+        # coherent credential pair. Keep the pair that actually built the
+        # clients so a watchdog reconnect cannot combine a newly loaded app
+        # token with the previous Web API client.
+        self._active_bot_token = ""
+        self._active_app_token = ""
+        self._transport_lock = asyncio.Lock()
         self._bot_user_id: str = ""
         self._bot_id: str = ""     # the app's own bot_id, to spot our own posts
         self._notification_service = None   # Set after service is created
@@ -513,8 +524,8 @@ class SlackChannel(BaseChannel):
         The bot outlives every reload and the guardrail lists decide, on each
         event, whether a message reaches the agent. Reading them per use means
         a reload that tightens ``deny_users`` takes effect immediately. The
-        tokens are handed to the transport at connect time, so those still
-        need a restart — they are listed in ``config_reload`` as such.
+        tokens are handed to the transport at connect time; ``reload_all``
+        rotates that transport explicitly when either token changes.
         """
         return self._config()
 
@@ -585,33 +596,26 @@ class SlackChannel(BaseChannel):
             )
             return
 
-        from slack_sdk.http_retry.builtin_async_handlers import (
-            AsyncRateLimitErrorRetryHandler,
-        )
-        from slack_sdk.web.async_client import AsyncWebClient
-
         self._stopping = False
-        self._web = AsyncWebClient(token=cfg.bot_token)
-        # The SDK retries connection errors out of the box but not 429s, and
-        # Slack rate limits chat.postMessage to roughly one call per second
-        # per channel. A streamed reply arrives as a burst of edits followed
-        # by a post, so without this the last message of a long answer is the
-        # one most likely to be dropped.
-        self._web.retry_handlers.append(
-            AsyncRateLimitErrorRetryHandler(max_retry_count=3),
-        )
+        async with self._transport_lock:
+            web, client, auth = await self._prepare_transport(
+                cfg.bot_token, cfg.app_token,
+            )
+            self._activate_transport(
+                web, client, auth, cfg.bot_token, cfg.app_token,
+            )
+            try:
+                await self._connect_socket(client)
+            except (Exception, asyncio.CancelledError):
+                await self._close_socket_quietly(client)
+                self._client = None
+                self._web = None
+                self._active_bot_token = ""
+                self._active_app_token = ""
+                raise
 
-        auth = await self._web.auth_test()
-        self._bot_user_id = auth.get("user_id", "")
-        self._bot_id = auth.get("bot_id", "")
-        logger.info(
-            "Slack authenticated as %s (%s, %s) in workspace %s",
-            auth.get("user"), self._bot_user_id, self._bot_id, auth.get("team"),
-        )
-
-        self._client = self._build_socket_client()
-        await self._client.connect()
         self._last_event_time = time.monotonic()
+        self._log_auth(auth, "Slack authenticated")
         logger.info("Slack Socket Mode connected")
 
         self._announce_auth_state()
@@ -620,19 +624,219 @@ class SlackChannel(BaseChannel):
             self._run_watchdog(), name="slack-socket-watchdog",
         )
 
-    def _build_socket_client(self):
+    @staticmethod
+    def _build_web_client(bot_token: str):
+        """Build the Web API half of one credential pair."""
+        from slack_sdk.http_retry.builtin_async_handlers import (
+            AsyncRateLimitErrorRetryHandler,
+        )
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        web = AsyncWebClient(token=bot_token)
+        # The SDK retries connection errors out of the box but not 429s, and
+        # Slack rate limits chat.postMessage to roughly one call per second
+        # per channel. A streamed reply arrives as a burst of edits followed
+        # by a post, so without this the last message of a long answer is the
+        # one most likely to be dropped.
+        web.retry_handlers.append(
+            AsyncRateLimitErrorRetryHandler(max_retry_count=3),
+        )
+        return web
+
+    async def _prepare_transport(self, bot_token: str, app_token: str):
+        """Validate both tokens and build, but do not connect, both clients."""
+        web = self._build_web_client(bot_token)
+        try:
+            auth = await web.auth_test()
+        except Exception as e:
+            raise RuntimeError(
+                f"the Slack bot token failed validation ({type(e).__name__})",
+            ) from e
+        client = self._build_socket_client(
+            app_token=app_token, web_client=web,
+        )
+        try:
+            client.wss_uri = await asyncio.wait_for(
+                client.issue_new_wss_url(), timeout=SOCKET_CONNECT_TIMEOUT,
+            )
+        except (Exception, asyncio.CancelledError) as e:
+            await self._close_socket_quietly(client)
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise RuntimeError(
+                f"the Slack app token failed validation ({type(e).__name__})",
+            ) from e
+        return web, client, auth
+
+    def _activate_transport(
+        self, web, client, auth: dict, bot_token: str, app_token: str,
+    ) -> None:
+        """Publish one coherent Web API and Socket Mode credential pair."""
+        self._web = web
+        self._client = client
+        self._active_bot_token = bot_token
+        self._active_app_token = app_token
+        self._bot_user_id = auth.get("user_id", "")
+        self._bot_id = auth.get("bot_id", "")
+
+    def _log_auth(self, auth: dict, action: str) -> None:
+        logger.info(
+            "%s as %s (%s, %s) in workspace %s",
+            action,
+            auth.get("user"), self._bot_user_id, self._bot_id, auth.get("team"),
+        )
+
+    def _build_socket_client(
+        self, *, app_token: str | None = None, web_client=None,
+    ):
         """A fresh Socket Mode client wired to this channel's dispatcher."""
         from slack_sdk.socket_mode.aiohttp import SocketModeClient
 
         client = SocketModeClient(
-            app_token=self.config.slack.app_token,
-            web_client=self._web,
+            app_token=(
+                self._active_app_token if app_token is None else app_token
+            ),
+            web_client=self._web if web_client is None else web_client,
             # Slack closes and reissues a socket roughly hourly; without this
             # the channel goes quiet until the daemon restarts.
             auto_reconnect_enabled=True,
         )
         client.socket_mode_request_listeners.append(self._on_request)
         return client
+
+    @staticmethod
+    async def _close_socket_quietly(client) -> None:
+        """Best-effort cleanup for a client that will not be reused."""
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.close(), timeout=10)
+        except Exception as e:
+            logger.warning("Slack socket close raised: %s", e)
+
+    @staticmethod
+    async def _connect_socket(client) -> None:
+        """Connect with a bound wait; the Slack SDK otherwise retries forever."""
+        try:
+            await asyncio.wait_for(
+                client.connect(), timeout=SOCKET_CONNECT_TIMEOUT,
+            )
+        except TimeoutError as e:
+            raise RuntimeError("the Slack socket connection timed out") from e
+
+    @staticmethod
+    async def _close_socket_for_replacement(client) -> None:
+        """Close *client*, refusing to create a competing connection on failure."""
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.close(), timeout=10)
+        except Exception as e:
+            raise RuntimeError(
+                "the existing Slack socket could not be closed",
+            ) from e
+
+    def needs_credential_reload(self, bot_token: str, app_token: str) -> bool:
+        """Whether the connected clients differ from the desired token pair."""
+        return (
+            bot_token != self._active_bot_token
+            or app_token != self._active_app_token
+        )
+
+    async def reload_credentials(self, bot_token: str, app_token: str) -> None:
+        """Rotate both Slack clients without ever leaving two sockets connected.
+
+        The bot token can be validated while the old transport remains live.
+        Socket Mode is different: connecting the candidate before closing the
+        old socket lets the two clients steal each other's events. Close first,
+        and rebuild the previous transport if the candidate cannot connect.
+
+        Active credentials are tracked separately from the live config so a
+        failed reload is retryable and a watchdog rebuild keeps using the last
+        coherent pair rather than mixing old and new tokens.
+        """
+        if not bot_token or not app_token:
+            raise RuntimeError("the new Slack credentials are incomplete")
+
+        async with self._transport_lock:
+            if self._stopping:
+                raise RuntimeError("the Slack channel is stopping")
+            if not self.needs_credential_reload(bot_token, app_token):
+                return
+
+            web, client, auth = await self._prepare_transport(
+                bot_token, app_token,
+            )
+
+            old_client = self._client
+            old_web = self._web
+            old_bot_token = self._active_bot_token
+            old_app_token = self._active_app_token
+            old_bot_user_id = self._bot_user_id
+            old_bot_id = self._bot_id
+
+            try:
+                await self._close_socket_for_replacement(old_client)
+            except (Exception, asyncio.CancelledError):
+                await self._close_socket_quietly(client)
+                raise
+
+            # Publish before connect so an envelope arriving immediately after
+            # the handshake sees the matching Web client and bot identity.
+            self._activate_transport(
+                web, client, auth, bot_token, app_token,
+            )
+            # Identity and message ids are workspace-local. Token rotation is
+            # normally within one app, but clear before connecting so a move
+            # to another workspace cannot race an event through stale auth
+            # context. A failed rotation leaves these disposable caches empty.
+            self._seen_events.clear()
+            self._message_cache.clear()
+            self._last_inbound_ts.clear()
+            self._name_cache.clear()
+            try:
+                await self._connect_socket(client)
+            except (Exception, asyncio.CancelledError) as connect_error:
+                await self._close_socket_quietly(client)
+                self._web = old_web
+                self._active_bot_token = old_bot_token
+                self._active_app_token = old_app_token
+                self._bot_user_id = old_bot_user_id
+                self._bot_id = old_bot_id
+                self._client = old_client
+
+                if old_web is not None and old_app_token:
+                    try:
+                        rollback = self._build_socket_client(
+                            app_token=old_app_token, web_client=old_web,
+                        )
+                        self._client = rollback
+                        await self._connect_socket(rollback)
+                    except Exception as rollback_error:
+                        logger.error(
+                            "Slack credential rollback failed (%s)",
+                            type(rollback_error).__name__,
+                        )
+                        raise RuntimeError(
+                            "the new Slack credentials failed and the previous "
+                            "connection could not be restored",
+                        ) from connect_error
+                    if isinstance(connect_error, asyncio.CancelledError):
+                        raise
+                    raise RuntimeError(
+                        "the new Slack app token failed to connect; the previous "
+                        "connection was restored",
+                    ) from connect_error
+
+                if isinstance(connect_error, asyncio.CancelledError):
+                    raise
+                raise RuntimeError(
+                    "the new Slack app token failed to connect and no previous "
+                    "connection was available",
+                ) from connect_error
+
+            self._last_event_time = time.monotonic()
+            self._log_auth(auth, "Slack credentials reloaded")
 
     def _announce_auth_state(self) -> None:
         """Log how access is configured — loudly when it lets nobody in.
@@ -666,11 +870,8 @@ class SlackChannel(BaseChannel):
             task.cancel()
         if inflight:
             await asyncio.gather(*inflight, return_exceptions=True)
-        if self._client:
-            try:
-                await self._client.close()
-            except Exception as e:
-                logger.warning("Slack socket close raised: %s", e)
+        async with self._transport_lock:
+            await self._close_socket_quietly(self._client)
 
     # ------------------------------------------------------------------ #
     #  Watchdog                                                            #
@@ -690,7 +891,13 @@ class SlackChannel(BaseChannel):
             check_count += 1
             # is_connected() is a coroutine: it pings the socket rather than
             # reading a flag.
-            connected = bool(await self._client.is_connected())
+            try:
+                connected = bool(await self._client.is_connected())
+            except Exception:
+                # A credential rotation can close this client between the
+                # loop's null check and the ping. _rebuild rechecks under the
+                # lifecycle lock and leaves a replacement alone if it won.
+                connected = False
             if check_count % WATCHDOG_HEARTBEAT_EVERY == 0:
                 since = time.monotonic() - self._last_event_time
                 logger.info(
@@ -720,15 +927,27 @@ class SlackChannel(BaseChannel):
         A brief gap is the safe trade. Slack redelivers an unacked envelope,
         while a split connection loses events with no sign anything is wrong.
         """
-        old = self._client
-        if old is not None:
-            try:
-                await asyncio.wait_for(old.close(), timeout=10)
-            except Exception as e:
-                logger.warning("Slack: closing the old socket raised: %s", e)
+        async with self._transport_lock:
+            # A credential reload may have repaired the socket while the
+            # watchdog was waiting for the lifecycle lock.
+            if self._client is not None:
+                try:
+                    if await self._client.is_connected():
+                        return
+                except Exception:
+                    pass
 
-        self._client = self._build_socket_client()
-        await self._client.connect()
+            old = self._client
+            await self._close_socket_for_replacement(old)
+            client = self._build_socket_client(
+                app_token=self._active_app_token, web_client=self._web,
+            )
+            self._client = client
+            try:
+                await self._connect_socket(client)
+            except Exception:
+                await self._close_socket_quietly(client)
+                raise
 
     def _touch(self) -> None:
         """Record that an envelope arrived from Slack."""
@@ -1083,10 +1302,11 @@ class SlackChannel(BaseChannel):
         import httpx
 
         try:
+            token = self._active_bot_token or self.config.slack.bot_token
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.get(
                     url,
-                    headers={"Authorization": f"Bearer {self.config.slack.bot_token}"},
+                    headers={"Authorization": f"Bearer {token}"},
                     follow_redirects=True,
                 )
                 resp.raise_for_status()
