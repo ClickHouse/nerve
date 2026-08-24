@@ -32,6 +32,7 @@ around the outbound file.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 
 import pytest
@@ -47,6 +48,7 @@ from tests.slack_live import (
     RecordingRouter,
     SOCKET_DRAIN_SECONDS,
     build_channel,
+    direct_message_guardrails,
     make_client,
     wait_until_quiet,
     ignore_stale_events,
@@ -158,6 +160,7 @@ async def live_channel(_connected_channel):
         await wait_until_quiet(channel)
         for field, default in (
             ("allow_users", []), ("deny_users", []),
+            ("allow_direct_messages", False),
             ("allow_channels", []), ("deny_channels", []),
             ("reply_in_thread", True), ("commands", None),
         ):
@@ -256,7 +259,9 @@ class TestInboundLoop:
         auth = await human.auth_test()
         user_id = auth["user_id"]
         router = RecordingRouter()
-        channel, _ = await live_channel(router, allow_users=[user_id])
+        channel, _ = await live_channel(
+            router, **direct_message_guardrails(user_id),
+        )
 
         dm = await human.conversations_open(users=channel._bot_user_id)
         dm_id = dm["channel"]["id"]
@@ -266,6 +271,13 @@ class TestInboundLoop:
         msg = await router.wait_for_message(marker)
         assert msg.channel_key == f"slack:{dm_id}"
         assert msg.text == f"live dm test {marker}"
+
+
+async def test_the_live_dm_contract_uses_the_explicit_guardrail():
+    source = inspect.getsource(
+        TestInboundLoop.test_a_direct_message_reaches_the_router,
+    )
+    assert "direct_message_guardrails(user_id)" in source
 
 
 @requires_inbound
