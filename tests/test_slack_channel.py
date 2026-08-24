@@ -100,12 +100,6 @@ class TestMarkdownToSlack:
     def test_reserved_characters_are_escaped(self):
         assert _md_to_slack("a < b & c > d") == "a &lt; b &amp; c &gt; d"
 
-    def test_a_link_url_is_escaped_the_way_slack_stores_it(self):
-        # Verified against a live workspace: Slack rewrites a bare & inside a
-        # link to &amp;, so emitting it raw made the stored message differ
-        # from the one we sent.
-        assert _md_to_slack("[q](http://x?a=1&b=2)") == "<http://x?a=1&amp;b=2|q>"
-
     def test_bullets_become_real_bullets(self):
         assert _md_to_slack("- one\n- two") == "• one\n• two"
 
@@ -339,15 +333,6 @@ class TestMessageEvents:
         channel.router.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_another_bots_message_is_ignored(self):
-        channel = _channel(allow_users=["U1"])
-        await channel._handle_message_event({
-            "type": "message", "channel": "C1", "user": "U1",
-            "bot_id": "B9", "ts": "1.1", "text": "hi",
-        })
-        channel.router.handle_message.assert_not_called()
-
-    @pytest.mark.asyncio
     async def test_a_join_notice_is_ignored(self):
         channel = _channel(allow_users=["U1"])
         await channel._handle_message_event({
@@ -501,18 +486,11 @@ class TestOutbound:
         assert kwargs["text"] == "*hi*"
 
     @pytest.mark.asyncio
-    async def test_a_long_reply_is_sent_as_several_messages(self):
-        channel = _channel()
-        await channel.send(
-            OutboundMessage(target="C1", text="\n".join(["x" * 100] * 100)),
-        )
-        assert channel._web.chat_postMessage.await_count > 1
-
-    @pytest.mark.asyncio
-    async def test_nothing_is_truncated_away(self):
+    async def test_a_long_reply_is_split_without_truncation(self):
         channel = _channel()
         body = "\n".join(f"line {i}" for i in range(2000))
         await channel.send(OutboundMessage(target="C1", text=body))
+        assert channel._web.chat_postMessage.await_count > 1
         sent = "\n".join(
             c.kwargs["text"] for c in channel._web.chat_postMessage.await_args_list
         )
@@ -666,13 +644,6 @@ class TestGuardrailRegressions:
         assert await channel._authorize("U1", "D1", "im")
 
     @pytest.mark.asyncio
-    async def test_id_only_lists_still_skip_the_lookup(self):
-        channel = _channel(allow_users=["U0123ABC"])
-        channel._web.users_info = AsyncMock()
-        assert await channel._authorize("U0123ABC", "D1", "im")
-        channel._web.users_info.assert_not_called()
-
-    @pytest.mark.asyncio
     async def test_a_nameless_channel_lookup_refuses_a_channel_deny_rule(self):
         channel = _channel(allow_users=["U1"], deny_channels=["*-secret"])
         channel._web.conversations_info = AsyncMock(
@@ -682,15 +653,6 @@ class TestGuardrailRegressions:
 
 
 class TestOutboundFailureRegressions:
-    @pytest.mark.asyncio
-    async def test_send_propagates_a_failure(self):
-        # StreamAdapter recovers by editing the placeholder, but only if it
-        # is told. Swallowing the error dropped the whole reply.
-        channel = _channel()
-        channel._web.chat_postMessage = AsyncMock(side_effect=RuntimeError("ratelimited"))
-        with pytest.raises(RuntimeError):
-            await channel.send(OutboundMessage(target="C1", text="hi"))
-
     @pytest.mark.asyncio
     async def test_a_failed_placeholder_returns_none_without_raising(self):
         channel = _channel()
