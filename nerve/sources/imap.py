@@ -88,9 +88,12 @@ class ImapSource(Source):
             parsed, next_cursor = await asyncio.to_thread(
                 self._imap_fetch_blocking, cursor, limit,
             )
-        except Exception as e:
-            logger.error("IMAP error for %s: %s", self.source_name, e)
-            return FetchResult(records=[], next_cursor=cursor, has_more=False)
+        except Exception:
+            # Let SourceRunner record the failure and apply its health/backoff
+            # policy. Returning an empty successful fetch would retry the same
+            # UID forever without telling the caller why the cursor is stuck.
+            logger.exception("IMAP error for %s", self.source_name)
+            raise
 
         records: list[SourceRecord] = []
         for msg in parsed:
@@ -139,6 +142,9 @@ class ImapSource(Source):
         Returns (parsed_messages, next_cursor). Runs entirely in a worker
         thread — no async here.
         """
+        if limit <= 0:
+            return [], cursor
+
         M = imaplib.IMAP4_SSL(self.host, self.port)
         try:
             M.login(self.username, self._password)
@@ -182,8 +188,6 @@ class ImapSource(Source):
             # Process the oldest next batch. Advancing to the newest UID here
             # would skip the unprocessed backlog when there are more messages
             # than the per-run limit.
-            if limit <= 0:
-                return [], cursor
             uids = uids[:limit]
             next_uid = uids[-1]
 
