@@ -1247,9 +1247,9 @@ as Block Kit cards with buttons.
 |-----|------|---------|-------------|
 | `notifications.slack_channel_id` | string | `""` | Conversation for notifications; falls back to the first literal channel id in `slack.allow_channels` |
 
-The fallback only accepts a real channel id. A list of names and globs — or
-one holding just `dm` — resolves to nothing, and Slack notifications are
-skipped with a warning rather than posted to a made-up target.
+The fallback only accepts a real channel id. A list of names and globs resolves
+to nothing, and Slack notifications are skipped with a warning rather than
+posted to a made-up target.
 
 ## Quiet Hours
 
