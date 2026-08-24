@@ -162,7 +162,9 @@ class ImapSource(Source):
                 ).strftime("%d-%b-%Y")
                 typ, data = M.uid("search", None, "SINCE", since)
 
-            if typ != "OK" or not data or not data[0]:
+            if typ != "OK":
+                raise RuntimeError(f"IMAP SEARCH failed for {self.mailbox}: {typ}")
+            if not data or not data[0]:
                 # Nothing matched. Baseline the cursor so we don't re-scan.
                 baseline = last_uid if incremental else (uidnext - 1 if uidnext else 0)
                 return [], f"{uidvalidity}:{max(0, baseline)}"
@@ -177,23 +179,28 @@ class ImapSource(Source):
                 return [], f"{uidvalidity}:{last_uid}" if last_uid is not None else \
                     f"{uidvalidity}:{max(0, (uidnext - 1) if uidnext else 0)}"
 
-            # Cap to the newest `limit` messages, but track the true max UID so
-            # the cursor advances past everything we saw.
-            max_uid = uids[-1]
-            if len(uids) > limit:
-                uids = uids[-limit:]
+            # Process the oldest next batch. Advancing to the newest UID here
+            # would skip the unprocessed backlog when there are more messages
+            # than the per-run limit.
+            if limit <= 0:
+                return [], cursor
+            uids = uids[:limit]
+            next_uid = uids[-1]
 
             parsed: list[dict] = []
             for uid in uids:
                 try:
                     parsed.append(self._fetch_one(M, uid, uidvalidity))
-                except Exception as e:
-                    logger.warning(
-                        "IMAP %s: failed to parse uid %d: %s",
-                        self.source_name, uid, e,
+                except Exception:
+                    logger.exception(
+                        "IMAP %s: failed to parse uid %d",
+                        self.source_name, uid,
                     )
+                    # Do not advance past a UID that was not successfully
+                    # fetched. The next run must retry this batch.
+                    raise
 
-            return parsed, f"{uidvalidity}:{max_uid}"
+            return parsed, f"{uidvalidity}:{next_uid}"
         finally:
             try:
                 M.logout()

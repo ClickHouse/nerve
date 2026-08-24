@@ -179,6 +179,32 @@ class _FakeIMAP:
         return "OK", [(b"1 (RFC822 {n}", self._raw)]
 
 
+class _FakeMailbox:
+    """Minimal mailbox for exercising the blocking cursor flow."""
+
+    def __init__(self, uids: list[int], *, search_status: str = "OK"):
+        self.uids = uids
+        self.search_status = search_status
+
+    def login(self, username, password):
+        return "OK", [b"logged in"]
+
+    def select(self, mailbox, readonly=True):
+        return "OK", [b"selected"]
+
+    def status(self, mailbox, query):
+        return "OK", [b"INBOX (UIDVALIDITY 9 UIDNEXT 200)"]
+
+    def uid(self, command, *args):
+        assert command == "search"
+        if self.search_status != "OK":
+            return self.search_status, [b"search failed"]
+        return "OK", [" ".join(str(uid) for uid in self.uids).encode()]
+
+    def logout(self):
+        return "BYE", [b"logged out"]
+
+
 def _parse(src: ImapSource, message: EmailMessage) -> dict:
     return src._fetch_one(_FakeIMAP(message), 7, 99)
 
@@ -262,6 +288,93 @@ def _src(**kw) -> ImapSource:
     return ImapSource(
         host="h", username="u@x", password="p", label="scans", **kw,
     )
+
+
+def _stub_parsed_message(uid: int, uidvalidity: int) -> dict:
+    return {
+        "id": f"{uidvalidity}-{uid}",
+        "subject": f"Message {uid}",
+        "from": "sender@example.com",
+        "date": "",
+        "timestamp": "2026-06-20T00:00:00+00:00",
+        "body": "body",
+        "matched": False,
+        "image": None,
+        "media_type": None,
+    }
+
+
+def test_blocking_fetch_processes_oldest_batch(monkeypatch):
+    """A backlog is drained from the oldest UID instead of skipping ahead."""
+    src = _src()
+    mailbox = _FakeMailbox([101, 102, 103, 104, 105])
+    fetched: list[int] = []
+
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL",
+        lambda host, port: mailbox,
+    )
+
+    def _fetch_one(_mailbox, uid, uidvalidity):
+        fetched.append(uid)
+        return _stub_parsed_message(uid, uidvalidity)
+
+    monkeypatch.setattr(src, "_fetch_one", _fetch_one)
+
+    cursor = "9:100"
+    parsed, cursor = src._imap_fetch_blocking(cursor, limit=2)
+    assert [message["id"] for message in parsed] == ["9-101", "9-102"]
+    assert fetched == [101, 102]
+    assert cursor == "9:102"
+
+    parsed, cursor = src._imap_fetch_blocking(cursor, limit=2)
+    assert [message["id"] for message in parsed] == ["9-103", "9-104"]
+    assert cursor == "9:104"
+
+    parsed, cursor = src._imap_fetch_blocking(cursor, limit=2)
+    assert [message["id"] for message in parsed] == ["9-105"]
+    assert cursor == "9:105"
+
+
+@pytest.mark.asyncio
+async def test_fetch_preserves_cursor_when_a_uid_fails(monkeypatch):
+    """A failed UID must be retried instead of being skipped permanently."""
+    src = _src()
+    mailbox = _FakeMailbox([101, 102, 103])
+    fetched: list[int] = []
+
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL",
+        lambda host, port: mailbox,
+    )
+
+    def _fetch_one(_mailbox, uid, uidvalidity):
+        fetched.append(uid)
+        if uid == 102:
+            raise RuntimeError("temporary parse failure")
+        return _stub_parsed_message(uid, uidvalidity)
+
+    monkeypatch.setattr(src, "_fetch_one", _fetch_one)
+
+    result = await src.fetch(cursor="9:100", limit=2)
+    assert result.records == []
+    assert result.next_cursor == "9:100"
+    assert fetched == [101, 102]
+
+
+@pytest.mark.asyncio
+async def test_fetch_preserves_cursor_when_search_fails(monkeypatch):
+    """A failed search must not be treated as an empty mailbox."""
+    src = _src()
+    mailbox = _FakeMailbox([101, 102], search_status="NO")
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL",
+        lambda host, port: mailbox,
+    )
+
+    result = await src.fetch(cursor="9:100", limit=2)
+    assert result.records == []
+    assert result.next_cursor == "9:100"
 
 
 def _matched_msg(**over) -> dict:
