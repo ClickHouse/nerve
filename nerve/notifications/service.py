@@ -1154,10 +1154,9 @@ class NotificationService:
         """Resolve the Slack conversation for notification delivery.
 
         Falls back to the first entry of ``slack.allow_channels`` that is a
-        literal Slack id. A glob cannot be posted to, and neither can a
-        channel *name* or the synthetic ``dm`` marker the guardrails match
-        on — so a list without a real id resolves to nothing and the operator
-        must set ``notifications.slack_channel_id``.
+        literal Slack id. A glob or channel *name* cannot be posted to, so a
+        list without a real id resolves to nothing and the operator must set
+        ``notifications.slack_channel_id``.
         """
         from nerve.channels.slack import is_slack_id
 
