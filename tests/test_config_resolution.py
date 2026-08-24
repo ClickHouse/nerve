@@ -249,6 +249,11 @@ class TestSlackIsOptIn:
         })
         assert cfg.enabled is False
 
+    def test_direct_messages_are_an_explicit_opt_in(self):
+        assert SlackConfig.from_dict({}).allow_direct_messages is False
+        cfg = SlackConfig.from_dict({"allow_direct_messages": "true"})
+        assert cfg.allow_direct_messages is True
+
     def test_the_doctor_says_nothing_about_an_unconfigured_slack(self):
         from nerve.cli import doctor_report
 
@@ -261,6 +266,20 @@ class TestSlackIsOptIn:
 
         report = doctor_report(NerveConfig.from_dict({"slack": {"enabled": True}}))
         assert "[ERR] Slack enabled but bot_token, app_token not set" in report
+
+    def test_the_doctor_counts_direct_messages_as_a_guardrail(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({
+            "slack": {
+                "enabled": True,
+                "bot_token": "xoxb-test",
+                "app_token": "xapp-test",
+                "allow_direct_messages": True,
+            },
+        }))
+        assert "direct messages allowed" in report
+        assert "bot refuses every message" not in report
 
 
 class TestSlackDefaultCommands:

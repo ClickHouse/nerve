@@ -536,6 +536,7 @@ class SlackChannel(BaseChannel):
         return AccessPolicy.from_lists(
             allow_users=cfg.allow_users,
             deny_users=cfg.deny_users,
+            allow_direct_messages=cfg.allow_direct_messages,
             allow_channels=cfg.allow_channels,
             deny_channels=cfg.deny_channels,
         )
@@ -848,9 +849,10 @@ class SlackChannel(BaseChannel):
         policy = self.policy
         if not policy.configured:
             logger.warning(
-                "Slack: no slack.allow_users or slack.allow_channels configured "
-                "— every message will be refused. Add your Slack member id "
-                "(Profile → ⋮ → Copy member ID) to slack.allow_users.",
+                "Slack: no slack.allow_users, slack.allow_channels, or "
+                "slack.allow_direct_messages configured — every message will "
+                "be refused. Add your Slack member id (Profile → ⋮ → Copy "
+                "member ID) to slack.allow_users.",
             )
             return
         logger.info("Slack access policy: %s", policy.describe())
@@ -1067,14 +1069,9 @@ class SlackChannel(BaseChannel):
     async def _identify_conversation(
         self, channel_id: str, channel_type: str, resolve: bool,
     ) -> Identity:
-        """Build the Identity for a conversation.
-
-        A direct message has no name, so it is given the synthetic name
-        ``dm`` — that is how ``allow_channels: ["dm", "eng-*"]`` admits
-        direct messages alongside a set of channels.
-        """
-        if channel_type == "im":
-            return Identity(id=channel_id, names=("dm",))
+        """Build the Identity for a conversation."""
+        if channel_type == "im" or channel_id.startswith("D"):
+            return Identity(id=channel_id)
         if not resolve:
             return Identity(id=channel_id)
         cached = self._name_cache.get(f"c:{channel_id}")
@@ -1084,7 +1081,7 @@ class SlackChannel(BaseChannel):
             info = await self._web.conversations_info(channel=channel_id)
             channel = info.get("channel") or {}
             if channel.get("is_im"):
-                identity = Identity(id=channel_id, names=("dm",))
+                identity = Identity(id=channel_id)
             else:
                 name = channel.get("name") or ""
                 identity = Identity(
@@ -1115,6 +1112,11 @@ class SlackChannel(BaseChannel):
             )
             return False
 
+        direct_message = channel_type == "im" or channel_id.startswith("D")
+        if direct_message and not policy.allow_direct_messages:
+            logger.info("Slack refused a message: direct messages are not allowed")
+            return False
+
         user = await self._identify_user(
             user_id,
             needs_name_resolution(policy.users, is_id=is_slack_id),
@@ -1125,7 +1127,9 @@ class SlackChannel(BaseChannel):
             channel_type,
             needs_name_resolution(policy.conversations, is_id=is_slack_id),
         )
-        verdict = policy.check(user, conversation)
+        verdict = policy.check(
+            user, conversation, direct_message=direct_message,
+        )
         if not verdict.allowed:
             logger.info("Slack refused a message: %s", verdict.reason)
         return verdict.allowed
