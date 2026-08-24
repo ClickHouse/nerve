@@ -245,7 +245,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.bot_token`, `.app_token`, `.allow_users`, `.deny_users`, `.allow_direct_messages`, `.allow_channels`, `.deny_channels`, `.reply_in_thread`, `.stream_mode` | ✅ token changes reconnect the running transport; a failed rotation restores the previous connection and is reported as a reload error. The other settings are read per event, so tightening a guardrail takes effect on the next message |
+| `slack.*` except `.enabled` | ✅ token changes reconnect (and roll back on failure); other changes apply to the next event |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -280,7 +280,7 @@ reload cannot inspect, and are documented here only.
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
-| `slack.enabled` | the channel object is created and registered only at startup. Tokens and the four allow/deny lists do follow a reload (see the table above) |
+| `slack.enabled` | the Slack channel is registered only at startup |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1077,43 +1077,38 @@ users are ignored.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `slack.enabled` | bool | see below | Enable the Slack bot |
+| `slack.enabled` | bool | see below | Enable Slack |
 | `slack.bot_token` | string | - | Bot User OAuth Token (`xoxb-…`) |
 | `slack.app_token` | string | - | App-Level Token for Socket Mode (`xapp-…`) |
-| `slack.allow_users` | list[str] | `[]` | Senders allowed to reach the agent |
-| `slack.deny_users` | list[str] | `[]` | Senders always refused |
-| `slack.allow_direct_messages` | bool | `false` | Allow direct-message conversations |
-| `slack.allow_channels` | list[str] | `[]` | Conversations the agent answers in |
-| `slack.deny_channels` | list[str] | `[]` | Conversations always refused |
+| `slack.allow_users` | list[str] | `[]` | Allowed senders |
+| `slack.deny_users` | list[str] | `[]` | Blocked senders |
+| `slack.allow_direct_messages` | bool | `false` | Allow DMs; sender rules still apply |
+| `slack.allow_channels` | list[str] | `[]` | Allowed shared conversations |
+| `slack.deny_channels` | list[str] | `[]` | Blocked shared conversations |
 | `slack.reply_in_thread` | bool | `true` | One session per thread; replies stay in-thread |
-| `slack.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
-| `slack.commands` | list[str] | see below | Which `/nerve` subcommands the workspace may run |
+| `slack.stream_mode` | string | `partial` | `partial` (edit one message) or `full` |
+| `slack.commands` | list[str] | see below | Enabled `/nerve` subcommands |
 
-Both tokens are secrets — put them in `config.local.yaml`. Changing either
-reconnects Slack on reload; the access guardrails also take effect then.
+Put both tokens in `config.local.yaml`. Token changes reconnect on reload;
+guardrails, commands, and message behavior apply to the next event. Only
+`slack.enabled` requires a restart.
 
-Slack is opt-in. Without an explicit `slack.enabled`, the channel is on only
-when both tokens are set, so a configuration that predates Slack — one with
-no `slack` section at all — stays off and `nerve doctor` says nothing about
-it. Set `enabled: true` to be told about missing tokens instead of having the
-channel quietly stay down. Under lockdown the channel is off unless
-`enabled: true` is explicit, because lockdown drops the machine-local layer
-that decides whether this box answers Slack.
+Slack runs when `enabled: true`. If the key is omitted, it runs only when both
+tokens are present; under lockdown, `enabled: true` is always required. An
+explicit `true` also makes `nerve doctor` report missing tokens.
 
 ### Setting up the Slack app
 
 Socket Mode means the bot dials out to Slack, so Nerve needs no public URL.
 
 1. Create an app at <https://api.slack.com/apps> from the manifest below.
-2. **Basic Information → App-Level Tokens**: generate a token with the
-   `connections:write` scope. This is `slack.app_token` (`xapp-…`).
-3. **Install App**: install to the workspace and copy the Bot User OAuth
-   Token. This is `slack.bot_token` (`xoxb-…`).
-4. **App Home** → *Show Tabs* → turn on the **Messages Tab** and tick
-   *Allow users to send Slash commands and messages from the messages tab*.
-   Without it the direct-message conversation with the bot is read-only and
-   Slack refuses every DM with `restricted_action_read_only_channel`. The
-   manifest cannot set this.
+2. Under **Basic Information → App-Level Tokens**, create a
+   `connections:write` token for `slack.app_token` (`xapp-…`).
+3. Install the app and copy its Bot User OAuth Token to `slack.bot_token`
+   (`xoxb-…`).
+4. Under **App Home → Show Tabs**, enable **Messages Tab** and **Allow users
+   to send Slash commands and messages**. The manifest cannot set this; without
+   it DMs are read-only.
 5. Configure at least one access grant (see below), then restart Nerve.
 
 ```yaml
@@ -1161,25 +1156,16 @@ settings:
   socket_mode_enabled: true
 ```
 
-`users:read`, `users:read.email` and `channels:read` are only needed if the
-allow/deny lists name people or channels rather than raw ids. With ids only,
-Nerve never calls those endpoints and you can drop the scopes.
-
-If a **deny** rule names an email address, `users:read.email` is required.
-Without it Slack still answers `users.info` successfully but omits the email,
-so the rule could never match — Nerve refuses those users rather than let the
-deny list pass silently, and logs why. Write the rule against the handle or
-the member id if you would rather not grant the scope.
+Rules that use only raw IDs do not need `users:read`, `users:read.email`, or
+`channels:read`. Names need the corresponding read scope; email rules need
+`users:read.email`. If Slack omits identity data needed by a rule, Nerve
+refuses the message and logs why.
 
 ### Guardrails
 
-These guardrails are the whole authorization story — there is no pairing step,
-because the workspace already decides who can reach the bot at all.
-
-A pattern matches a Slack id (`U0123ABC`, `C0456DEF`), a handle, a display
-name, an email, or a channel name. Matching is case-insensitive and supports
-globs. Direct messages are controlled separately by
-`allow_direct_messages`; they are refused by default.
+Patterns match Slack IDs (`U0123ABC`, `C0456DEF`), handles, display names,
+emails, or channel names. Matching is case-insensitive and supports globs.
+Use raw IDs to avoid name lookups.
 
 ```yaml
 slack:
@@ -1190,105 +1176,51 @@ slack:
   deny_channels: ["*-social"]
 ```
 
-Rules, per list:
+- Deny rules always win.
+- A non-empty allow list restricts that dimension; an empty one allows
+  anything not denied.
+- Sender and conversation rules are independent. `allow_users` alone permits
+  those users in any non-denied shared channel; `allow_channels` alone permits
+  any non-denied user in those channels.
+- DMs also require `allow_direct_messages: true`. With no `allow_users`, that
+  permits any non-denied member who can DM the bot.
+- With no `allow_users`, `allow_channels`, or DM grant, Nerve refuses everyone.
+  Deny rules alone never enable access.
+- If a required name lookup fails or omits data, Nerve refuses the message.
 
-- **Deny wins.** A value matching any deny pattern is refused whatever the
-  allow list says.
-- **A non-empty allow list is a gate.** The value must match one of its
-  patterns.
-- **An empty allow list means "anything not denied".**
+### Message behavior
 
-The sender and the conversation are checked independently and both must
-pass. Direct messages require `allow_direct_messages: true`, and sender
-allow/deny rules still apply to them. That setting alone admits any workspace
-member who can DM the bot, just as `allow_channels` alone admits anyone in
-those channels. `allow_users` alone lets those people talk in shared channels,
-but does not enable direct messages.
+- In an allowed DM, the bot answers every message.
+- In a shared channel, it answers mentions and threads where it already has a
+  session.
+- With `reply_in_thread: true`, each thread has its own session and replies
+  stay there.
+- `/nerve` responses are ephemeral.
 
-Two failure modes are closed on purpose:
+### Commands
 
-- **No allow grant at all refuses everything.** A deny list is not an opt-in.
-  With both allow lists empty and `allow_direct_messages: false`, the bot logs
-  a warning at startup and answers nobody rather than handing the whole
-  workspace full agent access.
-- **A name that cannot be looked up is refused** when a deny list is set.
-  This covers a lookup that failed *and* one that succeeded while omitting an
-  alias the rules need. An allow list already fails closed on an unknown
-  name, but a deny list would otherwise fail open.
-
-A pattern counts as a literal id only if it has the real Slack shape — a
-`U`/`W`/`B`/`C`/`D`/`G`/`T` followed by at least seven uppercase alphanumerics.
-Anything else is treated as a name and resolved through the API, so an
-all-caps channel name like `ENGINEERING` is matched as a name, not mistaken
-for an id.
-
-Note that a `${VAR}` reference on a list field becomes one entry, not a
-comma-separated set — spell several values as a YAML list.
-
-### Behaviour
-
-- In a **direct message** the bot answers everything.
-- In a **channel** it answers only when mentioned, or when the message
-  continues a thread it already has a session for. Adding the bot to a busy
-  channel does not start an agent turn per remark.
-- With `reply_in_thread` on (the default) each thread is a separate session,
-  so several people can run separate conversations in one channel.
-- `/nerve <subcommand>` mirrors the Telegram command set. Replies are
-  ephemeral — only the person who ran the command sees them.
-
-### Limiting what the workspace can do
-
-`slack.commands` chooses which subcommands exist. Chatting with the agent and
-answering notification buttons are not commands, so they are unaffected.
+`slack.commands` controls slash commands only; chat and notification buttons
+are unaffected.
 
 ```yaml
 slack:
-  commands: []                     # no slash commands at all — chat only
-  commands: [reply]                # only answer pending questions
-  commands: [sessions, new, stop]  # session control, nothing operational
-  commands: [all]                  # everything, including doctor and restart
+  commands: []                    # disable /nerve
+  commands: [reply]               # enable only reply
+  commands: [sessions, new, stop] # enable this exact set
+  commands: [all]                 # enable every subcommand
 ```
 
-Omitting the key gives `new, stop, star, unstar`. Four subcommands are off
-unless you ask for them:
+Omitting the key enables `new`, `stop`, `star`, and `unstar`. `doctor`,
+`restart`, `sessions`, and `reply` are opt-in: the first two expose host
+operations, while the latter two can reach sessions outside Slack and are not
+scoped to the caller. Enable them only when every permitted user is trusted
+with the whole instance. Unknown command names are ignored with a warning;
+`/nerve help` shows the enabled set.
 
-- **`doctor`** prints host health into a shared workspace.
-- **`restart`** lets anyone on the allow list bounce the daemon.
-- **`sessions`** lists every session in the instance, Telegram and web ones
-  included, and attaches the one you pick to your own Slack conversation.
-- **`reply`** answers the latest pending question anywhere in the instance.
-
-The last two are not scoped to the caller. Nerve has no ownership model for
-Slack yet, so with `allow_direct_messages: true` any permitted member of the
-workspace could otherwise enumerate someone else's private session, continue
-it, or answer a question that was never theirs. Turn them on in a workspace
-where everyone on the allow list is trusted with every session.
-
-An unknown name is dropped with a warning rather than refused, since the key
-exists to narrow access and a typo should not stop the daemon booting.
-
-`/nerve help` lists only what is enabled, and a disabled command says it is
-turned off rather than pretending not to exist.
-
-### Slash commands cannot run in threads
-
-Slack refuses them outright — it answers *"/nerve is not supported in
-threads"* — and the payload carries no thread reference. So a command run at
-channel level has to work out which thread you meant.
-
-`/nerve stop`, `/nerve star` and `/nerve unstar` therefore resolve across
-every live session in the channel, not just the channel-level one. With one
-session live they act on it and name it; with several they show a picker
-rather than guess, since acting on someone else's thread silently is worse
-than asking. With none they say so.
-
-`/nerve new` and `/nerve sessions` cannot work that way, because both have to
-*bind* a session to a conversation and only a thread id identifies one. In a
-channel with `reply_in_thread` on they refuse and say why. Nothing is lost:
-each new mention in such a channel already opens its own thread and its own
-session, and `/nerve stop` ends one. Both commands work normally in a direct
-message and in a channel with `reply_in_thread: false`, where an ordinary
-message routes to the channel-level key the command can name.
+Slack slash-command payloads have no thread ID. In a threaded shared channel,
+`new` and `sessions` therefore refuse, while `stop`, `star`, and `unstar`
+select among that channel's active sessions. Commands work normally in DMs
+and channels with `reply_in_thread: false`.
 
 ## Quiet Hours
 
