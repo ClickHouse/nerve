@@ -54,6 +54,8 @@ WATCHDOG_HEARTBEAT_EVERY = 10
 # return a failure and restore the previous transport instead of hanging the
 # config endpoint indefinitely.
 SOCKET_CONNECT_TIMEOUT = 30
+# Give acknowledged work a short chance to finish when Slack is disabled live.
+_STOP_DRAIN_TIMEOUT = 30.0
 # Bounded caches: event dedupe, message text for reaction context, resolved names.
 _DEDUPE_MAX = 500
 _MESSAGE_CACHE_MAX = 200
@@ -461,6 +463,7 @@ class SlackChannel(BaseChannel):
         self._transport_lock = asyncio.Lock()
         self._bot_user_id: str = ""
         self._bot_id: str = ""     # the app's own bot_id, to spot our own posts
+        self._team_id: str = ""
         self._notification_service = None   # Set after service is created
         self._watchdog_task: asyncio.Task | None = None
         self._stopping = False
@@ -580,6 +583,9 @@ class SlackChannel(BaseChannel):
                 self._web = None
                 self._active_bot_token = ""
                 self._active_app_token = ""
+                self._bot_user_id = ""
+                self._bot_id = ""
+                self._team_id = ""
                 raise
 
         self._last_event_time = time.monotonic()
@@ -646,6 +652,7 @@ class SlackChannel(BaseChannel):
         self._active_app_token = app_token
         self._bot_user_id = auth.get("user_id", "")
         self._bot_id = auth.get("bot_id", "")
+        self._team_id = auth.get("team_id") or self._team_id
 
     def _log_auth(self, auth: dict, action: str) -> None:
         logger.info(
@@ -730,6 +737,13 @@ class SlackChannel(BaseChannel):
             web, client, auth = await self._prepare_transport(
                 bot_token, app_token,
             )
+            team_id = auth.get("team_id", "")
+            if self._team_id and team_id and team_id != self._team_id:
+                await self._close_socket_quietly(client)
+                raise RuntimeError(
+                    "the new Slack credentials belong to a different workspace; "
+                    "restart required",
+                )
 
             old_client = self._client
             old_web = self._web
@@ -737,6 +751,7 @@ class SlackChannel(BaseChannel):
             old_app_token = self._active_app_token
             old_bot_user_id = self._bot_user_id
             old_bot_id = self._bot_id
+            old_team_id = self._team_id
 
             try:
                 await self._close_socket_for_replacement(old_client)
@@ -749,10 +764,8 @@ class SlackChannel(BaseChannel):
             self._activate_transport(
                 web, client, auth, bot_token, app_token,
             )
-            # Identity and message ids are workspace-local. Token rotation is
-            # normally within one app, but clear before connecting so a move
-            # to another workspace cannot race an event through stale auth
-            # context. A failed rotation leaves these disposable caches empty.
+            # Names, dedupe keys, and message ids belong to the credential
+            # generation. A failed rotation leaves these disposable caches empty.
             self._seen_events.clear()
             self._message_cache.clear()
             self._last_inbound_ts.clear()
@@ -766,6 +779,7 @@ class SlackChannel(BaseChannel):
                 self._active_app_token = old_app_token
                 self._bot_user_id = old_bot_user_id
                 self._bot_id = old_bot_id
+                self._team_id = old_team_id
                 self._client = old_client
 
                 if old_web is not None and old_app_token:
@@ -819,7 +833,8 @@ class SlackChannel(BaseChannel):
             return
         logger.info("Slack access policy: %s", policy.describe())
 
-    async def stop(self) -> None:
+    async def stop(self, *, drain: bool = False) -> None:
+        """Stop receiving, optionally draining acknowledged dispatches first."""
         self._stopping = True
         if self._watchdog_task and not self._watchdog_task.done():
             self._watchdog_task.cancel()
@@ -827,15 +842,41 @@ class SlackChannel(BaseChannel):
                 await self._watchdog_task
             except asyncio.CancelledError:
                 pass
-        # Cancel and then wait: closing the socket out from under a dispatch
-        # still touching the router or the web client races teardown.
+        self._watchdog_task = None
+
+        if drain:
+            async with self._transport_lock:
+                await self._close_socket_quietly(self._client)
+
         inflight = list(self._inflight)
-        for task in inflight:
-            task.cancel()
-        if inflight:
+        if drain and inflight:
+            _, pending = await asyncio.wait(
+                inflight, timeout=_STOP_DRAIN_TIMEOUT,
+            )
+            if pending:
+                logger.warning(
+                    "Slack: cancelling %d dispatch(es) after drain timeout",
+                    len(pending),
+                )
+            for task in pending:
+                task.cancel()
             await asyncio.gather(*inflight, return_exceptions=True)
-        async with self._transport_lock:
-            await self._close_socket_quietly(self._client)
+        elif not drain:
+            # Normal process shutdown stays prompt and closes the socket only
+            # after dispatches stop touching the router and Web client.
+            for task in inflight:
+                task.cancel()
+            if inflight:
+                await asyncio.gather(*inflight, return_exceptions=True)
+            async with self._transport_lock:
+                await self._close_socket_quietly(self._client)
+
+        self._web = None
+        self._active_bot_token = ""
+        self._active_app_token = ""
+        self._bot_user_id = ""
+        self._bot_id = ""
+        self._team_id = ""
 
     # ------------------------------------------------------------------ #
     #  Watchdog                                                            #
@@ -931,6 +972,9 @@ class SlackChannel(BaseChannel):
             )
         except Exception as e:
             logger.warning("Slack ack failed for %s: %s", req.envelope_id, e)
+
+        if self._stopping:
+            return
 
         # The envelope is acked, so Slack will not resend it. Dropping past
         # the cap is therefore a real loss, but a bounded one: without it a
