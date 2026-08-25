@@ -32,6 +32,7 @@ around the outbound file.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import time
 
@@ -145,7 +146,7 @@ async def _connected_channel():
 @pytest_asyncio.fixture(loop_scope="module")
 async def live_channel(_connected_channel):
     """Point the shared channel at this test's router and guardrails."""
-    channel, cfg = _connected_channel
+    channel, _ = _connected_channel
 
     async def _use(router: RecordingRouter, **slack_kwargs):
         assert await channel._client.is_connected(), (
@@ -158,19 +159,21 @@ async def live_channel(_connected_channel):
         # allow list, and surface in the next test's router. CI is slower
         # than a laptop, so it saw this where local runs did not.
         await wait_until_quiet(channel)
+        config = copy.deepcopy(channel.config)
         for field, default in (
             ("allow_users", []), ("deny_users", []),
             ("allow_direct_messages", False),
             ("allow_channels", []), ("deny_channels", []),
-            ("reply_in_thread", True), ("commands", None),
+            ("commands", None),
         ):
-            setattr(cfg.slack, field, slack_kwargs.get(field, default))
+            setattr(config.slack, field, slack_kwargs.get(field, default))
+        channel.apply_config(config)
         channel.router = router
         router.channel = channel
         # Resolved identities are policy-specific, so a later test must not
         # inherit a verdict computed under different lists.
         channel._name_cache.clear()
-        return channel, cfg
+        return channel, config
 
     return _use
 
