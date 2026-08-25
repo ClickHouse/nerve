@@ -121,6 +121,8 @@ slack:
   #
   # Access patterns match Slack IDs or names, case-insensitively with globs.
   # Deny wins, DMs require explicit opt-in, and no allow grant refuses everyone.
+  # Grant users by member ID, handle, or email only: a member edits their own
+  # display and full name, so allow_users never matches those.
   # allow_users: ["U0123ABC", "alex.soffronow"]
   # deny_users: ["*-bot"]
   allow_direct_messages: false

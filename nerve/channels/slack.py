@@ -715,6 +715,11 @@ class SlackChannel(BaseChannel):
         answers 200, so an absent email there is indistinguishable from a
         user who has none — either way the candidate set is short of what the
         deny list needs, and the identity is marked incomplete.
+
+        A member edits ``display_name`` and ``real_name`` at will, so those
+        reach the policy as self-set names that only a deny rule may match.
+        The handle and the email are provisioned or verified, so a grant may
+        rest on them.
         """
         if not resolve:
             return Identity(id=user_id)
@@ -728,14 +733,18 @@ class SlackChannel(BaseChannel):
             profile = user.get("profile") or {}
             email = profile.get("email")
             names = tuple(
+                n for n in (user.get("name"), email) if n
+            )
+            self_set_names = tuple(
                 n for n in (
-                    user.get("name"),
                     profile.get("display_name"),
                     profile.get("real_name"),
-                    email,
                 ) if n
             )
-            complete = bool(names) and (email is not None or not need_email)
+            complete = (
+                bool(names or self_set_names)
+                and (email is not None or not need_email)
+            )
             if need_email and email is None:
                 logger.warning(
                     "Slack users.info returned no email for %s — the deny list "
@@ -743,7 +752,12 @@ class SlackChannel(BaseChannel):
                     "or write the deny rule against the handle or id instead.",
                     user_id,
                 )
-            identity = Identity(id=user_id, names=names, complete=complete)
+            identity = Identity(
+                id=user_id,
+                names=names,
+                self_set_names=self_set_names,
+                complete=complete,
+            )
         except Exception as e:
             logger.warning("Slack users.info failed for %s: %s", user_id, e)
             identity = Identity(id=user_id, complete=False)
@@ -1687,11 +1701,20 @@ class SlackChannel(BaseChannel):
         user_id = (payload.get("user") or {}).get("id") or ""
         channel_id = (payload.get("channel") or {}).get("id") or ""
         response_url = payload.get("response_url") or ""
-        if not user_id:
+        # Both halves of the policy need a subject and a conversation. Slack
+        # omits the conversation for interactions on a view surface, which
+        # this app does not publish, so a press without one is refused rather
+        # than run against half a policy.
+        if not user_id or not channel_id:
+            logger.warning(
+                "Slack refused a %s press with no %s",
+                action_id or "button",
+                "sender" if not user_id else "conversation",
+            )
             return
 
         channel_type = "im" if channel_id.startswith("D") else "channel"
-        if channel_id and not await self._authorize(user_id, channel_id, channel_type):
+        if not await self._authorize(user_id, channel_id, channel_type):
             return
 
         if action_id.startswith("sessstop:"):

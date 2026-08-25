@@ -1162,9 +1162,16 @@ refuses the message and logs why.
 
 ### Guardrails
 
-Patterns match Slack IDs (`U0123ABC`, `C0456DEF`), handles, display names,
-emails, or channel names. Matching is case-insensitive and supports globs.
-Use raw IDs to avoid name lookups.
+Patterns match Slack IDs (`U0123ABC`, `C0456DEF`), handles, emails, or
+channel names. Matching is case-insensitive and supports globs. Use raw IDs
+to avoid name lookups.
+
+A member edits their own display name and full name, so an `allow_users`
+rule never grants on those. Write user grants against the member ID, the
+handle, or the email. `deny_users` does match display and full names,
+because refusing on more names than a grant may rest on is always safe. A
+grant that matches only a self-set name is refused and logged, so the rule
+does not fail silently.
 
 ```yaml
 slack:

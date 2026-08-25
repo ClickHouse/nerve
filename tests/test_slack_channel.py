@@ -298,6 +298,51 @@ class TestAuthorization:
         assert await channel._authorize("U1", "D1", "im")
 
     @pytest.mark.asyncio
+    async def test_a_spoofed_profile_name_does_not_grant_access(self):
+        # A member edits their own full name, so an allow list must not
+        # grant on it: anyone could rename themselves onto the list.
+        channel = _channel(
+            allow_users=["alex.soffronow"], allow_direct_messages=True,
+        )
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {
+                "name": "mallory",
+                "profile": {
+                    "real_name": "alex.soffronow",
+                    "display_name": "alex.soffronow",
+                },
+            }},
+        )
+        assert not await channel._authorize("U-mallory", "D1", "im")
+
+    @pytest.mark.asyncio
+    async def test_a_deny_rule_still_matches_a_profile_name(self):
+        channel = _channel(
+            allow_users=["*"], deny_users=["*-bot"],
+            allow_direct_messages=True,
+        )
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {
+                "name": "integration-42",
+                "profile": {"display_name": "deploy-bot", "email": "i@x.test"},
+            }},
+        )
+        assert not await channel._authorize("U-int", "D1", "im")
+
+    @pytest.mark.asyncio
+    async def test_an_email_allow_list_grants(self):
+        channel = _channel(
+            allow_users=["alex@clickhouse.com"], allow_direct_messages=True,
+        )
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {
+                "name": "alex",
+                "profile": {"email": "alex@clickhouse.com"},
+            }},
+        )
+        assert await channel._authorize("U1", "D1", "im")
+
+    @pytest.mark.asyncio
     async def test_a_failed_lookup_with_a_deny_list_refuses(self):
         channel = _channel(
             allow_users=["U1"], deny_users=["*-bot"],
@@ -1219,6 +1264,49 @@ class TestSlashCommandsAreThreadBlind:
             }
         )
         channel.router.stop_session.assert_awaited_once_with("s2")
+
+    @pytest.mark.asyncio
+    async def test_a_press_from_an_unauthorized_sender_is_refused(self):
+        channel = self._ch([])
+        channel.config.slack.allow_users = ["U-owner"]
+        channel._replace_via_url = AsyncMock()
+        await channel._handle_interactive(
+            {
+                "type": "block_actions",
+                "user": {"id": "U-mallory"},
+                "channel": {"id": "C1"},
+                "response_url": "https://hooks.slack.test/x",
+                "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
+            }
+        )
+        channel.router.stop_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_press_with_no_conversation_is_refused(self):
+        # The conversation half of the policy cannot run without a channel,
+        # so the press is refused rather than checked against half of it.
+        channel = self._ch([])
+        channel.config.slack.allow_users = ["U-owner"]
+        channel._replace_via_url = AsyncMock()
+        channel._notification_service = MagicMock()
+        channel._notification_service.answer_delivered_notification = AsyncMock()
+        for action_id, value in (
+            ("sessstop:s2", "s2"),
+            ("starpick:s2", "s2"),
+            ("notif:n1:yes", "yes"),
+        ):
+            await channel._handle_interactive(
+                {
+                    "type": "block_actions",
+                    "user": {"id": "U-mallory"},
+                    "response_url": "https://hooks.slack.test/x",
+                    "actions": [{"action_id": action_id, "value": value}],
+                }
+            )
+        channel.router.stop_session.assert_not_called()
+        channel.router.set_session_starred.assert_not_called()
+        channel._notification_service.answer_delivered_notification\
+            .assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_another_channels_sessions_are_not_touched(self):
