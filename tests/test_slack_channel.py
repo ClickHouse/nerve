@@ -655,6 +655,29 @@ class TestReactionEvents:
         )
         channel.router.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_reaction_does_not_cross_conversations_on_a_shared_ts(self):
+        # A Slack ts is unique inside one conversation only, so the same ts
+        # in another channel must not reach the first channel's session.
+        channel = _channel(allow_channels=["C1", "C2"])
+        channel._cache_message("1.1", "C1:1.0", "the original in C1")
+        await channel._handle_reaction_event({
+            "type": "reaction_added", "user": "U1", "reaction": "tada",
+            "item": {"channel": "C2", "ts": "1.1"},
+        })
+        channel.router.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_reaction_still_reaches_its_own_thread_session(self):
+        channel = _channel(allow_channels=["C1"])
+        channel._cache_message("1.1", "C1:1.0", "the original in C1")
+        await channel._handle_reaction_event({
+            "type": "reaction_added", "user": "U1", "reaction": "tada",
+            "item": {"channel": "C1", "ts": "1.1"},
+        })
+        msg = channel.router.handle_message.await_args[0][0]
+        assert msg.channel_key == "slack:C1:1.0"
+
 
 class TestOutbound:
     @pytest.mark.asyncio
