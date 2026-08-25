@@ -384,9 +384,14 @@ class TestGuardrailsAgainstRealSlack:
         )
         posted.note_bot(TEST_CHANNEL, anchor["ts"])
         # The channel only forwards reactions on messages it still has
-        # context for, which is what the outbound cache is for.
+        # context for, which is what the outbound cache is for. Every
+        # shared-channel entry the channel writes carries a thread, because a
+        # top-level message is the root of its own, so the target here is the
+        # one production would have cached.
         channel._cache_message(
-            anchor["ts"], format_target(TEST_CHANNEL), f"react to me {marker}",
+            anchor["ts"],
+            format_target(TEST_CHANNEL, anchor["ts"]),
+            f"react to me {marker}",
         )
         await human.reactions_add(
             channel=TEST_CHANNEL, timestamp=anchor["ts"], name="tada",
