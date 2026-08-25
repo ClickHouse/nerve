@@ -176,6 +176,22 @@ class NotificationStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def get_latest_notification_delivery(
+        self,
+        notification_id: str,
+        channel: str,
+    ) -> dict | None:
+        """Return the most recent delivery through one transport."""
+        async with self.db.execute(
+            """SELECT * FROM notification_deliveries
+               WHERE notification_id = ? AND channel = ?
+               ORDER BY delivered_at DESC, rowid DESC
+               LIMIT 1""",
+            (notification_id, channel),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     async def find_pending_question_for_delivery(
         self,
         channel: str,

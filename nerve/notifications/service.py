@@ -858,10 +858,6 @@ class NotificationService:
                     )
                     if not msg_id:
                         return None
-                    await self.db.update_notification(
-                        notification_id,
-                        slack_message_id=str(msg_id),
-                    )
                     return "slack"
             except Exception as e:
                 logger.error(
@@ -1146,32 +1142,9 @@ class NotificationService:
     def _get_slack_channel(self):
         """Get the connected SlackChannel, or None if unavailable."""
         channel = self.engine.router.get_channel("slack")
-        if not channel or getattr(channel, "_web", None) is None:
+        if not channel or not getattr(channel, "is_available", False):
             return None
         return channel
-
-    def _resolve_slack_channel_id(self) -> str | None:
-        """Resolve the Slack conversation for notification delivery.
-
-        Falls back to the first entry of ``slack.allow_channels`` that is a
-        literal Slack id. A glob or channel *name* cannot be posted to, so a
-        list without a real id resolves to nothing and the operator must set
-        ``notifications.slack_channel_id``.
-        """
-        from nerve.channels.slack import is_slack_id
-
-        configured = self.config.notifications.slack_channel_id
-        if configured:
-            return configured
-        for entry in self.config.slack.allow_channels:
-            if entry and is_slack_id(entry):
-                return entry
-        logger.warning(
-            "No notifications.slack_channel_id set and slack.allow_channels "
-            "holds no literal channel id — Slack notifications cannot be "
-            "delivered",
-        )
-        return None
 
     async def _deliver_slack(
         self,
@@ -1192,12 +1165,6 @@ class NotificationService:
             )
             return None
 
-        target = self._resolve_slack_channel_id()
-        if not target:
-            return None
-
-        from nerve.channels.slack import build_notification_blocks
-
         text = self._build_notification_text(session_id, title, body, priority)
 
         button_options: list[tuple[str, str]] = []
@@ -1214,17 +1181,21 @@ class NotificationService:
                     rendered = value
                 button_options.append((rendered, value))
 
-        blocks = build_notification_blocks(
-            text, notification_id, button_options or None,
+        delivery = await channel.post_notification(
+            notification_id,
+            text,
+            button_options or None,
         )
-        msg_id = await channel._post(target, text, blocks)
-
-        if msg_id:
-            channel._cache_message(msg_id, target, text)
-            await self.db.update_notification(
-                notification_id, slack_channel_id=target,
-            )
-        return msg_id
+        if not delivery:
+            return None
+        target, message_id = delivery
+        await self.db.record_notification_delivery(
+            notification_id,
+            "slack",
+            target=target,
+            message_id=message_id,
+        )
+        return message_id
 
     async def _edit_slack_expired(self, notif: dict[str, Any]) -> None:
         """Best-effort edit of the Slack card to show it expired.
@@ -1232,17 +1203,14 @@ class NotificationService:
         Rebuilds the original text from the row and appends the status line,
         dropping the now-dead buttons. All failures are swallowed by design.
         """
-        message_id = notif.get("slack_message_id")
-        if not message_id:
-            return
         channel = self._get_slack_channel()
         if not channel:
             return
-        target = notif.get("slack_channel_id") or self._resolve_slack_channel_id()
-        if not target:
+        delivery = await self.db.get_latest_notification_delivery(
+            notif["id"], "slack",
+        )
+        if not delivery or not delivery.get("message_id"):
             return
-
-        from nerve.channels.slack import _md_to_slack, parse_target
 
         text = self._build_notification_text(
             notif["session_id"],
@@ -1251,19 +1219,11 @@ class NotificationService:
             notif.get("priority") or "normal",
         )
         text += "\n\n⏰ Expired unanswered"
-
-        channel_id, _ = parse_target(target)
-        try:
-            await channel._web.chat_update(
-                channel=channel_id,
-                ts=str(message_id),
-                text=_md_to_slack(text),
-                blocks=[],
-            )
-        except Exception as exc:
-            logger.debug(
-                "slack expiry edit failed for %s: %s", notif["id"], exc,
-            )
+        await channel.expire_notification(
+            delivery["target"],
+            str(delivery["message_id"]),
+            text,
+        )
 
     # ------------------------------------------------------------------ #
     #  Maintenance (called by the periodic background tick)                #
@@ -1500,12 +1460,14 @@ class NotificationService:
         now-dead inline keyboard. Telegram refuses edits on old
         messages (>48h) — all failures are swallowed by design.
         """
-        target = str(notif.get("telegram_chat_id") or "")
-        delivery = None
-        if target:
-            delivery = await self.db.get_notification_delivery(
-                notif["id"], "telegram", target,
-            )
+        delivery = await self.db.get_latest_notification_delivery(
+            notif["id"], "telegram",
+        )
+        target = str(
+            (delivery or {}).get("target")
+            or notif.get("telegram_chat_id")
+            or ""
+        )
         message_id = (
             (delivery or {}).get("message_id")
             or notif.get("telegram_message_id")
