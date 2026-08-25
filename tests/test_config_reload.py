@@ -939,6 +939,34 @@ class TestSlackLifecycleReload:
         assert reload_failures(summary)["slack"] == "socket stuck"
 
     @pytest.mark.asyncio
+    async def test_a_disable_failure_redacts_the_generation_it_stopped(
+        self, tmp_path, monkeypatch,
+    ):
+        # The desired generation carries no tokens once the operator removes
+        # them, so redacting against it alone left the live token in a
+        # message that reload_all returns over HTTP.
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(
+            config_dir, ws, monkeypatch,
+            bot_token="xoxb-live-secret", app_token="xapp-live-secret",
+        )
+        channel.stop = AsyncMock(
+            side_effect=RuntimeError(
+                "close failed for xoxb-live-secret and xapp-live-secret",
+            ),
+        )
+        engine = self._engine(channel)
+
+        _write_config(config_dir, ws, "slack:\n  enabled: false\n")
+        summary = await reload_all(engine, None, config_dir)
+
+        failure = reload_failures(summary)["slack"]
+        assert "xoxb-live-secret" not in failure
+        assert "xapp-live-secret" not in failure
+        assert failure == "close failed for <redacted> and <redacted>"
+
+    @pytest.mark.asyncio
     async def test_a_failed_enable_stays_absent_and_retries(
         self, tmp_path, monkeypatch,
     ):

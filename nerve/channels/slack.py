@@ -613,8 +613,13 @@ class SlackChannel(BaseChannel):
         is safer than overlapping connections.
         """
         async with self._transport_lock:
+            # The watchdog repairs outside the lifecycle lock, so a stop may
+            # have started while it waited here. Connecting now would leave
+            # a socket behind the channel that is going away.
+            if self._stopping:
+                return
             # A credential reload may have repaired the socket while the
-            # watchdog was waiting for the lifecycle lock.
+            # watchdog was waiting for the transport lock.
             if self._client is not None:
                 try:
                     if await self._client.is_connected():

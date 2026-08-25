@@ -25,6 +25,23 @@ class SlackRuntimeError(RuntimeError):
     """A sanitized Slack transition failure safe for logs and HTTP output."""
 
 
+def _secrets_of(*configs: NerveConfig | None) -> tuple[str, ...]:
+    """Every token that must not appear in a message handed to a caller."""
+    return tuple(
+        secret
+        for config in configs
+        if config is not None
+        for secret in (config.slack.bot_token, config.slack.app_token)
+        if secret
+    )
+
+
+def _redact(detail: str, secrets: tuple[str, ...]) -> str:
+    for secret in secrets:
+        detail = detail.replace(secret, "<redacted>")
+    return detail
+
+
 class SlackRuntime:
     """Own one Slack instance and serialize every lifecycle transition."""
 
@@ -41,6 +58,7 @@ class SlackRuntime:
         self._channel: SlackChannel | None = None
         self._active_config: NerveConfig | None = None
         self._watchdog_task: asyncio.Task | None = None
+        self._closed = False
 
     @property
     def channel(self) -> SlackChannel | None:
@@ -52,53 +70,69 @@ class SlackRuntime:
 
     async def reconcile(self, config: NerveConfig) -> str | None:
         """Atomically reconcile one desired process config generation."""
-        desired = copy.deepcopy(config)
         async with self._lock:
-            if not desired.slack.enabled:
-                if self._channel is None:
-                    return None
-                try:
-                    await self._stop_locked(drain=True)
-                except Exception as error:
-                    raise self._safe_error(error, desired) from error
-                return "disabled"
-
-            if not desired.slack.bot_token or not desired.slack.app_token:
-                raise self._safe_error(
-                    RuntimeError("Slack needs both bot_token and app_token"),
-                    desired,
-                )
-
-            if self._channel is None:
-                return await self._enable_locked(desired)
-
-            channel = self._channel
-            if self.router.get_channel(self.name) is not channel:
+            if self._closed:
+                # The process is shutting down. The workspace sync loop is
+                # given a bounded wait to finish the cycle it is in, and its
+                # git phase runs in a worker thread past cancellation, so a
+                # reload can still arrive here. Starting a socket now leaves
+                # one open past exit.
+                return "shutting down"
+            # Captured before any transition, because stopping clears the
+            # active generation and the tokens it held are exactly the ones
+            # a failure in that transition can name.
+            secrets = _secrets_of(self._active_config, config)
+            try:
+                return await self._reconcile_locked(copy.deepcopy(config))
+            except (SlackRuntimeError, asyncio.CancelledError):
+                raise
+            except Exception as error:
                 raise SlackRuntimeError(
-                    "the Slack runtime no longer owns the registered channel",
-                )
-            if not channel.is_available:
-                await self._stop_locked(drain=False)
-                return await self._enable_locked(desired)
+                    _redact(str(error) or type(error).__name__, secrets),
+                ) from error
 
-            slack = desired.slack
-            if channel.needs_credential_reload(slack.bot_token, slack.app_token):
-                try:
-                    await channel.reload_credentials(desired)
-                except Exception as error:
-                    if not channel.is_available:
-                        await self._stop_locked(drain=False)
-                    raise self._safe_error(error, desired) from error
-                self._active_config = desired
-                return "credentials reloaded"
+    async def _reconcile_locked(self, desired: NerveConfig) -> str | None:
+        """Move to *desired*, assuming the lifecycle lock is held."""
+        if not desired.slack.enabled:
+            if self._channel is None:
+                return None
+            await self._stop_locked(drain=True)
+            return "disabled"
 
-            channel.apply_config(desired)
+        if not desired.slack.bot_token or not desired.slack.app_token:
+            raise RuntimeError("Slack needs both bot_token and app_token")
+
+        if self._channel is None:
+            return await self._enable_locked(desired)
+
+        channel = self._channel
+        if self.router.get_channel(self.name) is not channel:
+            raise SlackRuntimeError(
+                "the Slack runtime no longer owns the registered channel",
+            )
+        if not channel.is_available:
+            await self._stop_locked(drain=False)
+            return await self._enable_locked(desired)
+
+        slack = desired.slack
+        if channel.needs_credential_reload(slack.bot_token, slack.app_token):
+            try:
+                await channel.reload_credentials(desired)
+            except Exception:
+                if not channel.is_available:
+                    await self._stop_locked(drain=False)
+                raise
             self._active_config = desired
-            return None
+            return "credentials reloaded"
+
+        channel.apply_config(desired)
+        self._active_config = desired
+        return None
 
     async def shutdown(self) -> None:
-        """Stop and unpublish whichever Slack instance is current."""
+        """Stop Slack for good; no later reconcile may bring it back."""
         async with self._lock:
+            self._closed = True
             if self._channel is not None:
                 await self._stop_locked(drain=False)
 
@@ -129,7 +163,7 @@ class SlackRuntime:
                 self._active_config = None
             if isinstance(error, asyncio.CancelledError):
                 raise
-            raise self._safe_error(error, desired) from error
+            raise
 
         self._active_config = desired
         self._watchdog_task = asyncio.create_task(
@@ -166,6 +200,12 @@ class SlackRuntime:
         check_count = 0
         while True:
             await asyncio.sleep(WATCHDOG_INTERVAL)
+            # The lifecycle lock covers the decision only. Repair runs
+            # outside it, because rebuild_transport waits on a socket close
+            # and a connect, and holding the lock across that made a config
+            # reload and a shutdown wait on an unreachable Slack. The
+            # channel's own transport lock still serializes repair against
+            # credential rotation.
             async with self._lock:
                 if self._channel is not channel or not channel.is_available:
                     return
@@ -178,35 +218,18 @@ class SlackRuntime:
                         check_count,
                         channel.seconds_since_last_event,
                     )
-                if connected:
-                    continue
-                logger.warning("Slack socket is down — rebuilding")
-                try:
-                    await channel.rebuild_transport()
-                except Exception as error:
-                    logger.error(
-                        "Slack reconnect failed: %s",
-                        self._safe_detail(error, self._active_config),
-                    )
-                else:
-                    logger.info("Slack socket reconnected")
-
-    def _safe_error(
-        self,
-        error: Exception,
-        desired: NerveConfig | None,
-    ) -> SlackRuntimeError:
-        return SlackRuntimeError(
-            self._safe_detail(error, self._active_config, desired),
-        )
-
-    @staticmethod
-    def _safe_detail(error: Exception, *configs: NerveConfig | None) -> str:
-        detail = str(error) or type(error).__name__
-        for config in configs:
-            if config is None:
+            if connected:
                 continue
-            for secret in (config.slack.bot_token, config.slack.app_token):
-                if secret:
-                    detail = detail.replace(secret, "<redacted>")
-        return detail
+            logger.warning("Slack socket is down, rebuilding")
+            try:
+                await channel.rebuild_transport()
+            except Exception as error:
+                logger.error(
+                    "Slack reconnect failed: %s",
+                    _redact(
+                        str(error) or type(error).__name__,
+                        _secrets_of(self._active_config),
+                    ),
+                )
+            else:
+                logger.info("Slack socket reconnected")

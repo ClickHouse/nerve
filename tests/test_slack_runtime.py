@@ -294,7 +294,10 @@ async def test_unrecoverable_rotation_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_watchdog_rebuild_serializes_with_config_reconcile(monkeypatch):
+async def test_a_config_reconcile_does_not_wait_on_a_socket_rebuild(monkeypatch):
+    # A rebuild waits on a socket close and a connect. Holding the lifecycle
+    # lock across that made every config reload and the shutdown wait on an
+    # unreachable Slack, so the lock now covers the decision only.
     from nerve.channels import slack_runtime as runtime_module
 
     monkeypatch.setattr(runtime_module, "WATCHDOG_INTERVAL", 0.001)
@@ -313,13 +316,52 @@ async def test_watchdog_rebuild_serializes_with_config_reconcile(monkeypatch):
     await runtime.reconcile(_config(allow_users=["U1"]))
     await entered.wait()
 
-    reconcile = asyncio.create_task(
-        runtime.reconcile(_config(allow_users=["U2"])),
-    )
-    await asyncio.sleep(0)
-    assert not reconcile.done()
+    assert await runtime.reconcile(_config(allow_users=["U2"])) is None
+    assert runtime.channel.config.slack.allow_users == ["U2"]
 
     release.set()
-    assert await reconcile is None
-    assert runtime.channel.config.slack.allow_users == ["U2"]
     await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_does_not_wait_on_a_socket_rebuild(monkeypatch):
+    from nerve.channels import slack_runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "WATCHDOG_INTERVAL", 0.001)
+    router = _Router()
+    runtime = SlackRuntime(router)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    _FakeChannel.connected = False
+
+    async def slow_rebuild(channel):
+        entered.set()
+        await release.wait()
+        type(channel).connected = True
+
+    _FakeChannel.rebuild_hook = slow_rebuild
+    await runtime.reconcile(_config(allow_users=["U1"]))
+    await entered.wait()
+
+    await asyncio.wait_for(runtime.shutdown(), timeout=1)
+    assert runtime.channel is None
+    assert router.get_channel("slack") is None
+    release.set()
+
+
+@pytest.mark.asyncio
+async def test_a_reconcile_after_shutdown_does_not_restart_slack():
+    # The sync loop is given a bounded wait to finish its cycle, and its git
+    # phase runs in a worker thread past cancellation, so a reload can land
+    # after the channel has already been stopped for exit.
+    router = _Router()
+    runtime = SlackRuntime(router)
+    assert await runtime.reconcile(_config(allow_users=["U1"])) == "enabled"
+
+    await runtime.shutdown()
+    assert runtime.channel is None
+
+    assert await runtime.reconcile(_config(allow_users=["U1"])) == "shutting down"
+    assert runtime.channel is None
+    assert router.get_channel("slack") is None
+    assert runtime._watchdog_task is None
