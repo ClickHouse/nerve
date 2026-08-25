@@ -117,8 +117,16 @@ export function InteractiveQuestionCard() {
                         variant="pill"
                         size="sm"
                         active={active}
-                        role={q.multiSelect ? 'checkbox' : 'radio'}
-                        aria-checked={active}
+                        // A toggle button, which is what this is: a plain
+                        // button that stays lit. It was briefly `role="radio"` /
+                        // `role="checkbox"` with `aria-checked`, which announces
+                        // a keyboard model the group does not implement — there
+                        // is no `radiogroup`, no roving tab stop and no arrow-key
+                        // movement, so every option is separately tabbable and
+                        // the arrow keys do nothing. Claiming less and meaning it
+                        // is better for a screen-reader user than claiming the
+                        // richer pattern and leaving it unbuilt.
+                        aria-pressed={active}
                         onClick={() => choose(q, value)}
                         title={option.description}
                         className="rounded px-2.5 py-1.5"

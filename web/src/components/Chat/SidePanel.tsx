@@ -69,7 +69,13 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
             variant="tab"
             size="sm"
             active={isActive}
-            aria-selected={isActive}
+            // `aria-pressed`, not `aria-selected`: these look like tabs but the
+            // strip is not a `tablist`, the panes are not `tabpanel`s, and there
+            // is no roving tab stop or arrow-key movement. `aria-selected` is
+            // only defined on `option`/`tab`/`row`/`gridcell`, so on a bare
+            // button it is a false promise *and* invalid ARIA. Same reasoning as
+            // the answer pills in InteractiveQuestionCard.
+            aria-pressed={isActive}
             onClick={() => onFocus(tab.id)}
             className="group gap-1.5 px-3 py-2 border-r border-r-surface-raised hover:bg-surface-hover"
           >

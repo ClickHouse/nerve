@@ -1211,8 +1211,9 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuOpen(!menuOpen); }}
           title="Session actions"
           aria-label={`Actions for ${cleanTitle(session)}`}
+          // `aria-expanded` only — the popup is a `div` of ordinary buttons,
+          // not an ARIA menu. Same note as ChatInput's kebab.
           aria-expanded={menuOpen}
-          aria-haspopup="menu"
           className={`p-0.5 cursor-pointer transition-opacity ${
             session.starred
               ? 'text-hue-yellow opacity-100 [&>*:first-child]:block [&>*:last-child]:hidden hover:[&>*:first-child]:hidden hover:[&>*:last-child]:block hover:text-text-muted'

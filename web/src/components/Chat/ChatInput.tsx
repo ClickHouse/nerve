@@ -781,8 +781,13 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               size="md"
               onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
               disabled={disabled || isStreaming || rewriteActive}
+              // `aria-expanded` only. This was `aria-haspopup="menu"`, which
+              // promises the ARIA menu pattern — `menu`/`menuitem` roles, focus
+              // moving into the popup, arrow-key navigation, Escape to close —
+              // where the popup below is a `div` of ordinary buttons. It is a
+              // disclosure, so it now says so rather than announcing a keyboard
+              // model that is not there.
               aria-expanded={menuOpen}
-              aria-haspopup="menu"
               className="rounded-xl"
             >
               <MoreHorizontal size={18} />
