@@ -774,7 +774,12 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             // basis-full makes the textarea claim a whole flex line on its
             // own; order-1 puts that line under the controls rather than
             // above them. Both are undone at `md`, back to a single row.
-            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-base text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
+            // `text-sm`, matching every other input in the app (`FIELD_SIZES.md`
+            // is `text-sm` too). This was `text-[15px]` before the type scale
+            // landed and got rounded *up* to `text-base` — 16px, which reads
+            // oversized next to the transcript and fits noticeably less text on
+            // a line at the composer's 430px.
+            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-sm text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
           {/* Run-later kebab — three-dots menu next to Send. Its submenu
               defers the composed prompt into a new session without spending
