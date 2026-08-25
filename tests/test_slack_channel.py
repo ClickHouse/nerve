@@ -242,6 +242,53 @@ class TestNotificationBlocks:
         assert len(blocks[0]["text"]["text"]) <= 3000
 
 
+class TestNotificationDelivery:
+    @pytest.mark.asyncio
+    async def test_the_channel_owns_target_resolution_and_block_rendering(self):
+        channel = _channel(allow_channels=["engineering-*", "C0456DEF"])
+
+        delivery = await channel.post_notification(
+            "n1", "Deploy?", [("Approve", "approve")],
+        )
+
+        assert delivery == ("C0456DEF", "1.1")
+        posted = channel._web.chat_postMessage.await_args.kwargs
+        assert posted["channel"] == "C0456DEF"
+        assert posted["blocks"][1]["elements"][0]["action_id"] == (
+            "notif:n1:approve"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_dm_is_a_notification_target(self):
+        channel = _channel()
+        channel.config.notifications.slack_channel_id = "D0123ABC"
+
+        delivery = await channel.post_notification("n1", "Hello")
+
+        assert delivery == ("D0123ABC", "1.1")
+
+    @pytest.mark.asyncio
+    async def test_a_quiescing_channel_refuses_external_delivery(self):
+        channel = _channel(allow_channels=["C0456DEF"])
+        channel._state = "quiescing"
+
+        assert await channel.post_notification("n1", "Hello") is None
+        channel._web.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_expiry_replaces_the_card_without_buttons(self):
+        channel = _channel()
+
+        await channel.expire_notification("C0456DEF", "1.1", "Expired")
+
+        channel._web.chat_update.assert_awaited_once_with(
+            channel="C0456DEF",
+            ts="1.1",
+            text="Expired",
+            blocks=[],
+        )
+
+
 # ---------------------------------------------------------------------- #
 #  Channel wiring                                                         #
 # ---------------------------------------------------------------------- #
@@ -2052,8 +2099,7 @@ class TestApprovalAttribution:
     @pytest.mark.asyncio
     async def test_the_button_press_carries_the_slack_member_id(self):
         _, service = await self._press()
-        kwargs = service.handle_answer.await_args.kwargs
-        assert kwargs["answered_by"] == "slack"
+        kwargs = service.answer_delivered_notification.await_args.kwargs
         assert kwargs["actor"] == "U0123ABC"
 
     @pytest.mark.asyncio

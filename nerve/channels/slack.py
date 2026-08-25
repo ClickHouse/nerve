@@ -36,6 +36,7 @@ from nerve.channels.slack_presentation import (
     _MAX_ACTION_ELEMENTS,
     _SESSIONS_BUTTON_LIMIT,
     _md_to_slack,
+    build_notification_blocks,
     build_sessions_blocks,
     slack_emoji_name,
     slack_to_plain,
@@ -1201,6 +1202,67 @@ class SlackChannel(BaseChannel):
             unfurl_media=False,
         )
         return resp.get("ts")
+
+    def _notification_target(self) -> str | None:
+        """Resolve a concrete conversation from the active config generation."""
+        configured = self.config.notifications.slack_channel_id.strip()
+        if configured:
+            if is_slack_id(configured) and configured[0] in "CGD":
+                return configured
+            logger.warning(
+                "notifications.slack_channel_id is not a Slack conversation id",
+            )
+            return None
+
+        for entry in self.config.slack.allow_channels:
+            if is_slack_id(entry) and entry[0] in "CG":
+                return entry
+        logger.warning(
+            "No notifications.slack_channel_id is set and slack.allow_channels "
+            "has no literal conversation id",
+        )
+        return None
+
+    async def post_notification(
+        self,
+        notification_id: str,
+        text: str,
+        options: list[tuple[str, str]] | None = None,
+    ) -> tuple[str, str] | None:
+        """Render and post one notification using the active Slack config."""
+        if not self.is_available:
+            return None
+        target = self._notification_target()
+        if not target:
+            return None
+        blocks = build_notification_blocks(text, notification_id, options)
+        message_id = await self._post(target, text, blocks)
+        if not message_id:
+            return None
+        self._cache_message(message_id, target, text)
+        return target, message_id
+
+    async def expire_notification(
+        self,
+        target: str,
+        message_id: str,
+        text: str,
+    ) -> None:
+        """Replace a notification card with its expired state."""
+        if not self.is_available:
+            return
+        channel_id, _ = parse_target(target)
+        try:
+            await self._web.chat_update(
+                channel=channel_id,
+                ts=message_id,
+                text=_md_to_slack(text),
+                blocks=[],
+            )
+        except Exception as exc:
+            logger.debug(
+                "Slack expiry edit failed for %s: %s", message_id, exc,
+            )
 
     async def send(self, message: OutboundMessage) -> None:
         """Send a complete message, split to fit Slack's render limit.
