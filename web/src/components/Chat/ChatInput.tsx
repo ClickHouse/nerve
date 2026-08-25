@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
 import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
-import { IconButton, Select, TextField } from '../ui';
+import { Button, IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
@@ -776,34 +776,44 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               defers the composed prompt into a new session without spending
               tokens now (opens upward; the composer sits at the bottom). */}
           <div className="relative shrink-0 order-2 md:order-none" ref={menuRef}>
-            <button
+            <IconButton
+              label="More options"
+              size="md"
               onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
               disabled={disabled || isStreaming || rewriteActive}
-              className="w-10 h-10 text-text-muted hover:text-text-secondary rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0 disabled:opacity-30"
-              title="More options"
+              aria-expanded={menuOpen}
+              aria-haspopup="menu"
+              className="rounded-xl"
             >
               <MoreHorizontal size={18} />
-            </button>
+            </IconButton>
             {menuOpen && (
               <div className="absolute right-0 bottom-full mb-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[170px]">
-                <button
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  fullWidth
                   onClick={() => setRunLaterOpen(v => !v)}
-                  className="flex items-center justify-between gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
+                  aria-expanded={runLaterOpen}
+                  className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left"
                 >
                   <span className="flex items-center gap-2.5"><Clock size={14} /> Run later</span>
                   <ChevronRight size={14} className={`transition-transform ${runLaterOpen ? 'rotate-90' : ''}`} />
-                </button>
+                </Button>
                 {runLaterOpen && (
                   <div className="border-t border-border mt-1 pt-1">
                     {RUN_LATER_OPTIONS.map(opt => (
-                      <button
+                      <Button
                         key={opt.delay}
+                        variant="subtle"
+                        size="sm"
+                        fullWidth
                         onClick={() => handleRunLater(opt.delay)}
                         disabled={!canSend}
-                        className="w-full text-left px-3 py-1.5 pl-8 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors disabled:opacity-30"
+                        className="justify-start px-3 py-1.5 pl-8 rounded-none text-left"
                       >
                         {opt.label}
-                      </button>
+                      </Button>
                     ))}
                   </div>
                 )}

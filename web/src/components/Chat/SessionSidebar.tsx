@@ -652,7 +652,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                 onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setRootDropActive(true); }}
                 onDragLeave={() => setRootDropActive(false)}
                 onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleUnparentDrop(); }}
-                className={`mx-1 my-1 px-3 py-2 rounded-md border border-dashed text-[11px] text-center transition-colors ${
+                className={`mx-1 my-1 px-3 py-2 rounded-md border border-dashed text-xs text-center transition-colors ${
                   rootDropActive
                     ? 'border-accent text-accent bg-accent/10'
                     : 'border-border-subtle text-text-faint'
@@ -798,16 +798,18 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 /** '...' row: pulls the next page of a list that the page window cut short. */
 function MoreRow({ onClick }: { onClick: () => void }) {
   return (
-    <button
+    <Button
+      variant="subtle"
+      size="sm"
       onClick={onClick}
       title="Load more"
-      // Width has to leave room for its own margins: plain `w-full` + `mx-1`
+      // Width has to leave room for its own margins: plain `fullWidth` + `mx-1`
       // is 100% + 8px, which overflows the list and puts a horizontal
       // scrollbar under the whole panel (mx-1 = 0.25rem a side).
-      className="w-[calc(100%-0.5rem)] px-3 py-1 mx-1 text-left text-[12px] leading-none tracking-widest text-text-faint hover:text-text-muted hover:bg-surface-raised rounded-md cursor-pointer transition-colors"
+      className="w-[calc(100%-0.5rem)] justify-start px-3 py-1 mx-1 text-left text-xs leading-none tracking-widest"
     >
       ...
-    </button>
+    </Button>
   );
 }
 
@@ -936,8 +938,8 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (isParked(session)) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title={parkedTitle(session)}>
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-violet-500" />
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-violet" />
       </span>
     );
   }
@@ -1171,7 +1173,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
       {hasChildren && !expanded && childCount > 0 && (
         <span
-          className="shrink-0 text-[10px] text-text-faint/60 tabular-nums"
+          className="shrink-0 text-2xs text-text-faint/60 tabular-nums"
           title={`${childCount} nested session${childCount !== 1 ? 's' : ''}`}
         >
           {childCount}

@@ -27,22 +27,11 @@ import '@fontsource/inconsolata/500.css'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
-import { ClickUIProvider } from '@clickhouse/click-ui'
-import App from './App'
-import { useThemeStore } from './stores/themeStore'
-
-/** Feeds Click UI the theme Nerve's own store already resolved. */
-function ThemedApp() {
-  const resolved = useThemeStore((s) => s.resolved)
-  return (
-    // persistTheme={false}: themeStore owns persistence (key `nerve-theme`, and
-    // it can hold 'system', which Click UI cannot represent). Letting Click UI
-    // also write localStorage would give us two sources of truth that disagree.
-    <ClickUIProvider theme={resolved} persistTheme={false}>
-      <App />
-    </ClickUIProvider>
-  )
-}
+// ThemedApp pulls in Click UI. That is safe here and not a violation of the
+// import-order rule above: this import is evaluated after `./index.css`, so
+// the layer statement has already fixed the cascade order by the time Click
+// UI's own `@layer clickui` block is seen.
+import { ThemedApp } from './ThemedApp'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
