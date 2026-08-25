@@ -100,6 +100,46 @@ SOCKET_DRAIN_SECONDS = 2.5
 # someone else's exhaust.
 SOCKET_QUIET_SECONDS = 1.5
 
+# After the envelope has reached the channel, how long to let dispatch run
+# before calling a refusal a refusal. Dispatch starts off the ack path, so
+# this covers the policy's own Slack lookups rather than network delivery,
+# which the arrival wait has already accounted for.
+REFUSAL_SETTLE_SECONDS = 3.0
+
+# The runner's clock minus Slack's, measured from a real Slack timestamp.
+# Event ages are the difference between a stamp Slack wrote and a reading of
+# the local clock, which are two different clocks. A runner that has drifted
+# ahead of Slack by more than EVENT_TIMEOUT would call every fresh event
+# stale and drop it, and on the refusal tests that reads as a guardrail
+# doing its job. WSL2 across a host suspend drifts by far more than that, so
+# the offset is measured rather than assumed.
+_clock_offset: float | None = None
+
+
+def note_slack_timestamp(slack_ts: Any) -> None:
+    """Calibrate the local clock against one Slack-stamped timestamp."""
+    global _clock_offset
+    try:
+        _clock_offset = time.time() - float(slack_ts)
+    except (TypeError, ValueError):
+        return
+
+
+def event_age_seconds(event_time: Any) -> float | None:
+    """Age of an event on Slack's clock, or None if it cannot be told.
+
+    None means the harness has no calibration or no usable stamp. Callers
+    treat that as "not stale": a stale event that slips through only makes a
+    test wait for a marker it will not match, while wrongly dropping a fresh
+    one hides the behavior under test.
+    """
+    if _clock_offset is None:
+        return None
+    try:
+        return (time.time() - _clock_offset) - float(event_time)
+    except (TypeError, ValueError):
+        return None
+
 
 def live_diagnostic(event: str, **fields: Any) -> None:
     """Emit one machine-readable, credential-free live-test diagnostic."""
@@ -125,10 +165,34 @@ class SocketDiagnostics:
     event_types: Counter[str] = field(default_factory=Counter)
     delayed_envelopes: int = 0
     max_event_age_seconds: float = 0.0
+    # Text of every envelope the harness handed to the channel, and of every
+    # one it dropped first. A refusal test needs the difference: an event the
+    # harness dropped as stale never met the policy, so a quiet router says
+    # nothing about the guardrail.
+    forwarded_texts: list[str] = field(default_factory=list)
+    dropped_texts: list[str] = field(default_factory=list)
     _clients: int = 0
 
     def emit(self, event: str, **fields: Any) -> None:
         live_diagnostic(event, socket=self.label, **fields)
+
+    @staticmethod
+    def _text_of(req) -> str:
+        payload = req.payload or {}
+        return ((payload.get("event") or {}).get("text")) or ""
+
+    def note_forwarded(self, req) -> None:
+        self.forwarded_texts.append(self._text_of(req))
+
+    def note_dropped(self, req) -> None:
+        self.dropped_texts.append(self._text_of(req))
+
+    def forwarded(self, marker: str) -> bool:
+        """Whether an envelope carrying *marker* reached the channel."""
+        return any(marker in text for text in self.forwarded_texts)
+
+    def dropped(self, marker: str) -> bool:
+        return any(marker in text for text in self.dropped_texts)
 
     def attach(self, socket) -> None:
         """Attach passive listeners before *socket* connects."""
@@ -253,10 +317,16 @@ def make_client(token: str):
 
 @dataclass
 class Posted:
-    """Messages the test created, so they can be cleaned up afterwards."""
+    """What the test created, so it can be cleaned up afterwards.
+
+    An upload is not a message: chat.delete cannot remove it, so a file
+    needs its own id recorded and files.delete to take it away. Without
+    that, every run leaves another copy in the scratch channel for good.
+    """
 
     bot: list[tuple[str, str]] = field(default_factory=list)   # (channel, ts)
     user: list[tuple[str, str]] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)             # file ids
 
     def note_bot(self, channel: str, ts: str | None) -> None:
         if ts:
@@ -265,6 +335,10 @@ class Posted:
     def note_user(self, channel: str, ts: str | None) -> None:
         if ts:
             self.user.append((channel, ts))
+
+    def note_file(self, file_id: str | None) -> None:
+        if file_id:
+            self.files.append(file_id)
 
 
 class RecordingRouter:
@@ -326,14 +400,38 @@ class RecordingRouter:
         )
 
     async def expect_no_message(
-        self, marker: str, settle: float = 6.0,
+        self, marker: str, channel, timeout: float = EVENT_TIMEOUT,
     ) -> None:
-        """Assert nothing carrying *marker* is routed within *settle* seconds.
+        """Assert the event met the policy and was refused by it.
 
-        The guardrail tests turn on this: a real Slack event reaches the
-        socket and must go no further.
+        Waiting and finding an empty router proves little on its own. An
+        event Slack never delivered, one it handed to another connection,
+        and one the harness dropped as stale all look the same from here. So
+        this first waits for the envelope to reach the channel, and only
+        then asserts nothing came out the far side.
         """
-        await asyncio.sleep(settle)
+        diagnostics = getattr(channel._client, "_live_diagnostics", None)
+        assert diagnostics is not None, (
+            "the live channel has no diagnostics, so a refusal cannot be "
+            "told apart from an event that never arrived"
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if diagnostics.forwarded(marker):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            dropped = diagnostics.dropped(marker)
+            raise AssertionError(
+                f"no envelope carrying {marker!r} reached the channel within "
+                f"{timeout}s, so the guardrail was never exercised "
+                f"({'the harness dropped it as stale' if dropped else 'Slack never delivered it'})",
+            )
+
+        # The envelope is in. Dispatch runs off the ack path, so give it room
+        # before concluding the policy stopped it.
+        await asyncio.sleep(REFUSAL_SETTLE_SECONDS)
         found = self._matching(marker)
         assert not found, (
             f"expected the message to be refused, but the router received "
@@ -489,10 +587,17 @@ async def wait_until_receiving(
                 channel=TEST_CHANNEL, text="nerve socket readiness probe",
             )
             ts = probe["ts"]
+            # A message ts is Slack's own clock reading, which is what the
+            # staleness cutoff has to measure against.
+            note_slack_timestamp(ts)
             probes.append(ts)
             probe_posted[ts] = post_started
             if diagnostics:
-                diagnostics.emit("probe_posted", probe=len(probes))
+                diagnostics.emit(
+                    "probe_posted",
+                    probe=len(probes),
+                    clock_offset_seconds=round(_clock_offset or 0.0, 3),
+                )
             settle = min(deadline, loop.time() + probe_interval)
             while loop.time() < settle:
                 if ts in seen_fresh:
@@ -612,12 +717,10 @@ def ignore_stale_events(channel) -> None:
 
     async def drop_stale(sock, req):
         payload = req.payload or {}
-        event_time = payload.get("event_time")
-        try:
-            too_old = time.time() - float(event_time) > EVENT_TIMEOUT
-        except (TypeError, ValueError):
-            too_old = False
+        age = event_age_seconds(payload.get("event_time"))
+        too_old = age is not None and age > EVENT_TIMEOUT
 
+        diagnostics = getattr(sock, "_live_diagnostics", None)
         if req.retry_attempt or too_old:
             await sock.send_socket_mode_response(
                 SocketModeResponse(envelope_id=req.envelope_id),
@@ -627,7 +730,11 @@ def ignore_stale_events(channel) -> None:
             )
             if observer:
                 await observer(sock, req)
+            if diagnostics:
+                diagnostics.note_dropped(req)
             return
+        if diagnostics:
+            diagnostics.note_forwarded(req)
         for fn in installed:
             await fn(sock, req)
 
