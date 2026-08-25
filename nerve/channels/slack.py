@@ -134,6 +134,10 @@ def parse_target(target: str) -> tuple[str, str | None]:
     return channel_id, (thread_ts if sep and thread_ts else None)
 
 
+class SlackUnavailable(RuntimeError):
+    """The channel cannot carry traffic for the generation now running."""
+
+
 class SlackChannel(BaseChannel):
     """Slack bot channel over Socket Mode.
 
@@ -1155,6 +1159,19 @@ class SlackChannel(BaseChannel):
     #  Outbound                                                            #
     # ------------------------------------------------------------------ #
 
+    def _available_web(self) -> Any:
+        """The Web client of the running generation, or refuse to use one.
+
+        ``_web`` is set while starting and again while a rotation validates
+        the next credential pair, so a caller that checks only the attribute
+        can post through a client whose generation is not the one serving
+        events. Refusing is what lets StreamAdapter keep the placeholder and
+        the notification service record nothing as delivered.
+        """
+        if not self.is_available:
+            raise SlackUnavailable(f"the Slack channel is {self._state}")
+        return self._web
+
     async def _post(
         self, target: str, text: str, blocks: list[dict] | None = None,
     ) -> str | None:
@@ -1167,10 +1184,9 @@ class SlackChannel(BaseChannel):
         notification as delivered. Callers that genuinely want best-effort
         catch it themselves.
         """
-        if self._web is None:
-            return None
+        web = self._available_web()
         channel_id, thread_ts = parse_target(target)
-        resp = await self._web.chat_postMessage(
+        resp = await web.chat_postMessage(
             channel=channel_id,
             text=text,
             blocks=blocks,
@@ -1184,10 +1200,10 @@ class SlackChannel(BaseChannel):
         """Send a complete message, split to fit Slack's render limit.
 
         Propagates a failure so StreamAdapter can fall back to editing the
-        streaming placeholder; swallowing it loses the whole turn.
+        streaming placeholder; swallowing it loses the whole turn. An
+        unavailable channel is one of those failures.
         """
-        if self._web is None:
-            return
+        self._available_web()
         for chunk in split_message(message.text, MAX_MSG_LEN):
             ts = await self._post(message.target, _md_to_slack(chunk))
             if ts:
@@ -1219,7 +1235,7 @@ class SlackChannel(BaseChannel):
 
     async def edit_message(self, target: str, message_id: str, text: str) -> None:
         """Rewrite a previously sent message with the latest streamed text."""
-        if self._web is None:
+        if not self.is_available:
             return
         channel_id, _ = parse_target(target)
         body = _md_to_slack(text)
@@ -1235,7 +1251,7 @@ class SlackChannel(BaseChannel):
 
     async def delete_message(self, target: str, message_id: str) -> None:
         """Remove a message — used to clear the streaming placeholder."""
-        if self._web is None:
+        if not self.is_available:
             return
         channel_id, _ = parse_target(target)
         try:
@@ -1250,7 +1266,7 @@ class SlackChannel(BaseChannel):
         message would be one more post to clean up. A reaction on the message
         being answered says the same thing and disappears with it.
         """
-        if self._web is None:
+        if not self.is_available:
             return
         ts = self._last_inbound_ts.get(target)
         if not ts:
@@ -1266,7 +1282,7 @@ class SlackChannel(BaseChannel):
 
     async def set_reaction(self, target: str, message_id: Any, emoji: str) -> None:
         """Set an emoji reaction on a message."""
-        if self._web is None:
+        if not self.is_available:
             return
         name = slack_emoji_name(emoji)
         if not name:
@@ -1282,7 +1298,7 @@ class SlackChannel(BaseChannel):
 
     async def send_file(self, target: str, file_path: str) -> bool:
         """Upload a file into the conversation as an attachment."""
-        if self._web is None or not target:
+        if not self.is_available or not target:
             return False
         path = Path(file_path)
         if not path.is_file():
@@ -1667,7 +1683,7 @@ class SlackChannel(BaseChannel):
         text: str,
     ) -> None:
         """Reply so only the person who ran the command sees it."""
-        if self._web is None:
+        if not self.is_available:
             return
         try:
             await self._web.chat_postEphemeral(
@@ -1686,7 +1702,7 @@ class SlackChannel(BaseChannel):
         blocks: list[dict],
     ) -> None:
         """Ephemeral reply carrying Block Kit, for the pickers."""
-        if self._web is None:
+        if not self.is_available:
             return
         try:
             await self._web.chat_postEphemeral(
@@ -1705,7 +1721,7 @@ class SlackChannel(BaseChannel):
         channel_key: str,
     ) -> None:
         """Post the session switcher, visible only to the requester."""
-        if self._web is None:
+        if not self.is_available:
             return
         blocks = await self._sessions_blocks_for(channel_key)
         try:
