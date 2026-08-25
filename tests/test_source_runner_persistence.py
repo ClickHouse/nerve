@@ -65,6 +65,26 @@ async def test_runner_reports_persistence_failure_without_advancing_cursor(
 
 
 @pytest.mark.asyncio
+async def test_runner_rolls_back_real_insert_failure_and_preserves_cursor(
+    db, caplog,
+):
+    await db.set_sync_cursor(SOURCE_NAME, "old")
+    records = [_record("good"), _record("bad")]
+    records[1].summary = None
+    runner = SourceRunner(_FixedSource(records), db)
+
+    result = await runner.run()
+
+    assert result.records_ingested == 0
+    assert result.error is not None
+    assert await db.get_sync_cursor(SOURCE_NAME) == "old"
+    rows, _ = await db.list_source_messages(source=SOURCE_NAME, limit=10)
+    assert rows == []
+    assert not db.db.in_transaction
+    assert f"{SOURCE_NAME}/bad" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_runner_retries_the_same_batch_after_persistence_recovers(
     db, monkeypatch,
 ):
