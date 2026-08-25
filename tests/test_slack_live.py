@@ -17,6 +17,7 @@ Run just these with::
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -80,6 +81,113 @@ async def test_the_diagnostics_wrapper_preserves_socket_builder_arguments(
         app_token="xapp-test", web_client=web_client,
     ) is socket
     assert calls == [("xapp-test", web_client)]
+
+
+@pytest.fixture(autouse=True)
+def _keep_the_measured_clock_offset():
+    """Leave the harness calibration as the live fixtures found it.
+
+    It is module state measured from a real Slack timestamp, so a test that
+    fakes it must not hand a fabricated offset to the live tests.
+    """
+    import tests.slack_live as harness
+
+    saved = harness._clock_offset
+    yield
+    harness._clock_offset = saved
+
+
+class TestStalenessCutoff:
+    """The cutoff has to survive a runner clock that disagrees with Slack."""
+
+    async def test_an_uncalibrated_harness_calls_nothing_stale(self, monkeypatch):
+        import tests.slack_live as harness
+
+        monkeypatch.setattr(harness, "_clock_offset", None)
+        assert harness.event_age_seconds(time.time()) is None
+
+    async def test_a_fresh_event_is_fresh_despite_a_skewed_runner(self, monkeypatch):
+        # The runner sits ten minutes ahead of Slack. Comparing the two
+        # clocks directly made every fresh event look stale, and a dropped
+        # event reads as a refusal on the guardrail tests.
+        import tests.slack_live as harness
+
+        slack_now = 1_700_000_000.0
+        monkeypatch.setattr(harness.time, "time", lambda: slack_now + 600.0)
+        harness.note_slack_timestamp(str(slack_now))
+        age = harness.event_age_seconds(slack_now)
+        assert age is not None
+        assert abs(age) < 1.0
+        assert age <= harness.EVENT_TIMEOUT
+
+    async def test_an_event_from_an_earlier_run_is_still_stale(self, monkeypatch):
+        import tests.slack_live as harness
+
+        slack_now = 1_700_000_000.0
+        monkeypatch.setattr(harness.time, "time", lambda: slack_now + 600.0)
+        harness.note_slack_timestamp(str(slack_now))
+        age = harness.event_age_seconds(slack_now - 3600.0)
+        assert age is not None
+        assert age > harness.EVENT_TIMEOUT
+
+    async def test_a_missing_stamp_is_not_stale(self, monkeypatch):
+        import tests.slack_live as harness
+
+        harness.note_slack_timestamp("1700000000.000100")
+        assert harness.event_age_seconds(None) is None
+        assert harness.event_age_seconds("not-a-number") is None
+
+
+class TestRefusalControl:
+    """A quiet router only means a refusal if the event actually arrived."""
+
+    @staticmethod
+    def _req(text: str):
+        return SimpleNamespace(
+            payload={"event": {"text": text}},
+            retry_attempt=0,
+            retry_reason=None,
+            type="events_api",
+            envelope_id="e1",
+        )
+
+    async def test_diagnostics_separate_forwarded_from_dropped(self):
+        from tests.slack_live import SocketDiagnostics
+
+        diagnostics = SocketDiagnostics("control-test")
+        diagnostics.note_forwarded(self._req("hello nvz-aaa"))
+        diagnostics.note_dropped(self._req("stale nvz-bbb"))
+
+        assert diagnostics.forwarded("nvz-aaa")
+        assert not diagnostics.dropped("nvz-aaa")
+        assert diagnostics.dropped("nvz-bbb")
+        # The distinction is the point: a dropped envelope never met the
+        # policy, so it cannot stand in for a refusal.
+        assert not diagnostics.forwarded("nvz-bbb")
+        assert not diagnostics.forwarded("nvz-never-sent")
+
+    async def test_a_refusal_needs_the_envelope_to_have_arrived(self):
+        from tests.slack_live import SocketDiagnostics
+
+        router = RecordingRouter()
+        diagnostics = SocketDiagnostics("control-test")
+        channel = SimpleNamespace(
+            _client=SimpleNamespace(_live_diagnostics=diagnostics),
+        )
+        with pytest.raises(AssertionError, match="never delivered it"):
+            await router.expect_no_message("nvz-absent", channel, timeout=0.3)
+
+    async def test_a_dropped_envelope_does_not_count_as_a_refusal(self):
+        from tests.slack_live import SocketDiagnostics
+
+        router = RecordingRouter()
+        diagnostics = SocketDiagnostics("control-test")
+        diagnostics.note_dropped(self._req("stale nvz-old"))
+        channel = SimpleNamespace(
+            _client=SimpleNamespace(_live_diagnostics=diagnostics),
+        )
+        with pytest.raises(AssertionError, match="dropped it as stale"):
+            await router.expect_no_message("nvz-old", channel, timeout=0.3)
 
 
 async def test_live_direct_messages_use_the_explicit_guardrail():
@@ -153,6 +261,13 @@ async def posted(bot, _ack_outbound_events):
                 await client.chat_delete(channel=channel, ts=ts)
             except Exception:
                 pass  # A test that already deleted it, or a stale ts.
+    if BOT_TOKEN and tracker.files:
+        client = make_client(BOT_TOKEN)
+        for file_id in tracker.files:
+            try:
+                await client.files_delete(file=file_id)
+            except Exception:
+                pass  # Already gone, or removed with its message.
 
 
 # ---------------------------------------------------------------------- #
@@ -302,13 +417,25 @@ class TestSlackAcceptsWhatWeSend:
         cfg.slack = SlackConfig(bot_token=BOT_TOKEN, app_token="unused")
         channel = SlackChannel(cfg, router=None)  # type: ignore[arg-type]
         channel._web = bot
+        channel._state = "running"
         assert await channel.send_file(format_target(TEST_CHANNEL), str(path))
+
+        # chat.delete cannot remove an upload, so the file id has to be
+        # recorded for files.delete or the scratch channel keeps every copy.
+        listed = await bot.files_list(channel=TEST_CHANNEL, count=20)
+        for entry in listed.get("files") or []:
+            if entry.get("name") == "report.txt":
+                posted.note_file(entry.get("id"))
 
     async def test_streaming_edits_then_removes_the_placeholder(
         self, bot, posted,
     ):
         placeholder = await bot.chat_postMessage(channel=TEST_CHANNEL, text="⏳")
         ts = placeholder["ts"]
+        # Tracked before the edits, so a rate limit part way through the loop
+        # does not leave the placeholder behind. Teardown tolerates a ts this
+        # test has already deleted itself.
+        posted.note_bot(TEST_CHANNEL, ts)
         for fragment in ("partial one", "partial one and two"):
             await bot.chat_update(
                 channel=TEST_CHANNEL, ts=ts, text=_md_to_slack(fragment),

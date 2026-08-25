@@ -214,8 +214,10 @@ class TestInboundLoop:
             m for m in replies["messages"] if m.get("user") == channel._bot_user_id
         ]
         assert bot_replies, "the bot did not reply in the thread"
-        assert bot_replies[0]["text"] == "*live reply*"
+        # Recorded before the text is checked, so a mismatch does not leave
+        # the bot's reply behind in the channel.
         posted.note_bot(TEST_CHANNEL, bot_replies[0]["ts"])
+        assert bot_replies[0]["text"] == "*live reply*"
 
     async def test_channel_chatter_without_a_mention_is_left_alone(
         self, live_channel, human, posted,
@@ -229,7 +231,7 @@ class TestInboundLoop:
             channel=TEST_CHANNEL, text=f"just talking to my colleagues {marker}",
         )
         posted.note_user(TEST_CHANNEL, sent["ts"])
-        await router.expect_no_message(marker)
+        await router.expect_no_message(marker, channel)
 
     async def test_a_thread_reply_continues_without_another_mention(
         self, live_channel, human, posted,
@@ -300,7 +302,7 @@ class TestGuardrailsAgainstRealSlack:
             channel=TEST_CHANNEL, text=f"<@{channel._bot_user_id}> let me in {marker}",
         )
         posted.note_user(TEST_CHANNEL, sent["ts"])
-        await router.expect_no_message(marker)
+        await router.expect_no_message(marker, channel)
 
     async def test_an_unconfigured_policy_refuses_a_real_message(
         self, live_channel, human, posted,
@@ -313,7 +315,7 @@ class TestGuardrailsAgainstRealSlack:
             channel=TEST_CHANNEL, text=f"<@{channel._bot_user_id}> anyone home {marker}",
         )
         posted.note_user(TEST_CHANNEL, sent["ts"])
-        await router.expect_no_message(marker)
+        await router.expect_no_message(marker, channel)
 
     async def test_allowing_by_handle_resolves_through_users_info(
         self, live_channel, human, bot, posted,
@@ -366,7 +368,7 @@ class TestGuardrailsAgainstRealSlack:
             channel=TEST_CHANNEL, text=f"<@{channel._bot_user_id}> should not pass {marker}",
         )
         posted.note_user(TEST_CHANNEL, sent["ts"])
-        await router.expect_no_message(marker)
+        await router.expect_no_message(marker, channel)
 
     async def test_a_reaction_from_a_human_is_forwarded(
         self, live_channel, human, bot, posted,
