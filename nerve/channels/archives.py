@@ -39,14 +39,20 @@ MAX_TEXT_SIZE = 512 * 1024
 # Files in one archive. A directory listing longer than this is a machine
 # dump, not something a person meant to show the agent.
 MAX_ENTRIES = 100
-# Uncompressed bytes for one entry, and for the archive as a whole. Both
-# are what the prompt has to carry, so they are far below the ~20 MB
-# compressed cap the channels put on the download.
-MAX_ENTRY_SIZE = 20_000_000
-MAX_TOTAL_SIZE = 50_000_000
-# Uncompressed / compressed for one entry. Ordinary text reaches about 10;
-# an archive built to expand reaches thousands.
+# Uncompressed bytes for one entry, and for the archive as a whole.
+# Images and PDFs reach the model as base64, which is 4/3 of the bytes
+# read, so the total is set from what the prompt can carry after that
+# expansion. The channels cap the download at about 20 MB of compressed
+# bytes, which says nothing about what the archive expands to.
+MAX_ENTRY_SIZE = 5_000_000
+MAX_TOTAL_SIZE = 12_000_000
+# Uncompressed / compressed for one entry, checked only above RATIO_FLOOR.
+# Small files reach a high ratio for ordinary reasons, such as generated
+# code or a log of one repeated line, and refusing those loses real
+# content. MAX_ENTRY_SIZE and MAX_TOTAL_SIZE already bound what any entry
+# adds to the prompt, so the ratio only has to catch the large entries.
 MAX_RATIO = 100
+RATIO_FLOOR = 1_000_000
 
 
 class _EntryTooLarge(Exception):
@@ -116,19 +122,24 @@ def extract_zip(data: bytes, meta_line: str) -> tuple[list[dict[str, str]], str]
                 if size > MAX_ENTRY_SIZE:
                     parts.append(_refusal(info, "too large to read"))
                     continue
-                if info.compress_size and size / info.compress_size > MAX_RATIO:
+                if (
+                    size > RATIO_FLOOR
+                    and info.compress_size
+                    and size / info.compress_size > MAX_RATIO
+                ):
                     logger.warning(
                         "Refusing ZIP entry %s: %d bytes from %d compressed",
                         name, size, info.compress_size,
                     )
                     parts.append(_refusal(info, "compression ratio too high"))
                     continue
-                if total_read + size > MAX_TOTAL_SIZE:
-                    parts.append(_refusal(info, "archive size budget spent"))
-                    continue
-
+                # The type-specific budget is checked first so a refusal names
+                # the limit the entry actually hit.
                 if ext in TEXT_EXTENSIONS and total_text + size > MAX_TEXT_SIZE:
                     parts.append(_refusal(info, "text, too large to inline"))
+                    continue
+                if total_read + size > MAX_TOTAL_SIZE:
+                    parts.append(_refusal(info, "archive size budget spent"))
                     continue
 
                 try:
