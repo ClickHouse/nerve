@@ -1,23 +1,8 @@
-"""Slack bot channel — receive messages, run agent, respond.
+"""Slack bot channel over Socket Mode.
 
-Uses slack_sdk Socket Mode: the bot opens an outbound WebSocket to Slack, so
-no public URL and no inbound firewall hole are needed. That is the same shape
-as the Telegram channel's long-polling transport, and it keeps a self-hosted
-Nerve reachable from behind NAT.
-
-Session management is delegated to ChannelRouter. Access control is not:
-a Slack workspace carries traffic the operator never meant for the agent, so
-every inbound event passes :class:`~nerve.channels.access.AccessPolicy`
-before it becomes an InboundMessage. See :mod:`nerve.channels.access`.
-
-Addressing
-----------
-A Slack conversation is a channel id, optionally narrowed to one thread. The
-two are packed into a single ``target`` string — ``C0456DEF`` or
-``C0456DEF:1699887766.123456`` — because :class:`BaseChannel` gives a channel
-one opaque address per destination. ``channel_key`` is ``slack:<target>``, so
-with ``reply_in_thread`` on, each thread is its own session and two people can
-run separate conversations in one channel.
+Inbound messages are authorized before routing. Targets encode a channel and
+optional thread as ``C0456DEF[:timestamp]``; channel keys add the ``slack:``
+prefix, allowing per-thread sessions when configured.
 """
 
 from __future__ import annotations
@@ -173,14 +158,8 @@ def parse_target(target: str) -> tuple[str, str | None]:
 def _md_to_slack(text: str) -> str:
     """Convert standard Markdown to Slack mrkdwn.
 
-    Slack's flavour collides with Markdown on the two most common markers:
-    ``*text*`` is bold rather than italic, and ``_text_`` is the only italic.
-    Links are ``<url|label>``. Headings and tables do not exist, so headings
-    become bold lines.
-
-    Code spans and fences are lifted out first and restored last, so the
-    substitutions never rewrite code — the failure that makes a snippet of
-    Python containing ``**kwargs`` render as bold.
+    Slack uses ``*`` for bold, ``_`` for italic, and ``<url|label>`` for links.
+    Protect code spans and fences before substitution so they stay literal.
     """
     protected: list[str] = []
 
@@ -415,16 +394,10 @@ def build_notification_blocks(
     notification_id: str,
     options: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Render a notification card, with one button per option.
+    """Render notification text and option buttons as Block Kit.
 
-    ``options`` is a list of ``(label, value)``. The value rides in the
-    button's ``value`` field and the notification id in ``action_id``;
-    Slack allows 2000 chars for each, so neither needs the truncation
-    Telegram's 64-byte ``callback_data`` forces.
-
-    3000 characters is the limit on one section, not on the message, so a
-    long body is spread over several sections at line boundaries. Only a
-    body past the whole-message block limit loses anything, and it says so.
+    Text is split at Slack's section limit and truncated only at the full
+    message's block limit. IDs and values use their dedicated button fields.
     """
     chunks = split_message(_md_to_slack(text), _MAX_SECTION_LEN)
     if len(chunks) > _MAX_SECTION_BLOCKS:
@@ -745,16 +718,11 @@ class SlackChannel(BaseChannel):
         )
 
     async def reload_credentials(self, bot_token: str, app_token: str) -> None:
-        """Rotate both Slack clients without ever leaving two sockets connected.
+        """Replace the Web API and Socket Mode clients as one credential pair.
 
-        The bot token can be validated while the old transport remains live.
-        Socket Mode is different: connecting the candidate before closing the
-        old socket lets the two clients steal each other's events. Close first,
-        and rebuild the previous transport if the candidate cannot connect.
-
-        Active credentials are tracked separately from the live config so a
-        failed reload is retryable and a watchdog rebuild keeps using the last
-        coherent pair rather than mixing old and new tokens.
+        Validate before closing the old socket, but connect only after closing
+        it to avoid competing consumers. Restore the old transport on failure;
+        tracked active credentials keep the reload retryable.
         """
         if not bot_token or not app_token:
             raise RuntimeError("the new Slack credentials are incomplete")
@@ -918,16 +886,10 @@ class SlackChannel(BaseChannel):
                 logger.error("Slack reconnect failed: %s", e, exc_info=True)
 
     async def _rebuild(self) -> None:
-        """Replace the socket, closing the old one first.
+        """Replace a disconnected socket after closing the old client.
 
-        Calling ``connect()`` again on a live client leaves the previous
-        session running: Slack hands each event to exactly one of an app's
-        open connections, so the orphan silently takes a share of the
-        traffic and the agent sees only part of its own conversation. The
-        old client is therefore closed before a new one is built.
-
-        A brief gap is the safe trade. Slack redelivers an unacked envelope,
-        while a split connection loses events with no sign anything is wrong.
+        Connecting twice can leave competing Slack consumers, so a brief gap
+        is safer than overlapping connections.
         """
         async with self._transport_lock:
             # A credential reload may have repaired the socket while the
@@ -1147,18 +1109,11 @@ class SlackChannel(BaseChannel):
             await self._handle_reaction_event(event)
 
     def _is_own_message(self, event: dict[str, Any]) -> bool:
-        """True only for messages this app itself posted.
+        """Whether this app posted the message.
 
-        Treating every ``bot_id`` as our own is too broad: Slack stamps one
-        onto a message a *person* sent through any app or integration —
-        a workflow, a scheduled send, a client posting with a user token —
-        while still naming them in ``user``. Ignoring those drops real people
-        mid-conversation.
-
-        Other bots are turned away by the ``bot_message`` subtype instead,
-        which is what a message with no human behind it carries. A person
-        posting through an app is a person, and the access policy judges
-        them on their own id.
+        A foreign ``bot_id`` may represent a person using an integration, so
+        only this app's bot and user IDs count. The ``bot_message`` subtype
+        filters other bots.
         """
         if self._bot_id and event.get("bot_id") == self._bot_id:
             return True
@@ -1689,15 +1644,9 @@ class SlackChannel(BaseChannel):
     )
 
     def _binds_to_channel_key(self, channel_id: str) -> bool:
-        """Whether ordinary messages here land on the command's own key.
+        """Whether slash commands and messages share the channel-level key.
 
-        A slash command carries no thread reference, so it can only name
-        ``slack:<channel>``. A direct message routes there, and so does a
-        channel message while ``reply_in_thread`` is off. With it on, a
-        channel message opens a thread and routes to
-        ``slack:<channel>:<ts>`` instead, so a session bound at channel level
-        is never read again: the command reports success and the next message
-        starts somewhere else.
+        DMs always do; shared channels do only when threaded replies are off.
         """
         if not channel_id:
             return False
@@ -1721,17 +1670,10 @@ class SlackChannel(BaseChannel):
         )
 
     async def _live_sessions_for_channel(self, channel_id: str) -> list[dict[str, Any]]:
-        """Every live session reachable from this channel, newest first.
+        """Return this channel's live sessions, including threaded ones.
 
-        Slack refuses to run a slash command inside a thread — it answers
-        "/nerve is not supported in threads" — so a command never carries
-        thread context and cannot simply read the session for its own key.
-        With per-thread routing that key usually owns nothing while the
-        threads beside it are busy, which is how ``/nerve stop`` came to
-        report "No active session" with three turns still running.
-
-        The prefix is re-checked per row because ``slack:C123`` is also a
-        prefix of ``slack:C1234``.
+        Slash commands carry no thread context, so search by channel prefix.
+        Re-check parsed IDs because ``slack:C123`` also prefixes ``slack:C1234``.
         """
         rows = await self.router.list_conversation_sessions(f"slack:{channel_id}")
         matching: list[dict[str, Any]] = []

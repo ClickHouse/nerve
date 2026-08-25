@@ -115,19 +115,12 @@ slack:
   # install that does not use Slack never has to say so. Set it to true to be
   # told about a missing token instead of having the channel stay down.
   enabled: false
-  # Socket Mode — the bot dials out, so no public URL is needed. Both tokens
-  # go in config.local.yaml:
+  # Socket Mode needs both tokens in config.local.yaml; no public URL is needed:
   #   bot_token: xoxb-…   (OAuth & Permissions → Bot User OAuth Token)
   #   app_token: xapp-…   (Basic Information → App-Level Tokens, connections:write)
   #
-  # Access guardrails. Patterns match a Slack id (U0123ABC / C0456DEF), a
-  # handle, a display name, an email, or a channel name — case-insensitive,
-  # with globs. Deny always beats allow. Direct messages are a separate,
-  # explicit opt-in.
-  #
-  # With no allow grant at all the bot refuses every message. That is
-  # deliberate: an open bot in a workspace is full agent access for anyone
-  # in it. Allow specific users, direct messages, and/or specific channels.
+  # Access patterns match Slack IDs or names, case-insensitively with globs.
+  # Deny wins, DMs require explicit opt-in, and no allow grant refuses everyone.
   # allow_users: ["U0123ABC", "alex.soffronow"]
   # deny_users: ["*-bot"]
   allow_direct_messages: false
@@ -138,15 +131,11 @@ slack:
   # one session per channel and replies at channel level.
   reply_in_thread: true
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
-  # Which /nerve subcommands the workspace may run. Chatting and notification
-  # buttons are not commands, so they are unaffected.
+  # `/nerve` defaults to new, stop, star, and unstar.
   #   omitted  — new, stop, star, unstar
   #   []       — no slash commands at all
   #   [all]    — everything, including doctor and restart
-  # doctor prints host health into a shared workspace and restart lets anyone
-  # on the allow list bounce the daemon. sessions and reply reach every
-  # session in the instance, Telegram and web ones included, and are not
-  # scoped to the caller. All four are opt-in.
+  # doctor/restart affect the host; sessions/reply reach other channels. Opt in.
   # commands: [sessions, new, stop, reply]
 
 # Quiet hours (local timezone)

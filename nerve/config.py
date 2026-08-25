@@ -1018,14 +1018,8 @@ SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
 def _slack_commands(raw: object) -> list[str] | None:
     """Normalize ``slack.commands``.
 
-    ``None`` (absent) keeps the default set; ``[]`` disables the slash
-    command. ``"all"`` as the sole entry means every known subcommand, so a
-    trusted workspace does not have to list them.
-
-    An unknown name is dropped with a warning rather than refused: the whole
-    point of the key is to *narrow* what a workspace can reach, and a typo
-    that stopped the daemon booting would be a worse failure than a command
-    that stays off.
+    Absence keeps the defaults, an empty list disables commands, and a sole
+    ``all`` or ``*`` enables every command. Unknown names are warned and dropped.
     """
     if raw is None:
         return None
@@ -1055,15 +1049,10 @@ def _slack_commands(raw: object) -> list[str] | None:
 
 @dataclass
 class SlackConfig:
-    """Slack bot channel — Socket Mode transport plus access guardrails.
+    """Slack Socket Mode and access settings.
 
-    Slack has no pairing step, because a workspace already decides who can
-    reach the bot at all. Direct messages are an explicit opt-in; sender and
-    channel patterns match a Slack id (``U0123ABC``), handle, display name,
-    email, or channel name case-insensitively and with globs (``eng-*``).
-    See :mod:`nerve.channels.access` for the semantics — deny wins, a
-    non-empty allow list is a gate, and a policy with no allow grant at all
-    refuses everything.
+    Direct messages require explicit opt-in. Sender and channel patterns match
+    Slack IDs or resolved names using :mod:`nerve.channels.access` semantics.
     """
 
     # Off until the workspace is set up. Slack reaches an installation that
@@ -1084,14 +1073,8 @@ class SlackConfig:
     # its own session. Off means every message in a channel shares one session
     # and replies land at channel level.
     reply_in_thread: bool = True
-    # Which `/nerve` subcommands the workspace may run. None keeps the
-    # default set, which acts only on this channel's own sessions; an empty
-    # list turns the slash command off entirely. `doctor` and `restart` are
-    # operator tools and are opt-in: the first prints host health into a
-    # shared workspace, and the second lets anyone on the allow list bounce
-    # the daemon. `sessions` and `reply` are opt-in too, because they reach
-    # every session in the instance.
-    # See SLACK_ALL_COMMANDS / SLACK_DEFAULT_COMMANDS.
+    # None keeps safe defaults; [] disables commands. Host-wide and
+    # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
     commands: list[str] | None = None
 
     @classmethod
@@ -1107,20 +1090,9 @@ class SlackConfig:
             stream_mode = "partial"
         bot_token = d.get("bot_token", "")
         app_token = d.get("app_token", "")
-        # Slack is opt-in. An installation that predates the channel has no
-        # `slack` section at all, and reading that as "on" makes `nerve
-        # doctor` fail on every one of them over credentials nobody meant to
-        # set. Without an explicit `enabled`, the section counts as switched
-        # on only once both Socket Mode tokens are there.
-        #
-        # Lockdown still wins, for the reason TelegramConfig.from_dict gives:
-        # whether a box answers Slack is a per-machine decision written to the
-        # machine-local config.yaml, and lockdown drops that layer. Shared
-        # settings carrying a token this box can resolve must not start
-        # serving a workspace on their own.
-        #
-        # An unparseable value falls back to off rather than to the declared
-        # default, so `enabled: ${SLACK_ON:-nope}` cannot turn the bot on.
+        # Explicit `enabled` wins. Otherwise both tokens enable Slack, except
+        # under lockdown where the machine-local opt-in is unavailable. Invalid
+        # boolean values fail closed.
         enabled = (
             _as_bool(d["enabled"], False, label="SlackConfig.enabled")
             if "enabled" in d
