@@ -1,23 +1,8 @@
-"""A local stand-in for Slack — the Web API and the Socket Mode gateway.
+"""Local Slack Web API and Socket Mode stand-in for integration tests.
 
-Socket Mode is just a WebSocket the bot dials out to, and the URL for it
-comes from ``apps.connections.open`` on the Web API. Point a
-:class:`slack_sdk.web.async_client.AsyncWebClient` at a different
-``base_url`` and both halves are ours, so a Slack integration test needs no
-workspace, no tokens, and no network.
-
-Usage::
-
-    async with FakeSlack() as slack:
-        channel = SlackChannel(lambda: cfg, router)
-        with slack.patch_client(monkeypatch):
-            await channel.start()
-        await slack.push_event({"type": "message", ...})
-        await slack.wait_for("chat.postMessage")
-
-What it deliberately does not do: rate limits, pagination, scope
-enforcement, or Block Kit validation. It answers the calls this channel
-makes, records them, and lets a test push envelopes at the bot.
+``FakeSlack`` records the calls used by ``SlackChannel`` and can push socket
+envelopes without credentials or network access. It omits rate limits,
+pagination, scope enforcement, and Block Kit validation.
 """
 
 from __future__ import annotations
