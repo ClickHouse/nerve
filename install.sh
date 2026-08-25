@@ -29,8 +29,11 @@ CONFIG_DIR="${NERVE_CONFIG_DIR:-$INSTALL_DIR}"
 # failed at `uv pip install -e .` with an opaque dependency conflict.
 MIN_PYTHON_MINOR=13
 PREFERRED_PYTHON_MINOR=13
-# Vite 7 (see web/package.json) requires Node 20.19+ or 22.12+.
-MIN_NODE_VERSION="20.19.0"
+# 22.12, not Vite 7's 20.19 floor: @clickhouse/click-ui declares
+# `engines.node >=22.12.0`, and web/package.json now declares the same. Provisioning
+# a 20.19 here would install a Node the dependency graph refuses under a strict
+# (`--engine-strict`) install, which is a support claim we cannot back.
+MIN_NODE_VERSION="22.12.0"
 NON_INTERACTIVE="${NERVE_NON_INTERACTIVE:-0}"
 AUTO_YES="${NERVE_YES:-0}"
 [ "$NON_INTERACTIVE" = "1" ] && AUTO_YES=1
@@ -331,7 +334,7 @@ ensure_python() {
     success "Python $installed_py_ver installed via system packages"
 }
 
-# --- Dependency: Node.js 18+ ---
+# --- Dependency: Node.js (floor in MIN_NODE_VERSION) ---
 
 ensure_node() {
     if command_exists node; then
@@ -341,7 +344,7 @@ ensure_node() {
             success "Node.js v$ver"
             return
         fi
-        warn "Node.js v$ver is too old (need v${MIN_NODE_VERSION}+ or v22.12+)"
+        warn "Node.js v$ver is too old (need v${MIN_NODE_VERSION}+)"
     fi
 
     info "Node.js v${MIN_NODE_VERSION}+ is not installed"
@@ -372,7 +375,10 @@ ensure_node() {
             run_as_root pacman -S --noconfirm nodejs npm
             ;;
         zypper)
-            run_as_root zypper install -y nodejs20
+            # nodejs22, not nodejs20: openSUSE's nodejs20 tops out below the
+            # MIN_NODE_VERSION floor, so it would install and then fail the
+            # check below.
+            run_as_root zypper install -y nodejs22
             ;;
         brew)
             brew install node
@@ -389,7 +395,7 @@ ensure_node() {
             ;;
         *)
             error "Don't know how to install Node.js on $DISTRO."
-            error "Install Node.js ${MIN_NODE_MAJOR}+ manually and re-run."
+            error "Install Node.js v${MIN_NODE_VERSION}+ manually and re-run."
             exit 1
             ;;
     esac
@@ -399,7 +405,20 @@ ensure_node() {
         exit 1
     fi
 
-    success "Node.js $(node --version) installed"
+    # A distro's "node" package is whatever that distro froze, and nodesource's
+    # setup_lts.x follows whatever upstream calls LTS today. Neither is promised
+    # to clear our floor, and a too-old Node here surfaces much later as an
+    # opaque syntax error inside a dependency. Check what actually landed.
+    local new_ver
+    new_ver="$(node --version | tr -d 'v')"
+    if ! version_ge "$new_ver" "$MIN_NODE_VERSION"; then
+        error "Installed Node.js v${new_ver}, but v${MIN_NODE_VERSION}+ is required."
+        error "The package for $DISTRO is behind. Install a newer Node.js and re-run:"
+        error "  https://nodejs.org/en/download/"
+        exit 1
+    fi
+
+    success "Node.js v${new_ver} installed"
 }
 
 # --- Clone or Update Repository ---
