@@ -1,5 +1,5 @@
 import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from 'react';
-import { cx } from './styles';
+import { overridable } from './styles';
 
 /**
  * A button whose whole content is an icon.
@@ -58,9 +58,8 @@ const REST: Record<IconButtonVariant, string> = {
   subtle: 'text-text-muted bg-surface-raised hover:bg-surface-hover',
   /**
    * `text-on-accent`, never `text-white`: the accent is ClickHouse yellow in
-   * dark mode, where white is unreadable on it. A call site cannot correct this
-   * itself — Tailwind emits same-property colour utilities alphabetically, so
-   * `.text-white` lands after `.text-on-accent` and wins at equal specificity.
+   * dark mode, where white is unreadable on it. See the same note on `Button`'s
+   * `primary` — it has to be right here, not corrected per call site.
    */
   primary: 'text-on-accent bg-accent hover:bg-accent-hover',
   /** Destructive and already red at rest, for a control that sits alone. */
@@ -120,12 +119,14 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
         type={type ?? 'button'}
         title={label}
         aria-label={label}
-        className={cx(
-          'inline-flex items-center justify-center shrink-0 cursor-pointer',
-          'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
-          SIZES[size],
-          SHAPE[variant],
-          active ? ACTIVE[variant] : REST[variant],
+        className={overridable(
+          [
+            'inline-flex items-center justify-center shrink-0 cursor-pointer',
+            'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+            SIZES[size],
+            SHAPE[variant],
+            active ? ACTIVE[variant] : REST[variant],
+          ],
           className,
         )}
         {...rest}

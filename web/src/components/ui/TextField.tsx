@@ -3,7 +3,13 @@ import {
   type InputHTMLAttributes,
   type TextareaHTMLAttributes,
 } from 'react';
-import { FIELD_BARE, FIELD_BASE, FIELD_SIZES, cx, type FieldSize } from './styles';
+import {
+  FIELD_BARE,
+  FIELD_BASE,
+  FIELD_SIZES,
+  overridable,
+  type FieldSize,
+} from './styles';
 
 /**
  * Text inputs.
@@ -17,20 +23,18 @@ import { FIELD_BARE, FIELD_BASE, FIELD_SIZES, cx, type FieldSize } from './style
  * import it directly — but not a drop-in for these.
  *
  * `fullWidth` is a prop rather than a `w-full` in the base classes because four
- * of the number inputs are deliberately narrow (`w-16`, `w-24`) and a base
- * `w-full` would win the cascade against them.
+ * of the number inputs are deliberately narrow (`w-16`, `w-24`), and defaulting
+ * it on with a named opt-out states that better than four `w-auto` overrides.
  */
 
 /**
  * Drop the field chrome — background, border, radius and padding — keeping only
  * the focus and placeholder behaviour.
  *
- * This exists because the chrome cannot be removed from a call site. Tailwind
- * emits same-property utilities in alphabetical order, so a `bg-bg-sunken` or
- * `p-5` written by the caller loses to the primitive's `bg-surface-raised` and
- * `px-3` at equal specificity. Without an opt-out, every full-bleed editing
- * surface in the app — the markdown editor pane, the chat composer — has to
- * stay a native element and misses the shared focus and disabled handling.
+ * For the full-bleed editing surfaces — the markdown editor pane, the chat
+ * composer — which want the shared focus and disabled handling but own their own
+ * background. One flag rather than the five negating classes it would otherwise
+ * take at each call site.
  */
 export interface FieldChromeProps {
   /** Render as a bare editing surface rather than a bordered form field. */
@@ -61,10 +65,12 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(
       <input
         ref={ref}
         type={type}
-        className={cx(
-          bare ? FIELD_BARE : FIELD_BASE,
-          !bare && FIELD_SIZES[fieldSize],
-          fullWidth && 'w-full',
+        className={overridable(
+          [
+            bare ? FIELD_BARE : FIELD_BASE,
+            !bare && FIELD_SIZES[fieldSize],
+            fullWidth && 'w-full',
+          ],
           className,
         )}
         {...rest}
@@ -103,11 +109,13 @@ export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(
       <textarea
         ref={ref}
         rows={rows}
-        className={cx(
-          bare ? FIELD_BARE : FIELD_BASE,
-          !bare && FIELD_SIZES[fieldSize],
-          fullWidth && 'w-full',
-          resizable ? 'resize-y' : 'resize-none',
+        className={overridable(
+          [
+            bare ? FIELD_BARE : FIELD_BASE,
+            !bare && FIELD_SIZES[fieldSize],
+            fullWidth && 'w-full',
+            resizable ? 'resize-y' : 'resize-none',
+          ],
           className,
         )}
         {...rest}

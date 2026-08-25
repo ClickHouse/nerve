@@ -1,8 +1,13 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
+import { Badge } from './Badge';
 import { Button, type ButtonVariant } from './Button';
+import { Checkbox } from './Checkbox';
 import { IconButton, type IconButtonVariant } from './IconButton';
+import { Select } from './Select';
+import { overridable } from './styles';
+import { TextArea, TextField } from './TextField';
 
 /**
  * These specs exist for one bug, which is invisible to every other check we
@@ -224,5 +229,145 @@ describe('IconButton colour classes are unambiguous', () => {
     render(<IconButton label="Delete task"><svg /></IconButton>);
     const el = screen.getByRole('button', { name: 'Delete task' });
     expect(el).toHaveAttribute('title', 'Delete task');
+  });
+});
+
+/**
+ * The other half of the same bug, from the caller's side.
+ *
+ * Everything above pins the *primitive* to one class per property. That is
+ * necessary and not sufficient: a call site that writes `className="px-0"` is
+ * adding the second one from outside, and until `overridable` landed it lost —
+ * `.px-0` is emitted before `.px-2`, so the primitive's padding won and the
+ * override was inert. Five migrated call sites were relying on exactly that, so
+ * this is a regression matrix rather than a hypothetical.
+ *
+ * The assertions are `not.toHaveClass` on the default rather than `toHaveClass`
+ * on the override: an override that is merely *present* is what the old,
+ * broken behaviour also produced. The default having been removed is the thing
+ * that distinguishes them, and it is what jsdom can see without a stylesheet.
+ */
+describe('a caller className replaces the primitive default', () => {
+  const CASES = [
+    // [what, props, className, displaced default, note]
+    ['horizontal padding', { size: 'xs' } as const, 'px-0', 'px-2', 'PromptRewriteCard'],
+    ['vertical padding', { size: 'sm' } as const, 'py-0.5', 'py-1.5', 'TodoPanel'],
+    ['type size', { size: 'sm' } as const, 'text-sm', 'text-xs', 'TodoPanel'],
+    ['gap', { size: 'md' } as const, 'gap-2.5', 'gap-2', 'ReviewLoopCard'],
+    ['radius', { variant: 'pill' } as const, 'rounded', 'rounded-full', 'InteractiveQuestionCard'],
+    ['radius', { variant: 'primary' } as const, 'rounded', 'rounded-lg', 'InteractiveQuestionCard'],
+    ['radius', { variant: 'subtle' } as const, 'rounded-none', 'rounded', 'ChatInput menu'],
+  ] as const;
+
+  for (const [what, props, override, displaced, note] of CASES) {
+    it(`${what}: ${override} displaces ${displaced} (${note})`, () => {
+      render(
+        <Button {...props} className={override}>
+          label
+        </Button>,
+      );
+      const el = screen.getByRole('button');
+      expect(el).toHaveClass(override);
+      expect(el).not.toHaveClass(displaced);
+    });
+  }
+
+  it('leaves the properties the caller did not name alone', () => {
+    // The failure mode on the other side: a merge that is too eager strips the
+    // variant's colour or the size's type scale along with its padding.
+    render(<Button variant="primary" size="sm" className="px-0">go</Button>);
+    const el = screen.getByRole('button');
+    expect(el).toHaveClass('text-on-accent', 'bg-accent', 'text-xs', 'gap-1.5');
+    expect(el).not.toHaveClass('px-3');
+  });
+
+  it('keeps a longhand beside the shorthand it refines', () => {
+    // `pl-8` indents the run-later submenu items under their parent row; it is
+    // meant to sit *with* `px-3`, not to replace it. Tailwind gives the longhand
+    // the win on its own, and dropping `px-3` here would lose the right padding.
+    render(<Button size="sm" className="pl-8">1 hour</Button>);
+    const el = screen.getByRole('button');
+    expect(el).toHaveClass('px-3', 'pl-8');
+  });
+
+  it('lets a caller cancel a hover it does not want', () => {
+    render(<Button variant="ghost" className="hover:bg-transparent">x</Button>);
+    const el = screen.getByRole('button');
+    expect(el).toHaveClass('hover:bg-transparent');
+    expect(el).not.toHaveClass('hover:bg-surface-raised');
+  });
+
+  it('applies to IconButton, whose radius and box the composer overrides', () => {
+    render(
+      <IconButton label="More options" size="md" className="rounded-xl">
+        <svg />
+      </IconButton>,
+    );
+    const el = screen.getByRole('button');
+    expect(el).toHaveClass('rounded-xl', 'w-10', 'h-10');
+    // `md` already sets `rounded-xl`, so nothing is displaced here — the point
+    // is that the size's box survives a radius override.
+  });
+
+  it('applies to Badge', () => {
+    render(<Badge className="text-xs px-2">42</Badge>);
+    const el = screen.getByText('42');
+    expect(el).toHaveClass('text-xs', 'px-2');
+    expect(el).not.toHaveClass('text-2xs', 'px-1.5');
+  });
+
+  it('applies to TextField and TextArea', () => {
+    render(
+      <>
+        <TextField aria-label="answer" className="px-2.5 rounded" />
+        <TextArea aria-label="prompt" className="text-sm" />
+      </>,
+    );
+    const input = screen.getByRole('textbox', { name: 'answer' });
+    expect(input).toHaveClass('px-2.5', 'rounded', 'py-2');
+    expect(input).not.toHaveClass('px-3', 'rounded-lg');
+
+    const area = screen.getByRole('textbox', { name: 'prompt' });
+    expect(area).toHaveClass('text-sm', 'resize-none');
+  });
+
+  it('applies to Select', () => {
+    render(<Select aria-label="status" fieldSize="sm" className="py-1.5" />);
+    const el = screen.getByRole('combobox');
+    expect(el).toHaveClass('py-1.5', 'px-2', 'cursor-pointer');
+    expect(el).not.toHaveClass('py-1');
+  });
+
+  it('applies to Checkbox, on the input and on its label wrapper', () => {
+    render(<Checkbox label="Archived" className="w-3.5" labelClassName="text-xs" />);
+    const input = screen.getByRole('checkbox', { name: 'Archived' });
+    expect(input).toHaveClass('w-3.5', 'accent-accent');
+
+    const label = input.closest('label');
+    expect(label).toHaveClass('text-xs');
+    expect(label).not.toHaveClass('text-sm');
+  });
+});
+
+/**
+ * `overridable` resolves the caller against the tables and stops there.
+ *
+ * Running the whole string through tailwind-merge in one go would be shorter and
+ * would also silently fix collisions *between* the size and variant tables —
+ * which is the bug the rest of this file exists to catch, and which has shipped
+ * four times on this branch. These two specs pin the boundary, because the
+ * "simplification" that erases it looks like an improvement in review.
+ */
+describe('overridable leaves the primitive tables alone', () => {
+  it('does not resolve a collision inside the defaults', () => {
+    expect(overridable(['px-2 px-3'], 'text-sm')).toBe('px-2 px-3 text-sm');
+  });
+
+  it('does not resolve one while also applying an override', () => {
+    expect(overridable(['px-2 px-3 py-1'], 'py-0')).toBe('px-2 px-3 py-0');
+  });
+
+  it('is a plain join when the caller passes nothing', () => {
+    expect(overridable(['a b', false, 'c'])).toBe('a b c');
   });
 });

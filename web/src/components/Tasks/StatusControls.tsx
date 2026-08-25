@@ -8,9 +8,9 @@ export function StatusBadge({ status, className = '' }: {
 }) {
   const meta = useTaskStatusStore((s) => s.statuses.find((x) => x.name === status));
   return (
-    // The colour is a user-configured hex rather than a design token, so it
-    // stays an inline style — which is also the only thing that reliably beats
-    // the tone classes, since Tailwind orders colour utilities alphabetically.
+    // The colour is a user-configured hex rather than a design token, so there
+    // is no utility class to name it and it has to be an inline style — which
+    // also puts it above `tone`'s classes without depending on their order.
     <Badge size="sm" pill outline style={statusBadgeStyle(meta?.color)} className={className}>
       {meta?.label || status}
     </Badge>

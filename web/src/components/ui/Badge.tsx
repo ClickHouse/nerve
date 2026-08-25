@@ -1,5 +1,5 @@
 import { forwardRef, type HTMLAttributes, type ReactNode } from 'react';
-import { cx } from './styles';
+import { overridable } from './styles';
 
 /**
  * A status chip.
@@ -87,12 +87,14 @@ export const Badge = forwardRef<HTMLSpanElement, BadgeProps>(function Badge(
   return (
     <span
       ref={ref}
-      className={cx(
-        'inline-flex items-center font-medium whitespace-nowrap',
-        SIZES[size],
-        TONES[tone],
-        pill ? 'rounded-full' : 'rounded',
-        outline && 'border border-current/25',
+      className={overridable(
+        [
+          'inline-flex items-center font-medium whitespace-nowrap',
+          SIZES[size],
+          TONES[tone],
+          pill ? 'rounded-full' : 'rounded',
+          outline && 'border border-current/25',
+        ],
         className,
       )}
       {...rest}

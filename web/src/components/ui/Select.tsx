@@ -1,5 +1,5 @@
 import { forwardRef, type ReactNode, type SelectHTMLAttributes } from 'react';
-import { FIELD_BASE, FIELD_SIZES, cx, type FieldSize } from './styles';
+import { FIELD_BASE, FIELD_SIZES, overridable, type FieldSize } from './styles';
 
 /**
  * A dropdown, on the native `<select>`.
@@ -73,11 +73,8 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(function Select
     <select
       ref={ref}
       value={value}
-      className={cx(
-        FIELD_BASE,
-        FIELD_SIZES[fieldSize],
-        'cursor-pointer',
-        fullWidth && 'w-full',
+      className={overridable(
+        [FIELD_BASE, FIELD_SIZES[fieldSize], 'cursor-pointer', fullWidth && 'w-full'],
         className,
       )}
       {...rest}

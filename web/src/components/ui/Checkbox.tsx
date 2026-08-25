@@ -1,5 +1,5 @@
 import { forwardRef, type InputHTMLAttributes, type ReactNode } from 'react';
-import { cx } from './styles';
+import { overridable } from './styles';
 
 /**
  * A checkbox, with its label.
@@ -17,11 +17,10 @@ import { cx } from './styles';
 /**
  * The label's typography, as props rather than as classes on `labelClassName`.
  *
- * `labelClassName` cannot set either of these: Tailwind emits same-property
- * utilities in alphabetical order, so a caller's `text-text-dim` loses to the
- * wrapper's own `text-text-secondary`, and `text-xs` loses to `text-sm`. Naming
- * the two properties the label actually varies keeps the choice type-checked
- * and puts exactly one class per property on the element.
+ * These are the only two properties the app's checkbox labels vary, and naming
+ * them keeps the choice closed and type-checked — `labelTone="dim"` is checked
+ * at compile time where `labelClassName="text-text-dim"` is a string nobody
+ * validates. `labelClassName` still works, and now wins, for anything else.
  */
 export type CheckboxLabelSize = 'xs' | 'sm';
 export type CheckboxLabelTone = 'secondary' | 'muted' | 'dim';
@@ -70,8 +69,8 @@ export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
         // `accent-accent` is the whole styling budget: it tints the native
         // control with the theme's accent and leaves the platform's own check,
         // focus ring and touch target alone.
-        className={cx(
-          'accent-accent cursor-pointer disabled:cursor-not-allowed',
+        className={overridable(
+          ['accent-accent cursor-pointer disabled:cursor-not-allowed'],
           className,
         )}
         {...rest}
@@ -82,11 +81,13 @@ export const Checkbox = forwardRef<HTMLInputElement, CheckboxProps>(
 
     return (
       <label
-        className={cx(
-          'inline-flex items-center gap-2',
-          LABEL_SIZES[labelSize],
-          LABEL_TONES[labelTone],
-          disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
+        className={overridable(
+          [
+            'inline-flex items-center gap-2',
+            LABEL_SIZES[labelSize],
+            LABEL_TONES[labelTone],
+            disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
+          ],
           labelClassName,
         )}
       >

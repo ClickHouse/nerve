@@ -1,5 +1,5 @@
 import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from 'react';
-import { cx } from './styles';
+import { overridable } from './styles';
 
 /**
  * The app's button.
@@ -46,10 +46,9 @@ const VARIANTS: Record<ButtonVariant, string> = {
    * The page's one committing action.
    *
    * `text-on-accent`, never `text-white`: the accent is ClickHouse yellow in
-   * dark mode, where white is unreadable on it. A call site cannot correct this
-   * itself — Tailwind emits same-property colour utilities alphabetically, so
-   * `.text-white` lands after `.text-on-accent` and wins at equal specificity.
-   * It has to be right here.
+   * dark mode, where white is unreadable on it. `overridable` means a call site
+   * *could* now correct a wrong default, but 1.1:1 text is not something a
+   * reviewer will spot at the call site, so it has to be right here.
    */
   primary: 'text-on-accent bg-accent hover:bg-accent-hover rounded-lg font-medium',
   /** Sits beside a primary without competing with it. */
@@ -157,7 +156,10 @@ const VARIANTS: Record<ButtonVariant, string> = {
  * The same trap caught `tab`, whose `border-transparent` outsorted, and so
  * beat, `ACTIVE.tab`'s `border-accent`.
  *
- * `Button.test.tsx` pins the invariant so it cannot come back unnoticed.
+ * `overridable` does not rescue this. It resolves the *caller's* `className`
+ * against these tables and deliberately leaves collisions between the tables
+ * themselves in place, so that they still reach the DOM where the test can see
+ * them. `Button.test.tsx` pins the invariant so it cannot come back unnoticed.
  */
 const ACTIVE: Partial<Record<ButtonVariant, string>> = {
   pill: 'bg-accent/15 text-accent border-accent/30',
@@ -207,9 +209,11 @@ const SIZES: Record<ButtonSize, string> = {
 
 /**
  * `link` takes the type scale but not the padding — a link sitting in a
- * sentence cannot carry a button's box. The classes have to be dropped rather
- * than overridden: `p-0` from a call site would lose to `px-3` here, on the
- * same ordering rule described above.
+ * sentence cannot carry a button's box.
+ *
+ * A separate table rather than a `px-0` at each of the ~30 call sites: the
+ * padding is wrong for *every* link, not for some of them, and `overridable`
+ * exists for the exceptions rather than for the rule.
  */
 const LINK_SIZES: Record<ButtonSize, string> = {
   xs: 'text-xs gap-1',
@@ -248,13 +252,15 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       // Buttons inside a form default to `submit` and will submit it. Almost
       // none of these are submit buttons, and the ones that are say so.
       type={type ?? 'button'}
-      className={cx(
-        'inline-flex items-center justify-center shrink-0 cursor-pointer',
-        'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
-        variant === 'link' ? LINK_SIZES[size] : SIZES[size],
-        VARIANTS[variant],
-        state,
-        fullWidth && 'w-full',
+      className={overridable(
+        [
+          'inline-flex items-center justify-center shrink-0 cursor-pointer',
+          'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+          variant === 'link' ? LINK_SIZES[size] : SIZES[size],
+          VARIANTS[variant],
+          state,
+          fullWidth && 'w-full',
+        ],
         className,
       )}
       {...rest}
