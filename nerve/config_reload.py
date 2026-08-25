@@ -11,6 +11,7 @@ the operator table in ``docs/config.md``.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 from pathlib import Path
 
@@ -266,6 +267,8 @@ async def _reconcile_slack(new_config, engine) -> str | None:
 
     try:
         channel = engine.router.get_channel("slack")
+        if inspect.isawaitable(channel):
+            channel = await channel
     except Exception as e:  # noqa: BLE001 — keep the unified reload best-effort
         logger.warning(
             "Could not locate the running Slack channel (%s)", type(e).__name__,
