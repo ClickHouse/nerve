@@ -710,8 +710,10 @@ async def lifespan(app: FastAPI):
     if telegram_channel:
         await telegram_channel.stop()
     # Slack may have been enabled or disabled since startup.
+    from nerve.channels.slack import SlackChannel
+
     slack_channel = _engine.router.get_channel("slack")
-    if slack_channel:
+    if isinstance(slack_channel, SlackChannel):
         await slack_channel.stop()
     if ws_sync_task:
         # Exit through the loop's own stop path rather than cancelling it where
