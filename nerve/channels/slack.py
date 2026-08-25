@@ -68,6 +68,7 @@ _DEDUPE_MAX = 500
 _MESSAGE_CACHE_MAX = 200
 _NAME_CACHE_MAX = 500
 _INBOUND_TS_MAX = 500
+_EDIT_CLOCK_MAX = 500
 _NAME_CACHE_TTL = 600.0
 # Concurrent dispatch tasks. The router serialises per session, so this only
 # bounds envelopes not yet routed — including ones headed for a refusal.
@@ -179,6 +180,11 @@ class SlackChannel(BaseChannel):
         # Every shared-channel thread is a distinct target, so this and the
         # name cache are bounded rather than left to grow per thread.
         self._last_inbound_ts: collections.OrderedDict[str, str] = (
+            collections.OrderedDict()
+        )
+        # conversation -> monotonic time of the last droppable edit. Slack
+        # rate limits chat.update per conversation, not per thread.
+        self._last_channel_edit: collections.OrderedDict[str, float] = (
             collections.OrderedDict()
         )
         # Resolved names: id -> (Identity, monotonic deadline).
@@ -1233,11 +1239,34 @@ class SlackChannel(BaseChannel):
             )
             return None
 
-    async def edit_message(self, target: str, message_id: str, text: str) -> None:
+    def _claim_channel_edit(self, channel_id: str) -> bool:
+        """Whether a droppable edit may go out for this conversation now.
+
+        Slack rate limits ``chat.update`` per conversation rather than per
+        thread, so every thread streaming in one channel shares one budget.
+        The SDK answers a 429 by sleeping inside the request, and the
+        streaming listener is awaited from the agent's token loop, so those
+        sleeps stall the run itself. Dropping the edit costs less: the next
+        token brings another.
+        """
+        now = time.monotonic()
+        if now - self._last_channel_edit.get(channel_id, 0.0) < EDIT_INTERVAL:
+            return False
+        self._remember(
+            self._last_channel_edit, channel_id, now, _EDIT_CLOCK_MAX,
+        )
+        return True
+
+    async def edit_message(
+        self, target: str, message_id: str, text: str,
+        *, throttle: bool = False,
+    ) -> None:
         """Rewrite a previously sent message with the latest streamed text."""
         if not self.is_available:
             return
         channel_id, _ = parse_target(target)
+        if throttle and not self._claim_channel_edit(channel_id):
+            return
         body = _md_to_slack(text)
         if len(body) > MAX_MSG_LEN:
             body = body[:MAX_MSG_LEN] + "…"
@@ -1246,7 +1275,7 @@ class SlackChannel(BaseChannel):
                 channel=channel_id, ts=message_id, text=body,
             )
         except Exception as e:
-            logger.debug("Slack chat.update failed for %s: %s", target, e)
+            logger.warning("Slack chat.update failed for %s: %s", target, e)
         self._cache_message(message_id, target, text)
 
     async def delete_message(self, target: str, message_id: str) -> None:

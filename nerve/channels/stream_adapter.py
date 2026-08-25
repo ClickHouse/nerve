@@ -132,13 +132,17 @@ class StreamAdapter:
             return
 
         async with self._edit_lock:
+            # Stamped before the attempt. A failed edit still has to hold the
+            # interval, or every later token retries at once and each retry
+            # can sleep on a rate limit inside the agent's token loop.
+            self._last_edit = asyncio.get_event_loop().time()
             try:
                 indicator = STREAMING_INDICATOR
                 display = self._truncate(display, reserve=len(indicator))
                 await self.channel.edit_message(
                     self.target, self._placeholder_id, display + indicator,
+                    throttle=True,
                 )
-                self._last_edit = now
             except Exception:
                 pass  # Edit failures are non-fatal
 

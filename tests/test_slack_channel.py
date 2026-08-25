@@ -702,6 +702,32 @@ class TestOutbound:
         assert sent == body
 
     @pytest.mark.asyncio
+    async def test_threads_in_one_channel_share_the_edit_budget(self):
+        # Slack meters chat.update per conversation, so two threads streaming
+        # at the per-adapter interval together exceed it.
+        channel = _channel()
+        await channel.edit_message("C1:1.0", "1.1", "a", throttle=True)
+        await channel.edit_message("C1:2.0", "2.1", "b", throttle=True)
+        assert channel._web.chat_update.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_separate_channels_do_not_share_the_edit_budget(self):
+        channel = _channel()
+        await channel.edit_message("C1:1.0", "1.1", "a", throttle=True)
+        await channel.edit_message("C2:1.0", "1.1", "b", throttle=True)
+        assert channel._web.chat_update.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_final_edit_is_never_dropped(self):
+        # The recovery path in StreamAdapter is the only thing standing
+        # between a failed send and a lost reply, so it must not be shed.
+        channel = _channel()
+        await channel.edit_message("C1:1.0", "1.1", "streamed", throttle=True)
+        await channel.edit_message("C1:1.0", "1.1", "the answer")
+        assert channel._web.chat_update.await_count == 2
+        assert channel._web.chat_update.await_args.kwargs["text"] == "the answer"
+
+    @pytest.mark.asyncio
     async def test_an_edit_stays_inside_the_length_limit(self):
         channel = _channel()
         await channel.edit_message("C1", "1.1", "y" * (MAX_MSG_LEN + 500))
