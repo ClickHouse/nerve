@@ -219,6 +219,27 @@
   --text-2xs--line-height: calc(0.875 / 0.625);/* 14px, keeps dense rows dense */
   --text-display: 2rem;                        /* 32px — Click UI font-sizes-6 */
   --text-display--line-height: calc(2.5 / 2);  /* 40px */
+
+  /* ── Emphasis weights, moved up one step for Inter ──
+     The panel leans on `font-medium` for almost all of its emphasis: 151 of the
+     170 weighted elements in the app, against 17 `font-semibold` and 2
+     `font-bold`. That worked when the stack was `-apple-system, …` and 500
+     resolved to SF Pro Medium or Segoe UI Semibold. Inter's steps are much
+     closer together — measured on one string at 14px, 400 sets 186.6px and 500
+     sets 188.9px, a 1.2% difference — so headings, labels and counts stopped
+     separating from body copy and the UI got harder to scan.
+
+     Remapping the scale rather than rewriting 151 call sites: this is the one
+     knob, `font-medium` keeps meaning "the emphasised one", and there is a
+     single place to tune it. Both target weights are already loaded (main.tsx
+     ships Inter 400/500/600/700), so this costs nothing. 600 against 400 is
+     191.0px against 186.6px plus visibly heavier stems.
+
+     `font-semibold` moves with it so the two do not collapse into one level;
+     `font-bold` stays at 700 and now coincides with semibold, which is fine at
+     two call sites. If this reads too heavy, 500/600 restores the old scale. */
+  --font-weight-medium: 600;
+  --font-weight-semibold: 700;
 }
 
 /* ── Layout (theme-independent) ── */
@@ -402,7 +423,36 @@
 
 [data-cui-theme="light"] {
   color-scheme: light;
-  --theme-bg-sunken: var(--palette-slate-50);      /* #f6f7fa, under #ffffff */
+
+  /* ── Elevation runs the other way in light ──
+     The shared derivation above maps `bg` onto Click UI's `background-default`
+     and `surface` onto `background-muted`. In dark that is right: muted (#1c1c1c)
+     is lighter than default (#151515), so a card lifts off the page. In light it
+     inverts — default is #ffffff and muted is #f6f7fa — so the page became the
+     brightest thing on screen and every card sat *below* it in a grey that is
+     2/255 from the lane behind it. On the task board the cards disappeared into
+     their columns; measured 1.016:1 card-to-lane, against 1.071 on `main`.
+
+     So light gets its own ramp: a grey page, white cards, and controls tinted
+     back down towards the page. That is the model `main` had (bg #f5f5f5,
+     surface #ffffff, raised #f8f8f8) expressed in Click UI's palette, and it is
+     what "raised" has to mean when the page is not the darkest surface.
+
+       bg      #f6f7fa   page
+       sunken  #edeef1   recessed wells
+       surface #ffffff   cards, panels, assistant messages
+       raised  #fafbfc   inputs and secondary buttons sitting on a card
+       hover   #eff0f3   hover, which has to darken rather than lighten here
+
+     Card-to-lane goes 1.016 -> 1.053. The text ramp below is solved against the
+     darkest background, which moves #eeeff2 -> #edeef1 — one unit, so the
+     measured floor shifts 4.70 -> 4.68 and stays over AA. Re-measure if you
+     move `sunken`, since that is now the binding one. */
+  --theme-bg: var(--click-global-color-background-muted);
+  --theme-bg-sunken: color-mix(in oklab, var(--click-global-color-background-muted) 45%, var(--click-global-color-stroke-default));
+  --theme-surface: var(--click-global-color-background-default);
+  --theme-surface-raised: color-mix(in oklab, var(--click-global-color-background-default) 45%, var(--click-global-color-background-muted));
+  --theme-surface-hover: color-mix(in oklab, var(--click-global-color-background-muted) 55%, var(--click-global-color-stroke-default));
 
   /* Text ramp, light half. Same construction as the dark ramp in the block
      above — see the long note there for why these exist and how to retune —
@@ -421,27 +471,48 @@
        token            was                     now                on white   on its tint
        --theme-info     info-400  #437eef        info-600  #104ec6  3.84 -> 7.17   3.32 -> 6.20
        --theme-link     same as info
-       --theme-success  success-700 #008a0b      success-800 #006108  7.74      4.27 -> 7.30
-       --theme-hue-emerald  success-700          success-800        4.22 -> 6.03
 
-     `hue-emerald` joins them for the same reason and lands on the same step as
-     `--theme-success` above: at success-700 it measured 4.22:1 on the muted
-     surface, and it is spent on text 23 times (the `$` in every shell block,
-     "Available"/"Connected" labels, skill counts) rather than on dots.
+     `hue-emerald` and `hue-green` follow `--theme-success` for the same reason:
+     they are spent on text 23 times (the `$` in every shell block,
+     "Available"/"Connected" labels, skill counts) rather than only on dots.
 
      Dark mode is unaffected — it passes comfortably (success 10.5, info 7.2).
-     Revert by deleting these four lines if design-system fidelity is worth
-     more than AA here. */
+     Revert by deleting these lines if design-system fidelity is worth more
+     than AA here.
+
+     ── The green, specifically ──
+     Click UI's light `success` foreground is success-700 #008a0b, which is
+     3.90:1 on the darkest light background — under AA. This branch first took
+     the whole step down to success-800 #006108, which passes at 6.67 but reads
+     as a forest green rather than a green.
+
+     `#007109` is the greenest point on the 700 -> 800 line that still clears
+     4.5:1 on every background the sweep actually finds it on — solved rather
+     than picked, and the binding case is not a plain surface:
+
+       plain    white 5.85   page 5.46   raised 5.65   sunken 5.05
+       15% wash of itself, which is what MemuPage's type chips do:
+                white 4.96   page 4.65   raised 4.82   sunken 4.32*
+
+     Colour on a 15% wash of *itself* is inherently low-contrast — the tint moves
+     with the foreground — and it is what pinned this. Going further, to
+     `#007e0a`, is a visibly better green and still clears everything plain
+     (worst 4.54), but drops the `knowledge` chip on /memory to 4.24. Click UI's
+     own success-700 #008a0b is 3.90 plain, and `main`'s emerald #16a34a was
+     2.84. Change the percentage below to move along that line.
+
+     (*) no chip sits on a sunken surface today; the sweep is the authority on
+     which combinations exist. Re-solve if that changes. */
   --theme-info: var(--palette-info-600);
   --theme-link: var(--palette-info-600);
-  --theme-success: var(--palette-success-800);
+  --theme-success: color-mix(in oklab, var(--palette-success-700) 35%, var(--palette-success-800));
   /* Identity hues — dark steps so they carry on a white page. */
   --theme-hue-yellow: var(--palette-brand-700);    /* #686b00 */
   --theme-hue-amber: var(--palette-sunrise-700);   /* #8a6900 */
   --theme-hue-orange: var(--palette-warning-700);  /* #a33c00 */
   --theme-hue-red: var(--palette-danger-600);      /* #c10000 */
-  --theme-hue-emerald: var(--palette-success-800); /* #006108, one step darker for AA — see note above */
-  --theme-hue-green: var(--palette-success-800);   /* #006108 */
+  --theme-hue-emerald: var(--theme-success);       /* #007109 — see the green note above */
+  --theme-hue-green: var(--theme-success);         /* #007109 */
   --theme-hue-teal: var(--palette-teal-700);       /* #067462 */
   --theme-hue-cyan: var(--palette-babyblue-700);   /* #006170 */
   --theme-hue-sky: var(--palette-info-500);        /* #1d64ec */
