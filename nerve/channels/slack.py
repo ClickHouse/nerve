@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
-from nerve.channels.access import AccessPolicy, Identity, needs_name_resolution
+from nerve.channels.access import Identity, needs_name_resolution
 from nerve.channels.archives import (
     IMAGE_EXT_TO_MIME,
     MAX_TEXT_SIZE,
@@ -30,6 +30,7 @@ from nerve.channels.base import (
     InboundMessage,
     OutboundMessage,
 )
+from nerve.channels.slack_access import SlackAccessPolicy
 from nerve.config import (
     SLACK_ALL_COMMANDS,
     SLACK_DEFAULT_COMMANDS,
@@ -503,16 +504,9 @@ class SlackChannel(BaseChannel):
         return self._config()
 
     @property
-    def policy(self) -> AccessPolicy:
+    def policy(self) -> SlackAccessPolicy:
         """The access policy, rebuilt per read so reloads apply at once."""
-        cfg = self.config.slack
-        return AccessPolicy.from_lists(
-            allow_users=cfg.allow_users,
-            deny_users=cfg.deny_users,
-            allow_direct_messages=cfg.allow_direct_messages,
-            allow_channels=cfg.allow_channels,
-            deny_channels=cfg.deny_channels,
-        )
+        return SlackAccessPolicy.from_config(self.config.slack)
 
     @property
     def enabled_commands(self) -> frozenset[str]:
@@ -1067,27 +1061,22 @@ class SlackChannel(BaseChannel):
     ) -> bool:
         """Run the access policy for one event, logging any refusal."""
         policy = self.policy
-        if not policy.configured:
-            logger.warning(
-                "Slack: refusing %s in %s — no allow list configured",
-                user_id, channel_id,
-            )
-            return False
-
         direct_message = channel_type == "im" or channel_id.startswith("D")
-        if direct_message and not policy.allow_direct_messages:
-            logger.info("Slack refused a message: direct messages are not allowed")
-            return False
+        early = policy.preflight(direct_message=direct_message)
+        if early is not None:
+            log = logger.warning if not policy.configured else logger.info
+            log("Slack refused a message: %s", early.reason)
+            return early.allowed
 
         user = await self._identify_user(
             user_id,
             needs_name_resolution(policy.users, is_id=is_slack_id),
-            need_email=policy.users.deny_needs(lambda p: "@" in p),
+            need_email=policy.users.any_deny_pattern(lambda p: "@" in p),
         )
         conversation = await self._identify_conversation(
             channel_id,
             channel_type,
-            needs_name_resolution(policy.conversations, is_id=is_slack_id),
+            needs_name_resolution(policy.channels, is_id=is_slack_id),
         )
         verdict = policy.check(
             user, conversation, direct_message=direct_message,
