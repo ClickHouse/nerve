@@ -1201,6 +1201,9 @@ slack:
   session.
 - Each shared-channel thread has its own session and all replies stay there;
   shared channels never have a channel-wide session.
+- Messages another app wrote itself are ignored, so two agents in one channel
+  cannot answer each other without end. A person posting through an
+  integration still reaches the agent, because they keep their own user ID.
 - `/nerve` responses are ephemeral.
 
 ### Commands

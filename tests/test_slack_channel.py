@@ -1158,6 +1158,9 @@ class TestOwnMessageDetection:
     @pytest.mark.asyncio
     async def test_a_human_posting_through_an_app_reaches_the_router(self):
         channel = self._ch()
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"is_bot": False, "profile": {}}},
+        )
         await channel._handle_message_event(
             self._event(bot_id="B0OTHERAPP", text="<@U0BOT> via an integration"),
         )
@@ -1165,14 +1168,85 @@ class TestOwnMessageDetection:
         assert msg.text == "via an integration"
 
     @pytest.mark.asyncio
-    async def test_another_bot_is_still_ignored(self):
-        # Loop prevention now rests on the subtype, which is what a message
-        # with no human behind it carries.
+    async def test_a_legacy_webhook_post_is_ignored(self):
         channel = self._ch()
         await channel._handle_message_event(
             self._event(subtype="bot_message", bot_id="B0OTHERAPP", user=None),
         )
         channel.router.handle_message.assert_not_called()
+
+    def _open_channel(self):
+        """A channel-only grant, which admits any member of C1.
+
+        This is the config that makes the loop reachable, and it is the one
+        docs/config.md offers for a shared channel, so the loop guard has to
+        hold without help from the user gate.
+        """
+        channel = _channel(allow_channels=["C1"])
+        channel._bot_user_id = "U0BOT"
+        channel._bot_id = "B0SELF"
+        channel.router.get_last_session = AsyncMock(return_value="s1")
+        return channel
+
+    @pytest.mark.asyncio
+    async def test_an_authorized_human_reply_reaches_the_router(self):
+        # The control for the two tests below: this config really does admit
+        # a thread reply with no mention, which is what makes a loop possible.
+        channel = self._open_channel()
+        await channel._handle_message_event(
+            self._event(thread_ts="1.0", text="on it"),
+        )
+        channel.router.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_another_agents_own_reply_is_ignored(self):
+        # Two of these in one channel would otherwise answer each other for
+        # ever: a reply continues an owned thread with no mention needed.
+        channel = self._open_channel()
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"is_bot": True, "profile": {}}},
+        )
+        await channel._handle_message_event(
+            self._event(
+                bot_id="B0OTHERAGENT",
+                user="U0OTHERAGENT",
+                thread_ts="1.0",
+                text="on it",
+            ),
+        )
+        channel.router.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_sender_beside_a_bot_id_is_ignored(self):
+        channel = self._open_channel()
+        channel._web.users_info = AsyncMock(side_effect=RuntimeError("no scope"))
+        await channel._handle_message_event(
+            self._event(
+                bot_id="B0OTHERAGENT",
+                user="U0OTHERAGENT",
+                thread_ts="1.0",
+                text="on it",
+            ),
+        )
+        channel.router.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_message_with_no_bot_id_costs_no_lookup(self):
+        channel = self._ch()
+        channel._web.users_info = AsyncMock()
+        assert not await channel._is_another_app_talking(self._event())
+        channel._web.users_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_bot_verdict_is_cached(self):
+        channel = self._ch()
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"is_bot": True, "profile": {}}},
+        )
+        event = self._event(bot_id="B0OTHERAGENT", user="U0OTHERAGENT")
+        assert await channel._is_another_app_talking(event)
+        assert await channel._is_another_app_talking(event)
+        assert channel._web.users_info.await_count == 1
 
 
 class TestAmpersandEscaping:
