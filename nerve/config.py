@@ -2039,7 +2039,9 @@ class AuthConfig:
 @dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
-    channels: list[str] = field(default_factory=lambda: ["web", "telegram"])
+    channels: list[str] = field(
+        default_factory=lambda: ["web", "telegram", "slack"],
+    )
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     slack_channel_id: str = ""                # Target conversation; falls back to a literal id in slack.allow_channels
     default_expiry_hours: int = 48            # Auto-expire unanswered questions
@@ -2058,7 +2060,7 @@ class NotificationsConfig:
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
-            channels=d.get("channels", ["web", "telegram"]),
+            channels=d.get("channels", ["web", "telegram", "slack"]),
             telegram_chat_id=d.get("telegram_chat_id"),
             slack_channel_id=str(d.get("slack_channel_id") or ""),
             default_expiry_hours=d.get("default_expiry_hours", 48),

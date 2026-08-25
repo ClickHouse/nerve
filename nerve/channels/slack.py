@@ -1026,6 +1026,16 @@ class SlackChannel(BaseChannel):
             return
         target, original_text = cached
 
+        _, thread_ts = parse_target(target)
+        if not channel_id.startswith("D") and thread_ts is None:
+            # A shared channel has no conversation-wide session: each thread
+            # owns one. A message cached at channel level, such as a
+            # notification card, has no thread for a reaction to join, and
+            # opening one would write a slack:<channel> mapping that the
+            # session pickers deliberately do not list. A DM is one
+            # conversation, so it has no thread to require.
+            return
+
         channel_type = "im" if channel_id.startswith("D") else "channel"
         if not await self._authorize(user_id, channel_id, channel_type):
             return
@@ -1984,15 +1994,17 @@ class SlackChannel(BaseChannel):
             return
 
         actor = (payload.get("user") or {}).get("id") or ""
-        thread_ts = (payload.get("message") or {}).get("thread_ts") or None
+        # A card is posted at conversation level, so the target recorded for
+        # it is the bare conversation. Slack fills in thread_ts on any
+        # message that has replies, so carrying it across from the press
+        # would stop matching that record the moment somebody replied under
+        # the card, and every later press would read as already answered.
+        target = format_target((payload.get("channel") or {}).get("id") or "")
         result = await self._notification_service.answer_delivered_notification(
             notification_id,
             answer,
             channel="slack",
-            target=format_target(
-                (payload.get("channel") or {}).get("id") or "",
-                thread_ts,
-            ),
+            target=target,
             actor=actor,
         )
         if not result:

@@ -172,6 +172,19 @@ class TestSchema:
             cols = {row[1] async for row in cur}
         assert {"notification_id", "channel", "target", "message_id"} <= cols
 
+    async def test_slack_is_a_default_notification_channel(self):
+        # Cards reach nobody unless the transport is in this list, and the
+        # list replaces the default rather than extending it.
+        from nerve.config import NotificationsConfig
+
+        assert NotificationsConfig().channels == ["web", "telegram", "slack"]
+        assert NotificationsConfig.from_dict({}).channels == [
+            "web", "telegram", "slack",
+        ]
+        assert NotificationsConfig.from_dict(
+            {"channels": ["web"]},
+        ).channels == ["web"]
+
 
 @pytest.mark.asyncio
 class TestScopedAnswers:
