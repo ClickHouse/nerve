@@ -10,6 +10,7 @@ directory before an entry is opened, so refusing one costs nothing.
 from __future__ import annotations
 
 import io
+import os
 import zipfile
 from unittest.mock import AsyncMock, MagicMock
 
@@ -110,7 +111,6 @@ class TestDecompressionBounds:
 
     def test_the_aggregate_budget_stops_later_entries(self, monkeypatch):
         monkeypatch.setattr(archives, "MAX_TOTAL_SIZE", 120)
-        monkeypatch.setattr(archives, "MAX_RATIO", 100_000)
         data = _zip({"a.txt": b"a" * 100, "b.txt": b"b" * 100})
         _, text = extract_zip(data, "[File: a.zip]")
         assert "a" * 100 in text
@@ -118,10 +118,30 @@ class TestDecompressionBounds:
 
     def test_the_text_budget_refuses_rather_than_cuts(self, monkeypatch):
         monkeypatch.setattr(archives, "MAX_TEXT_SIZE", 50)
-        monkeypatch.setattr(archives, "MAX_RATIO", 100_000)
         _, text = extract_zip(_zip({"long.txt": b"c" * 200}), "[File: a.zip]")
         assert "long.txt (200 bytes) [text, too large to inline]" in text
         assert "c" * 200 not in text
+
+    def test_a_small_repetitive_text_file_still_arrives(self):
+        # Repetition is ordinary: generated code, or a log of one repeated
+        # error line. Both compress far past MAX_RATIO while staying small
+        # enough that no budget is at stake, so both must be inlined.
+        body = b"def handler(event):\n    return {'ok': True}\n" * 2400
+        _, text = extract_zip(_zip({"app.py": body}), "[File: a.zip]")
+        assert "compression ratio too high" not in text
+        assert "def handler(event):" in text
+
+    def test_the_archive_budget_bounds_what_base64_adds_to_the_prompt(self):
+        # Each entry is under MAX_ENTRY_SIZE, and the entropy padding keeps
+        # it under MAX_RATIO. Only the aggregate budget stops a small upload
+        # from filling the prompt with base64.
+        body = os.urandom(6000) + b"\0" * 494_000
+        data = _zip({f"doc{i:03}.pdf": body for i in range(100)})
+        blocks, text = extract_zip(data, "[File: a.zip]")
+        encoded = sum(len(b["data"]) for b in blocks)
+        assert len(data) < 2_000_000, "the upload itself stays small"
+        assert encoded < 20_000_000, f"base64 reached {encoded} bytes"
+        assert "archive size budget spent" in text
 
     def test_a_refused_entry_still_appears_in_the_listing(self, monkeypatch):
         monkeypatch.setattr(archives, "MAX_ENTRY_SIZE", 10)
