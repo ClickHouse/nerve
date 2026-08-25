@@ -1002,7 +1002,7 @@ class SlackChannel(BaseChannel):
         if self._is_duplicate(f"reaction:{channel_id}:{ts}:{user_id}:{reaction}"):
             return
 
-        cached = self._message_cache.get(ts)
+        cached = self._message_cache.get(format_target(channel_id, ts))
         if not cached:
             # Only react to reactions on messages from this conversation that
             # we still hold context for; anything else has no session to
@@ -1306,12 +1306,21 @@ class SlackChannel(BaseChannel):
             cache.popitem(last=False)
 
     def _cache_message(self, ts: str, target: str, text: str) -> None:
-        """Store a message snippet in the LRU cache for reaction lookups."""
+        """Store a message snippet in the LRU cache for reaction lookups.
+
+        A Slack ts is unique inside one conversation rather than across the
+        workspace, so the key carries the conversation too. The stored
+        target keeps the thread, which the key does not.
+        """
         snippet = (text or "")[:200]
         if not snippet:
             return
+        channel_id, _ = parse_target(target)
         self._remember(
-            self._message_cache, ts, (target, snippet), _MESSAGE_CACHE_MAX,
+            self._message_cache,
+            format_target(channel_id, ts),
+            (target, snippet),
+            _MESSAGE_CACHE_MAX,
         )
 
     # ------------------------------------------------------------------ #
