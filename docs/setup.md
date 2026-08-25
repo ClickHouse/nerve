@@ -119,6 +119,8 @@ curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh \
     bash
 ```
 
+Dependency installation adapts to the environment: as root (a plain `ubuntu:24.04` container, for example) packages are installed directly with no `sudo` needed, and on Debian and Ubuntu `DEBIAN_FRONTEND=noninteractive` is set so `tzdata` and friends cannot open a debconf prompt. As a non-root user, `sudo -n` is used, so a missing password rule fails immediately instead of waiting.
+
 The daemon is not started: unattended installs are normally followed by a service manager that owns the process (see [systemd Service](#systemd-service-optional)). Set `NERVE_START=1` to start it from the installer instead.
 
 Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards.

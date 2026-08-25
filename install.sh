@@ -21,6 +21,9 @@ set -euo pipefail
 NERVE_REPO="https://github.com/ClickHouse/nerve.git"
 NERVE_BRANCH="${NERVE_BRANCH:-main}"
 INSTALL_DIR="${NERVE_INSTALL_DIR:-$HOME/nerve}"
+# The CLI resolves this itself, so upgrade detection, init, start and the
+# summary must all agree with it or they act on different configurations.
+CONFIG_DIR="${NERVE_CONFIG_DIR:-$INSTALL_DIR}"
 # 13, not 12: pyproject's requires-python is >=3.13 (set by memu-py==1.4.0).
 # Accepting 3.12 here meant the installer would provision a Python that then
 # failed at `uv pip install -e .` with an opaque dependency conflict.
@@ -62,6 +65,32 @@ confirm() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# Root images (ubuntu:24.04 and friends) can install packages with no sudo at
+# all, so elevation is a capability question, not a "is sudo present" one.
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif ! command_exists sudo; then
+        error "Root privileges are required, but sudo is not available."
+        return 1
+    elif [ "$NON_INTERACTIVE" = "1" ]; then
+        # -n so automation fails instead of waiting on a password prompt.
+        sudo -n "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# apt's -y answers apt, not debconf: tzdata still asks for a geographic area.
+# The variable is set past the sudo boundary so sudo cannot strip it.
+run_debian_command() {
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+        run_as_root env DEBIAN_FRONTEND=noninteractive "$@"
+    else
+        run_as_root "$@"
+    fi
+}
+
 # Compare versions: version_ge "3.13" "3.13" → true
 version_ge() {
     local a="$1" b="$2"
@@ -98,10 +127,10 @@ detect_os() {
     DISTRO="unknown"
     PKG_MGR="unknown"
     ARCH="$(uname -m)"
-    HAS_SUDO=0
-
-    if command_exists sudo; then
-        HAS_SUDO=1
+    # "Can we install packages", not "is sudo installed" — root needs neither.
+    CAN_ELEVATE=0
+    if [ "$(id -u)" -eq 0 ] || command_exists sudo; then
+        CAN_ELEVATE=1
     fi
 
     case "$(uname -s)" in
@@ -151,8 +180,8 @@ ensure_git() {
     fi
 
     info "git is not installed"
-    if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
-        error "git is required but sudo is not available. Install git manually and re-run."
+    if [ "$CAN_ELEVATE" = "0" ] && [ "$OS" = "linux" ]; then
+        error "git is required but packages cannot be installed (not root, no sudo). Install git manually and re-run."
         exit 1
     fi
 
@@ -163,13 +192,13 @@ ensure_git() {
 
     case "$PKG_MGR" in
         apt)
-            sudo apt-get update -qq && sudo apt-get install -y -qq git ;;
+            run_debian_command apt-get update -qq && run_debian_command apt-get install -y -qq git ;;
         dnf)
-            sudo dnf install -y -q git ;;
+            run_as_root dnf install -y -q git ;;
         pacman)
-            sudo pacman -S --noconfirm git ;;
+            run_as_root pacman -S --noconfirm git ;;
         zypper)
-            sudo zypper install -y git ;;
+            run_as_root zypper install -y git ;;
         brew)
             brew install git ;;
         *)
@@ -241,8 +270,8 @@ ensure_python() {
     # Last resort: system packages
     warn "uv python install failed. Trying system packages..."
 
-    if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
-        error "Cannot install Python: no sudo and uv python install failed."
+    if [ "$CAN_ELEVATE" = "0" ] && [ "$OS" = "linux" ]; then
+        error "Cannot install Python: no way to elevate and uv python install failed."
         error "Install Python 3.13+ manually and re-run."
         exit 1
     fi
@@ -251,24 +280,24 @@ ensure_python() {
         apt)
             if ! apt-cache show python3.13 >/dev/null 2>&1; then
                 info "Adding deadsnakes PPA..."
-                sudo apt-get update -qq
-                sudo apt-get install -y -qq software-properties-common
-                sudo add-apt-repository -y ppa:deadsnakes/ppa
-                sudo apt-get update -qq
+                run_debian_command apt-get update -qq
+                run_debian_command apt-get install -y -qq software-properties-common
+                run_debian_command add-apt-repository -y ppa:deadsnakes/ppa
+                run_debian_command apt-get update -qq
             fi
-            sudo apt-get install -y -qq python3.13 python3.13-venv python3.13-dev
+            run_debian_command apt-get install -y -qq python3.13 python3.13-venv python3.13-dev
             PYTHON_CMD="python3.13"
             ;;
         dnf)
-            sudo dnf install -y -q python3.13 || sudo dnf install -y -q python3.12 || sudo dnf install -y -q python3
+            run_as_root dnf install -y -q python3.13 || run_as_root dnf install -y -q python3.12 || run_as_root dnf install -y -q python3
             PYTHON_CMD="$(command -v python3.13 || command -v python3.12 || command -v python3)"
             ;;
         pacman)
-            sudo pacman -S --noconfirm python
+            run_as_root pacman -S --noconfirm python
             PYTHON_CMD="python3"
             ;;
         zypper)
-            sudo zypper install -y python313 || sudo zypper install -y python312 || sudo zypper install -y python3
+            run_as_root zypper install -y python313 || run_as_root zypper install -y python312 || run_as_root zypper install -y python3
             PYTHON_CMD="$(command -v python3.13 || command -v python3.12 || command -v python3)"
             ;;
         brew)
@@ -317,8 +346,8 @@ ensure_node() {
 
     info "Node.js v${MIN_NODE_VERSION}+ is not installed"
 
-    if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
-        error "Node.js is required but sudo is not available."
+    if [ "$CAN_ELEVATE" = "0" ] && [ "$OS" = "linux" ]; then
+        error "Node.js is required but packages cannot be installed (not root, no sudo)."
         error "Install Node.js v${MIN_NODE_VERSION}+ manually and re-run."
         exit 1
     fi
@@ -331,19 +360,19 @@ ensure_node() {
     case "$PKG_MGR" in
         apt)
             info "Installing Node.js via nodesource..."
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-            sudo apt-get install -y -qq nodejs
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | run_debian_command bash -
+            run_debian_command apt-get install -y -qq nodejs
             ;;
         dnf)
             info "Installing Node.js via nodesource..."
-            curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash -
-            sudo dnf install -y -q nodejs
+            curl -fsSL https://rpm.nodesource.com/setup_lts.x | run_as_root bash -
+            run_as_root dnf install -y -q nodejs
             ;;
         pacman)
-            sudo pacman -S --noconfirm nodejs npm
+            run_as_root pacman -S --noconfirm nodejs npm
             ;;
         zypper)
-            sudo zypper install -y nodejs20
+            run_as_root zypper install -y nodejs20
             ;;
         brew)
             brew install node
@@ -496,7 +525,7 @@ INIT_SKIPPED=0
 
 run_init() {
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
-    local config_local="$INSTALL_DIR/config.local.yaml"
+    local config_local="$CONFIG_DIR/config.local.yaml"
 
     if [ "$IS_UPGRADE" = "1" ] && [ -f "$config_local" ]; then
         info "Existing configuration found — skipping setup wizard"
@@ -509,7 +538,7 @@ run_init() {
         step "Running Nerve setup (non-interactive)"
         cd "$INSTALL_DIR" || exit 1
         # Fail loudly: a half-configured unattended install is worse than none.
-        "$nerve_bin" -c "$INSTALL_DIR" init --non-interactive
+        "$nerve_bin" -c "$CONFIG_DIR" init --non-interactive
         INIT_COMPLETED=1
         return
     fi
@@ -533,7 +562,7 @@ run_init() {
     step "Running Nerve setup"
     cd "$INSTALL_DIR" || exit 1
     # Don't let a wizard abort look like a failed installation (set -e).
-    if "$nerve_bin" init; then
+    if "$nerve_bin" -c "$CONFIG_DIR" init; then
         INIT_COMPLETED=1
     else
         printf "\n"
@@ -561,7 +590,7 @@ offer_start() {
         return
     fi
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
-    if "$nerve_bin" start; then
+    if "$nerve_bin" -c "$CONFIG_DIR" start; then
         NERVE_STARTED=1
     else
         warn "Start failed — check logs with: nerve logs"
@@ -602,7 +631,7 @@ print_summary() {
     printf "    ${CYAN}nerve stop${NC}            Stop the daemon\n"
     printf "\n"
     printf "  ${DIM}Install dir : $INSTALL_DIR${NC}\n"
-    printf "  ${DIM}Config      : $INSTALL_DIR/config.local.yaml${NC}\n"
+    printf "  ${DIM}Config      : $CONFIG_DIR/config.local.yaml${NC}\n"
     printf "  ${DIM}Data        : ~/.nerve/${NC}\n"
     printf "\n"
     printf "  ${DIM}To uninstall: rm -rf $INSTALL_DIR ~/.nerve ~/.local/bin/nerve${NC}\n"
