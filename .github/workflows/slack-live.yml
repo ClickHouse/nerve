@@ -14,18 +14,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# One run at a time, across every branch and pull request.
-#
-# cancel-in-progress is false on purpose, the opposite of ci.yml. Killing a
-# run mid-flight leaves envelopes unacked and messages undeleted, and Slack
-# redelivers an unacked envelope — so a cancelled run does not just lose its
-# own result, it poisons the next one. Queueing is the cheaper failure: the
-# suite takes about three minutes.
-#
-# Note the GitHub behaviour this cannot avoid: only one run may be pending
-# per group, so a third run arriving while one is executing and one is queued
-# cancels the queued one. It is not lost work, it is a skipped check, and
-# re-running the job is enough.
+# Serialize against the shared workspace and let active runs finish so
+# unacknowledged envelopes cannot retry into the next job. GitHub keeps only
+# one queued run per group; a displaced queued check can simply be rerun.
 concurrency:
   group: slack-live-workspace
   cancel-in-progress: false

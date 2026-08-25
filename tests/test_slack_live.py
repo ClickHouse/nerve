@@ -23,14 +23,16 @@ import pytest
 import pytest_asyncio
 
 from nerve.channels.slack import (
+    format_target,
+    is_slack_id,
+    SlackChannel,
+)
+from nerve.channels.slack_presentation import (
     _EMOJI_TO_SLACK,
     MAX_MSG_LEN,
     _md_to_slack,
     build_notification_blocks,
-    format_target,
-    is_slack_id,
     split_message,
-    SlackChannel,
 )
 from tests.slack_live import (
     BOT_TOKEN,
@@ -298,7 +300,7 @@ class TestSlackAcceptsWhatWeSend:
 
         cfg = NerveConfig()
         cfg.slack = SlackConfig(bot_token=BOT_TOKEN, app_token="unused")
-        channel = SlackChannel(lambda: cfg, router=None)  # type: ignore[arg-type]
+        channel = SlackChannel(cfg, router=None)  # type: ignore[arg-type]
         channel._web = bot
         assert await channel.send_file(format_target(TEST_CHANNEL), str(path))
 
