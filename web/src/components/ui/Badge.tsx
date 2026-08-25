@@ -44,6 +44,14 @@ export type BadgeTone =
  * `accent`, `purple` and `neutral` stay as they are: they label a *kind* of
  * thing (a plan type, a skill, a transport), not how something went, and there
  * is no status token that means "purple".
+ *
+ * `purple` does pair a hue with a 15% tint of itself, which is the combination
+ * the note above says was never checked — and it did not hold: `hue-purple` on
+ * its own tint measures 3.93:1 in dark (3.68 on a raised surface). The
+ * foreground is therefore `hue-violet`, which is the same ramp two steps
+ * lighter — the step index.css already keeps lighter precisely because it is
+ * the one used under an alpha modifier. Over the same tint that reads
+ * 5.72 / 5.37 dark and 5.00 / 4.59 light (surface / raised).
  */
 const TONES: Record<BadgeTone, string> = {
   neutral: 'text-text-muted bg-border-subtle',
@@ -52,7 +60,7 @@ const TONES: Record<BadgeTone, string> = {
   warning: 'text-warning bg-warning-bg',
   danger: 'text-error bg-error-bg',
   info: 'text-info bg-info-bg',
-  purple: 'text-hue-purple bg-hue-purple/15',
+  purple: 'text-hue-violet bg-hue-purple/15',
 };
 
 export type BadgeSize = 'xs' | 'sm';

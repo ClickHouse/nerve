@@ -602,7 +602,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   label="Running"
                   count={pinnedRunning.length}
                   collapsed={collapsedGroups.has('Running')}
-                  tone="text-success/70"
+                  tone="text-success"
                   onToggle={() => toggleGroup('Running')}
                 />
                 {!collapsedGroups.has('Running') && pinnedRunning.map(renderTree)}
@@ -617,7 +617,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   label="Starred"
                   count={pinnedStarred.length}
                   collapsed={collapsedGroups.has('Starred')}
-                  tone="text-hue-yellow/70"
+                  tone="text-hue-yellow"
                   onToggle={() => toggleGroup('Starred')}
                 />
                 {!collapsedGroups.has('Starred') && pinnedStarred.map(renderTree)}
@@ -837,7 +837,7 @@ function GroupHeader({ label, count, collapsed, tone, onToggle }: {
       }
       <span className={`text-2xs font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
       {collapsed && count > 0 && (
-        <span className="text-2xs text-text-faint/60 tabular-nums">{count}</span>
+        <span className="text-2xs text-text-faint tabular-nums">{count}</span>
       )}
     </Button>
   );
@@ -1173,7 +1173,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
       {hasChildren && !expanded && childCount > 0 && (
         <span
-          className="shrink-0 text-2xs text-text-faint/60 tabular-nums"
+          className="shrink-0 text-2xs text-text-faint tabular-nums"
           title={`${childCount} nested session${childCount !== 1 ? 's' : ''}`}
         >
           {childCount}

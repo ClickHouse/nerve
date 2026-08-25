@@ -258,12 +258,52 @@
      by the same perceptual amount. */
 
   /* Text. Click UI ships three levels (default / muted / disabled); Nerve needs
-     five, so secondary and faint are interpolated. */
+     five, so the ramp is interpolated between `text-default` and
+     `text-disabled` — the two ends of Click UI's own grey axis.
+
+     The percentages are NOT evenly spaced, and they DIFFER PER THEME — the
+     light overrides live in the `[data-cui-theme="light"]` block below. Each is
+     solved so the step lands on a target contrast ratio against
+     `--theme-surface-raised`, the LIGHTEST of the three backgrounds body text
+     sits on (#2d2d2d dark, #ecedee light) and therefore the worst case. Solving
+     against `--theme-surface` instead leaves every badge and pill that sits on
+     a raised surface at 4.43:1 — under the line by just enough to matter, and
+     invisible unless you audit against all three. Targets are 11 / 7.5 / 5.7 /
+     4.7 on that worst background. Measured (bg / surface / raised):
+
+                       dark                     light
+       text            16.52 / 14.74 / 13.77    18.20 / 16.99 / 15.53
+       text-secondary  13.20 / 11.78 / 11.00    12.89 / 12.04 / 11.00
+       text-muted       9.00 /  8.03 /  7.50     8.79 /  8.21 /  7.50
+       text-dim         6.84 /  6.10 /  5.70     6.68 /  6.24 /  5.70
+       text-faint       5.64 /  5.03 /  4.70     5.51 /  5.14 /  4.70
+
+     One shared set of percentages does NOT work: the two themes travel opposite
+     directions from `text-default`, and contrast is not linear in the mix, so
+     the light `text-faint` lands at 3.86:1 on dark's numbers. Both sets are
+     needed.
+
+     What this replaces: `text-dim` was mapped straight onto Click UI's
+     `text-disabled`, and `text-faint` onto a mix of it toward the page. Those
+     are *control* colours — deliberately inert, never meant to carry copy — and
+     Nerve spends them on timestamps, counts, paths and labels. The result was
+     2.44:1 on `text-dim` and 1.39:1 on `text-faint` in light: about 900 nodes
+     of barely-readable text across the app. `text-muted` moves too, because
+     Click UI's light `text-muted` is itself only 4.77:1 on `surface` — there is
+     no room to fit two more legible steps under it, so the ramp shifts up to
+     make space.
+
+     To retune: change a target, re-run `ladder2.mjs` in the sweep harness, and
+     paste the percentages back into BOTH blocks. Do not hand-edit a percentage
+     without re-measuring — the mix is in oklab, so ratio is not linear in it. */
   --theme-text: var(--click-global-color-text-default);
-  --theme-text-secondary: color-mix(in oklab, var(--click-global-color-text-default) 70%, var(--click-global-color-text-muted));
-  --theme-text-muted: var(--click-global-color-text-muted);
-  --theme-text-dim: var(--click-global-color-text-disabled);
-  --theme-text-faint: color-mix(in oklab, var(--click-global-color-text-disabled) 70%, var(--click-global-color-background-default));
+  --theme-text-secondary: color-mix(in oklab, var(--click-global-color-text-default) 81%, var(--click-global-color-text-disabled));
+  --theme-text-muted: color-mix(in oklab, var(--click-global-color-text-default) 51%, var(--click-global-color-text-disabled));
+  --theme-text-dim: color-mix(in oklab, var(--click-global-color-text-default) 32%, var(--click-global-color-text-disabled));
+  --theme-text-faint: color-mix(in oklab, var(--click-global-color-text-default) 19%, var(--click-global-color-text-disabled));
+  /* Placeholders are the one text-like role where `disabled` IS the right
+     token: an empty field is genuinely inert, and the label above it carries
+     the meaning. Left on Click UI's own value deliberately. */
   --theme-placeholder: var(--click-global-color-text-disabled);
 
   /* Borders. stroke-muted is identical to stroke-default in both Click UI
@@ -364,6 +404,14 @@
   color-scheme: light;
   --theme-bg-sunken: var(--palette-slate-50);      /* #f6f7fa, under #ffffff */
 
+  /* Text ramp, light half. Same construction as the dark ramp in the block
+     above — see the long note there for why these exist and how to retune —
+     but solved against white / #f6f7fa, which needs its own percentages. */
+  --theme-text-secondary: color-mix(in oklab, var(--click-global-color-text-default) 77%, var(--click-global-color-text-disabled));
+  --theme-text-muted: color-mix(in oklab, var(--click-global-color-text-default) 58%, var(--click-global-color-text-disabled));
+  --theme-text-dim: color-mix(in oklab, var(--click-global-color-text-default) 45%, var(--click-global-color-text-disabled));
+  --theme-text-faint: color-mix(in oklab, var(--click-global-color-text-default) 37%, var(--click-global-color-text-disabled));
+
   /* ── Two AA corrections, each one palette step darker ──
      Click UI's own light-theme values fail WCAG AA on their intended
      backgrounds, so these are the only places we knowingly diverge from the
@@ -374,9 +422,15 @@
        --theme-info     info-400  #437eef        info-600  #104ec6  3.84 -> 7.17   3.32 -> 6.20
        --theme-link     same as info
        --theme-success  success-700 #008a0b      success-800 #006108  7.74      4.27 -> 7.30
+       --theme-hue-emerald  success-700          success-800        4.22 -> 6.03
+
+     `hue-emerald` joins them for the same reason and lands on the same step as
+     `--theme-success` above: at success-700 it measured 4.22:1 on the muted
+     surface, and it is spent on text 23 times (the `$` in every shell block,
+     "Available"/"Connected" labels, skill counts) rather than on dots.
 
      Dark mode is unaffected — it passes comfortably (success 10.5, info 7.2).
-     Revert by deleting these three lines if design-system fidelity is worth
+     Revert by deleting these four lines if design-system fidelity is worth
      more than AA here. */
   --theme-info: var(--palette-info-600);
   --theme-link: var(--palette-info-600);
@@ -386,7 +440,7 @@
   --theme-hue-amber: var(--palette-sunrise-700);   /* #8a6900 */
   --theme-hue-orange: var(--palette-warning-700);  /* #a33c00 */
   --theme-hue-red: var(--palette-danger-600);      /* #c10000 */
-  --theme-hue-emerald: var(--palette-success-700); /* #008a0b */
+  --theme-hue-emerald: var(--palette-success-800); /* #006108, one step darker for AA — see note above */
   --theme-hue-green: var(--palette-success-800);   /* #006108 */
   --theme-hue-teal: var(--palette-teal-700);       /* #067462 */
   --theme-hue-cyan: var(--palette-babyblue-700);   /* #006170 */

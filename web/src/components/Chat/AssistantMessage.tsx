@@ -33,7 +33,7 @@ export function AssistantMessage({ message }: { message: ChatMessage }) {
         </div>
         {message.created_at && (
           <div
-            className="mt-1 text-right text-2xs text-text-faint/60 tabular-nums"
+            className="mt-1 text-right text-2xs text-text-faint tabular-nums"
             title={new Date(message.created_at).toLocaleString()}
           >
             {formatMessageTime(message.created_at)}
