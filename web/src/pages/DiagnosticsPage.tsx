@@ -176,14 +176,20 @@ export function DiagnosticsPage() {
                     const heightPct = maxCost > 0 ? Math.max(2, (cost / maxCost) * 100) : 2;
                     const dateLabel = day.date?.slice(5) || ''; // MM-DD
                     return (
-                      <div key={day.date} className="flex-1 flex flex-col items-center gap-0.5 min-w-0">
-                        <div
-                          className="w-full bg-accent/30 rounded-t-sm hover:bg-accent/50 transition-colors relative group"
-                          style={{ height: `${heightPct}%` }}
-                        >
-                          <div className="absolute -top-6 left-1/2 -translate-x-1/2 hidden group-hover:block z-10
-                            bg-surface-raised border border-border-subtle rounded px-1.5 py-0.5 text-[10px] text-text-secondary whitespace-nowrap shadow-lg">
-                            {formatTokens((day.input_tokens || 0) + (day.output_tokens || 0))} &middot; ${cost.toFixed(2)}
+                      <div key={day.date} className="flex-1 flex flex-col items-center gap-0.5 min-w-0 h-full">
+                        {/* Bar track. The bar's percentage height needs a parent
+                            with a definite height to resolve against, so the
+                            column is h-full and the track takes the space left
+                            over after the date label. */}
+                        <div className="flex-1 w-full flex items-end min-h-0">
+                          <div
+                            className="w-full bg-accent/30 rounded-t-sm hover:bg-accent/50 transition-colors relative group"
+                            style={{ height: `${heightPct}%` }}
+                          >
+                            <div className="absolute -top-6 left-1/2 -translate-x-1/2 hidden group-hover:block z-10
+                              bg-surface-raised border border-border-subtle rounded px-1.5 py-0.5 text-[10px] text-text-secondary whitespace-nowrap shadow-lg">
+                              {formatTokens((day.input_tokens || 0) + (day.output_tokens || 0))} &middot; ${cost.toFixed(2)}
+                            </div>
                           </div>
                         </div>
                         <span className="text-[9px] text-text-faint tabular-nums">{dateLabel}</span>
