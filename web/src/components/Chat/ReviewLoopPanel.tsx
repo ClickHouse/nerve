@@ -47,7 +47,10 @@ export function ReviewLoopPanel({ disabled }: { disabled?: boolean }) {
 
   return (
     <div className="px-4 pt-3 pb-1">
-      <div className="max-w-[var(--chat-width)] mx-auto">
+      {/* No `max-w-[var(--chat-width)]`: this renders inside the composer, and
+          the composer stack is not capped to the reading column. See the note
+          on the main input row in ChatInput. */}
+      <div>
         {/* A low-alpha wash of the success *foreground* rather than
             `bg-success-bg`: this is a full-width config panel, and the opaque
             feedback tint is sized for a chip or an alert, not a slab. */}

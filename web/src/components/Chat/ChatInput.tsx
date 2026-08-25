@@ -581,7 +581,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Prompt rewrite preview */}
       {rewrite.status !== 'idle' && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-[var(--chat-width)] mx-auto">
+          <div>
             <PromptRewriteCard
               state={
                 rewrite.status === 'loading' ? { status: 'loading' }
@@ -601,7 +601,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Quote cards */}
       {quotes.length > 0 && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-[var(--chat-width)] mx-auto space-y-2">
+          <div className="space-y-2">
             {quotes.map((quote, idx) => (
               <QuoteCard
                 key={quote.id}
@@ -619,7 +619,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Attachment previews */}
       {attachments.length > 0 && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-[var(--chat-width)] mx-auto flex gap-2 flex-wrap">
+          <div className="flex gap-2 flex-wrap">
             {attachments.map(a => (
               <AttachmentPreview key={a.id} attachment={a} onRemove={() => removeAttachment(a.id)} />
             ))}
@@ -633,13 +633,24 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           buttons plus the model picker, which left the textarea a ~90px
           stub, so the row wraps instead: controls stay on the first line and
           the textarea takes a full-width line of its own below them (see the
-          `basis-full`/`order-1` pair on it). */}
+          `basis-full`/`order-1` pair on it).
+
+          The composer stack — this row and the rewrite / quote / attachment
+          strips above it — deliberately does NOT carry
+          `max-w-[var(--chat-width)]`, which everything on the transcript side
+          does. Those are one cap on two things that want different widths: a
+          reading column wants to stay narrow for prose, while the composer is a
+          control surface and only ever gets narrower as the model picker and
+          five buttons take their fixed share out of it. At the default 768 that
+          left the textarea 430px. Widening the reading column to fix the
+          composer made the transcript worse, and there is no reason to trade
+          them off against each other, so the composer just fills the pane. */}
       <div className="px-4 py-3">
         {/* `relative` is the anchor for the run-later popup below. It hangs off
             this row rather than off its own 40px trigger so that it is aligned
             to the composer and cannot leave the viewport, wherever the trigger
             happens to have wrapped to. */}
-        <div className="relative max-w-[var(--chat-width)] mx-auto flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
+        <div className="relative flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
           {/* File attach button */}
           <IconButton
             size="md"
