@@ -650,7 +650,7 @@ def build_channel(
         app_token=APP_TOKEN,
         **slack_kwargs,
     )
-    channel = SlackChannel(lambda: cfg, router)  # type: ignore[arg-type]
+    channel = SlackChannel(cfg, router)
     router.channel = channel
     if diagnostics_label:
         diagnostics = SocketDiagnostics(diagnostics_label)
