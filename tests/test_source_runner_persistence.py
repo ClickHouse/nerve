@@ -85,6 +85,43 @@ async def test_runner_rolls_back_real_insert_failure_and_preserves_cursor(
 
 
 @pytest.mark.asyncio
+async def test_runner_rolls_back_existing_update_when_later_insert_fails(db):
+    existing = _record("existing")
+    await db.insert_source_messages([existing], source=SOURCE_NAME)
+
+    async with db.db.execute(
+        "SELECT rowid FROM source_messages WHERE source = ? AND id = ?",
+        (SOURCE_NAME, existing.id),
+    ) as cursor:
+        old_rowid = (await cursor.fetchone())[0]
+
+    await db.set_sync_cursor(SOURCE_NAME, "old")
+    updated = _record(existing.id)
+    updated.content = "Updated content"
+    bad = _record("bad")
+    bad.summary = None
+
+    result = await SourceRunner(_FixedSource([updated, bad]), db).run()
+
+    assert result.records_ingested == 0
+    assert result.error is not None
+    assert await db.get_sync_cursor(SOURCE_NAME) == "old"
+    async with db.db.execute(
+        "SELECT rowid, id, summary, content FROM source_messages "
+        "WHERE source = ? ORDER BY rowid",
+        (SOURCE_NAME,),
+    ) as cursor:
+        rows = [dict(row) async for row in cursor]
+    assert rows == [{
+        "rowid": old_rowid,
+        "id": existing.id,
+        "summary": existing.summary,
+        "content": existing.content,
+    }]
+    assert not db.db.in_transaction
+
+
+@pytest.mark.asyncio
 async def test_runner_retries_the_same_batch_after_persistence_recovers(
     db, monkeypatch,
 ):
