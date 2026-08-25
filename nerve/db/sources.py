@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 
 class SourceStore:
@@ -115,82 +118,77 @@ class SourceStore:
         field changes from "author" to "mention") surface as new messages for
         consumer cursors that already read the old version.
         """
-        import logging
-        logger = logging.getLogger(__name__)
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(days=ttl_days)).isoformat()
         now_iso = now.isoformat()
         inserted = 0
         async with self._atomic():
             for r in records:
-                try:
-                    new_metadata = json.dumps(r.metadata) if r.metadata else None
+                new_metadata = json.dumps(r.metadata) if r.metadata else None
 
-                    # Check if this record already exists
+                # Check if this record already exists
+                async with self.db.execute(
+                    "SELECT metadata, content FROM source_messages "
+                    "WHERE source = ? AND id = ?",
+                    (source, r.id),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+
+                forced_rowid: int | None = None
+                if existing:
+                    old_metadata, old_content = existing[0], existing[1]
+                    if old_metadata == new_metadata and old_content == r.content:
+                        # Nothing changed — skip silently
+                        continue
+                    # Metadata or content changed. Re-surface the update to
+                    # consumer cursors (which poll `rowid > cursor_seq`) by
+                    # re-inserting at a strictly-higher rowid.
+                    #
+                    # source_messages has PRIMARY KEY (source, id) and no
+                    # AUTOINCREMENT, so a plain re-INSERT lands at the implicit
+                    # rowid MAX(rowid)+1. If the row being replaced is itself
+                    # the current MAX, deleting it first lowers the max and the
+                    # re-insert REUSES the same rowid, leaving it <= a cursor
+                    # already parked there, so the update is silently never
+                    # re-delivered. Capture MAX(rowid)+1 BEFORE the delete
+                    # (while the old row still counts toward the max) and insert
+                    # at that explicit rowid so it is always above every prior
+                    # rowid and every consumer cursor.
                     async with self.db.execute(
-                        "SELECT metadata, content FROM source_messages "
-                        "WHERE source = ? AND id = ?",
-                        (source, r.id),
+                        "SELECT COALESCE(MAX(rowid), 0) + 1 FROM source_messages"
                     ) as cursor:
-                        existing = await cursor.fetchone()
+                        forced_rowid = (await cursor.fetchone())[0]
+                    await self.db.execute(
+                        "DELETE FROM source_messages WHERE source = ? AND id = ?",
+                        (source, r.id),
+                    )
+                    logger.info(
+                        "Source message %s/%s updated (content/metadata changed): "
+                        "re-inserting at rowid %s to re-surface for consumers",
+                        source, r.id, forced_rowid,
+                    )
 
-                    forced_rowid: int | None = None
-                    if existing:
-                        old_metadata, old_content = existing[0], existing[1]
-                        if old_metadata == new_metadata and old_content == r.content:
-                            # Nothing changed — skip silently
-                            continue
-                        # Metadata or content changed. Re-surface the update to
-                        # consumer cursors (which poll `rowid > cursor_seq`) by
-                        # re-inserting at a strictly-higher rowid.
-                        #
-                        # source_messages has PRIMARY KEY (source, id) and no
-                        # AUTOINCREMENT, so a plain re-INSERT lands at the implicit
-                        # rowid MAX(rowid)+1. If the row being replaced is itself
-                        # the current MAX, deleting it first lowers the max and the
-                        # re-insert REUSES the same rowid, leaving it <= a cursor
-                        # already parked there, so the update is silently never
-                        # re-delivered. Capture MAX(rowid)+1 BEFORE the delete
-                        # (while the old row still counts toward the max) and insert
-                        # at that explicit rowid so it is always above every prior
-                        # rowid and every consumer cursor.
-                        async with self.db.execute(
-                            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM source_messages"
-                        ) as cursor:
-                            forced_rowid = (await cursor.fetchone())[0]
-                        await self.db.execute(
-                            "DELETE FROM source_messages WHERE source = ? AND id = ?",
-                            (source, r.id),
-                        )
-                        logger.info(
-                            "Source message %s/%s updated (content/metadata changed): "
-                            "re-inserting at rowid %s to re-surface for consumers",
-                            source, r.id, forced_rowid,
-                        )
-
-                    if forced_rowid is not None:
-                        await self.db.execute(
-                            "INSERT INTO source_messages "
-                            "(rowid, id, source, record_type, summary, content, raw_content, timestamp, metadata, created_at, expires_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (forced_rowid, r.id, source, r.record_type, r.summary, r.content,
-                             getattr(r, 'raw_content', None),
-                             r.timestamp, new_metadata,
-                             now_iso, expires),
-                        )
-                    else:
-                        await self.db.execute(
-                            "INSERT INTO source_messages "
-                            "(id, source, record_type, summary, content, raw_content, timestamp, metadata, created_at, expires_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (r.id, source, r.record_type, r.summary, r.content,
-                             getattr(r, 'raw_content', None),
-                             r.timestamp, new_metadata,
-                             now_iso, expires),
-                        )
-                    inserted += 1
-                except Exception as e:
-                    logger.warning("Failed to insert source message %s: %s", r.id, e)
+                if forced_rowid is not None:
+                    await self.db.execute(
+                        "INSERT INTO source_messages "
+                        "(rowid, id, source, record_type, summary, content, raw_content, timestamp, metadata, created_at, expires_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (forced_rowid, r.id, source, r.record_type, r.summary, r.content,
+                         getattr(r, 'raw_content', None),
+                         r.timestamp, new_metadata,
+                         now_iso, expires),
+                    )
+                else:
+                    await self.db.execute(
+                        "INSERT INTO source_messages "
+                        "(id, source, record_type, summary, content, raw_content, timestamp, metadata, created_at, expires_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (r.id, source, r.record_type, r.summary, r.content,
+                         getattr(r, 'raw_content', None),
+                         r.timestamp, new_metadata,
+                         now_iso, expires),
+                    )
+                inserted += 1
         return inserted
 
     async def update_source_messages_processed(
