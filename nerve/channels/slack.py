@@ -850,15 +850,50 @@ class SlackChannel(BaseChannel):
             await self._handle_reaction_event(event)
 
     def _is_own_message(self, event: dict[str, Any]) -> bool:
-        """Whether this app posted the message.
-
-        A foreign ``bot_id`` may represent a person using an integration, so
-        only this app's bot and user IDs count. The ``bot_message`` subtype
-        filters other bots.
-        """
+        """Whether this app posted the message."""
         if self._bot_id and event.get("bot_id") == self._bot_id:
             return True
         return bool(self._bot_user_id and event.get("user") == self._bot_user_id)
+
+    async def _is_another_app_talking(self, event: dict[str, Any]) -> bool:
+        """Whether another app authored this message itself.
+
+        ``bot_id`` alone does not answer it: a person posting through an
+        integration keeps their own ``user`` id and gains the app's
+        ``bot_id``, and those messages are meant to reach the agent. What
+        separates the two is whether the sender is a bot user, which only
+        ``users.info`` can say.
+
+        Answering another app is what lets two agents in one channel reply
+        to each other without end, because a reply continues an owned thread
+        with no further mention needed. An unresolved sender beside a
+        ``bot_id`` is therefore treated as an app.
+        """
+        if not event.get("bot_id"):
+            return False
+        user_id = event.get("user") or ""
+        if not user_id:
+            return True
+
+        cache_key = f"bot:{user_id}"
+        cached = self._name_cache.get(cache_key)
+        if cached and cached[1] > time.monotonic():
+            return bool(cached[0])
+        try:
+            info = await self._web.users_info(user=user_id)
+            is_bot = bool((info.get("user") or {}).get("is_bot"))
+        except Exception as e:
+            logger.warning(
+                "Slack users.info failed for %s beside bot_id %s, so the "
+                "message is treated as another app's: %s",
+                user_id, event.get("bot_id"), e,
+            )
+            is_bot = True
+        self._remember(
+            self._name_cache, cache_key,
+            (is_bot, time.monotonic() + _NAME_CACHE_TTL), _NAME_CACHE_MAX,
+        )
+        return is_bot
 
     async def _should_answer(
         self, event: dict[str, Any], channel_type: str, channel_key: str,
@@ -886,6 +921,8 @@ class SlackChannel(BaseChannel):
             return
         subtype = event.get("subtype")
         if subtype in _IGNORED_SUBTYPES:
+            return
+        if await self._is_another_app_talking(event):
             return
 
         channel_id = event.get("channel") or ""
