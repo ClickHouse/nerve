@@ -17,6 +17,7 @@ from nerve.channels.base import ChannelCapability, OutboundMessage
 from nerve.channels.slack import (
     MAX_MSG_LEN,
     SlackChannel,
+    SlackUnavailable,
     _md_to_slack,
     build_sessions_blocks,
     format_target,
@@ -705,6 +706,62 @@ class TestOutbound:
         channel = _channel()
         await channel.edit_message("C1", "1.1", "y" * (MAX_MSG_LEN + 500))
         assert len(channel._web.chat_update.await_args.kwargs["text"]) <= MAX_MSG_LEN + 1
+
+    @pytest.mark.asyncio
+    async def test_sending_while_rotating_is_refused_not_dropped(self):
+        # A rotation publishes the next Web client before it connects the
+        # next socket, so _web alone is set while the generation serving
+        # events is still the previous one. Returning quietly here told
+        # StreamAdapter the reply had been sent and it deleted the
+        # placeholder, leaving the user with neither.
+        channel = _channel()
+        channel._state = "rotating"
+        with pytest.raises(SlackUnavailable):
+            await channel.send(OutboundMessage(target="C1", text="hi"))
+        channel._web.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_channel_refuses_to_post(self):
+        channel = _channel()
+        channel._state = "quiescing"
+        with pytest.raises(SlackUnavailable):
+            await channel._post("C1", "hi")
+
+    @pytest.mark.asyncio
+    async def test_streaming_keeps_the_placeholder_when_the_channel_goes_away(
+        self,
+    ):
+        # The user-visible half: a quiet refusal read as success, so the
+        # placeholder was deleted and the reply never posted.
+        from nerve.channels.stream_adapter import StreamAdapter
+
+        channel = _channel()
+        adapter = StreamAdapter(channel, "C1", "s1")
+        adapter._placeholder_id = "1.1"
+        adapter._buffer = "the answer"
+        channel.edit_message = AsyncMock()
+        channel.delete_message = AsyncMock()
+        channel._state = "rotating"
+
+        await adapter._handle_done()
+
+        # The recovery branch, not the "sent, so drop the placeholder" one.
+        channel.edit_message.assert_awaited_once()
+        channel.delete_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_best_effort_paths_stay_quiet_while_rotating(self):
+        channel = _channel()
+        channel._state = "rotating"
+        channel._remember(channel._last_inbound_ts, "C1", "1.1", 10)
+        await channel.edit_message("C1", "1.1", "text")
+        await channel.delete_message("C1", "1.1")
+        await channel.send_typing("C1")
+        await channel.set_reaction("C1", "1.1", "🎉")
+        assert not await channel.send_file("C1", __file__)
+        channel._web.chat_update.assert_not_called()
+        channel._web.chat_delete.assert_not_called()
+        channel._web.reactions_add.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_failed_post_is_reported_not_swallowed(self):
