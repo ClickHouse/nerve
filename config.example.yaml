@@ -127,15 +127,13 @@ slack:
   # allow_channels: ["eng-*", "C0456DEF"]
   # deny_channels: ["*-random", "*-social"]
   #
-  # Each thread becomes its own session and replies stay in-thread. Off means
-  # one session per channel and replies at channel level.
-  reply_in_thread: true
+  # Every shared-channel thread is its own session; DMs use one conversation.
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
-  # `/nerve` defaults to new, stop, star, and unstar.
-  #   omitted  — new, stop, star, unstar
+  # `/nerve` defaults to new, stop, star, unstar, and reply.
+  #   omitted  — new, stop, star, unstar, reply
   #   []       — no slash commands at all
   #   [all]    — everything, including doctor and restart
-  # doctor/restart affect the host; sessions/reply reach other channels. Opt in.
+  # doctor/restart affect the host; sessions lists other channels. Opt in.
   # commands: [sessions, new, stop, reply]
 
 # Quiet hours (local timezone)

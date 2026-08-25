@@ -283,14 +283,11 @@ class TestSlackIsOptIn:
 
 
 class TestSlackDefaultCommands:
-    def test_globally_scoped_commands_are_off_by_default(self):
-        # Both reach every session in the instance, web and Telegram
-        # included, and Slack has no ownership model to narrow them to the
-        # caller. Listing them in slack.commands turns them back on.
+    def test_only_globally_scoped_session_listing_is_off_by_default(self):
         from nerve.config import SLACK_DEFAULT_COMMANDS
 
         assert "sessions" not in SLACK_DEFAULT_COMMANDS
-        assert "reply" not in SLACK_DEFAULT_COMMANDS
+        assert "reply" in SLACK_DEFAULT_COMMANDS
 
     def test_they_are_still_available_on_request(self):
         from nerve.config import SLACK_ALL_COMMANDS

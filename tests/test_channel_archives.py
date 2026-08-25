@@ -167,7 +167,7 @@ class TestChannelsShareTheBounds:
         cfg.slack = SlackConfig(
             enabled=True, bot_token="xoxb-t", app_token="xapp-t",
         )
-        channel = SlackChannel(lambda: cfg, router=MagicMock())
+        channel = SlackChannel(cfg, router=MagicMock())
         channel._download_file = AsyncMock(
             return_value=_zip({"bomb.png": b"\x00" * 4_000_000}),
         )

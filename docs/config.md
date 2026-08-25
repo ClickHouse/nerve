@@ -1084,7 +1084,6 @@ users are ignored.
 | `slack.allow_direct_messages` | bool | `false` | Allow DMs; sender rules still apply |
 | `slack.allow_channels` | list[str] | `[]` | Allowed shared conversations |
 | `slack.deny_channels` | list[str] | `[]` | Blocked shared conversations |
-| `slack.reply_in_thread` | bool | `true` | One session per thread; replies stay in-thread |
 | `slack.stream_mode` | string | `partial` | `partial` (edit one message) or `full` |
 | `slack.commands` | list[str] | see below | Enabled `/nerve` subcommands |
 
@@ -1193,8 +1192,8 @@ slack:
 - In an allowed DM, the bot answers every message.
 - In a shared channel, it answers mentions and threads where it already has a
   session.
-- With `reply_in_thread: true`, each thread has its own session and replies
-  stay there.
+- Each shared-channel thread has its own session and all replies stay there;
+  shared channels never have a channel-wide session.
 - `/nerve` responses are ephemeral.
 
 ### Commands
@@ -1210,17 +1209,15 @@ slack:
   commands: [all]                 # enable every subcommand
 ```
 
-Omitting the key enables `new`, `stop`, `star`, and `unstar`. `doctor`,
-`restart`, `sessions`, and `reply` are opt-in: the first two expose host
-operations, while the latter two can reach sessions outside Slack and are not
-scoped to the caller. Enable them only when every permitted user is trusted
-with the whole instance. Unknown command names are ignored with a warning;
+Omitting the key enables `new`, `stop`, `star`, `unstar`, and `reply`.
+`doctor`, `restart`, and `sessions` are opt-in: the first two expose host
+operations, while `sessions` can reach sessions outside Slack and is not
+scoped to the caller. Unknown command names are ignored with a warning;
 `/nerve help` shows the enabled set.
 
-Slack slash-command payloads have no thread ID. In a threaded shared channel,
-`new` and `sessions` therefore refuse, while `stop`, `star`, and `unstar`
-select among that channel's active sessions. Commands work normally in DMs
-and channels with `reply_in_thread: false`.
+Slack slash-command payloads have no thread ID. In a shared channel, `new` and
+`sessions` therefore refuse, while `stop`, `star`, and `unstar` select among
+that channel's active thread sessions. Commands work normally in DMs.
 
 ## Quiet Hours
 

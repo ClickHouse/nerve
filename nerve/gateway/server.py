@@ -6,10 +6,8 @@ Single entry point for the entire Nerve gateway.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import ssl
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +15,6 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from nerve import paths
@@ -344,33 +341,20 @@ async def lifespan(app: FastAPI):
         await telegram_channel.start()
         logger.info("Telegram bot started")
 
-    # Start Slack bot if enabled
-    slack_channel = None
-    if config.slack.enabled and config.slack.bot_token and config.slack.app_token:
-        from nerve.channels.slack import SlackChannel
-        # get_config, not the object read above: the channel resolves config per
-        # use so a reload reaches the reads that happen per event (the
-        # allow/deny lists).
-        slack_channel = SlackChannel(get_config, _engine.router)
-        slack_channel.set_notification_service(notification_service)
-        try:
-            await slack_channel.start()
-        except Exception as e:
-            # A bad token or a revoked app must not stop the daemon booting —
-            # every other channel and the web UI still work without Slack.
-            # Registration happens only after a clean start: a half-built
-            # channel left in the router still answers get_channel("slack"),
-            # so notification fanout would keep posting into a dead client and
-            # recording the result as delivered.
-            logger.error("Slack bot failed to start: %s", e, exc_info=True)
-            try:
-                await slack_channel.stop()
-            except Exception:
-                logger.debug("Slack cleanup after failed start raised", exc_info=True)
-            slack_channel = None
-        else:
-            _engine.register_channel(slack_channel)
-            logger.info("Slack bot started")
+    # Install the lifecycle owner even when Slack starts disabled, so a later
+    # reload can enable it without rebuilding gateway state.
+    from nerve.channels.slack_runtime import SlackRuntime
+
+    slack_runtime = SlackRuntime(_engine.router, notification_service)
+    _engine.register_channel_runtime("slack", slack_runtime)
+    try:
+        slack_outcome = await slack_runtime.reconcile(config)
+        if slack_outcome:
+            logger.info("Slack bot %s", slack_outcome)
+    except Exception as e:
+        # Slack is optional; its runtime leaves a failed candidate absent and
+        # retryable while the web UI and other channels continue starting.
+        logger.error("Slack bot failed to start: %s", e, exc_info=True)
 
     # Start cron service
     global _cron_service
@@ -709,12 +693,7 @@ async def lifespan(app: FastAPI):
     # the polling and socket tasks before we get a chance to stop them cleanly.
     if telegram_channel:
         await telegram_channel.stop()
-    # Slack may have been enabled or disabled since startup.
-    from nerve.channels.slack import SlackChannel
-
-    slack_channel = _engine.router.get_channel("slack")
-    if isinstance(slack_channel, SlackChannel):
-        await slack_channel.stop()
+    await slack_runtime.shutdown()
     if ws_sync_task:
         # Exit through the loop's own stop path rather than cancelling it where
         # it stands: a cycle interrupted between the merge and the reload leaves

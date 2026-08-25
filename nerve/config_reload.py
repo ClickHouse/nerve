@@ -11,7 +11,6 @@ the operator table in ``docs/config.md``.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import logging
 from pathlib import Path
 
@@ -246,87 +245,19 @@ def _repoint(new_config, engine, cron_service) -> list[str]:
     return problems
 
 
-def _redact_slack_error(
-    error: Exception, bot_token: str, app_token: str,
-) -> str:
-    """Describe a Slack lifecycle error without exposing either token."""
-    detail = str(error) or type(error).__name__
-    for secret in (bot_token, app_token):
-        if secret:
-            detail = detail.replace(secret, "<redacted>")
-    return detail
-
-
 async def _reconcile_slack(new_config, engine) -> str | None:
-    """Make the registered Slack channel match its enabled state and tokens."""
+    """Ask the installed Slack lifecycle owner to reconcile this generation."""
     if engine is None:
         return None
-
-    from nerve.channels.slack import SlackChannel
-    from nerve.config import get_config
-
     try:
-        channel = engine.router.get_channel("slack")
-        if inspect.isawaitable(channel):
-            channel = await channel
-    except Exception as e:  # noqa: BLE001 — keep the unified reload best-effort
-        logger.warning(
-            "Could not locate the running Slack channel (%s)", type(e).__name__,
-        )
-        return f"{_ERROR_PREFIX}could not locate the running Slack channel"
-    bot_token = new_config.slack.bot_token
-    app_token = new_config.slack.app_token
-
-    if not new_config.slack.enabled:
-        if not isinstance(channel, SlackChannel):
+        runtime = engine.get_channel_runtime("slack")
+        if runtime is None:
             return None
-        try:
-            engine.router.unregister(channel)
-            await channel.stop(drain=True)
-        except Exception as e:  # noqa: BLE001 — report and keep reloading
-            detail = _redact_slack_error(e, bot_token, app_token)
-            logger.warning("Slack disable failed: %s", detail)
-            return f"{_ERROR_PREFIX}{detail}"
-        return "disabled"
-
-    if channel is not None and not isinstance(channel, SlackChannel):
-        return f"{_ERROR_PREFIX}the registered Slack channel has an unexpected type"
-
-    if channel is None:
-        if not bot_token or not app_token:
-            return f"{_ERROR_PREFIX}Slack needs both bot_token and app_token"
-
-        candidate = None
-        try:
-            candidate = SlackChannel(get_config, engine.router)
-            candidate.set_notification_service(
-                getattr(engine, "notification_service", None),
-            )
-            await candidate.start()
-            engine.router.register(candidate)
-        except Exception as e:  # noqa: BLE001 — leave Slack absent and retryable
-            if candidate is not None:
-                try:
-                    await candidate.stop()
-                except Exception:
-                    logger.debug(
-                        "Slack cleanup after failed enable raised", exc_info=True,
-                    )
-            detail = _redact_slack_error(e, bot_token, app_token)
-            logger.warning("Slack enable failed: %s", detail)
-            return f"{_ERROR_PREFIX}{detail}"
-        return "enabled"
-
-    try:
-        if not channel.needs_credential_reload(bot_token, app_token):
-            return None
-        await channel.reload_credentials(bot_token, app_token)
+        return await runtime.reconcile(new_config)
     except Exception as e:  # noqa: BLE001 — report the subsystem, continue reload
-        detail = _redact_slack_error(e, bot_token, app_token)
-        logger.warning("Slack credential reload failed: %s", detail)
+        detail = str(e) or type(e).__name__
+        logger.warning("Slack reload failed: %s", detail)
         return f"{_ERROR_PREFIX}{detail}"
-
-    return "credentials reloaded"
 
 
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:

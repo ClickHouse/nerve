@@ -1005,13 +1005,11 @@ class TelegramConfig:
 SLACK_ALL_COMMANDS: tuple[str, ...] = (
     "sessions", "new", "stop", "star", "unstar", "reply", "doctor", "restart",
 )
-# `sessions` and `reply` are absent on purpose. Both reach every session in
-# the instance, including web and Telegram ones, and Slack has no ownership
-# model yet to narrow them to the caller. In a workspace where several people
-# may DM the bot that would let any of them list, attach to, continue, or
-# answer someone else's work. List them in `slack.commands` to turn them on.
+# `sessions` is absent on purpose: it reaches every interactive session in the
+# instance, and Slack has no ownership model yet to narrow that list. Replies
+# are safe by default because notification lookup is delivery-target scoped.
 SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
-    "new", "stop", "star", "unstar",
+    "new", "stop", "star", "unstar", "reply",
 )
 
 
@@ -1069,10 +1067,6 @@ class SlackConfig:
     allow_channels: list[str] = field(default_factory=list)
     deny_channels: list[str] = field(default_factory=list)
     stream_mode: str = "partial"
-    # Reply inside the thread the message came from, and treat each thread as
-    # its own session. Off means every message in a channel shares one session
-    # and replies land at channel level.
-    reply_in_thread: bool = True
     # None keeps safe defaults; [] disables commands. Host-wide and
     # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
     commands: list[str] | None = None
@@ -1108,7 +1102,6 @@ class SlackConfig:
             allow_channels=d.get("allow_channels") or [],
             deny_channels=d.get("deny_channels") or [],
             stream_mode=stream_mode,
-            reply_in_thread=d.get("reply_in_thread", True),
             commands=_slack_commands(d.get("commands")),
         )
 

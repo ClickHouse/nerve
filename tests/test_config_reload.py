@@ -792,13 +792,17 @@ class TestSlackLifecycleReload:
             cls._body(bot_token, app_token, allow_user),
         )
         monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
-        channel = SlackChannel(cfgmod.get_config, router=MagicMock())
+        channel = SlackChannel(cfgmod.get_config(), router=MagicMock())
         channel._active_bot_token = bot_token
         channel._active_app_token = app_token
+        channel._state = "running"
+        channel._web = object()
         return channel
 
     @staticmethod
     def _engine(channel, notification_service=None):
+        from nerve.channels.slack_runtime import SlackRuntime
+
         state = {"channel": channel}
         router = MagicMock()
         router.get_channel.side_effect = lambda name: (
@@ -816,12 +820,19 @@ class TestSlackLifecycleReload:
 
         router.register.side_effect = register
         router.unregister.side_effect = unregister
-        return SimpleNamespace(
+        if channel is not None:
+            channel.router = router
+        runtime = SlackRuntime(router, notification_service)
+        runtime._channel = channel
+        runtime._active_config = channel.config if channel is not None else None
+        engine = SimpleNamespace(
             router=router,
             notification_service=notification_service,
             reload_mcp_config=AsyncMock(return_value=[]),
             _skill_manager=None,
         )
+        engine.get_channel_runtime = lambda name: runtime if name == "slack" else None
+        return engine
 
     @pytest.mark.asyncio
     async def test_changed_tokens_rotate_the_running_transport(
@@ -831,21 +842,25 @@ class TestSlackLifecycleReload:
         ws.mkdir()
         channel = self._running_channel(config_dir, ws, monkeypatch)
 
-        async def rotate(bot_token, app_token):
-            channel._active_bot_token = bot_token
-            channel._active_app_token = app_token
+        async def rotate(config):
+            channel._active_bot_token = config.slack.bot_token
+            channel._active_app_token = config.slack.app_token
+            channel.apply_config(config)
 
         channel.reload_credentials = AsyncMock(side_effect=rotate)
         engine = self._engine(channel)
 
         _write_config(
-            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+            config_dir,
+            ws,
+            self._body("xoxb-new", "xapp-new"),
         )
         summary = await reload_all(engine, None, config_dir)
 
-        channel.reload_credentials.assert_awaited_once_with(
-            "xoxb-new", "xapp-new",
-        )
+        channel.reload_credentials.assert_awaited_once()
+        desired = channel.reload_credentials.await_args.args[0]
+        assert desired.slack.bot_token == "xoxb-new"
+        assert desired.slack.app_token == "xapp-new"
         assert summary["slack"] == "credentials reloaded"
         assert "slack.bot_token" not in summary.get("restart_required", "")
         assert "slack.app_token" not in summary.get("restart_required", "")
@@ -867,6 +882,8 @@ class TestSlackLifecycleReload:
 
         async def start(channel):
             started.append(channel)
+            channel._state = "running"
+            channel._web = object()
 
         monkeypatch.setattr(SlackChannel, "start", start)
         notifications = object()
@@ -940,6 +957,8 @@ class TestSlackLifecycleReload:
             attempts += 1
             if attempts == 1:
                 raise RuntimeError("bad xoxb-new")
+            channel._state = "running"
+            channel._web = object()
 
         monkeypatch.setattr(SlackChannel, "start", start)
         engine = self._engine(None)
@@ -1058,9 +1077,12 @@ class TestReloadRoute:
         monkeypatch.setattr(route_mod, "get_deps", lambda: SimpleNamespace(engine=None))
         monkeypatch.setattr(
             "nerve.config_reload.reload_all",
-            AsyncMock(return_value={
-                "config": "error: bad yaml", "cron": {"enabled": 3},
-            }),
+            AsyncMock(
+                return_value={
+                    "config": "error: bad yaml",
+                    "cron": {"enabled": 3},
+                }
+            ),
         )
         result = await route_mod.reload_config_route(user={})
         assert result["ok"] is False
