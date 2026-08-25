@@ -623,6 +623,7 @@ class TestOutbound:
         channel._active_app_token = "xapp-old"
         channel._bot_user_id = "U0OLD"
         channel._bot_id = "B0OLD"
+        channel._team_id = "T0OLD"
 
         candidate_web = MagicMock()
         candidate = MagicMock()
@@ -639,7 +640,7 @@ class TestOutbound:
         channel._prepare_transport = AsyncMock(return_value=(
             candidate_web,
             candidate,
-            {"user_id": "U0NEW", "bot_id": "B0NEW"},
+            {"user_id": "U0NEW", "bot_id": "B0NEW", "team_id": "T0OLD"},
         ))
 
         rollback = MagicMock()
@@ -665,7 +666,33 @@ class TestOutbound:
         assert channel._active_app_token == "xapp-old"
         assert channel._bot_user_id == "U0OLD"
         assert channel._bot_id == "B0OLD"
+        assert channel._team_id == "T0OLD"
         assert channel.needs_credential_reload("xoxb-new", "xapp-new")
+
+    @pytest.mark.asyncio
+    async def test_credentials_for_another_workspace_need_a_restart(self):
+        channel = _channel()
+        old_web = channel._web
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        channel._client = old_client
+        channel._active_bot_token = "xoxb-old"
+        channel._active_app_token = "xapp-old"
+        channel._team_id = "T0OLD"
+
+        candidate = MagicMock()
+        candidate.close = AsyncMock()
+        channel._prepare_transport = AsyncMock(return_value=(
+            MagicMock(), candidate, {"team_id": "T0NEW"},
+        ))
+
+        with pytest.raises(RuntimeError, match="different workspace"):
+            await channel.reload_credentials("xoxb-new", "xapp-new")
+
+        candidate.close.assert_awaited_once()
+        old_client.close.assert_not_awaited()
+        assert channel._web is old_web
+        assert channel._team_id == "T0OLD"
 
     @pytest.mark.asyncio
     async def test_a_socket_handshake_cannot_hold_reload_open_forever(
@@ -801,6 +828,20 @@ class TestOutboundFailureRegressions:
 
 class TestDispatchBounds:
     @pytest.mark.asyncio
+    async def test_stopping_acks_without_starting_more_work(self):
+        channel = _channel()
+        channel._stopping = True
+        channel._dispatch = AsyncMock()
+        client = MagicMock()
+        client.send_socket_mode_response = AsyncMock()
+        req = MagicMock(envelope_id="e1", type="events_api", payload={})
+
+        await channel._on_request(client, req)
+
+        client.send_socket_mode_response.assert_awaited_once()
+        channel._dispatch.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_envelopes_past_the_cap_are_dropped(self):
         import nerve.channels.slack as slack_module
 
@@ -837,6 +878,40 @@ class TestDispatchBounds:
         await started.wait()
         await channel.stop()
         assert task.done()
+
+    @pytest.mark.asyncio
+    async def test_live_disable_can_drain_inflight_dispatches(self):
+        channel = _channel()
+        channel._client = MagicMock()
+        channel._client.close = AsyncMock()
+        finished = asyncio.Event()
+
+        async def _finish():
+            await asyncio.sleep(0)
+            finished.set()
+
+        task = asyncio.create_task(_finish())
+        channel._inflight.add(task)
+        await channel.stop(drain=True)
+
+        assert finished.is_set()
+        assert not task.cancelled()
+        assert channel._web is None
+
+    @pytest.mark.asyncio
+    async def test_live_disable_bounds_the_drain(self, monkeypatch):
+        import nerve.channels.slack as slack_module
+
+        monkeypatch.setattr(slack_module, "_STOP_DRAIN_TIMEOUT", 0)
+        channel = _channel()
+        channel._client = MagicMock()
+        channel._client.close = AsyncMock()
+        task = asyncio.create_task(asyncio.Event().wait())
+        channel._inflight.add(task)
+
+        await channel.stop(drain=True)
+
+        assert task.cancelled()
 
 
 class TestNotificationBlockLimits:

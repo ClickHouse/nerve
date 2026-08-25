@@ -71,6 +71,19 @@ class _StubChannel(BaseChannel):
 # ---------------------------------------------------------------------------
 
 
+class TestRouterRegistry:
+    def test_unregister_only_removes_the_registered_instance(self):
+        router = ChannelRouter(MagicMock())
+        current = _StubChannel(name="slack")
+        stale = _StubChannel(name="slack")
+        router.register(current)
+
+        assert not router.unregister(stale)
+        assert router.get_channel("slack") is current
+        assert router.unregister(current)
+        assert router.get_channel("slack") is None
+
+
 @pytest.mark.asyncio
 class TestRouterSendFile:
     async def test_no_channel_arg_returns_false_no_context(self):

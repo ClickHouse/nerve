@@ -175,7 +175,8 @@ class FakeSlack:
             "ok": True,
             "user_id": self.bot_user_id,
             "user": "nerve",
-            "team": "T0FAKE",
+            "team": "fake",
+            "team_id": "T0FAKE",
         }
 
     def _api_apps_connections_open(self, body: dict) -> dict:

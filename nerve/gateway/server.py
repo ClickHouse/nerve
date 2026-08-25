@@ -709,6 +709,8 @@ async def lifespan(app: FastAPI):
     # the polling and socket tasks before we get a chance to stop them cleanly.
     if telegram_channel:
         await telegram_channel.stop()
+    # Slack may have been enabled or disabled since startup.
+    slack_channel = _engine.router.get_channel("slack")
     if slack_channel:
         await slack_channel.stop()
     if ws_sync_task:
