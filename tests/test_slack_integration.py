@@ -78,22 +78,26 @@ class TestSocketMode:
         ignore_stale_events(channel)
         try:
             class ProbeClient:
-                posts = 0
+                # Slack stamps a message ts with the epoch second it was
+                # sent, and the harness calibrates its staleness clock from
+                # one, so a counter here would leave the cutoff blind.
+                def __init__(self):
+                    self.sent: list[str] = []
 
                 async def chat_postMessage(self, **kwargs):
-                    self.posts += 1
-                    ts = f"1.{self.posts}"
+                    ts = f"{time.time():.6f}"
+                    self.sent.append(ts)
                     event = {
                         "type": "message", "channel": kwargs["channel"],
                         "channel_type": "channel", "user": "U0BOT",
                         "ts": ts, "text": kwargs["text"],
                     }
-                    if self.posts == 2:
+                    if len(self.sent) == 2:
                         # The first probe missed the immediate attempts and
                         # arrives only as a retry. Readiness must ack it before
                         # returning, or its next retry poisons a later run.
                         await slack.push_event(
-                            {**event, "ts": "1.1"},
+                            {**event, "ts": self.sent[0]},
                             retry_attempt=2,
                             retry_reason="timeout",
                         )
@@ -108,10 +112,11 @@ class TestSocketMode:
                     })
                     return {"ok": True}
 
+            probe = ProbeClient()
             await wait_until_receiving(
                 sink,
                 timeout=2.0,
-                web_client=ProbeClient(),
+                web_client=probe,
                 probe_interval=0.05,
             )
             await slack.push("events_api", {
@@ -120,7 +125,8 @@ class TestSocketMode:
             })
             await slack.settle()
             assert len(slack.acks) == 5
-            assert "1.1" not in routed, "a marked retry reached the router"
+            assert probe.sent[0] not in routed, "a marked retry reached the router"
+            assert probe.sent[1] in routed, "the fresh probe never arrived"
             assert "3.1" not in routed, "an unmarked stale event reached the router"
         finally:
             await sink.close()
