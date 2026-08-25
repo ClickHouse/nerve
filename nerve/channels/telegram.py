@@ -1211,7 +1211,7 @@ class TelegramChannel(BaseChannel):
         # Stop the current session before creating a new one
         prev = await self.router.get_last_session(channel_key)
         if prev:
-            stopped = await self.router.engine.stop_session(prev)
+            stopped = await self.router.stop_session(prev)
             if stopped:
                 await update.message.reply_text(
                     f"Stopped session `{prev}`.",
@@ -1240,7 +1240,7 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("No active session.")
             return
 
-        stopped = await self.router.engine.stop_session(session_id)
+        stopped = await self.router.stop_session(session_id)
         if stopped:
             await update.message.reply_text(
                 f"Stopped session `{session_id}`.",
@@ -1882,19 +1882,21 @@ class TelegramChannel(BaseChannel):
             await query.answer("Service unavailable", show_alert=True)
             return
 
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id,
-            answer=answer,
-            answered_by="telegram",
+        result = await self._notification_service.answer_delivered_notification(
+            notification_id,
+            answer,
+            channel="telegram",
+            target=str(update.effective_chat.id),
+            actor=str(query.from_user.id),
         )
 
-        if success:
+        if result:
             status_line = f"\u2705 Answered: {answer}"
             toast = f"Answered: {answer}"
             # A snooze keeps the row pending with redeliver_at stamped \u2014
             # confirm on the card that it will come back, instead of the
             # generic answered state (which read as "handled, gone").
-            snoozed_until = await self._get_snoozed_until(notification_id)
+            snoozed_until = self._snoozed_until(result)
             if snoozed_until:
                 status_line = (
                     f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
@@ -1912,26 +1914,17 @@ class TelegramChannel(BaseChannel):
         else:
             await query.answer("Already answered or expired", show_alert=True)
 
-    async def _get_snoozed_until(self, notification_id: str) -> str | None:
-        """Return a human-readable re-delivery time if the row was snoozed.
-
-        After ``handle_answer`` succeeds, a snoozed approval is the only
-        outcome that leaves the row ``pending`` with ``redeliver_at``
-        set. Rendered in the host's local timezone. None when the answer
-        was a final decision (or anything fails \u2014 this is cosmetic).
-        """
+    @staticmethod
+    def _snoozed_until(notification: dict[str, Any]) -> str | None:
+        """Render the next delivery time when an answer snoozed the row."""
         try:
-            notif = await self._notification_service.db.get_notification(
-                notification_id,
-            )
             if (
-                not notif
-                or notif.get("status") != "pending"
-                or not notif.get("redeliver_at")
+                notification.get("status") != "pending"
+                or not notification.get("redeliver_at")
             ):
                 return None
             from datetime import datetime
-            dt = datetime.fromisoformat(notif["redeliver_at"])
+            dt = datetime.fromisoformat(notification["redeliver_at"])
             return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
         except Exception:
             return None
@@ -1950,21 +1943,16 @@ class TelegramChannel(BaseChannel):
 
         answer_text = " ".join(context.args)
 
-        pending = await self._notification_service.db.list_notifications(
-            status="pending", type="question", limit=1,
-        )
-        if not pending:
-            await update.message.reply_text("No pending questions.")
-            return
-
-        notification_id = pending[0]["id"]
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id,
-            answer=answer_text,
-            answered_by="telegram",
+        result = await self._notification_service.answer_latest_question(
+            answer_text,
+            channel="telegram",
+            target=str(update.effective_chat.id),
+            actor=str(update.effective_user.id),
         )
 
-        if success:
-            await update.message.reply_text(f"Answer recorded for: {pending[0]['title']}")
+        if result:
+            await update.message.reply_text(
+                f"Answer recorded for: {result['title']}",
+            )
         else:
-            await update.message.reply_text("Failed to record answer.")
+            await update.message.reply_text("No pending questions in this chat.")

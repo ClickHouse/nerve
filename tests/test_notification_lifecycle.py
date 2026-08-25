@@ -166,6 +166,59 @@ class TestSchema:
         assert notif["redeliver_at"] is None
         assert notif["redelivery_count"] == 0
 
+    async def test_v045_delivery_scope_exists(self, db: Database):
+        async with db.db.execute(
+            "PRAGMA table_info(notification_deliveries)",
+        ) as cur:
+            cols = {row[1] async for row in cur}
+        assert {"notification_id", "channel", "target", "message_id"} <= cols
+
+
+@pytest.mark.asyncio
+class TestScopedAnswers:
+    async def test_latest_question_is_scoped_to_delivery_target(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("wanted-session", source="external")
+        await db.create_session("other-session", source="external")
+        await db.create_notification(
+            "wanted", "wanted-session", "question", "Wanted question",
+        )
+        await db.record_notification_delivery(
+            "wanted", "telegram", target="100", message_id="1",
+        )
+        await db.create_notification(
+            "newer-other", "other-session", "question", "Other question",
+        )
+        await db.record_notification_delivery(
+            "newer-other", "telegram", target="200", message_id="2",
+        )
+
+        result = await svc.answer_latest_question(
+            "yes", channel="telegram", target="100", actor="42",
+        )
+
+        assert result and result["id"] == "wanted"
+        assert (await db.get_notification("newer-other"))["status"] == "pending"
+        metadata = json.loads(result["metadata"])
+        assert metadata["answered_by_actor"] == "42"
+
+    async def test_explicit_answer_rejects_a_different_delivery_target(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("s1", source="external")
+        await db.create_notification("n1", "s1", "question", "Question")
+        await db.record_notification_delivery("n1", "telegram", target="100")
+
+        result = await svc.answer_delivered_notification(
+            "n1", "yes", channel="telegram", target="200", actor="42",
+        )
+
+        assert result is None
+        assert (await db.get_notification("n1"))["status"] == "pending"
+
 
 # ----------------------------------------------------------------------
 #  Snooze semantics
