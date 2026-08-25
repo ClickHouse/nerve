@@ -859,6 +859,12 @@ class NotificationService:
                     if not msg_id:
                         return None
                     return "slack"
+                else:
+                    logger.warning(
+                        "notifications.channels names %r, which nothing "
+                        "delivers to; notification %s skips it",
+                        channel_name, notification_id,
+                    )
             except Exception as e:
                 logger.error(
                     "Failed to deliver %s to %s: %s",
@@ -1160,9 +1166,20 @@ class NotificationService:
         """Send a notification to Slack, with Block Kit buttons for answers."""
         channel = self._get_slack_channel()
         if not channel:
-            logger.warning(
-                "Slack channel not available for notification %s", notification_id,
-            )
+            # Slack is in the default channel list, so most installations
+            # reach here with it switched off. An absent channel is that
+            # case and stays quiet; a registered one that cannot take
+            # traffic is worth a line.
+            if self.engine.router.get_channel("slack") is None:
+                logger.debug(
+                    "Slack is not running; notification %s skips it",
+                    notification_id,
+                )
+            else:
+                logger.warning(
+                    "Slack channel not available for notification %s",
+                    notification_id,
+                )
             return None
 
         text = self._build_notification_text(session_id, title, body, priority)
