@@ -1758,7 +1758,7 @@ class TestSetCronLogSession:
         assert logs[0]["session_id"] == "cron:job-live2:20260610-130000"
 
 
-class TestChannelSessionsByPrefix:
+class TestChannelSessionsForConversation:
     """One conversation can own several sessions — a Slack channel keys one
     per thread — so a caller holding only the conversation needs the set.
     """
@@ -1780,25 +1780,23 @@ class TestChannelSessionsByPrefix:
             "slack:C1:1.0": "thread_a",
             "slack:C1:2.0": "thread_b",
         })
-        rows = await db.list_channel_sessions_by_prefix("slack:C1")
+        rows = await db.list_channel_sessions_for_conversation("slack:C1")
         assert {r["session_id"] for r in rows} == {"base", "thread_a", "thread_b"}
 
     @pytest.mark.asyncio
     async def test_it_does_not_bleed_into_a_longer_channel_id(self, db):
         # "slack:C1" is a prefix of "slack:C12" as a string.
         await self._seed(db, {"slack:C1": "mine", "slack:C12": "theirs"})
-        rows = await db.list_channel_sessions_by_prefix("slack:C1")
-        assert "theirs" in {r["session_id"] for r in rows}, (
-            "the SQL is a prefix match; the caller narrows further"
-        )
-        rows = await db.list_channel_sessions_by_prefix("slack:C12")
+        rows = await db.list_channel_sessions_for_conversation("slack:C1")
+        assert {r["session_id"] for r in rows} == {"mine"}
+        rows = await db.list_channel_sessions_for_conversation("slack:C12")
         assert {r["session_id"] for r in rows} == {"theirs"}
 
     @pytest.mark.asyncio
     async def test_wildcards_in_the_key_are_escaped(self, db):
         # An unescaped _ or % would silently widen the match.
         await self._seed(db, {"slack:C_1": "literal", "slack:CX1": "other"})
-        rows = await db.list_channel_sessions_by_prefix("slack:C_1")
+        rows = await db.list_channel_sessions_for_conversation("slack:C_1")
         assert {r["session_id"] for r in rows} == {"literal"}
 
     @pytest.mark.asyncio
@@ -1818,7 +1816,7 @@ class TestChannelSessionsByPrefix:
             {"slack:C1:1.0": "live", "slack:C1:2.0": "gone"},
             statuses={"gone": "archived"},
         )
-        rows = await db.list_channel_sessions_by_prefix(
+        rows = await db.list_channel_sessions_for_conversation(
             "slack:C1", exclude_statuses=("archived",),
         )
         assert {r["session_id"] for r in rows} == {"live"}
@@ -1826,5 +1824,5 @@ class TestChannelSessionsByPrefix:
     @pytest.mark.asyncio
     async def test_rows_carry_the_session_title(self, db):
         await self._seed(db, {"slack:C1:1.0": "s1"})
-        rows = await db.list_channel_sessions_by_prefix("slack:C1")
+        rows = await db.list_channel_sessions_for_conversation("slack:C1")
         assert rows[0]["title"] == "t-s1"
