@@ -635,7 +635,11 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           the textarea takes a full-width line of its own below them (see the
           `basis-full`/`order-1` pair on it). */}
       <div className="px-4 py-3">
-        <div className="max-w-[var(--chat-width)] mx-auto flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
+        {/* `relative` is the anchor for the run-later popup below. It hangs off
+            this row rather than off its own 40px trigger so that it is aligned
+            to the composer and cannot leave the viewport, wherever the trigger
+            happens to have wrapped to. */}
+        <div className="relative max-w-[var(--chat-width)] mx-auto flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
           {/* File attach button */}
           <IconButton
             size="md"
@@ -774,8 +778,16 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           />
           {/* Run-later kebab — three-dots menu next to Send. Its submenu
               defers the composed prompt into a new session without spending
-              tokens now (opens upward; the composer sits at the bottom). */}
-          <div className="relative shrink-0 order-2 md:order-none" ref={menuRef}>
+              tokens now (opens upward; the composer sits at the bottom).
+
+              No `order`: it belongs on the controls line with everything else.
+              It used to carry `order-2`, which on a phone sorted it *after* the
+              `order-1` textarea — so it wrapped onto a third line of its own,
+              alone at the left margin under the message box, and the popup
+              (right-aligned to a 40px trigger 16px from the left edge) opened
+              ~114px off the left of the screen. Desktop never showed it: that
+              row is `md:flex-nowrap`, so nothing wraps and `order` is inert. */}
+          <div className="shrink-0" ref={menuRef}>
             <IconButton
               label="More options"
               size="md"
@@ -793,7 +805,14 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               <MoreHorizontal size={18} />
             </IconButton>
             {menuOpen && (
-              <div className="absolute right-0 bottom-full mb-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[170px]">
+              // A fixed width, where this used to be `min-w-[170px]`. Same
+              // 170px on screen — the min-width was what decided it before, an
+              // absolutely-positioned box with only `right` set having had
+              // nothing but a 40px trigger to shrink-to-fit against. Anchored to
+              // the composer there is 500px of room and it would take all of it
+              // for four short labels, and `w-max` does not help: Chrome's
+              // max-content for these `w-full` children lands in the same place.
+              <div className="absolute right-0 bottom-full mb-1 z-50 w-[170px] bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1">
                 <Button
                   variant="subtle"
                   size="sm"
