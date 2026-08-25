@@ -8,6 +8,7 @@ the ack contract, and the shape of the calls actually put on the wire.
 
 from __future__ import annotations
 
+import copy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -41,7 +42,7 @@ async def _started(server: FakeSlack, monkeypatch, **slack_kwargs):
     router = MagicMock()
     router.handle_message = AsyncMock(return_value="ok")
     router.get_last_session = AsyncMock(return_value=None)
-    channel = SlackChannel(lambda: cfg, router)
+    channel = SlackChannel(cfg, router)
     server.patch_client(monkeypatch)
     await channel.start()
     await server.wait_connected()
@@ -70,7 +71,10 @@ class TestSocketMode:
         )
         old_client = channel._client
         try:
-            await channel.reload_credentials("xoxb-replaced", "xapp-replaced")
+            config = copy.deepcopy(channel.config)
+            config.slack.bot_token = "xoxb-replaced"
+            config.slack.app_token = "xapp-replaced"
+            await channel.reload_credentials(config)
 
             assert channel._client is not old_client
             assert not await old_client.is_connected()
@@ -99,7 +103,10 @@ class TestSocketMode:
         slack.errors[failed_method] = "invalid_auth"
         try:
             with pytest.raises(RuntimeError, match="token failed validation"):
-                await channel.reload_credentials(bot_token, app_token)
+                config = copy.deepcopy(channel.config)
+                config.slack.bot_token = bot_token
+                config.slack.app_token = app_token
+                await channel.reload_credentials(config)
 
             assert channel._client is old_client
             assert await old_client.is_connected()
@@ -148,8 +155,10 @@ class TestSocketMode:
 
     async def test_stop_closes_the_socket(self, slack, monkeypatch):
         channel, _ = await _started(slack, monkeypatch, allow_users=["U1"])
+        client = channel._client
         await channel.stop()
-        assert not await channel._client.is_connected()
+        assert channel._client is None
+        assert not await client.is_connected()
 
 
 @pytest.mark.asyncio

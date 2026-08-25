@@ -2,7 +2,7 @@
 
 Inbound messages are authorized before routing. Targets encode a channel and
 optional thread as ``C0456DEF[:timestamp]``; channel keys add the ``slack:``
-prefix, allowing per-thread sessions when configured.
+prefix. Shared channels always use thread-scoped sessions.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from nerve.channels.access import Identity, needs_name_resolution
 from nerve.channels.archives import (
@@ -31,6 +31,16 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.slack_access import SlackAccessPolicy
+from nerve.channels.slack_presentation import (
+    MAX_MSG_LEN,
+    _MAX_ACTION_ELEMENTS,
+    _SESSIONS_BUTTON_LIMIT,
+    _md_to_slack,
+    build_sessions_blocks,
+    slack_emoji_name,
+    slack_to_plain,
+    split_message,
+)
 from nerve.config import (
     SLACK_ALL_COMMANDS,
     SLACK_DEFAULT_COMMANDS,
@@ -42,9 +52,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# chat.postMessage accepts 40k chars but renders only the first ~4k as a
-# single block, so split well below that and let each chunk stand alone.
-MAX_MSG_LEN = 3900
 # chat.update is limited to roughly one call per second per channel.
 EDIT_INTERVAL = 1.2
 # Watchdog: check every 30s, log heartbeat every ~5 min.
@@ -65,8 +72,6 @@ _NAME_CACHE_TTL = 600.0
 # Concurrent dispatch tasks. The router serialises per session, so this only
 # bounds envelopes not yet routed — including ones headed for a refusal.
 _MAX_INFLIGHT = 100
-# Slack renders at most 25 elements in one actions block.
-_MAX_ACTION_ELEMENTS = 25
 # Star picker action ids: ``starpick:<1|0>:<session id>``. Distinct from the
 # session card's ``sessstar:`` toggle, which flips whatever the row holds —
 # a picker has to set the state the command asked for.
@@ -97,26 +102,6 @@ _MAX_DOWNLOAD_SIZE = 20_000_000    # refuse to pull anything larger into a promp
 _TEXT_EXTENSIONS = TEXT_EXTENSIONS
 _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 
-# Unicode emoji → Slack short name. The agent's set_reaction tool speaks the
-# Telegram reaction vocabulary; reactions.add only accepts short names. An
-# emoji outside this table is skipped rather than guessed at, so a reaction
-# never silently lands as the wrong one.
-_EMOJI_TO_SLACK: dict[str, str] = {
-    "👍": "thumbsup", "👎": "thumbsdown", "❤": "heart", "❤️": "heart",
-    "🔥": "fire", "🥰": "smiling_face_with_3_hearts", "👏": "clap",
-    "😁": "grin", "🤔": "thinking_face", "🤯": "exploding_head",
-    "😱": "scream", "😢": "cry", "🎉": "tada", "🤩": "star-struck",
-    "🙏": "pray", "👌": "ok_hand", "🥱": "yawning_face", "😍": "heart_eyes",
-    "🌚": "new_moon_with_face", "💯": "100", "🤣": "rolling_on_the_floor_laughing",
-    "⚡": "zap", "🏆": "trophy", "💔": "broken_heart", "🤨": "face_with_raised_eyebrow",
-    "😐": "neutral_face", "🍾": "champagne", "👀": "eyes", "🙈": "see_no_evil",
-    "😇": "innocent", "🤝": "handshake", "🤗": "hugging_face", "🫡": "saluting_face",
-    "🆒": "cool", "😎": "sunglasses", "✅": "white_check_mark", "❌": "x",
-    "⏳": "hourglass_flowing_sand", "🚀": "rocket", "✍": "writing_hand",
-    "🤡": "clown_face", "💩": "hankey", "😴": "sleeping", "👻": "ghost",
-}
-
-
 # ---------------------------------------------------------------------- #
 #  Pure helpers — module level so they are testable without a transport   #
 # ---------------------------------------------------------------------- #
@@ -134,15 +119,6 @@ def is_slack_id(pattern: str) -> bool:
     return bool(_SLACK_ID_RE.match(pattern))
 
 
-# A bare & — one that is not already the start of an escape Slack recognises.
-_BARE_AMPERSAND_RE = re.compile(r"&(?!(?:amp|lt|gt);)")
-
-
-def _escape_ampersands(text: str) -> str:
-    """Escape ``&`` without double-escaping one that is already an entity."""
-    return _BARE_AMPERSAND_RE.sub("&amp;", text)
-
-
 def format_target(channel_id: str, thread_ts: str | None = None) -> str:
     """Pack a conversation address into one opaque target string."""
     return f"{channel_id}:{thread_ts}" if thread_ts else channel_id
@@ -158,288 +134,6 @@ def parse_target(target: str) -> tuple[str, str | None]:
     return channel_id, (thread_ts if sep and thread_ts else None)
 
 
-def _md_to_slack(text: str) -> str:
-    """Convert standard Markdown to Slack mrkdwn.
-
-    Slack uses ``*`` for bold, ``_`` for italic, and ``<url|label>`` for links.
-    Protect code spans and fences before substitution so they stay literal.
-    """
-    protected: list[str] = []
-
-    def _protect(replacement: str) -> str:
-        idx = len(protected)
-        protected.append(replacement)
-        return f"\x00{idx}\x00"
-
-    def _fence(m: re.Match) -> str:
-        # Slack has no language tag — it would render as the first line of
-        # the block — and needs the newline after the opening fence kept,
-        # or the whole block collapses onto one line.
-        return _protect("```\n" + m.group(2).strip("\n") + "\n```")
-    text = re.sub(r"```(\w*)\n?(.*?)```", _fence, text, flags=re.DOTALL)
-
-    def _code(m: re.Match) -> str:
-        return _protect(f"`{m.group(1)}`")
-    text = re.sub(r"`([^`]+)`", _code, text)
-
-    def _link(m: re.Match) -> str:
-        # Slack escapes & inside a link too, and rewrites the message if we
-        # do not. Doing it here keeps what we send byte-identical to what
-        # Slack stores, so a later edit does not fight the normalisation.
-        label = _escape_ampersands(m.group(1))
-        url = _escape_ampersands(m.group(2))
-        return _protect(f"<{url}|{label}>")
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link, text)
-
-    # Slack requires these three escaped in message text; everything else is
-    # literal. Do it before adding markup so the markup itself survives.
-    text = _escape_ampersands(text).replace("<", "&lt;").replace(">", "&gt;")
-
-    # Headings have no equivalent — render the text as a bold line. Bold is
-    # staged behind \x01 until the italic pass has run, so a bold marker is
-    # never re-read as a pair of italic ones.
-    text = re.sub(
-        r"^\s{0,3}#{1,6}\s+(.+?)\s*$",
-        lambda m: f"\x01{m.group(1)}\x01",
-        text,
-        flags=re.MULTILINE,
-    )
-    text = re.sub(
-        r"\*\*(.+?)\*\*", lambda m: f"\x01{m.group(1)}\x01", text, flags=re.DOTALL,
-    )
-    text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"_\1_", text)
-    text = text.replace("\x01", "*")
-
-    # Markdown bullets render as literal dashes in Slack.
-    text = re.sub(r"^(\s*)[-+]\s+", r"\1• ", text, flags=re.MULTILINE)
-
-    for i, repl in enumerate(protected):
-        text = text.replace(f"\x00{i}\x00", repl)
-
-    return text
-
-
-def slack_to_plain(text: str, bot_user_id: str = "") -> str:
-    """Turn Slack's wire format into something worth putting in a prompt.
-
-    Unwraps ``<url|label>`` and ``<@U123>`` markup, drops the bot's own
-    mention (the agent does not need to be told it was addressed), and
-    unescapes the three reserved entities.
-    """
-    if bot_user_id:
-        text = re.sub(rf"<@{re.escape(bot_user_id)}(\|[^>]*)?>", "", text)
-    # Entity forms first — each is a <…|…> too, so the generic link rule
-    # would otherwise claim them and render "#general" as "general (#C1)".
-    text = re.sub(r"<#C[A-Z0-9]+\|([^>]+)>", r"#\1", text)
-    text = re.sub(r"<#(C[A-Z0-9]+)>", r"#\1", text)
-    text = re.sub(r"<@([UW][A-Z0-9]+)\|([^>]+)>", r"@\2", text)
-    text = re.sub(r"<@([UW][A-Z0-9]+)>", r"@\1", text)
-    text = re.sub(r"<!subteam\^[A-Z0-9]+\|@?([^>]+)>", r"@\1", text)
-    text = re.sub(r"<!(here|channel|everyone)(\|[^>]*)?>", r"@\1", text)
-    text = re.sub(r"<([^|>]+)\|([^>]+)>", r"\2 (\1)", text)
-    text = re.sub(r"<((?:https?|mailto):[^>]+)>", r"\1", text)
-    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-    return text.strip()
-
-
-def split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
-    """Split *text* into chunks under *limit*, preferring line boundaries.
-
-    A hard slice mid-line breaks code fences and lists across messages, so
-    lines are packed greedily and only a single over-long line is cut.
-    """
-    if len(text) <= limit:
-        return [text] if text else []
-
-    chunks: list[str] = []
-    current = ""
-    for line in text.split("\n"):
-        while len(line) > limit:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.append(line[:limit])
-            line = line[limit:]
-        if not current:
-            current = line
-        elif len(current) + 1 + len(line) <= limit:
-            current = f"{current}\n{line}"
-        else:
-            chunks.append(current)
-            current = line
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def slack_emoji_name(emoji: str) -> str | None:
-    """Map a unicode emoji (or an already-short name) to a Slack short name."""
-    cleaned = emoji.strip().strip(":")
-    if cleaned and all(c.isalnum() or c in "-_+" for c in cleaned):
-        return cleaned
-    return _EMOJI_TO_SLACK.get(emoji.strip()) or _EMOJI_TO_SLACK.get(
-        emoji.strip().rstrip("️"),
-    )
-
-
-# Block Kit rendering ---------------------------------------------------- #
-
-_SESSIONS_BUTTON_LIMIT = 8
-_SESSION_LABEL_MAX = 70          # Slack button text is capped at 75 chars
-
-
-def _session_label(session: dict, current_id: str | None) -> str:
-    """Button label for one session: current marked ✓, starred marked ⭐."""
-    title = (session.get("title") or "").strip() or session.get("id", "?")
-    prefix = "✓ " if session.get("id") == current_id else ""
-    if session.get("starred"):
-        prefix += "⭐ "
-    label = f"{prefix}{title}"
-    if len(label) > _SESSION_LABEL_MAX:
-        label = label[: _SESSION_LABEL_MAX - 1] + "…"
-    return label
-
-
-def build_sessions_blocks(
-    sessions: list[dict], current_id: str | None,
-) -> list[dict[str, Any]]:
-    """Render the ``/nerve sessions`` Block Kit view (pure, sync — testable).
-
-    One tap-to-switch button per session with the id carried in ``value``,
-    a ⭐ toggle beside it, and a trailing "New session" button. Switching
-    away leaves the previous session running; its output still reaches the
-    conversation it was bound to.
-    """
-    blocks: list[dict[str, Any]] = []
-    shown = sessions[:_SESSIONS_BUTTON_LIMIT]
-
-    if not shown:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "No sessions yet — start one below."},
-        })
-    else:
-        current_title = next(
-            (
-                (s.get("title") or s.get("id"))
-                for s in shown
-                if s.get("id") == current_id
-            ),
-            None,
-        )
-        header = "*Sessions* — tap to switch."
-        if current_title:
-            header += f"\nCurrent: {current_title}"
-        header += "\n⭐ keeps a session alive (never auto-closed)."
-        blocks.append({
-            "type": "section", "text": {"type": "mrkdwn", "text": header},
-        })
-        for s in shown:
-            sid = s.get("id")
-            if not sid:
-                continue
-            blocks.append({
-                "type": "actions",
-                "block_id": f"sess_row:{sid}",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": _session_label(s, current_id),
-                            "emoji": True,
-                        },
-                        "action_id": f"sess:{sid}",
-                        "value": sid,
-                    },
-                    {
-                        "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "⭐" if s.get("starred") else "☆",
-                            "emoji": True,
-                        },
-                        "action_id": f"sessstar:{sid}",
-                        "value": sid,
-                    },
-                ],
-            })
-
-    blocks.append({
-        "type": "actions",
-        "block_id": "sess_new",
-        "elements": [{
-            "type": "button",
-            "text": {"type": "plain_text", "text": "➕ New session", "emoji": True},
-            "action_id": "sess:new",
-            "value": "new",
-            "style": "primary",
-        }],
-    })
-    return blocks
-
-
-# One section block holds 3000 chars, and one message holds 50 blocks. The
-# section budget leaves room for the option rows below them.
-_MAX_SECTION_LEN = 3000
-_MAX_SECTION_BLOCKS = 45
-
-# Slack renders a styled button in green or red. Keys are the canonical
-# approval ``value`` strings that NotificationService sends.
-_APPROVAL_STYLES: dict[str, str] = {
-    "approve": "primary", "yes": "primary", "allow": "primary",
-    "decline": "danger", "deny": "danger", "no": "danger", "reject": "danger",
-}
-
-
-def build_notification_blocks(
-    text: str,
-    notification_id: str,
-    options: list[tuple[str, str]] | None = None,
-) -> list[dict[str, Any]]:
-    """Render notification text and option buttons as Block Kit.
-
-    Text is split at Slack's section limit and truncated only at the full
-    message's block limit. IDs and values use their dedicated button fields.
-    """
-    chunks = split_message(_md_to_slack(text), _MAX_SECTION_LEN)
-    if len(chunks) > _MAX_SECTION_BLOCKS:
-        dropped = sum(len(c) for c in chunks[_MAX_SECTION_BLOCKS - 1:])
-        chunks = chunks[: _MAX_SECTION_BLOCKS - 1]
-        chunks.append(
-            f"_… {dropped} more characters — open the notification in the "
-            "web UI to read the rest._",
-        )
-    blocks: list[dict[str, Any]] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
-        for chunk in chunks
-    ]
-    elements = [
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": label[:75], "emoji": True},
-            "action_id": f"notif:{notification_id}:{value}"[:255],
-            "value": value[:2000],
-            **(
-                {"style": _APPROVAL_STYLES[value.lower()]}
-                if value.lower() in _APPROVAL_STYLES
-                else {}
-            ),
-        }
-        for label, value in (options or [])
-    ]
-    # Slack rejects the whole message with invalid_blocks past 25 elements in
-    # one actions block, so a long option list is spread over several rows.
-    for start in range(0, len(elements), _MAX_ACTION_ELEMENTS):
-        chunk = elements[start:start + _MAX_ACTION_ELEMENTS]
-        blocks.append({
-            "type": "actions",
-            "block_id": f"notif:{notification_id}:{start}",
-            "elements": chunk,
-        })
-    return blocks
-
-
 class SlackChannel(BaseChannel):
     """Slack bot channel over Socket Mode.
 
@@ -448,16 +142,14 @@ class SlackChannel(BaseChannel):
     """
 
     def __init__(
-        self, config: Callable[[], NerveConfig], router: ChannelRouter,
+        self, config: NerveConfig, router: ChannelRouter,
     ):
         self._config = config
         self.router = router
         self._client: Any = None            # AsyncSocketModeClient
         self._web: Any = None               # AsyncWebClient
-        # The config object is hot, but a connected transport must use one
-        # coherent credential pair. Keep the pair that actually built the
-        # clients so a watchdog reconnect cannot combine a newly loaded app
-        # token with the previous Web API client.
+        # Credentials from the runtime's active config generation.
+        # A watchdog reconnect must reuse this coherent pair.
         self._active_bot_token = ""
         self._active_app_token = ""
         self._transport_lock = asyncio.Lock()
@@ -465,8 +157,8 @@ class SlackChannel(BaseChannel):
         self._bot_id: str = ""     # the app's own bot_id, to spot our own posts
         self._team_id: str = ""
         self._notification_service = None   # Set after service is created
-        self._watchdog_task: asyncio.Task | None = None
         self._stopping = False
+        self._state = "stopped"
         self._last_event_time: float = 0.0  # monotonic, set on any inbound envelope
         # Envelopes are dispatched off the ack path; hold a strong reference so
         # the loop cannot collect a task mid-flight.
@@ -480,8 +172,8 @@ class SlackChannel(BaseChannel):
             collections.OrderedDict()
         )
         # target -> ts of the last inbound message, for the read-receipt ack.
-        # With reply_in_thread on, every thread is a distinct target, so this
-        # and the name cache are bounded rather than left to grow per thread.
+        # Every shared-channel thread is a distinct target, so this and the
+        # name cache are bounded rather than left to grow per thread.
         self._last_inbound_ts: collections.OrderedDict[str, str] = (
             collections.OrderedDict()
         )
@@ -496,15 +188,17 @@ class SlackChannel(BaseChannel):
 
     @property
     def config(self) -> NerveConfig:
-        """The live config, resolved per read rather than captured.
+        """The config generation active for this Slack runtime."""
+        return self._config
 
-        The bot outlives every reload and the guardrail lists decide, on each
-        event, whether a message reaches the agent. Reading them per use means
-        a reload that tightens ``deny_users`` takes effect immediately. The
-        tokens are handed to the transport at connect time; ``reload_all``
-        rotates that transport explicitly when either token changes.
-        """
-        return self._config()
+    def apply_config(self, config: NerveConfig) -> None:
+        """Atomically advance behavior that needs no transport work."""
+        self._config = config
+
+    @property
+    def is_available(self) -> bool:
+        """Whether external delivery may use this channel."""
+        return self._state == "running" and self._web is not None
 
     @property
     def policy(self) -> SlackAccessPolicy:
@@ -561,24 +255,28 @@ class SlackChannel(BaseChannel):
         """Connect the Socket Mode client and start dispatching events."""
         cfg = self.config.slack
         if not cfg.bot_token or not cfg.app_token:
-            logger.warning(
-                "Slack needs both bot_token (xoxb-…) and app_token (xapp-…) — "
-                "channel not started",
+            raise RuntimeError(
+                "Slack needs both bot_token (xoxb-…) and app_token (xapp-…)",
             )
-            return
 
         self._stopping = False
+        self._state = "starting"
         async with self._transport_lock:
-            web, client, auth = await self._prepare_transport(
-                cfg.bot_token, cfg.app_token,
-            )
-            self._activate_transport(
-                web, client, auth, cfg.bot_token, cfg.app_token,
-            )
             try:
+                web, client, auth = await self._prepare_transport(
+                    cfg.bot_token,
+                    cfg.app_token,
+                )
+                self._activate_transport(
+                    web,
+                    client,
+                    auth,
+                    cfg.bot_token,
+                    cfg.app_token,
+                )
                 await self._connect_socket(client)
             except (Exception, asyncio.CancelledError):
-                await self._close_socket_quietly(client)
+                await self._close_socket_quietly(self._client)
                 self._client = None
                 self._web = None
                 self._active_bot_token = ""
@@ -586,17 +284,15 @@ class SlackChannel(BaseChannel):
                 self._bot_user_id = ""
                 self._bot_id = ""
                 self._team_id = ""
+                self._state = "stopped"
                 raise
 
         self._last_event_time = time.monotonic()
+        self._state = "running"
         self._log_auth(auth, "Slack authenticated")
         logger.info("Slack Socket Mode connected")
 
         self._announce_auth_state()
-
-        self._watchdog_task = asyncio.create_task(
-            self._run_watchdog(), name="slack-socket-watchdog",
-        )
 
     @staticmethod
     def _build_web_client(bot_token: str):
@@ -714,17 +410,18 @@ class SlackChannel(BaseChannel):
     def needs_credential_reload(self, bot_token: str, app_token: str) -> bool:
         """Whether the connected clients differ from the desired token pair."""
         return (
-            bot_token != self._active_bot_token
-            or app_token != self._active_app_token
+            bot_token != self._active_bot_token or app_token != self._active_app_token
         )
 
-    async def reload_credentials(self, bot_token: str, app_token: str) -> None:
-        """Replace the Web API and Socket Mode clients as one credential pair.
+    async def reload_credentials(self, config: NerveConfig) -> None:
+        """Apply a config generation while replacing its credential pair.
 
         Validate before closing the old socket, but connect only after closing
-        it to avoid competing consumers. Restore the old transport on failure;
-        tracked active credentials keep the reload retryable.
+        it to avoid competing consumers. The behavior snapshot changes before
+        the new socket can deliver and rolls back with the previous transport.
         """
+        bot_token = config.slack.bot_token
+        app_token = config.slack.app_token
         if not bot_token or not app_token:
             raise RuntimeError("the new Slack credentials are incomplete")
 
@@ -752,18 +449,27 @@ class SlackChannel(BaseChannel):
             old_bot_user_id = self._bot_user_id
             old_bot_id = self._bot_id
             old_team_id = self._team_id
+            old_config = self._config
+            old_state = self._state
+            self._state = "rotating"
 
             try:
                 await self._close_socket_for_replacement(old_client)
             except (Exception, asyncio.CancelledError):
+                self._state = old_state
                 await self._close_socket_quietly(client)
                 raise
 
             # Publish before connect so an envelope arriving immediately after
             # the handshake sees the matching Web client and bot identity.
             self._activate_transport(
-                web, client, auth, bot_token, app_token,
+                web,
+                client,
+                auth,
+                bot_token,
+                app_token,
             )
+            self._config = config
             # Names, dedupe keys, and message ids belong to the credential
             # generation. A failed rotation leaves these disposable caches empty.
             self._seen_events.clear()
@@ -781,6 +487,7 @@ class SlackChannel(BaseChannel):
                 self._bot_id = old_bot_id
                 self._team_id = old_team_id
                 self._client = old_client
+                self._config = old_config
 
                 if old_web is not None and old_app_token:
                     try:
@@ -790,6 +497,10 @@ class SlackChannel(BaseChannel):
                         self._client = rollback
                         await self._connect_socket(rollback)
                     except Exception as rollback_error:
+                        self._state = "stopped"
+                        self._stopping = True
+                        self._web = None
+                        self._client = None
                         logger.error(
                             "Slack credential rollback failed (%s)",
                             type(rollback_error).__name__,
@@ -798,6 +509,7 @@ class SlackChannel(BaseChannel):
                             "the new Slack credentials failed and the previous "
                             "connection could not be restored",
                         ) from connect_error
+                    self._state = old_state
                     if isinstance(connect_error, asyncio.CancelledError):
                         raise
                     raise RuntimeError(
@@ -807,12 +519,15 @@ class SlackChannel(BaseChannel):
 
                 if isinstance(connect_error, asyncio.CancelledError):
                     raise
+                self._state = "stopped"
+                self._stopping = True
                 raise RuntimeError(
                     "the new Slack app token failed to connect and no previous "
                     "connection was available",
                 ) from connect_error
 
             self._last_event_time = time.monotonic()
+            self._state = "running"
             self._log_auth(auth, "Slack credentials reloaded")
 
     def _announce_auth_state(self) -> None:
@@ -836,13 +551,7 @@ class SlackChannel(BaseChannel):
     async def stop(self, *, drain: bool = False) -> None:
         """Stop receiving, optionally draining acknowledged dispatches first."""
         self._stopping = True
-        if self._watchdog_task and not self._watchdog_task.done():
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except asyncio.CancelledError:
-                pass
-        self._watchdog_task = None
+        self._state = "quiescing"
 
         if drain:
             async with self._transport_lock:
@@ -877,50 +586,27 @@ class SlackChannel(BaseChannel):
         self._bot_user_id = ""
         self._bot_id = ""
         self._team_id = ""
+        self._client = None
+        self._state = "stopped"
 
     # ------------------------------------------------------------------ #
     #  Watchdog                                                            #
     # ------------------------------------------------------------------ #
 
-    async def _run_watchdog(self) -> None:
-        """Reconnect the socket when Slack's own auto-reconnect gives up."""
-        check_count = 0
-        while not self._stopping:
-            try:
-                await asyncio.sleep(WATCHDOG_INTERVAL)
-            except asyncio.CancelledError:
-                break
-            if self._client is None or self._stopping:
-                break
+    async def transport_connected(self) -> bool:
+        """Check whether the active Socket Mode client answers a ping."""
+        if self._client is None or self._stopping:
+            return False
+        try:
+            return bool(await self._client.is_connected())
+        except Exception:
+            return False
 
-            check_count += 1
-            # is_connected() is a coroutine: it pings the socket rather than
-            # reading a flag.
-            try:
-                connected = bool(await self._client.is_connected())
-            except Exception:
-                # A credential rotation can close this client between the
-                # loop's null check and the ping. _rebuild rechecks under the
-                # lifecycle lock and leaves a replacement alone if it won.
-                connected = False
-            if check_count % WATCHDOG_HEARTBEAT_EVERY == 0:
-                since = time.monotonic() - self._last_event_time
-                logger.info(
-                    "Slack watchdog: %s (check #%d, last event %.0fs ago)",
-                    "connected" if connected else "disconnected", check_count, since,
-                )
-            if connected:
-                continue
+    @property
+    def seconds_since_last_event(self) -> float:
+        return time.monotonic() - self._last_event_time
 
-            logger.warning("Slack socket is down — rebuilding")
-            try:
-                await self._rebuild()
-                self._last_event_time = time.monotonic()
-                logger.info("Slack socket reconnected")
-            except Exception as e:
-                logger.error("Slack reconnect failed: %s", e, exc_info=True)
-
-    async def _rebuild(self) -> None:
+    async def rebuild_transport(self) -> None:
         """Replace a disconnected socket after closing the old client.
 
         Connecting twice can leave competing Slack consumers, so a brief gap
@@ -947,6 +633,7 @@ class SlackChannel(BaseChannel):
             except Exception:
                 await self._close_socket_quietly(client)
                 raise
+            self._last_event_time = time.monotonic()
 
     def _touch(self) -> None:
         """Record that an envelope arrived from Slack."""
@@ -1091,17 +778,24 @@ class SlackChannel(BaseChannel):
                 )
         except Exception as e:
             logger.warning(
-                "Slack conversations.info failed for %s: %s", channel_id, e,
+                "Slack conversations.info failed for %s: %s",
+                channel_id,
+                e,
             )
             identity = Identity(id=channel_id, complete=False)
         self._remember(
-            self._name_cache, f"c:{channel_id}",
-            (identity, time.monotonic() + _NAME_CACHE_TTL), _NAME_CACHE_MAX,
+            self._name_cache,
+            f"c:{channel_id}",
+            (identity, time.monotonic() + _NAME_CACHE_TTL),
+            _NAME_CACHE_MAX,
         )
         return identity
 
     async def _authorize(
-        self, user_id: str, channel_id: str, channel_type: str,
+        self,
+        user_id: str,
+        channel_id: str,
+        channel_type: str,
     ) -> bool:
         """Run the access policy for one event, logging any refusal."""
         policy = self.policy
@@ -1192,12 +886,11 @@ class SlackChannel(BaseChannel):
         channel_type = event.get("channel_type") or (
             "im" if channel_id.startswith("D") else "channel"
         )
-        cfg = self.config.slack
-        thread_ts = event.get("thread_ts") if cfg.reply_in_thread else None
-        # A first reply in a channel opens a thread on the message itself, so
-        # the conversation stays out of the channel's main flow.
-        if cfg.reply_in_thread and not thread_ts and channel_type != "im":
-            thread_ts = ts
+        # Shared channels are containers for thread sessions, never sessions
+        # themselves. A top-level mention becomes its own thread root.
+        thread_ts = None
+        if channel_type != "im":
+            thread_ts = event.get("thread_ts") or ts
         target = format_target(channel_id, thread_ts)
         channel_key = f"slack:{target}"
 
@@ -1328,7 +1021,8 @@ class SlackChannel(BaseChannel):
             size = int(f.get("size") or 0)
             ext = f".{name.rsplit('.', 1)[-1].lower()}" if "." in name else ""
             size_str = (
-                f"{size / 1024:.0f} KB" if size < 1_000_000
+                f"{size / 1024:.0f} KB"
+                if size < 1_000_000
                 else f"{size / 1_000_000:.1f} MB"
             )
             meta = f"[File: {name} ({size_str}, {mime or 'unknown type'})]"
@@ -1345,7 +1039,9 @@ class SlackChannel(BaseChannel):
             )
             if is_text:
                 if size > _MAX_TEXT_SIZE:
-                    parts.append(f"{meta}\n(Text file too large to inline — {size_str})")
+                    parts.append(
+                        f"{meta}\n(Text file too large to inline — {size_str})"
+                    )
                     continue
                 data = await self._download_file(url)
                 if data is None:
@@ -1382,7 +1078,10 @@ class SlackChannel(BaseChannel):
                 parts.append(meta)
                 continue
 
-            if ext == ".zip" or mime in ("application/zip", "application/x-zip-compressed"):
+            if ext == ".zip" or mime in (
+                "application/zip",
+                "application/x-zip-compressed",
+            ):
                 data = await self._download_file(url)
                 if data is None:
                     parts.append(meta)
@@ -1583,7 +1282,9 @@ class SlackChannel(BaseChannel):
         channel_type = "im" if channel_id.startswith("D") else "channel"
         if not await self._authorize(user_id, channel_id, channel_type):
             await self._respond_ephemeral(
-                channel_id, user_id, "You are not authorized to use this bot.",
+                channel_id,
+                user_id,
+                "You are not authorized to use this bot.",
             )
             return
 
@@ -1606,12 +1307,13 @@ class SlackChannel(BaseChannel):
             )
             return
 
-        # `sessions` and `new` bind a session to the command's own key. In a
-        # threaded channel nothing ever reads that key, so they would answer
-        # as if they had worked and change nothing.
-        if sub in ("sessions", "new") and not self._binds_to_channel_key(channel_id):
+        # Slack slash commands carry no thread context. Commands that require
+        # one exact conversation therefore remain DM-only.
+        if sub in ("sessions", "new") and not self._has_slash_session_key(channel_id):
             await self._respond_ephemeral(
-                channel_id, user_id, self._THREADED_CHANNEL_REFUSAL.format(sub=sub),
+                channel_id,
+                user_id,
+                self._THREADED_CHANNEL_REFUSAL.format(sub=sub),
             )
             return
 
@@ -1671,51 +1373,49 @@ class SlackChannel(BaseChannel):
     _THREADED_CHANNEL_REFUSAL = (
         "`/nerve {sub}` needs a thread to bind the session to, and Slack does "
         "not run `/nerve` inside one. Every new mention in this channel "
-        "already opens its own thread and its own session. Use `/nerve stop` "
-        "to end one, or set `slack.reply_in_thread: false` to keep a single "
-        "session per channel."
+        "opens its own thread and session. Use `/nerve stop` to select a "
+        "running thread, or use this command in a DM."
     )
 
-    def _binds_to_channel_key(self, channel_id: str) -> bool:
-        """Whether slash commands and messages share the channel-level key.
-
-        DMs always do; shared channels do only when threaded replies are off.
-        """
-        if not channel_id:
-            return False
-        if channel_id.startswith("D"):
-            return True
-        return not self.config.slack.reply_in_thread
+    @staticmethod
+    def _has_slash_session_key(channel_id: str) -> bool:
+        """Whether a slash command names an exact conversation session."""
+        return bool(channel_id and channel_id.startswith("D"))
 
     async def _cmd_new(
-        self, channel_id: str, user_id: str, channel_key: str, args: list[str],
+        self,
+        channel_id: str,
+        user_id: str,
+        channel_key: str,
+        args: list[str],
     ) -> None:
         prev = await self.router.get_last_session(channel_key)
         if prev:
-            await self.router.engine.stop_session(prev)
+            await self.router.stop_session(prev)
         title = " ".join(args) or None
         session_id = await self.router.create_session(
-            channel_key, title=title, source="slack",
+            channel_key,
+            title=title,
+            source="slack",
         )
         await self._respond_ephemeral(
-            channel_id, user_id,
+            channel_id,
+            user_id,
             f"New session `{session_id}`" + (f" — {title}" if title else ""),
         )
 
     async def _live_sessions_for_channel(self, channel_id: str) -> list[dict[str, Any]]:
-        """Return this channel's live sessions, including threaded ones.
-
-        Slash commands carry no thread context, so search by channel prefix.
-        Re-check parsed IDs because ``slack:C123`` also prefixes ``slack:C1234``.
-        """
+        """Return live sessions in this exact Slack conversation."""
         rows = await self.router.list_conversation_sessions(f"slack:{channel_id}")
         matching: list[dict[str, Any]] = []
         for row in rows:
             key = row.get("channel_key") or ""
             if not key.startswith("slack:"):
                 continue
-            row_channel, thread_ts = parse_target(key[len("slack:"):])
+            row_channel, thread_ts = parse_target(key[len("slack:") :])
             if row_channel != channel_id:
+                continue
+            if not channel_id.startswith("D") and thread_ts is None:
                 continue
             matching.append({**row, "thread_ts": thread_ts})
         return matching
@@ -1724,7 +1424,7 @@ class SlackChannel(BaseChannel):
     def _session_choice_label(row: dict[str, Any]) -> str:
         """Button label naming one session, and the thread it belongs to."""
         title = (row.get("title") or "").strip() or row.get("session_id", "?")
-        where = "in thread" if row.get("thread_ts") else "in channel"
+        where = "in thread" if row.get("thread_ts") else "in conversation"
         label = f"{title} ({where})"
         return label[:74] + "…" if len(label) > 75 else label
 
@@ -1787,29 +1487,41 @@ class SlackChannel(BaseChannel):
             return
 
         await self._respond_ephemeral_blocks(
-            channel_id, user_id,
+            channel_id,
+            user_id,
             text="Which session should I stop?",
             blocks=self._session_picker_blocks(
-                candidates, "Pick the one to stop:", "sessstop:", style="danger",
+                candidates,
+                "Pick the one to stop:",
+                "sessstop:",
+                style="danger",
             ),
         )
 
     async def _stop_and_report(
-        self, channel_id: str, user_id: str, row: dict[str, Any],
+        self,
+        channel_id: str,
+        user_id: str,
+        row: dict[str, Any],
     ) -> None:
         """Stop one session and say which one, so the answer is checkable."""
         session_id = row["session_id"]
-        stopped = await self.router.engine.stop_session(session_id)
+        stopped = await self.router.stop_session(session_id)
         where = "the thread" if row.get("thread_ts") else "this channel"
         await self._respond_ephemeral(
-            channel_id, user_id,
+            channel_id,
+            user_id,
             f"Stopped `{session_id}` in {where}."
             if stopped
             else f"`{session_id}` was not running.",
         )
 
     async def _cmd_star(
-        self, channel_id: str, user_id: str, channel_key: str, starred: bool,
+        self,
+        channel_id: str,
+        user_id: str,
+        channel_key: str,
+        starred: bool,
     ) -> None:
         # Same thread-blindness as stop: resolve across the conversation
         # rather than the command's own key, which usually owns nothing.
@@ -1857,58 +1569,75 @@ class SlackChannel(BaseChannel):
     async def _cmd_reply(self, channel_id: str, user_id: str, answer: str) -> None:
         if not answer:
             await self._respond_ephemeral(
-                channel_id, user_id, "Usage: `/nerve reply <your answer>`",
+                channel_id,
+                user_id,
+                "Usage: `/nerve reply <your answer>`",
             )
             return
         if not self._notification_service:
             await self._respond_ephemeral(
-                channel_id, user_id, "Notification service not available.",
+                channel_id,
+                user_id,
+                "Notification service not available.",
             )
             return
-        pending = await self._notification_service.db.list_notifications(
-            status="pending", type="question", limit=1,
-        )
-        if not pending:
-            await self._respond_ephemeral(channel_id, user_id, "No pending questions.")
-            return
-        ok = await self._notification_service.handle_answer(
-            notification_id=pending[0]["id"], answer=answer, answered_by="slack",
+        result = await self._notification_service.answer_latest_question(
+            answer,
+            channel="slack",
+            target=channel_id,
+            actor=user_id,
         )
         await self._respond_ephemeral(
-            channel_id, user_id,
-            f"Answer recorded for: {pending[0]['title']}"
-            if ok
-            else "Failed to record answer.",
+            channel_id,
+            user_id,
+            f"Answer recorded for: {result['title']}"
+            if result
+            else "No pending questions in this conversation.",
         )
 
     async def _respond_ephemeral(
-        self, channel_id: str, user_id: str, text: str,
+        self,
+        channel_id: str,
+        user_id: str,
+        text: str,
     ) -> None:
         """Reply so only the person who ran the command sees it."""
         if self._web is None:
             return
         try:
             await self._web.chat_postEphemeral(
-                channel=channel_id, user=user_id, text=_md_to_slack(text),
+                channel=channel_id,
+                user=user_id,
+                text=_md_to_slack(text),
             )
         except Exception as e:
             logger.warning("Slack chat.postEphemeral failed: %s", e)
 
     async def _respond_ephemeral_blocks(
-        self, channel_id: str, user_id: str, text: str, blocks: list[dict],
+        self,
+        channel_id: str,
+        user_id: str,
+        text: str,
+        blocks: list[dict],
     ) -> None:
         """Ephemeral reply carrying Block Kit, for the pickers."""
         if self._web is None:
             return
         try:
             await self._web.chat_postEphemeral(
-                channel=channel_id, user=user_id, text=text, blocks=blocks,
+                channel=channel_id,
+                user=user_id,
+                text=text,
+                blocks=blocks,
             )
         except Exception as e:
             logger.warning("Slack ephemeral blocks failed: %s", e)
 
     async def _send_sessions_view(
-        self, channel_id: str, user_id: str, channel_key: str,
+        self,
+        channel_id: str,
+        user_id: str,
+        channel_key: str,
     ) -> None:
         """Post the session switcher, visible only to the requester."""
         if self._web is None:
@@ -1966,7 +1695,7 @@ class SlackChannel(BaseChannel):
             return
 
         if action_id.startswith("sessstop:"):
-            stopped = await self.router.engine.stop_session(value)
+            stopped = await self.router.stop_session(value)
             await self._replace_via_url(
                 response_url,
                 f"Stopped `{value}`." if stopped else f"`{value}` was not running.",
@@ -2022,11 +1751,9 @@ class SlackChannel(BaseChannel):
         """Switch, create, or star a session from the switcher card."""
         channel_key = f"slack:{format_target(channel_id)}"
 
-        # A card posted before `reply_in_thread` was turned on, or one kept
-        # open in a threaded channel, would bind the session to a key no
-        # message ever reads. Starring does not touch the mapping, so it is
-        # still allowed.
-        if not action_id.startswith("sessstar:") and not self._binds_to_channel_key(
+        # Session cards are only actionable where Slack gives the interaction
+        # an exact session key. Starring does not change the mapping.
+        if not action_id.startswith("sessstar:") and not self._has_slash_session_key(
             channel_id,
         ):
             await self._replace_via_url(
@@ -2076,12 +1803,21 @@ class SlackChannel(BaseChannel):
             return
 
         actor = (payload.get("user") or {}).get("id") or ""
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id, answer=answer, answered_by="slack",
+        thread_ts = (payload.get("message") or {}).get("thread_ts") or None
+        result = await self._notification_service.answer_delivered_notification(
+            notification_id,
+            answer,
+            channel="slack",
+            target=format_target(
+                (payload.get("channel") or {}).get("id") or "",
+                thread_ts,
+            ),
+            actor=actor,
         )
-        if not success:
+        if not result:
             await self._replace_via_url(
-                response_url, "Already answered or expired.",
+                response_url,
+                "Already answered or expired.",
             )
             return
 
@@ -2096,7 +1832,7 @@ class SlackChannel(BaseChannel):
         ).strip("\n")
 
         status = f"✅ Answered: {_md_to_slack(answer)}"
-        snoozed_until = await self._get_snoozed_until(notification_id)
+        snoozed_until = self._snoozed_until(result)
         if snoozed_until:
             status = f"💤 Snoozed until {snoozed_until} — will resurface"
         # Written as raw mention markup: the converter would escape it, and
@@ -2109,24 +1845,17 @@ class SlackChannel(BaseChannel):
             already_mrkdwn=True,
         )
 
-    async def _get_snoozed_until(self, notification_id: str) -> str | None:
-        """Human-readable re-delivery time if the row was snoozed.
-
-        A snoozed approval is the only outcome that leaves the row pending
-        with ``redeliver_at`` set. Cosmetic, so every failure yields None.
-        """
+    @staticmethod
+    def _snoozed_until(notification: dict[str, Any]) -> str | None:
+        """Render the next delivery time when an answer snoozed the row."""
         try:
-            notif = await self._notification_service.db.get_notification(
-                notification_id,
-            )
-            if (
-                not notif
-                or notif.get("status") != "pending"
-                or not notif.get("redeliver_at")
+            if notification.get("status") != "pending" or not notification.get(
+                "redeliver_at"
             ):
                 return None
             from datetime import datetime
-            dt = datetime.fromisoformat(notif["redeliver_at"])
+
+            dt = datetime.fromisoformat(notification["redeliver_at"])
             return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
         except Exception:
             return None

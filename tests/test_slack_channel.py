@@ -8,6 +8,7 @@ web client and router are stubs.
 from __future__ import annotations
 
 import asyncio
+import copy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,7 +18,6 @@ from nerve.channels.slack import (
     MAX_MSG_LEN,
     SlackChannel,
     _md_to_slack,
-    build_notification_blocks,
     build_sessions_blocks,
     format_target,
     is_slack_id,
@@ -26,6 +26,7 @@ from nerve.channels.slack import (
     slack_to_plain,
     split_message,
 )
+from nerve.channels.slack_presentation import build_notification_blocks
 from nerve.config import NerveConfig, SlackConfig
 
 
@@ -43,16 +44,28 @@ def _config(**slack_kwargs) -> NerveConfig:
 def _channel(**slack_kwargs) -> SlackChannel:
     """A channel with a stub transport, ready to take events."""
     cfg = _config(**slack_kwargs)
-    channel = SlackChannel(lambda: cfg, router=MagicMock())
+    channel = SlackChannel(cfg, router=MagicMock())
     channel._web = MagicMock()
     channel._web.chat_postMessage = AsyncMock(return_value={"ts": "1.1"})
     channel._web.chat_update = AsyncMock(return_value={"ok": True})
     channel._web.chat_delete = AsyncMock(return_value={"ok": True})
     channel._web.reactions_add = AsyncMock(return_value={"ok": True})
+    channel._state = "running"
     channel._bot_user_id = "U0BOT"
     channel.router.handle_message = AsyncMock(return_value="done")
     channel.router.get_last_session = AsyncMock(return_value=None)
     return channel
+
+
+def _with_credentials(
+    channel: SlackChannel,
+    bot_token: str,
+    app_token: str,
+) -> NerveConfig:
+    config = copy.deepcopy(channel.config)
+    config.slack.bot_token = bot_token
+    config.slack.app_token = app_token
+    return config
 
 
 # ---------------------------------------------------------------------- #
@@ -249,7 +262,7 @@ class TestCapabilities:
     def test_the_policy_follows_a_config_reload(self):
         # The channel outlives a reload, so every guardrail is read per use.
         cfg = _config(allow_users=["U1"])
-        channel = SlackChannel(lambda: cfg, router=MagicMock())
+        channel = SlackChannel(cfg, router=MagicMock())
         assert channel.policy.users.allow == ["U1"]
         assert channel.policy.allow_direct_messages is False
         cfg.slack.allow_users = ["U2"]
@@ -269,7 +282,8 @@ class TestAuthorization:
     @pytest.mark.asyncio
     async def test_an_id_allow_list_needs_no_name_lookup(self):
         channel = _channel(
-            allow_users=["U0123ABC"], allow_direct_messages=True,
+            allow_users=["U0123ABC"],
+            allow_direct_messages=True,
         )
         channel._web.users_info = AsyncMock()
         assert await channel._authorize("U0123ABC", "D1", "im")
@@ -312,7 +326,8 @@ class TestAuthorization:
     @pytest.mark.asyncio
     async def test_the_direct_message_setting_allows_them(self):
         channel = _channel(
-            allow_users=["U1"], allow_direct_messages=True,
+            allow_users=["U1"],
+            allow_direct_messages=True,
         )
         assert await channel._authorize("U1", "D1", "im")
 
@@ -339,61 +354,99 @@ class TestMessageEvents:
     @pytest.mark.asyncio
     async def test_an_unauthorized_sender_never_reaches_the_router(self):
         channel = _channel(
-            allow_users=["U-other"], allow_direct_messages=True,
+            allow_users=["U-other"],
+            allow_direct_messages=True,
         )
-        await channel._handle_message_event({
-            "type": "message", "channel": "D1", "channel_type": "im",
-            "user": "U1", "ts": "1.1", "text": "hello",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "D1",
+                "channel_type": "im",
+                "user": "U1",
+                "ts": "1.1",
+                "text": "hello",
+            }
+        )
         channel.router.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_bots_own_message_is_ignored(self):
         channel = _channel(
-            allow_users=["U0BOT"], allow_direct_messages=True,
+            allow_users=["U0BOT"],
+            allow_direct_messages=True,
         )
-        await channel._handle_message_event({
-            "type": "message", "channel": "D1", "channel_type": "im",
-            "user": "U0BOT", "ts": "1.1", "text": "hi",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "D1",
+                "channel_type": "im",
+                "user": "U0BOT",
+                "ts": "1.1",
+                "text": "hi",
+            }
+        )
         channel.router.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_join_notice_is_ignored(self):
         channel = _channel(allow_users=["U1"])
-        await channel._handle_message_event({
-            "type": "message", "subtype": "channel_join",
-            "channel": "C1", "user": "U1", "ts": "1.1", "text": "joined",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "subtype": "channel_join",
+                "channel": "C1",
+                "user": "U1",
+                "ts": "1.1",
+                "text": "joined",
+            }
+        )
         channel.router.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_channel_chatter_without_a_mention_is_ignored(self):
         # Adding the bot to a busy channel must not start a turn per remark.
         channel = _channel(allow_users=["U1"])
-        await channel._handle_message_event({
-            "type": "message", "channel": "C1", "channel_type": "channel",
-            "user": "U1", "ts": "1.1", "text": "morning all",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.1",
+                "text": "morning all",
+            }
+        )
         channel.router.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_mention_in_a_channel_is_answered(self):
         channel = _channel(allow_users=["U1"])
-        await channel._handle_message_event({
-            "type": "message", "channel": "C1", "channel_type": "channel",
-            "user": "U1", "ts": "1.1", "text": "<@U0BOT> status?",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.1",
+                "text": "<@U0BOT> status?",
+            }
+        )
         msg = channel.router.handle_message.await_args[0][0]
         assert msg.text == "status?"
 
     @pytest.mark.asyncio
     async def test_a_channel_reply_opens_a_thread_on_the_message(self):
         channel = _channel(allow_users=["U1"])
-        await channel._handle_message_event({
-            "type": "message", "channel": "C1", "channel_type": "channel",
-            "user": "U1", "ts": "1.1", "text": "<@U0BOT> hi",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.1",
+                "text": "<@U0BOT> hi",
+            }
+        )
         msg = channel.router.handle_message.await_args[0][0]
         assert msg.sender_id == "C1:1.1"
         assert msg.channel_key == "slack:C1:1.1"
@@ -417,22 +470,68 @@ class TestMessageEvents:
     async def test_thread_replies_continue_a_session_without_a_mention(self):
         channel = _channel(allow_users=["U1"])
         channel.router.get_last_session = AsyncMock(return_value="s1")
-        await channel._handle_message_event({
-            "type": "message", "channel": "C1", "channel_type": "channel",
-            "user": "U1", "ts": "1.2", "thread_ts": "1.0", "text": "and then?",
-        })
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.2",
+                "thread_ts": "1.0",
+                "text": "and then?",
+            }
+        )
         channel.router.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_reply_in_thread_off_keeps_one_session_per_channel(self):
-        channel = _channel(allow_users=["U1"], reply_in_thread=False)
-        await channel._handle_message_event({
-            "type": "message", "channel": "C1", "channel_type": "channel",
-            "user": "U1", "ts": "1.1", "thread_ts": "1.0",
-            "text": "<@U0BOT> hi",
-        })
+    async def test_unowned_thread_reply_without_a_mention_is_ignored(self):
+        channel = _channel(allow_users=["U1"])
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.2",
+                "thread_ts": "1.0",
+                "text": "hello",
+            }
+        )
+        channel.router.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_mention_claims_an_unowned_thread(self):
+        channel = _channel(allow_users=["U1"])
+        await channel._handle_message_event(
+            {
+                "type": "app_mention",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.2",
+                "thread_ts": "1.0",
+                "text": "<@U0BOT> help",
+            }
+        )
+        message = channel.router.handle_message.await_args.args[0]
+        assert message.channel_key == "slack:C1:1.0"
+
+    @pytest.mark.asyncio
+    async def test_an_existing_thread_never_uses_the_channel_key(self):
+        channel = _channel(allow_users=["U1"])
+        await channel._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": "U1",
+                "ts": "1.1",
+                "thread_ts": "1.0",
+                "text": "<@U0BOT> hi",
+            }
+        )
         msg = channel.router.handle_message.await_args[0][0]
-        assert msg.channel_key == "slack:C1"
+        assert msg.channel_key == "slack:C1:1.0"
 
     @pytest.mark.asyncio
     async def test_a_redelivered_event_runs_once(self):
@@ -484,22 +583,31 @@ class TestReactionEvents:
     async def test_a_reaction_on_an_unknown_message_is_ignored(self):
         # Otherwise a stray emoji anywhere in the workspace opens a session.
         channel = _channel(allow_users=["U1"])
-        await channel._handle_reaction_event({
-            "type": "reaction_added", "user": "U1", "reaction": "tada",
-            "item": {"channel": "D1", "ts": "9.9"},
-        })
+        await channel._handle_reaction_event(
+            {
+                "type": "reaction_added",
+                "user": "U1",
+                "reaction": "tada",
+                "item": {"channel": "D1", "ts": "9.9"},
+            }
+        )
         channel.router.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_reaction_is_ignored(self):
         channel = _channel(
-            allow_users=["U-other"], allow_direct_messages=True,
+            allow_users=["U-other"],
+            allow_direct_messages=True,
         )
         channel._cache_message("1.1", "D1", "the original")
-        await channel._handle_reaction_event({
-            "type": "reaction_added", "user": "U1", "reaction": "tada",
-            "item": {"channel": "D1", "ts": "1.1"},
-        })
+        await channel._handle_reaction_event(
+            {
+                "type": "reaction_added",
+                "user": "U1",
+                "reaction": "tada",
+                "item": {"channel": "D1", "ts": "1.1"},
+            }
+        )
         channel.router.handle_message.assert_not_called()
 
 
@@ -567,16 +675,9 @@ class TestOutbound:
         assert not await _channel().send_file("C1", "/nope/missing.txt")
 
     @pytest.mark.asyncio
-    async def test_the_watchdog_reconnects_a_dropped_socket(self, monkeypatch):
-        # is_connected() is a coroutine. Reading it without awaiting yields a
-        # truthy coroutine object, so the watchdog would call a dead socket
-        # healthy forever and never reconnect.
-        import nerve.channels.slack as slack_module
-
-        monkeypatch.setattr(slack_module, "WATCHDOG_INTERVAL", 0.01)
+    async def test_rebuild_uses_the_active_credential_pair(self):
         channel = _channel()
         channel._active_app_token = "xapp-active"
-        channel.config.slack.app_token = "xapp-new-in-config"
         active_web = channel._web
         dead = MagicMock()
         dead.is_connected = AsyncMock(return_value=False)
@@ -588,14 +689,7 @@ class TestOutbound:
         fresh.connect = AsyncMock()
         channel._build_socket_client = MagicMock(return_value=fresh)
 
-        task = asyncio.create_task(channel._run_watchdog())
-        await asyncio.sleep(0.05)
-        channel._stopping = True
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await channel.rebuild_transport()
 
         fresh.connect.assert_awaited()
         # The old socket must be closed first. Slack gives each event to one
@@ -630,6 +724,7 @@ class TestOutbound:
 
         async def connect_candidate():
             events.append("candidate connected")
+            assert not channel.is_available
             raise RuntimeError("invalid app token")
 
         async def close_candidate():
@@ -651,8 +746,10 @@ class TestOutbound:
         rollback.connect = AsyncMock(side_effect=connect_rollback)
         channel._build_socket_client = MagicMock(return_value=rollback)
 
+        desired = _with_credentials(channel, "xoxb-new", "xapp-new")
+        desired.slack.allow_users = ["U2"]
         with pytest.raises(RuntimeError, match="previous connection was restored"):
-            await channel.reload_credentials("xoxb-new", "xapp-new")
+            await channel.reload_credentials(desired)
 
         assert events == [
             "old closed",
@@ -667,6 +764,8 @@ class TestOutbound:
         assert channel._bot_user_id == "U0OLD"
         assert channel._bot_id == "B0OLD"
         assert channel._team_id == "T0OLD"
+        assert channel.config.slack.allow_users == []
+        assert channel.is_available
         assert channel.needs_credential_reload("xoxb-new", "xapp-new")
 
     @pytest.mark.asyncio
@@ -682,17 +781,24 @@ class TestOutbound:
 
         candidate = MagicMock()
         candidate.close = AsyncMock()
-        channel._prepare_transport = AsyncMock(return_value=(
-            MagicMock(), candidate, {"team_id": "T0NEW"},
-        ))
+        channel._prepare_transport = AsyncMock(
+            return_value=(
+                MagicMock(),
+                candidate,
+                {"team_id": "T0NEW"},
+            )
+        )
 
+        desired = _with_credentials(channel, "xoxb-new", "xapp-new")
+        desired.slack.allow_users = ["U2"]
         with pytest.raises(RuntimeError, match="different workspace"):
-            await channel.reload_credentials("xoxb-new", "xapp-new")
+            await channel.reload_credentials(desired)
 
         candidate.close.assert_awaited_once()
         old_client.close.assert_not_awaited()
         assert channel._web is old_web
         assert channel._team_id == "T0OLD"
+        assert channel.config.slack.allow_users == []
 
     @pytest.mark.asyncio
     async def test_a_socket_handshake_cannot_hold_reload_open_forever(
@@ -747,12 +853,16 @@ class TestGuardrailRegressions:
     @pytest.mark.asyncio
     async def test_an_uppercase_deny_name_still_forces_a_lookup(self):
         channel = _channel(deny_users=["ALICE"], allow_channels=["C0456DEF"])
-        channel._web.users_info = AsyncMock(return_value={
-            "user": {"id": "U999", "name": "ALICE", "profile": {"email": "a@b.c"}},
-        })
-        channel._web.conversations_info = AsyncMock(return_value={
-            "channel": {"id": "C0456DEF", "name": "eng"},
-        })
+        channel._web.users_info = AsyncMock(
+            return_value={
+                "user": {"id": "U999", "name": "ALICE", "profile": {"email": "a@b.c"}},
+            }
+        )
+        channel._web.conversations_info = AsyncMock(
+            return_value={
+                "channel": {"id": "C0456DEF", "name": "eng"},
+            }
+        )
         assert not await channel._authorize("U999", "C0456DEF", "channel")
         channel._web.users_info.assert_awaited()
 
@@ -761,34 +871,47 @@ class TestGuardrailRegressions:
         # users.info answers 200 without profile.email when the token lacks
         # users:read.email, so the deny pattern silently matched nothing.
         channel = _channel(
-            allow_users=["U999"], deny_users=["blocked@x.com"],
+            allow_users=["U999"],
+            deny_users=["blocked@x.com"],
             allow_direct_messages=True,
         )
-        channel._web.users_info = AsyncMock(return_value={
-            "user": {"id": "U999", "name": "blocked", "profile": {}},
-        })
+        channel._web.users_info = AsyncMock(
+            return_value={
+                "user": {"id": "U999", "name": "blocked", "profile": {}},
+            }
+        )
         assert not await channel._authorize("U999", "D1", "im")
 
     @pytest.mark.asyncio
     async def test_an_email_deny_rule_still_works_with_the_scope(self):
         channel = _channel(
-            allow_users=["*"], deny_users=["blocked@x.com"],
+            allow_users=["*"],
+            deny_users=["blocked@x.com"],
             allow_direct_messages=True,
         )
-        channel._web.users_info = AsyncMock(return_value={
-            "user": {"id": "U9", "name": "b", "profile": {"email": "blocked@x.com"}},
-        })
+        channel._web.users_info = AsyncMock(
+            return_value={
+                "user": {
+                    "id": "U9",
+                    "name": "b",
+                    "profile": {"email": "blocked@x.com"},
+                },
+            }
+        )
         assert not await channel._authorize("U9", "D1", "im")
 
     @pytest.mark.asyncio
     async def test_an_innocent_user_is_not_caught_by_an_email_deny_rule(self):
         channel = _channel(
-            allow_users=["*"], deny_users=["blocked@x.com"],
+            allow_users=["*"],
+            deny_users=["blocked@x.com"],
             allow_direct_messages=True,
         )
-        channel._web.users_info = AsyncMock(return_value={
-            "user": {"id": "U1", "name": "ok", "profile": {"email": "ok@x.com"}},
-        })
+        channel._web.users_info = AsyncMock(
+            return_value={
+                "user": {"id": "U1", "name": "ok", "profile": {"email": "ok@x.com"}},
+            }
+        )
         assert await channel._authorize("U1", "D1", "im")
 
     @pytest.mark.asyncio
@@ -916,13 +1039,14 @@ class TestDispatchBounds:
 
 class TestNotificationBlockLimits:
     def test_options_are_chunked_to_slacks_actions_limit(self):
-        import nerve.channels.slack as slack_module
+        import nerve.channels.slack_presentation as presentation_module
 
         options = [(f"opt{i}", f"v{i}") for i in range(60)]
         blocks = build_notification_blocks("pick", "n1", options)
         actions = [b for b in blocks if b["type"] == "actions"]
         assert all(
-            len(b["elements"]) <= slack_module._MAX_ACTION_ELEMENTS for b in actions
+            len(b["elements"]) <= presentation_module._MAX_ACTION_ELEMENTS
+            for b in actions
         )
         assert sum(len(b["elements"]) for b in actions) == 60
 
@@ -1032,7 +1156,7 @@ class TestSlashCommandsAreThreadBlind:
     def _ch(self, sessions, **kw):
         channel = _channel(allow_users=["U1"], **kw)
         channel.router.list_conversation_sessions = AsyncMock(return_value=sessions)
-        channel.router.engine.stop_session = AsyncMock(return_value=True)
+        channel.router.stop_session = AsyncMock(return_value=True)
         channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
         return channel
 
@@ -1047,7 +1171,7 @@ class TestSlashCommandsAreThreadBlind:
         # beside it is busy, and stop used to report "No active session".
         channel = self._ch([self._row("s1", thread="1.0")])
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.engine.stop_session.assert_awaited_once_with("s1")
+        channel.router.stop_session.assert_awaited_once_with("s1")
         said = channel._web.chat_postEphemeral.await_args.kwargs["text"]
         assert "s1" in said and "thread" in said
 
@@ -1055,22 +1179,29 @@ class TestSlashCommandsAreThreadBlind:
     async def test_nothing_live_says_so_plainly(self):
         channel = self._ch([])
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.engine.stop_session.assert_not_called()
-        assert "No active session" in channel._web.chat_postEphemeral.await_args.kwargs["text"]
+        channel.router.stop_session.assert_not_called()
+        assert (
+            "No active session"
+            in channel._web.chat_postEphemeral.await_args.kwargs["text"]
+        )
 
     @pytest.mark.asyncio
     async def test_several_live_sessions_ask_instead_of_guessing(self):
         # Stopping someone else's thread silently would be worse than asking.
-        channel = self._ch([
-            self._row("s1", thread="1.0", title="Deploy"),
-            self._row("s2", thread="2.0", title="Triage"),
-        ])
+        channel = self._ch(
+            [
+                self._row("s1", thread="1.0", title="Deploy"),
+                self._row("s2", thread="2.0", title="Triage"),
+            ]
+        )
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.engine.stop_session.assert_not_called()
+        channel.router.stop_session.assert_not_called()
         blocks = channel._web.chat_postEphemeral.await_args.kwargs["blocks"]
         action_ids = [
             e["action_id"]
-            for b in blocks if b["type"] == "actions" for e in b["elements"]
+            for b in blocks
+            if b["type"] == "actions"
+            for e in b["elements"]
         ]
         assert action_ids == ["sessstop:s1", "sessstop:s2"]
 
@@ -1078,25 +1209,39 @@ class TestSlashCommandsAreThreadBlind:
     async def test_the_picker_button_stops_the_chosen_session(self):
         channel = self._ch([])
         channel._replace_via_url = AsyncMock()
-        await channel._handle_interactive({
-            "type": "block_actions",
-            "user": {"id": "U1"},
-            "channel": {"id": "C1"},
-            "response_url": "https://hooks.slack.test/x",
-            "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
-        })
-        channel.router.engine.stop_session.assert_awaited_once_with("s2")
+        await channel._handle_interactive(
+            {
+                "type": "block_actions",
+                "user": {"id": "U1"},
+                "channel": {"id": "C1"},
+                "response_url": "https://hooks.slack.test/x",
+                "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
+            }
+        )
+        channel.router.stop_session.assert_awaited_once_with("s2")
 
     @pytest.mark.asyncio
     async def test_another_channels_sessions_are_not_touched(self):
-        # "slack:C1" is a prefix of "slack:C12", so the query result is
-        # re-checked per row.
-        channel = self._ch([
-            {"channel_key": "slack:C12:9.9", "session_id": "other"},
-            self._row("mine", thread="1.0"),
-        ])
+        # Keep the adapter defensive even though the shared query is exact.
+        channel = self._ch(
+            [
+                {"channel_key": "slack:C12:9.9", "session_id": "other"},
+                self._row("mine", thread="1.0"),
+            ]
+        )
         found = await channel._live_sessions_for_channel("C1")
         assert [r["session_id"] for r in found] == ["mine"]
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_channel_level_mapping_is_never_consumed(self):
+        channel = self._ch(
+            [
+                self._row("legacy"),
+                self._row("thread", thread="1.0"),
+            ]
+        )
+        found = await channel._live_sessions_for_channel("C1")
+        assert [row["session_id"] for row in found] == ["thread"]
 
     @pytest.mark.asyncio
     async def test_star_also_resolves_across_threads(self):
@@ -1126,16 +1271,12 @@ class TestCommandExposure:
         enabled = self._ch().enabled_commands
         assert "doctor" not in enabled
         assert "restart" not in enabled
-        assert {"new", "stop", "star", "unstar"} <= enabled
+        assert {"new", "stop", "star", "unstar", "reply"} <= enabled
 
-    def test_globally_scoped_commands_are_off_by_default(self):
-        # sessions lists and attaches every session in the instance, and
-        # reply answers whichever question is pending anywhere. In a
-        # workspace where several people may DM the bot, that is one
-        # member reading and continuing another's work.
+    def test_only_the_globally_scoped_session_list_is_off_by_default(self):
         enabled = self._ch().enabled_commands
         assert "sessions" not in enabled
-        assert "reply" not in enabled
+        assert "reply" in enabled
 
     @pytest.mark.asyncio
     async def test_sessions_is_refused_unless_it_was_asked_for(self):
@@ -1146,11 +1287,20 @@ class TestCommandExposure:
         channel.router.list_sessions.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reply_is_refused_unless_it_was_asked_for(self):
+    async def test_reply_is_scoped_to_the_slack_conversation_and_actor(self):
         channel = self._ch()
         channel._notification_service = MagicMock()
+        channel._notification_service.answer_latest_question = AsyncMock(
+            return_value={"title": "Proceed?"},
+        )
         said = await self._run(channel, "reply yes")
-        assert "turned off" in said
+        assert "Proceed?" in said
+        channel._notification_service.answer_latest_question.assert_awaited_once_with(
+            "yes",
+            channel="slack",
+            target="C1",
+            actor="U1",
+        )
 
     def test_both_are_still_available_on_request(self):
         enabled = self._ch(commands=["sessions", "reply"]).enabled_commands
@@ -1165,15 +1315,17 @@ class TestCommandExposure:
     def test_all_enables_everything(self):
         from nerve.config import SLACK_ALL_COMMANDS
 
-        assert self._ch(commands=["all"]).enabled_commands == frozenset(SLACK_ALL_COMMANDS)
+        assert self._ch(commands=["all"]).enabled_commands == frozenset(
+            SLACK_ALL_COMMANDS
+        )
 
     @pytest.mark.asyncio
     async def test_a_disabled_command_is_refused_not_run(self):
         channel = self._ch(commands=["reply"])
-        channel.router.engine.stop_session = AsyncMock()
+        channel.router.stop_session = AsyncMock()
         said = await self._run(channel, "stop")
         assert "turned off" in said
-        channel.router.engine.stop_session.assert_not_called()
+        channel.router.stop_session.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restart_is_refused_by_default(self):
@@ -1198,13 +1350,7 @@ class TestCommandExposure:
 
 
 class TestCommandsBindTheKeyMessagesRead:
-    """A slash command can only name ``slack:<channel>``.
-
-    With ``reply_in_thread`` on, a channel message opens a thread and routes
-    to ``slack:<channel>:<ts>``, so a session bound at channel level was
-    never read again: `/nerve new` reported a new session, left the running
-    thread alone, and the next mention started somewhere else.
-    """
+    """Slash commands bind only DMs; shared messages always bind threads."""
 
     def _ch(self, **kw):
         channel = _channel(
@@ -1213,7 +1359,7 @@ class TestCommandsBindTheKeyMessagesRead:
         channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
         channel.router.create_session = AsyncMock(return_value="s-new")
         channel.router.switch_session = AsyncMock()
-        channel.router.engine.stop_session = AsyncMock(return_value=True)
+        channel.router.stop_session = AsyncMock(return_value=True)
         channel.router.list_sessions = AsyncMock(return_value=[])
         return channel
 
@@ -1240,14 +1386,16 @@ class TestCommandsBindTheKeyMessagesRead:
         assert bound == routed == "slack:D1"
 
     @pytest.mark.asyncio
-    async def test_a_dm_thread_keeps_a_session_of_its_own(self):
-        # A reply inside a DM thread is its own conversation, so it does not
-        # pick up what the command bound to the DM itself.
+    async def test_a_dm_thread_uses_the_dm_conversation(self):
         channel = self._ch()
         routed = await self._route(
-            channel, channel="D1", channel_type="im", ts="1.2", thread_ts="1.0",
+            channel,
+            channel="D1",
+            channel_type="im",
+            ts="1.2",
+            thread_ts="1.0",
         )
-        assert routed == "slack:D1:1.0"
+        assert routed == "slack:D1"
 
     @pytest.mark.asyncio
     async def test_a_threaded_channel_refuses_rather_than_orphaning_a_session(self):
@@ -1259,37 +1407,21 @@ class TestCommandsBindTheKeyMessagesRead:
 
         said = await self._run(channel, "C1", "new")
         channel.router.create_session.assert_not_called()
-        channel.router.engine.stop_session.assert_not_called()
+        channel.router.stop_session.assert_not_called()
         assert "needs a thread" in said
 
     @pytest.mark.asyncio
     async def test_a_thread_reply_is_not_stopped_by_a_channel_command(self):
         channel = self._ch()
         await self._route(
-            channel, channel="C1", channel_type="channel",
-            ts="1.2", thread_ts="1.0",
+            channel,
+            channel="C1",
+            channel_type="channel",
+            ts="1.2",
+            thread_ts="1.0",
         )
         await self._run(channel, "C1", "new")
-        channel.router.engine.stop_session.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_an_unthreaded_channel_binds_the_key_a_message_reads(self):
-        channel = self._ch(reply_in_thread=False)
-        routed = await self._route(
-            channel, channel="C1", channel_type="channel", ts="1.1",
-        )
-        await self._run(channel, "C1", "new")
-        bound = channel.router.create_session.await_args[0][0]
-        assert bound == routed == "slack:C1"
-
-    @pytest.mark.asyncio
-    async def test_an_unthreaded_thread_reply_shares_the_channel_session(self):
-        channel = self._ch(reply_in_thread=False)
-        routed = await self._route(
-            channel, channel="C1", channel_type="channel",
-            ts="1.2", thread_ts="1.0",
-        )
-        assert routed == "slack:C1"
+        channel.router.stop_session.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_session_picker_is_refused_in_a_threaded_channel(self):
@@ -1507,11 +1639,11 @@ class TestNotificationSections:
     def test_a_body_past_the_block_limit_says_what_it_dropped(self):
         # 50 blocks is a hard limit on the whole message, so the only
         # content that can be lost is content Slack would refuse anyway.
-        import nerve.channels.slack as slack_module
+        import nerve.channels.slack_presentation as presentation_module
 
         blocks = build_notification_blocks("z" * 400_000, "n1")
         sections = self._sections(blocks)
-        assert len(sections) == slack_module._MAX_SECTION_BLOCKS
+        assert len(sections) == presentation_module._MAX_SECTION_BLOCKS
         assert "more characters" in sections[-1]
 
 
@@ -1556,8 +1688,12 @@ class TestNotificationCardRoundTrip:
 
         channel = _channel(allow_users=["U1"])
         service = MagicMock()
-        service.handle_answer = AsyncMock(return_value=True)
-        service.db.get_notification = AsyncMock(return_value=None)
+        service.answer_delivered_notification = AsyncMock(
+            return_value={
+                "status": "answered",
+                "redeliver_at": None,
+            }
+        )
         channel._notification_service = service
 
         blocks = build_notification_blocks(raw, "n1", [("Approve", "approve")])
@@ -1626,20 +1762,33 @@ class TestApprovalAttribution:
         channel = _channel(allow_users=["U0123ABC"])
         channel._replace_via_url = AsyncMock()
         service = MagicMock()
-        service.handle_answer = AsyncMock(return_value=True)
-        service.db.get_notification = AsyncMock(return_value=None)
+        service.answer_delivered_notification = AsyncMock(
+            return_value={
+                "status": "answered",
+                "redeliver_at": None,
+            }
+        )
         channel._notification_service = service
-        await channel._handle_interactive({
-            "type": "block_actions",
-            "user": {"id": "U0123ABC"},
-            "channel": {"id": "C1"},
-            "response_url": "https://hooks.slack.test/x",
-            "actions": [{"action_id": action_id, "value": value}],
-            "message": {"blocks": build_notification_blocks("Ship it?", "n1")},
-        })
+        await channel._handle_interactive(
+            {
+                "type": "block_actions",
+                "user": {"id": "U0123ABC"},
+                "channel": {"id": "C1"},
+                "response_url": "https://hooks.slack.test/x",
+                "actions": [{"action_id": action_id, "value": value}],
+                "message": {"blocks": build_notification_blocks("Ship it?", "n1")},
+            }
+        )
         return channel, service
 
     @pytest.mark.asyncio
     async def test_the_settled_card_names_who_answered(self):
-        channel, _ = await self._press()
+        channel, service = await self._press()
         assert "(by <@U0123ABC>)" in channel._replace_via_url.await_args[0][1]
+        service.answer_delivered_notification.assert_awaited_once_with(
+            "n1",
+            "approve",
+            channel="slack",
+            target="C1",
+            actor="U0123ABC",
+        )
