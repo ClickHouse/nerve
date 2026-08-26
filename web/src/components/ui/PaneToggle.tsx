@@ -6,11 +6,8 @@ import { IconButton } from './IconButton';
  *
  * Same icon pair and position as the chat header's sidebar toggle, so the
  * control for "show me the list" is in the same corner on every page that
- * has a list.
- *
- * The pair is Click UI's `slide-out` plus its mirror image, drawn in
- * `icons.tsx`: Click UI ships `slide-in`/`slide-out` with the bar on opposite
- * edges, which would make the panel edge jump sides as the toggle flips.
+ * has a list. Both glyphs keep the bar on the same edge, so only the arrow
+ * turns over as the toggle flips.
  */
 export function PaneToggle({ open, onToggle, label }: {
   open: boolean;

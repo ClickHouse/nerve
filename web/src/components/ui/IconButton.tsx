@@ -9,11 +9,10 @@ import { overridable } from './styles';
  * point of the component: an icon-only button with no `aria-label` announces as
  * "button" and nothing else, and a required prop makes that impossible.
  *
- * Not Click UI's `IconButton`, which picks its glyph from a closed union of
- * Click UI icon names. A quarter of this app's icons are drawn locally (see
- * `icons.tsx`) and have no such name, and several of these buttons swap their
- * icon by state — a spinner while busy, the action's glyph otherwise. Taking
- * the icon as children covers both.
+ * Not Click UI's `IconButton`, which picks its glyph by name from a closed
+ * union of Click UI icons. This app's icons are components (see `icons.tsx`),
+ * and several of these buttons swap their icon by state — a spinner while
+ * busy, the action's glyph otherwise. Taking the icon as children covers both.
  */
 
 export type IconButtonSize = 'xs' | 'sm' | 'md';
