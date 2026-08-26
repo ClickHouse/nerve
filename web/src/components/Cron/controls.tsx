@@ -16,7 +16,7 @@ export function JobTypeIcon({ type }: { type: string }) {
 }
 
 /**
- * Which kind of job this is — identity, not status, so it keeps the `hue-*`
+ * Which kind of job this is — identity, not status, so it uses the `hue-*`
  * colours (through the Badge tones that carry them) and pairs with the amber /
  * blue of `JobTypeIcon` above. A green badge here would read as "healthy",
  * which is what `StatusBadge` is for.
@@ -78,8 +78,6 @@ export function TriggerButton({ jobId, small = false }: { jobId: string; small?:
     ? <Loader2 size={small ? 12 : 14} className="animate-spin" />
     : <Play size={small ? 12 : 14} />;
 
-  // The disabled treatment is the primitives' (`opacity-50`, `cursor-not-allowed`)
-  // rather than the hand-rolled `text-text-faint` this used to swap in.
   if (small) {
     return (
       <IconButton label="Trigger now" size="xs" onClick={handleClick}

@@ -31,11 +31,10 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
       <div className="flex items-center justify-between px-3 py-2 border-b border-border-subtle bg-bg shrink-0">
         <span className="text-sm text-text-dim font-mono">{path}</span>
         <div className="flex items-center gap-2">
-          {/* A segmented pair. Both halves were nameless icon-only buttons;
-              IconButton's required label gives each one an accessible name,
-              and `active` is the accent tint the rest of the app uses for a
-              current selection. `px-2.5` keeps the segments as wide as they
-              were — the `p-1` of size xs would halve them. */}
+          {/* A segmented pair. IconButton's required label gives each half an
+              accessible name, and `active` is the accent tint the rest of the
+              app uses for a current selection. `px-2.5` keeps the segments
+              wide — the `p-1` of size xs would halve them. */}
           <div className="flex bg-surface-raised rounded-md border border-border">
             <IconButton
               label="Edit source" size="xs" className="px-2.5"

@@ -10,7 +10,7 @@ import { IconButton } from './IconButton';
  *
  * The pair is Click UI's `slide-out` plus its mirror image, drawn in
  * `icons.tsx`: Click UI ships `slide-in`/`slide-out` with the bar on opposite
- * edges, which would have made the panel edge jump sides as the toggle flipped.
+ * edges, which would make the panel edge jump sides as the toggle flips.
  */
 export function PaneToggle({ open, onToggle, label }: {
   open: boolean;

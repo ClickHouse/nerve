@@ -185,8 +185,9 @@ function RunListItem({ run, selected, onSelect }: {
   onSelect: () => void;
 }) {
   const usage = run.aggregate_usage;
-  // Left as a bare <button>: this is a multi-line card, and `Button`'s base
-  // `inline-flex items-center justify-center` would lay its rows side by side.
+  // A bare <button> rather than `Button`: this is a multi-line card, and
+  // `Button`'s base `inline-flex items-center justify-center` would lay its
+  // rows side by side.
   return (
     <button
       type="button"

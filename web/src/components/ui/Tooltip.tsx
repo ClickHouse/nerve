@@ -4,13 +4,11 @@ import { Tooltip as ClickTooltip } from '@clickhouse/click-ui/Tooltip';
 /**
  * A hover/focus tooltip, on Click UI's.
  *
- * This is one place the design system fits without argument. Click UI's
- * `Tooltip` is a Radix compound — `Root` / `Trigger` / `Content` — and its
- * provider is already mounted by `ClickUIProvider`, so the only thing missing
- * was an API short enough that converting a `title="…"` is a one-line change.
+ * Click UI's `Tooltip` is a Radix compound — `Root` / `Trigger` / `Content` —
+ * and its provider is mounted by `ClickUIProvider`. This wraps the three in one
+ * component, so a tip is a one-prop change at the call site.
  *
- * The app has 138 native `title` attributes and no tooltip component at all.
- * A native title is fine and should stay wherever it is doing its job; reach
+ * A native `title` is fine and should stay wherever it is doing its job; reach
  * for this when the tip needs markup, needs to be readable (native titles are
  * slow to appear and unstyleable), or sits on something with no other hover
  * affordance.

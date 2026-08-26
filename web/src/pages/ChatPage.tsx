@@ -250,9 +250,6 @@ export function ChatPage() {
           {/* Header */}
           <div className="border-b border-border-subtle px-3 md:px-5 py-2.5 flex items-center justify-between gap-2 bg-bg shrink-0">
             <div className="flex items-center gap-2 min-w-0">
-              {/* `PaneToggle` was modelled on this control — same icon pair,
-                  same corner, same "Hide/Show <pane>" naming — so this is the
-                  original folding into the primitive. */}
               <PaneToggle open={sessionListOpen} onToggle={toggleSessionList} label="sidebar" />
               <span className="font-medium text-base truncate">
                 {virtualSession?.id === activeSession
@@ -299,8 +296,8 @@ export function ChatPage() {
                   : rl.status === 'killed' ? 'killed'
                   : rl.status;
                 // A review loop's state is status, so these are the feedback
-                // tokens. The default branch is the live loop, which was the
-                // same green as `passed` and stays that way.
+                // tokens. The default branch is the live loop, which takes the
+                // same green as `passed`.
                 const tone = rl.status === 'passed'
                   ? 'text-success border-success-border bg-success-bg'
                   : rl.status === 'awaiting_user'

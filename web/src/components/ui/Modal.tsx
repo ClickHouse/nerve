@@ -17,14 +17,11 @@ import { modalStack } from './modalStack';
  * stops the event propagating. This app's global shortcuts are a bubble-phase
  * `document` listener (`useKeyboardShortcuts`) that does not consult
  * `defaultPrevented`, so under Radix an Escape would close the dialog *and*
- * stop a generation running behind it: the exact regression the third spec in
- * `Modal.test.tsx` exists to catch. Radix would also bring a second body-scroll
- * lock alongside the refcounted one below, and it renders its overlay as a
- * *sibling* of the panel rather than its parent, which changes what "click the
- * backdrop" means. The behaviour here is kept; Click UI is adopted through the
- * theme tokens the panel is painted with and through the `IconButton` in the
- * header. Click UI's `Dialog` remains the right choice for a dialog that does
- * not have to coexist with these global handlers.
+ * stop a generation running behind it. Radix would also bring a second
+ * body-scroll lock alongside the refcounted one below, and it renders its
+ * overlay as a *sibling* of the panel rather than its parent, which changes
+ * what "click the backdrop" means. Click UI's `Dialog` remains the right choice
+ * for a dialog that does not have to coexist with these global handlers.
  *
  * Three details are load-bearing:
  *

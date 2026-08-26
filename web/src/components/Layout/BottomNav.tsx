@@ -132,7 +132,7 @@ export function BottomNav() {
 
         {/* Native, for a different reason from the tab cells above: `Button`'s
             largest size is `px-3 py-2`, which on a phone drops these rows from
-            a 44px touch target to ~36px. Restoring `px-4 py-3` from the call
+            a 44px touch target to ~36px. Setting `px-4 py-3` from the call
             site does work today — but only because Tailwind happens to emit
             the larger value of a utility later, which is not a rule to build a
             touch target on. */}

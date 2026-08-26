@@ -43,11 +43,11 @@ export function NavRail() {
             // holding an icon *above* a label, and every `Button` size carries
             // at least `px-2`. Tailwind emits the values of one utility in
             // ascending order, so a call site's `px-0` loses to the variant's
-            // `px-2` at equal specificity — the padding cannot be given back,
-            // and 40px minus 16px does not fit the word "Notifs".
+            // `px-2` at equal specificity — the padding cannot be removed, and
+            // 40px minus 16px does not fit the word "Notifs".
             //
             // The active treatment below is `Button variant="subtle" active`'s,
-            // spelled out, so the two still agree on what "current" looks like.
+            // spelled out, so the two agree on what "current" looks like.
             <button
               key={path}
               onClick={() => navigate(path)}

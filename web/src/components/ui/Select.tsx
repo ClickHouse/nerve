@@ -13,16 +13,15 @@ import { FIELD_BASE, FIELD_SIZES, overridable, type FieldSize } from './styles';
  * nodes inside its own panel and whose Escape handler runs on the capture phase
  * — so an open Click UI list inside a dialog would be untabbable, and Escape
  * would close the dialog instead of the list. Making that work means teaching
- * the Modal about Radix's layer stack, which is a bigger change than the one
- * this refactor is making.
+ * the Modal about Radix's layer stack.
  *
  * **It is not a native control.** This app is used on a phone (the whole
  * `PageHeader` breakpoint story exists for that reason), and a native `<select>`
  * gets the platform's own picker there.
  *
- * So: use this for the existing selects. Reach for Click UI's `Select`
- * directly when a new one needs search or option groups — and keep it out of
- * dialogs until the Modal knows about Radix layers.
+ * So: use this for the app's plain selects. Reach for Click UI's `Select`
+ * directly when one needs search or option groups — and keep it out of dialogs
+ * until the Modal knows about Radix layers.
  */
 
 export interface SelectOption {

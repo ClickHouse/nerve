@@ -22,7 +22,7 @@ export function ThemeToggle() {
   // The label names the *current* preference, which is what the cycle
   // dark → light → system needs to expose: the glyph alone cannot say which of
   // the three states you are in. IconButton spends it as both `title` and
-  // `aria-label`, so the control finally has an accessible name.
+  // `aria-label`, so the control has an accessible name.
   return (
     <IconButton label={THEME_LABELS[preference]} size="md" onClick={cycleTheme}>
       <Icon size={16} />

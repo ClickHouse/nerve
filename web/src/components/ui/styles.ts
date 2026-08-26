@@ -43,21 +43,18 @@ const mergeCache = new Map<string, string>();
  *
  * Tailwind v4 emits same-property utilities in alphabetical/numeric order of
  * class name, so between two of them the later-*sorting* name wins — not the one
- * written last in the `class` attribute. Every primitive in this folder
- * therefore used to beat its own callers at whatever it happened to set:
- * `<Button size="xs" className="px-0">` rendered `px-2`, and `size="sm"` plus
- * `text-sm` rendered `text-xs`. Several migrated call sites asked for exactly
- * those and silently did not get them.
+ * written last in the `class` attribute. On class order alone a primitive beats
+ * its own callers at whatever it sets: `size="xs"` with a caller's `px-0` would
+ * render `px-2`, and `size="sm"` with `text-sm` would render `text-xs`.
  *
  * This drops the defaults that the override contradicts, so the escape hatch the
  * props cannot cover behaves the way its name implies.
  *
  * **It merges the override against the defaults, and nothing else.** Passing the
  * whole string through `twMerge` in one go would be shorter, and would also
- * quietly resolve collisions *between* the variant and size tables — which is
- * the bug class `Button.test.tsx` exists to catch, and which has already shipped
- * four times on this branch. Those tables must still never emit two of the same
- * property, and a duplicate inside them must still reach the DOM where the test
+ * quietly resolve collisions *between* the variant and size tables, which is
+ * what `Button.test.tsx` checks for. Those tables must never emit two of the
+ * same property, and a duplicate inside them must reach the DOM where the test
  * can see it. Filtering per default class keeps both properties: internal
  * duplicates survive untouched, and only the caller displaces anything.
  */
@@ -91,8 +88,7 @@ export function overridable(
 /**
  * The one focus treatment in the app: the border takes the accent colour and
  * nothing else moves. There is no focus ring anywhere in this codebase, so
- * adding one here would make wrapped controls look unlike their neighbours
- * until every last one is converted.
+ * adding one here would make these controls look unlike their neighbours.
  */
 export const FIELD_BASE =
   'bg-surface-raised border border-border-subtle text-text outline-none ' +
@@ -107,9 +103,9 @@ export const FIELD_BASE =
  * directly on the page rather than in a form. It sets no colour or spacing at
  * all, so a caller that wants a `p-5` and a `bg-bg-sunken` states them once
  * rather than stating them *against* a form field's chrome. `overridable` would
- * now let the caller win either way — this stays a named mode because "bare
- * editing surface" is a different thing from "form field with the padding
- * changed", not because the cascade forces it.
+ * let the caller win either way; this is a named mode because "bare editing
+ * surface" is a different thing from "form field with the padding changed", not
+ * because the cascade forces it.
  */
 export const FIELD_BARE =
   'bg-transparent border-0 text-text outline-none ' +

@@ -76,8 +76,6 @@ pre { white-space: pre-wrap; }
 
   return (
     <div>
-      {/* Toggle between HTML and text views. The pill's active/inactive pair
-          is what these two were already spelling out by hand. */}
       <div className="flex items-center gap-1 mb-3">
         <Button variant="pill" size="xs" active={showHtml} onClick={() => setShowHtml(true)}>
           HTML

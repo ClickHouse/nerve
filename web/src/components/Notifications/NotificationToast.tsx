@@ -7,11 +7,9 @@ import { Bell, HelpCircle, ShieldCheck, X } from '../ui/icons';
 const TOAST_DURATION = 5000;
 
 /**
- * The three canonical approval answers, as button variants rather than the
- * hand-rolled `emerald-400/15` + `red-400/15` class strings they replace —
- * which were stock Tailwind, so they did not follow the light theme.
- * `success` and `danger` are both *tinted*: `--theme-success` is a feedback
- * foreground (pale mint in dark mode) and would be unreadable as a solid fill.
+ * The three canonical approval answers, as button variants. `success` and
+ * `danger` are both *tinted*: `--theme-success` is a feedback foreground (pale
+ * mint in dark mode) and would be unreadable as a solid fill.
  */
 const APPROVAL_QUICK_VARIANTS: Record<string, ButtonVariant> = {
   approve: 'success',
@@ -95,9 +93,7 @@ export function NotificationToast() {
                 {isQuestion && options && notif.status === 'pending' && (
                   <div className="flex flex-wrap gap-1.5 mt-2">
                     {/* The pill chip, in its selected treatment: an answer
-                        option is a choice among a set, and `pill active` is
-                        the accent-on-accent-tint the hand-rolled classes here
-                        were already spelling out. */}
+                        option is a choice among a set. */}
                     {options.slice(0, 3).map((opt: string) => (
                       <Button
                         key={opt}

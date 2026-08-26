@@ -312,9 +312,9 @@ function MessageList() {
       {messages.map((msg) => {
         const isSelected = selectedMessage?.id === msg.id && selectedMessage?.source === msg.source;
         return (
-          // Left as a bare <button>: this is a two-line card, and `Button`'s
-          // base `inline-flex items-center justify-center` would lay the two
-          // rows side by side rather than stacked.
+          // A bare <button> rather than `Button`: this is a two-line card, and
+          // `Button`'s base `inline-flex items-center justify-center` would lay
+          // the two rows side by side rather than stacked.
           <button key={`${msg.source}:${msg.id}`} onClick={() => selectMessage(msg.source, msg.id)}
             className={`w-full text-left px-3 py-2.5 border-b border-border-subtle transition-colors cursor-pointer
               ${isSelected ? 'bg-accent/10 border-l-2 border-l-accent' : 'hover:bg-surface'}`}>
@@ -611,9 +611,9 @@ function MessageDetail() {
           </Button>
           {showProcessed && (
             <div className="p-3 bg-surface border border-border-subtle rounded-lg">
-              {/* Was `prose prose-invert prose-sm`, which generated nothing —
-                  @tailwindcss/typography is not installed. `.markdown-content`
-                  is this app's own rule set and covers the same ground. */}
+              {/* @tailwindcss/typography is not installed, so `prose` classes
+                  generate nothing. `.markdown-content` is this app's own rule
+                  set and covers the same ground. */}
               <div className="markdown-content text-sm text-text-muted">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {msg.processed_content || ''}
@@ -723,7 +723,7 @@ function ConsumersDetail() {
           const cursorsForSession = consumers.filter(c => c.session_id === sid);
           const totalUnread = cursorsForSession.reduce((sum, c) => sum + c.unread, 0);
           return (
-            // Two-line card; see MessageList for why this stays a <button>.
+            // Two-line card; see MessageList for why this is a bare <button>.
             <button key={sid} onClick={() => navigate(`/chat/${sid}`)}
               className="w-full text-left p-3 rounded border border-border-subtle hover:border-border-subtle hover:bg-surface transition-colors cursor-pointer">
               <div className="flex items-center justify-between">

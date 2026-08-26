@@ -15,7 +15,7 @@ function FileTreeNode({ node, depth, selectedPath, onSelect }: {
       <div>
         {/* Native, like the app's other list rows. `Button`'s `xs`/`sm` sizes
             pin the label to `text-xs`, and Tailwind emits `.text-xs` after
-            `.text-sm`, so a call site cannot put a 14px tree row back; the one
+            `.text-sm`, so a call site cannot ask for a 14px tree row; the one
             size that does carry `text-sm` is `md`, whose `py-2` doubles the
             height of a row in a tree that is often 200 deep. */}
         <button

@@ -30,9 +30,10 @@ CONFIG_DIR="${NERVE_CONFIG_DIR:-$INSTALL_DIR}"
 MIN_PYTHON_MINOR=13
 PREFERRED_PYTHON_MINOR=13
 # 22.12, not Vite 7's 20.19 floor: @clickhouse/click-ui declares
-# `engines.node >=22.12.0`, and web/package.json now declares the same. Provisioning
-# a 20.19 here would install a Node the dependency graph refuses under a strict
-# (`--engine-strict`) install, which is a support claim we cannot back.
+# `engines.node >=22.12.0`, and web/package.json declares the same.
+# Provisioning a 20.19 here would install a Node the dependency graph refuses
+# under a strict (`--engine-strict`) install, which is a support claim we
+# cannot back.
 MIN_NODE_VERSION="22.12.0"
 NON_INTERACTIVE="${NERVE_NON_INTERACTIVE:-0}"
 AUTO_YES="${NERVE_YES:-0}"

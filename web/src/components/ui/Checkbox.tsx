@@ -8,11 +8,10 @@ import { overridable } from './styles';
  * UI's `Checkbox` is Radix's, whose `onCheckedChange` hands back a
  * `boolean | 'indeterminate'` instead. Radix's is the right one when a checkbox
  * needs a tri-state or has to be styled beyond `accent-color`; this one is for
- * converting the plain ones.
+ * the plain ones.
  *
  * The label is rendered as a `<label>` wrapping both, so the text is part of
- * the hit area — the app's one hand-rolled checkbox put its label in a sibling
- * span, which made a 13px box the only place you could click.
+ * the hit area and not just the 13px box.
  */
 /**
  * The label's typography, as props rather than as classes on `labelClassName`.
@@ -20,7 +19,7 @@ import { overridable } from './styles';
  * These are the only two properties the app's checkbox labels vary, and naming
  * them keeps the choice closed and type-checked — `labelTone="dim"` is checked
  * at compile time where `labelClassName="text-text-dim"` is a string nobody
- * validates. `labelClassName` still works, and now wins, for anything else.
+ * validates. `labelClassName` takes anything else, and wins over these props.
  */
 export type CheckboxLabelSize = 'xs' | 'sm';
 export type CheckboxLabelTone = 'secondary' | 'muted' | 'dim';

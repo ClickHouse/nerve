@@ -13,9 +13,8 @@ import { useIsMobile } from '../hooks/useMediaQuery';
 /**
  * Memory-type identity colours. Data-driven: the map is read at runtime to
  * colour a dot, a badge and a badge tint, so these stay CSS colour *values*
- * rather than becoming utility classes. They are `--theme-hue-*` now, so the
- * identity colour follows the light/dark theme like the rest of the page —
- * the raw hexes here were pinned dark-theme values.
+ * rather than becoming utility classes. They are `--theme-hue-*` tokens, so
+ * the identity colour follows the light/dark theme like the rest of the page.
  */
 const TYPE_COLORS: Record<string, string> = {
   profile: 'var(--theme-accent)',
@@ -29,10 +28,8 @@ const TYPE_COLORS: Record<string, string> = {
 /**
  * A 15% wash of an identity colour, matching the 15% alpha `Badge`'s tones use.
  *
- * `color-mix` rather than the `color + '20'` string concat this replaces: that
- * only ever worked for a literal hex, and produced the invalid `var(--theme-
- * accent)20` for the one entry that was already a token — so `profile` badges
- * have been rendering with no tint at all.
+ * `color-mix` rather than an alpha suffix on the colour: the map holds
+ * `var(--theme-*)` tokens, and a suffix only works on a literal hex.
  */
 const tint = (color: string) => `color-mix(in oklab, ${color} 15%, transparent)`;
 
@@ -294,7 +291,7 @@ function Heatmap({ items, onDayClick, selectedDate }: { items: MemoryItem[]; onD
 
   // Data-driven, so these stay colour values rather than utilities. The three
   // steps are one hue at three alphas, keyed off item count; `color-mix` lets
-  // that hue be the theme token instead of the old pinned `#f59e0b`.
+  // that hue be the theme token.
   const getColor = (count: number, dateStr: string) => {
     if (selectedDate === dateStr) return 'var(--theme-accent)';
     if (count === 0) return 'var(--theme-surface)';

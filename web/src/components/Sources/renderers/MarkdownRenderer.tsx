@@ -7,13 +7,11 @@ interface Props {
 }
 
 /**
- * The eight `prose*` classes this used to carry — `prose prose-invert
- * prose-sm`, plus five `prose-<element>:` modifiers — generated no CSS at all:
- * `@tailwindcss/typography` is not installed, so every heading, link, table and
- * code block in a source message rendered as bare browser defaults. They are
- * replaced by `.markdown-content` (index.css), which is the app's own markdown
- * stylesheet and is what the chat transcript already uses — so a GitHub
- * notification and an agent message now render the same way.
+ * Styled by `.markdown-content` (index.css), the app's own markdown
+ * stylesheet, which the chat transcript uses too — so a GitHub notification
+ * and an agent message render the same way. `prose*` classes are not an
+ * option here: `@tailwindcss/typography` is not installed, so they generate no
+ * CSS at all.
  *
  * The base text colour stays on this element: `.markdown-content` colours
  * links, blockquotes and code, but inherits the body colour, which is what

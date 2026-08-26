@@ -4,31 +4,26 @@ import { Icon as ClickIcon, type IconName } from '@clickhouse/click-ui/Icon';
 /**
  * The app's icon set, on Click UI's glyphs behind lucide's call signature.
  *
- * 449 call sites across 77 files render icons as `<Name size={14}
- * className="..."/>`. Click UI ships the same idea under a different shape —
- * one `<Icon name="kebab-case"/>` component over a closed union of 174 names —
- * so switching sets by hand would have meant touching every one of those call
- * sites. This module is the adapter instead: one component per lucide name the
- * app actually uses, taking the props the app already passes. A page moves onto
- * the design system by changing `from 'lucide-react'` to `from
- * '../ui/icons'` — nothing else.
+ * Call sites render icons as `<Name size={14} className="..."/>`, while Click UI
+ * ships the same idea under a different shape — one `<Icon name="kebab-case"/>`
+ * component over a closed union of names. This module is the adapter: one
+ * component per lucide name the app uses, taking the props the call sites pass.
  *
  * Two things are deliberate about how the Click UI glyphs are wrapped:
  *
  * **Size stays in pixels.** Click UI sizes icons on a named scale (`xs` 12,
  * `sm` 16, `md` 20 …) but this app uses fourteen distinct pixel sizes, over
- * half of them 13 or 14, and some computed (`size={small ? 12 : 14}`). Snapping
- * to the nearest named step would have resized nearly every icon in the app, so
- * the pixel value is passed straight through as an explicit width/height
- * instead. Click UI's `size` scale is still reachable — it is what the `xs`…
- * `xxl` steps mean — but nothing here has to opt into it.
+ * half of them 13 or 14, and some computed (`size={small ? 12 : 14}`), which no
+ * named step matches. The pixel value is passed straight through as an explicit
+ * width/height. Click UI's `size` scale is still reachable — it is what the
+ * `xs`…`xxl` steps mean — but nothing here has to opt into it.
  *
  * **Icons are decorative and unnamed.** Click UI's `<Icon>` defaults to
- * `role="img"` with `aria-label` set to the glyph name, which would put 449
- * nodes announced as "cross" or "loading" into the accessibility tree and into
- * every `getByRole` query in the test suite. Every icon-only control in this app
- * already carries its own `title`/`aria-label`, so the icons are hidden and the
- * control keeps the name — which is also what lucide did.
+ * `role="img"` with `aria-label` set to the glyph name, which would put every
+ * icon into the accessibility tree — and into every `getByRole` query in the
+ * test suite — announced as "cross" or "loading". Every icon-only control in
+ * this app carries its own `title`/`aria-label`, so the icons are hidden and
+ * the control keeps the name.
  *
  * Where Click UI has no equivalent glyph, one is drawn here on the same 24×24
  * grid at the same 1.5 stroke with round caps and joins. Those are marked
@@ -38,18 +33,18 @@ import { Icon as ClickIcon, type IconName } from '@clickhouse/click-ui/Icon';
 
 export interface IconProps
   extends Omit<SVGProps<SVGSVGElement>, 'ref' | 'width' | 'height'> {
-  /** Pixel size, as lucide took it. Matches lucide's default of 24. */
+  /** Pixel size. Defaults to 24, as the call sites expect. */
   size?: number | string;
 }
 
-/** The shape every icon in this module has — lucide's, minus the parts unused here. */
+/** The shape every icon in this module has. */
 export type Icon = ComponentType<IconProps>;
 
 const cx = (...parts: Array<string | false | undefined>) =>
   parts.filter(Boolean).join(' ');
 
 /**
- * A Click UI glyph in lucide's clothing.
+ * A Click UI glyph behind this module's props.
  *
  * `<Icon>` renders the glyph inside a wrapper element and recolours it from
  * `currentColor` through its own stylesheet — which is what keeps the app's
@@ -189,9 +184,7 @@ export const Star = clickUI('star', 'Star');
  *
  * Click UI ships only the outline, and a `fill-*` class on the call site cannot
  * fill it: `<Icon>` renders the glyph inside a wrapper element, so `className`
- * lands on that box and never reaches the `<path>`. The starred sessions in the
- * sidebar asked for `fill-hue-yellow` and silently got an outline — the class
- * was applied, just to the wrong node.
+ * lands on that box and never reaches the `<path>`.
  *
  * Same path data as Click UI's `star`, so the two are the same shape at the
  * same optical weight; only `fill` differs.
@@ -204,9 +197,9 @@ export const StarFilled = drawn(
 export const Trash2 = clickUI('trash', 'Trash2');
 export const Zap = clickUI('flash', 'Zap');
 
-/** Click UI's `enter` is the same return arrow lucide draws for `CornerDownLeft`. */
+/** Click UI's `enter` is the return arrow. */
 export const CornerDownLeft = clickUI('enter', 'CornerDownLeft');
-/** `popout` is the box-with-escaping-arrow glyph, i.e. lucide's external link. */
+/** `popout` is the box-with-escaping-arrow glyph, i.e. an external link. */
 export const ExternalLink = clickUI('popout', 'ExternalLink');
 /** The grip is Click UI's two columns of dots. */
 export const GripVertical = clickUI('dots-vertical-double', 'GripVertical');
@@ -220,14 +213,13 @@ export const Terminal = clickUI('query', 'Terminal');
 export const SquareTerminal = clickUI('query', 'SquareTerminal');
 /**
  * Click UI's `loading` is the static spinner glyph — the animation lives in a
- * separate `loading-animated` icon. The static one is what lucide's `Loader2`
- * is too, and every call site in this app already spins it with `animate-spin`;
- * using the animated glyph would spin it twice.
+ * separate `loading-animated` icon. Every call site spins this one with
+ * `animate-spin`, so the animated glyph would spin twice.
  */
 export const Loader2 = clickUI('loading', 'Loader2');
 
 /* ------------------------------------------------------------------ *
- * Near-duplicates the app used inconsistently, folded onto one glyph
+ * Near-duplicate names, folded onto one glyph
  * ------------------------------------------------------------------ */
 
 export const CheckCircle = clickUI('check-in-circle', 'CheckCircle');
@@ -263,12 +255,12 @@ export const MessageCircle = MessageSquare;
 
 /** Click UI has no dollar-in-circle; this is the bare `$`. */
 export const CircleDollarSign = clickUI('dollar', 'CircleDollarSign');
-/** `git-merge` — a merge graph where lucide draws a branch. Same family. */
+/** `git-merge` — a merge graph rather than a branch. Same family. */
 export const GitBranch = clickUI('git-merge', 'GitBranch');
 /** No hammer or wrench in the set; `gear` is the generic tool. */
 export const Hammer = clickUI('gear', 'Hammer');
 export const Wrench = clickUI('gear', 'Wrench');
-/** Checkboxes become bullets — Click UI has no checklist glyph. */
+/** Bullets, not checkboxes: Click UI has no checklist glyph. */
 export const ListTodo = clickUI('list-bulleted', 'ListTodo');
 /** Two stacked pages; the same glyph Click UI uses for copy. */
 export const Files = clickUI('copy', 'Files');
@@ -278,15 +270,15 @@ export const Timer = clickUI('alarm', 'Timer');
 export const Archive = clickUI('cards', 'Archive');
 /** `?` on a card — the nearest thing to a question in a speech bubble. */
 export const MessageCircleQuestion = clickUI('support', 'MessageCircleQuestion');
-/** The check is dropped; Click UI has only the plain magnifier. */
+/** No check on it: Click UI has only the plain magnifier. */
 export const SearchCheck = clickUI('search', 'SearchCheck');
-/** A loop with an arrowhead, where lucide draws a rectangular repeat. */
+/** A loop with an arrowhead, rather than a rectangular repeat. */
 export const Repeat = clickUI('integrations', 'Repeat');
-/** Nodes joined by edges — lucide draws boxes, same reading. */
+/** Nodes joined by edges rather than boxes. Same reading. */
 export const Workflow = clickUI('tree-structure', 'Workflow');
-/** Expand-in-place, rather than lucide's pair of diagonal arrows. */
+/** Expand-in-place, rather than a pair of diagonal arrows. */
 export const Maximize2 = clickUI('expand-all', 'Maximize2');
-/** A stop button, where lucide draws a cross in an octagon. Both read "halted". */
+/** A stop button rather than a cross in an octagon. Both read "halted". */
 export const OctagonX = clickUI('stop', 'OctagonX');
 /** The bare cross. */
 export const X = clickUI('cross', 'X');

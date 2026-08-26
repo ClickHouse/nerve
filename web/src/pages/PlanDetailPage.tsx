@@ -139,12 +139,11 @@ export function PlanDetailPage() {
             <div className="mt-6 space-y-3">
               <div className="flex items-center gap-3">
                 {/* Approving is this page's one committing action, so it takes
-                    the `primary` treatment — a deliberate green→accent change.
-                    It was `bg-emerald-600 text-white`, and the alternatives do
-                    not hold: `success` is tinted, which would leave the
-                    affirmative action quieter than the `dangerSolid` Decline
-                    beside it, and there is no solid-success pair to build one
-                    from — `--theme-success` is a feedback *foreground*. */}
+                    the `primary` treatment. The alternatives do not hold:
+                    `success` is tinted, which would leave the affirmative
+                    action quieter than the `dangerSolid` Decline beside it, and
+                    there is no solid-success pair to build one from —
+                    `--theme-success` is a feedback *foreground*. */}
                 <Button variant="primary" size="md" onClick={handleApprove} disabled={actionLoading}>
                   <Check size={14} />
                   Approve &amp; Implement
@@ -167,8 +166,8 @@ export function PlanDetailPage() {
                   <div className="flex gap-0">
                     <div className="w-1 bg-error/40 rounded-full shrink-0" />
                     <div className="flex-1 pl-3">
-                      {/* The red focus border is gone on purpose: FIELD_BASE is
-                          the app's one focus treatment and it is accent. */}
+                      {/* No red focus border here: FIELD_BASE is the app's one
+                          focus treatment and it is accent. */}
                       <TextArea
                         value={declineFeedback}
                         onChange={e => setDeclineFeedback(e.target.value)}

@@ -105,9 +105,9 @@ export function BoardColumn({
         <div className="flex items-center gap-2">
           {dragHandle}
           <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
-          {/* The named steps carry a line-height the arbitrary sizes did not,
-              so the header pins its own — a lane header is chrome and must not
-              grow at the cards' expense. */}
+          {/* The named type steps carry a line-height, so the header pins its
+              own — a lane header is chrome and must not grow at the cards'
+              expense. */}
           <h2 className="text-sm leading-tight font-semibold text-text-secondary truncate">{label}</h2>
           <span className="text-xs leading-tight text-text-faint tabular-nums">{lane.total}</span>
           <div className="ml-auto flex items-center gap-0.5">

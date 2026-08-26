@@ -25,11 +25,11 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
       {/* Native buttons, not `Button`: these are `justify-between` rows — label
           on the left, count or hover controls on the right — and the
           primitive's base `justify-center` wins over a `justify-between` from
-          the call site (Tailwind emits it later), so the layout cannot be had
-          back. The job rows below also carry their own controls (`ChatLink`,
-          `TriggerButton`), which makes each row a container for interactive
-          children as much as a control. Selected treatment is `subtle
-          active`'s. */}
+          the call site (Tailwind emits it later), so the layout cannot come
+          from there. The job rows below also carry their own controls
+          (`ChatLink`, `TriggerButton`), which makes each row a container for
+          interactive children as much as a control. Selected treatment is
+          `subtle active`'s. */}
       <div className="p-2 space-y-1">
         <button onClick={() => { selectJob(null); onSelect?.(); }}
           className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-sm transition-colors cursor-pointer

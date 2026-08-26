@@ -40,7 +40,7 @@ function parseMemoryItems(text: string): MemoryItem[] {
 
 /**
  * Memory-type identity, not status: `profile` is not "this succeeded", it is a
- * kind of record. The tones are picked so the chips keep the hues they had.
+ * kind of record. Each tone is picked for its hue, not for its meaning.
  */
 const TYPE_TONES: Record<string, BadgeTone> = {
   event: 'info',

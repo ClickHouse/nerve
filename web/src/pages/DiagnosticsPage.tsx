@@ -46,8 +46,8 @@ function RunButton({ onClick, label, title }: { onClick: () => Promise<void>; la
   };
 
   return (
-    // `disabled` carries the running state now — `Button` already dims and
-    // blocks the cursor, which is what the hand-rolled branch was doing.
+    // `disabled` carries the running state: `Button` already dims the control
+    // and blocks the cursor.
     <Button variant="secondary" onClick={handleClick} disabled={running} title={title}>
       {running
         ? <><Loader2 size={12} className="animate-spin" /> Running...</>

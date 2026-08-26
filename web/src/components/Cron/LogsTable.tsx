@@ -29,8 +29,7 @@ export function LogsTable({ showJobColumn }: { showJobColumn: boolean }) {
       <div className="flex-1 overflow-y-auto">
         {/* `text-sm` carries a 20px line-height, which on `py-2` cells would
             add 4px to every row of a log that is often hundreds long.
-            `leading-tight` (17.5px) keeps the run history as dense as the
-            13px/normal it replaces. */}
+            `leading-tight` (17.5px) keeps the run history dense. */}
         <table className="w-full text-sm leading-tight">
           <thead className="sticky top-0 bg-bg">
             <tr className="text-text-muted">
@@ -69,8 +68,6 @@ function LogsPagination() {
       <span className="text-xs text-text-dim tabular-nums">
         {from}–{to} of {logsTotal}
       </span>
-      {/* The `btn(enabled)` helper this replaces existed only to hand-roll a
-          disabled colour; IconButton carries that treatment itself. */}
       <IconButton label="Previous page" size="xs" disabled={!hasPrev || loading}
         onClick={() => setLogsPage(logsOffset - LOGS_PAGE_SIZE)}>
         <ChevronLeft size={14} />

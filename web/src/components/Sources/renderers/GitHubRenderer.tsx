@@ -24,8 +24,7 @@ export function GitHubRenderer({ content, metadata, summary: _summary }: Props) 
             <Github size={14} className="text-hue-purple shrink-0" />
             <span className="text-sm text-text-secondary font-medium">{repoName}</span>
             {/* Purple is GitHub's identity here, not a status — it matches the
-                `text-hue-purple` mark above it, and `hue-purple` follows the
-                light theme where the stock `purple-500/15` did not. */}
+                `text-hue-purple` mark above it. */}
             {subjectType && <Badge tone="purple">{subjectType}</Badge>}
             {reason && <Badge>{reason}</Badge>}
           </div>

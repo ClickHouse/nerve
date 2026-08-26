@@ -4,18 +4,11 @@ import { overridable } from './styles';
 /**
  * The app's button.
  *
- * There were 239 hand-styled `<button>` elements across 74 files before this,
- * carrying 195 distinct class strings between them. Nearly all of those were
- * one of six shapes with the spacing or the disabled opacity drifting by a step
- * — `disabled:opacity-30`, `-40` and `-50` all appear, on buttons that do the
- * same job. The variants below are those six shapes, named.
- *
  * Deliberately **not** Click UI's `Button`: that one renders its content from a
  * `label` string plus an `iconLeft`/`iconRight` icon name, and takes no
  * children. Most buttons in this app hold real markup — an icon element, a
- * truncating span, a count badge — so wrapping it would have meant rewriting
- * every call site's content rather than just its classes. Click UI's `Button`
- * is still the right thing for a plain labelled button; import it directly.
+ * truncating span, a count badge — which it cannot take. Click UI's `Button` is
+ * the right thing for a plain labelled button; import it directly.
  *
  * Everything the design system does contribute reaches this through the
  * semantic tokens (`bg-accent`, `text-text-muted`, `border-border-subtle`),
@@ -46,9 +39,9 @@ const VARIANTS: Record<ButtonVariant, string> = {
    * The page's one committing action.
    *
    * `text-on-accent`, never `text-white`: the accent is ClickHouse yellow in
-   * dark mode, where white is unreadable on it. `overridable` means a call site
-   * *could* now correct a wrong default, but 1.1:1 text is not something a
-   * reviewer will spot at the call site, so it has to be right here.
+   * dark mode, where white is unreadable on it. `overridable` lets a call site
+   * correct a wrong default, but 1.1:1 text is not something a reviewer will
+   * spot at the call site, so it has to be right here.
    */
   primary: 'text-on-accent bg-accent hover:bg-accent-hover rounded-lg font-medium',
   /** Sits beside a primary without competing with it. */
@@ -66,21 +59,19 @@ const VARIANTS: Record<ButtonVariant, string> = {
   subtle: 'rounded',
   /**
    * Destructive, tinted. Uses `hue-red` rather than a stock `red-*` so it
-   * follows the light theme — the hand-rolled `bg-red-600` buttons this
-   * replaces are pinned to dark-theme values.
+   * follows the light theme; a stock red is one fixed value in both themes.
    */
   danger:
     'text-hue-red bg-hue-red/15 hover:bg-hue-red/25 rounded-md font-medium',
   /**
    * Affirmative, but *not* the page's primary action — "Accept as-is",
    * "Adopt & continue", "Start review loop". Green rather than accent, because
-   * the accent is now ClickHouse yellow and reads as neither.
+   * the accent is ClickHouse yellow and reads as neither.
    *
    * Tinted, not solid, and that is forced rather than chosen: `--theme-success`
    * is Click UI's feedback *foreground*, which in dark mode is a pale mint
-   * (#ccffd0). `bg-success text-white` measures 1.12:1 — the same bug as
-   * `bg-accent text-white`, from the same cause. Text-on-tint is the only
-   * pairing legible in both themes (10.5:1 dark, 7.3:1 light).
+   * (#ccffd0). `bg-success text-white` measures 1.12:1. Text-on-tint is the
+   * only pairing legible in both themes (10.5:1 dark, 7.3:1 light).
    */
   success:
     'text-success bg-success-bg border border-success-border hover:border-success rounded-md font-medium',
@@ -117,12 +108,11 @@ const VARIANTS: Record<ButtonVariant, string> = {
   /**
    * Destructive and unmissable — for the confirm step, not the trigger.
    *
-   * `bg-error-solid`, not `bg-hue-red`. An earlier version of this comment
-   * claimed `text-white` was safe here "because it sits on red, not on the
-   * accent" — that was wrong. `hue-red` is an *identity* hue meant for text on
-   * the page background, so it flips to a light #ff7575 in dark mode, where
-   * white on it measures 2.61:1. `error-solid` is a theme-independent palette
-   * entry (#c10000 both ways), giving 6.43:1 in either theme.
+   * `bg-error-solid`, not `bg-hue-red`. `hue-red` is an *identity* hue meant
+   * for text on the page background, so it flips to a light #ff7575 in dark
+   * mode, where white on it measures 2.61:1. `error-solid` is a
+   * theme-independent palette entry (#c10000 both ways), giving 6.43:1 in
+   * either theme.
    */
   dangerSolid:
     'text-white bg-error-solid hover:bg-error-solid/90 rounded-md font-medium',
@@ -135,9 +125,8 @@ const VARIANTS: Record<ButtonVariant, string> = {
 };
 
 /**
- * The selected treatment, per variant. The app was already consistent about
- * this — an active control is accent-on-accent-tint — it just spelled the tint
- * three different ways (`/10`, `/15`, `/20`).
+ * The selected treatment, per variant: an active control is accent on an accent
+ * tint.
  *
  * **Any variant with an entry here must set no colour in VARIANTS.** Its
  * resting colour goes in INACTIVE instead, so that exactly one of the two sets
@@ -151,15 +140,14 @@ const VARIANTS: Record<ButtonVariant, string> = {
  * stylesheet it lands at offset 49085, against `.text-hue-red` 51903,
  * `.text-on-accent` 52978, `.text-text-dim` 53924, `.text-text-faint` 53967,
  * `.text-text-muted` 54167, `.text-text-secondary` 54214 and `.text-white`
- * 54310. Appending an accent `ACTIVE` after a coloured base therefore lost
- * silently, every time — `active` simply did nothing on `ghost` and `subtle`.
- * The same trap caught `tab`, whose `border-transparent` outsorted, and so
- * beat, `ACTIVE.tab`'s `border-accent`.
+ * 54310. An accent `ACTIVE` appended after a coloured base therefore loses,
+ * silently, and a `border-transparent` in the base outsorts, and so beats,
+ * `ACTIVE.tab`'s `border-accent`.
  *
  * `overridable` does not rescue this. It resolves the *caller's* `className`
  * against these tables and deliberately leaves collisions between the tables
  * themselves in place, so that they still reach the DOM where the test can see
- * them. `Button.test.tsx` pins the invariant so it cannot come back unnoticed.
+ * them. `Button.test.tsx` pins the invariant.
  */
 const ACTIVE: Partial<Record<ButtonVariant, string>> = {
   pill: 'bg-accent/15 text-accent border-accent/30',
@@ -182,21 +170,21 @@ const INACTIVE: Partial<Record<ButtonVariant, string>> = {
    * then be hovering to the colour it is already on, and the control would go
    * dead.
    *
-   * `surface-hover` instead of `surface-raised` is a real improvement but it
-   * does not rescue that case on its own, and it is worth writing down why so
-   * nobody "simplifies" the text move away on the strength of it. Both are
-   * `color-mix` of the same two near-neutral greys: `surface-raised` is 50/50,
-   * `surface-hover` is 25/75. In dark those inputs are #282828 and #323232, so
-   * the two land roughly 2 units apart out of 255; in light (#f6f7fa, #e6e7e9)
-   * roughly 4. On a raised parent that step is essentially invisible, and the
-   * text is the only thing the eye actually gets. A genuinely distinct surface
-   * step would need a token the palette does not have.
+   * `surface-hover` rather than `surface-raised` is better, but it does not
+   * rescue that case on its own, so it is no reason to drop the text move. Both
+   * are `color-mix` of the same two near-neutral greys: `surface-raised` is
+   * 50/50, `surface-hover` is 25/75. In dark those inputs are #282828 and
+   * #323232, so the two land roughly 2 units apart out of 255; in light
+   * (#f6f7fa, #e6e7e9) roughly 4. On a raised parent that step is essentially
+   * invisible, and the text is the only thing the eye actually gets. A
+   * genuinely distinct surface step would need a token the palette does not
+   * have.
    *
    * The text moves *up* from the resting colour rather than the resting colour
    * moving down: dimming ~71 list rows at rest to buy a hover state on one
    * segmented control would be a bad trade. Both hovers are `hover:`-prefixed,
-   * so they carry a pseudo-class and sit outside the ordering hazard described
-   * below — this pair is decided by specificity, not by class name.
+   * so they carry a pseudo-class and sit outside the ordering hazard on ACTIVE
+   * — this pair is decided by specificity, not by class name.
    */
   subtle: 'text-text-secondary hover:text-text hover:bg-surface-hover',
 };

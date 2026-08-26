@@ -13,9 +13,9 @@ import { useToastHotkeyShim } from './useToastHotkeyShim';
  * what is worth pinning is that doing so is still enough to reach Radix's
  * listener after a Click UI or Radix upgrade moves it.
  *
- * `expectsFocusTheft` is the negative control. Without it the suite would keep
- * passing if Click UI dropped the toast viewport, if Radix changed the hotkey,
- * or if the harness simply never dispatched a real F8 — three ways to be green
+ * The `shim={false}` case is the negative control. Without it the suite would
+ * keep passing if Click UI dropped the toast viewport, if Radix changed the
+ * hotkey, or if the harness never dispatched a real F8 — three ways to be green
  * while testing nothing.
  */
 function Harness({ shim }: { shim: boolean }) {
@@ -50,7 +50,7 @@ describe('Click UI toast hotkey', () => {
   }
 
   it('steals focus from a text field when nothing intercepts it', () => {
-    // Negative control — this is the reported defect, reproduced.
+    // Negative control: with no shim, F8 pulls focus into the toast viewport.
     render(<Harness shim={false} />);
     const input = screen.getByRole('textbox', { name: 'composer' });
     input.focus();

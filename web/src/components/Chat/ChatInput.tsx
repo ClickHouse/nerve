@@ -636,15 +636,14 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           `basis-full`/`order-1` pair on it).
 
           The composer stack — this row and the rewrite / quote / attachment
-          strips above it — deliberately does NOT carry
-          `max-w-[var(--chat-width)]`, which everything on the transcript side
-          does. Those are one cap on two things that want different widths: a
-          reading column wants to stay narrow for prose, while the composer is a
-          control surface and only ever gets narrower as the model picker and
-          five buttons take their fixed share out of it. At the default 768 that
-          left the textarea 430px. Widening the reading column to fix the
-          composer made the transcript worse, and there is no reason to trade
-          them off against each other, so the composer just fills the pane. */}
+          strips above it — does not carry `max-w-[var(--chat-width)]`, which
+          everything on the transcript side does. One cap cannot serve both: a
+          reading column stays narrow for prose, while the composer is a control
+          surface that only gets narrower as the model picker and five buttons
+          take their fixed share out of it. Capped at the default 768 the
+          textarea gets 430px, and widening the reading column to suit the
+          composer would make the transcript worse, so the composer fills the
+          pane instead. */}
       <div className="px-4 py-3">
         {/* `relative` is the anchor for the run-later popup below. It hangs off
             this row rather than off its own 40px trigger so that it is aligned
@@ -785,11 +784,9 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             // basis-full makes the textarea claim a whole flex line on its
             // own; order-1 puts that line under the controls rather than
             // above them. Both are undone at `md`, back to a single row.
-            // `text-sm`, matching every other input in the app (`FIELD_SIZES.md`
-            // is `text-sm` too). This was `text-[15px]` before the type scale
-            // landed and got rounded *up* to `text-base` — 16px, which reads
-            // oversized next to the transcript and fits noticeably less text on
-            // a line at the composer's 430px.
+            // `text-sm` matches every other input in the app (`FIELD_SIZES.md`
+            // is `text-sm` too). `text-base` — 16px — reads oversized next to
+            // the transcript and fits noticeably less text on a line.
             className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-sm text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
           {/* Run-later kebab — three-dots menu next to Send. Its submenu
@@ -797,37 +794,34 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               tokens now (opens upward; the composer sits at the bottom).
 
               No `order`: it belongs on the controls line with everything else.
-              It used to carry `order-2`, which on a phone sorted it *after* the
-              `order-1` textarea — so it wrapped onto a third line of its own,
-              alone at the left margin under the message box, and the popup
-              (right-aligned to a 40px trigger 16px from the left edge) opened
-              ~114px off the left of the screen. Desktop never showed it: that
-              row is `md:flex-nowrap`, so nothing wraps and `order` is inert. */}
+              Anything sorted after the `order-1` textarea wraps onto a line of
+              its own under the message box, at the left margin, where a popup
+              right-aligned to a 40px trigger opens off the left of the screen.
+              Desktop never shows this: that row is `md:flex-nowrap`, so nothing
+              wraps and `order` is inert. */}
           <div className="shrink-0" ref={menuRef}>
             <IconButton
               label="More options"
               size="md"
               onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
               disabled={disabled || isStreaming || rewriteActive}
-              // `aria-expanded` only. This was `aria-haspopup="menu"`, which
-              // promises the ARIA menu pattern — `menu`/`menuitem` roles, focus
-              // moving into the popup, arrow-key navigation, Escape to close —
-              // where the popup below is a `div` of ordinary buttons. It is a
-              // disclosure, so it now says so rather than announcing a keyboard
-              // model that is not there.
+              // `aria-expanded` only. `aria-haspopup="menu"` would promise the
+              // ARIA menu pattern — `menu`/`menuitem` roles, focus moving into
+              // the popup, arrow-key navigation, Escape to close — but the popup
+              // below is a `div` of ordinary buttons. It is a disclosure, so it
+              // says so rather than announcing a keyboard model that is not
+              // there.
               aria-expanded={menuOpen}
               className="rounded-xl"
             >
               <MoreHorizontal size={18} />
             </IconButton>
             {menuOpen && (
-              // A fixed width, where this used to be `min-w-[170px]`. Same
-              // 170px on screen — the min-width was what decided it before, an
-              // absolutely-positioned box with only `right` set having had
-              // nothing but a 40px trigger to shrink-to-fit against. Anchored to
-              // the composer there is 500px of room and it would take all of it
-              // for four short labels, and `w-max` does not help: Chrome's
-              // max-content for these `w-full` children lands in the same place.
+              // A fixed width, not a minimum. The popup is anchored to the
+              // composer, so it has ~500px to shrink-to-fit against and would
+              // take all of it for four short labels. `w-max` does not help:
+              // Chrome's max-content for these `w-full` children lands in the
+              // same place.
               <div className="absolute right-0 bottom-full mb-1 z-50 w-[170px] bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1">
                 <Button
                   variant="subtle"

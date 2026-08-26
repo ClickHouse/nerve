@@ -3,11 +3,11 @@
  *
  *   import { Button, IconButton, TextField, Badge } from '../ui';
  *
- * Icons are deliberately *not* re-exported here. There are 118 of them and they
- * shadow common words (`File`, `List`, `Filter`, `Search`, `Square`), so folding
- * them into this barrel would make every wildcard import ambiguous and every
- * name collision silent. Import them from `../ui/icons` instead — which is also
- * the single-line change that moves a file off lucide.
+ * Icons are deliberately *not* re-exported here. There are over a hundred of
+ * them and they shadow common words (`File`, `List`, `Filter`, `Search`,
+ * `Square`), so folding them into this barrel would make every wildcard import
+ * ambiguous and every name collision silent. Import them from `../ui/icons`
+ * instead.
  */
 
 export { Badge, type BadgeProps, type BadgeSize, type BadgeTone } from './Badge';

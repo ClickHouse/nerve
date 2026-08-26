@@ -22,12 +22,11 @@ import type { ReactNode } from 'react';
  * would move them visually while leaving the keyboard to step through every
  * filter and the search box first.
  *
- * This is Nerve's layout, not a library component, and it stays that way: the
- * three rules above are answers to this app's viewport and this app's headers,
- * and none of them is a shape a design system ships. What Click UI contributes
- * it contributes through the tokens — `border-border-subtle`, `bg-bg` and the
- * text colours are the theme, so this header repaints with the rest of the app
- * and holds no colour of its own.
+ * This is Nerve's layout, not a library component: the three rules above are
+ * answers to this app's viewport and this app's headers, and none of them is a
+ * shape a design system ships. Every colour is a theme token —
+ * `border-border-subtle`, `bg-bg` and the text colours — so this header
+ * repaints with the rest of the app and holds no colour of its own.
  *
  * For the slots: `filters` takes `Button variant="pill"` with `active`, `search`
  * takes a `TextField`, and `actions` takes `Button`/`IconButton` — the

@@ -112,9 +112,9 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
           style={{ backgroundColor: color }}
           title="Pick a color"
         >
-          {/* Stays a bare `<input>`: it is invisible, stretched over the
-              swatch, and the swatch itself is the control. `TextField`'s field
-              chrome would be painted onto something with `opacity-0`. */}
+          {/* A bare `<input>`, not `TextField`: it is invisible, stretched over
+              the swatch, and the swatch itself is the control. `TextField`'s
+              field chrome would be painted onto something with `opacity-0`. */}
           <input
             type="color"
             value={color}

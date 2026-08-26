@@ -10,22 +10,19 @@ import { overridable } from './styles';
 import { TextArea, TextField } from './TextField';
 
 /**
- * These specs exist for one bug, which is invisible to every other check we
- * have and which `tsc`, eslint and the build all pass straight through.
+ * These specs hold one rule that no other check can see: `tsc`, eslint and the
+ * build all pass a class collision straight through.
  *
  * Tailwind v4 emits same-property utilities in alphabetical order of class
  * name. Between two colour classes on one element, the winner is therefore the
  * later-*sorting* name — not the one written last in the `class` attribute, and
  * not the one from the "more specific" lookup table. `.text-accent` sorts
  * before every other colour token in this app, so a selected treatment appended
- * after a coloured base lost every time: `<Button variant="ghost" active>`
- * rendered muted, and `variant="tab" active` kept a transparent border.
+ * after a coloured base loses.
  *
- * Nothing about that is visible in jsdom, which applies no CSS at all. What can
- * be asserted is the structural rule that makes the ordering irrelevant: an
- * element must never carry two classes that set the same property. Enforcing
- * that here is what keeps the fix from quietly regressing the next time a
- * variant gains a colour.
+ * None of that is visible in jsdom, which applies no CSS at all. What can be
+ * asserted is the structural rule that makes the ordering irrelevant: an
+ * element must never carry two classes that set the same property.
  */
 
 /** Classes that set `color`. The `text-xs`/`text-sm` steps set size, not colour. */
@@ -119,18 +116,16 @@ const ICON_VARIANTS = Object.keys(ALL_ICON_VARIANTS) as IconButtonVariant[];
 
 /**
  * Hover feedback that only exists as a surface change disappears when the
- * parent already carries that surface. This is invisible to every other check:
- * the classes are all present and well-formed, nothing collides, and the
- * failure is purely that the user sees nothing happen.
+ * parent already carries that surface. No other check can see it: the classes
+ * are all present and well-formed, nothing collides, and the failure is purely
+ * that the user sees nothing happen.
  *
- * It is also the regression a reasonable person would introduce on purpose.
- * `subtle` currently hovers *both* the text and the surface, and the surface
- * half looks like the redundant one — so "we already hover the background,
- * drop the text move" is the obvious cleanup. It is backwards: on a raised
- * parent the surface step is the invisible half, roughly 2/255 in dark and
- * 4/255 in light (see the comment on INACTIVE.subtle for the arithmetic).
- *
- * The comment there explains it, but a comment cannot fail a build. This can.
+ * `subtle` hovers *both* the text and the surface, and the surface half looks
+ * like the redundant one, so "we already hover the background, drop the text
+ * move" reads as an obvious cleanup. It is backwards: on a raised parent the
+ * surface step is the invisible half, roughly 2/255 in dark and 4/255 in light
+ * (see the comment on INACTIVE.subtle for the arithmetic). A comment cannot
+ * fail a build. This can.
  */
 describe('Button hover feedback survives its container', () => {
   it('subtle keeps a text hover: its surface hover is invisible on a raised parent', () => {
@@ -174,7 +169,6 @@ describe('Button colour classes are unambiguous', () => {
   }
 
   it('renders the accent treatment when active, not the resting colour', () => {
-    // The regression itself: `ghost` used to keep `text-text-muted` here.
     render(<Button variant="ghost" active>on</Button>);
     expect(textColours(screen.getByRole('button'))).toEqual(['text-accent']);
   });
@@ -187,9 +181,9 @@ describe('Button colour classes are unambiguous', () => {
   });
 
   it('never puts white on the accent fill', () => {
-    // MIGRATION REFERENCE §3: accent is ClickHouse yellow in dark mode, so
-    // `text-white` on it is unreadable — and `.text-white` outsorts
-    // `.text-on-accent`, so a call site could not correct it either.
+    // The accent is ClickHouse yellow in dark mode, so `text-white` on it is
+    // unreadable — and `.text-white` outsorts `.text-on-accent`, so a call site
+    // cannot correct it either.
     render(<Button variant="primary">go</Button>);
     const el = screen.getByRole('button');
     expect(el).toHaveClass('bg-accent');
@@ -233,19 +227,18 @@ describe('IconButton colour classes are unambiguous', () => {
 });
 
 /**
- * The other half of the same bug, from the caller's side.
+ * The caller's side of the same rule.
  *
  * Everything above pins the *primitive* to one class per property. That is
  * necessary and not sufficient: a call site that writes `className="px-0"` is
- * adding the second one from outside, and until `overridable` landed it lost —
- * `.px-0` is emitted before `.px-2`, so the primitive's padding won and the
- * override was inert. Five migrated call sites were relying on exactly that, so
- * this is a regression matrix rather than a hypothetical.
+ * adding the second one from outside, and `.px-0` is emitted before `.px-2`, so
+ * on class order alone the primitive's padding wins and the override is inert.
+ * `overridable` drops the default instead.
  *
  * The assertions are `not.toHaveClass` on the default rather than `toHaveClass`
- * on the override: an override that is merely *present* is what the old,
- * broken behaviour also produced. The default having been removed is the thing
- * that distinguishes them, and it is what jsdom can see without a stylesheet.
+ * on the override: the override is present either way, so only the default
+ * being gone tells a working merge from an inert one, and that is what jsdom can
+ * see without a stylesheet.
  */
 describe('a caller className replaces the primitive default', () => {
   const CASES = [
@@ -352,11 +345,11 @@ describe('a caller className replaces the primitive default', () => {
 /**
  * `overridable` resolves the caller against the tables and stops there.
  *
- * Running the whole string through tailwind-merge in one go would be shorter and
- * would also silently fix collisions *between* the size and variant tables —
- * which is the bug the rest of this file exists to catch, and which has shipped
- * four times on this branch. These two specs pin the boundary, because the
- * "simplification" that erases it looks like an improvement in review.
+ * Running the whole string through tailwind-merge in one go would be shorter
+ * and would also silently fix collisions *between* the size and variant tables,
+ * which is what the rest of this file checks for. These specs pin the boundary,
+ * because the "simplification" that erases it looks like an improvement in
+ * review.
  */
 describe('overridable leaves the primitive tables alone', () => {
   it('does not resolve a collision inside the defaults', () => {

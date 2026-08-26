@@ -27,10 +27,10 @@ import '@fontsource/inconsolata/500.css'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
-// ThemedApp pulls in Click UI. That is safe here and not a violation of the
-// import-order rule above: this import is evaluated after `./index.css`, so
-// the layer statement has already fixed the cascade order by the time Click
-// UI's own `@layer clickui` block is seen.
+// ThemedApp pulls in Click UI. That is safe here and keeps the import-order
+// rule above: this import is evaluated after `./index.css`, so the layer
+// statement sets the cascade order before Click UI's own `@layer clickui`
+// block is seen.
 import { ThemedApp } from './ThemedApp'
 
 createRoot(document.getElementById('root')!).render(

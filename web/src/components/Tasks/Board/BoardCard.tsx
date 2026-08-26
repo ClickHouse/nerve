@@ -97,9 +97,8 @@ function BoardCardInner({ task, statusSince, onOpen }: BoardCardProps) {
         </div>
       )}
 
-      {/* `text-xs` carries a 1rem line-height where `text-[11px]` inherited
-          `normal`; the meta line is the densest row on the board, so it keeps
-          its own leading rather than reverting to an arbitrary size. */}
+      {/* `text-xs` carries a 1rem line-height, so the meta line — the densest
+          row on the board — pins its own leading. */}
       <div className="flex items-center gap-2.5 text-xs leading-tight flex-wrap">
         {task.deadline && (
           <span className={`flex items-center gap-1 ${deadlineTone(task.deadline)}`}>

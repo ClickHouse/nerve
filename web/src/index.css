@@ -24,50 +24,41 @@
 @import "highlight.js/styles/github-dark.min.css";
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   MIGRATION REFERENCE — read this before touching a className.
+   TOKEN REFERENCE — read this before touching a className.
 
    Everything below is generated from Click UI's design tokens. Nerve keeps its
-   own `--theme-*` names (2,495 utility call sites depend on them) but every
-   value now derives from a Click UI token, so light/dark switching is handled
-   by `data-cui-theme` on <html> and there is exactly one palette definition.
+   own `--theme-*` names, but every value derives from a Click UI token, so
+   light/dark switching is handled by `data-cui-theme` on <html> and there is
+   exactly one palette definition.
 
    ───────────────────────────────────────────────────────────────────────────
-   1. TYPE SCALE — replace every `text-[Npx]` with a named step.
+   1. TYPE SCALE — use a named step, never `text-[Npx]`.
 
    Click UI's scale is 10/12/14/16/18/20/32px. Tailwind's built-in
    xs/sm/base/lg/xl are already 12/14/16/18/20, so they ARE the Click UI scale
    and are NOT redefined. Only the 10px step (`text-2xs`) and the 32px display
    step (`text-display`) are added.
 
-       OLD                NEW             PX    NOTE
-       text-[9px]      →  text-2xs        10    round up
-       text-[10px]     →  text-2xs        10
-       text-[11px]     →  text-xs         12    round up
-       text-[12px]     →  text-xs         12
-       text-[12.5px]   →  text-xs         12
-       text-[13px]     →  text-sm         14    round up
-       text-[13.5px]   →  text-sm         14
-       text-[14px]     →  text-sm         14
-       text-[15px]     →  text-base       16    round up
-       text-[16px]     →  text-base       16
-       text-[18px]     →  text-lg         18
-       text-[20px]     →  text-xl         20
-       text-[32px]     →  text-display    32
+       CLASS           PX
+       text-2xs        10
+       text-xs         12
+       text-sm         14
+       text-base       16
+       text-lg         18
+       text-xl         20
+       text-display    32
 
-       text-xs / text-sm / text-base / text-lg / text-xl  — UNCHANGED, keep
-       using them. Nothing about Tailwind's built-in sizes was redefined.
-
-   Two consequences of leaving the built-ins alone, both intended:
-     • A named step carries a line-height; `text-[Npx]` did not (it inherited
-       `normal`). So `text-[12px]` → `text-xs` also gains `line-height: 1rem`,
-       `text-[13px]` → `text-sm` gains `1.25rem`. Rows get slightly roomier.
+   There is no step between them: round up. Two consequences of leaving the
+   built-ins alone:
+     • A named step carries a line-height; an arbitrary pixel size does not (it
+       inherits `normal`). `text-xs` is 12px/1rem, `text-sm` is 14px/1.25rem.
        If a row must stay tight, add an explicit `leading-*` — do NOT go back
        to an arbitrary pixel size.
      • `text-2xs` ships 10px/14px so the densest rows stay dense.
 
    ───────────────────────────────────────────────────────────────────────────
-   2. STATUS TOKENS — replace raw palette utilities (`emerald`/`red`/`amber`/
-      `blue`/`green`/`slate`-400/500 with /10–/25 alpha) with these.
+   2. STATUS TOKENS — use these, not raw palette utilities (`emerald`/`red`/
+      `amber`/`blue`/`green`/`slate`-400/500 with /10–/25 alpha).
 
    Each status has three variants, and the suffix names the CSS property it is
    for, so there is nothing to guess:
@@ -79,22 +70,19 @@
        info      text-info             bg-info-bg         border-info-border
        neutral   text-neutral          bg-neutral-bg      border-neutral-bg
 
-   Typical rewrite:
-       bg-emerald-400/10 border border-emerald-400/25 text-emerald-400
-     → bg-success-bg     border border-success-border  text-success
+   A tinted chip is `bg-success-bg border border-success-border text-success`.
 
-   ⚠ A SOLID FILL IS NOT `bg-<status>`. An earlier version of this note said it
-   was, and that is wrong — it is the single most repeated mistake in this
-   migration. The bare status token is Click UI's feedback *foreground*, a
-   colour meant to sit as TEXT on the matching `-bg` tint, so in dark mode it is
-   pale: error #ffbaba, success #ccffd0, warning #ffb88f. `bg-error text-white`
-   measures 1.62:1. Use the `-solid` tokens, which are theme-independent and
-   hold white text in both themes:
+   ⚠ A SOLID FILL IS NOT `bg-<status>`. The bare status token is Click UI's
+   feedback *foreground*, a colour meant to sit as TEXT on the matching `-bg`
+   tint, so in dark mode it is pale: error #ffbaba, success #ccffd0, warning
+   #ffb88f. `bg-error text-white` measures 1.62:1. For a solid chip, dot or
+   badge use the `-solid` tokens, which are theme-independent and hold white
+   text in both themes:
 
-       bg-red-500  (solid chip/dot/badge) → bg-error-solid   text-white
-       bg-blue-400 (solid chip/dot/badge) → bg-info-solid    text-white
-       bg-emerald-500                     → bg-success-solid text-white
-       bg-amber-500                       → bg-warning-solid text-white
+       bg-error-solid   text-white
+       bg-info-solid    text-white
+       bg-success-solid text-white
+       bg-warning-solid text-white
 
    A small coloured dot with no text on it can use `bg-error` etc. quite
    happily — the rule only bites when something has to be legible on top.
@@ -102,19 +90,19 @@
    `-bg` is an opaque tint from `--global-color-feedback-*-background`; do not
    stack an alpha modifier on it. `-border` is the foreground at 30% alpha, so
    it reads on top of the matching `-bg`. Nerve's `error` is Click UI's
-   `danger`; the token name stays `error` because call sites already use it.
+   `danger`; the token name is `error` because that is what call sites use.
 
    Hue identity colours (`text-hue-red`, `text-hue-emerald`, …) are for tool /
    badge / category IDENTITY, not status. Keep using them for that; use the
    status tokens above whenever the colour means "this succeeded / failed".
 
    ───────────────────────────────────────────────────────────────────────────
-   3. ACCENT IS NOW CLICKHOUSE YELLOW IN DARK MODE.
+   3. ACCENT IS CLICKHOUSE YELLOW IN DARK MODE.
 
    `--theme-accent` is #faff69 (dark) / #151515 (light). White text on it is
-   unreadable in dark mode, so every `bg-accent … text-white` MUST become:
+   unreadable in dark mode, so text on accent must be `text-on-accent`:
 
-       bg-accent text-white  →  bg-accent text-on-accent
+       bg-accent text-on-accent
 
    `text-on-accent` is Click UI's primary-button text colour (#1f1f1c dark /
    #ffffff light) and stays legible in both themes. Same for `bg-accent-hover`.
@@ -122,7 +110,7 @@
 
    ───────────────────────────────────────────────────────────────────────────
    4. FONTS. Inter (sans) and Inconsolata (mono) are self-hosted via
-   @fontsource and imported in main.tsx. Use `font-mono` for monospace; it now
+   @fontsource and imported in main.tsx. Use `font-mono` for monospace; it
    resolves to Click UI's mono stack. Click UI also names 'Basier Square' for
    display type — it is commercial, we do not ship it, and it falls back to
    Inter. There is no `font-display` utility for that reason.
@@ -220,24 +208,21 @@
   --text-display: 2rem;                        /* 32px — Click UI font-sizes-6 */
   --text-display--line-height: calc(2.5 / 2);  /* 40px */
 
-  /* ── Emphasis weights, moved up one step for Inter ──
+  /* ── Emphasis weights for Inter ──
      The panel leans on `font-medium` for almost all of its emphasis: 151 of the
      170 weighted elements in the app, against 17 `font-semibold` and 2
-     `font-bold`. That worked when the stack was `-apple-system, …` and 500
-     resolved to SF Pro Medium or Segoe UI Semibold. Inter's steps are much
-     closer together — measured on one string at 14px, 400 sets 186.6px and 500
-     sets 188.9px, a 1.2% difference — so headings, labels and counts stopped
-     separating from body copy and the UI got harder to scan.
-
-     Remapping the scale rather than rewriting 151 call sites: this is the one
-     knob, `font-medium` keeps meaning "the emphasised one", and there is a
-     single place to tune it. Both target weights are already loaded (main.tsx
-     ships Inter 400/500/600/700), so this costs nothing. 600 against 400 is
+     `font-bold`. Inter's steps sit close together — measured on one string at
+     14px, 400 sets 186.6px and 500 sets 188.9px, a 1.2% difference — too little
+     to separate a heading, label or count from body copy. 600 against 400 is
      191.0px against 186.6px plus visibly heavier stems.
 
+     Remapping the scale keeps `font-medium` meaning "the emphasised one" and
+     leaves a single place to tune it. Both target weights are loaded (main.tsx
+     ships Inter 400/500/600/700), so this costs nothing.
+
      `font-semibold` moves with it so the two do not collapse into one level;
-     `font-bold` stays at 700 and now coincides with semibold, which is fine at
-     two call sites. If this reads too heavy, 500/600 restores the old scale. */
+     `font-bold` stays at 700 and coincides with semibold, which is fine at two
+     call sites. If this reads too heavy, 500/600 is the lighter pairing. */
   --font-weight-medium: 600;
   --font-weight-semibold: 700;
 }
@@ -259,9 +244,8 @@
    the Click UI globals it derives from are themselves defined twice — on
    `:root, [data-cui-theme="light"]` and on `[data-cui-theme="dark"]` — and
    themeStore always writes the *resolved* theme to `data-cui-theme` (including
-   when the preference is 'system', and it re-writes on OS change). So the
-   theme switch happens one level down and the old `@media
-   (prefers-color-scheme: light)` duplicate of this whole block is gone. */
+   when the preference is 'system', and it re-writes on OS change). So the theme
+   switch happens one level down. */
 :root {
   /* Surfaces. Click UI gives two page surfaces (background-default and
      background-muted); the intermediate steps interpolate towards
@@ -304,15 +288,12 @@
      the light `text-faint` lands at 3.86:1 on dark's numbers. Both sets are
      needed.
 
-     What this replaces: `text-dim` was mapped straight onto Click UI's
-     `text-disabled`, and `text-faint` onto a mix of it toward the page. Those
-     are *control* colours — deliberately inert, never meant to carry copy — and
-     Nerve spends them on timestamps, counts, paths and labels. The result was
-     2.44:1 on `text-dim` and 1.39:1 on `text-faint` in light: about 900 nodes
-     of barely-readable text across the app. `text-muted` moves too, because
-     Click UI's light `text-muted` is itself only 4.77:1 on `surface` — there is
-     no room to fit two more legible steps under it, so the ramp shifts up to
-     make space.
+     Click UI's own `text-muted` and `text-disabled` cannot serve as the lower
+     steps. `text-disabled` is a *control* colour — deliberately inert, never
+     meant to carry copy — while Nerve spends these steps on timestamps, counts,
+     paths and labels. Light `text-muted` is itself only 4.77:1 on `surface`, so
+     there is no room to fit two more legible steps under it. The whole ramp is
+     solved instead.
 
      To retune: change a target, re-run `ladder2.mjs` in the sweep harness, and
      paste the percentages back into BOTH blocks. Do not hand-edit a percentage
@@ -378,11 +359,10 @@
   --theme-neutral-bg: var(--global-color-feedback-neutral-background);
   --theme-neutral-border: var(--global-color-feedback-neutral-stroke);
 
-  /* Diff. Same four names and same meanings as before — `*-bg` is the row tint,
-     the other two are the +/- indicator and gutter colour. Chat/diffTheme.ts
-     forwards all four into the @pierre/diffs shadow root, so do not rename
-     them. Deriving them from the feedback pair means the tint is pale-on-dark
-     and dark-on-light automatically. */
+  /* Diff. `*-bg` is the row tint; the other two are the +/- indicator and
+     gutter colour. Chat/diffTheme.ts forwards all four into the @pierre/diffs
+     shadow root, so do not rename them. Deriving them from the feedback pair
+     means the tint is pale-on-dark and dark-on-light automatically. */
   --theme-diff-add: var(--global-color-feedback-success-foreground);
   --theme-diff-del: var(--global-color-feedback-danger-foreground);
   --theme-diff-add-bg: var(--global-color-feedback-success-background);
@@ -412,11 +392,11 @@
   --theme-hue-blue: var(--palette-info-400);       /* #437eef */
   /* Violet sits two ramp steps lighter than the other identity hues on purpose.
      It is the most saturated ramp in the palette and it collapses fastest under
-     an opacity modifier, which is how these are almost always used. At the old
-     -300/-400 steps, `text-hue-violet/60` measured 2.79:1 on the sidebar and
+     an opacity modifier, which is how these are almost always used. At -300 and
+     -400, `text-hue-violet/60` measures 2.79:1 on the sidebar and
      `text-hue-purple/60` just 2.03:1 on a raised surface — below the 3:1 floor
-     for a non-text glyph, and visibly murky. -200/-300 give 3.71 and 2.79 at
-     60%, and clear 4.5:1 by /80. */
+     for a non-text glyph. -200/-300 give 3.71 and 2.79 at 60%, and clear 4.5:1
+     by /80. */
   --theme-hue-violet: var(--palette-violet-200);   /* #dd99ff */
   --theme-hue-purple: var(--palette-violet-300);   /* #cc66ff */
 }
@@ -428,15 +408,14 @@
      The shared derivation above maps `bg` onto Click UI's `background-default`
      and `surface` onto `background-muted`. In dark that is right: muted (#1c1c1c)
      is lighter than default (#151515), so a card lifts off the page. In light it
-     inverts — default is #ffffff and muted is #f6f7fa — so the page became the
-     brightest thing on screen and every card sat *below* it in a grey that is
-     2/255 from the lane behind it. On the task board the cards disappeared into
-     their columns; measured 1.016:1 card-to-lane, against 1.071 on `main`.
+     inverts — default is #ffffff and muted is #f6f7fa — which would make the
+     page the brightest thing on screen and put every card *below* it, in a grey
+     2/255 from the lane behind it: 1.016:1 card-to-lane, close enough that the
+     cards vanish into the columns of the task board.
 
      So light gets its own ramp: a grey page, white cards, and controls tinted
-     back down towards the page. That is the model `main` had (bg #f5f5f5,
-     surface #ffffff, raised #f8f8f8) expressed in Click UI's palette, and it is
-     what "raised" has to mean when the page is not the darkest surface.
+     back down towards the page. That is what "raised" has to mean when the page
+     is not the darkest surface, and it holds card-to-lane at 1.053.
 
        bg      #f6f7fa   page
        sunken  #edeef1   recessed wells
@@ -444,10 +423,9 @@
        raised  #fafbfc   inputs and secondary buttons sitting on a card
        hover   #eff0f3   hover, which has to darken rather than lighten here
 
-     Card-to-lane goes 1.016 -> 1.053. The text ramp below is solved against the
-     darkest background, which moves #eeeff2 -> #edeef1 — one unit, so the
-     measured floor shifts 4.70 -> 4.68 and stays over AA. Re-measure if you
-     move `sunken`, since that is now the binding one. */
+     The text ramp below is solved against the darkest background, `sunken`
+     #edeef1, where the measured floor is 4.68 — over AA. Re-measure if you move
+     `sunken`, since that is the binding one. */
   --theme-bg: var(--click-global-color-background-muted);
   --theme-bg-sunken: color-mix(in oklab, var(--click-global-color-background-muted) 45%, var(--click-global-color-stroke-default));
   --theme-surface: var(--click-global-color-background-default);
@@ -468,23 +446,25 @@
      design system. Both replacements are still Click UI palette entries, and
      `info-600` is the colour Click UI itself uses for link-hover.
 
-       token            was                     now                on white   on its tint
-       --theme-info     info-400  #437eef        info-600  #104ec6  3.84 -> 7.17   3.32 -> 6.20
-       --theme-link     same as info
+       token         Click UI's value  ours              on white     on its tint
+       --theme-info  info-400 #437eef  info-600 #104ec6  3.84 / 7.17  3.32 / 6.20
+       --theme-link  same as info
+
+     Each ratio pair reads Click UI's value / ours.
 
      `hue-emerald` and `hue-green` follow `--theme-success` for the same reason:
      they are spent on text 23 times (the `$` in every shell block,
      "Available"/"Connected" labels, skill counts) rather than only on dots.
 
-     Dark mode is unaffected — it passes comfortably (success 10.5, info 7.2).
-     Revert by deleting these lines if design-system fidelity is worth more
-     than AA here.
+     Dark mode needs no correction — it passes comfortably (success 10.5,
+     info 7.2). Revert by deleting these lines if design-system fidelity is
+     worth more than AA here.
 
      ── The green, specifically ──
      Click UI's light `success` foreground is success-700 #008a0b, which is
-     3.90:1 on the darkest light background — under AA. This branch first took
-     the whole step down to success-800 #006108, which passes at 6.67 but reads
-     as a forest green rather than a green.
+     3.90:1 on the darkest light background — under AA. The next step down,
+     success-800 #006108, passes at 6.67 but reads as a forest green rather
+     than a green.
 
      `#007109` is the greenest point on the 700 -> 800 line that still clears
      4.5:1 on every background the sweep actually finds it on — solved rather
@@ -495,11 +475,10 @@
                 white 4.96   page 4.65   raised 4.82   sunken 4.32*
 
      Colour on a 15% wash of *itself* is inherently low-contrast — the tint moves
-     with the foreground — and it is what pinned this. Going further, to
+     with the foreground — so the chips set the floor. Going further, to
      `#007e0a`, is a visibly better green and still clears everything plain
-     (worst 4.54), but drops the `knowledge` chip on /memory to 4.24. Click UI's
-     own success-700 #008a0b is 3.90 plain, and `main`'s emerald #16a34a was
-     2.84. Change the percentage below to move along that line.
+     (worst 4.54), but drops the `knowledge` chip on /memory to 4.24. Change the
+     percentage below to move along that line.
 
      (*) no chip sits on a sunken surface today; the sweep is the authority on
      which combinations exist. Re-solve if that changes. */
@@ -546,9 +525,8 @@ body {
 .msg-user { background: var(--theme-surface-hover); }
 /* Light: the page is white, so "stand out" has to mean the tinted surface
    rather than a lighter one — the polarity flips but the two roles still read
-   as alternating bands. Keyed on `data-cui-theme` (always the resolved theme,
-   so this also covers preference='system'), which is why the old
-   prefers-color-scheme duplicate is gone. */
+   as alternating bands. Keyed on `data-cui-theme`, which always holds the
+   resolved theme, so this also covers preference='system'. */
 [data-cui-theme="light"] .msg-assistant { background: var(--theme-surface); }
 [data-cui-theme="light"] .msg-user { background: transparent; }
 
@@ -603,10 +581,7 @@ body {
 
 /* ── Highlight.js light mode overrides ──
    github-dark.min.css is imported unconditionally above (unlayered, all rules
-   at specificity 0,1,0) and patched here for light mode at 0,2,0. Previously
-   this section existed three times: an invalid `:where(@media …)` selector that
-   never matched, a `[data-theme="light"]` copy, and a prefers-color-scheme copy
-   with the same ten hardcoded GitHub-light hexes. One block now, keyed on
+   at specificity 0,1,0) and patched here for light mode at 0,2,0. Keyed on
    `data-cui-theme` so it also covers preference='system', and driven off the
    Click UI palette so the syntax colours belong to the same system as the
    rest of the UI. */
@@ -696,8 +671,7 @@ body {
   animation: rewrite-shimmer 1.4s ease-in-out infinite;
 }
 
-/* Plan panel slide-in. The `.plan-panel` class rule had zero call sites and was
-   deleted; the keyframe is kept so a plan panel can opt back in. */
+/* Plan panel slide-in. No rule applies it; a plan panel opts in by name. */
 @keyframes plan-panel-enter {
   from { opacity: 0; transform: translateX(20px); }
   to { opacity: 1; transform: translateX(0); }

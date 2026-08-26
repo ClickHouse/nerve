@@ -92,19 +92,16 @@ jobs:
 
       - name: Install dependencies
         # --strict-peer-deps turns an unsatisfiable peer range from a warning
-        # into a failure. Click UI's Radix tree pulled react-remove-scroll@2.6.0,
-        # whose peer range stops at React 18 while this app is on React 19: the
-        # default `npm ci` installed it anyway and said nothing, but anyone whose
-        # npm has strict peers on could not install this lockfile at all. An
-        # `overrides` entry in web/package.json settles that one; this is what
-        # stops the next one arriving unannounced.
+        # into a failure. The default `npm ci` installs such a dependency anyway
+        # and says nothing, but anyone whose npm has strict peers on cannot
+        # install the lockfile at all. This job catches that here instead.
+        # An `overrides` entry in web/package.json is how to settle one.
         #
         # Deliberately NOT --engine-strict. npm applies that to every package in
         # the lockfile, including dev-only tooling whose Node floors are already
         # higher than anything we would declare as Nerve's (jsdom 22.22.2,
         # undici 22.19.0) — so it cannot express "the shipped dependencies fit
-        # the declared floor", which is the property worth checking, and it is
-        # unsatisfiable at 22.12.0 on `main` too.
+        # the declared floor", which is the property worth checking.
         run: npm ci --strict-peer-deps
 
       - name: Build frontend (tsc -b && vite build)

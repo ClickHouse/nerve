@@ -17,12 +17,11 @@ import { Modal } from './Modal';
  * The backdrop, found by its own class rather than by its position relative to
  * the panel.
  *
- * These specs used to reach it as `getByRole('dialog').parentElement` — which
- * only holds while the backdrop is the panel's *direct* parent. Insert any
- * wrapper between them (a transition container, a portal's own node) and the
- * lookup silently retargets at the wrapper: the clicks still land on something,
- * `onClose` still isn't called, and the specs pass without testing the
- * backdrop at all.
+ * `getByRole('dialog').parentElement` only holds while the backdrop is the
+ * panel's *direct* parent. Insert any wrapper between them (a transition
+ * container, a portal's own node) and that lookup silently retargets at the
+ * wrapper: the clicks still land on something, `onClose` still isn't called,
+ * and the specs pass without testing the backdrop at all.
  */
 function backdrop(): HTMLElement {
   const el = document.querySelector<HTMLElement>('.modal-backdrop');

@@ -15,16 +15,15 @@ import {
  * Text inputs.
  *
  * These keep the **native** event shape — `onChange(e)` with `e.target.value` —
- * which is what all 31 inputs and 17 textareas in the app already use, so a
- * call site converts by deleting its class string and nothing else. Click UI's
- * `TextField` takes `onChange(value, e?)` with the event optional, and narrows
- * `type` to text/email/tel/url; the app needs `password`, `number`, `date`,
- * `color` and `file` as well. It is the better component for a *new* form —
- * import it directly — but not a drop-in for these.
+ * which is what the app's inputs and textareas use. Click UI's `TextField`
+ * takes `onChange(value, e?)` with the event optional, and narrows `type` to
+ * text/email/tel/url; the app needs `password`, `number`, `date`, `color` and
+ * `file` as well. It is the better component for a *new* form — import it
+ * directly — but not a drop-in for these.
  *
- * `fullWidth` is a prop rather than a `w-full` in the base classes because four
- * of the number inputs are deliberately narrow (`w-16`, `w-24`), and defaulting
- * it on with a named opt-out states that better than four `w-auto` overrides.
+ * `fullWidth` is a prop rather than a `w-full` in the base classes because some
+ * number inputs are deliberately narrow (`w-16`, `w-24`); defaulting it on with
+ * a named opt-out states that better than a `w-auto` at each of them.
  */
 
 /**
@@ -85,9 +84,9 @@ export interface TextAreaProps
   fieldSize?: FieldSize;
   fullWidth?: boolean;
   /**
-   * Let the user drag the bottom edge. Off by default: 15 of the app's 17
-   * textareas suppress it, because they sit in a dialog whose height is already
-   * pinned and a resize handle just pushes the footer off screen.
+   * Let the user drag the bottom edge. Off by default: most of the app's
+   * textareas sit in a dialog whose height is already pinned, where a resize
+   * handle just pushes the footer off screen.
    */
   resizable?: boolean;
 }

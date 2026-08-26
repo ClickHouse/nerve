@@ -6,10 +6,8 @@ import { overridable } from './styles';
  *
  * `label` is required and is spent twice — as `title`, so a pointer gets a
  * tooltip, and as `aria-label`, so the control has a name at all. That is the
- * point of the component: the app has ~100 icon-only buttons and only 27
- * `aria-label`s between them, so most of them announce as "button" and nothing
- * else. Making the label non-optional means a converted button cannot be
- * nameless.
+ * point of the component: an icon-only button with no `aria-label` announces as
+ * "button" and nothing else, and a required prop makes that impossible.
  *
  * Not Click UI's `IconButton`, which picks its glyph from a closed union of
  * Click UI icon names. A quarter of this app's icons are drawn locally (see
@@ -41,15 +39,15 @@ export type IconButtonVariant =
 /**
  * The colour a variant carries **when it is not active**.
  *
- * Split out of VARIANTS because Tailwind v4 emits same-property utilities in
+ * Held apart from ACTIVE because Tailwind v4 emits same-property utilities in
  * alphabetical order of class name, so between two colour classes on one
  * element the later-*sorting* name wins rather than the one written last.
  * `.text-accent` sorts before every other colour token in this app (offset
  * 49085 in the built stylesheet, against `.text-hue-red` 51903, `.text-on-accent`
  * 52978, `.text-text-dim` 53924, `.text-text-faint` 53967, `.text-text-muted`
- * 54167), so appending the accent `active` treatment after a coloured base lost
- * every time — `active` did nothing on any of these four. Emitting exactly one
- * of REST/ACTIVE makes the result independent of that order.
+ * 54167), so an accent `active` treatment appended after a coloured base would
+ * lose. Emitting exactly one of REST/ACTIVE makes the result independent of
+ * that order.
  */
 const REST: Record<IconButtonVariant, string> = {
   /** Quiet until pointed at — the default, and what most of these are. */

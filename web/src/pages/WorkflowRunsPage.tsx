@@ -125,8 +125,6 @@ function BudgetBar({ run }: { run: WorkflowRun }) {
     );
   }
   const pct = (run.spent_usd / run.budget_usd) * 100;
-  // Was three hard-coded hexes, which stayed dark-theme values under the light
-  // theme. The status tokens carry the same three steps and follow the theme.
   const fill = pct >= 100 ? 'bg-error' : pct >= 80 ? 'bg-warning' : 'bg-success';
   return (
     <div

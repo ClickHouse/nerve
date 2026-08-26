@@ -69,11 +69,9 @@ function StatusBadge({ status }: { status: WorkflowRunStatus }) {
  * Spend vs budget: emerald, amber from 80%, red at 100%. Unbudgeted runs show
  * plain spend.
  *
- * The three colours were hard-coded hexes (`#10b981`/`#f59e0b`/`#ef4444`) —
- * dark-theme values that did not move with the light theme. Only the *width* is
- * data-driven, so it is the only thing left in `style`; the colour is a
- * three-step ramp and becomes a class. It uses `hue-*` rather than
- * `bg-success`/`bg-warning`/`bg-error` because those tokens are Click UI's
+ * Only the *width* is data-driven, so it is the only thing in `style`; the
+ * colour is a three-step ramp, so it becomes a class. It uses `hue-*` rather
+ * than `bg-success`/`bg-warning`/`bg-error` because those tokens are Click UI's
  * feedback *foregrounds* — pale mint / pale pink, meant to sit on the matching
  * `-bg` tint. This bar sits on a neutral `bg-border-subtle` track, where the
  * saturated theme-adaptive hues are what stay readable in both themes.

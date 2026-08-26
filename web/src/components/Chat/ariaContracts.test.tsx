@@ -18,18 +18,17 @@ vi.mock('../../api/client', () => ({
 }));
 
 /**
- * Three controls that told assistive technology they implemented a richer
- * keyboard pattern than they do.
+ * Three controls that look like a richer keyboard pattern than they implement:
+ * the answer pills, the run-later popup and the side-panel tab strip.
  *
  * `role="radio"`, `aria-selected` and `aria-haspopup="menu"` each commit the
  * author to a specific model — a radiogroup with one tab stop and arrow-key
  * movement, a tablist with tabpanels, a menu with `menuitem` children and focus
- * entry. None of the three were built. A screen-reader user is then told to
- * press arrow keys that do nothing, which is worse than the plain button
- * semantics they replaced, and none of it is visible on screen.
+ * entry. None of the three is built here, so any of those claims would tell a
+ * screen-reader user to press arrow keys that do nothing.
  *
  * These assert the *absence* of the claim as well as the presence of the honest
- * one, because the failure mode is re-adding the attribute while everything
+ * one, because the failure mode is adding the attribute back while everything
  * still looks and behaves correctly to a sighted mouse user.
  */
 
