@@ -887,6 +887,14 @@ class AgentConfig:
     # message teammates that no longer exist. Set False to restore the CLI
     # default (no SendMessage, no teams).
     agent_teams: bool = True
+    # Extra local Claude Code plugin directories, passed to the CLI as
+    # --plugin-dir on top of plugins auto-discovered from ~/.claude. Each
+    # directory must contain .claude-plugin/plugin.json and may declare
+    # lspServers, mcpServers, commands, agents, or skills. Auto-discovery
+    # only forwards plugins whose cache dir ships .mcp.json, and the CLI
+    # runs with setting_sources=[] so it never reads ~/.claude/settings.json
+    # itself — this key is the only route in for LSP-type plugins.
+    claude_plugin_dirs: list[str] = field(default_factory=list)
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @property
@@ -925,6 +933,7 @@ class AgentConfig:
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
+            claude_plugin_dirs=_str_list(d.get("claude_plugin_dirs"), clean=True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 
@@ -2444,17 +2453,32 @@ def _get_enabled_claude_code_plugins(
 
 def load_claude_code_plugins(
     claude_dir: Path | None = None,
+    extra_dirs: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Return SDK-compatible plugin configs for enabled Claude Code plugins.
 
     Each entry is ``{"type": "local", "path": "<dir>"}`` suitable for
-    ``ClaudeAgentOptions.plugins``.
+    ``ClaudeAgentOptions.plugins``. *extra_dirs* (``agent.claude_plugin_dirs``)
+    are appended after the auto-discovered plugins; a directory without a
+    ``.claude-plugin/plugin.json`` manifest is skipped with a warning.
     """
     plugins = _get_enabled_claude_code_plugins(claude_dir)
     result: list[dict[str, str]] = []
     for plugin_key, plugin_dir in plugins:
         logger.debug("Claude Code plugin %s → %s", plugin_key, plugin_dir)
         result.append({"type": "local", "path": str(plugin_dir)})
+    for raw in extra_dirs or []:
+        # Resolve before handing to --plugin-dir: the CLI subprocess runs in
+        # the session workspace, not the daemon cwd a relative entry names.
+        path = Path(raw).expanduser().resolve()
+        if not (path / ".claude-plugin" / "plugin.json").is_file():
+            logger.warning(
+                "claude_plugin_dirs: %s has no .claude-plugin/plugin.json — skipped",
+                path,
+            )
+            continue
+        logger.debug("Claude Code plugin dir (configured) → %s", path)
+        result.append({"type": "local", "path": str(path)})
     return result
 
 
