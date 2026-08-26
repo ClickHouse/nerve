@@ -247,6 +247,7 @@ describe('a caller className replaces the primitive default', () => {
     ['vertical padding', { size: 'sm' } as const, 'py-0.5', 'py-1.5', 'TodoPanel'],
     ['type size', { size: 'sm' } as const, 'text-sm', 'text-xs', 'TodoPanel'],
     ['gap', { size: 'md' } as const, 'gap-2.5', 'gap-2', 'ReviewLoopCard'],
+    ['flex shrink', {} as const, 'shrink', 'shrink-0', 'NotificationsPage session link'],
     ['radius', { variant: 'pill' } as const, 'rounded', 'rounded-full', 'InteractiveQuestionCard'],
     ['radius', { variant: 'primary' } as const, 'rounded', 'rounded-lg', 'InteractiveQuestionCard'],
     ['radius', { variant: 'subtle' } as const, 'rounded-none', 'rounded', 'ChatInput menu'],

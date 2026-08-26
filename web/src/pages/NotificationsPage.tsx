@@ -241,7 +241,12 @@ function NotificationCard({ notif }: { notif: Notification }) {
 
       {/* Session link + meta */}
       <div className="flex items-center gap-3 mt-2 text-xs">
-        <Button variant="link" size="xs" onClick={() => navigate(`/chat/${notif.session_id}`)}>
+        <Button
+          variant="link"
+          size="xs"
+          onClick={() => navigate(`/chat/${notif.session_id}`)}
+          className="min-w-0 shrink whitespace-normal wrap-anywhere text-left"
+        >
           Session: {notif.session_title || notif.session_id}
         </Button>
         <span className="text-text-faint">{notif.created_at?.slice(0, 16).replace('T', ' ')}</span>

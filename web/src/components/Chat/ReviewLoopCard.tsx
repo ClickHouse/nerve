@@ -204,9 +204,12 @@ export function ReviewLoopCard({ loopId }: { loopId: string }) {
             {met}/{loop.criteria.length} criteria
           </span>
           <span className="flex-1" />
-          {/* Spend bar */}
+          {/* Keep the useful numbers on a narrow row; the bar is redundant there. */}
           <span className="flex items-center gap-2 shrink-0">
-            <span className="w-24 h-1.5 rounded-full bg-surface-raised overflow-hidden">
+            <span
+              aria-hidden="true"
+              className="hidden h-1.5 w-24 overflow-hidden rounded-full bg-surface-raised md:block"
+            >
               <span
                 className={`block h-full rounded-full ${frac >= 0.8 ? 'bg-warning' : 'bg-success/70'}`}
                 style={{ width: `${Math.max(2, frac * 100)}%` }}
