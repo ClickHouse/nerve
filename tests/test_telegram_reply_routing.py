@@ -83,43 +83,50 @@ def test_re_record_refreshes_lru_recency():
 
 
 # --------------------------------------------------------------------------- #
-#  Resolve (with the live-session guard)                                      #
+#  Resolve — three-way: active / route / reject                               #
 # --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_resolve_active_when_not_a_reply():
+    ch = _make_channel(_FakeRouter({"sessA": {"status": "active"}}))
+    ch._record_reply_route(100, 42, "sessA")
+    assert await ch._resolve_reply(None, 42) == ("active", None)
+
 
 @pytest.mark.asyncio
 async def test_resolve_routes_to_live_session():
     ch = _make_channel(_FakeRouter({"sessA": {"status": "active"}}))
     ch._record_reply_route(100, 42, "sessA")
-    assert await ch._resolve_reply_session(100, 42) == "sessA"
+    assert await ch._resolve_reply(100, 42) == ("route", "sessA")
 
 
 @pytest.mark.asyncio
-async def test_resolve_none_when_not_a_reply():
-    ch = _make_channel(_FakeRouter({"sessA": {"status": "active"}}))
-    ch._record_reply_route(100, 42, "sessA")
-    assert await ch._resolve_reply_session(None, 42) is None
-
-
-@pytest.mark.asyncio
-async def test_resolve_falls_back_when_session_gone():
-    # Mapping exists but the session no longer exists → fall back (None).
+async def test_resolve_rejects_when_session_gone():
+    # Mapping exists but the session no longer exists → reject, never mis-route.
     ch = _make_channel(_FakeRouter({}))
     ch._record_reply_route(100, 42, "sessA")
-    assert await ch._resolve_reply_session(100, 42) is None
+    assert await ch._resolve_reply(100, 42) == ("reject", None)
 
 
 @pytest.mark.asyncio
-async def test_resolve_falls_back_when_session_archived():
+async def test_resolve_rejects_when_session_archived():
     ch = _make_channel(_FakeRouter({"sessA": {"status": "archived"}}))
     ch._record_reply_route(100, 42, "sessA")
-    assert await ch._resolve_reply_session(100, 42) is None
+    assert await ch._resolve_reply(100, 42) == ("reject", None)
 
 
 @pytest.mark.asyncio
-async def test_resolve_none_for_unmapped_reply():
+async def test_resolve_rejects_unmapped_reply():
     ch = _make_channel(_FakeRouter({"sessA": {"status": "active"}}))
-    # Replying to a message the bot never recorded (e.g. one the user sent).
-    assert await ch._resolve_reply_session(555, 42) is None
+    # Replying to a message the bot never recorded (user's own / LRU-evicted).
+    assert await ch._resolve_reply(555, 42) == ("reject", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_rejects_on_chat_mismatch():
+    ch = _make_channel(_FakeRouter({"sessA": {"status": "active"}}))
+    ch._record_reply_route(100, 42, "sessA")  # recorded for chat 42
+    assert await ch._resolve_reply(100, 43) == ("reject", None)  # replied in chat 43
 
 
 # --------------------------------------------------------------------------- #

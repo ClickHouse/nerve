@@ -44,6 +44,14 @@ logger = logging.getLogger(__name__)
 
 # Telegram message length limit
 MAX_MSG_LEN = 4096
+# Shown (no LLM) when a user replies to a message we can't tie to a live session,
+# rather than silently mis-routing the reply into the chat's active session.
+REPLY_UNRESOLVED_MSG = (
+    "⚠️ I couldn't find the session that produced the message you replied to "
+    "(it may be too old, or its session was archived). Nothing was sent, to "
+    "avoid routing it to the wrong session. Use /sessions to pick the session "
+    "you want, then send your message again."
+)
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -1011,27 +1019,35 @@ class TelegramChannel(BaseChannel):
             return None
         return session_id
 
-    async def _resolve_reply_session(
+    async def _resolve_reply(
         self, reply_message_id: int | None, chat_id: int,
-    ) -> str | None:
-        """Target session for a reply, or None to use the active session.
+    ) -> tuple[str, str | None]:
+        """Decide how to route an inbound message given its reply target.
 
-        Returns a session id only when the user replied to a message this
-        bot produced and that session still exists and is not archived;
-        otherwise None so the caller falls back to the chat's active session.
+        Returns ``(action, session_id)``:
+
+        - ``("active", None)`` — not a reply; use the chat's active session
+          (the default; plain messages are unchanged).
+        - ``("route", sid)``  — a reply to a message this bot produced whose
+          session is still live; route there and make it active.
+        - ``("reject", None)`` — a reply we cannot tie to a live session (the
+          message was never recorded / evicted from the LRU, or its session is
+          gone/archived). The caller nudges the user and drops the message
+          WITHOUT starting a turn — an explicit reply is never silently
+          delivered to the active session, which would be a mis-route.
         """
         if reply_message_id is None:
-            return None
+            return ("active", None)
         session_id = self._lookup_reply_route(reply_message_id, chat_id)
         if not session_id:
-            return None
+            return ("reject", None)
         try:
             row = await self.router.get_session(session_id)
         except Exception:
-            return None
+            row = None
         if not row or row.get("status") == "archived":
-            return None
-        return session_id
+            return ("reject", None)
+        return ("route", session_id)
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -1691,11 +1707,22 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
-        # A reply to a message the bot sent routes to the session that
-        # produced it (and makes it the active session); None → active session.
-        routed_session = await self._resolve_reply_session(
+        # Route a reply to the session that produced the replied-to message
+        # (and make it active). An unresolvable reply is rejected with a no-LLM
+        # nudge rather than mis-routed into the chat's active session.
+        action, routed_session = await self._resolve_reply(
             reply_msg.message_id if reply_msg else None, chat_id,
         )
+        if action == "reject":
+            logger.info(
+                "Telegram reply from chat %s not tied to a live session; nudging",
+                chat_id,
+            )
+            try:
+                await update.message.reply_text(REPLY_UNRESOLVED_MSG)
+            except Exception:
+                logger.error("Failed to send reply-unresolved nudge to chat %s", chat_id)
+            return
         if routed_session:
             logger.info("Telegram reply routed to session %s", routed_session)
 
@@ -1866,11 +1893,22 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
-        # A reply to a message the bot sent routes to the session that
-        # produced it (and makes it the active session); None → active session.
-        routed_session = await self._resolve_reply_session(
+        # Route a reply to the session that produced the replied-to message
+        # (and make it active). An unresolvable reply is rejected with a no-LLM
+        # nudge rather than mis-routed into the chat's active session.
+        action, routed_session = await self._resolve_reply(
             reply_msg.message_id if reply_msg else None, chat_id,
         )
+        if action == "reject":
+            logger.info(
+                "Telegram reply from chat %s not tied to a live session; nudging",
+                chat_id,
+            )
+            try:
+                await updates[0].message.reply_text(REPLY_UNRESOLVED_MSG)
+            except Exception:
+                logger.error("Failed to send reply-unresolved nudge to chat %s", chat_id)
+            return
         if routed_session:
             logger.info("Telegram reply routed to session %s", routed_session)
 
