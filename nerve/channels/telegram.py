@@ -483,6 +483,14 @@ class TelegramChannel(BaseChannel):
             collections.OrderedDict()
         )
         self._message_cache_max = 200
+        # Reply routing: telegram message_id -> (chat_id, session_id) for
+        # messages the bot has sent, so a user REPLY targets the session that
+        # produced the replied-to message (e.g. a cron/background session)
+        # instead of the chat's active session. Bounded LRU.
+        self._reply_routes: collections.OrderedDict[int, tuple[int, str]] = (
+            collections.OrderedDict()
+        )
+        self._reply_routes_max = 2000
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
 
@@ -825,6 +833,7 @@ class TelegramChannel(BaseChannel):
                     text=chunk,
                 )
             self._cache_message(sent.message_id, chat_id, chunk)
+            self._record_reply_route(sent.message_id, chat_id, message.session_id)
 
     def format_response(self, text: str) -> str:
         """Return text unchanged.
@@ -965,6 +974,64 @@ class TelegramChannel(BaseChannel):
         self._message_cache.move_to_end(message_id)
         while len(self._message_cache) > self._message_cache_max:
             self._message_cache.popitem(last=False)
+
+    # ------------------------------------------------------------------ #
+    #  Reply routing (reply → originating session)                         #
+    # ------------------------------------------------------------------ #
+
+    def _record_reply_route(
+        self, message_id: int, chat_id: int, session_id: str,
+    ) -> None:
+        """Remember which session produced an outbound Telegram message.
+
+        Lets a later user REPLY to that message route back to the
+        originating session (see ``_resolve_reply_session``). No-op when the
+        session is unknown. Bounded LRU keyed by ``message_id``.
+        """
+        if not session_id:
+            return
+        self._reply_routes[message_id] = (chat_id, session_id)
+        self._reply_routes.move_to_end(message_id)
+        while len(self._reply_routes) > self._reply_routes_max:
+            self._reply_routes.popitem(last=False)
+
+    def _lookup_reply_route(
+        self, message_id: int, chat_id: int,
+    ) -> str | None:
+        """Session that produced ``message_id`` in ``chat_id``, or None.
+
+        The chat must match, so a ``message_id`` from one chat can never
+        route a reply into a session bound to a different chat.
+        """
+        entry = self._reply_routes.get(message_id)
+        if not entry:
+            return None
+        cached_chat_id, session_id = entry
+        if cached_chat_id != chat_id:
+            return None
+        return session_id
+
+    async def _resolve_reply_session(
+        self, reply_message_id: int | None, chat_id: int,
+    ) -> str | None:
+        """Target session for a reply, or None to use the active session.
+
+        Returns a session id only when the user replied to a message this
+        bot produced and that session still exists and is not archived;
+        otherwise None so the caller falls back to the chat's active session.
+        """
+        if reply_message_id is None:
+            return None
+        session_id = self._lookup_reply_route(reply_message_id, chat_id)
+        if not session_id:
+            return None
+        try:
+            row = await self.router.get_session(session_id)
+        except Exception:
+            return None
+        if not row or row.get("status") == "archived":
+            return None
+        return session_id
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -1624,11 +1691,20 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
+        # A reply to a message the bot sent routes to the session that
+        # produced it (and makes it the active session); None → active session.
+        routed_session = await self._resolve_reply_session(
+            reply_msg.message_id if reply_msg else None, chat_id,
+        )
+        if routed_session:
+            logger.info("Telegram reply routed to session %s", routed_session)
+
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat_id}",
             sender_id=str(chat_id),
             text=text,
+            session_id=routed_session,
             metadata=metadata,
         )
 
@@ -1790,11 +1866,20 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
+        # A reply to a message the bot sent routes to the session that
+        # produced it (and makes it the active session); None → active session.
+        routed_session = await self._resolve_reply_session(
+            reply_msg.message_id if reply_msg else None, chat_id,
+        )
+        if routed_session:
+            logger.info("Telegram reply routed to session %s", routed_session)
+
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat_id}",
             sender_id=str(chat_id),
             text=text,
+            session_id=routed_session,
             metadata=metadata,
         )
 
