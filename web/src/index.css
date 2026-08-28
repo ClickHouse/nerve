@@ -486,7 +486,19 @@
   --theme-link: var(--palette-info-600);
   --theme-success: color-mix(in oklab, var(--palette-success-700) 35%, var(--palette-success-800));
   /* Identity hues — dark steps so they carry on a white page. */
-  --theme-hue-yellow: var(--palette-brand-700);    /* #686b00 */
+  /* ── Yellow moves ramps in light ──
+     brand is a LIME yellow (hue 62°), and darkening lime lands on olive:
+     brand-700 #686b00 reads as moss, which is wrong for a starred star. The
+     sunrise ramp is the same yellow at 46° — true gold — so light mode takes
+     its dark step instead. sunrise-700 alone is 4.41:1 on `sunken` and 4.49 on
+     `hover`, both under AA, so a step of -800 is mixed in until every light
+     surface clears 4.5 (same construction as the green above): 90/10 lands at
+     ≈#866600, measured white 5.37 / hover 4.71 / sunken 4.62. This makes
+     hue-yellow and hue-amber near-neighbours in light; they share no call
+     sites (yellow = stars/board, amber = plan/workflow chrome), and
+     emerald/green already set the precedent of hues converging in light.
+     Dark mode keeps brand-300 = the accent yellow. */
+  --theme-hue-yellow: color-mix(in oklab, var(--palette-sunrise-700) 90%, var(--palette-sunrise-800));
   --theme-hue-amber: var(--palette-sunrise-700);   /* #8a6900 */
   --theme-hue-orange: var(--palette-warning-700);  /* #a33c00 */
   --theme-hue-red: var(--palette-danger-600);      /* #c10000 */
