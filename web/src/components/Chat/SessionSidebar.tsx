@@ -1,12 +1,13 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink } from '../ui/icons';
+import { Link, useNavigate } from 'react-router-dom';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
+import { forkChat } from '../../utils/forkChat';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
@@ -1062,6 +1063,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   const [renameValue, setRenameValue] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const navigate = useNavigate();
   // Unsent draft for this chat (hidden on the active one — its text is in the box).
   const hasDraft = useChatStore(s => !!(s.drafts[session.id] || '').trim());
   // Unread = updated since you last opened it (client-only, see readStorage).
@@ -1163,6 +1165,8 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
       ) : isImplementSession(session) ? (
         <Hammer size={13} className="shrink-0 text-hue-cyan/70" />
+      ) : session.id.startsWith('fork-') ? (
+        <GitBranch size={13} className="shrink-0 text-hue-violet/70" />
       ) : (
         <MessageSquare size={13} className="shrink-0 opacity-50" />
       )}
@@ -1316,6 +1320,28 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               >
                 <Unlink size={14} />
                 Remove from parent
+              </Button>
+            )}
+            {/* Forkable = has a native conversation to branch (materializes
+                after the first completed turn). Self-contained: fork, then
+                jump into the new chat. */}
+            {session.sdk_session_id && (
+              <Button
+                variant="subtle"
+                size="sm"
+                fullWidth
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  void forkChat(session.id).then((forkId) => {
+                    if (forkId) navigate(`/chat/${forkId}`);
+                  });
+                }}
+                className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
+              >
+                <GitBranch size={14} />
+                Fork
               </Button>
             )}
             <div className="border-t border-border my-1" />

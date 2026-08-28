@@ -341,26 +341,91 @@ class TestRunningState:
 class TestFork:
     """Test session forking."""
 
+    @staticmethod
+    async def _seed_turns(db: Database, session_id: str, turns: int = 2) -> list[dict]:
+        """Write `turns` user/assistant pairs; assistant rows carry a
+        native_turn_id (like a real completed turn). Returns row info."""
+        rows = []
+        for n in range(1, turns + 1):
+            uid = await db.add_message(session_id, "user", f"prompt {n}")
+            aid = await db.add_message(
+                session_id, "assistant", f"answer {n}",
+                native_turn_id=f"turn-{n}",
+            )
+            rows.append({"user_id": uid, "assistant_id": aid, "turn": f"turn-{n}"})
+        return rows
+
     async def test_fork_session(self, sm: SessionManager, db: Database):
         await sm.get_or_create("source-1", title="Source")
+        await sm.mark_active("source-1", sdk_session_id="sdk-src-1")
         fork = await sm.fork_session("source-1", title="My Fork")
         assert fork["id"].startswith("fork-")
         assert fork["parent_session_id"] == "source-1"
         assert fork["title"] == "My Fork"
 
-    async def test_fork_with_message_id(self, sm: SessionManager, db: Database):
+    async def test_fork_copies_all_messages(self, sm: SessionManager, db: Database):
         await sm.get_or_create("source-2")
-        fork = await sm.fork_session("source-2", at_message_id="msg-42")
+        await sm.mark_active("source-2", sdk_session_id="sdk-src-2")
+        await self._seed_turns(db, "source-2", turns=2)
+        fork = await sm.fork_session("source-2")
+        assert fork["message_count"] == 4
+        msgs = await db.get_messages(fork["id"])
+        assert [m["content"] for m in msgs] == [
+            "prompt 1", "answer 1", "prompt 2", "answer 2",
+        ]
+        # Provenance + native anchors survive the copy (re-forkable).
+        assert all(m["external_id"].startswith("forkcopy:") for m in msgs)
+        assert msgs[1]["native_turn_id"] == "turn-1"
+        assert msgs[3]["native_turn_id"] == "turn-2"
+
+    async def test_fork_at_message_truncates_copy(self, sm: SessionManager, db: Database):
+        await sm.get_or_create("source-3")
+        await sm.mark_active("source-3", sdk_session_id="sdk-src-3")
+        rows = await self._seed_turns(db, "source-3", turns=3)
+        # Anchor at turn 2's assistant row: keep turns 1-2, drop turn 3.
+        anchor = rows[1]["assistant_id"]
+        fork = await sm.fork_session("source-3", at_message_id=str(anchor))
         session = await db.get_session(fork["id"])
-        assert session["forked_from_message"] == "msg-42"
+        assert session["forked_from_message"] == str(anchor)
+        msgs = await db.get_messages(fork["id"])
+        assert [m["content"] for m in msgs] == [
+            "prompt 1", "answer 1", "prompt 2", "answer 2",
+        ]
+
+    async def test_fork_at_user_message_keeps_its_turn(self, sm: SessionManager, db: Database):
+        """Anchoring at a user prompt keeps that prompt's full turn (the
+        native fork points are turn boundaries)."""
+        await sm.get_or_create("source-4")
+        await sm.mark_active("source-4", sdk_session_id="sdk-src-4")
+        rows = await self._seed_turns(db, "source-4", turns=2)
+        fork = await sm.fork_session(
+            "source-4", at_message_id=str(rows[0]["user_id"]),
+        )
+        msgs = await db.get_messages(fork["id"])
+        assert [m["content"] for m in msgs] == ["prompt 1", "answer 1"]
+
+    async def test_fork_at_unmapped_message_raises(self, sm: SessionManager, db: Database):
+        """A source with no native turn mappings can't be message-forked."""
+        await sm.get_or_create("source-5")
+        await sm.mark_active("source-5", sdk_session_id="sdk-src-5")
+        mid = await db.add_message("source-5", "user", "hello")
+        await db.add_message("source-5", "assistant", "hi")  # no native_turn_id
+        with pytest.raises(ValueError, match="native turn mapping"):
+            await sm.fork_session("source-5", at_message_id=str(mid))
+
+    async def test_fork_without_native_conversation_raises(self, sm: SessionManager):
+        await sm.get_or_create("source-6", title="Fresh")
+        with pytest.raises(ValueError, match="[Nn]othing to fork"):
+            await sm.fork_session("source-6")
 
     async def test_fork_nonexistent_raises(self, sm: SessionManager):
         with pytest.raises(ValueError, match="not found"):
             await sm.fork_session("nonexistent")
 
     async def test_fork_auto_title(self, sm: SessionManager):
-        await sm.get_or_create("source-3", title="Original")
-        fork = await sm.fork_session("source-3")
+        await sm.get_or_create("source-7", title="Original")
+        await sm.mark_active("source-7", sdk_session_id="sdk-src-7")
+        fork = await sm.fork_session("source-7")
         assert "Fork of Original" in fork["title"]
 
 

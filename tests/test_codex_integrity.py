@@ -41,12 +41,17 @@ async def test_fork_inherits_backend_model_and_cwd(db, tmp_path):
     await db.create_session(
         "parent", backend="codex", model="gpt-test", cwd=str(tmp_path),
     )
-    fork = await manager.fork_session("parent", at_message_id="7")
+    await db.update_session_fields("parent", {"sdk_session_id": "thread-p"})
+    await db.add_message("parent", "user", "q")
+    anchor = await db.add_message(
+        "parent", "assistant", "a", native_turn_id="turn-1",
+    )
+    fork = await manager.fork_session("parent", at_message_id=str(anchor))
     row = await db.get_session(fork["id"])
     assert row["backend"] == "codex"
     assert row["model"] == "gpt-test"
     assert row["cwd"] == str(tmp_path)
-    assert row["forked_from_message"] == "7"
+    assert row["forked_from_message"] == str(anchor)
 
 
 async def test_native_turn_lookup_and_thread_mapping(db):

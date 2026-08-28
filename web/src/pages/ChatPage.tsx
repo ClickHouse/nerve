@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -12,13 +12,14 @@ import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
-import { Loader2, Files, ExternalLink } from '../components/ui/icons';
+import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
 import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
+import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
@@ -55,6 +56,24 @@ export function ChatPage() {
   // The active session row may live in the feed or a lazy archived/system group.
   const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
 
+  // Forks of THIS chat keyed by their anchor message — MessageList marks the
+  // divergence points with a pill. Memoized so the memo'd list doesn't
+  // re-render on unrelated store churn.
+  const messageForks = useMemo(() => {
+    const map = new Map<string, { id: string; title: string }[]>();
+    for (const s of sessions) {
+      if (s.parent_session_id !== activeSession) continue;
+      if (!s.forked_from_message || !s.id.startsWith('fork-')) continue;
+      const arr = map.get(s.forked_from_message) ?? [];
+      arr.push({ id: s.id, title: s.title || s.id });
+      map.set(s.forked_from_message, arr);
+    }
+    return map.size > 0 ? map : undefined;
+  }, [sessions, activeSession]);
+
+  // Forkable = a real session with a native conversation to branch from.
+  const canForkSession = !!activeSessionRow?.sdk_session_id;
+
   // Below `md` the session list becomes an off-canvas drawer. Its open state is
   // deliberately NOT `sidebarCollapsed`: that one is a persisted desktop
   // preference (default: expanded), and reusing it would both pop the drawer
@@ -83,6 +102,20 @@ export function ChatPage() {
     previousSession.current = activeSession;
     if (switched) setMobileSidebarOpen(false);
   }, [activeSession, setMobileSidebarOpen]);
+
+  // Fork the active chat — optionally from a specific message. The fork is
+  // a real server session immediately; jump into it (push, not replace, so
+  // Back returns to the source chat).
+  const handleFork = useCallback(async (atMessageId?: number) => {
+    const { activeSession: source, virtualSession: virt } = useChatStore.getState();
+    if (!source || virt?.id === source) return; // nothing to fork in a new chat
+    const forkId = await forkChat(source, atMessageId);
+    if (forkId) navigate(`/chat/${forkId}`);
+  }, [navigate]);
+
+  const handleForkMessage = useCallback((messageId: number) => {
+    void handleFork(messageId);
+  }, [handleFork]);
 
   // Chat-scoped keyboard shortcuts. Global ones (new chat, search, modal,
   // Esc cascade) live in <GlobalShortcuts /> in App.tsx.
@@ -125,6 +158,13 @@ export function ChatPage() {
       },
     },
     {
+      id: 'chat-fork',
+      combo: { mod: true, shift: true, key: 'f' },
+      description: 'Fork this chat',
+      section: 'chat',
+      action: () => { void handleFork(); },
+    },
+    {
       id: 'chat-delete-current',
       combo: { mod: true, shift: true, key: 'Backspace' },
       description: 'Delete current conversation',
@@ -137,7 +177,7 @@ export function ChatPage() {
         }
       },
     },
-  ], []);
+  ], [handleFork]);
 
   useKeyboardShortcuts(chatShortcuts);
 
@@ -342,6 +382,17 @@ export function ChatPage() {
                 activeSession={activeSession}
                 onSelect={switchSession}
               />
+              {canForkSession && (
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  onClick={() => void handleFork()}
+                  title="Fork this chat — branch a new chat that shares this conversation (⌘⇧F)"
+                >
+                  <GitBranch size={14} />
+                  <span className="hidden lg:inline">Fork</span>
+                </Button>
+              )}
               {/* House convention for a tinted action: the identity hue rides
                   the icon and the label stays neutral, so nothing competes
                   with `subtle`'s own text colour. */}
@@ -371,6 +422,36 @@ export function ChatPage() {
             </div>
           </div>
 
+          {/* Fork provenance strip — orients a freshly opened fork: where it
+              branched from, one click back to the source. */}
+          {activeSessionRow?.id.startsWith('fork-') && (() => {
+            const parentId = activeSessionRow.parent_session_id;
+            const parentRow = parentId
+              ? findSessionById(parentId, sessions, archivedSessions, systemSessions)
+              : undefined;
+            return (
+              <div className="border-b border-border-subtle bg-hue-violet/[0.06] px-3 md:px-5 py-1.5 flex items-center gap-1.5 text-xs text-text-muted shrink-0">
+                <GitBranch size={12} className="text-hue-violet shrink-0" />
+                {parentRow ? (
+                  <>
+                    <span className="shrink-0">Forked from</span>
+                    <Link
+                      to={`/chat/${parentRow.id}`}
+                      className="truncate text-text-secondary hover:text-text underline-offset-2 hover:underline"
+                    >
+                      {parentRow.title || parentRow.id}
+                    </Link>
+                  </>
+                ) : (
+                  <span>Forked from another chat</span>
+                )}
+                {activeSessionRow.forked_from_message && (
+                  <span className="shrink-0 text-text-faint">· branched mid-conversation</span>
+                )}
+              </div>
+            );
+          })()}
+
           {/* Review-loop dashboard — sticky above the transcript for
               observer sessions: live criteria, attempt timeline with
               watch-the-leg jumps, inline decisions when parked. */}
@@ -390,6 +471,8 @@ export function ChatPage() {
                 messages={messages}
                 streamingBlocks={streamingBlocks}
                 isStreaming={isStreaming}
+                onForkMessage={canForkSession ? handleForkMessage : undefined}
+                messageForks={messageForks}
               />
             )}
             <ChatWidthHandle />
