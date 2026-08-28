@@ -45,9 +45,11 @@ def _resolve_memu_db_path(ctx: ToolContext) -> str:
 # inline-output limit (which would silently persist it to a file).
 _MAX_RECALL_BYTES = 10_000
 
-# Sub-budget for xmemory's synthesized answer so it can never crowd out the
-# memU items it's shown alongside.
-_MAX_XMEM_ANSWER_BYTES = 4_000
+# Sub-budget for xmemory's read result. Structured read modes (raw-tables /
+# xresponse) and multi-sub-query answers routinely exceed the old 4KB budget,
+# so give xmemory its own 16KB. Combined with the memU budget above the worst
+# case stays ~26KB — comfortably under the harness's ~55KB inline-output limit.
+_MAX_XMEM_ANSWER_BYTES = 16_000
 
 
 def _clip_to_budget(text: str, max_bytes: int = _MAX_RECALL_BYTES) -> str:
