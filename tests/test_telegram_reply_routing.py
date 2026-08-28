@@ -3,7 +3,8 @@
 When a user replies (Telegram reply) to a message the bot sent, the reply is
 routed to the session that produced that message instead of the chat's active
 session. The channel records ``message_id -> (chat_id, session_id)`` on every
-outbound send and resolves it back on inbound replies.
+outbound send and for each inbound message's landing session, then resolves it
+back on inbound replies — including the user replying to their own message.
 """
 
 from types import SimpleNamespace
@@ -15,13 +16,17 @@ from nerve.channels.telegram import TelegramChannel
 
 
 class _FakeRouter:
-    """Minimal router exposing the one method the channel calls here."""
+    """Minimal router exposing the methods the channel calls here."""
 
-    def __init__(self, sessions: dict | None = None):
+    def __init__(self, sessions: dict | None = None, active: str | None = None):
         self._sessions = sessions or {}
+        self._active = active
 
     async def get_session(self, session_id: str):
         return self._sessions.get(session_id)
+
+    async def get_active_session(self, channel_key: str, source: str):
+        return self._active
 
 
 def _make_channel(router: _FakeRouter | None = None) -> TelegramChannel:
@@ -157,3 +162,29 @@ async def test_send_without_session_id_records_nothing():
     ch._app = SimpleNamespace(bot=_Bot())
     await ch.send(OutboundMessage(target="42", text="hello"))  # session_id=""
     assert ch._lookup_reply_route(778, 42) is None
+
+
+# --------------------------------------------------------------------------- #
+#  Delivery session + recording the user's own messages                       #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_delivery_session_uses_routed_target():
+    ch = _make_channel(_FakeRouter(active="active1"))
+    assert await ch._delivery_session("sessB", "telegram:42") == "sessB"
+
+
+@pytest.mark.asyncio
+async def test_delivery_session_falls_back_to_active():
+    ch = _make_channel(_FakeRouter(active="active1"))
+    assert await ch._delivery_session(None, "telegram:42") == "active1"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_own_recorded_message_routes_to_where_it_landed():
+    # Recording the user's own inbound message against its landing session means
+    # a later reply to that same message routes back there (serxa's request).
+    ch = _make_channel(_FakeRouter({"active1": {"status": "active"}}, active="active1"))
+    landing = await ch._delivery_session(None, "telegram:42")  # → active1
+    ch._record_reply_route(500, 42, landing)                   # user's own msg id 500
+    assert await ch._resolve_reply(500, 42) == ("route", "active1")

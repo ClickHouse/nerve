@@ -491,10 +491,11 @@ class TelegramChannel(BaseChannel):
             collections.OrderedDict()
         )
         self._message_cache_max = 200
-        # Reply routing: telegram message_id -> (chat_id, session_id) for
-        # messages the bot has sent, so a user REPLY targets the session that
-        # produced the replied-to message (e.g. a cron/background session)
-        # instead of the chat's active session. Bounded LRU.
+        # Reply routing: telegram message_id -> (chat_id, session_id). Records
+        # both messages the bot sent and the session each inbound message landed
+        # in, so a user REPLY targets that session — a cron/background session's
+        # message, or the user's own earlier message — instead of the chat's
+        # active session. Bounded LRU.
         self._reply_routes: collections.OrderedDict[int, tuple[int, str]] = (
             collections.OrderedDict()
         )
@@ -1048,6 +1049,19 @@ class TelegramChannel(BaseChannel):
         if not row or row.get("status") == "archived":
             return ("reject", None)
         return ("route", session_id)
+
+    async def _delivery_session(
+        self, routed_session: str | None, channel_key: str,
+    ) -> str:
+        """The session an inbound message will actually be delivered to:
+        the explicit reply target if one resolved, else the chat's active
+        session. Recorded against the incoming message id so a later reply to
+        it — including the user replying to their OWN message — routes back to
+        the same session.
+        """
+        if routed_session:
+            return routed_session
+        return await self.router.get_active_session(channel_key, source="telegram")
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -1726,12 +1740,19 @@ class TelegramChannel(BaseChannel):
         if routed_session:
             logger.info("Telegram reply routed to session %s", routed_session)
 
+        channel_key = f"telegram:{chat_id}"
+        target_session = await self._delivery_session(routed_session, channel_key)
+        # Record this inbound message against the session it lands in, so a later
+        # reply to it — including the user replying to their own message — routes
+        # back to the same session.
+        self._record_reply_route(update.message.message_id, chat_id, target_session)
+
         msg = InboundMessage(
             channel_name="telegram",
-            channel_key=f"telegram:{chat_id}",
+            channel_key=channel_key,
             sender_id=str(chat_id),
             text=text,
-            session_id=routed_session,
+            session_id=target_session,
             metadata=metadata,
         )
 
@@ -1912,12 +1933,19 @@ class TelegramChannel(BaseChannel):
         if routed_session:
             logger.info("Telegram reply routed to session %s", routed_session)
 
+        channel_key = f"telegram:{chat_id}"
+        target_session = await self._delivery_session(routed_session, channel_key)
+        # Record this inbound message against the session it lands in, so a later
+        # reply to it — including the user replying to their own message — routes
+        # back to the same session.
+        self._record_reply_route(updates[0].message.message_id, chat_id, target_session)
+
         msg = InboundMessage(
             channel_name="telegram",
-            channel_key=f"telegram:{chat_id}",
+            channel_key=channel_key,
             sender_id=str(chat_id),
             text=text,
-            session_id=routed_session,
+            session_id=target_session,
             metadata=metadata,
         )
 
