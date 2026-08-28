@@ -6,12 +6,20 @@ interface Props {
   muted?: boolean;
 }
 
+/**
+ * Styled by `.markdown-content` (index.css), the app's own markdown
+ * stylesheet, which the chat transcript uses too — so a GitHub notification
+ * and an agent message render the same way. `prose*` classes are not an
+ * option here: `@tailwindcss/typography` is not installed, so they generate no
+ * CSS at all.
+ *
+ * The base text colour stays on this element: `.markdown-content` colours
+ * links, blockquotes and code, but inherits the body colour, which is what
+ * `muted` is for.
+ */
 export function MarkdownRenderer({ content, muted = false }: Props) {
   return (
-    <div className={`prose prose-invert prose-sm max-w-none
-      prose-headings:text-text prose-a:text-accent prose-code:text-text-secondary
-      prose-pre:bg-surface prose-pre:border prose-pre:border-border-subtle
-      ${muted ? 'text-text-muted' : 'text-text-secondary'}`}>
+    <div className={`markdown-content ${muted ? 'text-text-muted' : 'text-text-secondary'}`}>
       <ReactMarkdown remarkPlugins={[remarkGfm]}>
         {content || '*(empty)*'}
       </ReactMarkdown>

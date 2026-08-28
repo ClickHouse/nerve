@@ -1,15 +1,17 @@
 import { useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Zap, CheckCircle, XCircle, Clock, Plug } from 'lucide-react';
+import { ArrowLeft, Zap, CheckCircle, XCircle, Clock, Plug } from '../components/ui/icons';
+import { Badge, IconButton } from '../components/ui';
 import { useMcpStore } from '../stores/mcpStore';
 import { formatMcpName } from '../utils/formatMcpName';
 
+/** Transport identity, not status — so `hue-*` rather than a feedback token. */
 const TYPE_COLORS: Record<string, string> = {
   sdk: 'text-accent bg-accent/10',
-  stdio: 'text-hue-emerald bg-emerald-400/10',
-  sse: 'text-hue-amber bg-amber-400/10',
-  http: 'text-hue-sky bg-sky-400/10',
-  plugin: 'text-hue-violet bg-violet-400/10',
+  stdio: 'text-hue-emerald bg-hue-emerald/10',
+  sse: 'text-hue-amber bg-hue-amber/10',
+  http: 'text-hue-sky bg-hue-sky/10',
+  plugin: 'text-hue-violet bg-hue-violet/10',
 };
 
 function UsageBar({ total, success }: { total: number; success: number }) {
@@ -18,7 +20,7 @@ function UsageBar({ total, success }: { total: number; success: number }) {
   return (
     <div className="w-full bg-surface-raised rounded-full h-1.5">
       <div
-        className={`h-1.5 rounded-full ${pct >= 90 ? 'bg-emerald-500' : pct >= 70 ? 'bg-amber-500' : 'bg-red-500'}`}
+        className={`h-1.5 rounded-full ${pct >= 90 ? 'bg-success' : pct >= 70 ? 'bg-warning' : 'bg-error'}`}
         style={{ width: `${pct}%` }}
       />
     </div>
@@ -55,22 +57,15 @@ export function McpServerDetailPage() {
     <div className="flex-1 flex flex-col h-full overflow-hidden">
       {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-border shrink-0">
-        <button
-          onClick={() => navigate('/mcp')}
-          className="text-text-dim hover:text-text-secondary cursor-pointer"
-        >
+        <IconButton label="Back to MCP servers" onClick={() => navigate('/mcp')}>
           <ArrowLeft size={16} />
-        </button>
+        </IconButton>
         <div className="flex items-center gap-2 flex-1">
           <h1 className="text-sm font-medium text-text">{formatMcpName(s.name)}</h1>
-          <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${typeClass}`}>
+          <span className={`text-2xs px-1.5 py-0.5 rounded font-mono ${typeClass}`}>
             {s.type}
           </span>
-          {!s.enabled && (
-            <span className="text-[10px] text-hue-amber/70 bg-amber-500/10 px-1.5 py-0.5 rounded">
-              disabled
-            </span>
-          )}
+          {!s.enabled && <Badge tone="warning">disabled</Badge>}
         </div>
       </div>
 
@@ -126,7 +121,7 @@ export function McpServerDetailPage() {
                 {s.recent_usage.map(u => (
                   <div
                     key={u.id}
-                    className="flex items-center gap-3 px-3 py-1.5 text-[11px] bg-surface-raised border border-border rounded"
+                    className="flex items-center gap-3 px-3 py-1.5 text-xs bg-surface-raised border border-border rounded"
                   >
                     {u.success
                       ? <CheckCircle size={10} className="text-hue-emerald shrink-0" />

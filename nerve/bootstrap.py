@@ -1913,7 +1913,7 @@ class SetupWizard:
         if not shutil.which("node"):
             click.secho(
                 "  ⚠ Node.js not found — web UI not built.\n"
-                "    Install Node.js 18+ and run: cd web && npm ci && npm run build",
+                "    Install Node.js 22.12+ and run: cd web && npm ci && npm run build",
                 fg="yellow",
             )
             return
