@@ -26,10 +26,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pyproject says requires-python ">=3.12", but the pinned
-        # memu-py==1.4.0 dependency requires >=3.13, so 3.13 is the real
-        # floor (and what the dev environment runs). Add more versions here
-        # if that pin is ever relaxed.
+        # Matches pyproject's requires-python floor of >=3.13, which is set by
+        # the pinned memu-py==1.4.0. Add more versions here if that pin is ever
+        # relaxed and the floor drops.
         python-version: ["3.13"]
     steps:
       - name: Checkout
@@ -38,15 +37,32 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
+          # Pinned deliberately. uv owns the lockfile format (uv.lock records a
+          # `version` and `revision`) and it is also the tool asserting the lock
+          # is current, so letting CI float to whatever uv shipped this morning
+          # puts a moving part underneath the reproducibility this file exists to
+          # provide. Bump this alongside a `uv lock` refresh.
+          version: "0.12.0"
           enable-cache: true
-          # Key the uv cache on the dependency source (this repo has no uv.lock).
-          cache-dependency-glob: "pyproject.toml"
-
-      - name: Create virtual environment
-        run: uv venv --python ${{ matrix.python-version }}
+          # uv.lock is the single input that determines the resolution.
+          cache-dependency-glob: "uv.lock"
 
       - name: Install project and test dependencies
-        run: uv pip install -e ".[test]"
+        # `uv sync` resolves from uv.lock, creates .venv, and installs the
+        # project editable — so this run gets the same versions today and in six
+        # months. It also stops the cache deciding versions: before the lock, a
+        # restored cache carrying stale index metadata was the only reason CI
+        # kept resolving mcp 1.29.0 for three weeks after mcp 2.0.0 had broken
+        # every fresh install (#316).
+        #
+        # --locked asserts uv.lock is already in sync with pyproject.toml and
+        # fails if not, rather than silently re-locking. That is what makes this
+        # one job sufficient: any dependency change — added, removed, or
+        # re-bounded — invalidates the lock, so it cannot be merged without a
+        # relock, and the relock moves the pins that this job then tests. It
+        # does NOT fail merely because upstream published something new, since
+        # the lock is used as-is.
+        run: uv sync --extra test --locked --python ${{ matrix.python-version }}
 
       - name: Run test suite
         run: .venv/bin/pytest tests/ -v
@@ -65,15 +81,64 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
+          # Not pinned to web/package.json's `engines` floor of 22.12.0 — the
+          # `frontend-floor` job below covers that. The *test* toolchain needs
+          # more than the app itself does (jsdom declares `^22.22.2 ||
+          # ^24.15.0 || >=26.0.0`), so running the suite at the floor would be
+          # running it outside its own supported range.
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        # --strict-peer-deps turns an unsatisfiable peer range from a warning
+        # into a failure. The default `npm ci` installs such a dependency anyway
+        # and says nothing, but anyone whose npm has strict peers on cannot
+        # install the lockfile at all. This job catches that here instead.
+        # An `overrides` entry in web/package.json is how to settle one.
+        #
+        # Deliberately NOT --engine-strict. npm applies that to every package in
+        # the lockfile, including dev-only tooling whose Node floors are already
+        # higher than anything we would declare as Nerve's (jsdom 22.22.2,
+        # undici 22.19.0) — so it cannot express "the shipped dependencies fit
+        # the declared floor", which is the property worth checking.
+        run: npm ci --strict-peer-deps
 
       - name: Build frontend (tsc -b && vite build)
         run: npm run build
 
       - name: Run test suite (Vitest)
         run: npm test
+
+  frontend-floor:
+    # The Node floor is a support claim: install.sh refuses anything older,
+    # README and docs/setup.md tell people to install it, and web/package.json
+    # declares it in `engines`. This job is what keeps those four from drifting
+    # apart — it installs and builds on exactly the oldest Node we accept.
+    #
+    # Install and build only; see the note on `frontend-build` for why the test
+    # suite does not run down here.
+    name: Frontend install floor (Node 22.12.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js at the declared floor
+        uses: actions/setup-node@v5
+        with:
+          # Exact, and it has to stay in step with `engines.node` in
+          # web/package.json and MIN_NODE_VERSION in install.sh.
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --strict-peer-deps
+
+      - name: Build frontend (tsc -b && vite build)
+        run: npm run build

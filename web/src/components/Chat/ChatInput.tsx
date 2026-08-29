@@ -1,23 +1,35 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat } from 'lucide-react';
+import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
+import { Button, IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
+import { findSessionById } from '../../utils/findSession';
 import { PromptRewriteCard } from './PromptRewriteCard';
 import { BackendSelector } from './BackendSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
-  add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)', placeholder: 'Instructions...' },
-  remove:   { icon: Trash2,     label: 'Remove',  color: '#ef4444', placeholder: 'Instructions...' },
-  improve:  { icon: Sparkles,   label: 'Improve', color: '#a855f7', placeholder: 'Instructions...' },
-  question: { icon: HelpCircle, label: 'Ask',     color: '#f59e0b', placeholder: 'What do you want to know?' },
-  note:     { icon: StickyNote, label: 'Note',    color: '#6b7280', placeholder: 'Your note...' },
+  add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)',     placeholder: 'Instructions...' },
+  remove:   { icon: Trash2,     label: 'Remove',  color: 'var(--theme-hue-red)',    placeholder: 'Instructions...' },
+  improve:  { icon: Sparkles,   label: 'Improve', color: 'var(--theme-hue-purple)', placeholder: 'Instructions...' },
+  question: { icon: HelpCircle, label: 'Ask',     color: 'var(--theme-hue-amber)',  placeholder: 'What do you want to know?' },
+  note:     { icon: StickyNote, label: 'Note',    color: 'var(--theme-text-muted)', placeholder: 'Your note...' },
 };
 
 // Actions that auto-focus the instruction input (need user input)
 const FOCUS_ACTIONS = new Set<QuoteAction>(['add', 'question', 'note']);
+
+// "Run later" submenu — exactly these four, in this order. The three timed
+// delays schedule a one-shot wakeup; "none" ("Just accept it") saves the
+// prompt for the user to run manually.
+const RUN_LATER_OPTIONS: Array<{ delay: string; label: string }> = [
+  { delay: '30m', label: 'Run in 30 mins' },
+  { delay: '1h', label: 'Run in 1 hour' },
+  { delay: '24h', label: 'Run in 24 hours' },
+  { delay: 'none', label: 'Just accept it' },
+];
 
 // Prompt rewrite — refine the first message of a new chat before sending.
 const REWRITE_PREF_KEY = 'nerve_prompt_rewrite';
@@ -49,6 +61,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  // "Run later" kebab menu (mirrors the SessionSidebar three-dots menu).
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [runLaterOpen, setRunLaterOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastInstructionRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -65,6 +81,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const setDraft = useChatStore(s => s.setDraft);
   const activeSession = useChatStore(s => s.activeSession);
   const ensureRealSession = useChatStore(s => s.ensureRealSession);
+  const runLater = useChatStore(s => s.runLater);
   const isNewChat = useChatStore(s => s.messages.length === 0);
 
   // Persist the composer draft, but NOT on every keystroke. Writing to the
@@ -99,9 +116,13 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const backendDefault = useChatStore(s => s.backendDefault);
   const chosenBackend = newChatBackend ?? backendDefault;
   const sessions = useChatStore(s => s.sessions);
+  const archivedSessions = useChatStore(s => s.archivedSessions);
+  const systemSessions = useChatStore(s => s.systemSessions);
+  // The active session row may live in the feed or a lazy archived/system group.
+  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
   const activeBackend = isVirtualChat
     ? (chosenBackend ?? 'claude')
-    : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
+    : (activeSessionRow?.backend ?? 'claude');
 
   // ── Model picker (per-chat) ──
   // A virtual chat's pick lives in newChatModels until the session is
@@ -117,7 +138,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   const modelsDefault = modelDefaults[activeBackend] ?? null;
   const currentModel = isVirtualChat
     ? (newChatModels[activeBackend] ?? modelsDefault)
-    : (sessions.find(s => s.id === activeSession)?.model ?? modelsDefault);
+    : (activeSessionRow?.model ?? modelsDefault);
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -366,6 +387,51 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
     dispatchSend(message);
   };
 
+  // Close the kebab menu on an outside click (mirrors SessionSidebar).
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+        setRunLaterOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [menuOpen]);
+
+  /** Defer the composed message via a chosen "Run later" option, then clear
+   *  the composer exactly as a normal send does. */
+  const handleRunLater = (delay: string) => {
+    const message = composeMessage();
+    if (!message && attachments.length === 0) return;
+    const fileIds = attachments.filter(a => a.uploadedId).map(a => a.uploadedId!);
+    const imageBlocks = attachments
+      .filter(a => a.uploadedId && a.uploadedMeta?.file_type === 'image')
+      .map(a => ({
+        url: `/api/files/uploads/${a.uploadedId}`,
+        filename: a.uploadedMeta!.filename,
+        media_type: a.uploadedMeta!.media_type,
+      }));
+    setMenuOpen(false);
+    setRunLaterOpen(false);
+    // Fire the deferred create, then clear the composer synchronously — same
+    // ordering as dispatchSend so the carried draft ends up empty.
+    void runLater(
+      message, delay,
+      fileIds.length > 0 ? fileIds : undefined,
+      imageBlocks.length > 0 ? imageBlocks : undefined,
+    ).catch((e) => console.error('Run later failed:', e));
+    cancelDraftFlush();
+    setInput('');
+    historyIndexRef.current = -1;
+    historyStashRef.current = '';
+    setDraft(activeSession, '');
+    clearQuotes();
+    attachments.forEach(a => { if (a.preview) URL.revokeObjectURL(a.preview); });
+    setAttachments([]);
+  };
+
   // Previously-sent user prompts of this chat, newest first (adjacent dupes dropped).
   const getPromptHistory = (): string[] => {
     const msgs = useChatStore.getState().messages;
@@ -515,7 +581,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Prompt rewrite preview */}
       {rewrite.status !== 'idle' && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-[var(--chat-width)] mx-auto">
+          <div>
             <PromptRewriteCard
               state={
                 rewrite.status === 'loading' ? { status: 'loading' }
@@ -535,7 +601,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Quote cards */}
       {quotes.length > 0 && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-[var(--chat-width)] mx-auto space-y-2">
+          <div className="space-y-2">
             {quotes.map((quote, idx) => (
               <QuoteCard
                 key={quote.id}
@@ -553,7 +619,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
       {/* Attachment previews */}
       {attachments.length > 0 && (
         <div className="px-4 pt-3 pb-1">
-          <div className="max-w-[var(--chat-width)] mx-auto flex gap-2 flex-wrap">
+          <div className="flex gap-2 flex-wrap">
             {attachments.map(a => (
               <AttachmentPreview key={a.id} attachment={a} onRemove={() => removeAttachment(a.id)} />
             ))}
@@ -567,21 +633,35 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
           buttons plus the model picker, which left the textarea a ~90px
           stub, so the row wraps instead: controls stay on the first line and
           the textarea takes a full-width line of its own below them (see the
-          `basis-full`/`order-1` pair on it). */}
+          `basis-full`/`order-1` pair on it).
+
+          The composer stack — this row and the rewrite / quote / attachment
+          strips above it — does not carry `max-w-[var(--chat-width)]`, which
+          everything on the transcript side does. One cap cannot serve both: a
+          reading column stays narrow for prose, while the composer is a control
+          surface that only gets narrower as the model picker and five buttons
+          take their fixed share out of it. Capped at the default 768 the
+          textarea gets 430px, and widening the reading column to suit the
+          composer would make the transcript worse, so the composer fills the
+          pane instead. */}
       <div className="px-4 py-3">
-        <div className="max-w-[var(--chat-width)] mx-auto flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
+        {/* `relative` is the anchor for the run-later popup below. It hangs off
+            this row rather than off its own 40px trigger so that it is aligned
+            to the composer and cannot leave the viewport, wherever the trigger
+            happens to have wrapped to. */}
+        <div className="relative flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
           {/* File attach button */}
-          <button
+          <IconButton
+            size="md"
             onClick={() => fileInputRef.current?.click()}
             disabled={disabled || isStreaming || rewriteActive
               || (isVirtualChat && !!(newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())))}
-            className="w-10 h-10 text-text-muted hover:text-text-secondary rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0 disabled:opacity-30"
-            title={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
+            label={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
               ? 'Attaching files would start the review loop — start it or clear the form first'
               : 'Attach files'}
           >
             <Paperclip size={18} />
-          </button>
+          </IconButton>
 
           {/* Prompt rewrite toggle — only on a fresh chat, where it applies */}
           {rewriteAvailable && isNewChat && (
@@ -590,7 +670,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               disabled={disabled || isStreaming || rewriteActive}
               className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
                 rewriteEnabled
-                  ? 'text-hue-purple bg-purple-500/10 hover:bg-purple-500/15 shadow-[inset_0_0_0_1px_rgba(168,85,247,0.25)]'
+                  ? 'text-hue-purple bg-hue-purple/10 hover:bg-hue-purple/15 ring-1 ring-inset ring-hue-purple/25'
                   : 'text-text-muted hover:text-text-secondary'
               }`}
               title={rewriteEnabled
@@ -608,7 +688,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               disabled={disabled || isStreaming || rewriteActive}
               className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
                 newChatReviewLoop
-                  ? 'text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/15 shadow-[inset_0_0_0_1px_rgba(52,211,153,0.25)]'
+                  ? 'text-hue-emerald bg-hue-emerald/10 hover:bg-hue-emerald/15 ring-1 ring-inset ring-hue-emerald/25'
                   : 'text-text-muted hover:text-text-secondary'
               }`}
               title={newChatReviewLoop
@@ -629,7 +709,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               only this chat: virtual chats bind it at creation, real
               sessions PATCH their own row — never a global preference. */}
           {scopedModels.length > 1 && (
-            <select
+            <Select
               value={currentModel ?? ''}
               onChange={(e) => {
                 const picked = e.target.value;
@@ -641,7 +721,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
               }}
               disabled={disabled || isStreaming || rewriteActive}
               title="Model for this chat (other chats keep theirs)"
-              className="h-10 max-w-[170px] px-2.5 bg-surface-raised border border-border rounded-xl text-[13px] text-text-secondary outline-none focus:border-accent/50 cursor-pointer shrink-0 disabled:opacity-30 truncate"
+              className="h-10 max-w-[170px] px-2.5 rounded-xl shrink-0 truncate"
             >
               {/* A session may run on a model the picker no longer offers
                   (retired id, uninstalled Ollama model) — keep it visible
@@ -670,7 +750,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
                   ))}
                 </optgroup>
               )}
-            </select>
+            </Select>
           )}
 
           <input
@@ -704,24 +784,94 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
             // basis-full makes the textarea claim a whole flex line on its
             // own; order-1 puts that line under the controls rather than
             // above them. Both are undone at `md`, back to a single row.
-            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-[15px] text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
+            // `text-sm` matches every other input in the app (`FIELD_SIZES.md`
+            // is `text-sm` too). `text-base` — 16px — reads oversized next to
+            // the transcript and fits noticeably less text on a line.
+            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-sm text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
           />
+          {/* Run-later kebab — three-dots menu next to Send. Its submenu
+              defers the composed prompt into a new session without spending
+              tokens now (opens upward; the composer sits at the bottom).
+
+              No `order`: it belongs on the controls line with everything else.
+              Anything sorted after the `order-1` textarea wraps onto a line of
+              its own under the message box, at the left margin, where a popup
+              right-aligned to a 40px trigger opens off the left of the screen.
+              Desktop never shows this: that row is `md:flex-nowrap`, so nothing
+              wraps and `order` is inert. */}
+          <div className="shrink-0" ref={menuRef}>
+            <IconButton
+              label="More options"
+              size="md"
+              onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
+              disabled={disabled || isStreaming || rewriteActive}
+              // `aria-expanded` only. `aria-haspopup="menu"` would promise the
+              // ARIA menu pattern — `menu`/`menuitem` roles, focus moving into
+              // the popup, arrow-key navigation, Escape to close — but the popup
+              // below is a `div` of ordinary buttons. It is a disclosure, so it
+              // says so rather than announcing a keyboard model that is not
+              // there.
+              aria-expanded={menuOpen}
+              className="rounded-xl"
+            >
+              <MoreHorizontal size={18} />
+            </IconButton>
+            {menuOpen && (
+              // A fixed width, not a minimum. The popup is anchored to the
+              // composer, so it has ~500px to shrink-to-fit against and would
+              // take all of it for four short labels. `w-max` does not help:
+              // Chrome's max-content for these `w-full` children lands in the
+              // same place.
+              <div className="absolute right-0 bottom-full mb-1 z-50 w-[170px] bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1">
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  fullWidth
+                  onClick={() => setRunLaterOpen(v => !v)}
+                  aria-expanded={runLaterOpen}
+                  className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left"
+                >
+                  <span className="flex items-center gap-2.5"><Clock size={14} /> Run later</span>
+                  <ChevronRight size={14} className={`transition-transform ${runLaterOpen ? 'rotate-90' : ''}`} />
+                </Button>
+                {runLaterOpen && (
+                  <div className="border-t border-border mt-1 pt-1">
+                    {RUN_LATER_OPTIONS.map(opt => (
+                      <Button
+                        key={opt.delay}
+                        variant="subtle"
+                        size="sm"
+                        fullWidth
+                        onClick={() => handleRunLater(opt.delay)}
+                        disabled={!canSend}
+                        className="justify-start px-3 py-1.5 pl-8 rounded-none text-left"
+                      >
+                        {opt.label}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {isStreaming ? (
+            /* Native: this is a solid destructive fill, and IconButton has no
+               `dangerSolid` — its `danger` is red-on-transparent. `bg-error-solid`
+               rather than `bg-error`, which is the pale feedback foreground. */
             <button
+              type="button"
               onClick={onStop}
-              className="w-10 h-10 bg-red-500/80 hover:bg-red-500 text-white rounded-xl flex items-center justify-center cursor-pointer transition-colors shrink-0"
+              className="w-10 h-10 bg-error-solid hover:bg-error-solid/90 text-white rounded-xl inline-flex items-center justify-center cursor-pointer transition-colors shrink-0"
               title="Stop generation"
+              aria-label="Stop generation"
             >
               <Square size={16} />
             </button>
           ) : (
-            <button
-              onClick={handleSend}
-              disabled={!canSend}
-              className="w-10 h-10 bg-accent hover:bg-accent-hover text-white rounded-xl flex items-center justify-center disabled:opacity-30 cursor-pointer transition-colors shrink-0"
-            >
+            <IconButton label="Send" variant="primary" size="md" onClick={handleSend} disabled={!canSend}>
               <Send size={18} />
-            </button>
+            </IconButton>
           )}
         </div>
       </div>
@@ -743,8 +893,8 @@ function AttachmentPreview({ attachment, onRemove }: { attachment: AttachmentFil
         </div>
       )}
       <div className="pr-7 py-1.5 min-w-0">
-        <div className="text-[12px] text-text-secondary truncate max-w-[120px]">{attachment.file.name}</div>
-        <div className="text-[11px] text-text-muted">
+        <div className="text-xs text-text-secondary truncate max-w-[120px]">{attachment.file.name}</div>
+        <div className="text-xs text-text-muted">
           {attachment.uploading ? (
             <span className="flex items-center gap-1"><Loader2 size={10} className="animate-spin" /> Uploading...</span>
           ) : attachment.error ? (
@@ -754,12 +904,14 @@ function AttachmentPreview({ attachment, onRemove }: { attachment: AttachmentFil
           )}
         </div>
       </div>
-      <button
+      <IconButton
+        label={`Remove ${attachment.file.name}`}
+        size="xs"
         onClick={onRemove}
-        className="absolute top-1 right-1 w-5 h-5 rounded-full bg-bg/80 text-text-muted hover:text-text flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+        className="absolute top-1 right-1 rounded-full bg-bg/80 opacity-0 group-hover:opacity-100 transition-opacity"
       >
         <X size={12} />
-      </button>
+      </IconButton>
     </div>
   );
 }
@@ -785,32 +937,29 @@ function QuoteCard({ quote, instructionRef, onRemove, onUpdateInstruction, onSen
         {/* Icon + label */}
         <div className="flex items-center gap-1.5 shrink-0 pt-0.5">
           <Icon size={13} style={{ color: config.color }} />
-          <span className="text-[11px] font-medium uppercase tracking-wider" style={{ color: config.color }}>
+          <span className="text-xs font-medium uppercase tracking-wider" style={{ color: config.color }}>
             {config.label}
           </span>
         </div>
 
         {/* Content */}
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] text-text-muted leading-relaxed line-clamp-2">{truncated}</div>
-          <input
+          <div className="text-xs text-text-muted leading-relaxed line-clamp-2">{truncated}</div>
+          <TextField
+            bare
             ref={instructionRef}
-            type="text"
             value={quote.instruction}
             onChange={(e) => onUpdateInstruction(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && onSend) { e.preventDefault(); onSend(); } }}
             placeholder={config.placeholder}
-            className="w-full mt-1.5 px-0 py-0.5 bg-transparent text-[13px] text-text-secondary outline-none placeholder:text-text-faint border-b border-border focus:border-border transition-colors"
+            className="mt-1.5 py-0.5 text-sm text-text-secondary border-b border-border transition-colors"
           />
         </div>
 
         {/* Remove */}
-        <button
-          onClick={onRemove}
-          className="text-text-faint hover:text-text-muted cursor-pointer transition-colors shrink-0 pt-0.5"
-        >
+        <IconButton label="Remove this quote" size="xs" onClick={onRemove} className="shrink-0 mt-0.5">
           <X size={14} />
-        </button>
+        </IconButton>
       </div>
     </div>
   );

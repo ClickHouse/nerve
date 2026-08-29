@@ -2,7 +2,8 @@ import { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import {
   ArrowLeft, Eye, FilePlus, FileEdit, FileX, Loader2, RefreshCw, WrapText,
   Plus, GitBranch, Trash2, X, MessageSquare, FileText,
-} from 'lucide-react';
+} from '../ui/icons';
+import { Button, IconButton } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 import { useReviewStore } from '../../stores/reviewStore';
 import { api } from '../../api/client';
@@ -64,25 +65,36 @@ function FileCard({ file, onClick }: { file: ModifiedFileSummary; onClick: () =>
   const color = STATUS_COLOR[file.status] || 'text-text-muted';
   const badge = STATUS_BADGE[file.status] || '?';
   return (
-    <button
+    <Button
+      variant="subtle"
+      size="md"
+      fullWidth
       onClick={onClick}
-      className="w-full text-left px-4 py-2.5 hover:bg-surface transition-colors cursor-pointer border-b border-surface-raised last:border-b-0 group"
+      className="px-4 py-2.5 rounded-none text-left hover:bg-surface border-b border-surface-raised last:border-b-0 group"
     >
-      <div className="flex items-center gap-2.5">
-        <span className={`text-[11px] font-bold font-mono w-4 text-center shrink-0 ${color}`}>{badge}</span>
+      <div className="flex w-full items-center gap-2.5">
+        <span className={`text-xs leading-tight font-bold font-mono w-4 text-center shrink-0 ${color}`}>
+          {badge}
+        </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <Icon size={13} className={`shrink-0 ${color}`} />
-            <span className="text-[13px] font-medium text-text-secondary truncate">{fileName}</span>
+            <span className="text-sm leading-tight font-medium text-text-secondary truncate">{fileName}</span>
           </div>
-          {dirPath && <div className="text-[11px] text-text-faint truncate ml-[21px]">{dirPath}</div>}
+          {dirPath && (
+            <div className="text-xs leading-tight text-text-faint truncate ml-[21px]">{dirPath}</div>
+          )}
         </div>
-        <div className="flex items-center gap-1.5 shrink-0 text-[11px] font-mono tabular-nums">
-          {file.stats.additions > 0 && <span className="text-diff-add">+{file.stats.additions}</span>}
-          {file.stats.deletions > 0 && <span className="text-diff-del">&minus;{file.stats.deletions}</span>}
+        <div className="flex items-center gap-1.5 shrink-0 text-xs leading-tight font-mono tabular-nums">
+          {file.stats.additions > 0 && (
+            <span className="text-diff-add">+{file.stats.additions}</span>
+          )}
+          {file.stats.deletions > 0 && (
+            <span className="text-diff-del">&minus;{file.stats.deletions}</span>
+          )}
         </div>
       </div>
-    </button>
+    </Button>
   );
 }
 
@@ -96,6 +108,7 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
   const [wrap, setWrap] = useState(() => localStorage.getItem(WRAP_STORAGE_KEY) === 'true');
   const [preview, setPreview] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const canPreview = diff?.markdown_content != null;
 
   const toggleWrap = () => {
     const next = !wrap;
@@ -121,42 +134,74 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border-subtle bg-bg-sunken shrink-0">
-        <button onClick={onBack} className="w-5 h-5 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer">
+        <IconButton label="Back to the file list" size="xs" onClick={onBack}>
           <ArrowLeft size={14} />
-        </button>
-        <span className={`text-[13px] font-medium ${color}`}>{fileName}</span>
-        <div className="flex items-center gap-1.5 text-[11px] font-mono tabular-nums">
-          {diff?.stats && diff.stats.additions > 0 && <span className="text-diff-add">+{diff.stats.additions}</span>}
-          {diff?.stats && diff.stats.deletions > 0 && <span className="text-diff-del">&minus;{diff.stats.deletions}</span>}
+        </IconButton>
+        <span className={`text-sm font-medium ${color}`}>{fileName}</span>
+        <div className="flex items-center gap-1.5 text-xs font-mono tabular-nums">
+          {diff?.stats && diff.stats.additions > 0 && (
+            <span className="text-diff-add">+{diff.stats.additions}</span>
+          )}
+          {diff?.stats && diff.stats.deletions > 0 && (
+            <span className="text-diff-del">&minus;{diff.stats.deletions}</span>
+          )}
         </div>
         <div className="ml-auto flex items-center gap-1">
-          {diff?.markdown_content != null && (
-            <button onClick={() => setPreview(p => !p)} aria-pressed={preview}
-              className={`w-5 h-5 flex items-center justify-center cursor-pointer ${preview ? 'text-accent' : 'text-text-faint hover:text-text-muted'}`}
-              title={preview ? 'Show raw diff' : 'Show rendered markdown'}>
+          {canPreview && (
+            <IconButton
+              label={preview ? 'Show raw diff' : 'Show rendered markdown'}
+              size="xs"
+              active={preview}
+              aria-pressed={preview}
+              onClick={() => setPreview(p => !p)}
+            >
               <Eye size={13} />
-            </button>
+            </IconButton>
           )}
-          <button onClick={toggleWrap} aria-pressed={wrap}
-            className={`w-5 h-5 flex items-center justify-center cursor-pointer ${wrap ? 'text-accent' : 'text-text-faint hover:text-text-muted'}`}
-            title={wrap ? 'Disable line wrapping' : 'Enable line wrapping'}>
+          <IconButton
+            label={wrap ? 'Disable line wrapping' : 'Enable line wrapping'}
+            size="xs"
+            active={wrap}
+            aria-pressed={wrap}
+            onClick={toggleWrap}
+          >
             <WrapText size={13} />
-          </button>
+          </IconButton>
         </div>
       </div>
-      <div className="text-[11px] text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised">{file.short_path}</div>
+      <div className="text-xs text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised">
+        {file.short_path}
+      </div>
+
+      {/* Diff content */}
       <div ref={containerRef} className="flex-1 overflow-y-auto relative" data-role="plan">
         <SelectionToolbar containerRef={containerRef} />
-        {loading && <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint"><Loader2 size={14} className="animate-spin" /> Loading diff...</div>}
-        {error && <div className="px-4 py-4 text-[13px] text-hue-red">Failed to load diff: {error}</div>}
+        {loading && (
+          <div className="flex items-center gap-2 justify-center py-8 text-sm text-text-faint">
+            <Loader2 size={14} className="animate-spin" /> Loading diff...
+          </div>
+        )}
+        {error && (
+          <div className="px-4 py-4 text-sm text-hue-red">Failed to load diff: {error}</div>
+        )}
         {diff && !loading && (
           preview && diff.markdown_content != null ? (
-            <div className="px-4 py-3 text-[13px]">
+            <div className="px-4 py-3 text-sm">
               <MarkdownContent content={diff.markdown_content} />
-              {diff.markdown_truncated && <div className="text-center py-3 mt-3 text-[11px] text-text-faint border-t border-border-subtle">Preview truncated at {MAX_DIFF_LINES} lines</div>}
+              {diff.markdown_truncated && (
+                <div className="text-center py-3 mt-3 text-xs text-text-faint border-t border-border-subtle">
+                  Preview truncated at {MAX_DIFF_LINES} lines
+                </div>
+              )}
             </div>
           ) : (
-            <Suspense fallback={<div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint"><Loader2 size={14} className="animate-spin" /> Loading diff…</div>}>
+            <Suspense
+              fallback={
+                <div className="flex items-center gap-2 justify-center py-8 text-sm text-text-faint">
+                  <Loader2 size={14} className="animate-spin" /> Loading diff…
+                </div>
+              }
+            >
               <DiffView diff={diff} wrap={wrap} />
             </Suspense>
           )

@@ -4,6 +4,7 @@ helpers (no SDK subprocess)."""
 import asyncio
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -135,9 +136,12 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
          patch.object(backend, "_build_hooks", return_value={}):
         options = backend._build_options(spec)
 
-    assert options.system_prompt == marker
-    assert "Nerve runbooks" not in str(options.system_prompt)
-    assert "Codex-native skills" not in str(options.system_prompt)
+    # The prompt travels by file (never argv), so the exactness check is on
+    # what landed on disk.
+    rendered = Path(options.system_prompt["path"]).read_text(encoding="utf-8")
+    assert rendered == marker
+    assert "Nerve runbooks" not in rendered
+    assert "Codex-native skills" not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +548,48 @@ async def test_engine_fails_turn_when_eof_follows_content(db, tmp_path):
     asst = [r for r in rows if r["role"] == "assistant"][-1]
     assert asst["content"].startswith("Agent error:")
     assert json.dumps(asst["blocks"] or []).count("half an answer") == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_session_never_forks_from_parent(db, tmp_path):
+    """A source=='workflow' leg carries parent_session_id for sidebar nesting
+    only — its first turn must NOT fork the parent's native session (that would
+    contaminate the fresh orchestration prompt, and cross-backend it raises).
+    A non-workflow child with identical setup still forks: source is the only
+    discriminator."""
+    engine, _made = await _engine_with_scripted_clients(
+        db, tmp_path, "seed", [[("text", "ok"), ("result", "sdk-ok")]],
+    )
+    # Parent with a resumable native session — the fork target.
+    await engine.sessions.get_or_create(
+        "parent", title="t", source="web", backend="claude",
+    )
+    await db.update_session_fields("parent", {"sdk_session_id": "sdk-parent"})
+
+    forks: dict[str, str | None] = {}
+    served = engine._get_or_create_client
+
+    async def _cap(sid, source, model, **kw):
+        forks[sid] = kw.get("fork_from")
+        return await served(sid, source, model, **kw)
+
+    engine._get_or_create_client = _cap
+
+    # Workflow leg nested under the parent, still in 'created' state.
+    await engine.sessions.get_or_create(
+        "workflow:wfr-x", title="t", source="workflow", backend="claude",
+    )
+    await db.update_session_fields("workflow:wfr-x", {"parent_session_id": "parent"})
+    await engine.run("workflow:wfr-x", "go", source="workflow", channel="web")
+    assert forks["workflow:wfr-x"] is None
+
+    # Control: a non-workflow child with the same setup DOES fork.
+    await engine.sessions.get_or_create(
+        "web-child", title="t", source="web", backend="claude",
+    )
+    await db.update_session_fields("web-child", {"parent_session_id": "parent"})
+    await engine.run("web-child", "go", source="web", channel="web")
+    assert forks["web-child"] == "sdk-parent"
 
 
 # ---------------------------------------------------------------------------

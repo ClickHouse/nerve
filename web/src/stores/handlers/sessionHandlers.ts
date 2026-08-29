@@ -1,5 +1,5 @@
 import type { WSMessage } from '../../api/websocket';
-import type { PanelTab } from '../../types/chat';
+import type { PanelTab, Session } from '../../types/chat';
 import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
 import { hydrateMessage } from '../../utils/hydrateMessage';
 import type { Get, Set } from './types';
@@ -219,22 +219,27 @@ export function handleSessionArchived(
 
 export function handleSessionRunning(
   msg: Extract<WSMessage, { type: 'session_running' }>,
-  _get: Get,
+  get: Get,
   set: Set,
 ): void {
-  // Global broadcast: a session started or stopped running
+  // Global broadcast: a session started or stopped running. The event also
+  // carries the session's pending work (scheduled wake-up / live background
+  // task), so a session that only *looks* idle keeps its parked indicator
+  // without waiting for the next list fetch.
+  const runState = (sess: Session): Session => ({
+    ...sess,
+    is_running: msg.is_running,
+    pending_wakeup_at: msg.pending_wakeup_at ?? null,
+    has_background_tasks: !!msg.has_background_tasks,
+  });
   set(s => {
     const updates: Record<string, unknown> = {
       sessions: s.sessions.map(sess =>
-        sess.id === msg.session_id
-          ? { ...sess, is_running: msg.is_running }
-          : sess,
+        sess.id === msg.session_id ? runState(sess) : sess,
       ),
       // Also update search results if present
       searchResults: s.searchResults?.map(sess =>
-        sess.id === msg.session_id
-          ? { ...sess, is_running: msg.is_running }
-          : sess,
+        sess.id === msg.session_id ? runState(sess) : sess,
       ) ?? null,
     };
     // Active session started running from a background trigger (e.g.,
@@ -266,7 +271,7 @@ export function handleSessionRunning(
       if (finalBlocks.length > 0) {
         updates.messages = [
           ...s.messages,
-          { role: 'assistant' as const, blocks: finalBlocks },
+          { role: 'assistant' as const, blocks: finalBlocks, created_at: new Date().toISOString() },
         ];
       }
       updates.streamingBlocks = [];
@@ -275,6 +280,17 @@ export function handleSessionRunning(
     }
     return updates;
   });
+
+  // A backgrounded feed session that just STOPPED may have produced new content;
+  // its updated_at only refreshes via loadSessions() (session_running carries
+  // just is_running), so pull a fresh list to keep the unread marker accurate.
+  // Scoped: skip the active session (its own stream reloads) and cron/system
+  // churn (session ids that never enter the `sessions` feed).
+  if (!msg.is_running
+      && msg.session_id !== get().activeSession
+      && get().sessions.some(sess => sess.id === msg.session_id)) {
+    get().loadSessions();
+  }
 }
 
 export function handleSessionAwaitingInput(
@@ -309,6 +325,7 @@ export function handleAnswerInjected(
       messages: [...s.messages, {
         role: 'user' as const,
         blocks: [{ type: 'text' as const, content: msg.content }],
+        created_at: new Date().toISOString(),
       }],
     }));
   }
@@ -323,6 +340,6 @@ export function handleUserMessage(
   // bubble live. The sender is excluded server-side, so this never duplicates
   // its own optimistic message. hydrateMessage rebuilds any image/file blocks.
   if (msg.session_id !== get().activeSession) return;
-  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined });
+  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString() });
   set(s => ({ messages: [...s.messages, hydrated] }));
 }

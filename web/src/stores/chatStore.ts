@@ -10,6 +10,7 @@ import { randomUUID } from '../utils/uuid';
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
+import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
@@ -107,6 +108,10 @@ interface ChatState {
   virtualSession: Session | null;
   // Per-session unsent input text, keyed by session id (incl. the virtual one).
   drafts: Record<string, string>;
+  // Per-session "last seen" moment (ms) + a one-time baseline. A session is
+  // "unread" when its updated_at is newer than max(reads[id], readsBaseline).
+  reads: Record<string, number>;
+  readsBaseline: number;
   messages: ChatMessage[];
   // Streaming state — blocks built incrementally
   streamingBlocks: MessageBlock[];
@@ -171,6 +176,22 @@ interface ChatState {
   // Background tasks (run_in_background)
   backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout'; startedAt: number }[];
 
+  // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
+  sessionsHasMore: boolean;
+  sessionsNextOffset: number;
+  // Archived sessions — lazily loaded: fetched when the Archived group expands, dropped on collapse (null = not loaded); archivedCount rides on every GET /api/sessions for the badge.
+  archivedSessions: Session[] | null;
+  archivedCount: number;
+  archivedLoading: boolean;
+  archivedHasMore: boolean;
+  archivedNextOffset: number;
+  // System sessions (cron/hook) — lazily loaded, mirror of archived; kept out of the feed so cron traffic can never crowd the conversation list.
+  systemSessions: Session[] | null;
+  systemCount: number;
+  systemLoading: boolean;
+  systemHasMore: boolean;
+  systemNextOffset: number;
+
   // Session search
   searchQuery: string;
   searchResults: Session[] | null;  // null = not searching
@@ -211,15 +232,38 @@ interface ChatState {
   ensureRealSession: (running?: boolean) => Promise<string>;
   discardVirtualSession: () => void;
   setDraft: (sessionId: string, text: string) => void;
+  markSeen: (sessionId: string) => void;
   deleteSession: (id: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
+  unarchiveSession: (id: string) => Promise<void>;
+  /** Append the next page of conversations to the feed (the '...' row). */
+  loadMoreSessions: () => Promise<void>;
+  /** Fetch archived sessions: first page when the group opens, next page on '...'. */
+  loadArchivedSessions: (more?: boolean) => Promise<void>;
+  /** Fetch system sessions: first page when the group opens, next page on '...'. */
+  loadSystemSessions: (more?: boolean) => Promise<void>;
+  /** Forget a collapsed group's rows so reopening refetches from page 1. */
+  clearArchivedSessions: () => void;
+  clearSystemSessions: () => void;
+  /** Star an archived session: unarchive + star in one PATCH (hook fires). */
+  starArchivedSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
+  /** Re-parent a session (drag onto another) or clear it (null → top-level). */
+  setSessionParent: (childId: string, parentId: string | null) => Promise<void>;
   searchSessions: (query: string) => Promise<void>;
   clearSearch: () => void;
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
   sendMessage: (content: string) => void;
+  /** Defer a composed prompt into a new session without running the model
+   *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
+  runLater: (
+    content: string,
+    delay: string,
+    fileIds?: string[],
+    imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
+  ) => Promise<void>;
   /** Fetch selectable models for the composer picker (GET /api/models). */
   loadModels: () => Promise<void>;
   setNewChatBackend: (backend: string | null) => void;
@@ -280,6 +324,18 @@ function restoreVirtualSession(): Session | null {
 
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
+  sessionsHasMore: false,
+  sessionsNextOffset: 0,
+  archivedSessions: null,
+  archivedCount: 0,
+  archivedLoading: false,
+  archivedHasMore: false,
+  archivedNextOffset: 0,
+  systemSessions: null,
+  systemCount: 0,
+  systemLoading: false,
+  systemHasMore: false,
+  systemNextOffset: 0,
   activeSession: '',
   // Rehydrated too: an unsent chat's id is the key its draft is stored under,
   // so losing the id on reload orphaned the draft. Restoring it brings the
@@ -287,6 +343,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   virtualSession: restoreVirtualSession(),
   // Rehydrated from localStorage so unsent composer text survives a reload.
   drafts: loadDrafts(),
+  // Read/unread tracking (client-only): per-session last-seen stamps + the
+  // first-run baseline that keeps pre-existing sessions from all showing unread.
+  reads: loadReads(),
+  readsBaseline: loadBaseline(),
   messages: [],
   streamingBlocks: [],
   isStreaming: false,
@@ -505,11 +565,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadSessions: async () => {
     try {
-      const { sessions } = await api.listSessions();
-      set({ sessions });
-      // Reclaim persisted drafts whose session no longer exists (deleted or
-      // archived elsewhere) — but never the chat you're in or an unsent one.
-      const keep = new Set(sessions.map(s => s.id));
+      // Prior paged-in conversation depth (excludes starred, which arrive in full on page 1).
+      const prevDepth = get().sessionsNextOffset;
+      const { sessions, archived_count, system_count, has_more, next_offset } = await api.listSessions();
+      set({
+        sessions,
+        archivedCount: archived_count ?? 0,
+        systemCount: system_count ?? 0,
+        sessionsHasMore: !!has_more,
+        sessionsNextOffset: next_offset ?? sessions.length,
+      });
+      // Restore the depth the user had paged to, so a refresh never collapses the feed to page 1.
+      while (get().sessionsHasMore && get().sessionsNextOffset < prevDepth) {
+        await get().loadMoreSessions();
+      }
+      // Keep an OPEN lazy group fresh by refetching its first page; a collapsed group stays unfetched.
+      if (get().archivedSessions !== null) {
+        get().loadArchivedSessions();
+      }
+      if (get().systemSessions !== null) {
+        get().loadSystemSessions();
+      }
+      // Reclaim drafts whose session is gone — but never the active chat or an unsent one.
+      const keep = new Set(get().sessions.map(s => s.id));
       const { activeSession, virtualSession } = get();
       if (activeSession) keep.add(activeSession);
       if (virtualSession) keep.add(virtualSession.id);
@@ -520,6 +598,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   switchSession: async (id: string) => {
+    // Opening a session marks whatever you're leaving as read — you've now seen
+    // its latest content (the incoming session is marked on the real path below).
+    const leaving = get().activeSession;
+    if (leaving && leaving !== id) get().markSeen(leaving);
     // Leaving an untouched (empty-draft) virtual chat discards it, so the
     // sidebar never accumulates empty "New chat" entries. A filled
     // review-loop form counts as touched — don't silently drop it.
@@ -554,6 +636,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ loading: false });
       return;
     }
+    // Real session opened → mark it read (R1: auto-clear its unread marker).
+    get().markSeen(id);
     ws.switchSession(id);
     // Note: opening a chat deliberately does NOT touch updated_at (locally or
     // server-side) — updated_at means "last message activity", so browsing
@@ -719,10 +803,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { drafts: { ...s.drafts, [sessionId]: text } };
     }),
 
+  markSeen: (sessionId: string) => {
+    if (!sessionId) return;
+    const now = Date.now();
+    persistRead(sessionId, now);
+    set((s) => ({ reads: { ...s.reads, [sessionId]: now } }));
+  },
+
   deleteSession: async (id: string) => {
     try {
       await api.deleteSession(id);
       removeDraft(id);
+      removeRead(id);
       set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
       await get().loadSessions();
       if (get().activeSession === id) {
@@ -742,10 +834,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await api.archiveSession(id);
       removeDraft(id);
       set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
+      // Archiving cascades to the whole descendant subtree server-side, so
+      // loadSessions() drops the parent AND its children from the active feed.
       await get().loadSessions();
-      if (get().activeSession === id) {
-        // Switch to most recent remaining session
-        const remaining = get().sessions.filter(s => s.id !== id);
+      // The active chat may have been the target OR a now-archived descendant;
+      // switch away whenever it's no longer in the active list.
+      const active = get().activeSession;
+      const stillActive = get().sessions.some(s => s.id === active);
+      if (active && !stillActive) {
+        const remaining = get().sessions;
         if (remaining.length > 0) {
           await get().switchSession(remaining[0].id);
         }
@@ -781,6 +878,115 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }));
     } catch (e) {
       console.error('Failed to toggle star:', e);
+    }
+  },
+
+  setSessionParent: async (childId: string, parentId: string | null) => {
+    const child = get().sessions.find(s => s.id === childId);
+    if (!child || childId === parentId) return;
+    const prev = child.parent_session_id;
+    // Optimistic: move the child immediately so the drop feels instant; revert
+    // if the server rejects it (e.g. a cycle) so the tree stays truthful.
+    set(s => ({
+      sessions: s.sessions.map(sess =>
+        sess.id === childId ? { ...sess, parent_session_id: parentId ?? undefined } : sess
+      ),
+    }));
+    try {
+      await api.updateSession(childId, { parent_session_id: parentId });
+    } catch (e) {
+      console.error('Failed to set session parent:', e);
+      set(s => ({
+        sessions: s.sessions.map(sess =>
+          sess.id === childId ? { ...sess, parent_session_id: prev } : sess
+        ),
+      }));
+    }
+  },
+
+  loadMoreSessions: async () => {
+    // Feed '...': append the next page of conversations (starred already arrived in full on page 1).
+    try {
+      const { sessions, has_more, next_offset } = await api.listSessions(get().sessionsNextOffset);
+      set(s => ({
+        sessions: [...s.sessions, ...sessions],
+        sessionsHasMore: !!has_more,
+        sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
+      }));
+    } catch (e) {
+      console.error('Failed to load more sessions:', e);
+    }
+  },
+
+  loadArchivedSessions: async (more = false) => {
+    // more=false → (re)load page 1; more=true → append the next page ('...'); spinner shows only on a cold open.
+    const firstLoad = get().archivedSessions === null;
+    if (firstLoad) set({ archivedLoading: true });
+    try {
+      const offset = more ? get().archivedNextOffset : 0;
+      const { sessions, has_more, next_offset } = await api.listArchivedSessions(offset);
+      set(s => ({
+        archivedSessions: more && s.archivedSessions ? [...s.archivedSessions, ...sessions] : sessions,
+        archivedHasMore: !!has_more,
+        archivedNextOffset: next_offset ?? offset + sessions.length,
+        archivedLoading: false,
+      }));
+    } catch (e) {
+      console.error('Failed to load archived sessions:', e);
+      set({ archivedLoading: false });
+    }
+  },
+
+  loadSystemSessions: async (more = false) => {
+    const firstLoad = get().systemSessions === null;
+    if (firstLoad) set({ systemLoading: true });
+    try {
+      const offset = more ? get().systemNextOffset : 0;
+      const { sessions, has_more, next_offset } = await api.listSystemSessions(offset);
+      set(s => ({
+        systemSessions: more && s.systemSessions ? [...s.systemSessions, ...sessions] : sessions,
+        systemHasMore: !!has_more,
+        systemNextOffset: next_offset ?? offset + sessions.length,
+        systemLoading: false,
+      }));
+    } catch (e) {
+      console.error('Failed to load system sessions:', e);
+      set({ systemLoading: false });
+    }
+  },
+
+  // Collapsing a group drops its rows entirely, so the next expand repeats the exact same cold-open request instead of showing a stale snapshot.
+  clearArchivedSessions: () =>
+    set({ archivedSessions: null, archivedHasMore: false, archivedNextOffset: 0, archivedLoading: false }),
+
+  clearSystemSessions: () =>
+    set({ systemSessions: null, systemHasMore: false, systemNextOffset: 0, systemLoading: false }),
+
+  unarchiveSession: async (id: string) => {
+    try {
+      await api.unarchiveSession(id);
+      // Drop from the archived list right away; loadSessions() then brings it back into its normal group and refreshes the count.
+      set(s => ({
+        archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
+        archivedCount: Math.max(0, s.archivedCount - 1),
+      }));
+      await get().loadSessions();
+    } catch (e) {
+      console.error('Failed to unarchive session:', e);
+    }
+  },
+
+  starArchivedSession: async (id: string) => {
+    try {
+      // Backend composites this: starring an archived session unarchives it first, then stars, firing the star->project hook on a live session.
+      await api.updateSession(id, { starred: true });
+      set(s => ({
+        archivedSessions: s.archivedSessions ? s.archivedSessions.filter(x => x.id !== id) : s.archivedSessions,
+        archivedCount: Math.max(0, s.archivedCount - 1),
+      }));
+      await get().loadSessions();
+    } catch (e) {
+      console.error('Failed to star archived session:', e);
     }
   },
 
@@ -885,7 +1091,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
     set((state) => ({
-      messages: [...state.messages, { role: 'user' as const, blocks }],
+      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString() }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },
@@ -933,6 +1139,60 @@ export const useChatStore = create<ChatState>((set, get) => ({
         agentStatus: { state: 'idle' },
       }));
     }
+  },
+
+  runLater: async (content, delay, fileIds, imageBlocks) => {
+    // Build the optimistic block list once (pending user message shape).
+    const buildBlocks = (): import('../types/chat').MessageBlock[] => {
+      const blocks: import('../types/chat').MessageBlock[] = [];
+      if (content) blocks.push({ type: 'text', content });
+      if (imageBlocks) {
+        for (const img of imageBlocks) {
+          blocks.push({ type: 'image', url: img.url, filename: img.filename, media_type: img.media_type });
+        }
+      }
+      return blocks;
+    };
+    // Run later ALWAYS mints a brand-new session — it must never write the
+    // deferred prompt into the current chat (fresh, virtual, or existing).
+    // If a composer model/backend pick is in flight for a new chat, carry it
+    // onto the created row so the header badge is right from the first render.
+    const vs = get().virtualSession;
+    const effBackend = get().newChatBackend ?? null;
+    const pickedModel = effBackend
+      ? (get().newChatModels[effBackend] ?? null)
+      : null;
+    const real: Session = await api.createSession(
+      undefined, effBackend, undefined, null, pickedModel,
+    );
+    const res = await api.runLater(real.id, content, delay, fileIds, imageBlocks);
+    const now = new Date().toISOString();
+    set((state) => {
+      // Drop the transient new-chat state so we don't strand an empty virtual
+      // chat or leak its draft/model picks into the next new chat.
+      const drafts = { ...state.drafts };
+      if (vs) delete drafts[vs.id];
+      return {
+        sessions: [
+          { ...real, title: 'New chat', is_running: false, updated_at: now },
+          ...state.sessions,
+        ],
+        activeSession: real.id,
+        virtualSession: null,
+        newChatBackend: null,
+        newChatModels: {},
+        newChatReviewLoop: null,
+        drafts,
+        streamingBlocks: [],
+        isStreaming: false,
+        agentStatus: { state: 'idle' as const },
+        messages: [
+          { role: 'user' as const, blocks: buildBlocks(), created_at: now },
+          { role: 'assistant' as const, blocks: [{ type: 'text', content: res.ack }], created_at: now },
+        ],
+      };
+    });
+    if (vs) clearVirtualSession();
   },
 
   stopSession: () => {

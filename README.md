@@ -31,12 +31,12 @@ The installer handles everything — installs dependencies (Python, Node.js, uv)
 <details>
 <summary><strong>Manual install</strong></summary>
 
-**Prerequisites:** [Git](https://git-scm.com/), [Python 3.13+](https://www.python.org/), [uv](https://docs.astral.sh/uv/), [Node.js 18+](https://nodejs.org/)
+**Prerequisites:** [Git](https://git-scm.com/), [Python 3.13+](https://www.python.org/), [uv](https://docs.astral.sh/uv/), [Node.js 22.12+](https://nodejs.org/)
 
 ```bash
 git clone https://github.com/ClickHouse/nerve.git && cd nerve
-uv venv --python 3.13 && source .venv/bin/activate
-uv pip install -e .
+uv sync                      # creates .venv from uv.lock
+source .venv/bin/activate
 cd web && npm ci && npm run build && cd ..
 nerve init
 nerve start -f
@@ -262,7 +262,7 @@ See [docs/config.md](docs/config.md) for all options.
 
 - [Python](https://www.python.org/) 3.13+
 - [uv](https://docs.astral.sh/uv/) (recommended package manager)
-- [Node.js](https://nodejs.org/) 18+ (for web UI build)
+- [Node.js](https://nodejs.org/) 22.12+ (for web UI build)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) (bundled with `claude-agent-sdk`)
 - Anthropic API key **or** Claude subscription via [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) proxy
 - Optional: OpenAI API key (for vector-based memory search — without it, LLM-based recall is used), Telegram bot token, [gog](https://github.com/googleworkspace/cli) CLI, [gh](https://cli.github.com/) CLI

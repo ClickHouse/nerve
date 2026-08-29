@@ -1913,7 +1913,7 @@ class SetupWizard:
         if not shutil.which("node"):
             click.secho(
                 "  ⚠ Node.js not found — web UI not built.\n"
-                "    Install Node.js 18+ and run: cd web && npm ci && npm run build",
+                "    Install Node.js 22.12+ and run: cd web && npm ci && npm run build",
                 fg="yellow",
             )
             return
@@ -2766,11 +2766,25 @@ ENV NERVE_WORKSPACE={_DOCKER_WORKSPACE}
 """ + """
 WORKDIR /nerve
 
-# Pre-install Python dependencies for caching
-COPY pyproject.toml /tmp/pyproject.toml
-RUN python3 -c "import tomllib,pathlib; pathlib.Path('/tmp/requirements.txt').write_text('\\n'.join(tomllib.load(open('/tmp/pyproject.toml','rb'))['project']['dependencies']))" \\
-    && pip install --no-cache-dir -r /tmp/requirements.txt \\
-    && rm /tmp/pyproject.toml /tmp/requirements.txt
+# uv, pinned to the same version CI uses. Dependency versions come from
+# uv.lock, so this image installs exactly what CI tested rather than
+# re-resolving pyproject's bounds at build time.
+COPY --from=ghcr.io/astral-sh/uv:0.12.0 /uv /usr/local/bin/uv
+
+# The project environment lives OUTSIDE /nerve, which is a bind mount at
+# runtime: a .venv under /nerve would be shadowed by the host's checkout, and a
+# host .venv may not even be Linux-compatible. Putting it in /opt keeps the
+# image's environment intact regardless of what the host mounts.
+ENV UV_PROJECT_ENVIRONMENT=/opt/nerve-venv
+ENV PATH=/opt/nerve-venv/bin:$PATH
+
+# Pre-install dependencies for layer caching. Only pyproject.toml + uv.lock are
+# copied, so this layer is reused until dependencies actually change.
+# --no-install-project because the source tree arrives at runtime via the mount.
+COPY pyproject.toml uv.lock /tmp/nerve-deps/
+RUN cd /tmp/nerve-deps \\
+    && uv sync --locked --no-install-project --no-dev \\
+    && rm -rf /tmp/nerve-deps
 
 EXPOSE 8900
 
@@ -2850,8 +2864,15 @@ set -e
 
 cd /nerve
 
-# Install the package in editable mode (fast if already installed)
-pip install -e . --quiet 2>/dev/null
+# Install Nerve into the image's environment from uv.lock, so a container gets
+# the dependency set CI tested rather than whatever PyPI resolves today.
+#   --locked:  refuse a uv.lock that no longer matches pyproject.toml, instead
+#              of silently re-resolving (and rewriting the mounted checkout).
+#   --inexact: leave anything the image or the user added in place; only the
+#              locked set is reconciled.
+# The dependency layer is already baked into the image, so in the normal case
+# this only installs the project itself and returns in well under a second.
+uv sync --locked --inexact
 
 # Build web UI if not already built
 if [ ! -d "web/dist" ]; then
@@ -2918,8 +2939,15 @@ You are running inside a Docker container. Key paths:
 
 ### Working with Nerve source
 
-- The Nerve package is installed in editable mode (`pip install -e /nerve`).
+- The Nerve package is installed in editable mode, from `uv.lock`, by the
+  entrypoint (`uv sync --locked --inexact`). Dependency versions therefore match
+  what CI tested; rebuilding an unchanged commit gets the same set.
+- The Python environment is `/opt/nerve-venv`, deliberately outside `/nerve` —
+  that path is a bind mount, so a `.venv` under it would be shadowed by the
+  host's checkout.
 - After modifying Nerve source code, changes take effect immediately for Python.
+- After changing dependencies in `pyproject.toml`, run `uv lock` on the host and
+  restart the container; the entrypoint refuses a lock that no longer matches.
 - If you modify the web UI (`/nerve/web/`), rebuild with: `cd /nerve/web && npm run build`
 - Config files live in `/nerve/`, NOT in `{_DOCKER_NERVE_HOME}/` — the config
   directory is the working directory the daemon was started from.

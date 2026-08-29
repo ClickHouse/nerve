@@ -1,6 +1,7 @@
-import { Workflow as WorkflowIcon, Loader2, Check, X, Ban, ArrowRight } from 'lucide-react';
+import { Workflow as WorkflowIcon, Loader2, Check, X, Ban, ArrowRight } from '../../ui/icons';
 import type { ToolCallBlockData, WorkflowSnapshot } from '../../../types/chat';
 import { useChatStore } from '../../../stores/chatStore';
+import { Button } from '../../ui';
 
 /** Current phase index (1-based) = the highest phase that has agents, biased
  *  toward any phase with a running agent. Falls back to phases length. */
@@ -65,54 +66,57 @@ export function WorkflowToolBlock({ block }: { block: ToolCallBlockData }) {
   };
 
   const StatusIcon = isRunning ? (
+    // Identity, not status: the spinner carries the workflow's violet so a
+    // running card still reads as "workflow" at a glance.
     <Loader2 size={14} className="text-hue-violet animate-spin shrink-0" />
   ) : isFailed ? (
-    <X size={14} className="text-hue-red shrink-0" />
+    <X size={14} className="text-error shrink-0" />
   ) : status === 'stopped' ? (
     <Ban size={14} className="text-text-muted shrink-0" />
   ) : (
-    <Check size={14} className="text-hue-emerald shrink-0" />
+    <Check size={14} className="text-success shrink-0" />
   );
 
   return (
-    <div className="my-1.5 border border-violet-400/20 rounded-lg bg-surface overflow-hidden">
+    <div className="my-1.5 border border-hue-violet/20 rounded-lg bg-surface overflow-hidden">
       <div className="flex items-center gap-2 px-3 py-2">
         {StatusIcon}
         <WorkflowIcon size={14} className="text-hue-violet shrink-0" />
-        <span className="text-[13px] font-medium text-text-secondary truncate">{name}</span>
+        <span className="text-sm leading-tight font-medium text-text-secondary truncate">{name}</span>
 
         {phaseCount > 0 && (
-          <span className="text-[11px] text-text-faint shrink-0">
+          <span className="text-xs text-text-faint shrink-0">
             phase {curPhase}/{phaseCount}{curPhaseTitle ? ` · ${curPhaseTitle}` : ''}
           </span>
         )}
 
         <div className="ml-auto shrink-0 flex items-center gap-2">
           {total > 0 && (
-            <span className="text-[11px] text-text-faint font-mono" title="agents done / total">
+            <span className="text-xs text-text-faint font-mono" title="agents done / total">
               {done}/{total} agents
             </span>
           )}
           {tokens > 0 && (
-            <span className="text-[11px] text-text-faint font-mono" title="total tokens">
+            <span className="text-xs text-text-faint font-mono" title="total tokens">
               {tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : tokens} tok
             </span>
           )}
           {(isRunning || wf) && (
-            <button
+            <Button
+              variant="subtle"
+              size="xs"
               onClick={handleViewInPanel}
-              className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-text-dim hover:text-text-secondary cursor-pointer transition-colors rounded hover:bg-surface-raised"
               title="View workflow in side panel"
             >
               View <ArrowRight size={10} />
-            </button>
+            </Button>
           )}
         </div>
       </div>
 
       {/* Summary line when settled */}
       {!isRunning && wf?.summary && (
-        <div className="px-3 pb-2 text-[11px] text-text-faint truncate">{wf.summary}</div>
+        <div className="px-3 pb-2 text-xs text-text-faint truncate">{wf.summary}</div>
       )}
     </div>
   );

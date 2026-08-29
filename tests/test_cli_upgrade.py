@@ -11,7 +11,7 @@ import pytest
 import click
 from click.testing import CliRunner
 
-from nerve.cli import _find_source_root, _pip_install_cmd, upgrade
+from nerve.cli import _dep_install_cmd, _find_source_root, upgrade
 
 
 @dataclass
@@ -50,26 +50,78 @@ class TestFindSourceRoot:
         assert (root / "nerve" / "cli.py").exists()
 
 
-class TestPipInstallCmd:
-    """`_pip_install_cmd` prefers uv when available, falls back to pip."""
+class TestDepInstallCmd:
+    """`_dep_install_cmd` prefers `uv sync` from the lock, then uv pip, then pip."""
 
-    def test_uses_uv_when_available(self, tmp_path: Path) -> None:
-        with patch("nerve.cli.shutil.which", return_value="/usr/local/bin/uv"):
-            cmd = _pip_install_cmd(tmp_path)
+    def test_uses_uv_sync_when_lock_present(self, tmp_path: Path) -> None:
+        """A checkout with a uv.lock upgrades to the locked set, not a fresh resolve.
+
+        This is the property that stops `nerve upgrade` reintroducing a broken
+        release that has already been diagnosed and pinned away.
+        """
+        (tmp_path / "uv.lock").write_text("version = 1\n")
+        with patch("nerve.cli.shutil.which", return_value="/usr/local/bin/uv"), \
+             patch("nerve.cli.sys.prefix", "/venv"), \
+             patch("nerve.cli.sys.base_prefix", "/usr"):
+            cmd, env = _dep_install_cmd(tmp_path)
+
+        assert cmd[:2] == ["/usr/local/bin/uv", "sync"]
+        assert cmd[2:4] == ["--project", str(tmp_path)]
+        # Refuse a lock that no longer matches pyproject, without rewriting it.
+        assert "--locked" in cmd
+        assert "--frozen" not in cmd
+        # Must not uninstall extras the user added deliberately.
+        assert "--inexact" in cmd
+        # Sync into the venv nerve is installed in, not <project>/.venv.
+        assert env == {"UV_PROJECT_ENVIRONMENT": "/venv"}
+
+    def test_falls_back_to_uv_pip_without_lock(self, tmp_path: Path) -> None:
+        """No uv.lock at all — nothing to be reproducible against, so no warning."""
+        with patch("nerve.cli.shutil.which", return_value="/usr/local/bin/uv"), \
+             patch("nerve.cli.sys.prefix", "/venv"), \
+             patch("nerve.cli.sys.base_prefix", "/usr"), \
+             patch("nerve.cli.click.secho") as secho:
+            cmd, env = _dep_install_cmd(tmp_path)
+        secho.assert_not_called()
         assert cmd[0] == "/usr/local/bin/uv"
         assert cmd[1:4] == ["pip", "install", "-e"]
         assert str(tmp_path) in cmd
         # uv needs to know which interpreter to install into
         assert "--python" in cmd
         assert sys.executable in cmd
+        assert env == {}
+
+    def test_outside_a_venv_never_uses_uv_sync(self, tmp_path: Path) -> None:
+        """UV_PROJECT_ENVIRONMENT would point at a system prefix — refuse.
+
+        Syncing a system Python would let an upgrade remove or downgrade
+        packages well outside Nerve's own environment.
+        """
+        (tmp_path / "uv.lock").write_text("version = 1\n")
+        with patch("nerve.cli.shutil.which", return_value="/usr/local/bin/uv"), \
+             patch("nerve.cli.sys.prefix", "/usr"), \
+             patch("nerve.cli.sys.base_prefix", "/usr"), \
+             patch("nerve.cli.click.secho") as secho:
+            cmd, env = _dep_install_cmd(tmp_path)
+        # A lock exists but can't be used — say so rather than degrading quietly.
+        secho.assert_called_once()
+        assert "not reproducible" in secho.call_args[0][0]
+        assert "sync" not in cmd
+        assert cmd[1:4] == ["pip", "install", "-e"]
+        assert env == {}
 
     def test_falls_back_to_pip(self, tmp_path: Path) -> None:
-        with patch("nerve.cli.shutil.which", return_value=None):
-            cmd = _pip_install_cmd(tmp_path)
+        (tmp_path / "uv.lock").write_text("version = 1\n")
+        with patch("nerve.cli.shutil.which", return_value=None), \
+             patch("nerve.cli.click.secho") as secho:
+            cmd, env = _dep_install_cmd(tmp_path)
+        secho.assert_called_once()
+        assert "uv is not installed" in secho.call_args[0][0]
         assert cmd[:3] == [sys.executable, "-m", "pip"]
         assert "install" in cmd
         assert "-e" in cmd
         assert str(tmp_path) in cmd
+        assert env == {}
 
 
 class TestUpgradeCommand:

@@ -12,12 +12,14 @@ import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
-import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'lucide-react';
+import { Loader2, Files, ExternalLink } from '../components/ui/icons';
+import { PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
+import { findSessionById } from '../utils/findSession';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
 const STATUS_LABELS: Record<string, string> = {
@@ -40,7 +42,7 @@ export function ChatPage() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
   const {
-    sessions, activeSession, virtualSession, messages,
+    sessions, archivedSessions, systemSessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, mobileSidebarOpen, panels, panelVisible,
@@ -49,6 +51,9 @@ export function ChatPage() {
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
   } = useChatStore();
+
+  // The active session row may live in the feed or a lazy archived/system group.
+  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
 
   // Below `md` the session list becomes an off-canvas drawer. Its open state is
   // deliberately NOT `sidebarCollapsed`: that one is a persisted desktop
@@ -161,16 +166,15 @@ export function ChatPage() {
   // Restored to plain "Nerve" when leaving the chat page or when there's
   // no active session yet.
   useEffect(() => {
-    const session = sessions.find(s => s.id === activeSession);
-    if (!session) {
+    if (!activeSessionRow) {
       document.title = 'Nerve';
       return;
     }
-    const raw = session.title || session.id;
+    const raw = activeSessionRow.title || activeSessionRow.id;
     const clean = raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
     document.title = clean;
     return () => { document.title = 'Nerve'; };
-  }, [activeSession, sessions]);
+  }, [activeSession, activeSessionRow]);
 
   // Langfuse deep-link status — fetched once. Shows a small "external link"
   // icon when observability is enabled so we can jump from a session to
@@ -246,30 +250,25 @@ export function ChatPage() {
           {/* Header */}
           <div className="border-b border-border-subtle px-3 md:px-5 py-2.5 flex items-center justify-between gap-2 bg-bg shrink-0">
             <div className="flex items-center gap-2 min-w-0">
-              <button
-                onClick={toggleSessionList}
-                className="w-6 h-6 shrink-0 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer transition-colors rounded"
-                title={sessionListOpen ? 'Hide sidebar' : 'Show sidebar'}
-                aria-expanded={sessionListOpen}
-              >
-                {sessionListOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
-              </button>
-              <span className="font-medium text-[15px] truncate">
+              <PaneToggle open={sessionListOpen} onToggle={toggleSessionList} label="sidebar" />
+              <span className="font-medium text-base truncate">
                 {virtualSession?.id === activeSession
                   ? 'New chat'
-                  : (sessions.find(s => s.id === activeSession)?.title || activeSession)}
+                  : (activeSessionRow?.title || activeSession)}
               </span>
               {(() => {
                 const backend = virtualSession?.id === activeSession
                   ? (newChatBackend ?? backendDefault ?? 'claude')
-                  : (sessions.find(s => s.id === activeSession)?.backend ?? 'claude');
+                  : (activeSessionRow?.backend ?? 'claude');
                 return (
                   <span
                     title={`Agent backend: ${backend}`}
-                    className={`hidden md:inline shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border ${
+                    // Which backend is running is identity, not status, so
+                    // this stays on the `hue-*` scale.
+                    className={`hidden md:inline shrink-0 text-2xs uppercase tracking-wide px-1.5 py-0.5 rounded border ${
                       backend === 'codex'
-                        ? 'text-hue-teal border-teal-400/25 bg-teal-400/10'
-                        : 'text-hue-orange border-orange-400/25 bg-orange-400/10'
+                        ? 'text-hue-teal border-hue-teal/25 bg-hue-teal/10'
+                        : 'text-hue-orange border-hue-orange/25 bg-hue-orange/10'
                     }`}
                   >
                     {backend}
@@ -277,9 +276,9 @@ export function ChatPage() {
                 );
               })()}
               {(() => {
-                const model = sessions.find(s => s.id === activeSession)?.model;
+                const model = activeSessionRow?.model;
                 return model ? (
-                  <span className="hidden md:inline shrink-0 text-[11px] text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
+                  <span className="hidden md:inline shrink-0 text-xs text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
                     {formatModelLabel(model)}
                   </span>
                 ) : null;
@@ -287,7 +286,7 @@ export function ChatPage() {
               {(() => {
                 // Live review-loop chip for observer sessions (fed by the
                 // global review_loop_update event; rehydrate via reload).
-                const rl = sessions.find(s => s.id === activeSession)?.review_loop;
+                const rl = activeSessionRow?.review_loop;
                 if (!rl) return null;
                 const live = rl.status === 'implementing' || rl.status === 'verifying' || rl.status === 'pending';
                 const label = rl.status === 'awaiting_user'
@@ -296,17 +295,20 @@ export function ChatPage() {
                   : rl.status === 'failed' ? `failed${rl.failure_reason ? ` (${rl.failure_reason})` : ''}`
                   : rl.status === 'killed' ? 'killed'
                   : rl.status;
+                // A review loop's state is status, so these are the feedback
+                // tokens. The default branch is the live loop, which takes the
+                // same green as `passed`.
                 const tone = rl.status === 'passed'
-                  ? 'text-emerald-400 border-emerald-400/25 bg-emerald-400/10'
+                  ? 'text-success border-success-border bg-success-bg'
                   : rl.status === 'awaiting_user'
-                  ? 'text-hue-orange border-orange-400/25 bg-orange-400/10'
+                  ? 'text-warning border-warning-border bg-warning-bg'
                   : rl.status === 'failed' || rl.status === 'killed'
-                  ? 'text-error border-red-400/25 bg-red-400/10'
-                  : 'text-emerald-400 border-emerald-400/25 bg-emerald-400/10';
+                  ? 'text-error border-error-border bg-error-bg'
+                  : 'text-success border-success-border bg-success-bg';
                 return (
                   <span
                     title={`Review loop ${rl.id}: ${rl.status}${rl.failure_reason ? ` — ${rl.failure_reason}` : ''}`}
-                    className={`text-[11px] px-1.5 py-0.5 rounded border flex items-center gap-1.5 ${tone}`}
+                    className={`text-xs px-1.5 py-0.5 rounded border flex items-center gap-1.5 ${tone}`}
                   >
                     {live && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
                     🔁 {rl.iteration}/{rl.max_iterations} — {label}
@@ -314,7 +316,7 @@ export function ChatPage() {
                 );
               })()}
               {statusLabel && (
-                <div className="flex items-center gap-1.5 min-w-0 text-[12px] text-text-muted">
+                <div className="flex items-center gap-1.5 min-w-0 text-xs text-text-muted">
                   <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
                   <span className="truncate">{statusLabel}</span>
                 </div>
@@ -326,7 +328,7 @@ export function ChatPage() {
                 const used = rateLimits?.primary?.usedPercent;
                 return (
                   <span
-                    className="text-[11px] text-text-faint"
+                    className="text-xs text-text-faint"
                     title={JSON.stringify(backendStatus.data)}
                   >
                     Codex limit{typeof used === 'number' ? ` ${used}% used` : ' updated'}
@@ -354,7 +356,7 @@ export function ChatPage() {
               </button>
               {contextUsage && (
                 <div className="hidden md:flex">
-                  <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />
+                  <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
                 </div>
               )}
               {langfuse?.enabled && langfuse.host && activeSession && (
@@ -362,7 +364,7 @@ export function ChatPage() {
                   href={`${langfuse.host}/sessions?sessionId=${encodeURIComponent(activeSession)}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-[12px] text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
+                  className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-xs text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
                   title="View this session's trace in Langfuse"
                 >
                   <ExternalLink size={12} />
@@ -376,7 +378,7 @@ export function ChatPage() {
               observer sessions: live criteria, attempt timeline with
               watch-the-leg jumps, inline decisions when parked. */}
           {(() => {
-            const rl = sessions.find(s => s.id === activeSession)?.review_loop;
+            const rl = activeSessionRow?.review_loop;
             return rl ? <ReviewLoopCard key={rl.id} loopId={rl.id} /> : null;
           })()}
 

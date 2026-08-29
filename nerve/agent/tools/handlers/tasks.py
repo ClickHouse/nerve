@@ -83,7 +83,12 @@ _tasks_read: set[str] = set()
 
 
 def _make_task_id(title: str, ctx: ToolContext) -> str:
-    """Generate a task ID from date + slugified title."""
+    """Generate a base task ID from date + slugified title.
+
+    The slug is a 40-character truncation, so this is a *base* — two titles
+    that share a long prefix, or differ only past the cut, produce the same
+    string on the same day. :func:`_claim_task_id` resolves that.
+    """
     tz: timezone | ZoneInfo
     if ctx.config is not None:
         try:
@@ -132,6 +137,57 @@ async def _emit_task_event(ctx: ToolContext, task_id: str, event: str) -> None:
     from nerve.agent.streaming import emit_task_event
 
     await emit_task_event(await ctx.db.get_task(task_id), event)
+
+
+# How many suffixed IDs a single base may spawn before task_create gives up.
+# A day that legitimately needs a hundred tasks off one 40-character prefix
+# is a title problem, and refusing beats generating ever-longer IDs.
+_MAX_TASK_ID_SUFFIX = 99
+
+
+def _write_new_file(path: Path, content: str) -> None:
+    """Write ``content`` to ``path``, refusing to touch an existing file.
+
+    Mode ``x`` is the point: the existence check and the create are one
+    syscall, so two sessions racing for the same ID cannot both win it.
+    Blocking. Call it through ``asyncio.to_thread``.
+    """
+    with path.open("x", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+async def _claim_task_id(
+    ctx: ToolContext, base_id: str, body: str,
+) -> tuple[str, Path] | None:
+    """Write ``body`` under the first free ID at or after ``base_id``.
+
+    Returns the claimed ID and its path, or ``None`` when the base and every
+    suffix up to :data:`_MAX_TASK_ID_SUFFIX` are taken.
+
+    An ID is free only when no row holds it *and* neither active/ nor done/
+    holds its file. Both halves matter. The row check keeps a new task from
+    inheriting an existing task's history, since ``upsert_task`` would
+    otherwise rewrite that row's title, status and file_path in place. The
+    file checks hold the same line when the index and the tree disagree —
+    and they cover done/, whose IDs stay reserved so a completed task can
+    never be resurrected as a new pending one.
+    """
+    active_dir, done_dir = _task_dir(ctx), _done_dir(ctx)
+    for n in range(1, _MAX_TASK_ID_SUFFIX + 1):
+        candidate = base_id if n == 1 else f"{base_id}-{n}"
+        if ctx.db and await ctx.db.get_task(candidate) is not None:
+            continue
+        if (done_dir / f"{candidate}.md").exists():
+            continue
+        path = active_dir / f"{candidate}.md"
+        try:
+            await asyncio.to_thread(_write_new_file, path, body)
+        except FileExistsError:
+            # Either an untracked leftover or a racing session got there
+            # first. Both mean the ID is spoken for.
+            continue
+        return candidate, path
+    return None
 
 
 async def task_search_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -226,9 +282,6 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 },
             )
 
-    task_id = _make_task_id(title, ctx)
-    file_path = _task_dir(ctx) / f"{task_id}.md"
-
     md_parts = [f"# {title}\n"]
     if source_url:
         md_parts.append(f"**Source:** {source_url}")
@@ -240,24 +293,44 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
     md_parts.append("\n## Updates\n")
     md_parts.append(f"- {datetime.now(timezone.utc).strftime('%Y-%m-%d')}: Created")
 
-    await asyncio.to_thread(
-        file_path.write_text, "\n".join(md_parts), encoding="utf-8",
-    )
+    # Create is create. The ID is derived from a truncated title, so it
+    # collides on its own, and writing through a collision destroyed the
+    # older task: its file was truncated to the new body and its row was
+    # rewritten with the new title, status and content. A taken ID now
+    # moves the new task to the next suffix instead.
+    base_id = _make_task_id(title, ctx)
+    claimed = await _claim_task_id(ctx, base_id, "\n".join(md_parts))
+    if claimed is None:
+        return ToolResult.text(
+            f"Could not create task: the ID '{base_id}' and every suffix "
+            f"through '-{_MAX_TASK_ID_SUFFIX}' are already taken. Use a "
+            "title that differs within its first 40 characters.",
+            is_error=True,
+        )
+    task_id, file_path = claimed
 
     if ctx.db:
         rel_path = str(file_path.relative_to(ctx.workspace)) if ctx.workspace else str(file_path)
-        await ctx.db.upsert_task(
-            task_id=task_id,
-            file_path=rel_path,
-            title=title,
-            status=status,
-            source=source,
-            source_url=source_url or None,
-            deadline=deadline or None,
-            tags=tags_to_string(tags),
-            content=content,
-            actor=ctx.session_id,
-        )
+        try:
+            await ctx.db.upsert_task(
+                task_id=task_id,
+                file_path=rel_path,
+                title=title,
+                status=status,
+                source=source,
+                source_url=source_url or None,
+                deadline=deadline or None,
+                tags=tags_to_string(tags),
+                content=content,
+                actor=ctx.session_id,
+            )
+        except Exception:
+            # A claimed ID is now sticky, so a half-done create would burn it:
+            # the retry would take the next suffix and leave this file behind
+            # forever. The file was created exclusively by this call, so
+            # dropping it is safe and leaves the retry the ID it started with.
+            await asyncio.to_thread(file_path.unlink, missing_ok=True)
+            raise
 
     _tasks_read.add(task_id)
     await _emit_task_event(ctx, task_id, "created")

@@ -31,6 +31,14 @@ if (!window.requestAnimationFrame) {
   window.cancelAnimationFrame = ((id: number) => clearTimeout(id)) as typeof window.cancelAnimationFrame;
 }
 
+// jsdom has no layout engine and ships no `scrollIntoView` at all — the method
+// is absent rather than a no-op. Components that keep a live region pinned to
+// the bottom call it from a mount effect, so without this they throw during
+// render for reasons unrelated to whatever is under test.
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
 // jsdom reports every element as having no layout, so `offsetParent` is
 // null for everything. The Modal's focus trap filters candidates by
 // visibility using exactly that, which would leave it with nothing to

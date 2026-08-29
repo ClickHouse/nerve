@@ -1451,6 +1451,43 @@ class AgentEngine:
         runs to defer the terminal 'done' until spend-relevant work ends."""
         return self._has_live_background_tasks(session_id)
 
+    async def pending_wakeup_at(self, session_id: str) -> str | None:
+        """``fire_at`` of the session's pending wakeup, or ``None``.
+
+        ``ScheduleWakeup`` keeps at most one pending row per session (a new
+        request supersedes the old one), so this is a single timestamp
+        rather than a list. Never raises — a listing/indicator caller must
+        not fail on an enrichment read.
+        """
+        try:
+            rows = await self.db.list_pending_wakeups(session_id)
+        except Exception:  # noqa: BLE001 — enrichment must never break callers
+            logger.debug(
+                "pending wakeup lookup failed for %s", session_id, exc_info=True,
+            )
+            return None
+        return rows[0].get("fire_at") if rows else None
+
+    async def _broadcast_session_running(
+        self, session_id: str, is_running: bool,
+    ) -> None:
+        """Emit the global ``session_running`` event for a turn boundary.
+
+        Carries the session's *pending work* alongside the flag: a turn can
+        end with a wakeup scheduled or a background task still in flight, in
+        which case the session is parked rather than idle and the sidebar
+        keeps showing it as running (in its own colour). Shipping both bits
+        with the transition means the client can redraw the row without a
+        follow-up list fetch — which it skips for the active session.
+        """
+        await broadcaster.broadcast("__global__", {
+            "type": "session_running",
+            "session_id": session_id,
+            "is_running": is_running,
+            "pending_wakeup_at": await self.pending_wakeup_at(session_id),
+            "has_background_tasks": self._has_live_background_tasks(session_id),
+        })
+
     def get_codex_ultracode_run_ids(self, session_id: str) -> set[str] | None:
         """Ultracode run ids the session's live Codex client attributed to
         its current turn, or None when unavailable (no client / claude
@@ -2194,6 +2231,7 @@ class AgentEngine:
 
     async def _finalize_turn(
         self, session_id: str, st: _TurnState, channel: str | None,
+        bump_updated_at: bool = True,
     ) -> None:
         """Persist a completed turn and emit the terminal ``done`` event.
 
@@ -2201,6 +2239,11 @@ class AgentEngine:
         message (with interleaved blocks), persists the SDK session id,
         records usage/cost, broadcasts ``done``, and touches the idle
         timer.
+
+        ``bump_updated_at=False`` leaves the session's sidebar position
+        alone — passed for turns the user never asked for (a fired wakeup,
+        a background task settling), which are continuations of work that
+        was already visible rather than new activity.
         """
         # Merge tool results into tool_calls_log
         self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
@@ -2219,6 +2262,7 @@ class AgentEngine:
             thinking=st.thinking_text if st.thinking_text else None,
             blocks=st.ordered_blocks if st.ordered_blocks else None,
             native_turn_id=st.native_turn_id,
+            bump_updated_at=bump_updated_at,
         )
 
         # Persist SDK session ID and update status
@@ -2377,6 +2421,7 @@ class AgentEngine:
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
+        bump_updated_at: bool = True,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -2388,6 +2433,14 @@ class AgentEngine:
                     ``media_type``, and ``data`` (base64-encoded).
             image_refs: Optional metadata about uploaded files for persisting
                         in the user message blocks column (web uploads only).
+            bump_updated_at: Whether the turn counts as activity that re-sorts
+                      the sidebar. Callers pass False for a turn the user
+                      never asked for — a self-scheduled ``ScheduleWakeup``
+                      loop tick — so a session working through a loop keeps
+                      its place in the list. Deliberately NOT inferred from
+                      ``internal``: that flag only means "don't persist the
+                      trigger message", and plenty of internal turns (a
+                      run-later deferral, the star hook) are user-requested.
         """
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
@@ -2411,17 +2464,14 @@ class AgentEngine:
                 # when a terminal event is broadcast.
                 broadcaster.mark_turn_open(session_id)
                 # Notify all connected clients that this session started running
-                await broadcaster.broadcast("__global__", {
-                    "type": "session_running",
-                    "session_id": session_id,
-                    "is_running": True,
-                })
+                await self._broadcast_session_running(session_id, True)
                 try:
                     return await self._run_inner(
                         session_id, user_message, source, channel, model,
                         effort_override=effort_override,
                         internal=internal, images=images,
                         image_refs=image_refs,
+                        bump_updated_at=bump_updated_at,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -2449,12 +2499,10 @@ class AgentEngine:
                             )
                             broadcaster.clear_turn_open(session_id)
                     broadcaster.stop_buffering(session_id)
-                    # Notify all connected clients that this session stopped
-                    await broadcaster.broadcast("__global__", {
-                        "type": "session_running",
-                        "session_id": session_id,
-                        "is_running": False,
-                    })
+                    # Notify all connected clients that this session stopped.
+                    # Carries pending work, so a session parked on a wakeup or
+                    # a background task stays "running" in the sidebar.
+                    await self._broadcast_session_running(session_id, False)
 
     async def _run_inner(
         self,
@@ -2467,6 +2515,7 @@ class AgentEngine:
         internal: bool = False,
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
+        bump_updated_at: bool = True,
     ) -> str:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source)
@@ -2523,7 +2572,9 @@ class AgentEngine:
             if session:
                 parent_id = session.get("parent_session_id")
                 fork_msg = session.get("forked_from_message")
-                if parent_id and session.get("status") == SessionStatus.CREATED.value:
+                # Workflow legs carry parent_session_id for sidebar nesting only — never fork their fresh prompt from the parent (nor cross-backend).
+                if (parent_id and session.get("status") == SessionStatus.CREATED.value
+                        and session.get("source") != "workflow"):
                     parent = await self.db.get_session(parent_id)
                     if parent and parent.get("sdk_session_id"):
                         if parent.get("backend") != session.get("backend"):
@@ -2814,7 +2865,9 @@ class AgentEngine:
         # run_in_background task settles, the CLI runs an autonomous turn
         # which the idle stream watcher drains to the UI — no Nerve-side
         # output-file polling needed (the old regex watcher lived here).
-        await self._finalize_turn(session_id, st, channel)
+        await self._finalize_turn(
+            session_id, st, channel, bump_updated_at=bump_updated_at,
+        )
 
         return st.full_response_text
 
@@ -2899,11 +2952,7 @@ class AgentEngine:
                 if not broadcaster.is_buffering(session_id):
                     broadcaster.start_buffering(session_id)
                 self.sessions.mark_running(session_id)
-                await broadcaster.broadcast("__global__", {
-                    "type": "session_running",
-                    "session_id": session_id,
-                    "is_running": True,
-                })
+                await self._broadcast_session_running(session_id, True)
             broadcaster.mark_turn_open(session_id)
             await broadcaster.broadcast(session_id, {
                 "type": "auto_turn", "session_id": session_id,
@@ -2922,7 +2971,12 @@ class AgentEngine:
             if st is None:
                 return
             if _turn_has_content():
-                await self._finalize_turn(session_id, st, channel)
+                # Autonomous turn: the runtime resumed on its own (a
+                # background task settled). Continuation of work already in
+                # the list, so it must not re-sort the sidebar.
+                await self._finalize_turn(
+                    session_id, st, channel, bump_updated_at=False,
+                )
                 turns += 1
             # Empty turn (init arrived but content never did) — drop it;
             # the finally backstop ships a synthetic done if framing opened.
@@ -3071,11 +3125,7 @@ class AgentEngine:
                     broadcaster.clear_turn_open(session_id)
                 broadcaster.stop_buffering(session_id)
                 with contextlib.suppress(Exception):
-                    await broadcaster.broadcast("__global__", {
-                        "type": "session_running",
-                        "session_id": session_id,
-                        "is_running": False,
-                    })
+                    await self._broadcast_session_running(session_id, False)
 
         return turns
 

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Terminal, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Terminal, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 
 export function BashToolBlock({ block }: { block: ToolCallBlockData }) {
@@ -16,10 +16,10 @@ export function BashToolBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Terminal size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : 'text-hue-emerald'}`} />
+          : <Terminal size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-emerald'}`} />
         }
-        <span className="text-hue-emerald text-[13px] font-mono select-none">$</span>
-        <span className="text-[13px] font-mono text-text-secondary truncate">{truncatedCmd}</span>
+        <span className="text-hue-emerald text-sm leading-tight font-mono select-none">$</span>
+        <span className="text-sm leading-tight font-mono text-text-secondary truncate">{truncatedCmd}</span>
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
@@ -30,19 +30,19 @@ export function BashToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Full command */}
           {command.length > 80 && (
             <div className="px-3 py-2 border-b border-surface-raised">
-              <pre className="text-[12px] font-mono text-text-secondary whitespace-pre-wrap">{command}</pre>
+              <pre className="text-xs font-mono text-text-secondary whitespace-pre-wrap">{command}</pre>
             </div>
           )}
 
           {/* Output */}
           {block.result !== undefined && (
-            <pre className={`px-3 py-2 text-[12px] font-mono whitespace-pre-wrap max-h-80 overflow-y-auto ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+            <pre className={`px-3 py-2 text-xs font-mono whitespace-pre-wrap max-h-80 overflow-y-auto ${block.isError ? 'text-error' : 'text-text-muted'}`}>
               {block.result}
             </pre>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> Running...
             </div>
           )}

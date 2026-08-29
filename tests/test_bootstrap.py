@@ -366,6 +366,38 @@ class TestEnsureDockerFiles:
         # ever turned into a bare f-string it would swallow these.
         assert "${GOG_VERSION}" in content
 
+    def test_dockerfile_installs_from_the_lockfile(self, tmp_path: Path) -> None:
+        """Docker must install uv.lock's versions, not re-resolve pyproject bounds.
+
+        Before this, the image synthesised a requirements.txt from
+        `project.dependencies` and pip-installed it, so rebuilding an unchanged
+        Nerve commit could pull a newer, untested dependency — the #316 failure
+        mode, on a first-class deployment path.
+        """
+        wizard = SetupWizard(tmp_path)
+        wizard._ensure_docker_files()
+
+        content = (tmp_path / "Dockerfile").read_text()
+        assert "uv sync --locked --no-install-project" in content
+        assert "uv.lock" in content
+        # No pip-based dependency resolution anywhere in the image.
+        assert "pip install" not in content
+        assert "requirements.txt" not in content
+
+    def test_dockerfile_keeps_the_venv_outside_the_bind_mount(self, tmp_path: Path) -> None:
+        """/nerve is bind-mounted at runtime, so the venv cannot live under it.
+
+        A .venv inside /nerve would be shadowed by the host's checkout — and a
+        host-created .venv may not even be Linux-compatible.
+        """
+        wizard = SetupWizard(tmp_path)
+        wizard._ensure_docker_files()
+
+        content = (tmp_path / "Dockerfile").read_text()
+        assert "UV_PROJECT_ENVIRONMENT=/opt/nerve-venv" in content
+        assert "/opt/nerve-venv/bin:$PATH" in content
+        assert "UV_PROJECT_ENVIRONMENT=/nerve" not in content
+
     def test_dockerfile_sets_state_and_workspace_env(self, tmp_path: Path) -> None:
         """/root/.nerve must be a deliberate NERVE_HOME, not an artifact of $HOME."""
         from nerve.bootstrap import _DOCKER_NERVE_HOME, _DOCKER_WORKSPACE
@@ -471,7 +503,10 @@ class TestEnsureDockerFiles:
         wizard._ensure_docker_files()
 
         content = (tmp_path / "docker-entrypoint.sh").read_text()
-        assert "pip install -e ." in content
+        # Installs from uv.lock, not a fresh resolve: a container rebuild of an
+        # unchanged commit must not pick up a different dependency set.
+        assert "uv sync --locked --inexact" in content
+        assert "pip install" not in content
         assert "nerve init --if-needed --non-interactive" in content
         assert 'exec nerve start -f' in content
         assert 'exec "$@"' in content

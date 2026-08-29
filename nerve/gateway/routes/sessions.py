@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -96,6 +97,25 @@ class ForkRequest(BaseModel):
     title: str | None = None
 
 
+class RunLaterRequest(BaseModel):
+    """Defer a composed prompt into an already-created session.
+
+    The session is materialized by the caller first (the same
+    ``ensureRealSession`` path a normal first send uses), so this only
+    persists the pending message + acknowledgment and, for timed options,
+    schedules the one-shot wakeup.
+    """
+
+    session_id: str
+    message: str = ""
+    # One of the four composer options: "30m" | "1h" | "24h" | "none".
+    delay: str = "none"
+    # Attachments already uploaded against the session (mirrors the shape
+    # the composer sends on a normal message).
+    file_ids: list[str] | None = None
+    image_blocks: list[dict] | None = None
+
+
 # --- Session endpoints ---
 
 def _loop_summary(lp: dict) -> dict:
@@ -134,17 +154,65 @@ async def _attach_review_loops(deps, sessions: list[dict]) -> None:
             s["review_loop"] = _loop_summary(lp)
 
 
-@router.get("/api/sessions")
-async def list_sessions(user: dict = Depends(require_auth)):
-    deps = get_deps()
-    sessions = await deps.engine.sessions.list_sessions()
+def _page_size() -> int | None:
+    """Sidebar page size from config; ``None`` when configured unlimited."""
+    size = get_config().sessions.sidebar_page_size
+    return size if size and size > 0 else None
+
+
+async def _pending_wakeup_map(deps) -> dict[str, str]:
+    """``session_id -> fire_at`` for every pending wakeup, in one query.
+
+    ``ScheduleWakeup`` keeps at most one pending row per session, so a plain
+    map is enough. Enrichment: a failure dims the indicator, it must never
+    fail the listing.
+    """
+    try:
+        rows = await deps.db.list_pending_wakeups()
+    except Exception:  # noqa: BLE001 — enrichment must never break listing
+        return {}
+    return {r["session_id"]: r["fire_at"] for r in rows if r.get("session_id")}
+
+
+async def _decorate(deps, sessions: list[dict]) -> list[dict]:
+    """Attach the live per-row bits every sidebar list needs."""
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
+    # Pending work: no turn is in flight, yet the session isn't idle either —
+    # a wakeup is scheduled, or a background task is still running inside its
+    # CLI. The sidebar keeps those parked sessions in the "Running" group
+    # (with their own dot colour) instead of dropping them to idle.
+    wakeup_at = await _pending_wakeup_map(deps)
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
+        s["pending_wakeup_at"] = wakeup_at.get(s["id"])
+        s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
     await _attach_review_loops(deps, sessions)
-    return {"sessions": sessions}
+    return sessions
+
+
+def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> dict:
+    """``has_more``/``next_offset`` for the client's '...' control."""
+    seen = offset + len(page)
+    return {"has_more": limit is not None and seen < total, "next_offset": seen}
+
+
+@router.get("/api/sessions")
+async def list_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_conversation_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_conversation_sessions()
+    sessions = page if offset else await deps.engine.sessions.list_starred_sessions() + page
+    await _decorate(deps, sessions)
+    return {
+        "sessions": sessions,
+        "archived_count": await deps.engine.sessions.count_archived_sessions(),
+        "system_count": await deps.engine.sessions.count_system_sessions(),
+        **_page_meta(page, offset, total, limit),
+    }
 
 
 @router.get("/api/sessions/search")
@@ -154,13 +222,30 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
     deps = get_deps()
     sessions = await deps.db.search_sessions(q.strip())
-    running_ids = deps.engine.sessions.get_running_ids()
-    awaiting_ids = get_awaiting_ids()
-    for s in sessions:
-        s["is_running"] = s["id"] in running_ids
-        s["awaiting_input"] = s["id"] in awaiting_ids
-    await _attach_review_loops(deps, sessions)
+    await _decorate(deps, sessions)
     return {"sessions": sessions}
+
+
+@router.get("/api/sessions/archived")
+async def list_archived_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """One page of archived sessions — fetched only when the group is expanded."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_archived_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_archived_sessions()
+    await _decorate(deps, page)
+    return {"sessions": page, **_page_meta(page, offset, total, limit)}
+
+
+@router.get("/api/sessions/system")
+async def list_system_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+    """One page of system (cron/hook) sessions — fetched only when expanded."""
+    deps = get_deps()
+    limit = _page_size()
+    page = await deps.engine.sessions.list_system_sessions(limit=limit, offset=offset)
+    total = await deps.engine.sessions.count_system_sessions()
+    await _decorate(deps, page)
+    return {"sessions": page, **_page_meta(page, offset, total, limit)}
 
 
 @router.post("/api/sessions")
@@ -297,9 +382,33 @@ async def get_messages(session_id: str, limit: int = 500, user: dict = Depends(r
     return {"messages": messages, "last_usage": last_usage}
 
 
+async def _would_create_cycle(db, child_id: str, new_parent_id: str) -> bool:
+    """True if making ``child_id`` a child of ``new_parent_id`` forms a loop.
+
+    Walks up the ancestor chain from the proposed parent; reaching ``child_id``
+    means the drop would nest a session under its own descendant. The seen-set
+    also breaks any pre-existing cycle so the walk always terminates.
+    """
+    seen: set[str] = set()
+    cursor: str | None = new_parent_id
+    while cursor:
+        if cursor == child_id:
+            return True
+        if cursor in seen:
+            break
+        seen.add(cursor)
+        row = await db.get_session(cursor)
+        cursor = row.get("parent_session_id") if row else None
+    return False
+
+
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
-    """Update session fields (title, starred, model).
+    """Update session fields (title, starred, model, parent_session_id).
+
+    ``parent_session_id`` is the sidebar drag-to-nest relationship (null clears
+    it → top-level). It is display-only: guarded against self/cycle links and
+    against the ``created`` fork window so a drag never alters execution.
 
     ``model`` re-points THIS session only — the composer's picker is
     per-chat, not a global preference. The engine re-reads the session
@@ -335,9 +444,37 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
             except BackendError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
         fields["model"] = requested_model
+    if "parent_session_id" in req:
+        raw = req["parent_session_id"]
+        new_parent = str(raw).strip() if raw not in (None, "") else None
+        if new_parent is not None:
+            if new_parent == session_id:
+                raise HTTPException(status_code=400, detail="A session cannot be its own parent")
+            if not await deps.db.get_session(new_parent):
+                raise HTTPException(status_code=404, detail="Parent session not found")
+            # Fork-window guard: the engine reads parent_session_id to fork a
+            # brand-new session's first turn ONLY while status == 'created'.
+            # Refuse to set a parent in that window so a display drag can never
+            # turn a not-yet-started session into a fork. Anything already run
+            # (everything draggable in the sidebar) is unaffected.
+            if session.get("status") == "created":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Send a first message before nesting this session",
+                )
+            if await _would_create_cycle(deps.db, session_id, new_parent):
+                raise HTTPException(status_code=400, detail="That drop would create a cycle")
+        fields["parent_session_id"] = new_parent
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
+    # Starring an archived session restores it via the shared unarchive path (logs "unarchived", bumps updated_at) before the star write, so the star->project hook fires on a live session.
+    if fields.get("starred") == 1 and session.get("status") == "archived":
+        if deps.engine:
+            await deps.engine.sessions.unarchive_session(session_id)
+        else:
+            fields["status"] = "idle"
+            fields["archived_at"] = None
     await deps.db.update_session_fields(session_id, fields)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
@@ -447,6 +584,117 @@ async def fork_session(req: ForkRequest, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+# "Run later" — defer a prompt without spending tokens now. The three timed
+# options map to a delay in seconds + the synthetic acknowledgment text; the
+# manual option schedules nothing.
+_RUN_LATER_TIMED = {
+    "30m": (30 * 60, "Acknowledged — scheduled to run in 30 minutes."),
+    "1h": (60 * 60, "Acknowledged — scheduled to run in 1 hour."),
+    "24h": (24 * 60 * 60, "Acknowledged — scheduled to run in 24 hours."),
+}
+_RUN_LATER_MANUAL_ACK = "Acknowledged — saved to run manually later."
+
+
+@router.post("/api/sessions/run-later")
+async def run_later(req: RunLaterRequest, user: dict = Depends(require_auth)):
+    """Defer a composed prompt: persist it as the session's pending user
+    message plus a synthetic assistant acknowledgment (written directly, with
+    no LLM call and zero token spend), and — for the three timed options —
+    schedule a one-shot wakeup that fires ``engine.run`` on the stored prompt
+    after the delay. The wakeup reuses the ScheduleWakeup substrate swept by
+    ``CronService._sweep_wakeups``; the manual option ("Just accept it")
+    schedules nothing and is run by the user later.
+    """
+    deps = get_deps()
+    session = await deps.db.get_session(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    message = (req.message or "").strip()
+    if not message and not req.file_ids:
+        raise HTTPException(status_code=400, detail="Nothing to defer")
+
+    delay = (req.delay or "none").strip().lower()
+    if delay != "none" and delay not in _RUN_LATER_TIMED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown delay {delay!r} (want one of: 30m, 1h, 24h, none)",
+        )
+
+    # Pending user message — mirror the block shape a normal send persists:
+    # a text block plus one block per uploaded attachment. Resolve file_ids
+    # to records so BOTH images and ordinary files are carried into the
+    # deferred session (mirrors server._load_uploaded_files' image_refs:
+    # image type -> "image" block, everything else -> "file" block). Fall
+    # back to the caller-supplied image_blocks when no file_ids are given.
+    blocks: list[dict] = []
+    if message:
+        blocks.append({"type": "text", "content": message})
+    if req.file_ids:
+        records = await deps.db.get_uploaded_files_by_ids(req.file_ids)
+        by_id = {rec["id"]: rec for rec in records}
+        for fid in req.file_ids:
+            rec = by_id.get(fid)
+            if not rec:
+                continue
+            url = f"/api/files/uploads/{fid}"
+            if rec["file_type"] == "image":
+                blocks.append({
+                    "type": "image",
+                    "url": url,
+                    "filename": rec["filename"],
+                    "media_type": rec["media_type"],
+                })
+            else:
+                blocks.append({
+                    "type": "file",
+                    "url": url,
+                    "filename": rec["filename"],
+                    "media_type": rec["media_type"],
+                })
+    else:
+        for img in req.image_blocks or []:
+            blocks.append({
+                "type": "image",
+                "url": img.get("url"),
+                "filename": img.get("filename"),
+                "media_type": img.get("media_type"),
+            })
+    await deps.db.add_message(
+        req.session_id, role="user", content=message,
+        blocks=blocks or None, channel="web",
+    )
+
+    scheduled = delay != "none"
+    fire_at: str | None = None
+    if scheduled:
+        seconds, ack = _RUN_LATER_TIMED[delay]
+        # Compute fire_at directly (not via engine._wakeup_fire_at, which
+        # clamps to <=3600s) so the 24h option works. The wakeup store keeps
+        # a single pending wakeup per session, which suits a fresh session.
+        fire_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        ).isoformat()
+        await deps.db.add_wakeup(
+            req.session_id, prompt=message, fire_at=fire_at, reason="run-later",
+        )
+    else:
+        ack = _RUN_LATER_MANUAL_ACK
+
+    # Synthetic acknowledgment — persisted as a plain assistant row, never
+    # generated by the model (zero tokens to create the deferred session).
+    await deps.db.add_message(
+        req.session_id, role="assistant", content=ack, channel="web",
+    )
+
+    return {
+        "session_id": req.session_id,
+        "scheduled": scheduled,
+        "ack": ack,
+        "fire_at": fire_at,
+    }
+
+
 @router.post("/api/sessions/{session_id}/resume")
 async def resume_session(session_id: str, user: dict = Depends(require_auth)):
     """Resume a stopped or idle session."""
@@ -460,10 +708,31 @@ async def resume_session(session_id: str, user: dict = Depends(require_auth)):
 
 @router.post("/api/sessions/{session_id}/archive")
 async def archive_session(session_id: str, user: dict = Depends(require_auth)):
-    """Archive a session (soft delete)."""
+    """Archive a session and its entire descendant subtree (soft delete).
+
+    Cascade is the default: children, grandchildren and deeper are archived
+    bottom-up. Returns a structured report of which session ids were archived
+    vs skipped (with reasons) so a still-running descendant never silently
+    leaves an archived-parent-with-active-child orphan.
+    """
     deps = get_deps()
-    await deps.engine.sessions.archive_session(session_id)
-    return {"archived": True}
+    result = await deps.engine.sessions.archive_session_cascade(session_id)
+    return {
+        "archived": True,
+        "archived_ids": result["archived"],
+        "skipped": result["skipped"],
+    }
+
+
+@router.post("/api/sessions/{session_id}/unarchive")
+async def unarchive_session(session_id: str, user: dict = Depends(require_auth)):
+    """Restore an archived session (Archived group → Unarchive / Star)."""
+    deps = get_deps()
+    try:
+        await deps.engine.sessions.unarchive_session(session_id)
+        return {"unarchived": True}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/api/sessions/{session_id}/events")

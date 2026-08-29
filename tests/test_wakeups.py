@@ -163,8 +163,31 @@ class TestWakeupSweep:
         assert kwargs["user_message"] == "do the thing"
         assert kwargs["source"] == "wakeup"
         assert kwargs["internal"] is True
+        # A self-scheduled loop tick is the session continuing its own work —
+        # it must not re-sort the sidebar.
+        assert kwargs["bump_updated_at"] is False
         # Claimed — no longer pending.
         assert await svc.db.list_pending_wakeups("s1") == []
+
+    @pytest.mark.asyncio
+    async def test_run_later_wakeup_fires_with_cron_source(self, svc):
+        # A deferred "Run later" wakeup must dispatch through the cron
+        # source (mirroring plan_service/cron dispatch), not "wakeup".
+        await svc.db.add_wakeup(
+            "s1", prompt="deferred prompt", fire_at=_past(), reason="run-later",
+        )
+
+        await svc._sweep_wakeups()
+        await asyncio.sleep(0.05)
+
+        svc.engine.run.assert_awaited_once()
+        kwargs = svc.engine.run.await_args.kwargs
+        assert kwargs["source"] == "cron"
+        assert kwargs["user_message"] == "deferred prompt"
+        assert kwargs["internal"] is True
+        # The user wrote this message and asked for it to land now, so unlike
+        # a model-scheduled tick it DOES move the session up the sidebar.
+        assert kwargs["bump_updated_at"] is True
 
     @pytest.mark.asyncio
     async def test_skips_running_session(self, svc):

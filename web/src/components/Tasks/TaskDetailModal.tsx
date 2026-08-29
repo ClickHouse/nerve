@@ -1,9 +1,9 @@
 import { useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Maximize2 } from 'lucide-react';
 import { useTaskStore } from '../../stores/taskStore';
 import { useTaskStatusStore } from '../../stores/taskStatusStore';
-import { Modal } from '../ui/Modal';
+import { IconButton, Modal } from '../ui';
+import { Maximize2 } from '../ui/icons';
 import { TaskDetailBody } from './TaskDetailBody';
 
 /**
@@ -48,14 +48,13 @@ export function TaskDetailModal() {
         <span className="flex items-center gap-2 min-w-0">
           <span className="truncate">{title}</span>
           {taskId && (
-            <button
+            <IconButton
+              label="Open as full page"
+              size="xs"
               onClick={() => navigate(`/tasks/${taskId}`, { replace: true })}
-              title="Open as full page"
-              aria-label="Open as full page"
-              className="shrink-0 text-text-faint hover:text-text-muted cursor-pointer"
             >
               <Maximize2 size={13} />
-            </button>
+            </IconButton>
           )}
         </span>
       }
@@ -66,10 +65,10 @@ export function TaskDetailModal() {
       className="h-[85vh] max-h-[85vh]"
     >
       {detailLoading && (
-        <div className="p-8 text-center text-text-faint text-[13px]">Loading...</div>
+        <div className="p-8 text-center text-text-faint text-sm">Loading...</div>
       )}
       {!detailLoading && !selectedTask && (
-        <div className="p-8 text-center text-text-faint text-[13px]">Task not found.</div>
+        <div className="p-8 text-center text-text-faint text-sm">Task not found.</div>
       )}
       {!detailLoading && selectedTask && <TaskDetailBody task={selectedTask} />}
     </Modal>

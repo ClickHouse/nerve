@@ -7,9 +7,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh | bash
 #
 # Environment variables:
-#   NERVE_INSTALL_DIR  — Where to clone the repo (default: ~/nerve)
-#   NERVE_BRANCH       — Git branch to install (default: main)
-#   NERVE_YES          — Set to 1 to skip all confirmations
+#   NERVE_INSTALL_DIR      — Where to clone the repo (default: ~/nerve)
+#   NERVE_BRANCH           — Git branch to install (default: main)
+#   NERVE_YES              — Set to 1 to skip all confirmations
+#   NERVE_NON_INTERACTIVE  — Set to 1 for unattended install: implies NERVE_YES,
+#                            configures from env (see docs/setup.md), never prompts
+#   NERVE_START            — Set to 1 to start the daemon after an unattended
+#                            install; leave unset when a service manager owns it
 #
 set -euo pipefail
 
@@ -17,11 +21,23 @@ set -euo pipefail
 NERVE_REPO="https://github.com/ClickHouse/nerve.git"
 NERVE_BRANCH="${NERVE_BRANCH:-main}"
 INSTALL_DIR="${NERVE_INSTALL_DIR:-$HOME/nerve}"
-MIN_PYTHON_MINOR=12
+# The CLI resolves this itself, so upgrade detection, init, start and the
+# summary must all agree with it or they act on different configurations.
+CONFIG_DIR="${NERVE_CONFIG_DIR:-$INSTALL_DIR}"
+# 13, not 12: pyproject's requires-python is >=3.13 (set by memu-py==1.4.0).
+# Accepting 3.12 here meant the installer would provision a Python that then
+# failed at `uv pip install -e .` with an opaque dependency conflict.
+MIN_PYTHON_MINOR=13
 PREFERRED_PYTHON_MINOR=13
-# Vite 7 (see web/package.json) requires Node 20.19+ or 22.12+.
-MIN_NODE_VERSION="20.19.0"
+# 22.12, not Vite 7's 20.19 floor: @clickhouse/click-ui declares
+# `engines.node >=22.12.0`, and web/package.json declares the same.
+# Provisioning a 20.19 here would install a Node the dependency graph refuses
+# under a strict (`--engine-strict`) install, which is a support claim we
+# cannot back.
+MIN_NODE_VERSION="22.12.0"
+NON_INTERACTIVE="${NERVE_NON_INTERACTIVE:-0}"
 AUTO_YES="${NERVE_YES:-0}"
+[ "$NON_INTERACTIVE" = "1" ] && AUTO_YES=1
 IS_UPGRADE=0
 
 # --- Colors ---
@@ -53,7 +69,33 @@ confirm() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Compare versions: version_ge "3.13" "3.12" → true
+# Root images (ubuntu:24.04 and friends) can install packages with no sudo at
+# all, so elevation is a capability question, not a "is sudo present" one.
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif ! command_exists sudo; then
+        error "Root privileges are required, but sudo is not available."
+        return 1
+    elif [ "$NON_INTERACTIVE" = "1" ]; then
+        # -n so automation fails instead of waiting on a password prompt.
+        sudo -n "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# apt's -y answers apt, not debconf: tzdata still asks for a geographic area.
+# The variable is set past the sudo boundary so sudo cannot strip it.
+run_debian_command() {
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+        run_as_root env DEBIAN_FRONTEND=noninteractive "$@"
+    else
+        run_as_root "$@"
+    fi
+}
+
+# Compare versions: version_ge "3.13" "3.13" → true
 version_ge() {
     local a="$1" b="$2"
     [ "$(printf '%s\n%s' "$a" "$b" | sort -V | head -n1)" = "$b" ]
@@ -89,10 +131,10 @@ detect_os() {
     DISTRO="unknown"
     PKG_MGR="unknown"
     ARCH="$(uname -m)"
-    HAS_SUDO=0
-
-    if command_exists sudo; then
-        HAS_SUDO=1
+    # "Can we install packages", not "is sudo installed" — root needs neither.
+    CAN_ELEVATE=0
+    if [ "$(id -u)" -eq 0 ] || command_exists sudo; then
+        CAN_ELEVATE=1
     fi
 
     case "$(uname -s)" in
@@ -142,8 +184,8 @@ ensure_git() {
     fi
 
     info "git is not installed"
-    if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
-        error "git is required but sudo is not available. Install git manually and re-run."
+    if [ "$CAN_ELEVATE" = "0" ] && [ "$OS" = "linux" ]; then
+        error "git is required but packages cannot be installed (not root, no sudo). Install git manually and re-run."
         exit 1
     fi
 
@@ -154,13 +196,13 @@ ensure_git() {
 
     case "$PKG_MGR" in
         apt)
-            sudo apt-get update -qq && sudo apt-get install -y -qq git ;;
+            run_debian_command apt-get update -qq && run_debian_command apt-get install -y -qq git ;;
         dnf)
-            sudo dnf install -y -q git ;;
+            run_as_root dnf install -y -q git ;;
         pacman)
-            sudo pacman -S --noconfirm git ;;
+            run_as_root pacman -S --noconfirm git ;;
         zypper)
-            sudo zypper install -y git ;;
+            run_as_root zypper install -y git ;;
         brew)
             brew install git ;;
         *)
@@ -194,11 +236,11 @@ ensure_uv() {
     success "uv $(uv --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 }
 
-# --- Dependency: Python 3.12+ ---
+# --- Dependency: Python 3.13+ ---
 
 ensure_python() {
-    # Check for existing Python >= 3.12
-    for candidate in python3.13 python3.12 python3; do
+    # Check for an existing Python >= 3.$MIN_PYTHON_MINOR
+    for candidate in python3.13 python3; do
         if command_exists "$candidate"; then
             local ver
             ver="$(get_python_version "$candidate")"
@@ -220,7 +262,7 @@ ensure_python() {
         fi
     fi
 
-    # Fallback: try 3.12
+    # Fallback: retry the minimum supported minor
     if uv python install "3.$MIN_PYTHON_MINOR" 2>/dev/null; then
         PYTHON_CMD="$(uv python find "3.$MIN_PYTHON_MINOR" 2>/dev/null || echo "")"
         if [ -n "$PYTHON_CMD" ]; then
@@ -232,9 +274,9 @@ ensure_python() {
     # Last resort: system packages
     warn "uv python install failed. Trying system packages..."
 
-    if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
-        error "Cannot install Python: no sudo and uv python install failed."
-        error "Install Python 3.12+ manually and re-run."
+    if [ "$CAN_ELEVATE" = "0" ] && [ "$OS" = "linux" ]; then
+        error "Cannot install Python: no way to elevate and uv python install failed."
+        error "Install Python 3.13+ manually and re-run."
         exit 1
     fi
 
@@ -242,24 +284,24 @@ ensure_python() {
         apt)
             if ! apt-cache show python3.13 >/dev/null 2>&1; then
                 info "Adding deadsnakes PPA..."
-                sudo apt-get update -qq
-                sudo apt-get install -y -qq software-properties-common
-                sudo add-apt-repository -y ppa:deadsnakes/ppa
-                sudo apt-get update -qq
+                run_debian_command apt-get update -qq
+                run_debian_command apt-get install -y -qq software-properties-common
+                run_debian_command add-apt-repository -y ppa:deadsnakes/ppa
+                run_debian_command apt-get update -qq
             fi
-            sudo apt-get install -y -qq python3.13 python3.13-venv python3.13-dev
+            run_debian_command apt-get install -y -qq python3.13 python3.13-venv python3.13-dev
             PYTHON_CMD="python3.13"
             ;;
         dnf)
-            sudo dnf install -y -q python3.13 || sudo dnf install -y -q python3.12 || sudo dnf install -y -q python3
+            run_as_root dnf install -y -q python3.13 || run_as_root dnf install -y -q python3.12 || run_as_root dnf install -y -q python3
             PYTHON_CMD="$(command -v python3.13 || command -v python3.12 || command -v python3)"
             ;;
         pacman)
-            sudo pacman -S --noconfirm python
+            run_as_root pacman -S --noconfirm python
             PYTHON_CMD="python3"
             ;;
         zypper)
-            sudo zypper install -y python313 || sudo zypper install -y python312 || sudo zypper install -y python3
+            run_as_root zypper install -y python313 || run_as_root zypper install -y python312 || run_as_root zypper install -y python3
             PYTHON_CMD="$(command -v python3.13 || command -v python3.12 || command -v python3)"
             ;;
         brew)
@@ -268,20 +310,32 @@ ensure_python() {
             ;;
         *)
             error "Don't know how to install Python on $DISTRO."
-            error "Install Python 3.12+ manually and re-run."
+            error "Install Python 3.13+ manually and re-run."
             exit 1
             ;;
     esac
 
     if [ -z "${PYTHON_CMD:-}" ] || ! command_exists "$PYTHON_CMD"; then
-        error "Failed to install Python. Install Python 3.12+ manually and re-run."
+        error "Failed to install Python. Install Python 3.13+ manually and re-run."
         exit 1
     fi
 
-    success "Python $(get_python_version "$PYTHON_CMD") installed via system packages"
+    # Existence alone isn't enough. The fallback chains above can settle on an
+    # older interpreter (dnf/zypper try python3.13, then python3.12, then plain
+    # python3), and an interpreter below the floor fails much later at
+    # `uv pip install -e .` with an opaque transitive dependency conflict.
+    # Fail here, where the cause is obvious, instead.
+    installed_py_ver="$(get_python_version "$PYTHON_CMD")"
+    if ! version_ge "$installed_py_ver" "3.$MIN_PYTHON_MINOR"; then
+        error "Installed Python $installed_py_ver is below the required 3.$MIN_PYTHON_MINOR."
+        error "Install Python 3.$MIN_PYTHON_MINOR+ manually and re-run."
+        exit 1
+    fi
+
+    success "Python $installed_py_ver installed via system packages"
 }
 
-# --- Dependency: Node.js 18+ ---
+# --- Dependency: Node.js (floor in MIN_NODE_VERSION) ---
 
 ensure_node() {
     if command_exists node; then
@@ -291,13 +345,13 @@ ensure_node() {
             success "Node.js v$ver"
             return
         fi
-        warn "Node.js v$ver is too old (need v${MIN_NODE_VERSION}+ or v22.12+)"
+        warn "Node.js v$ver is too old (need v${MIN_NODE_VERSION}+)"
     fi
 
     info "Node.js v${MIN_NODE_VERSION}+ is not installed"
 
-    if [ "$HAS_SUDO" = "0" ] && [ "$OS" = "linux" ]; then
-        error "Node.js is required but sudo is not available."
+    if [ "$CAN_ELEVATE" = "0" ] && [ "$OS" = "linux" ]; then
+        error "Node.js is required but packages cannot be installed (not root, no sudo)."
         error "Install Node.js v${MIN_NODE_VERSION}+ manually and re-run."
         exit 1
     fi
@@ -310,19 +364,22 @@ ensure_node() {
     case "$PKG_MGR" in
         apt)
             info "Installing Node.js via nodesource..."
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-            sudo apt-get install -y -qq nodejs
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | run_debian_command bash -
+            run_debian_command apt-get install -y -qq nodejs
             ;;
         dnf)
             info "Installing Node.js via nodesource..."
-            curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash -
-            sudo dnf install -y -q nodejs
+            curl -fsSL https://rpm.nodesource.com/setup_lts.x | run_as_root bash -
+            run_as_root dnf install -y -q nodejs
             ;;
         pacman)
-            sudo pacman -S --noconfirm nodejs npm
+            run_as_root pacman -S --noconfirm nodejs npm
             ;;
         zypper)
-            sudo zypper install -y nodejs20
+            # nodejs22, not nodejs20: openSUSE's nodejs20 tops out below the
+            # MIN_NODE_VERSION floor, so it would install and then fail the
+            # check below.
+            run_as_root zypper install -y nodejs22
             ;;
         brew)
             brew install node
@@ -339,7 +396,7 @@ ensure_node() {
             ;;
         *)
             error "Don't know how to install Node.js on $DISTRO."
-            error "Install Node.js ${MIN_NODE_MAJOR}+ manually and re-run."
+            error "Install Node.js v${MIN_NODE_VERSION}+ manually and re-run."
             exit 1
             ;;
     esac
@@ -349,7 +406,20 @@ ensure_node() {
         exit 1
     fi
 
-    success "Node.js $(node --version) installed"
+    # A distro's "node" package is whatever that distro froze, and nodesource's
+    # setup_lts.x follows whatever upstream calls LTS today. Neither is promised
+    # to clear our floor, and a too-old Node here surfaces much later as an
+    # opaque syntax error inside a dependency. Check what actually landed.
+    local new_ver
+    new_ver="$(node --version | tr -d 'v')"
+    if ! version_ge "$new_ver" "$MIN_NODE_VERSION"; then
+        error "Installed Node.js v${new_ver}, but v${MIN_NODE_VERSION}+ is required."
+        error "The package for $DISTRO is behind. Install a newer Node.js and re-run:"
+        error "  https://nodejs.org/en/download/"
+        exit 1
+    fi
+
+    success "Node.js v${new_ver} installed"
 }
 
 # --- Clone or Update Repository ---
@@ -389,17 +459,20 @@ setup_python_env() {
 
     cd "$INSTALL_DIR" || exit 1
 
-    if [ ! -d ".venv" ]; then
-        info "Creating virtualenv..."
-        uv venv --python "3.$PREFERRED_PYTHON_MINOR" 2>/dev/null \
-            || uv venv --python "3.$MIN_PYTHON_MINOR" 2>/dev/null \
-            || uv venv
-    else
-        info "Using existing virtualenv"
-    fi
-
-    info "Installing dependencies..."
-    uv pip install -e . --quiet
+    # `uv sync` creates and manages .venv itself, so there's no separate venv
+    # step: it installs the exact versions in uv.lock and Nerve editable.
+    # Locked rather than re-resolved, so a fresh install gets the dependency set
+    # that CI actually tested.
+    # --locked: install the committed lock, and fail rather than silently
+    #   re-resolving and rewriting uv.lock in the user's checkout.
+    # --inexact: this script doubles as an upgrade path for an existing install,
+    #   and `uv sync` is exact by default — without this, rerunning it would
+    #   uninstall anything the user added on top (optional extras, local tools).
+    info "Installing dependencies from uv.lock..."
+    local sync_flags=(--locked --inexact --quiet)
+    uv sync "${sync_flags[@]}" --python "3.$PREFERRED_PYTHON_MINOR" 2>/dev/null \
+        || uv sync "${sync_flags[@]}" --python "3.$MIN_PYTHON_MINOR" 2>/dev/null \
+        || uv sync "${sync_flags[@]}"
     success "Python environment ready"
 }
 
@@ -472,11 +545,20 @@ INIT_SKIPPED=0
 
 run_init() {
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
-    local config_local="$INSTALL_DIR/config.local.yaml"
+    local config_local="$CONFIG_DIR/config.local.yaml"
 
     if [ "$IS_UPGRADE" = "1" ] && [ -f "$config_local" ]; then
         info "Existing configuration found — skipping setup wizard"
         info "Run 'nerve init' to reconfigure"
+        INIT_COMPLETED=1
+        return
+    fi
+
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+        step "Running Nerve setup (non-interactive)"
+        cd "$INSTALL_DIR" || exit 1
+        # Fail loudly: a half-configured unattended install is worse than none.
+        "$nerve_bin" -c "$CONFIG_DIR" init --non-interactive
         INIT_COMPLETED=1
         return
     fi
@@ -500,7 +582,7 @@ run_init() {
     step "Running Nerve setup"
     cd "$INSTALL_DIR" || exit 1
     # Don't let a wizard abort look like a failed installation (set -e).
-    if "$nerve_bin" init; then
+    if "$nerve_bin" -c "$CONFIG_DIR" init; then
         INIT_COMPLETED=1
     else
         printf "\n"
@@ -517,12 +599,18 @@ offer_start() {
     if [ "$INIT_COMPLETED" != "1" ] || [ "$IS_UPGRADE" = "1" ]; then
         return
     fi
+    # Unattended installs are usually followed by a service manager owning the
+    # process, so starting a stray daemon here is wrong unless asked for.
+    if [ "$NON_INTERACTIVE" = "1" ] && [ "${NERVE_START:-0}" != "1" ]; then
+        info "Not starting Nerve (set NERVE_START=1 to start it here)"
+        return
+    fi
     printf "\n"
-    if ! confirm "Start Nerve now?"; then
+    if [ "$NON_INTERACTIVE" != "1" ] && ! confirm "Start Nerve now?"; then
         return
     fi
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
-    if "$nerve_bin" start; then
+    if "$nerve_bin" -c "$CONFIG_DIR" start; then
         NERVE_STARTED=1
     else
         warn "Start failed — check logs with: nerve logs"
@@ -563,7 +651,7 @@ print_summary() {
     printf "    ${CYAN}nerve stop${NC}            Stop the daemon\n"
     printf "\n"
     printf "  ${DIM}Install dir : $INSTALL_DIR${NC}\n"
-    printf "  ${DIM}Config      : $INSTALL_DIR/config.local.yaml${NC}\n"
+    printf "  ${DIM}Config      : $CONFIG_DIR/config.local.yaml${NC}\n"
     printf "  ${DIM}Data        : ~/.nerve/${NC}\n"
     printf "\n"
     printf "  ${DIM}To uninstall: rm -rf $INSTALL_DIR ~/.nerve ~/.local/bin/nerve${NC}\n"
@@ -587,12 +675,15 @@ Usage:
   curl -fsSL .../install.sh | bash -s -- --yes
 
 Options:
-  --yes, -y       Skip all confirmation prompts
+  --yes, -y             Skip all confirmation prompts
+  --non-interactive     Unattended install; configure from environment
 
 Environment variables:
-  NERVE_INSTALL_DIR   Where to clone (default: ~/nerve)
-  NERVE_BRANCH        Git branch (default: main)
-  NERVE_YES           Set to 1 to skip confirmations
+  NERVE_INSTALL_DIR     Where to clone (default: ~/nerve)
+  NERVE_BRANCH          Git branch (default: main)
+  NERVE_YES             Set to 1 to skip confirmations
+  NERVE_NON_INTERACTIVE Set to 1 for unattended install (implies NERVE_YES)
+  NERVE_START           Set to 1 to start the daemon after unattended install
 
 EOF
 }
@@ -604,13 +695,19 @@ main() {
     for arg in "$@"; do
         case "$arg" in
             --yes|-y) AUTO_YES=1 ;;
+            --non-interactive) NON_INTERACTIVE=1; AUTO_YES=1 ;;
             --help|-h) usage; exit 0 ;;
         esac
     done
 
     # When piped via curl | bash, stdin is the pipe (EOF after script).
-    # Reclaim the terminal for all interactive prompts.
-    if [ ! -t 0 ] && [ -e /dev/tty ]; then
+    # Reclaim the terminal for all interactive prompts. The read test matters:
+    # under cloud-init and other daemons /dev/tty exists but there is no
+    # controlling terminal, so the open fails with ENXIO and set -e ends the
+    # install before it starts.
+    # Probe in a subshell: a failed `exec` redirection ends a non-interactive
+    # shell on POSIX-mode shells, where `||` would not get a chance to run.
+    if [ "$NON_INTERACTIVE" != "1" ] && [ ! -t 0 ] && (exec < /dev/tty) 2>/dev/null; then
         exec < /dev/tty
     fi
 

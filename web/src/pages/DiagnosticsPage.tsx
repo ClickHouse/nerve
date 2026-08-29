@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 // import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from 'lucide-react';
+import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from '../components/ui/icons';
+import { Button, IconButton } from '../components/ui';
 import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 
 function formatUptime(isoDate: string): string {
@@ -45,21 +46,14 @@ function RunButton({ onClick, label, title }: { onClick: () => Promise<void>; la
   };
 
   return (
-    <button
-      onClick={handleClick}
-      disabled={running}
-      className={`flex items-center gap-1.5 px-3 py-2 text-[12px] bg-surface border border-border-subtle rounded-lg cursor-pointer transition-colors shrink-0 ${
-        running
-          ? 'text-text-faint cursor-not-allowed'
-          : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-      }`}
-      title={title}
-    >
+    // `disabled` carries the running state: `Button` already dims the control
+    // and blocks the cursor.
+    <Button variant="secondary" onClick={handleClick} disabled={running} title={title}>
       {running
         ? <><Loader2 size={12} className="animate-spin" /> Running...</>
         : <><Play size={12} /> {label}</>
       }
-    </button>
+    </Button>
   );
 }
 
@@ -98,9 +92,9 @@ export function DiagnosticsPage() {
     <div className="h-full overflow-y-auto">
       <div className="border-b border-border-subtle px-6 py-3 flex items-center justify-between bg-bg shrink-0">
         <h1 className="text-lg font-semibold">Diagnostics</h1>
-        <button onClick={load} className="text-text-dim hover:text-text-muted cursor-pointer p-1.5 hover:bg-surface-raised rounded">
+        <IconButton label="Refresh diagnostics" onClick={load}>
           <RefreshCw size={16} />
-        </button>
+        </IconButton>
       </div>
 
       <div className="p-6 max-w-5xl mx-auto space-y-6">
@@ -114,7 +108,7 @@ export function DiagnosticsPage() {
 
         {/* Observability — Langfuse status */}
         {data.langfuse && (
-          <div className="text-[12px] text-text-dim flex items-center gap-3 flex-wrap">
+          <div className="text-xs text-text-dim flex items-center gap-3 flex-wrap">
             <span className="flex items-center gap-1.5">
               {data.langfuse.enabled ? (
                 <CheckCircle2 size={12} className="text-hue-green" />
@@ -149,7 +143,7 @@ export function DiagnosticsPage() {
         {/* Usage & Cost */}
         {usage?.last_7d && (
           <section>
-            <h2 className="text-[14px] font-medium text-text-muted mb-3 flex items-center gap-2">
+            <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
               <DollarSign size={14} /> Usage & Cost (7 days)
             </h2>
 
@@ -168,7 +162,7 @@ export function DiagnosticsPage() {
             {/* Daily usage chart — simple CSS bar chart */}
             {usage.daily?.length > 0 && (
               <div className="mb-3">
-                <div className="text-[11px] text-text-dim mb-2">Daily cost</div>
+                <div className="text-xs text-text-dim mb-2">Daily cost</div>
                 <div className="flex items-end gap-1 h-20">
                   {[...usage.daily].reverse().map((day: any) => {
                     const cost = day.cost_usd || 0;
@@ -176,17 +170,23 @@ export function DiagnosticsPage() {
                     const heightPct = maxCost > 0 ? Math.max(2, (cost / maxCost) * 100) : 2;
                     const dateLabel = day.date?.slice(5) || ''; // MM-DD
                     return (
-                      <div key={day.date} className="flex-1 flex flex-col items-center gap-0.5 min-w-0">
-                        <div
-                          className="w-full bg-accent/30 rounded-t-sm hover:bg-accent/50 transition-colors relative group"
-                          style={{ height: `${heightPct}%` }}
-                        >
-                          <div className="absolute -top-6 left-1/2 -translate-x-1/2 hidden group-hover:block z-10
-                            bg-surface-raised border border-border-subtle rounded px-1.5 py-0.5 text-[10px] text-text-secondary whitespace-nowrap shadow-lg">
-                            {formatTokens((day.input_tokens || 0) + (day.output_tokens || 0))} &middot; ${cost.toFixed(2)}
+                      <div key={day.date} className="flex-1 flex flex-col items-center gap-0.5 min-w-0 h-full">
+                        {/* Bar track. The bar's percentage height needs a parent
+                            with a definite height to resolve against, so the
+                            column is h-full and the track takes the space left
+                            over after the date label. */}
+                        <div className="flex-1 w-full flex items-end min-h-0">
+                          <div
+                            className="w-full bg-accent/30 rounded-t-sm hover:bg-accent/50 transition-colors relative group"
+                            style={{ height: `${heightPct}%` }}
+                          >
+                            <div className="absolute -top-6 left-1/2 -translate-x-1/2 hidden group-hover:block z-10
+                              bg-surface-raised border border-border-subtle rounded px-1.5 py-0.5 text-2xs text-text-secondary whitespace-nowrap shadow-lg">
+                              {formatTokens((day.input_tokens || 0) + (day.output_tokens || 0))} &middot; ${cost.toFixed(2)}
+                            </div>
                           </div>
                         </div>
-                        <span className="text-[9px] text-text-faint tabular-nums">{dateLabel}</span>
+                        <span className="text-2xs text-text-faint tabular-nums">{dateLabel}</span>
                       </div>
                     );
                   })}
@@ -197,7 +197,7 @@ export function DiagnosticsPage() {
             {/* By model breakdown */}
             {usage.by_model?.length > 0 && (
               <div className="border border-border-subtle rounded-lg overflow-hidden mb-3">
-                <table className="w-full text-[13px]">
+                <table className="w-full text-sm">
                   <thead>
                     <tr className="bg-surface text-text-muted">
                       <th className="text-left px-4 py-2 font-medium">Model</th>
@@ -210,7 +210,7 @@ export function DiagnosticsPage() {
                   <tbody>
                     {usage.by_model.map((m: any) => (
                       <tr key={m.model} className="border-t border-border-subtle hover:bg-surface">
-                        <td className="px-4 py-2 font-mono text-text-secondary text-[12px]">{formatModelName(m.model)}</td>
+                        <td className="px-4 py-2 font-mono text-text-secondary text-xs">{formatModelName(m.model)}</td>
                         <td className="px-4 py-2 text-right text-text-dim tabular-nums">{m.turns}</td>
                         <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(m.input_tokens || 0)}</td>
                         <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(m.output_tokens || 0)}</td>
@@ -225,7 +225,7 @@ export function DiagnosticsPage() {
             {/* By source breakdown */}
             {usage.by_source?.length > 0 && (
               <div className="border border-border-subtle rounded-lg overflow-hidden">
-                <table className="w-full text-[13px]">
+                <table className="w-full text-sm">
                   <thead>
                     <tr className="bg-surface text-text-muted">
                       <th className="text-left px-4 py-2 font-medium">Source</th>
@@ -257,7 +257,7 @@ export function DiagnosticsPage() {
         {/* memU Health */}
         {memuHealth && (
           <section>
-            <h2 className="text-[14px] font-medium text-text-muted mb-3 flex items-center gap-2">
+            <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
               <Database size={14} /> memU Memory Service
             </h2>
 
@@ -277,25 +277,25 @@ export function DiagnosticsPage() {
             {memuHealth.database?.type_distribution && (
               <div className="flex gap-2 mb-3 flex-wrap">
                 {Object.entries(memuHealth.database.type_distribution).map(([type, count]) => (
-                  <span key={type} className="text-[12px] px-2 py-1 bg-surface border border-border-subtle rounded">
+                  <span key={type} className="text-xs px-2 py-1 bg-surface border border-border-subtle rounded">
                     <span className="text-text-muted">{type}:</span>{' '}
                     <span className="text-text-secondary">{String(count)}</span>
                   </span>
                 ))}
                 {memuHealth.database?.total_categories > 0 && (
-                  <span className="text-[12px] px-2 py-1 bg-surface border border-border-subtle rounded">
+                  <span className="text-xs px-2 py-1 bg-surface border border-border-subtle rounded">
                     <span className="text-text-muted">categories:</span>{' '}
                     <span className="text-text-secondary">{memuHealth.database.total_categories}</span>
                   </span>
                 )}
                 {memuHealth.database?.total_resources > 0 && (
-                  <span className="text-[12px] px-2 py-1 bg-surface border border-border-subtle rounded">
+                  <span className="text-xs px-2 py-1 bg-surface border border-border-subtle rounded">
                     <span className="text-text-muted">resources:</span>{' '}
                     <span className="text-text-secondary">{memuHealth.database.total_resources}</span>
                   </span>
                 )}
                 {memuHealth.database?.events_missing_happened_at > 0 && (
-                  <span className="text-[12px] px-2 py-1 bg-amber-500/10 border border-amber-500/20 rounded text-amber-600">
+                  <span className="text-xs px-2 py-1 bg-warning-bg border border-warning-border rounded text-warning">
                     {memuHealth.database.events_missing_happened_at} events missing happened_at
                   </span>
                 )}
@@ -304,10 +304,10 @@ export function DiagnosticsPage() {
 
             {/* In-flight operations */}
             {memuHealth.in_flight?.length > 0 && (
-              <div className="mb-3 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
-                <div className="text-[12px] text-blue-600 mb-1">In-flight operations:</div>
+              <div className="mb-3 p-3 bg-info-bg border border-info-border rounded-lg">
+                <div className="text-xs text-info mb-1">In-flight operations:</div>
                 {memuHealth.in_flight.map((op: any, i: number) => (
-                  <div key={i} className="text-[12px] text-text-secondary">
+                  <div key={i} className="text-xs text-text-secondary">
                     {op.operation} — <span className="text-text-muted">{op.description}</span> ({op.elapsed_s}s)
                   </div>
                 ))}
@@ -316,7 +316,7 @@ export function DiagnosticsPage() {
 
             {/* Operation stats table */}
             <div className="border border-border-subtle rounded-lg overflow-hidden">
-              <table className="w-full text-[13px]">
+              <table className="w-full text-sm">
                 <thead>
                   <tr className="bg-surface text-text-muted">
                     <th className="text-left px-4 py-2 font-medium">Operation</th>
@@ -340,7 +340,7 @@ export function DiagnosticsPage() {
                           : <span className="text-text-dim">0</span>
                         }
                       </td>
-                      <td className="px-4 py-2 text-hue-red text-[12px] truncate max-w-xs">{stats.last_error || ''}</td>
+                      <td className="px-4 py-2 text-hue-red text-xs truncate max-w-xs">{stats.last_error || ''}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -352,7 +352,7 @@ export function DiagnosticsPage() {
         {/* Memorization Sweep */}
         {data.memorization && (
           <section>
-            <h2 className="text-[14px] font-medium text-text-muted mb-3 flex items-center gap-2">
+            <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
               <Brain size={14} /> Memorization Sweep
             </h2>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
@@ -365,21 +365,21 @@ export function DiagnosticsPage() {
             {/* Last run details */}
             <div className="flex items-center gap-3 mb-3">
               <div className="flex-1 p-3 bg-surface border border-border-subtle rounded-lg">
-                <div className="text-[11px] text-text-dim mb-1">Last run</div>
-                <div className="text-[13px] text-text-secondary">
+                <div className="text-xs text-text-dim mb-1">Last run</div>
+                <div className="text-sm text-text-secondary">
                   {data.memorization.last_run_at
                     ? new Date(data.memorization.last_run_at).toLocaleString()
                     : 'Not yet'}
                 </div>
                 {data.memorization.last_result && !data.memorization.last_result.error && (
-                  <div className="text-[12px] text-text-dim mt-1">
+                  <div className="text-xs text-text-dim mt-1">
                     {data.memorization.last_result.sessions_indexed > 0
                       ? `${data.memorization.last_result.sessions_indexed} sessions, ${data.memorization.last_result.messages_indexed} messages indexed`
                       : 'Nothing to index'}
                   </div>
                 )}
                 {data.memorization.last_result?.error && (
-                  <div className="text-[12px] text-hue-red mt-1 truncate">
+                  <div className="text-xs text-hue-red mt-1 truncate">
                     Error: {data.memorization.last_result.error}
                   </div>
                 )}
@@ -398,14 +398,14 @@ export function DiagnosticsPage() {
 
         {/* Cron Logs */}
         <section>
-          <h2 className="text-[14px] font-medium text-text-muted mb-3 flex items-center gap-2">
+          <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
             <Clock size={14} /> Cron Logs
           </h2>
           {cronLogs.length === 0 ? (
             <div className="text-text-faint text-sm">No cron logs</div>
           ) : (
             <div className="border border-border-subtle rounded-lg overflow-hidden">
-              <table className="w-full text-[13px]">
+              <table className="w-full text-sm">
                 <thead>
                   <tr className="bg-surface text-text-muted">
                     <th className="text-left px-4 py-2 font-medium">Job</th>
@@ -425,7 +425,7 @@ export function DiagnosticsPage() {
                         }
                       </td>
                       <td className="px-4 py-2 text-text-dim">{log.started_at}</td>
-                      <td className="px-4 py-2 text-hue-red text-[12px] truncate max-w-xs">{log.error || ''}</td>
+                      <td className="px-4 py-2 text-hue-red text-xs truncate max-w-xs">{log.error || ''}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -434,7 +434,7 @@ export function DiagnosticsPage() {
           )}
         </section>
 
-        <div className="text-[12px] text-text-faint pt-2">
+        <div className="text-xs text-text-faint pt-2">
           Workspace: {data.workspace} | Sessions: {data.sessions_count}
         </div>
       </div>
@@ -445,10 +445,10 @@ export function DiagnosticsPage() {
 function InfoCard({ icon: Icon, label, value }: { icon: typeof Server; label: string; value: string }) {
   return (
     <div className="p-3 bg-surface border border-border-subtle rounded-lg">
-      <div className="flex items-center gap-1.5 text-[11px] text-text-dim mb-1">
+      <div className="flex items-center gap-1.5 text-xs text-text-dim mb-1">
         <Icon size={12} /> {label}
       </div>
-      <div className="text-[14px] text-text-secondary truncate">{value}</div>
+      <div className="text-sm text-text-secondary truncate">{value}</div>
     </div>
   );
 }

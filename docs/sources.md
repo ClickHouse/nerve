@@ -78,7 +78,8 @@ A persistent cron job (`inbox-processor`) runs every 15 minutes:
 - **Instances:** One source per configured account (`imap:<label>`), each with an independent cursor
 - **Cursor:** `<UIDVALIDITY>:<max_uid>` — UIDs are only stable within a UIDVALIDITY, so a server-side reset is detected and re-baselined instead of trusted
 - **First run:** `SINCE` window of `initial_lookback_days` (default 1)
-- **Subsequent runs:** `UID SEARCH <last+1>:*`, filtered client-side (the `N:*` range always returns at least the highest UID)
+- **Subsequent runs:** `UID SEARCH <last+1>:*`, filtered client-side (the `N:*` range always returns at least the highest UID); oldest UIDs are processed first when a batch is full
+- **Failure policy:** A search or message fetch/parse failure fails the batch and leaves the cursor unchanged. `SourceRunner` reports the error and applies its health/backoff policy. Fix or remove a permanently malformed message, then the next run retries it; manually advancing the cursor is an operator recovery action when skipping that UID is confirmed safe
 - **Blocking I/O:** the whole IMAP conversation runs in a worker thread via `asyncio.to_thread`
 - **Credentials:** passwords live in `sync.imap.passwords` keyed by username (put them in `config.local.yaml`); an account with no password is skipped with a warning instead of failing the sync
 - **Optional image pass:** see below
@@ -298,9 +299,10 @@ With `allow_repos` empty (the default), all repos pass — behavior is unchanged
 ### GitHub actor guardrail
 
 The GitHub notification source also matches on `actors` — the list of every GitHub login
-involved in a notification (issue/PR author, assignees, and comment/review authors). This
-restricts **who** can put a notification in front of the worker, so a drive-by `@mention`
-from an untrusted account is dropped before the agent ever sees it:
+involved in a notification (issue/PR author, assignees, comment/review authors, and on a
+`reason=assign` notification the account that performed the assignment). This restricts
+**who** can put a notification in front of the worker, so a drive-by `@mention` from an
+untrusted account is dropped before the agent ever sees it:
 
 ```yaml
 sync:
@@ -313,6 +315,14 @@ sync:
 allowlist. A non-empty `allow_actors` is **fail-closed**: a notification with no
 identifiable actor (e.g. enrichment failed) is dropped. With `allow_actors` empty (the
 default), all actors pass — behavior is unchanged. The repo and actor rules AND together.
+
+Assignments are worth calling out. An `assign` notification names the assignee but not the
+assigner, and carries no comment text, so the assigner is fetched from the thread's event
+history and rendered as `Assigned by: <login>`. Without it, an assignment on a subject the
+inbox account itself authored has no third-party login anywhere — every candidate is that
+one account — and a non-empty `allow_actors` would drop it fail-closed. If you rely on
+"a maintainer assigns an issue to the bot" as a work signal, that login needs to be in
+`allow_actors`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

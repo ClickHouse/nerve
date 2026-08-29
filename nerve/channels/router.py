@@ -430,13 +430,20 @@ class ChannelRouter:
         """List sessions, most recently updated first."""
         return await self.engine.sessions.list_sessions(limit=limit)
 
+    async def list_interactive_sessions(
+        self, limit: int, offset: int = 0, current_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Switchable sessions for the /sessions keyboard: interactive sources
+        only, current → starred → recent, paginated. See
+        :meth:`nerve.agent.sessions.SessionManager.list_interactive_sessions`.
+        """
+        return await self.engine.sessions.list_interactive_sessions(
+            limit=limit, offset=offset, current_id=current_id,
+        )
+
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
         return await self.engine.sessions.set_starred(session_id, starred)
-
-    async def toggle_session_starred(self, session_id: str) -> bool:
-        """Toggle a session's starred flag. Returns the new state."""
-        return await self.engine.sessions.toggle_starred(session_id)
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""

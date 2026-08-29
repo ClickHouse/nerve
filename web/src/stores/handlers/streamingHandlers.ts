@@ -463,7 +463,7 @@ export function handleDone(
         : b
     );
     set((s) => ({
-      messages: [...s.messages, { role: 'assistant' as const, blocks: finalBlocks }],
+      messages: [...s.messages, { role: 'assistant' as const, blocks: finalBlocks, created_at: new Date().toISOString() }],
       streamingBlocks: [],
       isStreaming: false,
       ...doneUpdate,
@@ -496,6 +496,7 @@ export function handleStopped(
       blocks: finalBlocks.length > 0
         ? finalBlocks
         : [{ type: 'text', content: '*[Stopped by user]*' }],
+      created_at: new Date().toISOString(),
     }],
     streamingBlocks: [],
     isStreaming: false,

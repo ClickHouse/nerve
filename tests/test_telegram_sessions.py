@@ -61,15 +61,20 @@ def test_missing_title_falls_back_to_id():
     assert _flat(markup)[0].text == "✓ dddd4444"
 
 
-def test_button_limit_caps_sessions_but_keeps_new():
+def test_page_size_caps_session_rows_but_keeps_new():
+    from nerve.channels.telegram import _SESSIONS_PAGE_SIZE
     sessions = [
-        {"id": f"id{n:06d}", "title": f"S{n}", "source": "web"} for n in range(20)
+        {"id": f"id{n:06d}", "title": f"S{n}", "source": "web"} for n in range(50)
     ]
     _text, markup = build_sessions_view(sessions, current_id=None)
-    rows = markup.inline_keyboard
-    # 8 session buttons + 1 trailing "New session" row.
-    assert len(rows) == 9
-    assert rows[-1][0].callback_data == "sess:new"
+    switch_btns = [
+        b.callback_data for b in _flat(markup)
+        if (b.callback_data or "").startswith("sess:")
+        and b.callback_data != "sess:new"
+        and not (b.callback_data or "").startswith("sess:page:")
+    ]
+    assert len(switch_btns) == _SESSIONS_PAGE_SIZE   # one page's worth of rows
+    assert markup.inline_keyboard[-1][0].callback_data == "sess:new"
 
 
 def test_oversized_callback_data_is_skipped():
@@ -168,56 +173,102 @@ def test_tail_stays_within_telegram_message_limit():
     assert len(text) <= 4096
 
 
-# --- /sessions list excludes empty sessions -------------------------------- #
+# --- /sessions paging (interactive-only, current→starred→recent) ----------- #
 
 class _FakeRouter:
-    def __init__(self, sessions, counts, current):
-        self._s, self._c, self._cur = sessions, counts, current
-        self.count_calls = 0
+    """Stands in for the channel router. ``sessions`` is the already-filtered,
+    already-ordered interactive list the store would return (current first,
+    starred ahead of recent); the fake just paginates it, mirroring the SQL
+    ``LIMIT``/``OFFSET`` so the view's paging logic is what's under test."""
+
+    def __init__(self, sessions, counts=None, current=None):
+        self._s, self._cur = sessions, current
+        self.calls = []
 
     async def get_last_session(self, _channel_key):
         return self._cur
 
-    async def list_sessions(self, limit=20):
-        return self._s
+    async def list_interactive_sessions(self, limit, offset=0, current_id=None):
+        self.calls.append((limit, offset, current_id))
+        return self._s[offset:offset + limit]
 
-    async def count_session_messages(self, session_id):
-        self.count_calls += 1
-        return self._c.get(session_id, 0)
+
+def _cbs_of(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+def _switch_cbs(markup):
+    return [
+        c for c in _cbs_of(markup)
+        if c.startswith("sess:") and c != "sess:new" and not c.startswith("sess:page:")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_sessions_list_excludes_empty_sessions():
-    from nerve.channels.telegram import TelegramChannel
-    sessions = [
-        {"id": "has111", "title": "Has messages", "source": "telegram"},
-        {"id": "empty2", "title": "empty2", "source": "web"},       # 0 messages
-    ]
+async def test_sessions_view_renders_store_page_from_current_view():
+    from nerve.channels.telegram import TelegramChannel, _SESSIONS_PAGE_SIZE
+    # The store excludes empty/cron rows and orders the rest; the view renders
+    # that page verbatim and always keeps the New-session button.
+    sessions = [{"id": "has111", "title": "Has messages", "source": "telegram"}]
     ch = TelegramChannel.__new__(TelegramChannel)   # bypass __init__; only .router needed
-    ch.router = _FakeRouter(sessions, {"has111": 4, "empty2": 0}, current="has111")
+    ch.router = _FakeRouter(sessions, current="has111")
     _text, markup = await ch._sessions_view_for("telegram:1")
-    cbs = [b.callback_data for row in markup.inline_keyboard for b in row]
-    assert "sess:has111" in cbs        # non-empty shown
-    assert "sess:empty2" not in cbs    # empty hidden
-    assert "sess:new" in cbs           # New button still present
+    cbs = _cbs_of(markup)
+    assert "sess:has111" in cbs
+    assert "sess:new" in cbs
+    # Fetched interactive-only, one page + 1 (next-page probe), current pinned.
+    assert ch.router.calls == [(_SESSIONS_PAGE_SIZE + 1, 0, "has111")]
 
 
 @pytest.mark.asyncio
-async def test_sessions_list_caps_at_button_limit_and_stops_counting():
-    from nerve.channels.telegram import TelegramChannel, _SESSIONS_BUTTON_LIMIT
+async def test_sessions_view_first_page_offers_more_not_prev():
+    from nerve.channels.telegram import TelegramChannel, _SESSIONS_PAGE_SIZE
     sessions = [
-        {"id": f"s{n:02d}", "title": f"S{n}", "source": "telegram"} for n in range(12)
+        {"id": f"s{n:02d}", "title": f"S{n}", "source": "telegram"}
+        for n in range(_SESSIONS_PAGE_SIZE * 3)
     ]
-    counts = {s["id"]: 5 for s in sessions}
     ch = TelegramChannel.__new__(TelegramChannel)
-    ch.router = _FakeRouter(sessions, counts, current="s00")
+    ch.router = _FakeRouter(sessions, current="s00")
     _text, markup = await ch._sessions_view_for("telegram:1")
-    session_btns = [
-        b for row in markup.inline_keyboard for b in row
-        if b.callback_data.startswith("sess:") and b.callback_data != "sess:new"
+    cbs = _cbs_of(markup)
+    assert len(_switch_cbs(markup)) == _SESSIONS_PAGE_SIZE      # exactly one page
+    assert f"sess:page:{_SESSIONS_PAGE_SIZE}" in cbs            # ➡️ More → page 2
+    assert "sess:page:0" not in cbs                            # no ⬅️ Prev on page 1
+    assert "sess:new" in cbs
+
+
+@pytest.mark.asyncio
+async def test_sessions_view_middle_page_offers_prev_and_more():
+    from nerve.channels.telegram import TelegramChannel, _SESSIONS_PAGE_SIZE
+    sessions = [
+        {"id": f"s{n:03d}", "title": f"S{n}", "source": "telegram"}
+        for n in range(_SESSIONS_PAGE_SIZE * 3)
     ]
-    assert len(session_btns) == _SESSIONS_BUTTON_LIMIT       # keyboard capped
-    assert ch.router.count_calls == _SESSIONS_BUTTON_LIMIT   # stopped counting early
+    ch = TelegramChannel.__new__(TelegramChannel)
+    ch.router = _FakeRouter(sessions, current="s000")
+    off = _SESSIONS_PAGE_SIZE
+    text, markup = await ch._sessions_view_for("telegram:1", off)
+    cbs = _cbs_of(markup)
+    assert "sess:page:0" in cbs                                # ⬅️ Prev → page 1
+    assert f"sess:page:{off + _SESSIONS_PAGE_SIZE}" in cbs      # ➡️ More → page 3
+    assert "Page 2" in text
+    assert ch.router.calls[-1] == (_SESSIONS_PAGE_SIZE + 1, off, "s000")
+
+
+@pytest.mark.asyncio
+async def test_sessions_view_last_page_has_prev_no_more():
+    from nerve.channels.telegram import TelegramChannel, _SESSIONS_PAGE_SIZE
+    # Two pages exactly: at offset=page_size there is no further page.
+    sessions = [
+        {"id": f"s{n:02d}", "title": f"S{n}", "source": "telegram"}
+        for n in range(_SESSIONS_PAGE_SIZE * 2)
+    ]
+    ch = TelegramChannel.__new__(TelegramChannel)
+    ch.router = _FakeRouter(sessions, current="s00")
+    _text, markup = await ch._sessions_view_for("telegram:1", _SESSIONS_PAGE_SIZE)
+    cbs = _cbs_of(markup)
+    assert "sess:page:0" in cbs                                                # ⬅️ Prev present
+    assert not any(c.startswith("sess:page:") and c != "sess:page:0" for c in cbs)  # no ➡️ More
 
 
 def test_tail_empty_session():
@@ -237,69 +288,30 @@ def test_tail_active_status_shows_live_emoji():
     assert "🟢" in text and "•" not in text
 
 
-# --- star (kept-alive) toggle --------------------------------------------- #
+# --- star (kept-alive) marker (no per-row toggle) -------------------------- #
 
-def test_starred_session_shows_marker_and_filled_toggle():
+def test_starred_session_shows_marker_in_label_without_toggle_button():
     sessions = [
         {"id": "aaaa1111", "title": "Kept", "source": "web", "starred": True},
         {"id": "bbbb2222", "title": "Normal", "source": "web"},
     ]
     _text, markup = build_sessions_view(sessions, current_id=None)
     by_cb = {b.callback_data: b for b in _flat(markup)}
-    # Starred: switch label carries ⭐; its toggle button is the filled star.
+    # Starred: the switch label carries the ⭐ marker (read-only indicator).
     assert by_cb["sess:aaaa1111"].text == "⭐ Kept"
-    assert by_cb["sessstar:aaaa1111"].text == "⭐"
-    # Normal: no marker; toggle button is the hollow star.
+    # Normal: no marker.
     assert by_cb["sess:bbbb2222"].text == "Normal"
-    assert by_cb["sessstar:bbbb2222"].text == "☆"
+    # No per-row star toggle buttons — starring is via /star and /unstar, so the
+    # switch list stays one full-width tap-to-switch button per row (Telegram
+    # would render a cramped half-width 2nd column otherwise).
+    assert not any(
+        (b.callback_data or "").startswith("sessstar:") for b in _flat(markup)
+    )
 
 
 def test_sessions_view_explains_star_keeps_alive():
     text, _markup = build_sessions_view(
         [{"id": "aaaa1111", "title": "Work", "source": "web"}], current_id=None,
     )
-    assert "keeps a session alive" in text
-
-
-@pytest.mark.asyncio
-async def test_sessstar_callback_toggles_and_rerenders():
-    from nerve.channels.telegram import TelegramChannel
-
-    sessions = [{"id": "keep01", "title": "Keep", "source": "web"}]
-    ch = TelegramChannel.__new__(TelegramChannel)
-    router = _FakeRouter(sessions, {"keep01": 3}, current="keep01")
-    toggled = {}
-
-    async def _toggle(sid):
-        toggled["sid"] = sid
-        return True
-
-    router.toggle_session_starred = _toggle
-    ch.router = router
-
-    edited = {}
-
-    async def _safe_edit(query, text, markup, **kw):
-        edited["text"] = text
-
-    ch._safe_edit = _safe_edit
-
-    answers = []
-
-    class _Chat:
-        id = 1
-
-    class _Msg:
-        chat = _Chat()
-
-    class _Query:
-        data = "sessstar:keep01"
-        message = _Msg()
-
-        async def answer(self, *a, **k):
-            answers.append(a[0] if a else "")
-
-    await ch._handle_session_button(_Query())
-    assert toggled["sid"] == "keep01"          # toggle routed with the id
-    assert edited                              # list re-rendered in place
-    assert answers and "Kept alive" in answers[0]
+    assert "kept alive" in text.lower()
+    assert "/star" in text
