@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react';
-import { FileCheck, Play, Ban, Check } from 'lucide-react';
+import { FileCheck, Play, Ban, Check } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { useChatStore } from '../../../stores/chatStore';
+import { Button } from '../../ui';
 
 export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
   const pendingInteraction = useChatStore(s => s.pendingInteraction);
@@ -29,10 +30,10 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
       <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
         <div className="px-3 py-2.5 flex items-center gap-2">
           {wasApproved
-            ? <Check size={14} className="text-hue-green" />
-            : <Ban size={14} className="text-hue-red" />
+            ? <Check size={14} className="text-success" />
+            : <Ban size={14} className="text-error" />
           }
-          <span className="text-[13px] font-medium text-text-secondary">
+          <span className="text-sm leading-tight font-medium text-text-secondary">
             {isExitPlan ? 'Plan' : 'Plan mode'} {wasApproved ? 'approved' : 'declined'}
           </span>
         </div>
@@ -48,7 +49,7 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
       <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
         <div className="px-3 py-2.5 flex items-center gap-2">
           <FileCheck size={14} className="text-text-muted animate-pulse" />
-          <span className="text-[13px] text-text-muted">
+          <span className="text-sm leading-tight text-text-muted">
             {settling
               ? 'Resolving…'
               : (isExitPlan ? 'Waiting to approve plan...' : 'Waiting to enter plan mode...')}
@@ -67,7 +68,7 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
               ? <FileCheck size={15} className="text-accent" />
               : <Play size={15} className="text-accent" />
             }
-            <span className="text-[13px] font-medium text-text">
+            <span className="text-sm leading-tight font-medium text-text">
               {isExitPlan
                 ? 'Plan ready for approval'
                 : 'Claude wants to enter plan mode'
@@ -75,30 +76,34 @@ export function PlanApprovalBlock({ block }: { block: ToolCallBlockData }) {
             </span>
           </div>
           {isExitPlan && (
-            <p className="text-[12px] text-text-muted mb-3">
+            <p className="text-xs text-text-muted mb-3">
               Review the plan in the side panel, then approve or decline.
             </p>
           )}
           {isEnterPlan && (
-            <p className="text-[12px] text-text-muted mb-3">
+            <p className="text-xs text-text-muted mb-3">
               The agent will explore the codebase and design an implementation approach for your approval.
             </p>
           )}
           <div className="flex gap-2">
-            <button
+            <Button
+              variant="primary"
+              size="md"
+              className="flex-1"
               onClick={() => { setResponded(true); setApproved(true); answerInteraction(null); }}
-              className="flex-1 py-2 rounded-md text-[13px] font-medium bg-accent hover:bg-accent-hover text-white cursor-pointer transition-colors flex items-center justify-center gap-2"
             >
               <Check size={13} />
               {isExitPlan ? 'Approve' : 'Allow'}
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="secondary"
+              size="md"
+              className="flex-1"
               onClick={() => { setResponded(true); setApproved(false); denyInteraction('User declined.'); }}
-              className="flex-1 py-2 rounded-md text-[13px] font-medium bg-surface-raised hover:bg-surface-hover text-text-muted cursor-pointer transition-colors flex items-center justify-center gap-2"
             >
               <Ban size={13} />
               Decline
-            </button>
+            </Button>
           </div>
         </div>
       </div>

@@ -24,7 +24,7 @@ The `nerve init` wizard walks you through deployment, mode selection, API keys, 
 
 ### Server deployment
 - Python 3.13+
-- Node.js 18+ (for web UI build)
+- Node.js 22.12+ (for web UI build)
 - Anthropic API key **or** Claude subscription (via CLIProxyAPI proxy)
 
 ### Docker deployment

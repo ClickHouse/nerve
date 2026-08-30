@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronDown, ChevronRight, Loader2, OctagonX, Rocket } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2, OctagonX, Rocket } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { api, type WorkflowRun, type WorkflowRunStatus } from '../../../api/client';
 import { useWorkflowRunStore, isActiveRun } from '../../../stores/workflowRunStore';
+import { Button } from '../../ui';
 
 /** Extract readable text from MCP content blocks. */
 function extractText(result: string): string {
@@ -30,16 +31,21 @@ function statusLabel(status: WorkflowRunStatus): string {
   return status.replace(/_/g, ' ');
 }
 
+/**
+ * How the run ended — outcome, not identity, so this is the one colour map in
+ * the file that takes the status tokens rather than `hue-*`. (The Rocket glyph
+ * beside it stays `text-hue-amber`: that says "workflow run", not "went well".)
+ */
 function statusBadgeClasses(status: WorkflowRunStatus): string {
   switch (status) {
     case 'running':
-      return 'border-blue-400/25 bg-blue-400/10 text-hue-blue';
+      return 'border-info-border bg-info-bg text-info';
     case 'done':
-      return 'border-emerald-400/25 bg-emerald-400/10 text-hue-emerald';
+      return 'border-success-border bg-success-bg text-success';
     case 'failed':
-      return 'border-red-400/25 bg-red-400/10 text-hue-red';
+      return 'border-error-border bg-error-bg text-error';
     case 'budget_exhausted':
-      return 'border-amber-400/25 bg-amber-400/10 text-hue-amber';
+      return 'border-warning-border bg-warning-bg text-warning';
     default: // pending, killed
       return 'border-border bg-surface-raised text-text-muted';
   }
@@ -47,11 +53,11 @@ function statusBadgeClasses(status: WorkflowRunStatus): string {
 
 function StatusBadge({ status }: { status: WorkflowRunStatus }) {
   return (
-    <span className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-full border text-[10px] capitalize shrink-0 ${statusBadgeClasses(status)}`}>
+    <span className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-full border text-2xs capitalize shrink-0 ${statusBadgeClasses(status)}`}>
       {status === 'running' && (
         <span className="relative flex h-1.5 w-1.5">
-          <span className="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-60 animate-ping" />
-          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-400" />
+          <span className="absolute inline-flex h-full w-full rounded-full bg-info opacity-60 animate-ping" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-info" />
         </span>
       )}
       {statusLabel(status)}
@@ -59,28 +65,36 @@ function StatusBadge({ status }: { status: WorkflowRunStatus }) {
   );
 }
 
-/** Spend vs budget: emerald, amber from 80%, red at 100%. Unbudgeted runs show plain spend. */
+/**
+ * Spend vs budget: emerald, amber from 80%, red at 100%. Unbudgeted runs show
+ * plain spend.
+ *
+ * Only the *width* is data-driven, so it is the only thing in `style`; the
+ * colour is a three-step ramp, so it becomes a class. It uses `hue-*` rather
+ * than `bg-success`/`bg-warning`/`bg-error` because those tokens are Click UI's
+ * feedback *foregrounds* — pale mint / pale pink, meant to sit on the matching
+ * `-bg` tint. This bar sits on a neutral `bg-border-subtle` track, where the
+ * saturated theme-adaptive hues are what stay readable in both themes.
+ */
 function SpendLine({ run }: { run: WorkflowRun }) {
   if (run.budget_usd === null || run.budget_usd <= 0) {
     return (
-      <span className="text-[11px] text-text-dim tabular-nums whitespace-nowrap">
+      <span className="text-xs text-text-dim tabular-nums whitespace-nowrap">
         {fmtUsd(run.spent_usd)} spent
       </span>
     );
   }
   const pct = (run.spent_usd / run.budget_usd) * 100;
-  let color = '#10b981'; // emerald-500
-  if (pct >= 100) color = '#ef4444'; // red-500
-  else if (pct >= 80) color = '#f59e0b'; // amber-500
+  const barColor = pct >= 100 ? 'bg-hue-red' : pct >= 80 ? 'bg-hue-amber' : 'bg-hue-emerald';
   return (
     <div className="flex items-center gap-2 min-w-0" title={`${Math.round(pct)}% of budget`}>
-      <span className="text-[11px] text-text-dim tabular-nums shrink-0">
+      <span className="text-xs text-text-dim tabular-nums shrink-0">
         {fmtUsd(run.spent_usd)} of {fmtUsd(run.budget_usd)}
       </span>
       <div className="w-32 h-1.5 bg-border-subtle rounded-full overflow-hidden shrink-0">
         <div
-          className="h-full rounded-full transition-all duration-300"
-          style={{ width: `${Math.min(pct, 100)}%`, backgroundColor: color }}
+          className={`h-full rounded-full transition-all duration-300 ${barColor}`}
+          style={{ width: `${Math.min(pct, 100)}%` }}
         />
       </div>
     </div>
@@ -98,15 +112,15 @@ function RawResultFallback({ block }: { block: ToolCallBlockData }) {
         className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         <Rocket size={14} className="text-text-muted shrink-0" />
-        <span className="text-[13px] font-mono font-medium text-text-secondary truncate">{block.tool}</span>
-        <span className="text-[11px] text-text-faint shrink-0">run no longer available</span>
+        <span className="text-sm leading-tight font-mono font-medium text-text-secondary truncate">{block.tool}</span>
+        <span className="text-xs text-text-faint shrink-0">run no longer available</span>
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
       {expanded && (
         <div className="border-t border-border px-3 py-2">
-          <pre className="text-[12px] text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
+          <pre className="text-xs text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
             {text || 'No result recorded.'}
           </pre>
         </div>
@@ -152,8 +166,8 @@ export function WorkflowRunToolBlock({ block, runId }: { block: ToolCallBlockDat
     return (
       <div className="my-1.5 border border-border rounded-lg bg-surface px-3 py-2 flex items-center gap-2">
         <Loader2 size={14} className="animate-spin text-text-muted shrink-0" />
-        <span className="text-[13px] text-text-secondary">Workflow run</span>
-        <span className="text-[11px] font-mono text-text-faint">{runId}</span>
+        <span className="text-sm leading-tight text-text-secondary">Workflow run</span>
+        <span className="text-xs font-mono text-text-faint">{runId}</span>
       </div>
     );
   }
@@ -187,19 +201,20 @@ export function WorkflowRunToolBlock({ block, runId }: { block: ToolCallBlockDat
       <div className="flex items-center gap-2 px-3 py-2 min-w-0">
         <Rocket size={14} className="text-hue-amber shrink-0" />
         <StatusBadge status={run.status} />
-        <span className="text-[13px] font-medium text-text-secondary truncate" title={title}>{title}</span>
-        <span className="text-[11px] font-mono text-text-faint shrink-0">{run.id}</span>
+        <span className="text-sm leading-tight font-medium text-text-secondary truncate" title={title}>{title}</span>
+        <span className="text-xs font-mono text-text-faint shrink-0">{run.id}</span>
         {active && (
-          <button
-            type="button"
+          <Button
+            variant="danger"
+            size="xs"
+            className="ml-auto"
             onClick={() => { void onKill(); }}
             disabled={killing}
-            className="ml-auto shrink-0 inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border border-red-400/25 bg-red-400/10 text-hue-red text-[11px] hover:bg-red-400/20 disabled:opacity-50 cursor-pointer"
             title="Stop this run and mark it as killed"
           >
             {killing ? <Loader2 size={11} className="animate-spin" /> : <OctagonX size={11} />}
             Kill
-          </button>
+          </Button>
         )}
       </div>
 
@@ -208,12 +223,12 @@ export function WorkflowRunToolBlock({ block, runId }: { block: ToolCallBlockDat
       </div>
 
       {killError && (
-        <div className="px-3 pb-2 text-[11px] text-hue-red break-words">{killError}</div>
+        <div className="px-3 pb-2 text-xs text-error break-words">{killError}</div>
       )}
 
       {showError && errorText && (
         <div className="px-3 pb-2">
-          <pre className={`text-[11px] leading-5 whitespace-pre-wrap break-words max-h-40 overflow-y-auto ${run.status === 'budget_exhausted' ? 'text-hue-amber' : 'text-hue-red'}`}>
+          <pre className={`text-xs leading-5 whitespace-pre-wrap break-words max-h-40 overflow-y-auto ${run.status === 'budget_exhausted' ? 'text-warning' : 'text-error'}`}>
             {errorText}
           </pre>
         </div>
@@ -221,22 +236,23 @@ export function WorkflowRunToolBlock({ block, runId }: { block: ToolCallBlockDat
 
       {resultText && (
         <div className="px-3 pb-2">
-          <pre className="text-[11px] leading-5 whitespace-pre-wrap break-words max-h-64 overflow-y-auto text-text-muted">
+          <pre className="text-xs leading-5 whitespace-pre-wrap break-words max-h-64 overflow-y-auto text-text-muted">
             {resultShown}
           </pre>
           {resultTruncated && (
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="xs"
+              className="mt-1 -ml-2"
               onClick={() => setShowFullResult(v => !v)}
-              className="mt-1 text-[11px] text-text-dim hover:text-text-secondary cursor-pointer"
             >
               {showFullResult ? 'Show less' : 'Show full result'}
-            </button>
+            </Button>
           )}
         </div>
       )}
 
-      <div className="px-3 py-1.5 border-t border-border-subtle flex items-center gap-3 text-[11px]">
+      <div className="px-3 py-1.5 border-t border-border-subtle flex items-center gap-3 text-xs">
         {run.session_id && (
           <Link
             to={`/chat/${run.session_id}`}

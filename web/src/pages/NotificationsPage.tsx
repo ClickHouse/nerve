@@ -1,28 +1,35 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus, RotateCw, Clock } from 'lucide-react';
+import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus, RotateCw, Clock } from '../components/ui/icons';
+import { Badge, Button, IconButton, TextField, type BadgeTone, type ButtonVariant } from '../components/ui';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 import { PageHeader } from '../components/ui/PageHeader';
 
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
-  answered: 'bg-emerald-400/10 text-hue-emerald border-emerald-400/20',
-  expired: 'bg-border-subtle/50 text-text-muted border-border-subtle',
-  dismissed: 'bg-border-subtle/50 text-text-dim border-border-subtle',
-  silenced: 'bg-border-subtle/50 text-text-dim border-border-subtle',
+/** Lifecycle state — a status, so it takes a `Badge` tone. */
+const STATUS_TONES: Record<string, BadgeTone> = {
+  pending: 'warning',
+  answered: 'success',
+  expired: 'neutral',
+  dismissed: 'neutral',
+  silenced: 'neutral',
 };
 
+/**
+ * Priority dot. Only urgent and high get one; `bg-error`/`bg-warning` are the
+ * solid-fill status tokens, so the dot tracks the theme.
+ */
 const PRIORITY_DOTS: Record<string, string> = {
-  urgent: 'bg-red-500',
-  high: 'bg-orange-400',
+  urgent: 'bg-error',
+  high: 'bg-warning',
   normal: '',
   low: '',
 };
 
-const TYPE_BADGE_STYLES: Record<string, string> = {
-  question: 'bg-blue-400/10 text-hue-blue border-blue-400/20',
-  approval: 'bg-violet-400/10 text-hue-violet border-violet-400/20',
-  notify: 'bg-border-subtle/50 text-text-muted border-border-subtle',
+/** Which kind of notification this is — identity, not status. */
+const TYPE_BADGE_TONES: Record<string, BadgeTone> = {
+  question: 'info',
+  approval: 'purple',
+  notify: 'neutral',
 };
 
 const STATUS_FILTERS = [
@@ -43,17 +50,11 @@ const TYPE_FILTERS = [
 // Approval-kind button styling. Keyed by the option ``value`` the
 // dispatcher receives, not the human label, so the styling stays
 // stable even when labels are renamed.
-const APPROVAL_BUTTON_STYLES: Record<string, string> = {
-  approve:
-    'bg-emerald-400/15 text-hue-emerald border-emerald-400/30 hover:bg-emerald-400/25',
-  decline:
-    'bg-red-400/15 text-hue-red border-red-400/30 hover:bg-red-400/25',
-  snooze_24h:
-    'bg-border-subtle/40 text-text-muted border-border-subtle hover:bg-border-subtle/60',
+const APPROVAL_BUTTON_VARIANTS: Record<string, ButtonVariant> = {
+  approve: 'success',
+  decline: 'danger',
+  snooze_24h: 'secondary',
 };
-
-const APPROVAL_DEFAULT_BUTTON_STYLE =
-  'bg-accent/15 text-accent border-accent/30 hover:bg-accent/25';
 
 const APPROVAL_BUTTON_ICONS: Record<string, typeof Check> = {
   approve: Check,
@@ -133,19 +134,20 @@ function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
 
   if (!open) {
     return (
-      <button
+      <Button
+        variant="ghost"
+        size="md"
         onClick={() => setOpen(true)}
-        className="px-3 py-1 text-sm text-text-dim border border-dashed border-border rounded-lg hover:border-border-subtle hover:text-text-muted cursor-pointer"
+        className="border border-dashed border-border rounded-lg hover:border-border-subtle"
       >
         Custom answer...
-      </button>
+      </Button>
     );
   }
 
   return (
     <div className="flex items-center gap-2 w-full mt-1">
-      <input
-        type="text"
+      <TextField
         autoFocus
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -157,10 +159,13 @@ function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
           }
           if (e.key === 'Escape') setOpen(false);
         }}
-        className="flex-1 bg-surface-raised border border-border-subtle rounded-lg px-3 py-1 text-sm text-text outline-none focus:border-accent"
+        fullWidth={false}
+        className="flex-1"
         placeholder="Type your answer..."
       />
-      <button
+      <Button
+        variant="accentSoft"
+        size="md"
         onClick={() => {
           if (text.trim()) {
             onSubmit(text.trim());
@@ -168,16 +173,12 @@ function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
             setOpen(false);
           }
         }}
-        className="px-3 py-1 bg-accent/15 text-accent rounded-lg text-sm border border-accent/30 hover:bg-accent/25 cursor-pointer"
       >
         Send
-      </button>
-      <button
-        onClick={() => { setText(''); setOpen(false); }}
-        className="text-text-dim hover:text-text-muted cursor-pointer"
-      >
+      </Button>
+      <IconButton size="xs" label="Cancel" onClick={() => { setText(''); setOpen(false); }}>
         <X size={14} />
-      </button>
+      </IconButton>
     </div>
   );
 }
@@ -205,53 +206,55 @@ function NotificationCard({ notif }: { notif: Notification }) {
               floating beside the second line. */}
           <div className="flex items-start gap-2">
             {priorityDot && <span className={`w-2 h-2 mt-1.5 rounded-full shrink-0 ${priorityDot}`} />}
-            <h3 className="font-medium text-[15px] text-text">{notif.title}</h3>
+            <h3 className="font-medium text-base text-text">{notif.title}</h3>
           </div>
           {notif.body && (
             <p className="text-sm text-text-muted mt-1 whitespace-pre-wrap">{notif.body}</p>
           )}
           {isApproval && notif.target_kind && notif.target_id && (
-            <p className="text-[11px] text-text-faint mt-1 font-mono">
+            <p className="text-xs text-text-faint mt-1 font-mono">
               {notif.target_kind}: {notif.target_id}
             </p>
           )}
         </div>
-        <div className="flex flex-wrap items-center gap-2 text-[12px] shrink-0 order-0 sm:order-none">
+        <div className="flex flex-wrap items-center gap-2 shrink-0 order-0 sm:order-none">
           {(notif.redelivery_count ?? 0) > 0 && (
-            <span
-              className="flex items-center gap-1 px-2 py-0.5 rounded-full border bg-sky-400/10 text-hue-blue border-sky-400/20"
+            <Badge
+              tone="info"
+              size="sm"
+              pill
+              outline
               title={`Re-delivered after snooze (cycle ${notif.redelivery_count})`}
             >
               <RotateCw size={10} />
               {(notif.redelivery_count ?? 0) > 1 ? `×${notif.redelivery_count}` : 're-delivered'}
-            </span>
+            </Badge>
           )}
-          <span className={`px-2 py-0.5 rounded-full border ${STATUS_STYLES[notif.status] || STATUS_STYLES.dismissed}`}>
+          <Badge tone={STATUS_TONES[notif.status] || 'neutral'} size="sm" pill outline>
             {notif.status}
-          </span>
-          <span className={`px-2 py-0.5 rounded-full border ${TYPE_BADGE_STYLES[notif.type] || TYPE_BADGE_STYLES.notify}`}>
+          </Badge>
+          <Badge tone={TYPE_BADGE_TONES[notif.type] || 'neutral'} size="sm" pill outline>
             {notif.type}
-          </span>
+          </Badge>
         </div>
       </div>
 
       {/* Session link + meta */}
-      <div className="flex items-center gap-3 mt-2 text-[12px]">
-        <button
+      <div className="flex items-center gap-3 mt-2 text-xs">
+        <Button
+          variant="link"
+          size="xs"
           onClick={() => navigate(`/chat/${notif.session_id}`)}
-          className="text-accent hover:underline cursor-pointer"
+          className="min-w-0 shrink whitespace-normal wrap-anywhere text-left"
         >
           Session: {notif.session_title || notif.session_id}
-        </button>
+        </Button>
         <span className="text-text-faint">{notif.created_at?.slice(0, 16).replace('T', ' ')}</span>
         {notif.status === 'pending' && notif.type === 'notify' && (
-          <button
-            onClick={() => dismissNotification(notif.id)}
-            className="flex items-center gap-1 px-2 py-0.5 rounded text-text-muted hover:text-text-secondary hover:bg-surface-hover cursor-pointer transition-colors"
-          >
+          <Button variant="ghost" size="xs" onClick={() => dismissNotification(notif.id)}>
             <EyeOff size={11} />
             <span>Dismiss</span>
-          </button>
+          </Button>
         )}
       </div>
 
@@ -259,13 +262,14 @@ function NotificationCard({ notif }: { notif: Notification }) {
       {notif.type === 'question' && notif.status === 'pending' && (
         <div className="mt-3 flex flex-wrap gap-2">
           {options?.map((opt: string) => (
-            <button
+            <Button
               key={opt}
+              variant="accentSoft"
+              size="md"
               onClick={() => answerNotification(notif.id, opt)}
-              className="px-3 py-1.5 bg-accent/15 text-accent rounded-lg text-sm border border-accent/30 hover:bg-accent/25 cursor-pointer transition-colors"
             >
               {opt}
-            </button>
+            </Button>
           ))}
           <FreeTextInput onSubmit={(text) => answerNotification(notif.id, text)} />
         </div>
@@ -276,17 +280,22 @@ function NotificationCard({ notif }: { notif: Notification }) {
         <div className="mt-3 flex flex-wrap gap-2">
           {options?.map((value: string) => {
             const Icon = APPROVAL_BUTTON_ICONS[value];
-            const buttonStyle = APPROVAL_BUTTON_STYLES[value] || APPROVAL_DEFAULT_BUTTON_STYLE;
+            // `accentSoft` for anything outside approve/decline/snooze_24h, so
+            // an unrecognised option still reads as the same kind of control as
+            // the `success`/`danger` siblings beside it.
+            const variant = APPROVAL_BUTTON_VARIANTS[value] || 'accentSoft';
             const label = approvalLabel(value, optionLabels);
             return (
-              <button
+              <Button
                 key={value}
+                variant={variant}
+                size="md"
+                className="gap-1.5"
                 onClick={() => answerNotification(notif.id, value)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm border cursor-pointer transition-colors ${buttonStyle}`}
               >
                 {Icon ? <Icon size={14} /> : null}
                 <span>{label}</span>
-              </button>
+              </Button>
             );
           })}
         </div>
@@ -294,7 +303,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
 
       {/* Snoozed: still pending server-side, will be re-delivered */}
       {notif.status === 'pending' && notif.redeliver_at && (
-        <div className="mt-2 flex items-center gap-1.5 text-[12px] text-text-dim">
+        <div className="mt-2 flex items-center gap-1.5 text-xs text-text-dim">
           <Clock size={12} className="shrink-0" />
           <span>
             Snoozed — returns {formatLocalTime(notif.redeliver_at)}. You can still decide now.
@@ -304,7 +313,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
 
       {/* Show answer if answered */}
       {notif.status === 'answered' && (
-        <div className="mt-2 text-sm text-hue-emerald">
+        <div className="mt-2 text-sm text-success">
           Answer: {isApproval ? approvalLabel(notif.answer || '', optionLabels) : notif.answer}{' '}
           <span className="text-text-faint">(via {notif.answered_by})</span>
         </div>
@@ -314,7 +323,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
       {notif.status === 'silenced' && (() => {
         const info = parseSilenceInfo(notif);
         return (
-          <div className="mt-2 flex items-start gap-1.5 text-[12px] text-text-dim">
+          <div className="mt-2 flex items-start gap-1.5 text-xs text-text-dim">
             <BellOff size={12} className="mt-0.5 shrink-0" />
             <div className="min-w-0">
               <span>Silenced{info?.silenced_by ? ` by ${info.silenced_by}` : ''} — not delivered.</span>
@@ -335,7 +344,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
 function SilenceRow({ s, onRemove }: { s: Silence; onRemove: () => void }) {
   const overridden = s.override_count > 0;
   return (
-    <div className="flex items-center gap-3 px-3 py-2 bg-surface-raised border border-border-subtle rounded-lg text-[12px]">
+    <div className="flex items-center gap-3 px-3 py-2 bg-surface-raised border border-border-subtle rounded-lg text-xs">
       <code className="font-mono text-text-muted shrink-0">{s.id}</code>
       <code className="font-mono text-accent truncate flex-1 min-w-0">{s.pattern}</code>
       <span className="text-text-muted shrink-0">
@@ -349,15 +358,11 @@ function SilenceRow({ s, onRemove }: { s: Silence; onRemove: () => void }) {
         </span>
       )}
       {overridden && (
-        <span className="text-hue-yellow shrink-0" title="Force-overridden — this pattern may be too broad">⚠</span>
+        <span className="text-warning shrink-0" title="Force-overridden — this pattern may be too broad">⚠</span>
       )}
-      <button
-        onClick={onRemove}
-        className="text-text-dim hover:text-hue-red cursor-pointer shrink-0"
-        title="Remove silence"
-      >
+      <IconButton size="xs" variant="dangerGhost" label="Remove silence" onClick={onRemove}>
         <Trash2 size={13} />
-      </button>
+      </IconButton>
     </div>
   );
 }
@@ -393,49 +398,47 @@ function SilencesPanel() {
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         <BellOff size={15} className="text-text-muted" />
         <h2 className="text-sm font-semibold text-text">Silences</h2>
-        <span className="text-[12px] text-text-faint">
+        <span className="text-xs text-text-faint">
           Suppress known-benign alert classes — matched notifications are recorded but not delivered (priority unchanged).
         </span>
       </div>
 
       <div className="flex flex-wrap items-center gap-2 mb-2">
-        <input
-          type="text"
+        <TextField
           value={pattern}
           onChange={(e) => setPattern(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
           placeholder="Regex pattern (matches title + body)"
-          className="flex-1 min-w-[14rem] bg-surface-raised border border-border-subtle rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-accent font-mono"
+          fullWidth={false}
+          className="flex-1 min-w-[14rem] font-mono"
         />
-        <input
-          type="text"
+        <TextField
           value={reason}
           onChange={(e) => setReason(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
           placeholder="Reason"
-          className="flex-1 min-w-[10rem] bg-surface-raised border border-border-subtle rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
+          fullWidth={false}
+          className="flex-1 min-w-[10rem]"
         />
-        <input
+        <TextField
           type="number"
           min="0"
           value={ttlHours}
           onChange={(e) => setTtlHours(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
           placeholder="TTL h (0=∞)"
-          className="w-28 bg-surface-raised border border-border-subtle rounded-lg px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
+          fullWidth={false}
+          className="w-28"
         />
-        <button
-          onClick={submit}
-          disabled={adding}
-          className="flex items-center gap-1 px-3 py-1.5 bg-accent/15 text-accent rounded-lg text-sm border border-accent/30 hover:bg-accent/25 cursor-pointer disabled:opacity-50"
-        >
+        <Button variant="accentSoft" size="md"
+          onClick={submit} disabled={adding}>
           <Plus size={14} /> Add
-        </button>
+        </Button>
       </div>
-      {error && <div className="text-[12px] text-hue-red mb-2">{error}</div>}
+      {error && <div className="text-xs text-error mb-2">{error}</div>}
 
       {silences.length === 0 ? (
-        <div className="text-[12px] text-text-faint">No silences configured.</div>
+        <div className="text-xs text-text-faint">No silences configured.</div>
       ) : (
         <div className="space-y-1.5">
           {silences.map((s) => (
@@ -465,59 +468,39 @@ export function NotificationsPage() {
           <>
             {/* Status filters */}
             {STATUS_FILTERS.map(f => (
-              <button
-                key={f.value}
-                onClick={() => setFilter(f.value)}
-                className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
-                  ${filter === f.value
-                    ? 'bg-accent/15 text-accent border-accent/30'
-                    : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                  }`}
-              >
+              <Button key={f.value} variant="pill" active={filter === f.value}
+                onClick={() => setFilter(f.value)}>
                 {f.label}
-              </button>
+              </Button>
             ))}
             {/* Type filters — separated by a rule rather than the old ml-1,
                 which read as one undifferentiated run of pills once they
                 shared a scroller. */}
             <span className="mx-1 h-4 w-px shrink-0 bg-border-subtle" aria-hidden="true" />
             {TYPE_FILTERS.map(f => (
-              <button
-                key={f.value}
-                onClick={() => setTypeFilter(f.value)}
-                className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
-                  ${typeFilter === f.value
-                    ? 'bg-accent/15 text-accent border-accent/30'
-                    : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-                  }`}
-              >
+              <Button key={f.value} variant="pill" active={typeFilter === f.value}
+                onClick={() => setTypeFilter(f.value)}>
                 {f.label}
-              </button>
+              </Button>
             ))}
           </>
         }
         actions={
           <>
-          <button
-            onClick={() => setShowSilences(v => !v)}
-            className={`flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border cursor-pointer transition-colors whitespace-nowrap
-              ${showSilences
-                ? 'bg-accent/15 text-accent border-accent/30'
-                : 'border-border text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-              }`}
-          >
+          {/* A toggle, not a filter chip, so it keeps the rounded-lg button
+              shape — `pill` supplies the same active treatment either way. */}
+          <Button variant="pill" active={showSilences}
+            className="rounded-lg whitespace-nowrap"
+            onClick={() => setShowSilences(v => !v)}>
             <BellOff size={13} />
             Silences
-          </button>
+          </Button>
           {/* Dismiss All */}
           {pendingCount > 0 && (
-            <button
-              onClick={dismissAll}
-              className="flex items-center gap-1.5 px-3 py-1 text-[12px] rounded-lg border border-border text-text-muted hover:text-text-secondary hover:border-border hover:bg-surface-raised cursor-pointer transition-colors whitespace-nowrap"
-            >
+            <Button variant="secondary" className="whitespace-nowrap" onClick={dismissAll}>
               <CheckCheck size={13} />
               Dismiss All
-            </button>
+            </Button>
           )}
           </>
         }

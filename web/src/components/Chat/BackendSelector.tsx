@@ -1,4 +1,4 @@
-import { Sparkle, SquareTerminal } from 'lucide-react';
+import { Sparkle, SquareTerminal } from '../ui/icons';
 import { useChatStore } from '../../stores/chatStore';
 
 /**
@@ -19,12 +19,12 @@ const STYLES: Record<string, {
 }> = {
   claude: {
     icon: Sparkle,
-    active: 'text-hue-orange bg-orange-500/10 shadow-[inset_0_0_0_1px_rgba(249,115,22,0.3)]',
+    active: 'text-hue-orange bg-hue-orange/10 ring-1 ring-inset ring-hue-orange/30',
     dot: 'bg-hue-orange',
   },
   codex: {
     icon: SquareTerminal,
-    active: 'text-hue-teal bg-teal-400/10 shadow-[inset_0_0_0_1px_rgba(45,212,191,0.3)]',
+    active: 'text-hue-teal bg-hue-teal/10 ring-1 ring-inset ring-hue-teal/30',
     dot: 'bg-hue-teal',
   },
 };
@@ -59,7 +59,7 @@ export function BackendSelector({ disabled }: { disabled?: boolean }) {
             title={opt.available === false
               ? `${opt.label} unavailable — ${opt.reason ?? 'preflight failed'}`
               : `${opt.label} — ${opt.model}${opt.id === backendDefault ? ' (default)' : ''}. Applies to this new chat; the choice is fixed once the conversation starts.`}
-            className={`h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-all cursor-pointer disabled:opacity-30 disabled:cursor-default ${
+            className={`h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-sm font-medium transition-all cursor-pointer disabled:opacity-30 disabled:cursor-default ${
               isActive
                 ? style.active
                 : 'text-text-muted hover:text-text-secondary hover:bg-surface'
