@@ -1551,10 +1551,33 @@ class TelegramChannel(BaseChannel):
 
         return blocks, "\n".join(parts)
 
+    def _is_delivery_only_sink(self, chat: Any) -> bool:
+        """True when ``chat`` is a configured non-private notification sink.
+
+        ``notifications.telegram_chat_id`` can be pointed at a dedicated group
+        so pushes (the notify tool, async questions/approvals, tg-notify.sh)
+        land there instead of the owner's DM. Such a group is delivery-only:
+        inbound messages must not start an agent turn. A DM sink (the chat id
+        equals the user's own private chat) stays interactive, hence the
+        non-private requirement. Inline-button callbacks are handled
+        separately, so questions/approvals delivered here stay answerable.
+        """
+        notif_chat = self.config.notifications.telegram_chat_id
+        return bool(notif_chat) and chat.id == notif_chat and chat.type != "private"
+
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
         if not self._is_authorized(update.effective_user.id):
+            return
+
+        # Delivery-only notification sink: never start an agent turn on a
+        # message that arrives in the notifications group (a one-way channel).
+        if self._is_delivery_only_sink(update.effective_chat):
+            logger.info(
+                "Ignoring inbound message in delivery-only notification chat %s",
+                update.effective_chat.id,
+            )
             return
 
         # Media group (album) — collect all parts before processing
