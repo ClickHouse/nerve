@@ -19,6 +19,7 @@ export function hydrateMessage(raw: any): ChatMessage {
       blocks: userBlocks,
       channel: raw.channel,
       created_at: raw.created_at,
+      native_turn_id: raw.native_turn_id,
     };
   }
 
@@ -76,5 +77,6 @@ export function hydrateMessage(raw: any): ChatMessage {
     blocks,
     channel: raw.channel,
     created_at: raw.created_at,
+    native_turn_id: raw.native_turn_id,
   };
 }

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, UserMessage
 
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import SessionSpec, TransportDiedError
@@ -245,6 +245,71 @@ async def test_receive_turn_raises_on_idle_timeout():
     assert seen == _translated(messages)
     # The underlying iterator was closed before the exception propagated.
     assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_captures_fork_anchor_uuid():
+    """The turn's TurnCompleted carries the last MAIN-CHAIN transcript-entry
+    uuid as native_turn_id — the ``resume_session_at`` fork anchor. Sidechain
+    (subagent) entries and uuid-less messages must not win."""
+    messages = [
+        AssistantMessage(content=[TextBlock(text="a")], model="m", uuid="uuid-1"),
+        # Sidechain entry arrives later but is not a valid truncation point.
+        AssistantMessage(
+            content=[TextBlock(text="sub")], model="m",
+            uuid="uuid-side", parent_tool_use_id="tool-1",
+        ),
+        AssistantMessage(content=[TextBlock(text="b")], model="m", uuid="uuid-2"),
+        # End-turn tool shape: the kept turn can close on a user entry.
+        UserMessage(content=[], uuid="uuid-3"),
+        _result_msg(),
+    ]
+    sdk = _StubClient(messages)
+    client = _turn_client(sdk, "sess-fork", idle_timeout=5.0)
+    completed = [
+        e async for e in client.receive_turn()
+        if isinstance(e, ev.TurnCompleted)
+    ]
+    assert len(completed) == 1
+    assert completed[0].native_turn_id == "uuid-3"
+
+
+@pytest.mark.asyncio
+async def test_start_turn_resets_fork_anchor():
+    """A new turn must not inherit the previous turn's anchor uuid."""
+
+    class _QueryStub:
+        async def query(self, *_a, **_k):
+            return None
+
+    client = _turn_client(_StubClient([]), "sess-reset", idle_timeout=5.0)
+    client._last_entry_uuid = "stale-uuid"
+    client._sdk = _QueryStub()
+    from nerve.agent.backends.base import TurnInput
+    await client.start_turn(TurnInput(text="hi"))
+    assert client._last_entry_uuid is None
+
+
+def test_claude_options_pass_resume_session_at_only_for_forks(tmp_path):
+    """fork_last_turn_id maps to resume_session_at, gated on spec.fork —
+    without fork_session the flag would truncate the ORIGINAL session."""
+    cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    backend = ClaudeBackend(SimpleNamespace(
+        config=lambda: cfg,
+        claude_plugins=lambda: [],
+    ))
+    base = dict(
+        session_id="fork-opts", source="web", model=cfg.agent.model,
+        effort="high", system_prompt="p", cwd=str(tmp_path),
+        resume_native_id="native-1", fork_last_turn_id="uuid-9",
+    )
+    with patch.object(backend, "_build_mcp_servers", return_value={}), \
+         patch.object(backend, "_build_hooks", return_value={}):
+        forked = backend._build_options(SessionSpec(**base, fork=True))
+        plain = backend._build_options(SessionSpec(**base, fork=False))
+    assert forked.fork_session is True
+    assert forked.resume_session_at == "uuid-9"
+    assert plain.resume_session_at is None
 
 
 @pytest.mark.asyncio

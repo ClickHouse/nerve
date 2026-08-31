@@ -2586,9 +2586,14 @@ class AgentEngine:
                             fork_last_turn_id = await self.db.get_native_turn_at_message(
                                 parent_id, fork_msg,
                             )
-                            if parent.get("backend") == "codex" and not fork_last_turn_id:
+                            # Both backends truncate by native turn id now
+                            # (codex: thread/fork lastTurnId; claude:
+                            # --resume-session-at). A message fork without a
+                            # mapping would silently carry the FULL context —
+                            # the opposite of what was asked — so refuse.
+                            if not fork_last_turn_id:
                                 raise ValueError(
-                                    "Cannot fork this Codex session at the selected "
+                                    "Cannot fork this session at the selected "
                                     "message: no native turn mapping is available."
                                 )
 

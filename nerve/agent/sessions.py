@@ -500,8 +500,15 @@ class SessionManager:
     ) -> dict:
         """Create a forked session from an existing one.
 
-        The fork is a new session that can optionally be linked back to a
-        specific message point in the source session.
+        The fork is a new session that branches the source's *native*
+        conversation (Claude ``--fork-session``, Codex ``thread/fork``) on
+        its first turn — optionally truncated at a specific message point.
+        The source's messages up to that point are copied into the fork so
+        the new chat displays exactly the history the agent remembers.
+
+        Raises ``ValueError`` when the source doesn't exist, has no native
+        conversation yet, or ``at_message_id`` can't be mapped to a native
+        turn (pre-mapping history — see ``get_native_turn_at_message``).
 
         Args:
             source: Override the source field (default: inherit from parent).
@@ -509,6 +516,26 @@ class SessionManager:
         parent = await self.db.get_session(source_session_id)
         if not parent:
             raise ValueError(f"Source session not found: {source_session_id}")
+        if not parent.get("sdk_session_id"):
+            raise ValueError(
+                "Nothing to fork yet — this chat has no agent conversation."
+            )
+
+        # Resolve the fork point up front so a bad anchor fails the API
+        # call, not the fork's first message. The engine re-resolves the
+        # same mapping when it builds the client (source history is
+        # immutable, so both resolutions agree).
+        fork_turn_id: str | None = None
+        if at_message_id is not None:
+            fork_turn_id = await self.db.get_native_turn_at_message(
+                source_session_id, at_message_id,
+            )
+            if not fork_turn_id:
+                raise ValueError(
+                    "Cannot fork at that message: it has no native turn "
+                    "mapping (recorded per turn since this feature shipped). "
+                    "Fork the whole chat instead."
+                )
 
         fork_id = f"fork-{str(uuid.uuid4())[:8]}"
         fork_title = title or f"Fork of {parent.get('title', source_session_id)}"
@@ -522,6 +549,15 @@ class SessionManager:
             backend=parent.get("backend") or "claude",
             model=parent.get("model"),
             cwd=parent.get("cwd"),
+        )
+        copied = await self.db.copy_messages_to_session(
+            source_session_id, fork_id, up_to_native_turn_id=fork_turn_id,
+        )
+        session["message_count"] = copied
+        logger.info(
+            "Forked session %s from %s (%d messages copied%s)",
+            fork_id, source_session_id, copied,
+            f", at turn {fork_turn_id[:12]}" if fork_turn_id else "",
         )
         return session
 

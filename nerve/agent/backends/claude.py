@@ -544,6 +544,14 @@ class ClaudeBackend:
             betas=betas,
             resume=spec.resume_native_id,
             fork_session=spec.fork,
+            # Mid-conversation fork: truncate the resumed transcript at the
+            # kept turn's last entry (we record it per turn as
+            # native_turn_id — see ClaudeClient._translate_and_capture).
+            # Guarded on spec.fork: without fork_session this flag would
+            # truncate the ORIGINAL session in place.
+            resume_session_at=(
+                spec.fork_last_turn_id if spec.fork else None
+            ),
             hooks=hooks,
             stderr=_cli_stderr,
             extra_args=extra_args,
@@ -963,6 +971,10 @@ class ClaudeBackend:
 class ClaudeClient(AgentClient):
     """One live Claude Code CLI subprocess for one nerve session."""
 
+    # Class-level default so test doubles built via ``__new__`` (and any
+    # partially-initialized instance) read None instead of raising.
+    _last_entry_uuid: str | None = None
+
     def __init__(self, spec: SessionSpec, options: ClaudeAgentOptions):
         self._spec = spec
         self._options = options
@@ -971,6 +983,11 @@ class ClaudeClient(AgentClient):
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
         self.model: str = options.model or ""
+        # Last main-chain transcript-entry uuid observed this turn — the
+        # fork anchor (``resume_session_at`` wants "the last transcript
+        # entry of the turn you are keeping"). Reset per turn; attached to
+        # TurnCompleted as native_turn_id (codex parity).
+        self._last_entry_uuid: str | None = None
 
     # -- protocol ------------------------------------------------------- #
 
@@ -982,6 +999,10 @@ class ClaudeClient(AgentClient):
         await self._sdk.connect()
 
     async def start_turn(self, turn: TurnInput) -> None:
+        # Per-turn fork anchor: a turn that yields no transcript entries
+        # (errors out early) must not inherit the previous turn's uuid —
+        # a stale anchor would fork at the WRONG turn.
+        self._last_entry_uuid = None
         try:
             if turn.images or turn.documents:
                 blocks = self._build_content_blocks(turn)
@@ -1115,7 +1136,22 @@ class ClaudeClient(AgentClient):
         msg_sid = getattr(message, "session_id", None)
         if msg_sid:
             self._native_session_id = msg_sid
-        return translate_message(message)
+        # Track the last MAIN-CHAIN transcript entry uuid (assistant text /
+        # tool_use and user tool_result rows both count — a turn ending on
+        # an end-turn tool closes on a user entry). Sidechain (subagent)
+        # entries are skipped: they interleave mid-turn and are not valid
+        # truncation points for ``resume_session_at``.
+        if isinstance(message, (AssistantMessage, UserMessage)):
+            if getattr(message, "parent_tool_use_id", None) is None:
+                entry_uuid = getattr(message, "uuid", None)
+                if entry_uuid:
+                    self._last_entry_uuid = str(entry_uuid)
+        events = translate_message(message)
+        if self._last_entry_uuid:
+            for event in events:
+                if isinstance(event, ev.TurnCompleted):
+                    event.native_turn_id = self._last_entry_uuid
+        return events
 
     async def interrupt(self) -> None:
         await self._sdk.interrupt()
