@@ -1552,17 +1552,25 @@ class TelegramChannel(BaseChannel):
         return blocks, "\n".join(parts)
 
     def _is_delivery_only_sink(self, chat: Any) -> bool:
-        """True when ``chat`` is a configured non-private notification sink.
+        """True when ``chat`` is an opted-in, non-private notification sink.
 
         ``notifications.telegram_chat_id`` can be pointed at a dedicated group
         so pushes (the notify tool, async questions/approvals, tg-notify.sh)
-        land there instead of the owner's DM. Such a group is delivery-only:
-        inbound messages must not start an agent turn. A DM sink (the chat id
-        equals the user's own private chat) stays interactive, hence the
-        non-private requirement. Inline-button callbacks are handled
-        separately, so questions/approvals delivered here stay answerable.
+        land there instead of the owner's DM. When
+        ``notifications.delivery_only_sink`` is enabled, such a group is
+        delivery-only: inbound messages must not start an agent turn.
+
+        Gated behind the opt-in flag (default off) so an existing install that
+        used a group as the sink and still chatted there is unaffected. A DM
+        sink (chat id == the user's own private chat) stays interactive
+        regardless, hence the non-private requirement. Inline-button callbacks
+        are handled separately, so questions/approvals delivered here stay
+        answerable.
         """
-        notif_chat = self.config.notifications.telegram_chat_id
+        notif = self.config.notifications
+        if not getattr(notif, "delivery_only_sink", False):
+            return False
+        notif_chat = notif.telegram_chat_id
         return bool(notif_chat) and chat.id == notif_chat and chat.type != "private"
 
     async def _handle_message(self, update: Update, context: Any) -> None:
