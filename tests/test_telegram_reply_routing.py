@@ -63,6 +63,16 @@ def test_empty_session_is_not_recorded():
     assert ch._lookup_reply_route(100, 42) is None
 
 
+def test_same_message_id_in_two_chats_do_not_collide():
+    # Telegram message ids repeat across chats; keying on the id alone would
+    # let chat B's message clobber chat A's identically-numbered one.
+    ch = _make_channel()
+    ch._record_reply_route(100, 42, "sessA")   # chat 42, msg 100
+    ch._record_reply_route(100, 77, "sessB")   # chat 77, SAME msg id 100
+    assert ch._lookup_reply_route(100, 42) == "sessA"
+    assert ch._lookup_reply_route(100, 77) == "sessB"
+
+
 def test_reply_routes_are_lru_bounded():
     ch = _make_channel()
     ch._reply_routes_max = 3

@@ -491,12 +491,13 @@ class TelegramChannel(BaseChannel):
             collections.OrderedDict()
         )
         self._message_cache_max = 200
-        # Reply routing: telegram message_id -> (chat_id, session_id). Records
-        # both messages the bot sent and the session each inbound message landed
-        # in, so a user REPLY targets that session — a cron/background session's
+        # Reply routing: (chat_id, message_id) -> session_id. Records both
+        # messages the bot sent and the session each inbound message landed in,
+        # so a user REPLY targets that session — a cron/background session's
         # message, or the user's own earlier message — instead of the chat's
-        # active session. Bounded LRU.
-        self._reply_routes: collections.OrderedDict[int, tuple[int, str]] = (
+        # active session. Keyed by (chat_id, message_id) because Telegram
+        # message ids are unique only within a chat, not across chats. Bounded LRU.
+        self._reply_routes: collections.OrderedDict[tuple[int, int], str] = (
             collections.OrderedDict()
         )
         self._reply_routes_max = 2000
@@ -994,13 +995,16 @@ class TelegramChannel(BaseChannel):
         """Remember which session produced an outbound Telegram message.
 
         Lets a later user REPLY to that message route back to the
-        originating session (see ``_resolve_reply_session``). No-op when the
-        session is unknown. Bounded LRU keyed by ``message_id``.
+        originating session (see ``_resolve_reply``). No-op when the session
+        is unknown. Bounded LRU keyed by ``(chat_id, message_id)`` — message
+        ids repeat across chats, so keying on the id alone would let one chat
+        clobber another chat's identically-numbered message.
         """
         if not session_id:
             return
-        self._reply_routes[message_id] = (chat_id, session_id)
-        self._reply_routes.move_to_end(message_id)
+        key = (chat_id, message_id)
+        self._reply_routes[key] = session_id
+        self._reply_routes.move_to_end(key)
         while len(self._reply_routes) > self._reply_routes_max:
             self._reply_routes.popitem(last=False)
 
@@ -1009,16 +1013,10 @@ class TelegramChannel(BaseChannel):
     ) -> str | None:
         """Session that produced ``message_id`` in ``chat_id``, or None.
 
-        The chat must match, so a ``message_id`` from one chat can never
+        The key is per-chat, so a ``message_id`` from one chat can never
         route a reply into a session bound to a different chat.
         """
-        entry = self._reply_routes.get(message_id)
-        if not entry:
-            return None
-        cached_chat_id, session_id = entry
-        if cached_chat_id != chat_id:
-            return None
-        return session_id
+        return self._reply_routes.get((chat_id, message_id))
 
     async def _resolve_reply(
         self, reply_message_id: int | None, chat_id: int,
