@@ -23,7 +23,13 @@ dependencies = [
     # whole Claude backend, not just /mcp/v1. 0.2.82 is the dangerous case: it
     # declares `mcp>=1.23.0` with no upper bound, so `0.2.82 + mcp 2.x` is a
     # resolvable combination that cannot work.
-    "claude-agent-sdk>=0.2.140",
+    # Floor raised again to 0.2.150 for the bundled CLI. The SDK spawns its own
+    # `_bundled/claude` in preference to anything on PATH, so the CLI it ships
+    # is the one every session actually runs: 0.2.140 bundles 2.1.235, which
+    # rejects models released after it with "does not support this model;
+    # version 2.1.251 or newer is required". 0.2.150 bundles 2.1.257. Every
+    # release in 0.2.141..0.2.150 is a CLI-bundle bump only — no API change.
+    "claude-agent-sdk>=0.2.150",
     # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
     # rather than only through claude-agent-sdk. Both bounds are load-bearing:
     # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
