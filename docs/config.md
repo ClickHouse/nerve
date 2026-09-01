@@ -244,7 +244,7 @@ A reload is always explicit. Two things cause one:
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
-| `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
+| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -1052,6 +1052,7 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
 | `telegram.allowed_users` | list[int] | `[]` | Telegram user IDs allowed to DM the bot |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
+| `telegram.reply_routes_to_origin_session` | bool | `false` | When on, a reply routes to the session that produced the replied-to message (and makes it active); an unresolvable reply is refused. Off = a reply is context-only and lands in the active session |
 
 ### Pairing
 

@@ -29,8 +29,13 @@ class _FakeRouter:
         return self._active
 
 
-def _make_channel(router: _FakeRouter | None = None) -> TelegramChannel:
-    cfg = SimpleNamespace(telegram=SimpleNamespace(allowed_users=[]))
+def _make_channel(
+    router: _FakeRouter | None = None, routing_enabled: bool = True,
+) -> TelegramChannel:
+    cfg = SimpleNamespace(telegram=SimpleNamespace(
+        allowed_users=[],
+        reply_routes_to_origin_session=routing_enabled,
+    ))
     return TelegramChannel(lambda: cfg, router or _FakeRouter())
 
 
@@ -198,3 +203,20 @@ async def test_reply_to_own_recorded_message_routes_to_where_it_landed():
     landing = await ch._delivery_session(None, "telegram:42")  # → active1
     ch._record_reply_route(500, 42, landing)                   # user's own msg id 500
     assert await ch._resolve_reply(500, 42) == ("route", "active1")
+
+
+# --------------------------------------------------------------------------- #
+#  Feature flag: telegram.reply_routes_to_origin_session (default off)         #
+# --------------------------------------------------------------------------- #
+
+def test_routing_enabled_reflects_config():
+    assert _make_channel(routing_enabled=True)._reply_routing_enabled() is True
+    assert _make_channel(routing_enabled=False)._reply_routing_enabled() is False
+
+
+def test_recording_is_skipped_when_routing_disabled():
+    # With the flag off, nothing is recorded — so no message is ever a route
+    # target and replies fall through to the active session (legacy behavior).
+    ch = _make_channel(routing_enabled=False)
+    ch._record_reply_route(100, 42, "sessA")
+    assert ch._lookup_reply_route(100, 42) is None
