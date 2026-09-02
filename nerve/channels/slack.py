@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from nerve.channels.access import Identity, needs_name_resolution
+from nerve.channels.access import Decision, Identity, needs_name_resolution
 from nerve.channels.archives import (
     IMAGE_EXT_TO_MIME,
     MAX_TEXT_SIZE,
@@ -1212,6 +1212,53 @@ class SlackChannel(BaseChannel):
             unfurl_media=False,
         )
         return resp.get("ts")
+
+    async def authorize_outbound(self, target: str) -> Decision:
+        """Whether an agent may post to *target* unprompted.
+
+        The grant is ``slack.allow_channels`` read in the write direction: the
+        agent may post to a conversation an operator already named. No new
+        config keys, so writes cannot be widened by accident while reads are
+        narrowed.
+
+        Unsolicited direct messages are refused outright. An inbound DM comes
+        from someone who chose to write; an outbound one does not, and
+        ``allow_direct_messages`` was never asked to authorize a recipient the
+        agent names for itself. Gating that properly means resolving the
+        conversation's member and running it through ``policy.users``, which
+        is a separate decision with its own test surface.
+
+        This is deliberately stricter than :meth:`_notification_target`, which
+        does accept a ``D``: that is an operator writing one config value, not
+        an agent choosing a destination at runtime.
+        """
+        channel_id, _ = parse_target(target)
+        if not channel_id:
+            return Decision(False, "no Slack conversation id in the target")
+
+        if channel_id.startswith("D"):
+            return Decision(
+                False,
+                "unsolicited direct messages are not supported; address a "
+                "channel the policy allows instead",
+            )
+        if not channel_id.startswith(("C", "G")):
+            return Decision(
+                False,
+                f"{channel_id!r} is not a Slack channel or group conversation id",
+            )
+
+        policy = self.policy
+        if not policy.channels.allow:
+            # Skip the lookup a refusal cannot use.
+            return policy.check_outbound(Identity(id=channel_id))
+
+        conversation = await self._identify_conversation(
+            channel_id,
+            "channel",
+            needs_name_resolution(policy.channels, is_id=is_slack_id),
+        )
+        return policy.check_outbound(conversation)
 
     def _notification_target(self) -> str | None:
         """Resolve a concrete conversation from the active config generation."""

@@ -1254,6 +1254,35 @@ warning. Slack in the list costs nothing while Slack is off.
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
 a literal channel ID, delivery is skipped with a warning.
 
+### Addressed delivery
+
+The `send_channel_message` tool posts to a conversation the agent names,
+rather than to whichever chat it is answering. That makes it usable from a
+cron run with no conversation attached — and means the destination, not the
+sender, is what has to be authorized.
+
+The grant is `slack.allow_channels` read in the write direction: the agent may
+post to a conversation an operator already named, and `slack.deny_channels`
+still refuses. There are no separate write keys, so writes cannot widen while
+reads narrow.
+
+Three differences from the inbound policy are deliberate:
+
+- **`slack.allow_users` grants nothing here.** It says who may drive the
+  agent, not where the agent may broadcast. With no `slack.allow_channels`
+  set, every target is refused — unlike an inbound check, there is no sender
+  to have vetted first.
+- **Unsolicited DMs are refused**, even with `slack.allow_direct_messages`.
+  An inbound DM comes from someone who chose to write; an outbound one does
+  not. Gating one properly means resolving the conversation's member and
+  running them through the user rules, which is a separate change.
+- **`notifications.slack_channel_id` may still be a `D`.** That is an
+  operator writing one config value, not an agent choosing a destination at
+  runtime, so the two do not share a policy.
+
+Other channels refuse addressed delivery outright until they implement the
+same seam.
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
