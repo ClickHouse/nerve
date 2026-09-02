@@ -1030,11 +1030,11 @@ class SlackChannel(BaseChannel):
                 "subtype": event.get("subtype") or "",
             },
         )
-        await self.router.observe(observed, ttl_days=self._observe_ttl_days())
-
-    def _observe_ttl_days(self) -> int:
-        """How long a spooled observation survives undrained."""
-        return self.config.sync.message_ttl_days
+        await self.router.observe(
+            observed,
+            ttl_days=self.config.sync.message_ttl_days,
+            max_spool_rows=self.config.slack.observe.max_spool_rows,
+        )
 
     async def _handle_message_event(self, event: dict[str, Any]) -> None:
         """Turn a Slack message into an InboundMessage and hand it to the router."""

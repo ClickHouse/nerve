@@ -393,24 +393,31 @@ class TestSpool:
         rows = await db.read_channel_observations("slack")
         assert [p["n"] for _, p in rows] == [2]
 
-    async def test_an_unreadable_payload_does_not_wedge_the_drain(self, db):
+    async def test_an_unreadable_payload_is_reported_not_hidden(self, db):
+        # It comes back with a None payload rather than being dropped, so
+        # the drain can skip the row and still advance past its id.
         await db.insert_channel_observation("slack", "k", {"n": 1})
-        await db._write(
-            "INSERT INTO channel_observations "
-            "(channel, channel_key, payload, created_at, expires_at) "
-            "VALUES ('slack', 'k', 'not json', '2026-01-01', '2099-01-01')",
-            (),
-        )
+        await _write_garbage(db)
         await db.insert_channel_observation("slack", "k", {"n": 3})
 
         rows = await db.read_channel_observations("slack")
 
-        assert [p["n"] for _, p in rows] == [1, 3]
+        assert [p["n"] if p else None for _, p in rows] == [1, None, 3]
 
 
 # ---------------------------------------------------------------------- #
 #  ChannelSource                                                          #
 # ---------------------------------------------------------------------- #
+
+
+async def _write_garbage(db) -> None:
+    """Put a row in the spool whose payload will never parse."""
+    await db._write(
+        "INSERT INTO channel_observations "
+        "(channel, channel_key, payload, created_at, expires_at) "
+        "VALUES ('slack', 'k', 'not json', '2026-01-01', '2099-01-01')",
+        (),
+    )
 
 
 class TestChannelSource:
@@ -494,6 +501,26 @@ class TestChannelSource:
         result = await ChannelSource("slack", db).fetch("not-a-number")
 
         assert len(result.records) == 1
+
+    async def test_an_unreadable_row_is_skipped_and_passed(self, db):
+        # The wedge this guards against: if the cursor only ever advanced to
+        # the last row that *parsed*, a batch of entirely unreadable rows
+        # would move it nowhere, be re-read every run, and hide everything
+        # behind them for good.
+        source = ChannelSource("slack", db)
+        await _write_garbage(db)
+        await _write_garbage(db)
+
+        first = await source.fetch(None)
+
+        assert first.records == []
+        assert first.next_cursor == "2"
+
+        await db.insert_channel_observation(
+            "slack", "k", {"text": "reachable", "message_id": "3"},
+        )
+        second = await source.fetch(first.next_cursor)
+        assert [r.content for r in second.records] == ["reachable"]
 
     async def test_the_same_message_observed_twice_lands_once(self, db):
         payload = {
