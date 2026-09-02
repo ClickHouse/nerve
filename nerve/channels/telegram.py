@@ -1521,12 +1521,19 @@ class TelegramChannel(BaseChannel):
         grant, and that everything spooled stays untrusted input to the inbox
         rather than instructions.
 
+        Because that population is riskier than Slack's — every message here
+        is from someone refused, not merely someone who did not address the
+        agent — it takes a second opt-in,
+        ``telegram.observe.include_unauthorized_senders``, on top of the
+        conversation grant.
+
         Private chats are never observed. A stranger's DM is a refusal, and
         filing it away is not what the silence led them to expect; a group an
         operator listed is a different matter.
         """
+        observe = self.config.telegram.observe
         policy = self.observation
-        if not policy.active:
+        if not policy.active or not observe.include_unauthorized_senders:
             return
         chat = update.effective_chat
         user = update.effective_user
@@ -1535,18 +1542,27 @@ class TelegramChannel(BaseChannel):
             return
         if chat.type == "private":
             return
+        # Telegram delivers other bots' messages to group handlers under
+        # bot-to-bot mode. Slack drops them via _is_another_app_talking, and
+        # two agents feeding each other's inboxes is no better than two
+        # agents answering each other.
+        if user.is_bot:
+            return
 
+        # Only the numeric id is stable. A chat title is set by whoever runs
+        # the group, so treating it as allow-eligible would let anyone create
+        # a group called "ops-room" and walk into a grant meant for someone
+        # else's; a @username is claimable and movable for the same reason.
+        # Both stay deny-eligible, where a spoofable name can only ever
+        # subtract access.
         conversation = Identity(
             id=str(chat.id),
-            names=tuple(n for n in (chat.username, chat.title) if n),
+            self_set_names=tuple(n for n in (chat.username, chat.title) if n),
         )
-        # first_name/last_name are set by the account holder, so only a deny
-        # rule may match them; the @username is claimed and unique.
         sender = Identity(
             id=str(user.id),
-            names=(user.username,) if user.username else (),
             self_set_names=tuple(
-                n for n in (user.first_name, user.last_name) if n
+                n for n in (user.username, user.first_name, user.last_name) if n
             ),
         )
 
