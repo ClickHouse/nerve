@@ -941,6 +941,68 @@ class AgentConfig:
 
 
 @dataclass
+class ObserveConfig:
+    """Which conversations feed the inbox without the agent answering them.
+
+    A separate grant from the access rules on purpose. "May this person drive
+    the agent?" and "may this room's traffic reach the agent's inbox?" are
+    different questions, and answering the second with the first either
+    blocks watching a channel the agent takes no orders from, or widens
+    command access to everything worth watching.
+
+    Fail-closed twice over: off unless ``enabled``, and observing nothing
+    unless ``allow_conversations`` names something. An empty allow list here
+    means "nothing", not "everything" — the opposite of the access gates,
+    because this one is a standing grant to record other people's messages
+    rather than a check that already ran a sender rule first.
+
+    ``schedule`` is the drain cadence, not a poll: the messages are already
+    in the spool by the time it fires.
+    """
+
+    enabled: bool = False
+    allow_conversations: list[str] = field(default_factory=list)
+    deny_conversations: list[str] = field(default_factory=list)
+    allow_senders: list[str] = field(default_factory=list)
+    deny_senders: list[str] = field(default_factory=list)
+    schedule: str = "*/5 * * * *"
+    batch_size: int = 50
+    # Off by default: most chat messages are shorter than the runner's
+    # 800-char condense threshold, so this would build an LLM client that
+    # never gets used.
+    condense: bool = False
+    # Cap on spooled rows per channel before the oldest are dropped.
+    max_spool_rows: int = 10_000
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> ObserveConfig:
+        enabled = _as_bool(
+            d.get("enabled", False), False, label="observe.enabled",
+        )
+        allow = d.get("allow_conversations") or []
+        if enabled and not allow:
+            logger.warning(
+                "observe.enabled is set but observe.allow_conversations is "
+                "empty — nothing will be observed. Name the conversations to "
+                "watch; an empty list is not a wildcard here.",
+            )
+        return cls(
+            enabled=enabled,
+            allow_conversations=allow,
+            deny_conversations=d.get("deny_conversations") or [],
+            allow_senders=d.get("allow_senders") or [],
+            deny_senders=d.get("deny_senders") or [],
+            schedule=d.get("schedule", "*/5 * * * *"),
+            batch_size=d.get("batch_size", 50),
+            condense=_as_bool(
+                d.get("condense", False), False, label="observe.condense",
+            ),
+            max_spool_rows=d.get("max_spool_rows", 10_000),
+        )
+
+
+@dataclass
 class TelegramConfig:
     enabled: bool = True
     bot_token: str = ""
@@ -953,6 +1015,8 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
+    # Chats to spool to the inbox without answering — see ObserveConfig.
+    observe: ObserveConfig = field(default_factory=ObserveConfig)
 
     @classmethod
     @_coerced
@@ -996,6 +1060,7 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
+            observe=ObserveConfig.from_dict(d.get("observe", {})),
         )
 
 
@@ -1077,6 +1142,9 @@ class SlackConfig:
     # None keeps safe defaults; [] disables commands. Host-wide and
     # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
     commands: list[str] | None = None
+    # Conversations to spool to the inbox without answering. Its own grant,
+    # not derived from allow_channels — see ObserveConfig.
+    observe: ObserveConfig = field(default_factory=ObserveConfig)
 
     @classmethod
     @_coerced
@@ -1114,6 +1182,7 @@ class SlackConfig:
             ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
+            observe=ObserveConfig.from_dict(d.get("observe", {})),
         )
 
 

@@ -547,9 +547,21 @@ class CronService:
     def _source_schedule(self, runner) -> str | None:
         """The configured schedule for *runner*, or ``None`` if it has no config.
 
-        Source names can be compound (e.g. "gmail:account@email.com"). The
-        config key is the base type before the colon.
+        A runner that carries its own schedule wins. Sources configured
+        outside ``config.sync`` — a channel observation drain, say — have no
+        section here to look up, and returning ``None`` for them means the
+        runner is built and then silently never scheduled.
+
+        Otherwise the source name picks the section. Names can be compound
+        (e.g. "gmail:account@email.com"); the config key is the base type
+        before the colon.
         """
+        # Must actually be a string. This reads a duck-typed attribute, and a
+        # test double hands back a truthy stand-in for anything asked of it —
+        # which would put a MagicMock where a crontab expression belongs.
+        carried = getattr(runner, "schedule", "")
+        if isinstance(carried, str) and carried:
+            return carried
         config_key = runner.source.source_name.split(":")[0]
         source_config = getattr(self.config.sync, config_key, None)
         if source_config is None:
@@ -1287,16 +1299,18 @@ class CronService:
             )
 
     async def _cleanup_expired(self) -> None:
-        """Clean up expired source messages, consumer cursors, and old cron logs."""
+        """Clean up expired source messages, cursors, cron logs, and observations."""
         try:
             msg_count = await self.db.cleanup_expired_messages()
             cursor_count = await self.db.cleanup_expired_consumer_cursors()
             cron_log_count = await self.db.cleanup_old_cron_logs(days=14)
-            if msg_count or cursor_count or cron_log_count:
+            obs_count = await self.db.cleanup_expired_channel_observations()
+            if msg_count or cursor_count or cron_log_count or obs_count:
                 logger.info(
                     "Cleanup: %d expired messages, %d expired consumer cursors, "
-                    "%d cron logs older than 14 days",
-                    msg_count, cursor_count, cron_log_count,
+                    "%d cron logs older than 14 days, %d expired channel "
+                    "observations",
+                    msg_count, cursor_count, cron_log_count, obs_count,
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)

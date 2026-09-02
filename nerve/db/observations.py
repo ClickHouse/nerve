@@ -1,0 +1,135 @@
+"""Channel observation spool — the push-to-pull join for the sources layer.
+
+A channel appends here on its dispatch path; a
+:class:`~nerve.sources.channel.ChannelSource` drains it on the source
+runner's cadence. See ``v046_channel_observations`` for why the id is
+``AUTOINCREMENT`` and the payload is JSON.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# A busy channel must not fill the disk between drains. Past this many rows
+# for one channel, the oldest are dropped — losing the stale end of a
+# backlog nobody drained beats losing the daemon. Trimming is amortized
+# (see _TRIM_EVERY) so the dispatch path stays a single INSERT.
+DEFAULT_MAX_ROWS = 10_000
+_TRIM_EVERY = 100
+
+
+class ObservationStore:
+    """Mixin for the ``channel_observations`` spool."""
+
+    @property
+    def _observation_writes(self) -> dict[str, int]:
+        """channel -> inserts since that channel's last trim check.
+
+        Built on first use: mixins here have no ``__init__``, and a class
+        attribute would share one counter across every Database instance.
+        """
+        counts = self.__dict__.get("_observation_write_counts")
+        if counts is None:
+            counts = self.__dict__["_observation_write_counts"] = {}
+        return counts
+
+    async def insert_channel_observation(
+        self,
+        channel: str,
+        channel_key: str,
+        payload: dict[str, Any],
+        ttl_days: int = 7,
+        max_rows: int = DEFAULT_MAX_ROWS,
+    ) -> int:
+        """Append one observation. Returns its id.
+
+        This runs on the channel's dispatch path, so it is one INSERT and
+        nothing else. The row cap is enforced once every ``_TRIM_EVERY``
+        inserts rather than on each one; overshooting the cap by under a
+        hundred rows is cheaper than a COUNT per message.
+        """
+        now = datetime.now(timezone.utc)
+        result = await self._write(
+            "INSERT INTO channel_observations "
+            "(channel, channel_key, payload, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                channel,
+                channel_key,
+                json.dumps(payload),
+                now.isoformat(),
+                (now + timedelta(days=ttl_days)).isoformat(),
+            ),
+        )
+
+        seen = self._observation_writes.get(channel, 0) + 1
+        if seen >= _TRIM_EVERY:
+            self._observation_writes[channel] = 0
+            await self._trim_channel_observations(channel, max_rows)
+        else:
+            self._observation_writes[channel] = seen
+
+        return result.lastrowid or 0
+
+    async def _trim_channel_observations(self, channel: str, max_rows: int) -> None:
+        """Drop the oldest rows for *channel* past ``max_rows``."""
+        result = await self._write(
+            "DELETE FROM channel_observations WHERE channel = ? AND id <= ("
+            "  SELECT id FROM channel_observations WHERE channel = ?"
+            "  ORDER BY id DESC LIMIT 1 OFFSET ?"
+            ")",
+            (channel, channel, max_rows),
+        )
+        if result.rowcount:
+            logger.warning(
+                "Channel %s observation spool hit its %d-row cap — dropped %d "
+                "of the oldest rows. The drain is behind or not scheduled.",
+                channel, max_rows, result.rowcount,
+            )
+
+    async def read_channel_observations(
+        self, channel: str, after_id: int = 0, limit: int = 50,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Observations for *channel* past ``after_id``, oldest first.
+
+        Returns ``(id, payload)`` pairs. A row whose payload will not parse
+        is skipped rather than raising — one bad row must not wedge the
+        drain behind it forever, and the id still advances past it.
+        """
+        rows: list[tuple[int, dict[str, Any]]] = []
+        async with self.db.execute(
+            "SELECT id, payload FROM channel_observations "
+            "WHERE channel = ? AND id > ? ORDER BY id LIMIT ?",
+            (channel, after_id, limit),
+        ) as cursor:
+            async for row in cursor:
+                try:
+                    rows.append((row[0], json.loads(row[1])))
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        "Skipping unreadable observation %s on %s: %s",
+                        row[0], channel, e,
+                    )
+        return rows
+
+    async def get_channel_observation_max_id(self, channel: str) -> int:
+        """Highest id spooled for *channel*, or 0 if none."""
+        async with self.db.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM channel_observations WHERE channel = ?",
+            (channel,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+    async def cleanup_expired_channel_observations(self) -> int:
+        """Delete observations past their TTL. Returns count deleted."""
+        now = datetime.now(timezone.utc).isoformat()
+        result = await self._write(
+            "DELETE FROM channel_observations WHERE expires_at < ?", (now,),
+        )
+        return result.rowcount or 0

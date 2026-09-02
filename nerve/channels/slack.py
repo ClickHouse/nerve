@@ -13,10 +13,16 @@ import collections
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from nerve.channels.access import Decision, Identity, needs_name_resolution
+from nerve.channels.access import (
+    Decision,
+    Identity,
+    PatternGate,
+    needs_name_resolution,
+)
 from nerve.channels.archives import (
     IMAGE_EXT_TO_MIME,
     MAX_TEXT_SIZE,
@@ -28,8 +34,10 @@ from nerve.channels.base import (
     ChannelCapability,
     ChannelConstraints,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
+from nerve.channels.observation import ObservationPolicy
 from nerve.channels.slack_access import SlackAccessPolicy
 from nerve.channels.slack_presentation import (
     MAX_MSG_LEN,
@@ -134,6 +142,19 @@ def parse_target(target: str) -> tuple[str, str | None]:
     """
     channel_id, sep, thread_ts = target.partition(":")
     return channel_id, (thread_ts if sep and thread_ts else None)
+
+
+def slack_ts_to_iso(ts: str) -> str:
+    """Turn a Slack ``<seconds>.<microseconds>`` stamp into ISO 8601 UTC.
+
+    Falls back to now rather than raising. An unreadable stamp should cost an
+    observation its exact time, not drop the message.
+    """
+    try:
+        seconds = float(ts)
+    except (AttributeError, TypeError, ValueError):
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
 
 
 class SlackUnavailable(RuntimeError):
@@ -931,6 +952,90 @@ class SlackChannel(BaseChannel):
             return bool(await self.router.get_last_session(channel_key))
         return False
 
+    @property
+    def observation(self) -> ObservationPolicy:
+        """The observation grant, rebuilt per read so reloads apply at once."""
+        observe = self.config.slack.observe
+        return ObservationPolicy(
+            enabled=observe.enabled,
+            conversations=PatternGate(
+                "conversation",
+                allow=list(observe.allow_conversations),
+                deny=list(observe.deny_conversations),
+            ),
+            senders=PatternGate(
+                "sender",
+                allow=list(observe.allow_senders),
+                deny=list(observe.deny_senders),
+            ),
+        )
+
+    async def _observe(
+        self,
+        event: dict[str, Any],
+        channel_id: str,
+        user_id: str,
+        ts: str,
+        channel_key: str,
+    ) -> None:
+        """Spool a message the agent is not answering, if policy allows it.
+
+        Direct messages are never observed. A DM the agent declined to answer
+        is a refusal, and quietly filing it away is not what "we do not talk
+        to you" led the sender to expect.
+
+        Raw IDs are spooled and names are resolved only when a pattern needs
+        one, so watching a busy channel costs no Slack API call per message.
+        """
+        policy = self.observation
+        if not policy.active:
+            return
+        if channel_id.startswith("D"):
+            return
+
+        resolve = needs_name_resolution(
+            policy.conversations, is_id=is_slack_id,
+        )
+        conversation = await self._identify_conversation(
+            channel_id, "channel", resolve,
+        )
+        sender = await self._identify_user(
+            user_id,
+            needs_name_resolution(policy.senders, is_id=is_slack_id),
+            need_email=policy.senders.any_deny_pattern(lambda p: "@" in p),
+        )
+
+        verdict = policy.check(conversation, sender)
+        if not verdict.allowed:
+            logger.debug("Slack did not observe a message: %s", verdict.reason)
+            return
+
+        observed = ObservedMessage(
+            channel_name="slack",
+            channel_key=channel_key,
+            conversation_id=channel_id,
+            sender_id=user_id,
+            text=slack_to_plain(event.get("text") or "", self._bot_user_id),
+            message_id=ts,
+            timestamp=slack_ts_to_iso(ts),
+            conversation_title=next(iter(conversation.names), ""),
+            sender_name=next(
+                iter((*sender.names, *sender.self_set_names)), "",
+            ),
+            # thread_ts lets a reader pull the parent later. A reply without
+            # its thread is often meaningless, and expanding it here would
+            # cost an API call per observation.
+            metadata={
+                "thread_ts": event.get("thread_ts") or "",
+                "subtype": event.get("subtype") or "",
+            },
+        )
+        await self.router.observe(observed, ttl_days=self._observe_ttl_days())
+
+    def _observe_ttl_days(self) -> int:
+        """How long a spooled observation survives undrained."""
+        return self.config.sync.message_ttl_days
+
     async def _handle_message_event(self, event: dict[str, Any]) -> None:
         """Turn a Slack message into an InboundMessage and hand it to the router."""
         if self._is_own_message(event):
@@ -962,6 +1067,10 @@ class SlackChannel(BaseChannel):
         channel_key = f"slack:{target}"
 
         if not await self._should_answer(event, channel_type, channel_key):
+            # Not addressed to the agent — but possibly worth recording.
+            # This sits below the early returns above on purpose, so our own
+            # posts, join/leave noise, and other apps never reach the inbox.
+            await self._observe(event, channel_id, user_id, ts, channel_key)
             return
         if not await self._authorize(user_id, channel_id, channel_type):
             return
