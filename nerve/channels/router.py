@@ -27,6 +27,7 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.stream_adapter import StreamAdapter
+from nerve.db.observations import DEFAULT_MAX_ROWS
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -372,7 +373,12 @@ class ChannelRouter:
     #  Observation spool                                                    #
     # ------------------------------------------------------------------ #
 
-    async def observe(self, msg: ObservedMessage, ttl_days: int = 7) -> bool:
+    async def observe(
+        self,
+        msg: ObservedMessage,
+        ttl_days: int = 7,
+        max_spool_rows: int = DEFAULT_MAX_ROWS,
+    ) -> bool:
         """Spool a message a channel saw but did not answer.
 
         Channels reach the database through the router, never through the
@@ -393,6 +399,7 @@ class ChannelRouter:
                 channel_key=msg.channel_key,
                 payload=asdict(msg),
                 ttl_days=ttl_days,
+                max_rows=max_spool_rows,
             )
             return True
         except Exception as e:

@@ -68,11 +68,16 @@ class ChannelSource(Source):
         if not rows:
             return FetchResult(records=[], next_cursor=cursor, has_more=False)
 
-        records = [_to_record(self.channel, payload) for _, payload in rows]
-        next_cursor = str(rows[-1][0])
+        # The cursor tracks what was *scanned*, not what parsed. An
+        # unreadable row still has to move it, or the drain re-reads it
+        # every run and never reaches what is behind it.
         return FetchResult(
-            records=records,
-            next_cursor=next_cursor,
+            records=[
+                _to_record(self.channel, payload)
+                for _, payload in rows
+                if payload is not None
+            ],
+            next_cursor=str(rows[-1][0]),
             has_more=len(rows) >= limit,
         )
 

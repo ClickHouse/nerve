@@ -94,14 +94,17 @@ class ObservationStore:
 
     async def read_channel_observations(
         self, channel: str, after_id: int = 0, limit: int = 50,
-    ) -> list[tuple[int, dict[str, Any]]]:
+    ) -> list[tuple[int, dict[str, Any] | None]]:
         """Observations for *channel* past ``after_id``, oldest first.
 
-        Returns ``(id, payload)`` pairs. A row whose payload will not parse
-        is skipped rather than raising — one bad row must not wedge the
-        drain behind it forever, and the id still advances past it.
+        Every scanned row comes back as ``(id, payload)``, with ``payload``
+        None where the JSON would not parse. Dropping those rows here
+        instead would hide their ids from the caller, and a batch of
+        entirely unreadable rows would then pin the cursor in place and be
+        re-read on every run, with everything behind them unreachable.
+        Reporting them lets the drain skip the row and still move past it.
         """
-        rows: list[tuple[int, dict[str, Any]]] = []
+        rows: list[tuple[int, dict[str, Any] | None]] = []
         async with self.db.execute(
             "SELECT id, payload FROM channel_observations "
             "WHERE channel = ? AND id > ? ORDER BY id LIMIT ?",
@@ -115,6 +118,7 @@ class ObservationStore:
                         "Skipping unreadable observation %s on %s: %s",
                         row[0], channel, e,
                     )
+                    rows.append((row[0], None))
         return rows
 
     async def get_channel_observation_max_id(self, channel: str) -> int:

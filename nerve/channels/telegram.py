@@ -1576,7 +1576,9 @@ class TelegramChannel(BaseChannel):
             },
         )
         await self.router.observe(
-            observed, ttl_days=self.config.sync.message_ttl_days,
+            observed,
+            ttl_days=self.config.sync.message_ttl_days,
+            max_spool_rows=self.config.telegram.observe.max_spool_rows,
         )
 
     async def _handle_message(self, update: Update, context: Any) -> None:
