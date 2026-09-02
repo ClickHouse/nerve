@@ -104,16 +104,84 @@ class TestSlackAuthorizeOutbound:
         verdict = await channel.authorize_outbound("C0999ZZZZ")
 
         assert not verdict.allowed
-        assert "allow list" in verdict.reason
+        assert "not approved" in verdict.reason
 
-    async def test_a_denied_conversation_names_the_pattern(self):
+    async def test_a_denied_conversation_is_refused(self, caplog):
         channel = _slack(allow_channels=["*"], deny_channels=["C0999ZZZZ"])
 
-        verdict = await channel.authorize_outbound("C0999ZZZZ")
+        with caplog.at_level("INFO"):
+            verdict = await channel.authorize_outbound("C0999ZZZZ")
 
         assert not verdict.allowed
-        assert "C0999ZZZZ" in verdict.reason
-        assert "deny" in verdict.reason
+        # Coarse to the agent, specific to the log.
+        assert "C0999ZZZZ" not in verdict.reason
+        assert "deny pattern" in caplog.text
+
+    async def test_a_group_dm_is_refused(self):
+        # A `G` is ambiguous: legacy private channel or multi-person DM.
+        # Refusing only `D` would let a group DM in through the door
+        # marked "no unsolicited DMs".
+        channel = _slack(allow_channels=["*"])
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"is_mpim": True}},
+        )
+
+        verdict = await channel.authorize_outbound("G0123ABCD")
+
+        assert not verdict.allowed
+        assert "direct message" in verdict.reason
+
+    async def test_a_private_channel_is_allowed(self):
+        # The other half of the same ambiguity: a real `G` private channel
+        # must still work.
+        channel = _slack(allow_channels=["G0123ABCD"])
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "private-eng", "is_mpim": False}},
+        )
+
+        verdict = await channel.authorize_outbound("G0123ABCD")
+
+        assert verdict.allowed
+
+    async def test_an_unknowable_conversation_kind_fails_closed(self):
+        channel = _slack(allow_channels=["*"])
+        channel._web.conversations_info = AsyncMock(side_effect=RuntimeError("boom"))
+
+        verdict = await channel.authorize_outbound("G0123ABCD")
+
+        assert not verdict.allowed
+        assert "could not establish" in verdict.reason
+
+    async def test_a_conversation_name_is_not_a_target(self):
+        # Targets are ids. Accepting a name would make the destination
+        # depend on a lookup the caller does not control.
+        channel = _slack(allow_channels=["general"])
+
+        verdict = await channel.authorize_outbound("general")
+
+        assert not verdict.allowed
+        assert "not a name" in verdict.reason
+
+    async def test_a_malformed_id_is_refused(self):
+        channel = _slack(allow_channels=["*"])
+
+        verdict = await channel.authorize_outbound("Cx")
+
+        assert not verdict.allowed
+
+    async def test_a_refusal_does_not_name_the_pattern_or_channel(self):
+        # The reason goes back to the agent, which may repeat it into a
+        # chat. The detail belongs in the log, not the reply.
+        channel = _slack(allow_channels=["*"], deny_channels=["secret-*"])
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "secret-payroll"}},
+        )
+
+        verdict = await channel.authorize_outbound("C0123ABCD")
+
+        assert not verdict.allowed
+        assert "secret-payroll" not in verdict.reason
+        assert "secret-*" not in verdict.reason
 
     async def test_a_direct_message_is_refused(self):
         # An inbound DM comes from someone who chose to write. An outbound
@@ -126,16 +194,19 @@ class TestSlackAuthorizeOutbound:
         assert not verdict.allowed
         assert "direct message" in verdict.reason
 
-    async def test_an_unresolvable_name_is_refused_when_a_deny_list_needs_one(self):
+    async def test_an_unresolvable_name_is_refused_when_a_deny_list_needs_one(
+        self, caplog,
+    ):
         # conversations.info failing leaves the identity incomplete, and a
         # deny list cannot be checked against a name nobody could read.
         channel = _slack(allow_channels=["*"], deny_channels=["secrets"])
         channel._web.conversations_info = AsyncMock(side_effect=RuntimeError("boom"))
 
-        verdict = await channel.authorize_outbound("C0123ABCD")
+        with caplog.at_level("INFO"):
+            verdict = await channel.authorize_outbound("C0123ABCD")
 
         assert not verdict.allowed
-        assert "could not be fully identified" in verdict.reason
+        assert "could not be fully identified" in caplog.text
 
     async def test_a_name_grant_matches_the_resolved_conversation(self):
         channel = _slack(allow_channels=["general"])
@@ -180,7 +251,7 @@ class TestSlackAuthorizeOutbound:
         verdict = await channel.authorize_outbound("U0123ABCD")
 
         assert not verdict.allowed
-        assert "not a Slack channel" in verdict.reason
+        assert "not a Slack conversation id" in verdict.reason
 
     async def test_an_empty_target_is_refused(self):
         channel = _slack(allow_channels=["*"])
