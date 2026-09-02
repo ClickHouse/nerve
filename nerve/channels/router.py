@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import asdict
 from typing import Any, TYPE_CHECKING
 
 from nerve.agent.interactive import get_handler
@@ -22,6 +23,7 @@ from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
 from nerve.channels.stream_adapter import StreamAdapter
@@ -365,6 +367,39 @@ class ChannelRouter:
         ctx = self._message_context.get(session_id)
         target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
         return await chan_obj.send_file(target, file_path)
+
+    # ------------------------------------------------------------------ #
+    #  Observation spool                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def observe(self, msg: ObservedMessage, ttl_days: int = 7) -> bool:
+        """Spool a message a channel saw but did not answer.
+
+        Channels reach the database through the router, never through the
+        engine directly, so this is the seam. Returns True if the record was
+        spooled.
+
+        A failure is swallowed and logged. This sits on the dispatch path of
+        a channel that has already decided not to answer, so a database
+        hiccup must not take down message handling for traffic the agent was
+        never going to act on.
+        """
+        db = getattr(self.engine, "db", None)
+        if db is None:
+            return False
+        try:
+            await db.insert_channel_observation(
+                channel=msg.channel_name,
+                channel_key=msg.channel_key,
+                payload=asdict(msg),
+                ttl_days=ttl_days,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to spool an observation from %s: %s", msg.channel_name, e,
+            )
+            return False
 
     # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #

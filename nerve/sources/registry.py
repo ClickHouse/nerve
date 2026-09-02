@@ -240,4 +240,39 @@ def build_source_runners(
             gh_repos.batch_size, gh_repos.repos or "none",
         )
 
+    # Channel observation drains. Not a poll: the channel already spooled
+    # these over its own socket, and this only moves them into the inbox.
+    # What to watch is a property of the channel, so the config lives at
+    # slack.observe / telegram.observe rather than under sync.*, and the
+    # runner carries its own schedule instead of being looked up there.
+    for channel_name, channel_config in (
+        ("slack", config.slack),
+        ("telegram", config.telegram),
+    ):
+        observe = getattr(channel_config, "observe", None)
+        if observe is None or not observe.enabled:
+            continue
+        if not observe.allow_conversations:
+            # ObserveConfig.from_dict already warned. Don't build a runner
+            # whose policy can never approve anything to drain.
+            continue
+        from nerve.sources.channel import ChannelSource
+
+        runners.append(SourceRunner(
+            source=ChannelSource(channel_name, db),
+            db=db,
+            batch_size=observe.batch_size,
+            condense=observe.condense,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
+            ttl_days=ttl_days,
+            schedule=observe.schedule,
+        ))
+        logger.info(
+            "Registered source: %s observations (batch=%d, schedule=%s, "
+            "conversations allow=%s deny=%s)",
+            channel_name, observe.batch_size, observe.schedule,
+            observe.allow_conversations, observe.deny_conversations or [],
+        )
+
     return runners
