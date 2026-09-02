@@ -27,6 +27,7 @@ from nerve.db.mcp import McpStore
 from nerve.db.messages import MessageStore
 from nerve.db.migrations.runner import discover_migrations, run_migrations
 from nerve.db.notifications import NotificationStore
+from nerve.db.observations import ObservationStore
 from nerve.db.plans import PlanStore
 from nerve.db.review_loops import ReviewLoopStore
 from nerve.db.sessions import SessionStore
@@ -307,6 +308,7 @@ class Database(
     TaskStatusStore,
     PlanStore,
     NotificationStore,
+    ObservationStore,
     SourceStore,
     CronStore,
     SkillStore,

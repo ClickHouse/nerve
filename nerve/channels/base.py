@@ -67,6 +67,32 @@ class OutboundMessage:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ObservedMessage:
+    """A message a channel saw but did not answer.
+
+    Not an :class:`InboundMessage`: nothing here starts an agent turn. It is
+    a record headed for the source inbox, where the existing consumer tools
+    and cron gates can act on it — so the fields are the ones a reader needs
+    to make sense of a line of chat, not the ones the router needs to route.
+
+    Names are left empty when unresolved. Observation runs on the dispatch
+    path and a display name costs an API call, so the channel spools raw IDs
+    and a reader resolves them later — or does not, if nothing asked.
+    """
+
+    channel_name: str                               # "slack", "telegram"
+    channel_key: str                                # "slack:C0123ABCD:1700000000.000100"
+    conversation_id: str                            # "C0123ABCD"
+    sender_id: str                                  # "U0456DEFG"
+    text: str
+    message_id: str                                 # transport-native id (Slack ts)
+    timestamp: str                                  # ISO 8601
+    conversation_title: str = ""                    # "" until resolved
+    sender_name: str = ""                           # "" until resolved
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 class BaseChannel(abc.ABC):
     """Abstract base for all communication channels.
 

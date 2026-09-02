@@ -126,6 +126,13 @@ class SourceRunner:
             persist. Records that don't pass are dropped — never written to
             the inbox, never seen by the agent. An inactive/None filter is a
             no-op. See :mod:`nerve.sources.filters`.
+        schedule: Crontab or interval this runner asks to be scheduled on.
+            Empty means "look me up in ``config.sync.<name>``", which is how
+            every pull source works. A source configured somewhere else —
+            a channel's ``observe`` block, say — carries its own cadence
+            here, because the alternative is a phantom ``config.sync``
+            section that duplicates it, or a runner that is silently never
+            scheduled. See :meth:`CronService._source_schedule`.
     """
 
     def __init__(
@@ -139,6 +146,7 @@ class SourceRunner:
         condense_client_factory: Callable[[], Any] | None = None,
         ttl_days: int = 7,
         inbox_filter: InboxFilter | None = None,
+        schedule: str = "",
     ):
         self.source = source
         self.db = db
@@ -153,6 +161,7 @@ class SourceRunner:
         self._client_factory = condense_client_factory
         self.ttl_days = ttl_days
         self.inbox_filter = inbox_filter
+        self.schedule = schedule
         self._lock = asyncio.Lock()
         self._condense_client: Any | None = None
         self.health = SourceHealth()
