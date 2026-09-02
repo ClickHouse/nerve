@@ -257,6 +257,27 @@ def build_source_runners(
             # whose policy can never approve anything to drain.
             continue
         from nerve.sources.channel import ChannelSource
+        from nerve.sources.filters import FieldRule, InboxFilter
+
+        # Re-apply the deny rules at drain time. The channel already ran the
+        # full policy before spooling, so this is a second net, not the gate:
+        # it catches rows written before a conversation was added to the deny
+        # list, which the spool would otherwise deliver minutes or a TTL
+        # later under the old policy.
+        #
+        # Deny-only on purpose. These rules match the id field, so a
+        # name-based pattern simply will not match — harmless for a deny rule
+        # (the row passes, exactly as it does today) but fail-closed for an
+        # allow rule, which would drop every message from a policy written
+        # against channel names. The allow decision stays where it can be
+        # made correctly, at the channel, which knows which of a
+        # conversation's names are grantable.
+        observe_filter = InboxFilter(rules=[
+            FieldRule(
+                field="conversation_id", deny=list(observe.deny_conversations),
+            ),
+            FieldRule(field="sender_id", deny=list(observe.deny_senders)),
+        ])
 
         runners.append(SourceRunner(
             source=ChannelSource(channel_name, db),
@@ -266,6 +287,7 @@ def build_source_runners(
             condense_model=condense_model,
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
+            inbox_filter=observe_filter,
             schedule=observe.schedule,
         ))
         logger.info(

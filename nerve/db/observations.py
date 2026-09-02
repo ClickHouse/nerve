@@ -38,6 +38,12 @@ class ObservationStore:
             counts = self.__dict__["_observation_write_counts"] = {}
         return counts
 
+    # Longest a spooled message may be before it is truncated. Slack caps
+    # posts near 40k and Telegram near 4k, so this only bites on a pathological
+    # sender — but the cap is per row and the row count is capped separately,
+    # so without it the two together still bound nothing in bytes.
+    MAX_OBSERVED_TEXT = 16_000
+
     async def insert_channel_observation(
         self,
         channel: str,
@@ -53,6 +59,14 @@ class ObservationStore:
         inserts rather than on each one; overshooting the cap by under a
         hundred rows is cheaper than a COUNT per message.
         """
+        text = payload.get("text")
+        if isinstance(text, str) and len(text) > self.MAX_OBSERVED_TEXT:
+            payload = {
+                **payload,
+                "text": text[: self.MAX_OBSERVED_TEXT],
+                "truncated": True,
+            }
+
         now = datetime.now(timezone.utc)
         result = await self._write(
             "INSERT INTO channel_observations "
@@ -67,7 +81,11 @@ class ObservationStore:
             ),
         )
 
-        seen = self._observation_writes.get(channel, 0) + 1
+        # Start at the threshold rather than zero, so the first insert after
+        # a restart trims. A purely process-local counter never fires on a
+        # daemon that restarts more often than it writes _TRIM_EVERY rows,
+        # and the cap silently stops existing.
+        seen = self._observation_writes.get(channel, _TRIM_EVERY) + 1
         if seen >= _TRIM_EVERY:
             self._observation_writes[channel] = 0
             await self._trim_channel_observations(channel, max_rows)

@@ -35,14 +35,19 @@ _SUMMARY_PREVIEW = 80
 class ChannelSource(Source):
     """A source over one channel's observation spool.
 
-    ``channel`` is the transport name (``"slack"``), which is also
-    :attr:`source_name` — so the inbox shows ``slack`` beside ``gmail`` and
-    ``github``, and a cron gate reads ``sources: [slack]``.
+    The source name is ``<channel>:observed`` — compound like
+    ``gmail:<account>``, and distinct on purpose. ``telegram`` is already a
+    pull source, and sharing a name would mean sharing a job id
+    (``source:telegram``) and a cursor key: the two runners would evict each
+    other from the scheduler and then read each other's cursor, one an
+    integer and the other Telethon's JSON state. So a cron gate reads
+    ``sources: [slack:observed]``, and observed traffic stays legible as its
+    own stream rather than blending into a pull source's.
     """
 
     def __init__(self, channel: str, db: Database):
-        self.source_name = channel
         self.channel = channel
+        self.source_name = f"{channel}:observed"
         self._db = db
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
@@ -73,9 +78,9 @@ class ChannelSource(Source):
         # every run and never reaches what is behind it.
         return FetchResult(
             records=[
-                _to_record(self.channel, payload)
+                _to_record(self.channel, self.source_name, payload)
                 for _, payload in rows
-                if payload is not None
+                if isinstance(payload, dict)
             ],
             next_cursor=str(rows[-1][0]),
             has_more=len(rows) >= limit,
@@ -93,7 +98,9 @@ def _as_id(cursor: str | None) -> int:
         return 0
 
 
-def _to_record(channel: str, payload: dict[str, Any]) -> SourceRecord:
+def _to_record(
+    channel: str, source_name: str, payload: dict[str, Any],
+) -> SourceRecord:
     """Turn one spooled :class:`ObservedMessage` payload into a record."""
     conversation_id = payload.get("conversation_id") or ""
     message_id = payload.get("message_id") or ""
@@ -110,7 +117,7 @@ def _to_record(channel: str, payload: dict[str, Any]) -> SourceRecord:
     # instead of arriving twice.
     return SourceRecord(
         id=f"{conversation_id}:{message_id}",
-        source=channel,
+        source=source_name,
         record_type=f"{channel}_message",
         summary=f"[{title}] {sender}: {preview}",
         content=text,
