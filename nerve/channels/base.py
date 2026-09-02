@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Flag, auto
 from typing import Any
 
+from nerve.channels.access import Decision
+
 
 class ChannelCapability(Flag):
     """Capabilities a channel can declare.
@@ -190,6 +192,23 @@ class BaseChannel(abc.ABC):
         For Telegram, this could render as inline keyboard buttons.
         For Web, this is a JSON event over WebSocket.
         """
+
+    # ------------------------------------------------------------------ #
+    #  Optional: addressed delivery                                         #
+    # ------------------------------------------------------------------ #
+
+    async def authorize_outbound(self, target: str) -> Decision:
+        """Whether an agent may send an unsolicited message to *target*.
+
+        Addressed delivery is the one path where the destination comes from
+        the agent rather than from a person who wrote in first, so the write
+        policy belongs to the channel that knows what a target means. The
+        router asks; the channel decides.
+
+        Refusing by default matches :meth:`send_file`, which declines rather
+        than infer a destination. A channel opts in by overriding this.
+        """
+        return Decision(False, f"{self.name} does not accept addressed delivery")
 
     # ------------------------------------------------------------------ #
     #  Optional: file delivery                                              #
