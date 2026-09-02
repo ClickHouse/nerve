@@ -453,23 +453,25 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
     chat context — and cannot silently retarget a different conversation
     when it does have one.
 
-    A policy refusal comes back as text rather than ``is_error``, matching
-    ``react``: the agent asked a reasonable question and got a "no" with a
-    reason, which is an answer, not a malfunction.
+    A policy refusal comes back as plain text, not ``is_error``: the agent
+    asked a reasonable question and got a reasoned "no", which is an answer
+    rather than a malfunction. A transport failure *is* ``is_error``, so
+    turn telemetry does not record a message that never arrived as a
+    successful call.
     """
     if not ctx.engine:
-        return ToolResult.text("Engine not available.")
+        return ToolResult.text("Engine not available.", is_error=True)
 
     channel = args.get("channel", "").strip()
     target = args.get("target", "").strip()
     text = args.get("text", "")
 
     if not channel:
-        return ToolResult.text("Error: channel is required.")
+        return ToolResult.text("Error: channel is required.", is_error=True)
     if not target:
-        return ToolResult.text("Error: target is required.")
+        return ToolResult.text("Error: target is required.", is_error=True)
     if not text.strip():
-        return ToolResult.text("Error: text is required.")
+        return ToolResult.text("Error: text is required.", is_error=True)
 
     try:
         decision = await ctx.engine.router.deliver_addressed(
@@ -477,7 +479,16 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
         )
     except Exception as e:
         logger.error("send_channel_message dispatch failed: %s", e)
-        return ToolResult.text(f"Failed to send message on {channel}: {e}")
+        # A long message is split into several posts, so a failure partway
+        # through leaves the earlier parts delivered. Say so: a plain
+        # "failed" reads as "nothing happened" and invites a retry that
+        # posts those parts a second time.
+        return ToolResult.text(
+            f"Failed to send message on {channel}: {e}. If the message was "
+            f"long, earlier parts of it may already have been posted — check "
+            f"the conversation before retrying.",
+            is_error=True,
+        )
 
     if decision.allowed:
         return ToolResult.text(f"Message sent to {channel} target {target}.")
