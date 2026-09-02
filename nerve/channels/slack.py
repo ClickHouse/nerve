@@ -1231,26 +1231,54 @@ class SlackChannel(BaseChannel):
         This is deliberately stricter than :meth:`_notification_target`, which
         does accept a ``D``: that is an operator writing one config value, not
         an agent choosing a destination at runtime.
+
+        The refusal reason returned here is deliberately coarse. It goes back
+        to the agent, which may repeat it into a chat, and the detailed
+        verdict names the resolved conversation and the pattern that matched
+        — the same reasoning behind :meth:`SlackAccessPolicy.describe`. The
+        detail goes to the log instead.
         """
         channel_id, _ = parse_target(target)
         if not channel_id:
             return Decision(False, "no Slack conversation id in the target")
 
-        if channel_id.startswith("D"):
+        if not is_slack_id(channel_id):
+            return Decision(
+                False,
+                "target must be a Slack conversation id, not a name",
+            )
+        if channel_id[0] not in "CG":
             return Decision(
                 False,
                 "unsolicited direct messages are not supported; address a "
-                "channel the policy allows instead",
+                "channel the policy allows instead"
+                if channel_id[0] == "D"
+                else f"{channel_id!r} is not a Slack conversation id",
             )
-        if not channel_id.startswith(("C", "G")):
-            return Decision(
-                False,
-                f"{channel_id!r} is not a Slack channel or group conversation id",
-            )
+
+        # A `G` is ambiguous: legacy private channel or multi-person DM. Only
+        # conversations.info can say which, so refusing `D` alone would let a
+        # group DM through the door marked "no unsolicited DMs".
+        if channel_id[0] == "G":
+            private = await self._is_private_conversation(channel_id)
+            if private is None:
+                return Decision(
+                    False,
+                    f"could not establish what kind of conversation "
+                    f"{channel_id} is",
+                )
+            if private:
+                return Decision(
+                    False,
+                    "unsolicited direct messages are not supported; address a "
+                    "channel the policy allows instead",
+                )
 
         policy = self.policy
         if not policy.channels.allow:
-            # Skip the lookup a refusal cannot use.
+            # Skip the lookup a refusal cannot use. Not redacted: naming an
+            # unset config key tells the operator what to do and discloses
+            # nothing about what is in it.
             return policy.check_outbound(Identity(id=channel_id))
 
         conversation = await self._identify_conversation(
@@ -1258,7 +1286,53 @@ class SlackChannel(BaseChannel):
             "channel",
             needs_name_resolution(policy.channels, is_id=is_slack_id),
         )
-        return policy.check_outbound(conversation)
+        return self._public_verdict(policy.check_outbound(conversation))
+
+    @staticmethod
+    def _public_verdict(verdict: Decision) -> Decision:
+        """Log the policy's detailed reason; hand back a coarse one.
+
+        A refusal reason from :class:`PatternGate` names the conversation it
+        resolved and the glob that matched it. That is what a log wants and
+        the opposite of what should travel back to an agent that may be
+        talking to whoever prompted the send.
+        """
+        if verdict.allowed:
+            return verdict
+        logger.info("Slack refused addressed delivery: %s", verdict.reason)
+        return Decision(
+            False, "the destination is not approved by the Slack channel policy",
+        )
+
+    async def _is_private_conversation(self, channel_id: str) -> bool | None:
+        """Whether *channel_id* is a DM or multi-person DM.
+
+        Returns None when Slack could not say, so the caller can fail closed
+        rather than guess. Cached beside the resolved names, since the answer
+        is a property of the conversation and does not change.
+        """
+        cache_key = f"kind:{channel_id}"
+        cached = self._name_cache.get(cache_key)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+        try:
+            info = await self._web.conversations_info(channel=channel_id)
+            conversation = info.get("channel") or {}
+            private = bool(
+                conversation.get("is_mpim") or conversation.get("is_im"),
+            )
+        except Exception as e:
+            logger.warning(
+                "Slack conversations.info failed for %s, so its kind is "
+                "unknown and delivery is refused: %s",
+                channel_id, e,
+            )
+            return None
+        self._remember(
+            self._name_cache, cache_key,
+            (private, time.monotonic() + _NAME_CACHE_TTL), _NAME_CACHE_MAX,
+        )
+        return private
 
     def _notification_target(self) -> str | None:
         """Resolve a concrete conversation from the active config generation."""
