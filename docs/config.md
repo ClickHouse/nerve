@@ -1200,6 +1200,13 @@ Messages the bot sees but does not answer can be spooled to the source inbox,
 where `poll_source`, `read_source`, and the `messages` cron gate reach them
 like any other source. Nothing here starts an agent turn.
 
+The inbox source name is `<channel>:observed` — `slack:observed`,
+`telegram:observed` — so a cron gate reads `sources: [slack:observed]`.
+It is deliberately distinct from the `telegram` pull source: sharing a name
+would mean sharing a cron job id and a cursor key, and the two runners would
+evict each other from the scheduler and then read each other's cursor, one an
+integer and the other Telethon's JSON state.
+
 ```yaml
 slack:
   observe:
@@ -1224,7 +1231,31 @@ slack:
 | `slack.observe.condense` | bool | `false` | LLM-condense long messages |
 | `slack.observe.max_spool_rows` | int | `10000` | Spool cap per channel |
 
-`telegram.observe.*` takes the same keys.
+A malformed allow/deny value — a mapping, a bare string, a number — is
+discarded outright with a warning rather than salvaged. `{"*": false}` reads
+like a disabled wildcard but coerces to the key list `["*"]`, so guessing at
+intent here would turn a config that looks switched off into one that grants
+everything. An unusable `schedule` likewise falls back to the default rather
+than leaving the spool filling with nothing to drain it.
+
+`telegram.observe.*` takes the same keys, plus one of its own:
+`include_unauthorized_senders` (bool, default `false`). Telegram has no
+"addressed to me" test — an authorized user's every message is answered — so
+its only seen-but-unanswered path is a sender the allowlist refused.
+Observing there therefore means collecting from people explicitly denied the
+agent, a sharper edge than Slack's "in the room but not talking to me", and
+it takes this second opt-in on top of the conversation grant.
+
+Two more Telegram-specific rules follow from the same reasoning:
+
+- **Only numeric chat and user IDs are grantable.** A group's title is set by
+  whoever runs it, and a `@username` is claimable and movable, so anyone
+  could create a group called `ops-room` and walk into a grant meant for
+  someone else's. Titles and usernames stay deny-eligible, where a spoofable
+  name can only subtract access.
+- **Other bots are skipped.** Telegram delivers bot-authored messages to
+  group handlers under bot-to-bot mode; two agents filling each other's
+  inboxes is no better than two agents answering each other.
 
 **Observation is a separate grant from access, on purpose.** `allow_users` and
 `allow_channels` answer "who may drive the agent?". `observe.*` answers "whose
@@ -1245,11 +1276,28 @@ That makes two rules here the inverse of the access rules:
 The agent's own posts, join/leave noise, and other apps' messages are dropped
 before the observation hook, so they never reach the inbox.
 
-**Everything observed is untrusted by construction** — it comes from someone
-who is, by definition, not authorized to instruct the agent. What keeps it as
-data rather than instructions is the inbox guardrail on the source runner, the
-same choke point every other source passes through. This gate only decides
-whose words get that far.
+**Everything observed is untrusted input.** It comes from people who are not
+authorized to instruct the agent — that is the whole point of watching a
+conversation — so treat a spooled message as attacker-controlled text that an
+agent will later read.
+
+Be precise about what protects you here, because it is less than it may
+sound:
+
+- `observe.*` decides **whose messages are collected**. That is a real and
+  enforced boundary, checked before anything is written.
+- The drain re-applies the **deny** rules against `conversation_id` and
+  `sender_id`, so a conversation added to `deny_conversations` stops
+  reaching the inbox even if its messages were already spooled.
+- Nothing here inspects **content**. An inbox filter matches metadata; it
+  cannot tell a report from an instruction, and no allow/deny list will
+  separate them. The remaining protection is structural: observations land
+  in an inbox the agent reads deliberately via `poll_source`, rather than
+  being injected into a turn as if a user had said them.
+
+So scope the grant to conversations whose participants you would already
+trust to file a ticket, and treat any workflow that acts on observed content
+without review as accepting prompt injection.
 
 **Cost.** Observation runs on the message dispatch path, so it spools raw IDs
 and resolves display names only when a pattern needs one. ID patterns cost no

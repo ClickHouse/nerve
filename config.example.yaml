@@ -168,6 +168,10 @@ slack:
   #   deny_conversations: ["*-social"]
   #   deny_senders: ["*-bot"]
   #   schedule: "*/5 * * * *"     # how often the spool drains into the inbox
+  #
+  # Reaches the inbox as the source "slack:observed". Group DMs are never
+  # observed, and everything collected is untrusted input: the grant decides
+  # whose messages are kept, not whether their contents can be believed.
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
 # default rather than adding to it, so name every transport you want. A
