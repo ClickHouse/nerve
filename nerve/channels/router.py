@@ -459,6 +459,16 @@ class ChannelRouter:
         """Total message count for a session (to know if more history exists)."""
         return await self.engine.db.count_messages(session_id)
 
+    async def list_plans(
+        self, status: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List plans (optionally filtered by status), newest first."""
+        return await self.engine.db.list_plans(status=status, limit=limit)
+
+    async def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        """Fetch a plan row (joined with its task title), or None if gone."""
+        return await self.engine.db.get_plan(plan_id)
+
     # ------------------------------------------------------------------ #
     #  Outbound: engine → channel (cron delivery, etc.)                    #
     # ------------------------------------------------------------------ #
