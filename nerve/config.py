@@ -940,6 +940,69 @@ class AgentConfig:
         )
 
 
+_DEFAULT_OBSERVE_SCHEDULE = "*/5 * * * *"
+
+
+def _pattern_list(value: object, label: str) -> list[str]:
+    """Coerce an observe allow/deny value to a list of patterns.
+
+    Stricter than the generic coercion, because these lists decide whose
+    messages get recorded. The case that matters is a **mapping**:
+    ``allow_conversations: {"*": false}`` survives the general coercion
+    unchanged, and ``list()`` of it yields its *keys* — so a rule that reads
+    like a disabled wildcard silently becomes one that grants everything.
+    A mapping is discarded rather than salvaged.
+
+    A bare scalar still wraps to a single pattern. That is how a ``${VAR}``
+    env reference arrives, and dropping it would break the documented way to
+    configure a list field from the environment.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (dict, set)):
+        logger.warning(
+            "observe.%s must be a list of patterns, got %s — discarding it. "
+            "A mapping's keys would read as patterns, so a rule that looks "
+            "switched off would grant them.",
+            label, type(value).__name__,
+        )
+        return []
+    if not isinstance(value, (list, tuple)):
+        text = str(value).strip()
+        return [text] if text else []
+    patterns: list[str] = []
+    for entry in value:
+        if isinstance(entry, (dict, list, tuple, set)):
+            logger.warning(
+                "observe.%s: ignoring non-scalar entry %r", label, entry,
+            )
+            continue
+        text = str(entry).strip()
+        if text:
+            patterns.append(text)
+    return patterns
+
+
+def _observe_schedule(value: object) -> str:
+    """Coerce an observe schedule, falling back to the default.
+
+    An observation runner carries its own schedule, so an unusable value has
+    no ``sync.<name>`` section to fall back to — it would leave the channel
+    spooling with nothing ever draining it. Fall back loudly instead.
+    """
+    if value is None:
+        return _DEFAULT_OBSERVE_SCHEDULE
+    if not isinstance(value, str) or not value.strip():
+        logger.warning(
+            "observe.schedule must be a non-empty crontab or interval "
+            "string, got %r — falling back to %r. Left unset, the spool "
+            "would fill with nothing draining it.",
+            value, _DEFAULT_OBSERVE_SCHEDULE,
+        )
+        return _DEFAULT_OBSERVE_SCHEDULE
+    return value.strip()
+
+
 @dataclass
 class ObserveConfig:
     """Which conversations feed the inbox without the agent answering them.
@@ -965,7 +1028,7 @@ class ObserveConfig:
     deny_conversations: list[str] = field(default_factory=list)
     allow_senders: list[str] = field(default_factory=list)
     deny_senders: list[str] = field(default_factory=list)
-    schedule: str = "*/5 * * * *"
+    schedule: str = _DEFAULT_OBSERVE_SCHEDULE
     batch_size: int = 50
     # Off by default: most chat messages are shorter than the runner's
     # 800-char condense threshold, so this would build an LLM client that
@@ -973,6 +1036,12 @@ class ObserveConfig:
     condense: bool = False
     # Cap on spooled rows per channel before the oldest are dropped.
     max_spool_rows: int = 10_000
+    # Telegram only. Its sole seen-but-unanswered path is a sender refused by
+    # the allowlist, so observing there means collecting from people
+    # explicitly denied the agent — a sharper edge than Slack's "in the room
+    # but not talking to me". Kept behind its own opt-in so that is a
+    # decision rather than a side effect of enabling observation.
+    include_unauthorized_senders: bool = False
 
     @classmethod
     @_coerced
@@ -980,25 +1049,31 @@ class ObserveConfig:
         enabled = _as_bool(
             d.get("enabled", False), False, label="observe.enabled",
         )
-        allow = d.get("allow_conversations") or []
+        allow = _pattern_list(d.get("allow_conversations"), "allow_conversations")
         if enabled and not allow:
             logger.warning(
-                "observe.enabled is set but observe.allow_conversations is "
-                "empty — nothing will be observed. Name the conversations to "
-                "watch; an empty list is not a wildcard here.",
+                "observe.enabled is set but observe.allow_conversations names "
+                "nothing usable — nothing will be observed. List the "
+                "conversations to watch; an empty list is not a wildcard here.",
             )
         return cls(
             enabled=enabled,
             allow_conversations=allow,
-            deny_conversations=d.get("deny_conversations") or [],
-            allow_senders=d.get("allow_senders") or [],
-            deny_senders=d.get("deny_senders") or [],
-            schedule=d.get("schedule", "*/5 * * * *"),
+            deny_conversations=_pattern_list(
+                d.get("deny_conversations"), "deny_conversations",
+            ),
+            allow_senders=_pattern_list(d.get("allow_senders"), "allow_senders"),
+            deny_senders=_pattern_list(d.get("deny_senders"), "deny_senders"),
+            schedule=_observe_schedule(d.get("schedule")),
             batch_size=d.get("batch_size", 50),
             condense=_as_bool(
                 d.get("condense", False), False, label="observe.condense",
             ),
             max_spool_rows=d.get("max_spool_rows", 10_000),
+            include_unauthorized_senders=_as_bool(
+                d.get("include_unauthorized_senders", False), False,
+                label="observe.include_unauthorized_senders",
+            ),
         )
 
 

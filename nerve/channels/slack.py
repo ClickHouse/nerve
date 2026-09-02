@@ -980,9 +980,11 @@ class SlackChannel(BaseChannel):
     ) -> None:
         """Spool a message the agent is not answering, if policy allows it.
 
-        Direct messages are never observed. A DM the agent declined to answer
-        is a refusal, and quietly filing it away is not what "we do not talk
-        to you" led the sender to expect.
+        Private conversations are never observed. A DM the agent declined to
+        answer is a refusal, and quietly filing it away is not what "we do not
+        talk to you" led the sender to expect. That covers multi-person DMs,
+        which arrive as ``channel_type="mpim"`` on a ``G`` id — checking only
+        for ``D`` would file a group DM away as if it were a channel.
 
         Raw IDs are spooled and names are resolved only when a pattern needs
         one, so watching a busy channel costs no Slack API call per message.
@@ -990,7 +992,22 @@ class SlackChannel(BaseChannel):
         policy = self.observation
         if not policy.active:
             return
-        if channel_id.startswith("D"):
+        # The *raw* type, not the caller's derived one: that default turns an
+        # absent type into "channel", which is exactly the ambiguity this has
+        # to refuse rather than resolve.
+        declared = event.get("channel_type") or ""
+        if declared in ("im", "mpim") or channel_id.startswith("D"):
+            return
+        # A `G` is either a legacy private channel or a multi-person DM, and
+        # only the declared type distinguishes them cheaply. Without one,
+        # decline: observation is opt-in, so not recording something is
+        # always the safe outcome.
+        if channel_id.startswith("G") and declared not in ("channel", "group"):
+            logger.debug(
+                "Slack did not observe a message in %s: conversation type %r "
+                "does not distinguish a private channel from a group DM",
+                channel_id, declared or "unset",
+            )
             return
 
         resolve = needs_name_resolution(

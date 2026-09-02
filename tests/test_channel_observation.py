@@ -228,6 +228,38 @@ class TestSlackObserve:
 
         channel.router.observe.assert_not_awaited()
 
+    async def test_a_group_dm_is_never_observed(self):
+        # An MPIM arrives as channel_type="mpim" on a `G` id. Checking only
+        # for `D` would file a group DM away as if it were a channel.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._handle_message_event(
+            _event(channel="G0123ABCD", channel_type="mpim"),
+        )
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_private_channel_is_observed(self):
+        # The other half of the `G` ambiguity: a real private channel must
+        # still be watchable.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._handle_message_event(
+            _event(channel="G0123ABCD", channel_type="group"),
+        )
+
+        channel.router.observe.assert_awaited_once()
+
+    async def test_an_ambiguous_g_conversation_is_not_observed(self):
+        # No channel_type to disambiguate: decline rather than guess.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+        event = _event(channel="G0123ABCD")
+        event.pop("channel_type")
+
+        await channel._handle_message_event(event)
+
+        channel.router.observe.assert_not_awaited()
+
     async def test_the_agents_own_post_is_not_spooled(self):
         channel = _slack_channel(enabled=True, allow_conversations=["*"])
 
@@ -280,6 +312,124 @@ class TestSlackObserve:
 
         observed = channel.router.observe.await_args.args[0]
         assert observed.metadata["thread_ts"] == "1699999999.000000"
+
+
+# ---------------------------------------------------------------------- #
+#  Telegram hook                                                          #
+# ---------------------------------------------------------------------- #
+
+
+def _tg_channel(**observe_kwargs):
+    """A Telegram channel with a stub router and an observe policy."""
+    from nerve.channels.telegram import TelegramChannel
+
+    observe_kwargs.setdefault("include_unauthorized_senders", True)
+    cfg = NerveConfig()
+    cfg.telegram.observe = ObserveConfig(**observe_kwargs)
+    cfg.telegram.allowed_users = [999]
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._config = lambda: cfg
+    channel.router = MagicMock()
+    channel.router.observe = AsyncMock(return_value=True)
+    return channel
+
+
+def _tg_update(
+    chat_id=-100123, chat_type="supergroup", title="ops-room",
+    user_id=42, username="mallory", is_bot=False,
+):
+    update = MagicMock()
+    update.effective_chat.id = chat_id
+    update.effective_chat.type = chat_type
+    update.effective_chat.title = title
+    update.effective_chat.username = None
+    update.effective_user.id = user_id
+    update.effective_user.username = username
+    update.effective_user.first_name = "M"
+    update.effective_user.last_name = None
+    update.effective_user.full_name = "M"
+    update.effective_user.is_bot = is_bot
+    update.message.text = "overheard"
+    update.message.caption = None
+    update.message.message_id = 7
+    update.message.date = None
+    update.message.reply_to_message = None
+    return update
+
+
+class TestTelegramObserve:
+    async def test_a_granted_group_is_observed(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+
+        await channel._observe(_tg_update())
+
+        channel.router.observe.assert_awaited_once()
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.channel_name == "telegram"
+        assert observed.conversation_id == "-100123"
+        assert observed.text == "overheard"
+
+    async def test_a_spoofed_title_does_not_grant_access(self):
+        # A group's title is set by whoever runs it. If a title could satisfy
+        # an allow rule, anyone could create a group named "ops-room" and
+        # walk into a grant meant for a different one.
+        channel = _tg_channel(enabled=True, allow_conversations=["ops-room"])
+
+        await channel._observe(_tg_update(chat_id=-100999, title="ops-room"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_title_can_still_deny(self):
+        # Spoofable names may only ever subtract access.
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            deny_conversations=["ops-room"],
+        )
+
+        await channel._observe(_tg_update(title="ops-room"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_spoofed_username_does_not_grant_a_sender(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            allow_senders=["mallory"],
+        )
+
+        await channel._observe(_tg_update(username="mallory"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_private_chat_is_never_observed(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._observe(_tg_update(chat_type="private"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_another_bot_is_not_observed(self):
+        # Two agents filling each other's inboxes is no better than two
+        # agents answering each other.
+        channel = _tg_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._observe(_tg_update(is_bot=True))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_the_unauthorized_opt_in_is_required(self):
+        # Every Telegram observation is from a sender the allowlist refused,
+        # so collecting them takes its own acknowledgement.
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            include_unauthorized_senders=False,
+        )
+
+        await channel._observe(_tg_update())
+
+        channel.router.observe.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------- #
@@ -442,7 +592,7 @@ class TestChannelSource:
         assert len(result.records) == 1
         record = result.records[0]
         assert record.id == "C0123ABCD:1700000000.000100"
-        assert record.source == "slack"
+        assert record.source == "slack:observed"
         assert record.record_type == "slack_message"
         assert record.summary == "[general] alice: ship it"
         assert record.content == "ship it"
@@ -522,6 +672,24 @@ class TestChannelSource:
         second = await source.fetch(first.next_cursor)
         assert [r.content for r in second.records] == ["reachable"]
 
+    async def test_valid_json_that_is_not_an_object_is_skipped(self, db):
+        # `[]` parses fine and then has no .get(). Letting that raise out of
+        # fetch would leave the cursor behind the row forever.
+        await db._write(
+            "INSERT INTO channel_observations "
+            "(channel, channel_key, payload, created_at, expires_at) "
+            "VALUES ('slack', 'k', '[]', '2026-01-01', '2099-01-01')",
+            (),
+        )
+        await db.insert_channel_observation(
+            "slack", "k", {"text": "reachable", "message_id": "2"},
+        )
+
+        result = await ChannelSource("slack", db).fetch(None)
+
+        assert [r.content for r in result.records] == ["reachable"]
+        assert result.next_cursor == "2"
+
     async def test_the_same_message_observed_twice_lands_once(self, db):
         payload = {
             "conversation_id": "C1",
@@ -553,7 +721,7 @@ class TestRegistry:
 
         runners = build_source_runners(cfg, MagicMock())
 
-        slack = [r for r in runners if r.source.source_name == "slack"]
+        slack = [r for r in runners if r.source.source_name == "slack:observed"]
         assert len(slack) == 1
         # The runner carries its own cadence: the config lives at
         # slack.observe, and CronService would otherwise find no
@@ -569,7 +737,7 @@ class TestRegistry:
         service = CronService.__new__(CronService)
         service.config = NerveConfig()
         runner = MagicMock()
-        runner.source.source_name = "slack"
+        runner.source.source_name = "slack:observed"
         runner.schedule = "*/7 * * * *"
 
         assert service._source_schedule(runner) == "*/7 * * * *"
@@ -593,14 +761,14 @@ class TestRegistry:
 
         runners = build_source_runners(cfg, MagicMock())
 
-        assert not [r for r in runners if r.source.source_name == "slack"]
+        assert not [r for r in runners if r.source.source_name == "slack:observed"]
 
     def test_no_runner_when_observation_is_off(self, tmp_path):
         cfg = NerveConfig()
 
         runners = build_source_runners(cfg, MagicMock())
 
-        assert not [r for r in runners if r.source.source_name == "slack"]
+        assert not [r for r in runners if r.source.source_name == "slack:observed"]
 
     def test_telegram_gets_the_same_treatment(self, tmp_path):
         cfg = NerveConfig()
@@ -610,7 +778,9 @@ class TestRegistry:
 
         runners = build_source_runners(cfg, MagicMock())
 
-        assert [r for r in runners if r.source.source_name == "telegram"]
+        assert [
+            r for r in runners if r.source.source_name == "telegram:observed"
+        ]
 
 
 class TestConfig:
@@ -634,6 +804,52 @@ class TestConfig:
 
         assert not cfg.observe.enabled
         assert cfg.observe.allow_conversations == []
+
+    def test_a_mapping_allow_list_does_not_become_a_wildcard(self):
+        # {"*": false} reads like a disabled wildcard, and list() of it
+        # yields its keys. Guessing at intent would turn a config that looks
+        # switched off into one that grants everything.
+        cfg = SlackConfig.from_dict({
+            "observe": {"enabled": True, "allow_conversations": {"*": False}},
+        })
+
+        assert cfg.observe.allow_conversations == []
+        assert not cfg.observe.active if hasattr(
+            cfg.observe, "active",
+        ) else True
+
+    @pytest.mark.parametrize("bad", [{"C1": True}, {"*": False}, None])
+    def test_a_mapping_or_missing_allow_list_grants_nothing(self, bad):
+        cfg = SlackConfig.from_dict({
+            "observe": {"enabled": True, "allow_conversations": bad},
+        })
+
+        assert cfg.observe.allow_conversations == []
+
+    def test_a_bare_string_is_one_pattern_not_many(self):
+        # This is how `allow_conversations: ${OBSERVE_ROOMS}` arrives after
+        # interpolation. Dropping it would break the documented env-var
+        # idiom; splitting it would invent patterns nobody wrote.
+        cfg = SlackConfig.from_dict({
+            "observe": {"allow_conversations": "C0123ABCD"},
+        })
+
+        assert cfg.observe.allow_conversations == ["C0123ABCD"]
+
+    def test_scalar_entries_are_kept_and_junk_dropped(self):
+        cfg = SlackConfig.from_dict({
+            "observe": {"allow_conversations": [{"a": 1}, "C1", "  ", "C2"]},
+        })
+
+        assert cfg.observe.allow_conversations == ["C1", "C2"]
+
+    @pytest.mark.parametrize("bad", [5, "", "   ", None])
+    def test_an_unusable_schedule_falls_back(self, bad):
+        # There is no sync.slack section to fall back to, so an ignored
+        # schedule would leave the spool filling with nothing draining it.
+        cfg = SlackConfig.from_dict({"observe": {"schedule": bad}})
+
+        assert cfg.observe.schedule == "*/5 * * * *"
 
     def test_enabling_without_a_grant_warns(self, caplog):
         with caplog.at_level("WARNING"):
