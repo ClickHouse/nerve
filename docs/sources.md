@@ -168,6 +168,33 @@ visible rather than failing the fetch.
 - **Default schedule:** `*/5 * * * *` (every 5 min)
 - **Requires setup:** Run `nerve sync telegram` interactively once to authenticate with Telethon (phone number + code). The session is stored at `~/.nerve/telegram_sync.session`
 
+### Chat channels (Slack, Telegram)
+
+- **Adapter:** `nerve/sources/channel.py` — `ChannelSource`, one per observing channel
+- **Mechanism:** push, not pull. The channel already receives every message in
+  every conversation it sits in over its own socket. When it decides *not* to
+  answer one, it appends the message to the `channel_observations` spool; this
+  source drains the spool into the inbox. No chat API is polled — that would
+  duplicate data already delivered, add latency, and need a second cursor to
+  disagree with the first.
+- **Cursor:** the spool's autoincrement row id. `AUTOINCREMENT` is load-bearing:
+  the spool is pruned, and a plain SQLite rowid is reused after the highest row
+  is deleted, which would reissue ids the cursor has already passed and skip
+  the next observations for good.
+- **Source name:** the channel name — `slack`, `telegram` — so a cron gate reads
+  `sources: [slack]` and the inbox lists it beside `gmail`.
+- **Config:** `slack.observe.*` / `telegram.observe.*`, not `sync.*`. What to
+  watch is a property of the channel. The runner therefore carries its own
+  `schedule` rather than being looked up in `config.sync.<name>`.
+- **Default schedule:** `*/5 * * * *`
+- **Idempotent:** the record id is `<conversation>:<message_id>`, so a message
+  observed twice collapses on the inbox's `(source, id)` key.
+- **Guardrails:** ordinary `FieldRule`s over the spooled metadata —
+  `conversation_id`, `sender_id`, `thread_ts`, `channel_key`.
+
+See [config.md](config.md) for why observation is a separate grant from channel
+access, and what is deliberately never observed.
+
 ## Configuration
 
 Sources are configured under the `sync:` key in `config.yaml` / `config.local.yaml`:
@@ -480,6 +507,7 @@ The Sources page (`/sources`) has three tabs:
 - `consumer_cursors` — Per (consumer, source) read position with TTL and session linking
 - `source_messages` — Inbox messages with `raw_content` (original HTML), `processed_content` (LLM-condensed), TTL-based expiry
 - `source_run_log` — Per-run diagnostics (records ingested, errors, timestamps)
+- `channel_observations` — Push spool for chat messages a channel saw but did not answer, drained by `ChannelSource`. Row-capped per channel and TTL-swept by the daily cleanup
 - `cron_logs` — Job execution history (source jobs use `source:<name>` as job ID)
 
 ### API Endpoints

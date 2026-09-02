@@ -32,13 +32,16 @@ from nerve.channels.archives import (
     TEXT_EXTENSIONS,
     extract_zip,
 )
+from nerve.channels.access import Identity, PatternGate
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     ChannelConstraints,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
+from nerve.channels.observation import ObservationPolicy
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -1488,10 +1491,102 @@ class TelegramChannel(BaseChannel):
 
         return extract_zip(bytes(data), meta_line)
 
+    @property
+    def observation(self) -> ObservationPolicy:
+        """The observation grant, rebuilt per read so reloads apply at once."""
+        observe = self.config.telegram.observe
+        return ObservationPolicy(
+            enabled=observe.enabled,
+            conversations=PatternGate(
+                "chat",
+                allow=list(observe.allow_conversations),
+                deny=list(observe.deny_conversations),
+            ),
+            senders=PatternGate(
+                "sender",
+                allow=list(observe.allow_senders),
+                deny=list(observe.deny_senders),
+            ),
+        )
+
+    async def _observe(self, update: Update) -> None:
+        """Spool a message from a sender who may not instruct the agent.
+
+        Telegram has no "addressed to me" test the way Slack does — an
+        authorized user's every message is answered — so the only
+        seen-but-unanswered path is an unauthorized sender. That reads
+        alarming and is in fact the point: observation is watching a
+        conversation the agent takes no orders from. What makes it safe is
+        that it needs its own explicit ``telegram.observe.allow_conversations``
+        grant, and that everything spooled stays untrusted input to the inbox
+        rather than instructions.
+
+        Private chats are never observed. A stranger's DM is a refusal, and
+        filing it away is not what the silence led them to expect; a group an
+        operator listed is a different matter.
+        """
+        policy = self.observation
+        if not policy.active:
+            return
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        if chat.type == "private":
+            return
+
+        conversation = Identity(
+            id=str(chat.id),
+            names=tuple(n for n in (chat.username, chat.title) if n),
+        )
+        # first_name/last_name are set by the account holder, so only a deny
+        # rule may match them; the @username is claimed and unique.
+        sender = Identity(
+            id=str(user.id),
+            names=(user.username,) if user.username else (),
+            self_set_names=tuple(
+                n for n in (user.first_name, user.last_name) if n
+            ),
+        )
+
+        verdict = policy.check(conversation, sender)
+        if not verdict.allowed:
+            logger.debug("Telegram did not observe a message: %s", verdict.reason)
+            return
+
+        sent_at = message.date or datetime.now(timezone.utc)
+        observed = ObservedMessage(
+            channel_name="telegram",
+            channel_key=f"telegram:{chat.id}",
+            conversation_id=str(chat.id),
+            sender_id=str(user.id),
+            text=message.text or message.caption or "",
+            message_id=str(message.message_id),
+            timestamp=sent_at.isoformat(),
+            conversation_title=chat.title or chat.username or "",
+            sender_name=user.username or user.full_name or "",
+            metadata={
+                "chat_type": chat.type or "",
+                "reply_to_message_id": (
+                    str(message.reply_to_message.message_id)
+                    if message.reply_to_message
+                    else ""
+                ),
+            },
+        )
+        await self.router.observe(
+            observed, ttl_days=self.config.sync.message_ttl_days,
+        )
+
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
         if not self._is_authorized(update.effective_user.id):
+            # Not allowed to instruct the agent — which is exactly the
+            # premise of observation, not an obstacle to it. Needs its own
+            # explicit grant; see _observe.
+            await self._observe(update)
             return
 
         # Media group (album) — collect all parts before processing

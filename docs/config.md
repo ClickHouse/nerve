@@ -1194,6 +1194,73 @@ slack:
   Deny rules alone never enable access.
 - If a required name lookup fails or omits data, Nerve refuses the message.
 
+### Observation
+
+Messages the bot sees but does not answer can be spooled to the source inbox,
+where `poll_source`, `read_source`, and the `messages` cron gate reach them
+like any other source. Nothing here starts an agent turn.
+
+```yaml
+slack:
+  observe:
+    enabled: true
+    allow_conversations: ["C0123ABCD", "eng-*"]
+    deny_conversations: ["*-social"]
+    deny_senders: ["*-bot"]
+    schedule: "*/5 * * * *"     # how often the spool drains into the inbox
+    batch_size: 50
+    max_spool_rows: 10000       # per channel, before the oldest are dropped
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `slack.observe.enabled` | bool | `false` | Spool unanswered messages |
+| `slack.observe.allow_conversations` | list[str] | `[]` | Conversations to watch. **Empty means none** |
+| `slack.observe.deny_conversations` | list[str] | `[]` | Never watch these |
+| `slack.observe.allow_senders` | list[str] | `[]` | Restrict to these senders |
+| `slack.observe.deny_senders` | list[str] | `[]` | Skip these senders |
+| `slack.observe.schedule` | string | `*/5 * * * *` | Drain cadence |
+| `slack.observe.batch_size` | int | `50` | Records per drain |
+| `slack.observe.condense` | bool | `false` | LLM-condense long messages |
+| `slack.observe.max_spool_rows` | int | `10000` | Spool cap per channel |
+
+`telegram.observe.*` takes the same keys.
+
+**Observation is a separate grant from access, on purpose.** `allow_users` and
+`allow_channels` answer "who may drive the agent?". `observe.*` answers "whose
+traffic may reach the agent's inbox?". Watching a conversation the agent takes
+no orders from is a legitimate and different thing to want, and deriving one
+from the other would either block it or silently widen command access to
+everything worth watching.
+
+That makes two rules here the inverse of the access rules:
+
+- **An empty `allow_conversations` observes nothing**, not everything. A
+  standing grant to record other people's messages has to be written down.
+  `enabled: true` with no conversations logs a warning and registers no drain.
+- **Direct messages are never observed.** Declining to answer a DM is a
+  refusal; filing it away instead is not what the silence led the sender to
+  expect.
+
+The agent's own posts, join/leave noise, and other apps' messages are dropped
+before the observation hook, so they never reach the inbox.
+
+**Everything observed is untrusted by construction** — it comes from someone
+who is, by definition, not authorized to instruct the agent. What keeps it as
+data rather than instructions is the inbox guardrail on the source runner, the
+same choke point every other source passes through. This gate only decides
+whose words get that far.
+
+**Cost.** Observation runs on the message dispatch path, so it spools raw IDs
+and resolves display names only when a pattern needs one. ID patterns cost no
+Slack API call at all; name and glob patterns cost one `conversations.info` or
+`users.info` per distinct ID per 10 minutes, via the existing name cache.
+Prefer IDs when watching a busy conversation.
+
+**Thread context is not expanded.** A reply's `thread_ts` is recorded so a
+reader can pull the parent, but the parent is not fetched — that would cost an
+API call per observation. Expanding it is deferred.
+
 ### Message behavior
 
 - In an allowed DM, the bot answers every message.

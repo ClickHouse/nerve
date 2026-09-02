@@ -152,6 +152,22 @@ slack:
   #   [all]    — everything, including doctor and restart
   # doctor/restart affect the host; sessions lists other channels. Opt in.
   # commands: [sessions, new, stop, reply]
+  #
+  # Spool messages the bot sees but does not answer into the source inbox,
+  # where poll_source and the `messages` cron gate reach them. Nothing here
+  # starts an agent turn.
+  #
+  # A SEPARATE grant from the access rules above: those say who may drive the
+  # agent, this says whose traffic may reach its inbox. So an empty
+  # allow_conversations observes NOTHING rather than everything, and DMs are
+  # never observed. Prefer literal IDs — a name or glob costs a
+  # conversations.info lookup per conversation per 10 minutes.
+  # observe:
+  #   enabled: true
+  #   allow_conversations: ["C0456DEF", "eng-*"]
+  #   deny_conversations: ["*-social"]
+  #   deny_senders: ["*-bot"]
+  #   schedule: "*/5 * * * *"     # how often the spool drains into the inbox
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
 # default rather than adding to it, so name every transport you want. A
