@@ -948,6 +948,83 @@ class TestNonInteractiveBedrockRegion:
         assert settings["agent"]["model"].startswith("us.anthropic.")
 
 
+class TestNonInteractiveEmbeddingsEndpoint:
+    """NERVE_EMBEDDINGS_API_ENDPOINT / NERVE_EMBEDDINGS_MODEL env wiring."""
+
+    def _settings(self, tmp_path: Path) -> dict:
+        return yaml.safe_load(
+            (tmp_path / "ws" / "config" / "settings.yaml").read_text()
+        )
+
+    def test_endpoint_written_to_settings(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "NERVE_PROVIDER": "bedrock",
+            "NERVE_AWS_REGION": "eu-central-1",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_EMBEDDINGS_API_ENDPOINT": "https://llm.internal/v1",
+            "NERVE_EMBEDDINGS_MODEL": "bge-large-en",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.embeddings_api_endpoint == "https://llm.internal/v1"
+        memory = self._settings(tmp_path)["memory"]
+        assert memory["embed_base_url"] == "https://llm.internal/v1"
+        assert memory["embed_model"] == "bge-large-en"
+
+    def test_endpoint_survives_bedrock_model_rewrite(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Bedrock rewrites the chat models but not the embed keys."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "NERVE_PROVIDER": "bedrock",
+            "NERVE_AWS_REGION": "eu-central-1",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_EMBEDDINGS_API_ENDPOINT": "https://llm.internal/v1",
+            "NERVE_EMBEDDINGS_MODEL": "bge-large-en",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+
+        memory = self._settings(tmp_path)["memory"]
+        assert memory["fast_model"].startswith("eu.anthropic.")
+        assert memory["embed_base_url"] == "https://llm.internal/v1"
+        assert memory["embed_model"] == "bge-large-en"
+
+    def test_endpoint_is_stripped(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "NERVE_PROVIDER": "bedrock",
+            "NERVE_AWS_REGION": "eu-central-1",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_EMBEDDINGS_API_ENDPOINT": "  https://llm.internal/v1  ",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.embeddings_api_endpoint == "https://llm.internal/v1"
+
+    def test_omitted_endpoint_leaves_key_absent(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """No env var means no config key, leaving OpenAI as the default."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        env = {
+            "NERVE_PROVIDER": "bedrock",
+            "NERVE_AWS_REGION": "eu-central-1",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.embeddings_api_endpoint == ""
+        memory = self._settings(tmp_path)["memory"]
+        assert "embed_base_url" not in memory
+        assert memory["embed_model"] == "text-embedding-3-small"
+
+
 class TestNonInteractiveTelegramAllowedUsers:
     """NERVE_TELEGRAM_ALLOWED_USERS env wiring."""
 

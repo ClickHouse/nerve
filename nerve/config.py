@@ -1466,6 +1466,7 @@ class MemoryConfig:
     memorize_model: str = "claude-sonnet-4-6"  # Extraction & preprocessing
     fast_model: str = "claude-haiku-4-5-20251001"  # Category summaries, date resolution
     embed_model: str = ""
+    embed_base_url: str = ""  # OpenAI-compatible /v1 base; empty = api.openai.com
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
@@ -1482,6 +1483,7 @@ class MemoryConfig:
             memorize_model=d.get("memorize_model", "claude-sonnet-4-6"),
             fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
             embed_model=d.get("embed_model", ""),
+            embed_base_url=str(d.get("embed_base_url", "") or "").strip(),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
             knowledge_filter=d.get("knowledge_filter", False),
