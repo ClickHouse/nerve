@@ -80,6 +80,24 @@ class SlackAccessPolicy:
             )
         return self.channels.check(channel)
 
+    def check_outbound(self, channel: Identity) -> Decision:
+        """Decide whether the agent may post to a shared conversation unasked.
+
+        Read in the write direction the policy is short one term: there is no
+        sender to run through :attr:`users`. An allow list of users therefore
+        grants nothing here — it says who may drive the agent, not where the
+        agent may broadcast — so an explicit :attr:`channels` grant is
+        required, the same instinct as refusing shared channels to a lone
+        ``allow_direct_messages``.
+        """
+        if not self.channels.allow:
+            return Decision(
+                False,
+                "no slack.allow_channels configured, so no conversation is "
+                "approved for addressed delivery",
+            )
+        return self.channels.check(channel)
+
     def describe(self) -> str:
         """Summarize the policy without exposing configured patterns."""
         return (
