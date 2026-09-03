@@ -1254,55 +1254,27 @@ warning. Slack in the list costs nothing while Slack is off.
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
 a literal channel ID, delivery is skipped with a warning.
 
-### Addressed delivery
+### Outbound Slack message tool
 
-The `send_channel_message` tool posts to a conversation the agent names,
-rather than to whichever chat it is answering. That makes it usable from a
-cron run with no conversation attached — and means the destination, not the
-sender, is what has to be authorized.
+The `send_channel_message` tool posts to a given conversation. That makes it usable
+from a cron run with no conversation attached.
 
 It is **off by default**: `slack.allow_outbound: true` enables the capability,
-and `slack.allow_channels` then bounds where it may go. Two keys rather than
-one because `allow_channels` is set by nearly every Slack deployment for
-inbound access — deriving writes from it alone would have handed every cron
-run a megaphone into those channels on upgrade, with no opt-in. The switch
-never widens the destination set: with it on, `allow_channels` still decides,
-and `slack.deny_channels` still refuses.
+and `slack.allow_channels` then bounds where it may go. The target must be a literal conversation id.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `slack.allow_outbound` | bool | `false` | Let an agent post to a conversation it names |
 
-Three differences from the inbound policy are deliberate:
+Three differences from the inbound policy:
 
-- **`slack.allow_users` grants nothing here.** It says who may drive the
-  agent, not where the agent may broadcast. With no `slack.allow_channels`
-  set, every target is refused even when `allow_outbound` is on — unlike an
-  inbound check, there is no sender to have vetted first.
+- **`slack.allow_users` has no effect.** It says who may drive the
+  agent, not where the agent may broadcast.
 - **Unsolicited DMs are refused**, even with `slack.allow_direct_messages`.
-  An inbound DM comes from someone who chose to write; an outbound one does
-  not. Gating one properly means resolving the conversation's member and
-  running them through the user rules, which is a separate change.
   **Group DMs count.** A `G` id is either a legacy private channel or a
   multi-person DM, and only `conversations.info` can tell them apart, so a
   `G` target costs one cached lookup; a lookup that cannot answer is refused
   rather than guessed.
-- **`notifications.slack_channel_id` may still be a `D`.** That is an
-  operator writing one config value, not an agent choosing a destination at
-  runtime, so the two do not share a policy.
-
-The target must be a literal conversation id, never a name: a name would make
-the destination depend on a lookup the caller does not control.
-
-**Refusal reasons are coarse on purpose.** The reason travels back to the
-agent, which may repeat it into a chat, so the detailed verdict — which names
-the resolved conversation and the pattern that matched it — goes to the log
-and the agent is told only that the destination is not approved. The same
-reasoning is why `SlackAccessPolicy.describe()` reports counts rather than
-patterns.
-
-Other channels refuse addressed delivery outright until they implement the
-same seam.
 
 ## Quiet Hours
 
