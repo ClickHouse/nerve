@@ -57,6 +57,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    config_excluded_tools,
 )
 from nerve.agent.backends.images import validate_image_data, validate_image_file
 from nerve.agent.cache_policy import cache_ttl_env
@@ -410,7 +411,7 @@ class ClaudeBackend:
         # ScheduleWakeup is a Claude CLI built-in (captured via the
         # PostToolUse hook) — the registry equivalent exists for backends
         # without built-ins and would be a confusing duplicate here.
-        return {"schedule_wakeup"}
+        return {"schedule_wakeup"} | config_excluded_tools(self.config)
 
     def validate_resume_target(self, native_id: str, cwd: str) -> bool:
         """Check whether Claude Code still has the conversation .jsonl

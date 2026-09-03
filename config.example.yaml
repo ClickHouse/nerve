@@ -135,6 +135,7 @@ slack:
   # deployment for inbound access, so deriving writes from it alone would open
   # unprompted posting on upgrade. Turning this on never widens where writes
   # may go — allow_channels still bounds that, and DMs are always refused.
+  # While this is off, the send_channel_message tool is not offered at all.
   # allow_outbound: false
   #
   # Every shared-channel thread is its own session; DMs use one conversation.
