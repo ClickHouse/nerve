@@ -8,6 +8,15 @@ Three layers, tested separately because they fail differently:
   silently skips messages;
 * :class:`ChannelSource`, which turns buffered rows into inbox records and
   hands the rest — filtering, TTL, health, cursor — to ``SourceRunner``.
+
+What is *not* here is anything that turns on the events Slack actually
+sends. These hand ``_observe`` an event dict the test wrote, so they settle
+the policy branches and nothing about whether a real message carries the
+fields the payload is built from. Those live in
+``TestChannelSourceCollectsRealTraffic`` in
+:mod:`tests.test_slack_live_inbound`, driven by a real person posting into a
+real channel. Kept here: the pure branches, and the conversation kinds a
+live test cannot provoke.
 """
 
 from __future__ import annotations
@@ -187,21 +196,6 @@ class TestSlackRouting:
     combination is reachable, so every combination is pinned here.
     """
 
-    async def test_source_only_when_the_agent_is_not_addressed(self):
-        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
-
-        await channel._handle_message_event(_event())
-
-        channel.router.handle_message.assert_not_awaited()
-        channel.router.observe.assert_awaited_once()
-        observed = channel.router.observe.await_args.args[0]
-        assert observed.channel_name == "slack"
-        assert observed.conversation_id == "C0123ABCD"
-        assert observed.sender_id == "U0456DEFG"
-        assert observed.text == "just chatting"
-        assert observed.message_id == "1700000000.000100"
-        assert observed.timestamp.startswith("2023-11-14T")
-
     async def test_source_only_when_the_sender_may_not_drive_the_agent(self):
         # Addressed, but access refuses it. The source grant is its own
         # question, so the message still reaches the inbox — which is the
@@ -233,38 +227,6 @@ class TestSlackRouting:
         channel.router.handle_message.assert_awaited_once()
         channel.router.observe.assert_not_awaited()
 
-    async def test_a_handled_message_is_not_also_collected_by_default(self):
-        # Both routes match. Sending one message down both would show the
-        # agent its own conversation again as third-party inbox traffic, so
-        # the live route wins unless an operator says otherwise.
-        channel = _slack_channel(
-            allow_channels=["C0123ABCD"],
-            enabled=True,
-            allow_conversations=["C0123ABCD"],
-        )
-
-        await channel._handle_message_event(
-            _event(text="<@U0BOT> hello", type="app_mention"),
-        )
-
-        channel.router.handle_message.assert_awaited_once()
-        channel.router.observe.assert_not_awaited()
-
-    async def test_include_handled_messages_sends_it_to_both(self):
-        channel = _slack_channel(
-            allow_channels=["C0123ABCD"],
-            enabled=True,
-            allow_conversations=["C0123ABCD"],
-            include_handled_messages=True,
-        )
-
-        await channel._handle_message_event(
-            _event(text="<@U0BOT> hello", type="app_mention"),
-        )
-
-        channel.router.handle_message.assert_awaited_once()
-        channel.router.observe.assert_awaited_once()
-
     async def test_neither_route_takes_an_unaddressed_unwatched_message(self):
         channel = _slack_channel(
             allow_channels=["C0123ABCD"],
@@ -281,13 +243,6 @@ class TestSlackRouting:
 class TestSlackObserve:
     async def test_observation_off_buffers_nothing(self):
         channel = _slack_channel(enabled=False, allow_conversations=["C0123ABCD"])
-
-        await channel._handle_message_event(_event())
-
-        channel.router.observe.assert_not_awaited()
-
-    async def test_an_unwatched_channel_is_not_buffered(self):
-        channel = _slack_channel(enabled=True, allow_conversations=["C0AAA1111"])
 
         await channel._handle_message_event(_event())
 
@@ -333,13 +288,6 @@ class TestSlackObserve:
         event.pop("channel_type")
 
         await channel._handle_message_event(event)
-
-        channel.router.observe.assert_not_awaited()
-
-    async def test_the_agents_own_post_is_not_buffered(self):
-        channel = _slack_channel(enabled=True, allow_conversations=["*"])
-
-        await channel._handle_message_event(_event(user="U0BOT"))
 
         channel.router.observe.assert_not_awaited()
 
@@ -400,14 +348,6 @@ class TestSlackObserve:
         await channel._handle_message_event(_event())
 
         channel.router.observe.assert_not_awaited()
-
-    async def test_a_name_policy_resolves_and_records_the_name(self):
-        channel = _slack_channel(enabled=True, allow_conversations=["general"])
-
-        await channel._handle_message_event(_event())
-
-        observed = channel.router.observe.await_args.args[0]
-        assert observed.conversation_title == "general"
 
     async def test_the_thread_is_recorded_for_a_reader_to_expand(self):
         channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
