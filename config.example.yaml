@@ -129,6 +129,14 @@ slack:
   # allow_channels: ["eng-*", "C0456DEF"]
   # deny_channels: ["*-random", "*-social"]
   #
+  # Let an agent post to a conversation it names (send_channel_message),
+  # including from a cron run with no chat attached. Off by default and
+  # separate from the read grant above: allow_channels is set by nearly every
+  # deployment for inbound access, so deriving writes from it alone would open
+  # unprompted posting on upgrade. Turning this on never widens where writes
+  # may go — allow_channels still bounds that, and DMs are always refused.
+  # allow_outbound: false
+  #
   # Every shared-channel thread is its own session; DMs use one conversation.
   #
   # How a reply appears while the agent works. "partial" posts a placeholder
