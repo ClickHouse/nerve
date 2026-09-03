@@ -776,3 +776,32 @@ def build_channel(
         channel._build_socket_client = build_instrumented_socket
         channel._live_diagnostics = diagnostics
     return channel, cfg
+
+
+def build_outbound_channel(**slack_kwargs):
+    """A SlackChannel that can post live, with no Socket Mode connection.
+
+    Addressed delivery never reads an inbound event, so opening a socket
+    would only take a share of this app's envelopes away from whichever
+    test is waiting on one. The web client is real, which is the point:
+    ``authorize_outbound`` resolves conversation names through
+    ``conversations.info`` and the answer is Slack's, not a fixture's.
+
+    ``allow_outbound`` defaults on so each test states only the policy it is
+    about; the switch itself is unit-tested.
+    """
+    from nerve.channels.slack import SlackChannel
+    from nerve.config import NerveConfig, SlackConfig
+
+    slack_kwargs.setdefault("allow_outbound", True)
+    cfg = NerveConfig()
+    cfg.slack = SlackConfig(
+        enabled=True,
+        bot_token=BOT_TOKEN,
+        app_token=APP_TOKEN,
+        **slack_kwargs,
+    )
+    channel = SlackChannel(cfg, RecordingRouter())
+    channel._web = make_client(BOT_TOKEN)
+    channel._state = "running"
+    return channel

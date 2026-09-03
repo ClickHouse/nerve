@@ -8,6 +8,14 @@ the destination the thing that has to be authorized. The policy seam is
 Covers the Slack write policy, the default refusal every other channel
 inherits, the router guard on ``deliver``/``deliver_addressed``, and the
 ``send_channel_message`` handler that reports a refusal's reason.
+
+What is *not* here is anything that turns on Slack's own answer: whether a
+grant written against a channel name matches what ``conversations.info``
+calls it, and whether an authorized send arrives. A fixture returning
+``{"name": "general"}`` proves only that the test knows what the code reads.
+Those live in ``TestAddressedDelivery`` in :mod:`tests.test_slack_live`,
+against a real workspace. Kept here: the branches that are pure, the failures
+that have to be injected, and the paths a live test cannot provoke.
 """
 
 from __future__ import annotations
@@ -88,30 +96,6 @@ def _slack(**slack_kwargs) -> SlackChannel:
 
 
 class TestSlackAuthorizeOutbound:
-    async def test_an_allowed_conversation_is_approved(self):
-        channel = _slack(allow_channels=["C0123ABCD"])
-
-        verdict = await channel.authorize_outbound("C0123ABCD")
-
-        assert verdict.allowed
-
-    async def test_a_thread_target_is_approved_on_its_conversation(self):
-        # The thread ts addresses a reply inside a conversation already
-        # granted; splitting it off would refuse the allowed channel.
-        channel = _slack(allow_channels=["C0123ABCD"])
-
-        verdict = await channel.authorize_outbound("C0123ABCD:1700000000.000100")
-
-        assert verdict.allowed
-
-    async def test_a_conversation_off_the_allow_list_is_refused(self):
-        channel = _slack(allow_channels=["C0123ABCD"])
-
-        verdict = await channel.authorize_outbound("C0999ZZZZ")
-
-        assert not verdict.allowed
-        assert "not approved" in verdict.reason
-
     async def test_a_denied_conversation_is_refused(self, caplog):
         channel = _slack(allow_channels=["*"], deny_channels=["C0999ZZZZ"])
 
@@ -199,28 +183,6 @@ class TestSlackAuthorizeOutbound:
 
         assert not verdict.allowed
         assert "direct message" in verdict.reason
-
-    async def test_an_unresolvable_name_is_refused_when_a_deny_list_needs_one(
-        self, caplog,
-    ):
-        # conversations.info failing leaves the identity incomplete, and a
-        # deny list cannot be checked against a name nobody could read.
-        channel = _slack(allow_channels=["*"], deny_channels=["secrets"])
-        channel._web.conversations_info = AsyncMock(side_effect=RuntimeError("boom"))
-
-        with caplog.at_level("INFO"):
-            verdict = await channel.authorize_outbound("C0123ABCD")
-
-        assert not verdict.allowed
-        assert "could not be fully identified" in caplog.text
-
-    async def test_a_name_grant_matches_the_resolved_conversation(self):
-        channel = _slack(allow_channels=["general"])
-
-        verdict = await channel.authorize_outbound("C0123ABCD")
-
-        assert verdict.allowed
-        channel._web.conversations_info.assert_awaited_once()
 
     async def test_no_allow_channels_refuses_everything(self):
         # The empty PatternGate allows all comers, which is right for an
@@ -361,17 +323,6 @@ class TestDefaultRefusal:
 
 
 class TestRouterDeliver:
-    async def test_an_approved_target_receives_the_message(self):
-        router = ChannelRouter(MagicMock())
-        channel = _slack(allow_channels=["C0123ABCD"])
-        router.register(channel)
-
-        verdict = await router.deliver_addressed("slack", "C0123ABCD", "hello")
-
-        assert verdict.allowed
-        channel._web.chat_postMessage.assert_awaited_once()
-        assert channel._web.chat_postMessage.await_args.kwargs["channel"] == "C0123ABCD"
-
     async def test_the_caller_target_is_used_verbatim(self):
         # The whole point of this path: a session's last inbound message
         # must never redirect a delivery the caller addressed itself.
@@ -439,18 +390,6 @@ def _ctx(decision) -> ToolContext:
 
 
 class TestSendChannelMessageHandler:
-    async def test_a_delivered_message_is_confirmed(self):
-        ctx = _ctx(Decision(True, "ok"))
-
-        result = await send_channel_message_handler(
-            ctx, {"channel": "slack", "target": "C0123ABCD", "text": "hi"},
-        )
-
-        assert "sent" in result.content[0]["text"].lower()
-        ctx.engine.router.deliver_addressed.assert_awaited_once_with(
-            "slack", "C0123ABCD", "hi", session_id="s1",
-        )
-
     async def test_a_refusal_reports_the_reason(self):
         ctx = _ctx(Decision(False, "channel general (C1) is not on the allow list"))
 

@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
+from nerve.agent.tools.handlers.notifications import send_channel_message_handler
+from nerve.agent.tools.registry import ToolContext
+from nerve.channels.base import OutboundMessage
+from nerve.channels.router import ChannelRouter
 from nerve.channels.slack import (
     format_target,
     is_slack_id,
@@ -44,6 +49,7 @@ from tests.slack_live import (
     Posted,
     RecordingRouter,
     build_channel,
+    build_outbound_channel,
     direct_message_guardrails,
     make_client,
     requires_no_email_token,
@@ -481,3 +487,153 @@ class TestScopeOmission:
         assert not response["user"]["profile"].get("email"), (
             "the no-email token returned an email; it still has the scope"
         )
+
+
+# ---------------------------------------------------------------------- #
+#  Addressed delivery — the agent names the destination                   #
+# ---------------------------------------------------------------------- #
+
+
+@requires_outbound
+class TestAddressedDelivery:
+    """``send_channel_message``, end to end against the real workspace.
+
+    The unit tests settle the policy branches, which are pure. What they
+    cannot settle is whether the conversation Slack describes is the one
+    ``allow_channels`` was written against: a name grant matches
+    ``conversations.info``'s ``name`` field, and a fixture returning
+    ``{"name": "general"}`` proves only that the test knows what the code
+    reads. These run the same policy over Slack's own answer, then post.
+    """
+
+    async def test_the_scratch_channel_resolves_to_a_name_we_can_grant_on(
+        self, bot,
+    ):
+        # The premise the two name tests below rest on. Slack returns the
+        # name without a leading '#', which is what allow_channels matches.
+        info = await bot.conversations_info(channel=TEST_CHANNEL)
+        name = info["channel"]["name"]
+        assert name and not name.startswith("#"), name
+
+    async def test_an_id_grant_posts_to_the_conversation(self, bot, posted):
+        channel = build_outbound_channel(allow_channels=[TEST_CHANNEL])
+        marker = f"nvz-outbound-{uuid.uuid4().hex[:8]}"
+
+        verdict = await channel.authorize_outbound(TEST_CHANNEL)
+        assert verdict.allowed, verdict.reason
+        await channel.send(OutboundMessage(target=TEST_CHANNEL, text=marker))
+
+        ts = await _find_posted(bot, marker)
+        posted.note_bot(TEST_CHANNEL, ts)
+        assert ts, "the message never reached the conversation"
+
+    async def test_a_name_grant_matches_what_slack_calls_the_conversation(
+        self, bot, posted,
+    ):
+        info = await bot.conversations_info(channel=TEST_CHANNEL)
+        channel = build_outbound_channel(
+            allow_channels=[info["channel"]["name"]],
+        )
+        marker = f"nvz-outbound-name-{uuid.uuid4().hex[:8]}"
+
+        verdict = await channel.authorize_outbound(TEST_CHANNEL)
+        assert verdict.allowed, verdict.reason
+        await channel.send(OutboundMessage(target=TEST_CHANNEL, text=marker))
+
+        ts = await _find_posted(bot, marker)
+        posted.note_bot(TEST_CHANNEL, ts)
+        assert ts
+
+    async def test_a_deny_pattern_on_the_real_name_refuses_it(self, bot):
+        info = await bot.conversations_info(channel=TEST_CHANNEL)
+        channel = build_outbound_channel(
+            allow_channels=[TEST_CHANNEL],
+            deny_channels=[info["channel"]["name"]],
+        )
+
+        verdict = await channel.authorize_outbound(TEST_CHANNEL)
+
+        assert not verdict.allowed
+
+    async def test_a_name_slack_cannot_resolve_cannot_clear_a_deny_list(self):
+        # Slack answers channel_not_found, so the identity is short the name
+        # the deny list is written against. An unread name must not walk past
+        # the list that might have named it.
+        channel = build_outbound_channel(
+            allow_channels=["*"], deny_channels=["secrets"],
+        )
+
+        verdict = await channel.authorize_outbound("C00000000000")
+
+        assert not verdict.allowed
+
+    async def test_a_thread_target_posts_inside_the_thread(self, bot, posted):
+        root = await bot.chat_postMessage(
+            channel=TEST_CHANNEL, text="nvz-outbound-thread-root",
+        )
+        posted.note_bot(TEST_CHANNEL, root["ts"])
+        channel = build_outbound_channel(allow_channels=[TEST_CHANNEL])
+        marker = f"nvz-outbound-reply-{uuid.uuid4().hex[:8]}"
+        target = format_target(TEST_CHANNEL, root["ts"])
+
+        verdict = await channel.authorize_outbound(target)
+        assert verdict.allowed, verdict.reason
+        await channel.send(OutboundMessage(target=target, text=marker))
+
+        replies = await bot.conversations_replies(
+            channel=TEST_CHANNEL, ts=root["ts"],
+        )
+        texts = [m["text"] for m in replies["messages"]]
+        assert marker in texts, texts
+
+    async def test_the_tool_posts_through_the_router(self, bot, posted):
+        # The whole path the agent actually takes: handler → router →
+        # authorize_outbound → Slack.
+        channel = build_outbound_channel(allow_channels=[TEST_CHANNEL])
+        router = ChannelRouter(engine=SimpleNamespace(db=None))
+        router.register(channel)
+        ctx = ToolContext(
+            session_id="live-outbound",
+            engine=SimpleNamespace(router=router),
+        )
+        marker = f"nvz-outbound-tool-{uuid.uuid4().hex[:8]}"
+
+        result = await send_channel_message_handler(ctx, {
+            "channel": "slack", "target": TEST_CHANNEL, "text": marker,
+        })
+
+        assert not result.is_error, result.content[0]["text"]
+        ts = await _find_posted(bot, marker)
+        posted.note_bot(TEST_CHANNEL, ts)
+        assert ts, "the tool reported success but nothing was posted"
+
+    async def test_the_tool_refuses_a_conversation_off_the_allow_list(self, bot):
+        channel = build_outbound_channel(allow_channels=["C0NOTTHISONE"])
+        router = ChannelRouter(engine=SimpleNamespace(db=None))
+        router.register(channel)
+        ctx = ToolContext(
+            session_id="live-outbound",
+            engine=SimpleNamespace(router=router),
+        )
+        marker = f"nvz-outbound-refused-{uuid.uuid4().hex[:8]}"
+
+        result = await send_channel_message_handler(ctx, {
+            "channel": "slack", "target": TEST_CHANNEL, "text": marker,
+        })
+
+        assert "Refused" in result.content[0]["text"]
+        assert await _find_posted(bot, marker) is None, "a refusal still posted"
+
+
+async def _find_posted(bot, marker: str) -> "str | None":
+    """The ts of the bot message carrying *marker*, or None.
+
+    Reads recent history rather than a returned ts: ``send`` splits and
+    posts without handing one back, and the question here is whether Slack
+    holds the message, not whether the call returned.
+    """
+    history = await bot.conversations_history(channel=TEST_CHANNEL, limit=30)
+    for message in history["messages"]:
+        if marker in (message.get("text") or ""):
+            return message["ts"]
+    return None
