@@ -240,10 +240,10 @@ def build_source_runners(
             gh_repos.batch_size, gh_repos.repos or "none",
         )
 
-    # Channel observation drains. Not a poll: the channel already buffered
-    # these over its own socket, and this only moves them into the inbox.
-    # What to watch is a property of the channel, so the config lives at
-    # slack.observe / telegram.observe rather than under sync.*, and the
+    # Channel source drains. Not a poll: the channel already buffered these
+    # over its own socket, and this only moves them into the inbox. What to
+    # watch is a property of the channel, so the config lives at
+    # slack.source / telegram.source rather than under sync.*, and the
     # runner carries its own schedule instead of being looked up there.
     for channel_name, channel_config in (
         ("slack", config.slack),
@@ -253,8 +253,8 @@ def build_source_runners(
         if source_cfg is None or not source_cfg.enabled:
             continue
         if not source_cfg.allow_conversations:
-            # ObserveConfig.from_dict already warned. Don't build a runner
-            # whose policy can never approve anything to drain.
+            # ChannelSourceConfig.from_dict already warned. Don't build a
+            # runner whose policy can never approve anything to drain.
             continue
         from nerve.sources.channel import ChannelSource
         from nerve.sources.filters import FieldRule, InboxFilter
@@ -272,7 +272,7 @@ def build_source_runners(
         # against channel names. The allow decision stays where it can be
         # made correctly, at the channel, which knows which of a
         # conversation's names are grantable.
-        observe_filter = InboxFilter(rules=[
+        source_filter = InboxFilter(rules=[
             FieldRule(
                 field="conversation_id", deny=list(source_cfg.deny_conversations),
             ),
@@ -287,7 +287,7 @@ def build_source_runners(
             condense_model=condense_model,
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
-            inbox_filter=observe_filter,
+            inbox_filter=source_filter,
             schedule=source_cfg.schedule,
         ))
         logger.info(
