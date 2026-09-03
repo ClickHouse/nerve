@@ -2,9 +2,12 @@
 
 ## Overview
 
-Sources are cursor-based data streams that pull records from external services and persist them to a local inbox (`source_messages` table). The architecture follows a **producer/consumer** pattern inspired by Kafka:
+Sources are cursor-based data streams that persist records to a local inbox
+(`source_messages` table). Most fetch an external service. Channel sources
+drain records that Slack or Telegram already delivered to a local buffer. The
+architecture follows a **producer/consumer** pattern inspired by Kafka:
 
-- **Producers** (source runners) — Fetch records from external APIs, preprocess and condense them, persist to the inbox, and advance the source cursor. No agent processing happens here.
+- **Producers** (source runners) — Fetch or drain records, preprocess and condense them, persist to the inbox, and advance the source cursor. No agent processing happens here.
 - **Consumers** (agent tools) — Read from the inbox using independent persistent cursors. Multiple consumers can read the same messages without interfering with each other.
 
 ```
@@ -31,7 +34,7 @@ CONSUMERS (agent tools):
 
 ### Ingestion (Producer Side)
 
-1. **Fetch** — The source adapter calls an external API (gh CLI, gog CLI, Telethon) and returns normalized `SourceRecord` objects with an opaque cursor
+1. **Fetch** — The source adapter reads an external service (gh CLI, gog CLI, Telethon) or a local channel buffer and returns normalized `SourceRecord` objects with an opaque cursor
 2. **Preprocess** — Two-stage content cleanup:
    - **Source-specific** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
    - **LLM condensation** (`condense: true`) — Records still over 800 chars are sent to a fast model (Haiku) that extracts only essential information. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
@@ -159,7 +162,7 @@ visible rather than failing the fetch.
 - **Note:** GitHub's Events API returns truncated payloads (e.g., PR titles and URLs may be missing). The source constructs URLs from repo name + number and handles missing fields gracefully
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 
-### Telegram
+### Telegram account sync
 - **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
   This is the pull sync for your own Telegram account, and is separate from the
   `telegram:observed` bot-channel source below
@@ -174,13 +177,11 @@ visible rather than failing the fetch.
 
 A chat channel can feed the inbox with the group traffic it already receives.
 
-- **Adapter:** `nerve/sources/channel.py` — `ChannelSource`, one per channel with a source configured
-- **Mechanism:** push, not pull. The channel receives every message in every
-  conversation it sits in over its own socket, and writes the ones its source
-  grant approves to the `channel_observations` buffer. This source drains that
-  buffer into the inbox. No chat API is polled: that would duplicate data
-  already delivered, add latency, and need a second cursor to disagree with
-  the first.
+- **Adapter:** `nerve/sources/channel.py` — one `ChannelSource` per enabled
+  channel source
+- **Mechanism:** for each message delivered by the channel transport, matching
+  messages are written to the `channel_observations` buffer. `ChannelSource`
+  drains that buffer into the inbox; it does not poll the chat service.
 - **Source name:** `<channel>:observed` — `slack:observed`,
   `telegram:observed` — so a cron gate reads `sources: [slack:observed]`.
   Compound like `gmail:<account>`, and deliberately not the bare channel name:
@@ -196,20 +197,23 @@ A chat channel can feed the inbox with the group traffic it already receives.
   passed and skip everything after them.
 - **Idempotent:** the record id is `<conversation>:<message_id>`, so the same
   message collected twice collapses on the inbox's `(source, id)` key.
-- **Buffer cap:** `max_stored_messages` (default 10 000) is one budget per
+- **Buffer target:** `max_stored_messages` (default 10 000) is one budget per
   *transport*, covering all of its watched conversations together, not one per
-  conversation. Past it the oldest rows are dropped and a warning is logged.
-  Rows also expire after `sync.message_ttl_days`.
-- **Requires setup (Telegram only):** the bot must be a group administrator, or
-  have privacy mode disabled via BotFather. Under the default privacy mode it
-  receives only commands and replies to itself, so there is nothing to collect
+  conversation. Every 100 writes, Nerve drops the oldest rows back to that
+  target and logs a warning. The buffer can therefore exceed it by up to 99
+  rows. Daily cleanup removes rows after `sync.message_ttl_days`.
+- **Requires setup (Telegram only):** with privacy mode enabled, a non-admin bot
+  does not receive ordinary group messages. Make it an admin or disable privacy
+  mode with BotFather. See Telegram's
+  [privacy-mode documentation](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get).
 
 #### Routing: which messages get collected
 
-The live channel route and the source route are decided **independently** for
-every message. Access rules (`slack.allow_users`, `telegram.allowed_users`, …)
-answer "who may drive the agent?"; `<channel>.source.*` answers "whose traffic
-may reach the agent's inbox?". Either, both, or neither may say yes.
+For eligible shared-channel and group-chat messages, the live route and source
+route use separate rules. Access rules (`slack.allow_users`,
+`telegram.allowed_users`, …) decide who may drive the agent.
+`<channel>.source.*` decides whose traffic may reach the inbox. A message can
+take either route, both routes, or neither.
 
 | Live route | Source grant | `include_handled_messages` | Result |
 |---|---|---|---|
@@ -219,26 +223,24 @@ may reach the agent's inbox?". Either, both, or neither may say yes.
 | refuses | matches | — | source only |
 | refuses | no match | — | dropped |
 
-`include_handled_messages` defaults to `false` so one message is not processed
-twice: the agent already saw it as a live turn, and a copy in the inbox invites
-a second, later pass over its own conversation. Turn it on when the source is a
-record — an archive, a digest — rather than a work queue. "Handled" means the
-message was accepted for live routing, not that the agent produced a reply.
+By default, a message accepted by the live route is not also copied to the
+source. Set `include_handled_messages: true` only when source consumers should
+receive the same message later. "Handled" means accepted for live routing, not
+that the agent produced a reply.
 
 Whether the live route accepts differs by transport, and only affects which row
 of that table you land in:
 
-- **Slack** answers a shared-channel message when it mentions the bot or
-  continues a thread the bot already has a session for, *and* the sender passes
-  the access policy. A message that mentions the bot but comes from a sender
-  access refuses still reaches the source if the source grant matches it.
+- **Slack** accepts a shared-channel message for live routing when it mentions
+  the bot or continues a thread with an active session, and the sender passes
+  the access policy. A matching source can still collect a message that fails
+  the live access policy.
 - **Telegram** has no "addressed to me" test: authorization alone decides.
 
-**Never collected, whatever the config says:** direct and group DMs (declining
-to answer a DM is a refusal, and filing it away instead is not what the silence
-led the sender to expect), the agent's own messages, other bots and apps,
-join/leave and similar service events, and malformed events. Repeat deliveries
-of one message collapse on the inbox's `(source, id)` key.
+**Never collected, whatever the config says:** direct and group DMs, the
+agent's own messages, other bots and apps, join/leave and similar service
+events, malformed events, and Telegram `/pair` commands. Duplicate buffered
+records collapse to one inbox record on the `(source, id)` key.
 
 **The source is off by default and fail-closed.** An empty allow list collects
 nothing rather than everything — the inverse of the access rules, because this
@@ -252,38 +254,30 @@ authorized to instruct the agent — that is the usual reason to watch a room �
 so treat a buffered message as attacker-controlled text an agent will later
 read. What actually protects you:
 
-- `<channel>.source.*` decides **whose messages are collected**, enforced
-  before anything is written.
-- The drain re-applies the **deny** rules as `FieldRule`s over the buffered
-  `conversation_id` and `sender_id`, so a conversation added to a deny list
-  stops reaching the inbox even if its messages were already buffered. Those
-  rules match **ID fields only** — a deny pattern written against a channel or
-  chat *name* will not match here, though it still applies at the channel.
-  Deny-only for the same reason: a name-based allow rule would match nothing
-  and drop everything. Further `FieldRule`s can match anything else buffered,
-  including `thread_ts` and `channel_key`.
-- Nothing inspects **content**. An inbox filter matches metadata; it cannot
-  tell a report from an instruction. The remaining protection is structural:
-  records land in an inbox the agent reads deliberately via `poll_source`,
-  rather than being injected into a turn as if a user had said them.
+- `<channel>.source.*` decides **whose messages are collected** before anything
+  is written.
+- At drain time, Nerve rechecks conversation and sender deny rules against raw
+  IDs. Name-based denies apply only before buffering.
+- Inbox filters inspect metadata, not content. They cannot distinguish a report
+  from an instruction. Polling advances a cursor; it does not delete inbox
+  records. Daily cleanup removes them after their TTL expires. Agents see them
+  only through explicit source reads or cron gates, never in a live turn.
 
 So scope the grant to conversations whose participants you would already trust
 to file a ticket, and treat any workflow that acts on collected content without
 review as accepting prompt injection.
 
-**Cost.** The hook runs on the message dispatch path, so it buffers raw IDs and
-resolves display names only when a pattern needs one. ID patterns cost no API
-call; a name or glob costs one `conversations.info` / `users.info` per distinct
-ID per 10 minutes, through the existing name cache. Prefer IDs for a busy
-conversation.
+**Slack lookup cost.** Names and globs use cached `conversations.info` or
+`users.info` lookups. IDs do not. Prefer IDs for busy conversations.
 
-**Thread context is not expanded.** A reply's `thread_ts` is recorded so a
-reader can pull the parent, but the parent is not fetched — that would be an
-API call per message. Expanding it is deferred.
+**Reply context is not expanded.** Slack stores `thread_ts`; Telegram stores
+`reply_to_message_id`. The parent message is not fetched.
 
 ## Configuration
 
-Sources are configured under the `sync:` key in `config.yaml` / `config.local.yaml`:
+Pull sources are configured under the `sync:` key in `config.yaml` /
+`config.local.yaml`. Channel sources use `slack.source.*` and
+`telegram.source.*` instead.
 
 ```yaml
 sync:
@@ -593,7 +587,7 @@ The Sources page (`/sources`) has three tabs:
 - `consumer_cursors` — Per (consumer, source) read position with TTL and session linking
 - `source_messages` — Inbox messages with `raw_content` (original HTML), `processed_content` (LLM-condensed), TTL-based expiry
 - `source_run_log` — Per-run diagnostics (records ingested, errors, timestamps)
-- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`. Row-capped per transport and TTL-swept by the daily cleanup
+- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
 - `cron_logs` — Job execution history (source jobs use `source:<name>` as job ID)
 
 ### API Endpoints
