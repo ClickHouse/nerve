@@ -1072,6 +1072,67 @@ An unauthorized `/start` gets a reply with the sender's numeric ID and
 pairing instructions (rate-limited); all other messages from unauthorized
 users are ignored.
 
+### Observation
+
+Telegram can feed the source inbox the same way Slack does. **See
+[sources.md](sources.md#chat-channels-slack-telegram) for what the grant does
+and does not protect you from** — read it before enabling this, because on
+Telegram the collected population is everyone the allowlist *refused*.
+
+```yaml
+telegram:
+  source:
+    enabled: true
+    include_unauthorized_senders: true   # required; see below
+    allow_chats: ["-1001234567890"]
+    deny_senders: ["12345"]
+    schedule: "*/5 * * * *"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `telegram.source.enabled` | bool | `false` | Collect unanswered messages |
+| `telegram.source.include_unauthorized_senders` | bool | `false` | **Also required** — see below |
+| `telegram.source.allow_chats` | list[str] | `[]` | Chats to watch. **Empty means none** |
+| `telegram.source.deny_chats` | list[str] | `[]` | Never watch these |
+| `telegram.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
+| `telegram.source.deny_senders` | list[str] | `[]` | Skip these senders |
+| `telegram.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
+| `telegram.source.batch_size` | int | `50` | Records per drain |
+| `telegram.source.condense` | bool | `false` | LLM-condense long messages |
+| `telegram.source.max_stored_messages` | int | `10000` | Buffer cap per chat |
+
+Reaches the inbox as the source `telegram:observed`. The keys say *chats*
+rather than *channels* because on Telegram a channel is a specific entity
+type distinct from a group, and groups are mostly what you would watch.
+
+**`include_unauthorized_senders` is a second, deliberate opt-in.** Telegram
+has no "addressed to me" test — an authorized user's every message is
+answered — so the only seen-but-unanswered path is a sender
+`telegram.allowed_users` refused. Observing here therefore means collecting
+from people explicitly denied the agent, which is a sharper edge than Slack's
+"in the room but not talking to me". Enabling observation alone does nothing
+until you say so.
+
+**What the lists match.** Only numeric IDs may grant.
+
+| List | Matches | Example |
+|---|---|---|
+| `allow_chats` | numeric chat ID **only** | `-1001234567890` |
+| `deny_chats` | chat ID, `@username`, or title | `-1001234567890`, `ops-room` |
+| `allow_senders` | numeric user ID **only** | `42` |
+| `deny_senders` | user ID, `@username`, or profile name | `42`, `mallory` |
+
+A group's title is set by whoever runs it and a `@username` is claimable and
+movable, so treating either as grantable would let anyone create a group
+named `ops-room` and walk into a grant meant for someone else's. Both stay
+deny-eligible, where a spoofable name can only subtract access.
+
+**Private chats are never observed**, and **other bots are skipped** —
+Telegram delivers bot-authored messages to group handlers under bot-to-bot
+mode, and two agents filling each other's inboxes is no better than two
+agents answering each other.
+
 ## Slack
 
 | Key | Type | Default | Description |
@@ -1196,16 +1257,14 @@ slack:
 
 ### Observation
 
-Messages the bot sees but does not answer can be buffered to the source inbox,
-where `poll_source`, `read_source`, and the `messages` cron gate reach them
-like any other source. Nothing here starts an agent turn.
+Messages the bot sees but does not answer can be buffered into the source
+inbox, where `poll_source`, `read_source`, and the `messages` cron gate reach
+them like any other source. Nothing here starts an agent turn.
 
-The inbox source name is `<channel>:observed` — `slack:observed`,
-`telegram:observed` — so a cron gate reads `sources: [slack:observed]`.
-It is deliberately distinct from the `telegram` pull source: sharing a name
-would mean sharing a cron job id and a cursor key, and the two runners would
-evict each other from the scheduler and then read each other's cursor, one an
-integer and the other Telethon's JSON state.
+**This is a separate grant from the access rules above, and what it does and
+does not protect you from is documented in
+[sources.md](sources.md#chat-channels-slack-telegram).** Read that before
+enabling it; the keys below are only the surface.
 
 ```yaml
 slack:
@@ -1221,126 +1280,38 @@ slack:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `slack.source.enabled` | bool | `false` | Buffer unanswered messages |
+| `slack.source.enabled` | bool | `false` | Collect unanswered messages |
 | `slack.source.allow_channels` | list[str] | `[]` | Channels to watch. **Empty means none** |
 | `slack.source.deny_channels` | list[str] | `[]` | Never watch these |
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
-| `slack.source.schedule` | string | `*/5 * * * *` | Drain cadence |
+| `slack.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |
 | `slack.source.max_stored_messages` | int | `10000` | Buffer cap per channel |
 
-Telegram uses its own noun — `telegram.source.allow_chats` / `deny_chats` —
-because on Telegram a "channel" is a specific entity type distinct from a
-group, so `allow_channels` there would name the wrong thing.
+Reaches the inbox as the source `slack:observed`.
 
-#### What you can actually write in these lists
-
-Matching is case-insensitive and supports `*` / `?` globs. A leading `#` or
-`@` is stripped, so a name pasted from the client works as-is. **Deny always
-wins**, and a non-empty allow list must match or the message is skipped.
+**What the lists match.** Case-insensitive, `*` / `?` globs, and a leading `#`
+or `@` is stripped so a name pasted from Slack works as-is. Deny always wins;
+a non-empty allow list must match.
 
 | List | Matches | Example |
 |---|---|---|
-| `slack.source.allow_channels` | channel ID, or channel name | `C0123ABCD`, `eng-backend`, `eng-*` |
-| `slack.source.deny_channels` | same | `*-social` |
-| `slack.source.allow_senders` | member ID, handle, or email | `U0456DEFG`, `alice`, `*@example.com` |
-| `slack.source.deny_senders` | same, **plus** display and real names | `*-bot`, `Alice Smith` |
-| `telegram.source.allow_chats` | numeric chat ID **only** | `-1001234567890` |
-| `telegram.source.deny_chats` | chat ID, `@username`, or title | `-1001234567890`, `ops-room` |
-| `telegram.source.allow_senders` | numeric user ID **only** | `42` |
-| `telegram.source.deny_senders` | user ID, `@username`, or profile name | `42`, `mallory` |
+| `allow_channels` / `deny_channels` | channel ID, or channel name | `C0123ABCD`, `eng-backend`, `eng-*` |
+| `allow_senders` | member ID, handle, or email | `U0456DEFG`, `alice`, `*@example.com` |
+| `deny_senders` | same, **plus** display and real names | `*-bot`, `Alice Smith` |
 
-The pattern in that table is one rule: **a name may grant only where the
-platform controls it.** A Slack channel name and handle are workspace-assigned,
-so they can appear in an allow list; a Slack display name is edited by its
-owner, and every Telegram title and `@username` is chosen by whoever holds it,
-so those are deny-only. Otherwise anyone could name a group `ops-room` and
-walk into a grant meant for someone else's.
+A display name is edited by its owner, so it can only ever deny — the handle
+and email are workspace-assigned, so they may grant.
 
-**Prefer IDs when watching a busy conversation.** An ID matches with no API
-call at all; the moment any pattern is a name or glob, each conversation and
-sender is resolved once per 10 minutes through the existing name cache.
+**Group DMs are never observed**, along with DMs. An MPIM arrives as
+`channel_type="mpim"` on a `G` id; a `G` whose type cannot be established is
+skipped rather than guessed at.
 
-A **mapping** in an allow/deny list is discarded outright with a warning
-rather than salvaged: `{"*": false}` reads like a disabled wildcard but
-coerces to the key list `["*"]`, so guessing at intent would turn a rule that
-looks switched off into one that grants everything. A bare string still wraps
-to a single pattern, since that is how a `${VAR}` reference arrives. An
-unusable `schedule` falls back to the default rather than leaving the buffer
-filling with nothing to drain it.
-
-`telegram.source.*` takes the same keys, plus one of its own:
-`include_unauthorized_senders` (bool, default `false`). Telegram has no
-"addressed to me" test — an authorized user's every message is answered — so
-its only seen-but-unanswered path is a sender the allowlist refused.
-Observing there therefore means collecting from people explicitly denied the
-agent, a sharper edge than Slack's "in the room but not talking to me", and
-it takes this second opt-in on top of the conversation grant.
-
-Two more Telegram-specific rules follow from the same reasoning:
-
-- **Only numeric chat and user IDs are grantable.** A group's title is set by
-  whoever runs it, and a `@username` is claimable and movable, so anyone
-  could create a group called `ops-room` and walk into a grant meant for
-  someone else's. Titles and usernames stay deny-eligible, where a spoofable
-  name can only subtract access.
-- **Other bots are skipped.** Telegram delivers bot-authored messages to
-  group handlers under bot-to-bot mode; two agents filling each other's
-  inboxes is no better than two agents answering each other.
-
-**Observation is a separate grant from access, on purpose.** `allow_users` and
-`allow_channels` answer "who may drive the agent?". `source.*` answers "whose
-traffic may reach the agent's inbox?". Watching a conversation the agent takes
-no orders from is a legitimate and different thing to want, and deriving one
-from the other would either block it or silently widen command access to
-everything worth watching.
-
-That makes two rules here the inverse of the access rules:
-
-- **An empty allow list observes nothing**, not everything. A
-  standing grant to record other people's messages has to be written down.
-  `enabled: true` with none listed logs a warning and registers no drain.
-- **Direct messages are never observed.** Declining to answer a DM is a
-  refusal; filing it away instead is not what the silence led the sender to
-  expect.
-
-The agent's own posts, join/leave noise, and other apps' messages are dropped
-before the observation hook, so they never reach the inbox.
-
-**Everything observed is untrusted input.** It comes from people who are not
-authorized to instruct the agent — that is the whole point of watching a
-conversation — so treat a buffered message as attacker-controlled text that an
-agent will later read.
-
-Be precise about what protects you here, because it is less than it may
-sound:
-
-- `source.*` decides **whose messages are collected**. That is a real and
-  enforced boundary, checked before anything is written.
-- The drain re-applies the **deny** rules against `conversation_id` and
-  `sender_id`, so a conversation added to `deny_conversations` stops
-  reaching the inbox even if its messages were already buffered.
-- Nothing here inspects **content**. An inbox filter matches metadata; it
-  cannot tell a report from an instruction, and no allow/deny list will
-  separate them. The remaining protection is structural: observations land
-  in an inbox the agent reads deliberately via `poll_source`, rather than
-  being injected into a turn as if a user had said them.
-
-So scope the grant to conversations whose participants you would already
-trust to file a ticket, and treat any workflow that acts on observed content
-without review as accepting prompt injection.
-
-**Cost.** Observation runs on the message dispatch path, so it buffers raw IDs
-and resolves display names only when a pattern needs one. ID patterns cost no
-Slack API call at all; name and glob patterns cost one `conversations.info` or
-`users.info` per distinct ID per 10 minutes, via the existing name cache.
-Prefer IDs when watching a busy conversation.
-
-**Thread context is not expanded.** A reply's `thread_ts` is recorded so a
-reader can pull the parent, but the parent is not fetched — that would cost an
-API call per observation. Expanding it is deferred.
+**Prefer IDs for a busy channel.** An ID matches with no API call; any name or
+glob costs one `conversations.info` / `users.info` per distinct ID per 10
+minutes, through the existing name cache.
 
 ### Message behavior
 
@@ -1438,6 +1409,12 @@ Three differences from the inbound policy:
 ## Sources (sync)
 
 Sources pull data from external services on a schedule. See [sources.md](sources.md) for full details.
+
+Chat channels can also feed the inbox, but they are configured on the channel
+rather than here, because what to watch is a property of the channel: see
+`slack.source.*` and `telegram.source.*` in the sections above. They are push,
+not pull — the messages already arrived over the channel's socket — so their
+`schedule` is a drain cadence, not a poll interval.
 
 **Common fields** (available on all sources):
 
