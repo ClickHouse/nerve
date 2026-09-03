@@ -1,4 +1,4 @@
-"""V46: durable spool for messages a channel saw but did not answer.
+"""V46: durable buffer for messages a channel saw but did not answer.
 
 Sources are pull, cursor, and cron. Channels are push. This table is the
 join between them: the channel appends on the dispatch path, and a
@@ -7,12 +7,12 @@ filtering, condensing, TTL, health, and cursor handling for free.
 
 The alternative — writing straight to ``source_messages`` from the socket —
 would skip the inbox guardrail, which is the one layer standing between
-untrusted chat text and an autonomous agent. Spooling first keeps that
+untrusted chat text and an autonomous agent. Buffering first keeps that
 choke point where it already is.
 
 ``AUTOINCREMENT`` is load-bearing rather than decorative. A plain rowid is
 reused after the highest row is deleted, and this table is pruned by design,
-so a drained-and-pruned spool would hand out ids the cursor has already
+so a drained-and-pruned buffer would hand out ids the cursor has already
 passed and the next observations would be skipped. AUTOINCREMENT gives a
 strictly increasing id that survives pruning, which is what makes
 ``WHERE id > cursor`` correct.
@@ -53,4 +53,4 @@ CREATE INDEX IF NOT EXISTS idx_channel_observations_expires
 
 async def up(db: aiosqlite.Connection) -> None:
     await db.executescript(SQL)
-    logger.info("v046: channel_observations spool created")
+    logger.info("v046: channel_observations buffer created")

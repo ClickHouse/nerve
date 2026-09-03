@@ -968,7 +968,7 @@ class SlackChannel(BaseChannel):
     @property
     def observation(self) -> ObservationPolicy:
         """The observation grant, rebuilt per read so reloads apply at once."""
-        observe = self.config.slack.observe
+        observe = self.config.slack.source
         return ObservationPolicy(
             enabled=observe.enabled,
             conversations=PatternGate(
@@ -991,7 +991,7 @@ class SlackChannel(BaseChannel):
         ts: str,
         channel_key: str,
     ) -> None:
-        """Spool a message the agent is not answering, if policy allows it.
+        """Buffer a message the agent is not answering, if policy allows it.
 
         Private conversations are never observed. A DM the agent declined to
         answer is a refusal, and quietly filing it away is not what "we do not
@@ -999,7 +999,7 @@ class SlackChannel(BaseChannel):
         which arrive as ``channel_type="mpim"`` on a ``G`` id — checking only
         for ``D`` would file a group DM away as if it were a channel.
 
-        Raw IDs are spooled and names are resolved only when a pattern needs
+        Raw IDs are buffered and names are resolved only when a pattern needs
         one, so watching a busy channel costs no Slack API call per message.
         """
         policy = self.observation
@@ -1063,7 +1063,7 @@ class SlackChannel(BaseChannel):
         await self.router.observe(
             observed,
             ttl_days=self.config.sync.message_ttl_days,
-            max_spool_rows=self.config.slack.observe.max_spool_rows,
+            max_stored_messages=self.config.slack.source.max_stored_messages,
         )
 
     async def _handle_message_event(self, event: dict[str, Any]) -> None:

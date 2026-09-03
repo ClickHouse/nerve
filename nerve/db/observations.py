@@ -1,4 +1,4 @@
-"""Channel observation spool — the push-to-pull join for the sources layer.
+"""Channel observation buffer — the push-to-pull join for the sources layer.
 
 A channel appends here on its dispatch path; a
 :class:`~nerve.sources.channel.ChannelSource` drains it on the source
@@ -24,7 +24,7 @@ _TRIM_EVERY = 100
 
 
 class ObservationStore:
-    """Mixin for the ``channel_observations`` spool."""
+    """Mixin for the ``channel_observations`` buffer."""
 
     @property
     def _observation_writes(self) -> dict[str, int]:
@@ -38,7 +38,7 @@ class ObservationStore:
             counts = self.__dict__["_observation_write_counts"] = {}
         return counts
 
-    # Longest a spooled message may be before it is truncated. Slack caps
+    # Longest a buffered message may be before it is truncated. Slack caps
     # posts near 40k and Telegram near 4k, so this only bites on a pathological
     # sender — but the cap is per row and the row count is capped separately,
     # so without it the two together still bound nothing in bytes.
@@ -105,7 +105,7 @@ class ObservationStore:
         )
         if result.rowcount:
             logger.warning(
-                "Channel %s observation spool hit its %d-row cap — dropped %d "
+                "Channel %s observation buffer hit its %d-row cap — dropped %d "
                 "of the oldest rows. The drain is behind or not scheduled.",
                 channel, max_rows, result.rowcount,
             )
@@ -140,7 +140,7 @@ class ObservationStore:
         return rows
 
     async def get_channel_observation_max_id(self, channel: str) -> int:
-        """Highest id spooled for *channel*, or 0 if none."""
+        """Highest id buffered for *channel*, or 0 if none."""
         async with self.db.execute(
             "SELECT COALESCE(MAX(id), 0) FROM channel_observations WHERE channel = ?",
             (channel,),

@@ -1,12 +1,12 @@
-"""Channel → source bridge — what gets watched, spooled, and drained.
+"""Channel → source bridge — what gets watched, buffered, and drained.
 
 Three layers, tested separately because they fail differently:
 
 * the observation policy, which is the one place a mistake is a security
   bug rather than a missing feature;
-* the spool, whose id must stay monotonic across pruning or the drain
+* the buffer, whose id must stay monotonic across pruning or the drain
   silently skips messages;
-* :class:`ChannelSource`, which turns spooled rows into inbox records and
+* :class:`ChannelSource`, which turns buffered rows into inbox records and
   hands the rest — filtering, TTL, health, cursor — to ``SourceRunner``.
 """
 
@@ -21,7 +21,7 @@ from nerve.channels.base import ObservedMessage
 from nerve.channels.observation import ObservationPolicy
 from nerve.channels.router import ChannelRouter
 from nerve.channels.slack import SlackChannel
-from nerve.config import NerveConfig, ObserveConfig, SlackConfig
+from nerve.config import ChannelSourceConfig, NerveConfig, SlackConfig
 from nerve.db.observations import _TRIM_EVERY
 from nerve.sources.channel import ChannelSource
 from nerve.sources.registry import build_source_runners
@@ -51,7 +51,7 @@ def _policy(**kwargs) -> ObservationPolicy:
 
 
 def _slack_channel(
-    router=None, allow_channels=None, **observe_kwargs,
+    router=None, allow_channels=None, **source_kwargs,
 ) -> SlackChannel:
     """A Slack channel with a stub transport and an observe policy.
 
@@ -65,7 +65,7 @@ def _slack_channel(
         bot_token="xoxb-test",
         app_token="xapp-test",
         allow_channels=list(allow_channels or []),
-        observe=ObserveConfig(**observe_kwargs),
+        source=ChannelSourceConfig(**source_kwargs),
     )
     channel = SlackChannel(cfg, router=router or MagicMock())
     channel._web = MagicMock()
@@ -173,7 +173,7 @@ class TestObservationPolicy:
 
 
 class TestSlackObserve:
-    async def test_an_unanswered_message_in_a_watched_channel_is_spooled(self):
+    async def test_an_unanswered_message_in_a_watched_channel_is_buffered(self):
         channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
 
         await channel._handle_message_event(_event())
@@ -187,8 +187,8 @@ class TestSlackObserve:
         assert observed.message_id == "1700000000.000100"
         assert observed.timestamp.startswith("2023-11-14T")
 
-    async def test_an_answered_message_is_not_spooled(self):
-        # It becomes a real turn instead; spooling it too would show the
+    async def test_an_answered_message_is_not_buffered(self):
+        # It becomes a real turn instead; buffering it too would show the
         # agent its own conversation as third-party inbox traffic.
         channel = _slack_channel(
             allow_channels=["C0123ABCD"],
@@ -203,14 +203,14 @@ class TestSlackObserve:
         channel.router.observe.assert_not_awaited()
         channel.router.handle_message.assert_awaited_once()
 
-    async def test_observation_off_spools_nothing(self):
+    async def test_observation_off_buffers_nothing(self):
         channel = _slack_channel(enabled=False, allow_conversations=["C0123ABCD"])
 
         await channel._handle_message_event(_event())
 
         channel.router.observe.assert_not_awaited()
 
-    async def test_an_unwatched_channel_is_not_spooled(self):
+    async def test_an_unwatched_channel_is_not_buffered(self):
         channel = _slack_channel(enabled=True, allow_conversations=["C0AAA1111"])
 
         await channel._handle_message_event(_event())
@@ -260,21 +260,21 @@ class TestSlackObserve:
 
         channel.router.observe.assert_not_awaited()
 
-    async def test_the_agents_own_post_is_not_spooled(self):
+    async def test_the_agents_own_post_is_not_buffered(self):
         channel = _slack_channel(enabled=True, allow_conversations=["*"])
 
         await channel._handle_message_event(_event(user="U0BOT"))
 
         channel.router.observe.assert_not_awaited()
 
-    async def test_join_and_leave_noise_is_not_spooled(self):
+    async def test_join_and_leave_noise_is_not_buffered(self):
         channel = _slack_channel(enabled=True, allow_conversations=["*"])
 
         await channel._handle_message_event(_event(subtype="channel_join"))
 
         channel.router.observe.assert_not_awaited()
 
-    async def test_another_app_is_not_spooled(self):
+    async def test_another_app_is_not_buffered(self):
         channel = _slack_channel(enabled=True, allow_conversations=["*"])
         channel._web.users_info = AsyncMock(
             return_value={"user": {"is_bot": True, "profile": {}}},
@@ -319,13 +319,13 @@ class TestSlackObserve:
 # ---------------------------------------------------------------------- #
 
 
-def _tg_channel(**observe_kwargs):
+def _tg_channel(**source_kwargs):
     """A Telegram channel with a stub router and an observe policy."""
     from nerve.channels.telegram import TelegramChannel
 
-    observe_kwargs.setdefault("include_unauthorized_senders", True)
+    source_kwargs.setdefault("include_unauthorized_senders", True)
     cfg = NerveConfig()
-    cfg.telegram.observe = ObserveConfig(**observe_kwargs)
+    cfg.telegram.source = ChannelSourceConfig(**source_kwargs)
     cfg.telegram.allowed_users = [999]
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._config = lambda: cfg
@@ -477,11 +477,11 @@ class TestRouterObserve:
 
 
 # ---------------------------------------------------------------------- #
-#  Spool                                                                  #
+#  Buffer                                                                  #
 # ---------------------------------------------------------------------- #
 
 
-class TestSpool:
+class TestBuffer:
     async def test_rows_come_back_in_order_past_a_cursor(self, db):
         for i in range(5):
             await db.insert_channel_observation(
@@ -505,7 +505,7 @@ class TestSpool:
     async def test_ids_keep_climbing_after_a_prune(self, db):
         # The reason the migration uses AUTOINCREMENT. A plain rowid is
         # reused once the highest row is deleted, so a drained-and-pruned
-        # spool would reissue ids the cursor has already passed and the next
+        # buffer would reissue ids the cursor has already passed and the next
         # observations would be skipped for good.
         first = await db.insert_channel_observation("slack", "k", {"n": 1})
         await db._write("DELETE FROM channel_observations", ())
@@ -515,7 +515,7 @@ class TestSpool:
         assert second > first
 
     async def test_the_row_cap_drops_the_oldest(self, db):
-        # Trimming is amortized, so the cap is a bound the spool returns to
+        # Trimming is amortized, so the cap is a bound the buffer returns to
         # rather than one it never crosses: it may overshoot by up to one
         # trim interval. That beats a COUNT on the dispatch path.
         cap = 5
@@ -561,7 +561,7 @@ class TestSpool:
 
 
 async def _write_garbage(db) -> None:
-    """Put a row in the spool whose payload will never parse."""
+    """Put a row in the buffer whose payload will never parse."""
     await db._write(
         "INSERT INTO channel_observations "
         "(channel, channel_key, payload, created_at, expires_at) "
@@ -571,7 +571,7 @@ async def _write_garbage(db) -> None:
 
 
 class TestChannelSource:
-    async def test_spooled_rows_become_records(self, db):
+    async def test_buffered_rows_become_records(self, db):
         await db.insert_channel_observation(
             "slack", "slack:C0123ABCD",
             {
@@ -599,7 +599,7 @@ class TestChannelSource:
         assert record.metadata["thread_ts"] == "1699999999.000000"
         assert record.metadata["conversation_id"] == "C0123ABCD"
 
-    async def test_the_cursor_is_the_spool_id(self, db):
+    async def test_the_cursor_is_the_buffer_id(self, db):
         last = 0
         for i in range(3):
             last = await db.insert_channel_observation(
@@ -633,7 +633,7 @@ class TestChannelSource:
 
         assert result.has_more
 
-    async def test_an_empty_spool_holds_the_cursor(self, db):
+    async def test_an_empty_buffer_holds_the_cursor(self, db):
         result = await ChannelSource("slack", db).fetch("42")
 
         assert result.records == []
@@ -642,7 +642,7 @@ class TestChannelSource:
 
     async def test_an_unreadable_cursor_starts_over_rather_than_failing(self, db):
         # source_messages is keyed (source, id), so re-reading a bounded,
-        # TTL-capped spool re-inserts nothing. Failing closed here would
+        # TTL-capped buffer re-inserts nothing. Failing closed here would
         # instead wedge the source until someone edited the database.
         await db.insert_channel_observation(
             "slack", "k", {"text": "hi", "message_id": "1"},
@@ -715,7 +715,7 @@ class TestChannelSource:
 class TestRegistry:
     def test_an_observing_channel_gets_a_runner(self, tmp_path):
         cfg = NerveConfig()
-        cfg.slack.observe = ObserveConfig(
+        cfg.slack.source = ChannelSourceConfig(
             enabled=True, allow_conversations=["C0123ABCD"], schedule="*/7 * * * *",
         )
 
@@ -757,7 +757,7 @@ class TestRegistry:
 
     def test_no_runner_without_a_conversation_grant(self, tmp_path):
         cfg = NerveConfig()
-        cfg.slack.observe = ObserveConfig(enabled=True, allow_conversations=[])
+        cfg.slack.source = ChannelSourceConfig(enabled=True, allow_conversations=[])
 
         runners = build_source_runners(cfg, MagicMock())
 
@@ -772,7 +772,7 @@ class TestRegistry:
 
     def test_telegram_gets_the_same_treatment(self, tmp_path):
         cfg = NerveConfig()
-        cfg.telegram.observe = ObserveConfig(
+        cfg.telegram.source = ChannelSourceConfig(
             enabled=True, allow_conversations=["-100123"],
         )
 
@@ -786,7 +786,7 @@ class TestRegistry:
 class TestConfig:
     def test_observe_parses_from_a_slack_block(self):
         cfg = SlackConfig.from_dict({
-            "observe": {
+            "source": {
                 "enabled": True,
                 "allow_conversations": ["C1"],
                 "deny_senders": ["U0BOT"],
@@ -794,65 +794,65 @@ class TestConfig:
             },
         })
 
-        assert cfg.observe.enabled
-        assert cfg.observe.allow_conversations == ["C1"]
-        assert cfg.observe.deny_senders == ["U0BOT"]
-        assert cfg.observe.schedule == "*/9 * * * *"
+        assert cfg.source.enabled
+        assert cfg.source.allow_conversations == ["C1"]
+        assert cfg.source.deny_senders == ["U0BOT"]
+        assert cfg.source.schedule == "*/9 * * * *"
 
     def test_observation_is_off_by_default(self):
         cfg = SlackConfig.from_dict({})
 
-        assert not cfg.observe.enabled
-        assert cfg.observe.allow_conversations == []
+        assert not cfg.source.enabled
+        assert cfg.source.allow_conversations == []
 
     def test_a_mapping_allow_list_does_not_become_a_wildcard(self):
         # {"*": false} reads like a disabled wildcard, and list() of it
         # yields its keys. Guessing at intent would turn a config that looks
         # switched off into one that grants everything.
         cfg = SlackConfig.from_dict({
-            "observe": {"enabled": True, "allow_conversations": {"*": False}},
+            "source": {"enabled": True, "allow_conversations": {"*": False}},
         })
 
-        assert cfg.observe.allow_conversations == []
-        assert not cfg.observe.active if hasattr(
-            cfg.observe, "active",
+        assert cfg.source.allow_conversations == []
+        assert not cfg.source.active if hasattr(
+            cfg.source, "active",
         ) else True
 
     @pytest.mark.parametrize("bad", [{"C1": True}, {"*": False}, None])
     def test_a_mapping_or_missing_allow_list_grants_nothing(self, bad):
         cfg = SlackConfig.from_dict({
-            "observe": {"enabled": True, "allow_conversations": bad},
+            "source": {"enabled": True, "allow_conversations": bad},
         })
 
-        assert cfg.observe.allow_conversations == []
+        assert cfg.source.allow_conversations == []
 
     def test_a_bare_string_is_one_pattern_not_many(self):
         # This is how `allow_conversations: ${OBSERVE_ROOMS}` arrives after
         # interpolation. Dropping it would break the documented env-var
         # idiom; splitting it would invent patterns nobody wrote.
         cfg = SlackConfig.from_dict({
-            "observe": {"allow_conversations": "C0123ABCD"},
+            "source": {"allow_conversations": "C0123ABCD"},
         })
 
-        assert cfg.observe.allow_conversations == ["C0123ABCD"]
+        assert cfg.source.allow_conversations == ["C0123ABCD"]
 
     def test_scalar_entries_are_kept_and_junk_dropped(self):
         cfg = SlackConfig.from_dict({
-            "observe": {"allow_conversations": [{"a": 1}, "C1", "  ", "C2"]},
+            "source": {"allow_conversations": [{"a": 1}, "C1", "  ", "C2"]},
         })
 
-        assert cfg.observe.allow_conversations == ["C1", "C2"]
+        assert cfg.source.allow_conversations == ["C1", "C2"]
 
     @pytest.mark.parametrize("bad", [5, "", "   ", None])
     def test_an_unusable_schedule_falls_back(self, bad):
         # There is no sync.slack section to fall back to, so an ignored
-        # schedule would leave the spool filling with nothing draining it.
-        cfg = SlackConfig.from_dict({"observe": {"schedule": bad}})
+        # schedule would leave the buffer filling with nothing draining it.
+        cfg = SlackConfig.from_dict({"source": {"schedule": bad}})
 
-        assert cfg.observe.schedule == "*/5 * * * *"
+        assert cfg.source.schedule == "*/5 * * * *"
 
     def test_enabling_without_a_grant_warns(self, caplog):
         with caplog.at_level("WARNING"):
-            SlackConfig.from_dict({"observe": {"enabled": True}})
+            SlackConfig.from_dict({"source": {"enabled": True}})
 
         assert "allow_conversations" in caplog.text

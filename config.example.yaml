@@ -153,7 +153,7 @@ slack:
   # doctor/restart affect the host; sessions lists other channels. Opt in.
   # commands: [sessions, new, stop, reply]
   #
-  # Spool messages the bot sees but does not answer into the source inbox,
+  # Buffer messages the bot sees but does not answer into the source inbox,
   # where poll_source and the `messages` cron gate reach them. Nothing here
   # starts an agent turn.
   #
@@ -162,12 +162,12 @@ slack:
   # allow_conversations observes NOTHING rather than everything, and DMs are
   # never observed. Prefer literal IDs — a name or glob costs a
   # conversations.info lookup per conversation per 10 minutes.
-  # observe:
+  # source:
   #   enabled: true
   #   allow_conversations: ["C0456DEF", "eng-*"]
   #   deny_conversations: ["*-social"]
   #   deny_senders: ["*-bot"]
-  #   schedule: "*/5 * * * *"     # how often the spool drains into the inbox
+  #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
   #
   # Reaches the inbox as the source "slack:observed". Group DMs are never
   # observed, and everything collected is untrusted input: the grant decides

@@ -1494,7 +1494,7 @@ class TelegramChannel(BaseChannel):
     @property
     def observation(self) -> ObservationPolicy:
         """The observation grant, rebuilt per read so reloads apply at once."""
-        observe = self.config.telegram.observe
+        observe = self.config.telegram.source
         return ObservationPolicy(
             enabled=observe.enabled,
             conversations=PatternGate(
@@ -1510,28 +1510,28 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _observe(self, update: Update) -> None:
-        """Spool a message from a sender who may not instruct the agent.
+        """Buffer a message from a sender who may not instruct the agent.
 
         Telegram has no "addressed to me" test the way Slack does — an
         authorized user's every message is answered — so the only
         seen-but-unanswered path is an unauthorized sender. That reads
         alarming and is in fact the point: observation is watching a
         conversation the agent takes no orders from. What makes it safe is
-        that it needs its own explicit ``telegram.observe.allow_conversations``
-        grant, and that everything spooled stays untrusted input to the inbox
+        that it needs its own explicit ``telegram.source.allow_conversations``
+        grant, and that everything buffered stays untrusted input to the inbox
         rather than instructions.
 
         Because that population is riskier than Slack's — every message here
         is from someone refused, not merely someone who did not address the
         agent — it takes a second opt-in,
-        ``telegram.observe.include_unauthorized_senders``, on top of the
+        ``telegram.source.include_unauthorized_senders``, on top of the
         conversation grant.
 
         Private chats are never observed. A stranger's DM is a refusal, and
         filing it away is not what the silence led them to expect; a group an
         operator listed is a different matter.
         """
-        observe = self.config.telegram.observe
+        observe = self.config.telegram.source
         policy = self.observation
         if not policy.active or not observe.include_unauthorized_senders:
             return
@@ -1594,7 +1594,7 @@ class TelegramChannel(BaseChannel):
         await self.router.observe(
             observed,
             ttl_days=self.config.sync.message_ttl_days,
-            max_spool_rows=self.config.telegram.observe.max_spool_rows,
+            max_stored_messages=self.config.telegram.source.max_stored_messages,
         )
 
     async def _handle_message(self, update: Update, context: Any) -> None:

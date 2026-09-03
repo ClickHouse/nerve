@@ -370,20 +370,20 @@ class ChannelRouter:
         return await chan_obj.send_file(target, file_path)
 
     # ------------------------------------------------------------------ #
-    #  Observation spool                                                    #
+    #  Observation buffer                                                    #
     # ------------------------------------------------------------------ #
 
     async def observe(
         self,
         msg: ObservedMessage,
         ttl_days: int = 7,
-        max_spool_rows: int = DEFAULT_MAX_ROWS,
+        max_stored_messages: int = DEFAULT_MAX_ROWS,
     ) -> bool:
-        """Spool a message a channel saw but did not answer.
+        """Buffer a message a channel saw but did not answer.
 
         Channels reach the database through the router, never through the
         engine directly, so this is the seam. Returns True if the record was
-        spooled.
+        buffered.
 
         A failure is swallowed and logged. This sits on the dispatch path of
         a channel that has already decided not to answer, so a database
@@ -399,12 +399,12 @@ class ChannelRouter:
                 channel_key=msg.channel_key,
                 payload=asdict(msg),
                 ttl_days=ttl_days,
-                max_rows=max_spool_rows,
+                max_rows=max_stored_messages,
             )
             return True
         except Exception as e:
             logger.warning(
-                "Failed to spool an observation from %s: %s", msg.channel_name, e,
+                "Failed to buffer an observation from %s: %s", msg.channel_name, e,
             )
             return False
 
