@@ -240,7 +240,7 @@ def build_source_runners(
             gh_repos.batch_size, gh_repos.repos or "none",
         )
 
-    # Channel observation drains. Not a poll: the channel already spooled
+    # Channel observation drains. Not a poll: the channel already buffered
     # these over its own socket, and this only moves them into the inbox.
     # What to watch is a property of the channel, so the config lives at
     # slack.observe / telegram.observe rather than under sync.*, and the
@@ -249,10 +249,10 @@ def build_source_runners(
         ("slack", config.slack),
         ("telegram", config.telegram),
     ):
-        observe = getattr(channel_config, "observe", None)
-        if observe is None or not observe.enabled:
+        source_cfg = getattr(channel_config, "source", None)
+        if source_cfg is None or not source_cfg.enabled:
             continue
-        if not observe.allow_conversations:
+        if not source_cfg.allow_conversations:
             # ObserveConfig.from_dict already warned. Don't build a runner
             # whose policy can never approve anything to drain.
             continue
@@ -260,9 +260,9 @@ def build_source_runners(
         from nerve.sources.filters import FieldRule, InboxFilter
 
         # Re-apply the deny rules at drain time. The channel already ran the
-        # full policy before spooling, so this is a second net, not the gate:
+        # full policy before buffering, so this is a second net, not the gate:
         # it catches rows written before a conversation was added to the deny
-        # list, which the spool would otherwise deliver minutes or a TTL
+        # list, which the buffer would otherwise deliver minutes or a TTL
         # later under the old policy.
         #
         # Deny-only on purpose. These rules match the id field, so a
@@ -274,27 +274,27 @@ def build_source_runners(
         # conversation's names are grantable.
         observe_filter = InboxFilter(rules=[
             FieldRule(
-                field="conversation_id", deny=list(observe.deny_conversations),
+                field="conversation_id", deny=list(source_cfg.deny_conversations),
             ),
-            FieldRule(field="sender_id", deny=list(observe.deny_senders)),
+            FieldRule(field="sender_id", deny=list(source_cfg.deny_senders)),
         ])
 
         runners.append(SourceRunner(
             source=ChannelSource(channel_name, db),
             db=db,
-            batch_size=observe.batch_size,
-            condense=observe.condense,
+            batch_size=source_cfg.batch_size,
+            condense=source_cfg.condense,
             condense_model=condense_model,
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
             inbox_filter=observe_filter,
-            schedule=observe.schedule,
+            schedule=source_cfg.schedule,
         ))
         logger.info(
             "Registered source: %s observations (batch=%d, schedule=%s, "
             "conversations allow=%s deny=%s)",
-            channel_name, observe.batch_size, observe.schedule,
-            observe.allow_conversations, observe.deny_conversations or [],
+            channel_name, source_cfg.batch_size, source_cfg.schedule,
+            source_cfg.allow_conversations, source_cfg.deny_conversations or [],
         )
 
     return runners
