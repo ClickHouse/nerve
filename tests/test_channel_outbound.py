@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.tools.handlers.notifications import send_channel_message_handler
 from nerve.agent.tools.registry import ToolContext
 from nerve.channels.access import Decision
@@ -295,6 +296,55 @@ class TestOutboundSwitch:
 
         assert not verdict.allowed
         assert "slack.allow_channels" in verdict.reason
+
+
+class TestToolVisibility:
+    """The tool is offered only where it could succeed.
+
+    Outbound is off by default and Slack is off by default, so on an
+    ordinary install the tool would otherwise be advertised, tried, and
+    refused, costing a turn to learn that. Its description also names
+    allow_channels as the remaining condition, which is only true once the
+    switch is on.
+    """
+
+    @pytest.mark.parametrize(
+        "enabled,outbound,offered",
+        [
+            (False, False, False),
+            (True, False, False),
+            (False, True, False),   # nothing running to post through
+            (True, True, True),
+        ],
+    )
+    def test_the_gate_needs_a_running_channel_and_the_switch(
+        self, enabled, outbound, offered,
+    ):
+        cfg = NerveConfig()
+        cfg.slack = SlackConfig(enabled=enabled, allow_outbound=outbound)
+
+        assert bool(cfg.outbound_channels) is offered
+        excluded = config_excluded_tools(cfg)
+        assert ("send_channel_message" not in excluded) is offered
+
+    def test_the_prompt_stops_advertising_it_too(self):
+        # Two places name the tool: the session's MCP server and the
+        # system-prompt tool list. Hiding one and not the other tells the
+        # model about a tool it cannot call.
+        from nerve.agent.prompts import _format_tool_list
+
+        full = _format_tool_list()
+        filtered = _format_tool_list({"send_channel_message"})
+
+        assert "mcp__nerve__send_channel_message" in full
+        assert "mcp__nerve__send_channel_message" not in filtered
+
+    def test_the_registry_still_holds_it(self):
+        # The gate is per session, not per registry: an install that turns
+        # outbound on mid-run gets the tool at the next session.
+        from nerve.agent.tools import build_default_registry
+
+        assert "send_channel_message" in build_default_registry()
 
 
 class TestDefaultRefusal:
