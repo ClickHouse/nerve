@@ -2782,6 +2782,17 @@ class NerveConfig:
         """
         return self.ollama.enabled and self.proxy.enabled
 
+    @property
+    def outbound_channels(self) -> list[str]:
+        """Transports an agent may post to unprompted.
+
+        A channel that is not running has nothing to post through, and one
+        without its own outbound switch refuses every target. Empty means
+        ``send_channel_message`` can only refuse, which is what decides
+        whether it is offered at all.
+        """
+        return ["slack"] if self.slack.enabled and self.slack.allow_outbound else []
+
     def selectable_claude_models(
         self, discovered: list[str] | None = None,
     ) -> list[str]:
