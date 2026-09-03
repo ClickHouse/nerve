@@ -115,9 +115,11 @@ def build_session_mcp_server(
     ask_user/react/etc. always reference the correct session — no shared
     global, no race under concurrent sessions.
 
-    ``exclude`` drops tools by name — used by agent backends to hide
-    tools that duplicate a runtime built-in (e.g. the Claude backend
-    excludes ``schedule_wakeup``; the CLI's ScheduleWakeup covers it).
+    ``exclude`` drops tools by name — used by agent backends to hide tools
+    that duplicate a runtime built-in (e.g. the Claude backend excludes
+    ``schedule_wakeup``; the CLI's ScheduleWakeup covers it) and ones the
+    config leaves nothing to serve (see
+    :func:`~nerve.agent.backends.base.config_excluded_tools`).
 
     The returned dict matches the SDK's ``McpSdkServerConfig`` shape;
     ``alwaysLoad`` is set to ``True`` so the Claude Code CLI skips tool-
