@@ -21,7 +21,12 @@ from nerve.channels.base import ObservedMessage
 from nerve.channels.observation import ObservationPolicy
 from nerve.channels.router import ChannelRouter
 from nerve.channels.slack import SlackChannel
-from nerve.config import ChannelSourceConfig, NerveConfig, SlackConfig
+from nerve.config import (
+    ChannelSourceConfig,
+    NerveConfig,
+    SlackConfig,
+    TelegramConfig,
+)
 from nerve.db.observations import _TRIM_EVERY
 from nerve.sources.channel import ChannelSource
 from nerve.sources.registry import build_source_runners
@@ -788,7 +793,7 @@ class TestConfig:
         cfg = SlackConfig.from_dict({
             "source": {
                 "enabled": True,
-                "allow_conversations": ["C1"],
+                "allow_channels": ["C1"],
                 "deny_senders": ["U0BOT"],
                 "schedule": "*/9 * * * *",
             },
@@ -810,7 +815,7 @@ class TestConfig:
         # yields its keys. Guessing at intent would turn a config that looks
         # switched off into one that grants everything.
         cfg = SlackConfig.from_dict({
-            "source": {"enabled": True, "allow_conversations": {"*": False}},
+            "source": {"enabled": True, "allow_channels": {"*": False}},
         })
 
         assert cfg.source.allow_conversations == []
@@ -821,7 +826,7 @@ class TestConfig:
     @pytest.mark.parametrize("bad", [{"C1": True}, {"*": False}, None])
     def test_a_mapping_or_missing_allow_list_grants_nothing(self, bad):
         cfg = SlackConfig.from_dict({
-            "source": {"enabled": True, "allow_conversations": bad},
+            "source": {"enabled": True, "allow_channels": bad},
         })
 
         assert cfg.source.allow_conversations == []
@@ -831,14 +836,14 @@ class TestConfig:
         # interpolation. Dropping it would break the documented env-var
         # idiom; splitting it would invent patterns nobody wrote.
         cfg = SlackConfig.from_dict({
-            "source": {"allow_conversations": "C0123ABCD"},
+            "source": {"allow_channels": "C0123ABCD"},
         })
 
         assert cfg.source.allow_conversations == ["C0123ABCD"]
 
     def test_scalar_entries_are_kept_and_junk_dropped(self):
         cfg = SlackConfig.from_dict({
-            "source": {"allow_conversations": [{"a": 1}, "C1", "  ", "C2"]},
+            "source": {"allow_channels": [{"a": 1}, "C1", "  ", "C2"]},
         })
 
         assert cfg.source.allow_conversations == ["C1", "C2"]
@@ -851,8 +856,41 @@ class TestConfig:
 
         assert cfg.source.schedule == "*/5 * * * *"
 
+    def test_each_transport_uses_its_own_noun(self):
+        # On Telegram a "channel" is a specific entity type distinct from a
+        # group, so one shared noun could not name both correctly.
+        slack = SlackConfig.from_dict({"source": {"allow_channels": ["C1"]}})
+        tg = TelegramConfig.from_dict({"source": {"allow_chats": ["-100"]}})
+
+        assert slack.source.allow_conversations == ["C1"]
+        assert tg.source.allow_conversations == ["-100"]
+
+    def test_the_other_transports_key_grants_nothing(self):
+        # Fail closed on a key this transport does not read, rather than
+        # quietly accepting it and collecting nothing anyway.
+        cfg = SlackConfig.from_dict({"source": {"allow_chats": ["C1"]}})
+
+        assert cfg.source.allow_conversations == []
+
+    @pytest.mark.parametrize(
+        "written,matched",
+        [
+            ("#eng-backend", "eng-backend"),
+            ("@alice", "alice"),
+            ("eng-backend", "eng-backend"),
+            ("*@example.com", "*@example.com"),
+        ],
+    )
+    def test_a_pasted_display_name_still_matches(self, written, matched):
+        # A chat client renders "#eng-backend"; the API name has no sigil and
+        # matching is literal, so left alone the paste would match nothing
+        # and an allow list would leave the inbox silently empty.
+        cfg = SlackConfig.from_dict({"source": {"allow_channels": [written]}})
+
+        assert cfg.source.allow_conversations == [matched]
+
     def test_enabling_without_a_grant_warns(self, caplog):
         with caplog.at_level("WARNING"):
             SlackConfig.from_dict({"source": {"enabled": True}})
 
-        assert "allow_conversations" in caplog.text
+        assert "allow_channels" in caplog.text

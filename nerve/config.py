@@ -968,7 +968,7 @@ def _pattern_list(value: object, label: str) -> list[str]:
         )
         return []
     if not isinstance(value, (list, tuple)):
-        text = str(value).strip()
+        text = _strip_display_sigil(value)
         return [text] if text else []
     patterns: list[str] = []
     for entry in value:
@@ -977,10 +977,27 @@ def _pattern_list(value: object, label: str) -> list[str]:
                 "source.%s: ignoring non-scalar entry %r", label, entry,
             )
             continue
-        text = str(entry).strip()
+        text = _strip_display_sigil(entry)
         if text:
             patterns.append(text)
     return patterns
+
+
+def _strip_display_sigil(value: object) -> str:
+    """Drop a leading ``#`` or ``@`` from a pattern.
+
+    Chat UIs render a channel as ``#eng-backend`` and a person as ``@alice``,
+    so that is what an operator copies — but the API names carry no sigil and
+    matching is literal. Left alone, ``#eng-backend`` matches nothing, which
+    on an allow list means an inbox that stays empty with no error to explain
+    why.
+
+    Unambiguous to strip: neither platform lets a channel, chat, or user name
+    begin with ``#`` or ``@``. A ``@`` *inside* the value is untouched, so an
+    email pattern like ``*@example.com`` still works.
+    """
+    text = str(value).strip()
+    return text[1:].strip() if text[:1] in "#@" else text
 
 
 def _channel_source_schedule(value: object) -> str:
@@ -1013,11 +1030,22 @@ class ChannelSourceConfig:
     blocks watching a channel the agent takes no orders from, or widens
     command access to everything worth watching.
 
-    Fail-closed twice over: off unless ``enabled``, and observing nothing
-    unless ``allow_conversations`` names something. An empty allow list here
-    means "nothing", not "everything" — the opposite of the access gates,
-    because this one is a standing grant to record other people's messages
-    rather than a check that already ran a sender rule first.
+    Fail-closed twice over: off unless ``enabled``, and collecting nothing
+    unless the allow list names something. An empty allow list here means
+    "nothing", not "everything" — the opposite of the access gates, because
+    this one is a standing grant to record other people's messages rather
+    than a check that already ran a sender rule first.
+
+    The fields are transport-neutral, but the YAML keys are not: each channel
+    passes the ``subject`` its own users would recognise, so Slack reads
+    ``allow_channels`` and Telegram reads ``allow_chats``. Sharing one noun
+    was worse than it looks — on Telegram a "channel" is a specific entity
+    type distinct from a group, so ``allow_channels`` there would name the
+    wrong thing, and "conversations" named nothing anyone could act on.
+
+    What actually matches is per transport and documented in ``config.md``;
+    the short version is that a platform id always works, and a name works
+    only where the platform, not the subject, controls it.
 
     ``schedule`` is the drain cadence, not a poll: the messages are already
     in the buffer by the time it fires.
@@ -1045,23 +1073,32 @@ class ChannelSourceConfig:
 
     @classmethod
     @_coerced
-    def from_dict(cls, d: dict) -> ChannelSourceConfig:
+    def from_dict(
+        cls, d: dict, *, subject: str = "conversations",
+    ) -> ChannelSourceConfig:
+        """Parse a ``<channel>.source`` block.
+
+        ``subject`` is the noun this transport calls the thing being watched
+        — ``"channels"`` for Slack, ``"chats"`` for Telegram — and names both
+        the YAML keys and every warning, so an operator is told about the key
+        they actually wrote.
+        """
         enabled = _as_bool(
             d.get("enabled", False), False, label="source.enabled",
         )
-        allow = _pattern_list(d.get("allow_conversations"), "allow_conversations")
+        allow_key, deny_key = f"allow_{subject}", f"deny_{subject}"
+        allow = _pattern_list(d.get(allow_key), allow_key)
         if enabled and not allow:
             logger.warning(
-                "source.enabled is set but observe.allow_conversations names "
-                "nothing usable — nothing will be observed. List the "
-                "conversations to watch; an empty list is not a wildcard here.",
+                "source.enabled is set but source.%s names nothing usable — "
+                "nothing will be collected. List the %s to watch; an empty "
+                "list is not a wildcard here.",
+                allow_key, subject,
             )
         return cls(
             enabled=enabled,
             allow_conversations=allow,
-            deny_conversations=_pattern_list(
-                d.get("deny_conversations"), "deny_conversations",
-            ),
+            deny_conversations=_pattern_list(d.get(deny_key), deny_key),
             allow_senders=_pattern_list(d.get("allow_senders"), "allow_senders"),
             deny_senders=_pattern_list(d.get("deny_senders"), "deny_senders"),
             schedule=_channel_source_schedule(d.get("schedule")),
@@ -1135,7 +1172,9 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
-            source=ChannelSourceConfig.from_dict(d.get("source", {})),
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="chats",
+            ),
         )
 
 
@@ -1257,7 +1296,9 @@ class SlackConfig:
             ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
-            source=ChannelSourceConfig.from_dict(d.get("source", {})),
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="channels",
+            ),
         )
 
 
