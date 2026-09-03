@@ -8,16 +8,15 @@ from, or silently widens command access to everything worth watching.
 
 So the source gets its own gate, composed from the same
 :mod:`nerve.channels.access` primitives, and the two are evaluated
-independently: a message may be answered, collected, both, or neither. This
+independently: a message may be live-routed, collected, both, or neither. This
 gate is off unless configured, and a conversation must be named explicitly —
 there is no "watch everything the bot can see" by omission, because that is
 what a misconfiguration looks like.
 
 Most of what it approves comes from people who are *not* authorized to
 instruct the agent — that is the usual reason to watch a room. Everything
-buffered is untrusted input, and the guardrail that keeps it from becoming
-instructions is the inbox filter on the source runner, not this gate. This
-gate only decides whose words get that far.
+buffered is untrusted. This gate limits which messages are stored; neither it
+nor the inbox filter validates message content.
 """
 
 from __future__ import annotations

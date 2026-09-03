@@ -37,9 +37,9 @@ def channel(tmp_path, monkeypatch):
 def _update(user_id: int = 4242):
     reply = AsyncMock()
     return SimpleNamespace(
-        effective_user=SimpleNamespace(id=user_id),
-        effective_chat=SimpleNamespace(id=user_id),
-        message=SimpleNamespace(reply_text=reply),
+        effective_user=SimpleNamespace(id=user_id, is_bot=False),
+        effective_chat=SimpleNamespace(id=user_id, type="private"),
+        message=SimpleNamespace(reply_text=reply, sender_chat=None),
     ), reply
 
 
