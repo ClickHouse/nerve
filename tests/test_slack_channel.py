@@ -1063,6 +1063,10 @@ class TestIdPredicate:
         assert is_slack_id("C0456DEF")
         assert is_slack_id("W01ABCDEFGH")
 
+    def test_configured_slack_ids_are_case_insensitive(self):
+        assert is_slack_id("u0123abc")
+        assert is_slack_id("c0456def")
+
     def test_an_uppercase_name_is_not_an_id(self):
         # This is the bug: a case heuristic read ALICE as an id, skipped the
         # users.info lookup, and let deny_users=["ALICE"] admit her.

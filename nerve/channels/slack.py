@@ -117,11 +117,12 @@ _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 # ---------------------------------------------------------------------- #
 
 
-# Slack object ids: a type letter then uppercase alphanumerics. U/W users,
-# B bots, C/G/D/T conversations and teams. Used to decide whether an
-# allow/deny pattern can be matched against the id alone, so the shape has to
-# be exact — anything looser skips a name lookup a deny list depends on.
-_SLACK_ID_RE = re.compile(r"^[UWBCDGT][A-Z0-9]{7,}$")
+# Slack object ids: a type letter then alphanumerics. Canonical IDs are
+# uppercase, but config matching is case-insensitive. U/W users, B bots,
+# C/G/D/T conversations and teams. Used to decide whether an allow/deny pattern
+# can be matched against the id alone, so the shape has to be exact — anything
+# looser skips a name lookup a deny list depends on.
+_SLACK_ID_RE = re.compile(r"^[UWBCDGT][A-Z0-9]{7,}$", re.IGNORECASE)
 
 
 def is_slack_id(pattern: str) -> bool:

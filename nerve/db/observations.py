@@ -15,8 +15,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# A busy channel must not fill the disk between drains. Past this many rows
-# for one channel, the oldest are dropped — losing the stale end of a
+# A busy transport must not fill the disk between drains. Past this many rows
+# for one transport, the oldest are dropped — losing the stale end of a
 # backlog nobody drained beats losing the daemon. Trimming is amortized
 # (see _TRIM_EVERY) so the dispatch path stays a single INSERT.
 DEFAULT_MAX_ROWS = 10_000
@@ -28,7 +28,7 @@ class ObservationStore:
 
     @property
     def _observation_writes(self) -> dict[str, int]:
-        """channel -> inserts since that channel's last trim check.
+        """Transport name -> inserts since that transport's last trim check.
 
         Built on first use: mixins here have no ``__init__``, and a class
         attribute would share one counter across every Database instance.
@@ -95,7 +95,7 @@ class ObservationStore:
         return result.lastrowid or 0
 
     async def _trim_channel_observations(self, channel: str, max_rows: int) -> None:
-        """Drop the oldest rows for *channel* past ``max_rows``."""
+        """Drop the oldest rows for one transport past ``max_rows``."""
         result = await self._write(
             "DELETE FROM channel_observations WHERE channel = ? AND id <= ("
             "  SELECT id FROM channel_observations WHERE channel = ?"
@@ -105,15 +105,16 @@ class ObservationStore:
         )
         if result.rowcount:
             logger.warning(
-                "Channel %s observation buffer hit its %d-row cap — dropped %d "
-                "of the oldest rows. The drain is behind or not scheduled.",
+                "Transport %s observation buffer exceeded its %d-row target — "
+                "dropped %d of the oldest rows. The drain is behind or not "
+                "scheduled.",
                 channel, max_rows, result.rowcount,
             )
 
     async def read_channel_observations(
         self, channel: str, after_id: int = 0, limit: int = 50,
     ) -> list[tuple[int, dict[str, Any] | None]]:
-        """Observations for *channel* past ``after_id``, oldest first.
+        """Buffered rows for one transport past ``after_id``, oldest first.
 
         Every scanned row comes back as ``(id, payload)``, with ``payload``
         None where the JSON would not parse. Dropping those rows here
@@ -140,7 +141,7 @@ class ObservationStore:
         return rows
 
     async def get_channel_observation_max_id(self, channel: str) -> int:
-        """Highest id buffered for *channel*, or 0 if none."""
+        """Highest id buffered for one transport, or 0 if none."""
         async with self.db.execute(
             "SELECT COALESCE(MAX(id), 0) FROM channel_observations WHERE channel = ?",
             (channel,),

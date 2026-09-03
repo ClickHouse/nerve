@@ -240,9 +240,9 @@ def build_source_runners(
             gh_repos.batch_size, gh_repos.repos or "none",
         )
 
-    # Channel source drains. Not a poll: the channel already buffered these
-    # over its own socket, and this only moves them into the inbox. What to
-    # watch is a property of the channel, so the config lives at
+    # Channel source drains. Not a poll: the channel transport already
+    # delivered and buffered these events. This only moves them into the
+    # inbox. What to watch is a property of the channel, so the config lives at
     # slack.source / telegram.source rather than under sync.*, and the
     # runner carries its own schedule instead of being looked up there.
     for channel_name, channel_config in (

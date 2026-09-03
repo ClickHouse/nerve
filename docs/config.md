@@ -1052,7 +1052,7 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.enabled` | bool | `true` | Enable Telegram bot |
 | `telegram.bot_token` | string | - | Bot token from @BotFather |
 | `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
-| `telegram.allowed_users` | list[int] | `[]` | Telegram user IDs allowed to DM the bot |
+| `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
 
 ### Pairing
@@ -1064,13 +1064,15 @@ editing config files:
 1. Run `nerve pair` on the server — it prints a one-time 6-digit code
    (valid 1 hour). On a fresh install with no `allowed_users`, a code is
    also generated automatically at startup and printed to the log.
-2. Send the bot `/pair <code>` from the Telegram account to authorize.
+2. In a private chat, send the bot `/pair <code>` from the Telegram account to
+   authorize.
 3. The user ID is appended to `telegram.allowed_users` in
    `config.local.yaml` and takes effect immediately.
 
-An unauthorized `/start` gets a reply with the sender's numeric ID and
-pairing instructions (rate-limited); all other messages from unauthorized
-users are ignored.
+An unauthorized `/start` gets a reply with the sender's numeric ID and pairing
+instructions (rate-limited). Other unauthorized messages cannot start a live
+channel turn. Matching group messages may still go to the independent channel
+source.
 
 ### Channel source
 
@@ -1096,22 +1098,21 @@ telegram:
 | `telegram.source.deny_chats` | list[str] | `[]` | Never collect these |
 | `telegram.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `telegram.source.deny_senders` | list[str] | `[]` | Skip these senders |
-| `telegram.source.include_handled_messages` | bool | `false` | Also collect messages the bot answers |
+| `telegram.source.include_handled_messages` | bool | `false` | Also collect messages accepted for live routing |
 | `telegram.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `telegram.source.batch_size` | int | `50` | Records per drain |
 | `telegram.source.condense` | bool | `false` | LLM-condense long messages |
-| `telegram.source.max_stored_messages` | int | `10000` | Buffer cap for all Telegram chats together |
+| `telegram.source.max_stored_messages` | int | `10000` | Buffer trim target for all Telegram chats together; checked every 100 writes |
 
 Reaches the inbox as the source `telegram:observed` — distinct from the
 `telegram` sync source, which is the Telethon pull from your *user* account.
 The keys say *chats* rather than *channels* because on Telegram a channel is
 a specific entity type distinct from a group.
 
-**Setup: the bot must be able to see group messages.** By default BotFather
-enables privacy mode, under which a bot receives only commands and replies to
-itself. Make the bot a group administrator, or disable privacy mode via
-BotFather (`/setprivacy` → Disable), or this collects almost nothing however
-the grant is written.
+**Setup: the bot must receive group messages.** With privacy mode enabled, a
+non-admin bot does not receive ordinary group messages. Make it an admin or
+disable privacy mode with BotFather (`/setprivacy` → Disable). See Telegram's
+[privacy-mode documentation](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get).
 
 **What the lists match.** Only numeric IDs may grant.
 
@@ -1127,7 +1128,8 @@ movable, so treating either as grantable would let anyone create a group
 named `ops-room` and walk into a grant meant for someone else's. Both stay
 deny-eligible, where a spoofable name can only subtract access.
 
-**Never collected:** private chats, the bot's own messages, and other bots.
+**Never collected:** private chats, the bot's own messages, other bots, and
+`/pair` commands.
 
 ## Slack
 
@@ -1278,11 +1280,11 @@ slack:
 | `slack.source.deny_channels` | list[str] | `[]` | Never collect these |
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
-| `slack.source.include_handled_messages` | bool | `false` | Also collect messages the bot answers |
+| `slack.source.include_handled_messages` | bool | `false` | Also collect messages accepted for live routing |
 | `slack.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |
-| `slack.source.max_stored_messages` | int | `10000` | Buffer cap for all Slack channels together |
+| `slack.source.max_stored_messages` | int | `10000` | Buffer trim target for all Slack channels together; checked every 100 writes |
 
 Reaches the inbox as the source `slack:observed`.
 
@@ -1303,9 +1305,8 @@ and email are workspace-assigned, so they may grant.
 join/leave noise. A group DM arrives as `channel_type="mpim"` on a `G` id, and
 a `G` whose type cannot be established is skipped rather than guessed at.
 
-**Prefer IDs for a busy channel.** An ID matches with no API call; any name or
-glob costs one `conversations.info` / `users.info` per distinct ID per 10
-minutes, through the existing name cache.
+**Prefer IDs for a busy channel.** Names and globs use cached Slack API lookups
+(`conversations.info` or `users.info`); IDs do not.
 
 ### Message behavior
 
@@ -1402,14 +1403,16 @@ Three differences from the inbound policy:
 
 ## Sources (sync)
 
-Sources pull data from external services on a schedule. See [sources.md](sources.md) for full details.
+Most sources pull data from external services on a schedule. See
+[sources.md](sources.md) for full details.
 
 Chat channels also feed the inbox, but are configured on the channel — see
-`slack.source.*` and `telegram.source.*` above. They are push, not pull: the
-messages already arrived over the channel's socket, so their `schedule` is a
-drain cadence rather than a poll interval.
+`slack.source.*` and `telegram.source.*` above. For each message delivered by
+the channel transport, matching messages are written to a local buffer.
+`ChannelSource` drains that buffer; it does not poll the chat service. Its
+`schedule` is a drain cadence, not a poll interval.
 
-**Common fields** (available on all sources):
+**Common pull-source fields** (under `sync.<source>`; availability varies):
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

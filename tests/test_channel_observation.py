@@ -368,6 +368,19 @@ class TestSlackObserve:
         channel._web.conversations_info.assert_not_awaited()
         channel._web.users_info.assert_not_awaited()
 
+    async def test_lowercase_ids_still_cost_no_api_call(self):
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["c0123abcd"],
+            deny_senders=["u0999zzzz"],
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel.router.observe.assert_awaited_once()
+        channel._web.conversations_info.assert_not_awaited()
+        channel._web.users_info.assert_not_awaited()
+
     async def test_a_name_policy_resolves_and_records_the_name(self):
         channel = _slack_channel(enabled=True, allow_conversations=["general"])
 
@@ -437,11 +450,78 @@ def _tg_update(
     return update
 
 
+def _tg_command_application(channel, callback_name="_handle_new_session"):
+    """Build the real PTB dispatch table with command callbacks isolated."""
+    from telegram import User
+
+    channel.config.telegram.bot_token = "123:ABC"
+    command_callback = AsyncMock()
+    generic_callback = AsyncMock(wraps=channel._handle_message)
+    setattr(channel, callback_name, command_callback)
+    channel._handle_message = generic_callback
+    app = channel._build_application()
+    # process_update only needs the initialized flag for these blocking,
+    # persistence-free handlers. Setting the bot user avoids a getMe request.
+    app._initialized = True
+    app.bot._bot_user = User(
+        id=1000, first_name="Nerve", is_bot=True, username="nerve_bot",
+    )
+    return app, command_callback, generic_callback
+
+
+def _tg_command_update(app, text="/new", user_id=42, *, missing_user=False):
+    """A real Telegram command update, so PTB chooses the production handler."""
+    from telegram import Update
+
+    command = text.split(maxsplit=1)[0]
+    message = {
+        "message_id": 7,
+        "date": 1_700_000_000,
+        "chat": {"id": -100123, "type": "supergroup", "title": "Room"},
+        "text": text,
+        "entities": [{
+            "type": "bot_command", "offset": 0, "length": len(command),
+        }],
+    }
+    if not missing_user:
+        message["from"] = {
+            "id": user_id, "is_bot": False, "first_name": "Alice",
+        }
+    return Update.de_json({"update_id": 1, "message": message}, app.bot)
+
+
+def _tg_caption_update(app, caption="/pair 654321", user_id=42):
+    """A real Telegram photo caption, which PTB sends to MessageHandler."""
+    from telegram import Update
+
+    command = caption.split(maxsplit=1)[0]
+    return Update.de_json({
+        "update_id": 1,
+        "message": {
+            "message_id": 7,
+            "date": 1_700_000_000,
+            "chat": {"id": -100123, "type": "supergroup", "title": "Room"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Alice"},
+            "photo": [{
+                "file_id": "photo-id",
+                "file_unique_id": "photo-unique-id",
+                "width": 1,
+                "height": 1,
+                "file_size": 1,
+            }],
+            "caption": caption,
+            "caption_entities": [{
+                "type": "bot_command", "offset": 0, "length": len(command),
+            }],
+        },
+    }, app.bot)
+
+
 class TestTelegramRouting:
     """Same independent routing as Slack, decided by authorization.
 
-    Telegram has no "addressed to me" test — an authorized user's every
-    message is answered — so authorization alone settles the live route.
+    Telegram has no "addressed to me" test, so authorization alone settles the
+    live route for each message.
     The source grant is asked either way.
     """
 
@@ -489,8 +569,133 @@ class TestTelegramRouting:
         channel._collect_media_group.assert_not_awaited()
         channel.router.observe.assert_not_awaited()
 
+    async def test_a_message_without_an_effective_user_is_ignored(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update()
+        update.effective_user = None
+
+        await channel._handle_message(update, None)
+
+        channel._collect_media_group.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+
+class TestTelegramCommandRouting:
+    async def test_an_unauthorized_command_reaches_the_source(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, user_id=42))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_a_handled_command_stays_on_the_live_route_by_default(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, user_id=999))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_handled_command_can_reach_both_routes(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, user_id=999))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_a_pairing_code_is_never_collected(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(
+            channel, callback_name="_handle_pair",
+        )
+
+        await app.process_update(_tg_command_update(
+            app, text="/pair 654321", user_id=42,
+        ))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_pairing_code_addressed_to_another_bot_is_not_collected(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(
+            channel, callback_name="_handle_pair",
+        )
+
+        await app.process_update(_tg_command_update(
+            app, text="/pair@other_bot 654321", user_id=42,
+        ))
+
+        command_callback.assert_not_awaited()
+        generic_callback.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_pairing_code_in_a_media_caption_is_not_collected(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(
+            channel, callback_name="_handle_pair",
+        )
+
+        await app.process_update(_tg_caption_update(app, user_id=42))
+
+        command_callback.assert_not_awaited()
+        generic_callback.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_command_without_an_effective_user_is_ignored(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, missing_user=True))
+
+        command_callback.assert_not_awaited()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
 
 class TestTelegramObserve:
+    async def test_pairing_is_refused_outside_a_private_human_chat(
+        self, monkeypatch,
+    ):
+        channel = _tg_channel(enabled=True, allow_conversations=["*"])
+        update = _tg_update()
+        update.message.sender_chat = None
+        update.message.reply_text = AsyncMock()
+        verify = MagicMock(return_value=True)
+        monkeypatch.setattr("nerve.pairing.verify_pairing_code", verify)
+        context = MagicMock(args=["654321"])
+
+        await channel._handle_pair(update, context)
+
+        verify.assert_not_called()
+        assert 42 not in channel._allowed_users
+        update.message.reply_text.assert_not_awaited()
+
     async def test_a_granted_group_is_observed(self):
         channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
 
@@ -532,6 +737,21 @@ class TestTelegramObserve:
         )
 
         await channel._observe(_tg_update(username="mallory"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_full_profile_name_can_deny_a_sender(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            deny_senders=["Alice Smith"],
+        )
+        update = _tg_update()
+        update.effective_user.first_name = "Alice"
+        update.effective_user.last_name = "Smith"
+        update.effective_user.full_name = "Alice Smith"
+
+        await channel._observe(update)
 
         channel.router.observe.assert_not_awaited()
 
