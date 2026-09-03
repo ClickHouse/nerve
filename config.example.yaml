@@ -110,18 +110,19 @@ telegram:
   # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
   #
-  # Feed the source inbox with messages the bot does not answer, reaching it
-  # as the source "telegram:observed". Telegram has no "addressed to me" test,
-  # so the only unanswered messages are from senders allowed_users refused —
-  # collecting them needs include_unauthorized_senders as a second, explicit
-  # opt-in. Only numeric IDs may grant; a group title or @username is
-  # claimable, so those can only deny. Private chats and other bots are never
-  # collected. See docs/sources.md before enabling.
+  # Feed the source inbox from watched group chats, reaching it as the source
+  # "telegram:observed". Its own grant, independent of allowed_users: an
+  # authorized sender is still answered live, and an unauthorized one is still
+  # collected if the chat is listed. Only numeric IDs may grant — a group title
+  # or @username is claimable, so those can only deny. Private chats, other
+  # bots, and messages the bot answers are never collected. The bot must be a
+  # group admin or have privacy mode off to see group traffic at all.
+  # See docs/sources.md before enabling.
   # source:
   #   enabled: true
-  #   include_unauthorized_senders: true
   #   allow_chats: ["-1001234567890"]
   #   deny_senders: ["12345"]
+  #   include_handled_messages: false   # true also collects what the bot answers
 
 slack:
   # Omitting this key leaves Slack off until both tokens below are set, so an
@@ -166,30 +167,33 @@ slack:
   # doctor/restart affect the host; sessions lists other channels. Opt in.
   # commands: [sessions, new, stop, reply]
   #
-  # Buffer messages the bot sees but does not answer into the source inbox,
-  # where poll_source and the `messages` cron gate reach them. Nothing here
-  # starts an agent turn.
+  # Feed the source inbox from watched channels, reaching it as the source
+  # "slack:observed", where poll_source and the `messages` cron gate read it.
+  # Nothing here starts an agent turn.
   #
-  # A SEPARATE grant from the access rules above: those say who may drive the
-  # agent, this says whose traffic may reach its inbox. So an empty
-  # allow_channels collects NOTHING rather than everything, and DMs (group
-  # DMs included) are never collected.
+  # A SEPARATE grant from the access rules above, decided independently of
+  # them: those say who may drive the agent, this says whose traffic may reach
+  # its inbox. So an empty allow_channels collects NOTHING rather than
+  # everything. A mention from someone access refuses is still collected; a
+  # message the bot answers live is not, unless include_handled_messages.
+  # DMs (group DMs included), other apps, and the bot's own posts are never
+  # collected.
   #
   # allow_channels takes a channel ID or a channel name, with globs and a
   # leading "#" tolerated; deny_channels the same. allow_senders takes a
   # member ID, handle, or email — a display name can only ever deny, since
   # its owner picks it. Prefer literal IDs: an ID matches with no API call,
   # a name or glob costs one conversations.info per channel per 10 minutes.
+  #
+  # Everything collected is untrusted input: the grant decides whose messages
+  # are kept, not whether their contents can be believed. See docs/sources.md.
   # source:
   #   enabled: true
   #   allow_channels: ["C0456DEF", "eng-*"]
   #   deny_channels: ["*-social"]
   #   deny_senders: ["*-bot"]
+  #   include_handled_messages: false   # true also collects what the bot answers
   #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
-  #
-  # Reaches the inbox as the source "slack:observed". Group DMs are never
-  # observed, and everything collected is untrusted input: the grant decides
-  # whose messages are kept, not whether their contents can be believed.
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
 # default rather than adding to it, so name every transport you want. A

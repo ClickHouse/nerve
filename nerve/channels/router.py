@@ -379,16 +379,15 @@ class ChannelRouter:
         ttl_days: int = 7,
         max_stored_messages: int = DEFAULT_MAX_ROWS,
     ) -> bool:
-        """Buffer a message a channel saw but did not answer.
+        """Buffer a message a channel collected for the source inbox.
 
         Channels reach the database through the router, never through the
         engine directly, so this is the seam. Returns True if the record was
         buffered.
 
-        A failure is swallowed and logged. This sits on the dispatch path of
-        a channel that has already decided not to answer, so a database
-        hiccup must not take down message handling for traffic the agent was
-        never going to act on.
+        A failure is swallowed and logged. This sits on a channel's dispatch
+        path, ahead of any live handling, so a database hiccup must not take
+        down message handling for the sake of a buffered copy.
         """
         db = getattr(self.engine, "db", None)
         if db is None:

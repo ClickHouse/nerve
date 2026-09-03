@@ -1493,47 +1493,51 @@ class TelegramChannel(BaseChannel):
 
     @property
     def observation(self) -> ObservationPolicy:
-        """The observation grant, rebuilt per read so reloads apply at once."""
-        observe = self.config.telegram.source
+        """The source grant, rebuilt per read so reloads apply at once."""
+        source = self.config.telegram.source
         return ObservationPolicy(
-            enabled=observe.enabled,
+            enabled=source.enabled,
             conversations=PatternGate(
                 "chat",
-                allow=list(observe.allow_conversations),
-                deny=list(observe.deny_conversations),
+                allow=list(source.allow_conversations),
+                deny=list(source.deny_conversations),
             ),
             senders=PatternGate(
                 "sender",
-                allow=list(observe.allow_senders),
-                deny=list(observe.deny_senders),
+                allow=list(source.allow_senders),
+                deny=list(source.deny_senders),
             ),
         )
 
-    async def _observe(self, update: Update) -> None:
-        """Buffer a message from a sender who may not instruct the agent.
+    async def _observe(self, update: Update, handled: bool = False) -> None:
+        """Buffer a group message for the source inbox, if the grant allows.
 
-        Telegram has no "addressed to me" test the way Slack does — an
-        authorized user's every message is answered — so the only
-        seen-but-unanswered path is an unauthorized sender. That reads
-        alarming and is in fact the point: observation is watching a
-        conversation the agent takes no orders from. What makes it safe is
-        that it needs its own explicit ``telegram.source.allow_conversations``
-        grant, and that everything buffered stays untrusted input to the inbox
-        rather than instructions.
+        Asked of every group message, whatever ``telegram.allowed_users``
+        decided: the source is its own grant, so a sender being authorized
+        neither earns nor forfeits a place in the inbox. ``handled`` says the
+        live route accepted this message, and by default that is where it
+        stops — one message should not arrive twice.
+        ``include_handled_messages`` turns the copy back on for a source
+        meant as a record.
 
-        Because that population is riskier than Slack's — every message here
-        is from someone refused, not merely someone who did not address the
-        agent — it takes a second opt-in,
-        ``telegram.source.include_unauthorized_senders``, on top of the
-        conversation grant.
-
-        Private chats are never observed. A stranger's DM is a refusal, and
+        Private chats are never a source. A stranger's DM is a refusal, and
         filing it away is not what the silence led them to expect; a group an
         operator listed is a different matter.
+
+        The bot must be a group administrator, or have privacy mode disabled
+        via BotFather, for Telegram to deliver ordinary group traffic at all.
+        Without that it only sees commands and replies to itself, and this
+        collects almost nothing however the grant is written.
         """
-        observe = self.config.telegram.source
+        # Cheapest gates first: this runs on every message now, not only the
+        # ones from a sender the allowlist refused.
+        source = self.config.telegram.source
+        if not source.enabled:
+            return
+        if handled and not source.include_handled_messages:
+            return
         policy = self.observation
-        if not policy.active or not observe.include_unauthorized_senders:
+        if not policy.active:
             return
         chat = update.effective_chat
         user = update.effective_user
@@ -1594,17 +1598,19 @@ class TelegramChannel(BaseChannel):
         await self.router.observe(
             observed,
             ttl_days=self.config.sync.message_ttl_days,
-            max_stored_messages=self.config.telegram.source.max_stored_messages,
+            max_stored_messages=source.max_stored_messages,
         )
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
-        if not self._is_authorized(update.effective_user.id):
-            # Not allowed to instruct the agent — which is exactly the
-            # premise of observation, not an obstacle to it. Needs its own
-            # explicit grant; see _observe.
-            await self._observe(update)
+        # Two independent routes, as on Slack. Authorization decides the live
+        # one; the source has its own grant and is asked either way, so a
+        # group can feed the inbox whether or not its members may also drive
+        # the agent.
+        handled = self._is_authorized(update.effective_user.id)
+        await self._observe(update, handled=handled)
+        if not handled:
             return
 
         # Media group (album) — collect all parts before processing

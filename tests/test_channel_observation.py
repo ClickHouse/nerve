@@ -177,12 +177,20 @@ class TestObservationPolicy:
 # ---------------------------------------------------------------------- #
 
 
-class TestSlackObserve:
-    async def test_an_unanswered_message_in_a_watched_channel_is_buffered(self):
+class TestSlackRouting:
+    """The two routes are decided independently, then reconciled.
+
+    Live handling needs the message addressed to the agent and its sender
+    authorized; the source needs its own grant and neither of those. Every
+    combination is reachable, so every combination is pinned here.
+    """
+
+    async def test_source_only_when_the_agent_is_not_addressed(self):
         channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
 
         await channel._handle_message_event(_event())
 
+        channel.router.handle_message.assert_not_awaited()
         channel.router.observe.assert_awaited_once()
         observed = channel.router.observe.await_args.args[0]
         assert observed.channel_name == "slack"
@@ -192,9 +200,41 @@ class TestSlackObserve:
         assert observed.message_id == "1700000000.000100"
         assert observed.timestamp.startswith("2023-11-14T")
 
-    async def test_an_answered_message_is_not_buffered(self):
-        # It becomes a real turn instead; buffering it too would show the
-        # agent its own conversation as third-party inbox traffic.
+    async def test_source_only_when_the_sender_may_not_drive_the_agent(self):
+        # Addressed, but access refuses it. The source grant is its own
+        # question, so the message still reaches the inbox — which is the
+        # point of watching a channel the agent takes no orders from.
+        channel = _slack_channel(
+            allow_channels=["C0OTHER"],
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+        )
+
+        await channel._handle_message_event(
+            _event(text="<@U0BOT> hello", type="app_mention"),
+        )
+
+        channel.router.handle_message.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_channel_only_when_the_source_does_not_want_it(self):
+        channel = _slack_channel(
+            allow_channels=["C0123ABCD"],
+            enabled=True,
+            allow_conversations=["C0AAA1111"],
+        )
+
+        await channel._handle_message_event(
+            _event(text="<@U0BOT> hello", type="app_mention"),
+        )
+
+        channel.router.handle_message.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_handled_message_is_not_also_collected_by_default(self):
+        # Both routes match. Sending one message down both would show the
+        # agent its own conversation again as third-party inbox traffic, so
+        # the live route wins unless an operator says otherwise.
         channel = _slack_channel(
             allow_channels=["C0123ABCD"],
             enabled=True,
@@ -205,9 +245,38 @@ class TestSlackObserve:
             _event(text="<@U0BOT> hello", type="app_mention"),
         )
 
-        channel.router.observe.assert_not_awaited()
         channel.router.handle_message.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
 
+    async def test_include_handled_messages_sends_it_to_both(self):
+        channel = _slack_channel(
+            allow_channels=["C0123ABCD"],
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+            include_handled_messages=True,
+        )
+
+        await channel._handle_message_event(
+            _event(text="<@U0BOT> hello", type="app_mention"),
+        )
+
+        channel.router.handle_message.assert_awaited_once()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_neither_route_takes_an_unaddressed_unwatched_message(self):
+        channel = _slack_channel(
+            allow_channels=["C0123ABCD"],
+            enabled=True,
+            allow_conversations=["C0AAA1111"],
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel.router.handle_message.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+
+class TestSlackObserve:
     async def test_observation_off_buffers_nothing(self):
         channel = _slack_channel(enabled=False, allow_conversations=["C0123ABCD"])
 
@@ -325,17 +394,22 @@ class TestSlackObserve:
 
 
 def _tg_channel(**source_kwargs):
-    """A Telegram channel with a stub router and an observe policy."""
+    """A Telegram channel with a stub router and a source policy."""
     from nerve.channels.telegram import TelegramChannel
 
-    source_kwargs.setdefault("include_unauthorized_senders", True)
     cfg = NerveConfig()
     cfg.telegram.source = ChannelSourceConfig(**source_kwargs)
     cfg.telegram.allowed_users = [999]
     channel = TelegramChannel.__new__(TelegramChannel)
     channel._config = lambda: cfg
+    channel._allowed_users = set(cfg.telegram.allowed_users)
+    channel._last_update_time = 0.0
     channel.router = MagicMock()
     channel.router.observe = AsyncMock(return_value=True)
+    # Every routing test drives _handle_message, whose live branch is long.
+    # A media group short-circuits it at the first step, so these assert on
+    # which route was taken without stubbing the whole extraction pipeline.
+    channel._collect_media_group = AsyncMock()
     return channel
 
 
@@ -359,7 +433,61 @@ def _tg_update(
     update.message.message_id = 7
     update.message.date = None
     update.message.reply_to_message = None
+    update.message.media_group_id = "album"
     return update
+
+
+class TestTelegramRouting:
+    """Same independent routing as Slack, decided by authorization.
+
+    Telegram has no "addressed to me" test — an authorized user's every
+    message is answered — so authorization alone settles the live route.
+    The source grant is asked either way.
+    """
+
+    async def test_source_only_for_a_sender_who_may_not_drive_the_agent(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+
+        await channel._handle_message(_tg_update(user_id=42), None)
+
+        channel._collect_media_group.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_channel_only_when_the_source_does_not_want_the_chat(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100999"])
+
+        await channel._handle_message(_tg_update(user_id=999), None)
+
+        channel._collect_media_group.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_handled_message_is_not_also_collected_by_default(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+
+        await channel._handle_message(_tg_update(user_id=999), None)
+
+        channel._collect_media_group.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_include_handled_messages_sends_it_to_both(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+
+        await channel._handle_message(_tg_update(user_id=999), None)
+
+        channel._collect_media_group.assert_awaited_once()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_neither_route_takes_a_refused_sender_in_an_unwatched_chat(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100999"])
+
+        await channel._handle_message(_tg_update(user_id=42), None)
+
+        channel._collect_media_group.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
 
 
 class TestTelegramObserve:
@@ -423,14 +551,8 @@ class TestTelegramObserve:
 
         channel.router.observe.assert_not_awaited()
 
-    async def test_the_unauthorized_opt_in_is_required(self):
-        # Every Telegram observation is from a sender the allowlist refused,
-        # so collecting them takes its own acknowledgement.
-        channel = _tg_channel(
-            enabled=True,
-            allow_conversations=["*"],
-            include_unauthorized_senders=False,
-        )
+    async def test_the_source_off_collects_nothing(self):
+        channel = _tg_channel(enabled=False, allow_conversations=["*"])
 
         await channel._observe(_tg_update())
 
@@ -729,7 +851,7 @@ class TestRegistry:
         slack = [r for r in runners if r.source.source_name == "slack:observed"]
         assert len(slack) == 1
         # The runner carries its own cadence: the config lives at
-        # slack.observe, and CronService would otherwise find no
+        # slack.source, and CronService would otherwise find no
         # config.sync.slack section and never schedule it.
         assert slack[0].schedule == "*/7 * * * *"
 
@@ -789,7 +911,7 @@ class TestRegistry:
 
 
 class TestConfig:
-    def test_observe_parses_from_a_slack_block(self):
+    def test_the_source_block_parses(self):
         cfg = SlackConfig.from_dict({
             "source": {
                 "enabled": True,
@@ -804,11 +926,28 @@ class TestConfig:
         assert cfg.source.deny_senders == ["U0BOT"]
         assert cfg.source.schedule == "*/9 * * * *"
 
-    def test_observation_is_off_by_default(self):
+    def test_the_source_is_off_by_default(self):
         cfg = SlackConfig.from_dict({})
 
         assert not cfg.source.enabled
         assert cfg.source.allow_conversations == []
+
+    def test_handled_messages_are_left_to_the_live_route_by_default(self):
+        assert not SlackConfig.from_dict(
+            {"source": {}},
+        ).source.include_handled_messages
+        assert not TelegramConfig.from_dict(
+            {"source": {}},
+        ).source.include_handled_messages
+
+    @pytest.mark.parametrize("subject", ["slack", "telegram"])
+    def test_include_handled_messages_parses_on_both_transports(self, subject):
+        parse = SlackConfig.from_dict if subject == "slack" else (
+            TelegramConfig.from_dict
+        )
+        cfg = parse({"source": {"include_handled_messages": True}})
+
+        assert cfg.source.include_handled_messages
 
     def test_a_mapping_allow_list_does_not_become_a_wildcard(self):
         # {"*": false} reads like a disabled wildcard, and list() of it
