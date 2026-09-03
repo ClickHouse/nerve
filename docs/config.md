@@ -1205,6 +1205,15 @@ slack:
   cannot answer each other without end. A person posting through an
   integration still reaches the agent, because they keep their own user ID.
 - `/nerve` responses are ephemeral.
+- `stream_mode: partial` posts a `⏳` placeholder and edits it as tokens and
+  tool labels arrive, then posts the finished reply as a new message and
+  deletes the placeholder. It is a new message because Slack does not notify
+  on an edit. `full` skips all of that and posts once at the end.
+- Prefer `full` in a busy shared channel, where the placeholder is visible to
+  everyone, or under rate-limit pressure: Slack meters `chat.update` per
+  conversation, so every thread streaming in one channel shares a single edit
+  every 1.2s and the rest are dropped. Only replies to inbound messages
+  stream; cron output and notifications are a single post either way.
 
 ### Commands
 

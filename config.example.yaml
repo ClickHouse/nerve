@@ -130,6 +130,12 @@ slack:
   # deny_channels: ["*-random", "*-social"]
   #
   # Every shared-channel thread is its own session; DMs use one conversation.
+  #
+  # How a reply appears while the agent works. "partial" posts a placeholder
+  # and edits it as tokens and tool labels arrive, so a long turn shows
+  # progress; the finished reply is then posted as a new message. "full" waits
+  # and posts once. Prefer "full" in a busy channel, where the placeholder is
+  # visible to everyone, or where the edits crowd Slack's rate limit.
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
   # `/nerve` defaults to new, stop, star, unstar, and reply.
   #   omitted  — new, stop, star, unstar, reply
