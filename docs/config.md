@@ -1196,7 +1196,7 @@ slack:
 
 ### Observation
 
-Messages the bot sees but does not answer can be spooled to the source inbox,
+Messages the bot sees but does not answer can be buffered to the source inbox,
 where `poll_source`, `read_source`, and the `messages` cron gate reach them
 like any other source. Nothing here starts an agent turn.
 
@@ -1209,36 +1209,37 @@ integer and the other Telethon's JSON state.
 
 ```yaml
 slack:
-  observe:
+  source:
     enabled: true
     allow_conversations: ["C0123ABCD", "eng-*"]
     deny_conversations: ["*-social"]
     deny_senders: ["*-bot"]
-    schedule: "*/5 * * * *"     # how often the spool drains into the inbox
+    schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
     batch_size: 50
-    max_spool_rows: 10000       # per channel, before the oldest are dropped
+    max_stored_messages: 10000  # per channel, before the oldest are dropped
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `slack.observe.enabled` | bool | `false` | Spool unanswered messages |
-| `slack.observe.allow_conversations` | list[str] | `[]` | Conversations to watch. **Empty means none** |
-| `slack.observe.deny_conversations` | list[str] | `[]` | Never watch these |
-| `slack.observe.allow_senders` | list[str] | `[]` | Restrict to these senders |
-| `slack.observe.deny_senders` | list[str] | `[]` | Skip these senders |
-| `slack.observe.schedule` | string | `*/5 * * * *` | Drain cadence |
-| `slack.observe.batch_size` | int | `50` | Records per drain |
-| `slack.observe.condense` | bool | `false` | LLM-condense long messages |
-| `slack.observe.max_spool_rows` | int | `10000` | Spool cap per channel |
+| `slack.source.enabled` | bool | `false` | Buffer unanswered messages |
+| `slack.source.allow_conversations` | list[str] | `[]` | Conversations to watch. **Empty means none** |
+| `slack.source.deny_conversations` | list[str] | `[]` | Never watch these |
+| `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
+| `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
+| `slack.source.schedule` | string | `*/5 * * * *` | Drain cadence |
+| `slack.source.batch_size` | int | `50` | Records per drain |
+| `slack.source.condense` | bool | `false` | LLM-condense long messages |
+| `slack.source.max_stored_messages` | int | `10000` | Buffer cap per channel |
 
-A malformed allow/deny value — a mapping, a bare string, a number — is
-discarded outright with a warning rather than salvaged. `{"*": false}` reads
-like a disabled wildcard but coerces to the key list `["*"]`, so guessing at
-intent here would turn a config that looks switched off into one that grants
-everything. An unusable `schedule` likewise falls back to the default rather
-than leaving the spool filling with nothing to drain it.
+A **mapping** in an allow/deny list is discarded outright with a warning
+rather than salvaged: `{"*": false}` reads like a disabled wildcard but
+coerces to the key list `["*"]`, so guessing at intent would turn a rule that
+looks switched off into one that grants everything. A bare string still wraps
+to a single pattern, since that is how a `${VAR}` reference arrives. An
+unusable `schedule` falls back to the default rather than leaving the buffer
+filling with nothing to drain it.
 
-`telegram.observe.*` takes the same keys, plus one of its own:
+`telegram.source.*` takes the same keys, plus one of its own:
 `include_unauthorized_senders` (bool, default `false`). Telegram has no
 "addressed to me" test — an authorized user's every message is answered — so
 its only seen-but-unanswered path is a sender the allowlist refused.
@@ -1258,7 +1259,7 @@ Two more Telegram-specific rules follow from the same reasoning:
   inboxes is no better than two agents answering each other.
 
 **Observation is a separate grant from access, on purpose.** `allow_users` and
-`allow_channels` answer "who may drive the agent?". `observe.*` answers "whose
+`allow_channels` answer "who may drive the agent?". `source.*` answers "whose
 traffic may reach the agent's inbox?". Watching a conversation the agent takes
 no orders from is a legitimate and different thing to want, and deriving one
 from the other would either block it or silently widen command access to
@@ -1278,17 +1279,17 @@ before the observation hook, so they never reach the inbox.
 
 **Everything observed is untrusted input.** It comes from people who are not
 authorized to instruct the agent — that is the whole point of watching a
-conversation — so treat a spooled message as attacker-controlled text that an
+conversation — so treat a buffered message as attacker-controlled text that an
 agent will later read.
 
 Be precise about what protects you here, because it is less than it may
 sound:
 
-- `observe.*` decides **whose messages are collected**. That is a real and
+- `source.*` decides **whose messages are collected**. That is a real and
   enforced boundary, checked before anything is written.
 - The drain re-applies the **deny** rules against `conversation_id` and
   `sender_id`, so a conversation added to `deny_conversations` stops
-  reaching the inbox even if its messages were already spooled.
+  reaching the inbox even if its messages were already buffered.
 - Nothing here inspects **content**. An inbox filter matches metadata; it
   cannot tell a report from an instruction, and no allow/deny list will
   separate them. The remaining protection is structural: observations land
@@ -1299,7 +1300,7 @@ So scope the grant to conversations whose participants you would already
 trust to file a ticket, and treat any workflow that acts on observed content
 without review as accepting prompt injection.
 
-**Cost.** Observation runs on the message dispatch path, so it spools raw IDs
+**Cost.** Observation runs on the message dispatch path, so it buffers raw IDs
 and resolves display names only when a pattern needs one. ID patterns cost no
 Slack API call at all; name and glob patterns cost one `conversations.info` or
 `users.info` per distinct ID per 10 minutes, via the existing name cache.

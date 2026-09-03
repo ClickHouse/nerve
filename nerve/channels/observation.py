@@ -12,7 +12,7 @@ a conversation must be named explicitly — there is no "watch everything the
 bot can see" by omission, because that is what a misconfiguration looks like.
 
 Observed messages come from people who are, by construction, *not* authorized
-to instruct the agent. Everything spooled here is untrusted input, and the
+to instruct the agent. Everything buffered here is untrusted input, and the
 guardrail that keeps it from becoming instructions is the inbox filter on the
 source runner, not this gate. This gate only decides whose words get that far.
 """
@@ -26,7 +26,7 @@ from nerve.channels.access import Decision, Identity, PatternGate
 
 @dataclass
 class ObservationPolicy:
-    """Whether a conversation and sender may be spooled to the inbox.
+    """Whether a conversation and sender may be buffered to the inbox.
 
     ``conversations`` is fail-closed by design: an empty allow list observes
     nothing at all, rather than everything. That inverts
@@ -52,7 +52,7 @@ class ObservationPolicy:
         return self.enabled and bool(self.conversations.allow)
 
     def check(self, conversation: Identity, sender: Identity) -> Decision:
-        """Decide whether one message may be spooled."""
+        """Decide whether one message may be buffered."""
         if not self.enabled:
             return Decision(False, "observation is not enabled")
         if not self.conversations.allow:
