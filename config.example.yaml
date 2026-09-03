@@ -109,6 +109,19 @@ telegram:
   dm_policy: pairing
   # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  #
+  # Feed the source inbox with messages the bot does not answer, reaching it
+  # as the source "telegram:observed". Telegram has no "addressed to me" test,
+  # so the only unanswered messages are from senders allowed_users refused —
+  # collecting them needs include_unauthorized_senders as a second, explicit
+  # opt-in. Only numeric IDs may grant; a group title or @username is
+  # claimable, so those can only deny. Private chats and other bots are never
+  # collected. See docs/sources.md before enabling.
+  # source:
+  #   enabled: true
+  #   include_unauthorized_senders: true
+  #   allow_chats: ["-1001234567890"]
+  #   deny_senders: ["12345"]
 
 slack:
   # Omitting this key leaves Slack off until both tokens below are set, so an
