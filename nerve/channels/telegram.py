@@ -229,6 +229,23 @@ def _format_reply_context(message: Any) -> str:
     return "\n".join(parts)
 
 
+def _describe_telegram_attachment(message: Any) -> str:
+    """Name a message's attachment without downloading it.
+
+    An uncaptioned photo or sticker still says something. ``_extract_sticker``
+    and ``_extract_document`` say more but fetch the file to do it.
+    """
+    sticker = getattr(message, "sticker", None)
+    if sticker:
+        return f"[Sticker: {sticker.emoji}]" if sticker.emoji else "[Sticker]"
+    document = getattr(message, "document", None)
+    if document:
+        return f"[File: {document.file_name or 'unnamed'}]"
+    if getattr(message, "photo", None):
+        return "[Photo]"
+    return ""
+
+
 # Inline-keyboard /sessions rendering ------------------------------------- #
 _SESSIONS_PAGE_SIZE = 10        # sessions shown per /sessions page; ⬅️/➡️ page the rest
 _SESSION_LABEL_MAX = 40         # Telegram wraps long button labels poorly
@@ -1648,13 +1665,21 @@ class TelegramChannel(BaseChannel):
             logger.debug("Telegram did not observe a message: %s", verdict.reason)
             return
 
+        text = message.text or message.caption or ""
+        attachment = _describe_telegram_attachment(message)
+        if attachment:
+            text = f"{attachment}\n\n{text}" if text else attachment
+        # Neither text nor an attachment is nothing worth a row.
+        if not text:
+            return
+
         sent_at = message.date or datetime.now(timezone.utc)
         observed = ObservedMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat.id}",
             conversation_id=str(chat.id),
             sender_id=str(user.id),
-            text=message.text or message.caption or "",
+            text=text,
             message_id=str(message.message_id),
             timestamp=sent_at.isoformat(),
             conversation_title=chat.title or chat.username or "",

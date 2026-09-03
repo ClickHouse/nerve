@@ -1000,6 +1000,27 @@ def _strip_display_sigil(value: object) -> str:
     return text[1:].strip() if text[:1] in "#@" else text
 
 
+_MIN_STORED_MESSAGES = 100
+
+
+def _stored_message_target(value: object, default: int) -> int:
+    """Coerce a ``source.max_stored_messages``, holding it above a floor.
+
+    Zero is the case to catch: it reads like "no limit" and tells the trim to
+    keep no rows, emptying the buffer before the drain reads it. A negative
+    does the same, since SQLite reads a negative OFFSET as zero.
+    """
+    target = _lenient_int(value, default, label="source.max_stored_messages")
+    if target >= _MIN_STORED_MESSAGES:
+        return target
+    logger.warning(
+        "source.max_stored_messages is %r, which would trim the buffer to "
+        "nothing before the drain reads it. Using %d instead.",
+        value, _MIN_STORED_MESSAGES,
+    )
+    return _MIN_STORED_MESSAGES
+
+
 def _channel_source_schedule(value: object) -> str:
     """Coerce a ``source.schedule``, falling back to the default.
 
@@ -1106,7 +1127,9 @@ class ChannelSourceConfig:
             condense=_as_bool(
                 d.get("condense", False), False, label="source.condense",
             ),
-            max_stored_messages=d.get("max_stored_messages", 10_000),
+            max_stored_messages=_stored_message_target(
+                d.get("max_stored_messages"), 10_000,
+            ),
             include_handled_messages=_as_bool(
                 d.get("include_handled_messages", False), False,
                 label="source.include_handled_messages",

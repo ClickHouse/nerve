@@ -183,8 +183,8 @@ slack:
   # allow_channels takes a channel ID or a channel name, with globs and a
   # leading "#" tolerated; deny_channels the same. allow_senders takes a
   # member ID, handle, or email — a display name can only ever deny, since
-  # its owner picks it. Prefer literal IDs: names and globs use cached Slack API
-  # lookups; IDs do not.
+  # its owner picks it. Prefer uppercase IDs: everything else uses cached Slack
+  # API lookups.
   #
   # Everything collected is untrusted input: the grant decides whose messages
   # are kept, not whether their contents can be believed. See docs/sources.md.
