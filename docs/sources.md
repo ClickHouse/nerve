@@ -181,19 +181,82 @@ visible rather than failing the fetch.
   the buffer is pruned, and a plain SQLite rowid is reused after the highest row
   is deleted, which would reissue ids the cursor has already passed and skip
   the next observations for good.
-- **Source name:** the channel name — `slack`, `telegram` — so a cron gate reads
-  `sources: [slack]` and the inbox lists it beside `gmail`.
+- **Source name:** `<channel>:observed` — `slack:observed`,
+  `telegram:observed` — so a cron gate reads `sources: [slack:observed]`.
+  Compound like `gmail:<account>`, and distinct from the bare channel name on
+  purpose: `telegram` is already a pull source, and sharing the name would
+  mean sharing a cron job id and a cursor key, leaving the two runners to
+  evict each other from the scheduler and then read each other's cursor —
+  one an integer, the other Telethon's JSON state.
 - **Config:** `slack.source.*` / `telegram.source.*`, not `sync.*`. What to
   watch is a property of the channel. The runner therefore carries its own
-  `schedule` rather than being looked up in `config.sync.<name>`.
+  `schedule` rather than being looked up in `config.sync.<name>`, which would
+  otherwise return nothing and leave it silently unscheduled.
 - **Default schedule:** `*/5 * * * *`
 - **Idempotent:** the record id is `<conversation>:<message_id>`, so a message
   observed twice collapses on the inbox's `(source, id)` key.
-- **Guardrails:** ordinary `FieldRule`s over the buffered metadata —
-  `conversation_id`, `sender_id`, `thread_ts`, `channel_key`.
+- **Guardrails:** the drain re-applies the configured *deny* rules as
+  ordinary `FieldRule`s over the buffered metadata (`conversation_id`,
+  `sender_id`). Deny-only: those rules match id fields, so a name-based allow
+  rule would fail closed and drop everything — the allow decision stays at
+  the channel, which knows which of a conversation's names are grantable.
+  Further `FieldRule`s can match anything else buffered, including
+  `thread_ts` and `channel_key`.
 
-See [config.md](config.md) for why observation is a separate grant from channel
-access, and what is deliberately never observed.
+### What the grant does and does not protect you from
+
+**Observation is a separate grant from channel access, on purpose.**
+`slack.allow_users` / `allow_channels` answer "who may drive the agent?".
+`<channel>.source.*` answers "whose traffic may reach the agent's inbox?".
+Watching a conversation the agent takes no orders from is a legitimate and
+different thing to want, and deriving one from the other would either block
+it or silently widen command access to everything worth watching.
+
+That makes two rules here the inverse of the access rules:
+
+- **An empty allow list collects nothing**, not everything. A standing grant
+  to record other people's messages has to be written down; `enabled: true`
+  with nothing listed logs a warning and registers no drain.
+- **Direct messages are never collected** — group DMs included. Declining to
+  answer a DM is a refusal, and filing it away instead is not what the
+  silence led the sender to expect.
+
+The agent's own posts, join/leave noise, and other apps' messages are dropped
+before the hook, so they never reach the inbox.
+
+**Everything collected is untrusted input.** It comes from people who are not
+authorized to instruct the agent — that is the whole point of watching a
+conversation — so treat a buffered message as attacker-controlled text that an
+agent will later read. Be precise about what protects you, because it is less
+than it may sound:
+
+- `<channel>.source.*` decides **whose messages are collected**. That is a
+  real and enforced boundary, checked before anything is written.
+- The drain re-applies the **deny** rules against `conversation_id` and
+  `sender_id`, so a conversation added to a deny list stops reaching the
+  inbox even if its messages were already buffered.
+- Nothing here inspects **content**. An inbox filter matches metadata; it
+  cannot tell a report from an instruction, and no allow/deny list will
+  separate them. The remaining protection is structural: observations land in
+  an inbox the agent reads deliberately via `poll_source`, rather than being
+  injected into a turn as if a user had said them.
+
+So scope the grant to conversations whose participants you would already
+trust to file a ticket, and treat any workflow that acts on collected content
+without review as accepting prompt injection.
+
+**Cost.** The hook runs on the message dispatch path, so it buffers raw IDs
+and resolves display names only when a pattern needs one. ID patterns cost no
+API call at all; a name or glob costs one `conversations.info` / `users.info`
+per distinct ID per 10 minutes, through the existing name cache. Prefer IDs
+when watching a busy conversation.
+
+**Thread context is not expanded.** A reply's `thread_ts` is recorded so a
+reader can pull the parent, but the parent is not fetched — that would be an
+API call per observation. Expanding it is deferred.
+
+See [config.md](config.md) for the per-channel keys: `slack.source.*` under
+the Slack section, `telegram.source.*` under Telegram.
 
 ## Configuration
 
