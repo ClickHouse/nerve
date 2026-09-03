@@ -159,13 +159,18 @@ slack:
   #
   # A SEPARATE grant from the access rules above: those say who may drive the
   # agent, this says whose traffic may reach its inbox. So an empty
-  # allow_conversations observes NOTHING rather than everything, and DMs are
-  # never observed. Prefer literal IDs — a name or glob costs a
-  # conversations.info lookup per conversation per 10 minutes.
+  # allow_channels collects NOTHING rather than everything, and DMs (group
+  # DMs included) are never collected.
+  #
+  # allow_channels takes a channel ID or a channel name, with globs and a
+  # leading "#" tolerated; deny_channels the same. allow_senders takes a
+  # member ID, handle, or email — a display name can only ever deny, since
+  # its owner picks it. Prefer literal IDs: an ID matches with no API call,
+  # a name or glob costs one conversations.info per channel per 10 minutes.
   # source:
   #   enabled: true
-  #   allow_conversations: ["C0456DEF", "eng-*"]
-  #   deny_conversations: ["*-social"]
+  #   allow_channels: ["C0456DEF", "eng-*"]
+  #   deny_channels: ["*-social"]
   #   deny_senders: ["*-bot"]
   #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
   #

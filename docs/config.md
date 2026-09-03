@@ -1211,8 +1211,8 @@ integer and the other Telethon's JSON state.
 slack:
   source:
     enabled: true
-    allow_conversations: ["C0123ABCD", "eng-*"]
-    deny_conversations: ["*-social"]
+    allow_channels: ["C0123ABCD", "eng-*"]
+    deny_channels: ["*-social"]
     deny_senders: ["*-bot"]
     schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
     batch_size: 50
@@ -1222,14 +1222,46 @@ slack:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `slack.source.enabled` | bool | `false` | Buffer unanswered messages |
-| `slack.source.allow_conversations` | list[str] | `[]` | Conversations to watch. **Empty means none** |
-| `slack.source.deny_conversations` | list[str] | `[]` | Never watch these |
+| `slack.source.allow_channels` | list[str] | `[]` | Channels to watch. **Empty means none** |
+| `slack.source.deny_channels` | list[str] | `[]` | Never watch these |
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
 | `slack.source.schedule` | string | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |
 | `slack.source.max_stored_messages` | int | `10000` | Buffer cap per channel |
+
+Telegram uses its own noun — `telegram.source.allow_chats` / `deny_chats` —
+because on Telegram a "channel" is a specific entity type distinct from a
+group, so `allow_channels` there would name the wrong thing.
+
+#### What you can actually write in these lists
+
+Matching is case-insensitive and supports `*` / `?` globs. A leading `#` or
+`@` is stripped, so a name pasted from the client works as-is. **Deny always
+wins**, and a non-empty allow list must match or the message is skipped.
+
+| List | Matches | Example |
+|---|---|---|
+| `slack.source.allow_channels` | channel ID, or channel name | `C0123ABCD`, `eng-backend`, `eng-*` |
+| `slack.source.deny_channels` | same | `*-social` |
+| `slack.source.allow_senders` | member ID, handle, or email | `U0456DEFG`, `alice`, `*@example.com` |
+| `slack.source.deny_senders` | same, **plus** display and real names | `*-bot`, `Alice Smith` |
+| `telegram.source.allow_chats` | numeric chat ID **only** | `-1001234567890` |
+| `telegram.source.deny_chats` | chat ID, `@username`, or title | `-1001234567890`, `ops-room` |
+| `telegram.source.allow_senders` | numeric user ID **only** | `42` |
+| `telegram.source.deny_senders` | user ID, `@username`, or profile name | `42`, `mallory` |
+
+The pattern in that table is one rule: **a name may grant only where the
+platform controls it.** A Slack channel name and handle are workspace-assigned,
+so they can appear in an allow list; a Slack display name is edited by its
+owner, and every Telegram title and `@username` is chosen by whoever holds it,
+so those are deny-only. Otherwise anyone could name a group `ops-room` and
+walk into a grant meant for someone else's.
+
+**Prefer IDs when watching a busy conversation.** An ID matches with no API
+call at all; the moment any pattern is a name or glob, each conversation and
+sender is resolved once per 10 minutes through the existing name cache.
 
 A **mapping** in an allow/deny list is discarded outright with a warning
 rather than salvaged: `{"*": false}` reads like a disabled wildcard but
@@ -1267,9 +1299,9 @@ everything worth watching.
 
 That makes two rules here the inverse of the access rules:
 
-- **An empty `allow_conversations` observes nothing**, not everything. A
+- **An empty allow list observes nothing**, not everything. A
   standing grant to record other people's messages has to be written down.
-  `enabled: true` with no conversations logs a warning and registers no drain.
+  `enabled: true` with none listed logs a warning and registers no drain.
 - **Direct messages are never observed.** Declining to answer a DM is a
   refusal; filing it away instead is not what the silence led the sender to
   expect.
