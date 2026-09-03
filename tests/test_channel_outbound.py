@@ -58,7 +58,12 @@ class _PlainChannel(BaseChannel):
 
 
 def _slack(**slack_kwargs) -> SlackChannel:
-    """A Slack channel with a stub transport, ready to authorize."""
+    """A Slack channel with a stub transport, ready to authorize.
+
+    ``allow_outbound`` defaults on here so each test states only the policy
+    it is about; the switch itself is covered by TestOutboundSwitch.
+    """
+    slack_kwargs.setdefault("allow_outbound", True)
     cfg = NerveConfig()
     cfg.slack = SlackConfig(
         enabled=True,
@@ -260,6 +265,36 @@ class TestSlackAuthorizeOutbound:
 
         assert not verdict.allowed
         assert "no Slack conversation id" in verdict.reason
+
+
+class TestOutboundSwitch:
+    async def test_addressed_delivery_is_off_by_default(self):
+        # allow_channels is set by nearly every Slack deployment for inbound
+        # access. Deriving writes from it alone would hand every cron run a
+        # megaphone into those channels the moment this shipped.
+        channel = _slack(allow_channels=["C0123ABCD"], allow_outbound=False)
+
+        verdict = await channel.authorize_outbound("C0123ABCD")
+
+        assert not verdict.allowed
+        assert "slack.allow_outbound" in verdict.reason
+
+    async def test_the_switch_does_not_widen_where_writes_may_go(self):
+        # On, but the conversation is still not granted: the switch enables
+        # the capability, allow_channels still bounds it.
+        channel = _slack(allow_channels=["C0123ABCD"], allow_outbound=True)
+
+        verdict = await channel.authorize_outbound("C0999ZZZZ")
+
+        assert not verdict.allowed
+
+    async def test_the_switch_alone_grants_nothing(self):
+        channel = _slack(allow_outbound=True)
+
+        verdict = await channel.authorize_outbound("C0123ABCD")
+
+        assert not verdict.allowed
+        assert "slack.allow_channels" in verdict.reason
 
 
 class TestDefaultRefusal:

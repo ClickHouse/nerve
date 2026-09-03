@@ -1261,17 +1261,24 @@ rather than to whichever chat it is answering. That makes it usable from a
 cron run with no conversation attached — and means the destination, not the
 sender, is what has to be authorized.
 
-The grant is `slack.allow_channels` read in the write direction: the agent may
-post to a conversation an operator already named, and `slack.deny_channels`
-still refuses. There are no separate write keys, so writes cannot widen while
-reads narrow.
+It is **off by default**: `slack.allow_outbound: true` enables the capability,
+and `slack.allow_channels` then bounds where it may go. Two keys rather than
+one because `allow_channels` is set by nearly every Slack deployment for
+inbound access — deriving writes from it alone would have handed every cron
+run a megaphone into those channels on upgrade, with no opt-in. The switch
+never widens the destination set: with it on, `allow_channels` still decides,
+and `slack.deny_channels` still refuses.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `slack.allow_outbound` | bool | `false` | Let an agent post to a conversation it names |
 
 Three differences from the inbound policy are deliberate:
 
 - **`slack.allow_users` grants nothing here.** It says who may drive the
   agent, not where the agent may broadcast. With no `slack.allow_channels`
-  set, every target is refused — unlike an inbound check, there is no sender
-  to have vetted first.
+  set, every target is refused even when `allow_outbound` is on — unlike an
+  inbound check, there is no sender to have vetted first.
 - **Unsolicited DMs are refused**, even with `slack.allow_direct_messages`.
   An inbound DM comes from someone who chose to write; an outbound one does
   not. Gating one properly means resolving the conversation's member and

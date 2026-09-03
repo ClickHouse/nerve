@@ -1238,6 +1238,13 @@ class SlackChannel(BaseChannel):
         — the same reasoning behind :meth:`SlackAccessPolicy.describe`. The
         detail goes to the log instead.
         """
+        if not self.config.slack.allow_outbound:
+            return Decision(
+                False,
+                "slack.allow_outbound is not enabled, so the agent may not "
+                "post to a conversation it names",
+            )
+
         channel_id, _ = parse_target(target)
         if not channel_id:
             return Decision(False, "no Slack conversation id in the target")

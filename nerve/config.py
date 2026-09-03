@@ -1066,6 +1066,13 @@ class SlackConfig:
     allow_direct_messages: bool = False
     allow_channels: list[str] = field(default_factory=list)
     deny_channels: list[str] = field(default_factory=list)
+    # Whether an agent may post to a conversation it names, unprompted
+    # (send_channel_message). Off by default and separate from the read
+    # grant: allow_channels is set by nearly every Slack deployment for
+    # inbound access, so deriving writes from it alone would hand every
+    # cron run a megaphone into those channels on upgrade. Turning this on
+    # never widens where writes may go — allow_channels still bounds that.
+    allow_outbound: bool = False
     stream_mode: str = "partial"
     # None keeps safe defaults; [] disables commands. Host-wide and
     # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
@@ -1101,6 +1108,10 @@ class SlackConfig:
             allow_direct_messages=d.get("allow_direct_messages", False),
             allow_channels=d.get("allow_channels") or [],
             deny_channels=d.get("deny_channels") or [],
+            allow_outbound=_as_bool(
+                d.get("allow_outbound", False), False,
+                label="SlackConfig.allow_outbound",
+            ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
         )
