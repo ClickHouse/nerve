@@ -117,16 +117,18 @@ _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 # ---------------------------------------------------------------------- #
 
 
-# Slack object ids: a type letter then alphanumerics. Canonical IDs are
-# uppercase, but config matching is case-insensitive. U/W users, B bots,
-# C/G/D/T conversations and teams. Used to decide whether an allow/deny pattern
-# can be matched against the id alone, so the shape has to be exact — anything
-# looser skips a name lookup a deny list depends on.
-_SLACK_ID_RE = re.compile(r"^[UWBCDGT][A-Z0-9]{7,}$", re.IGNORECASE)
+# Slack object ids: a type letter then uppercase alphanumerics. U/W users,
+# B bots, C/G/D/T conversations and teams. Decides whether a pattern can be
+# matched against the id alone, so anything looser skips a name lookup a deny
+# list depends on. Case-sensitive: `beckyjones` is a legal handle and
+# `c0456def` a legal channel name, so only a lookup tells a lowercase id from
+# a lowercase name. Matching is case-insensitive either way, so a lowercase id
+# still matches. It just costs the lookup.
+_SLACK_ID_RE = re.compile(r"^[UWBCDGT][A-Z0-9]{7,}$")
 
 
 def is_slack_id(pattern: str) -> bool:
-    """Whether *pattern* is a literal Slack object id rather than a name."""
+    """Whether *pattern* can only be a literal Slack object id, never a name."""
     return bool(_SLACK_ID_RE.match(pattern))
 
 
@@ -143,6 +145,17 @@ def parse_target(target: str) -> tuple[str, str | None]:
     """
     channel_id, sep, thread_ts = target.partition(":")
     return channel_id, (thread_ts if sep and thread_ts else None)
+
+
+def _describe_slack_files(files: list[dict[str, Any]]) -> str:
+    """Name a message's attachments without downloading them.
+
+    For an upload posted with no comment the file name is the whole message.
+    ``_extract_files`` says more but fetches the bytes to do it.
+    """
+    return " ".join(
+        f"[File: {f.get('name') or 'unnamed'}]" for f in files
+    )
 
 
 def slack_ts_to_iso(ts: str) -> str:
@@ -1026,21 +1039,35 @@ class SlackChannel(BaseChannel):
             )
             return
 
-        resolve = needs_name_resolution(
-            policy.conversations, is_id=is_slack_id,
-        )
+        # Conversation first: it settles most refusals, and an id-only channel
+        # grant needs no lookup. Resolving the sender first would cost one per
+        # speaker in every channel the bot sits in, watched or not.
         conversation = await self._identify_conversation(
-            channel_id, "channel", resolve,
+            channel_id,
+            "channel",
+            needs_name_resolution(policy.conversations, is_id=is_slack_id),
         )
+        verdict = policy.conversations.check(conversation)
+        if not verdict.allowed:
+            logger.debug("Slack did not observe a message: %s", verdict.reason)
+            return
+
         sender = await self._identify_user(
             user_id,
             needs_name_resolution(policy.senders, is_id=is_slack_id),
             need_email=policy.senders.any_deny_pattern(lambda p: "@" in p),
         )
-
-        verdict = policy.check(conversation, sender)
+        verdict = policy.senders.check(sender)
         if not verdict.allowed:
             logger.debug("Slack did not observe a message: %s", verdict.reason)
+            return
+
+        text = slack_to_plain(event.get("text") or "", self._bot_user_id)
+        attachments = _describe_slack_files(event.get("files") or [])
+        if attachments:
+            text = f"{attachments}\n\n{text}" if text else attachments
+        # Neither text nor a file name is nothing worth a row.
+        if not text:
             return
 
         observed = ObservedMessage(
@@ -1048,7 +1075,7 @@ class SlackChannel(BaseChannel):
             channel_key=channel_key,
             conversation_id=channel_id,
             sender_id=user_id,
-            text=slack_to_plain(event.get("text") or "", self._bot_user_id),
+            text=text,
             message_id=ts,
             timestamp=slack_ts_to_iso(ts),
             conversation_title=next(iter(conversation.names), ""),

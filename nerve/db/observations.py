@@ -140,15 +140,6 @@ class ObservationStore:
                     rows.append((row[0], None))
         return rows
 
-    async def get_channel_observation_max_id(self, channel: str) -> int:
-        """Highest id buffered for one transport, or 0 if none."""
-        async with self.db.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM channel_observations WHERE channel = ?",
-            (channel,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
     async def cleanup_expired_channel_observations(self) -> int:
         """Delete observations past their TTL. Returns count deleted."""
         now = datetime.now(timezone.utc).isoformat()

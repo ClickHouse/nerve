@@ -1306,7 +1306,11 @@ join/leave noise. A group DM arrives as `channel_type="mpim"` on a `G` id, and
 a `G` whose type cannot be established is skipped rather than guessed at.
 
 **Prefer IDs for a busy channel.** Names and globs use cached Slack API lookups
-(`conversations.info` or `users.info`); IDs do not.
+(`conversations.info` or `users.info`). An ID skips the lookup, but only in
+uppercase: `beckyjones` is a legal handle and `c0456def` a legal channel name,
+so a lowercase pattern is resolved rather than assumed. It still matches. It
+just costs the lookup. A channel the grant does not name is refused before any
+sender is resolved.
 
 ### Message behavior
 

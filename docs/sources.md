@@ -201,7 +201,13 @@ A chat channel can feed the inbox with the group traffic it already receives.
   *transport*, covering all of its watched conversations together, not one per
   conversation. Every 100 writes, Nerve drops the oldest rows back to that
   target and logs a warning. The buffer can therefore exceed it by up to 99
-  rows. Daily cleanup removes rows after `sync.message_ttl_days`.
+  rows. Values below 100 are refused and 100 used instead: `0` reads like "no
+  limit" but tells the trim to keep nothing. Daily cleanup removes rows after
+  `sync.message_ttl_days`.
+- **Backlog:** one run keeps fetching while the buffer reports more, up to 20
+  batches, so a chat busier than one `batch_size` per tick still drains. Each
+  batch is persisted before the next starts, so a run that stops at the bound
+  resumes there and logs a warning. Raise `batch_size` if that repeats.
 - **Requires setup (Telegram only):** with privacy mode enabled, a non-admin bot
   does not receive ordinary group messages. Make it an admin or disable privacy
   mode with BotFather. See Telegram's
@@ -268,10 +274,17 @@ to file a ticket, and treat any workflow that acts on collected content without
 review as accepting prompt injection.
 
 **Slack lookup cost.** Names and globs use cached `conversations.info` or
-`users.info` lookups. IDs do not. Prefer IDs for busy conversations.
+`users.info` lookups. An ID skips the lookup, but only in uppercase. A
+lowercase pattern could equally be a name, so it is resolved rather than
+assumed. A channel the grant does not name is refused before any sender is
+resolved.
 
 **Reply context is not expanded.** Slack stores `thread_ts`; Telegram stores
 `reply_to_message_id`. The parent message is not fetched.
+
+**Attachments are named, not fetched.** An upload contributes `[File: <name>]`,
+`[Photo]`, or `[Sticker: <emoji>]` ahead of any caption. A message with neither
+text nor an attachment is not collected.
 
 ## Configuration
 
