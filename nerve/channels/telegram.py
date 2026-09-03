@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -561,18 +561,42 @@ class TelegramChannel(BaseChannel):
         )
         app = builder.build()
 
-        # Register handlers
-        app.add_handler(CommandHandler("start", self._handle_start))
-        app.add_handler(CommandHandler("pair", self._handle_pair))
-        app.add_handler(CommandHandler("session", self._handle_session))
-        app.add_handler(CommandHandler("sessions", self._handle_sessions))
-        app.add_handler(CommandHandler("star", self._handle_star))
-        app.add_handler(CommandHandler("unstar", self._handle_unstar))
-        app.add_handler(CommandHandler("new", self._handle_new_session))
-        app.add_handler(CommandHandler("stop", self._handle_stop))
-        app.add_handler(CommandHandler("restart", self._handle_restart))
-        app.add_handler(CommandHandler("doctor", self._handle_doctor))
-        app.add_handler(CommandHandler("reply", self._handle_reply))
+        # A CommandHandler wins over the generic MessageHandler in this group,
+        # so commands need the source hook on their own callback.
+        app.add_handler(CommandHandler(
+            "start", self._source_routed_command(self._handle_start),
+        ))
+        # Never persist a one-time pairing code in the source buffer.
+        app.add_handler(CommandHandler(
+            "pair", self._source_routed_command(self._handle_pair, collect=False),
+        ))
+        app.add_handler(CommandHandler(
+            "session", self._source_routed_command(self._handle_session),
+        ))
+        app.add_handler(CommandHandler(
+            "sessions", self._source_routed_command(self._handle_sessions),
+        ))
+        app.add_handler(CommandHandler(
+            "star", self._source_routed_command(self._handle_star),
+        ))
+        app.add_handler(CommandHandler(
+            "unstar", self._source_routed_command(self._handle_unstar),
+        ))
+        app.add_handler(CommandHandler(
+            "new", self._source_routed_command(self._handle_new_session),
+        ))
+        app.add_handler(CommandHandler(
+            "stop", self._source_routed_command(self._handle_stop),
+        ))
+        app.add_handler(CommandHandler(
+            "restart", self._source_routed_command(self._handle_restart),
+        ))
+        app.add_handler(CommandHandler(
+            "doctor", self._source_routed_command(self._handle_doctor),
+        ))
+        app.add_handler(CommandHandler(
+            "reply", self._source_routed_command(self._handle_reply),
+        ))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL | filters.Document.ALL,
@@ -643,7 +667,8 @@ class TelegramChannel(BaseChannel):
             code = pairing.get_or_create_pairing_code()
             logger.info(
                 "Telegram: no allowed_users configured — pairing mode active. "
-                "Send the bot:  /pair %s  to authorize your account "
+                "In a private chat, send the bot:  /pair %s  to authorize "
+                "your account "
                 "(code valid for 1h; run `nerve pair` to get a fresh one).",
                 code,
             )
@@ -1022,6 +1047,31 @@ class TelegramChannel(BaseChannel):
         """Record that we received an update from Telegram."""
         self._last_update_time = time.monotonic()
 
+    def _source_routed_command(
+        self,
+        callback: Callable[[Update, Any], Awaitable[None]],
+        *,
+        collect: bool = True,
+    ) -> Callable[[Update, Any], Awaitable[None]]:
+        """Add source routing to a command without changing PTB precedence."""
+
+        async def wrapped(update: Update, context: Any) -> None:
+            chat = update.effective_chat
+            user = update.effective_user
+            message = update.message
+            if chat is None or user is None or message is None:
+                return
+
+            source = self.config.telegram.source
+            if collect and source.enabled and source.allow_conversations:
+                await self._observe(
+                    update,
+                    handled=self._is_authorized(user.id),
+                )
+            await callback(update, context)
+
+        return wrapped
+
     async def _handle_start(self, update: Update, context: Any) -> None:
         """Handle /start command."""
         self._touch()
@@ -1037,7 +1087,8 @@ class TelegramChannel(BaseChannel):
                 await update.message.reply_text(
                     "This Nerve instance isn't paired with your account.\n"
                     f"Your Telegram ID: {user_id}\n\n"
-                    "To pair, run `nerve pair` on the server, then send me:\n"
+                    "To pair, run `nerve pair` on the server, then open a "
+                    "private chat with me and send:\n"
                     "/pair <code>"
                 )
             return
@@ -1046,9 +1097,21 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _handle_pair(self, update: Update, context: Any) -> None:
-        """Handle /pair <code> — authorize a user via a one-time pairing code."""
+        """Authorize a user who sends /pair <code> in a private chat."""
         self._touch()
-        user_id = update.effective_user.id
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        if (
+            chat.type != "private"
+            or user.is_bot
+            or getattr(message, "sender_chat", None) is not None
+        ):
+            logger.warning("Ignoring /pair outside a private human chat")
+            return
+        user_id = user.id
 
         if self._is_authorized(user_id):
             await update.message.reply_text("Already paired — you're authorized.")
@@ -1546,6 +1609,14 @@ class TelegramChannel(BaseChannel):
             return
         if chat.type == "private":
             return
+        # Pairing codes are credentials. A command addressed to another bot
+        # bypasses our CommandHandler and reaches the generic message handler,
+        # so enforce this exclusion at the source gate too.
+        text = message.text or message.caption or ""
+        words = text.split(maxsplit=1)
+        command = words[0].partition("@")[0].casefold() if words else ""
+        if command == "/pair":
+            return
         # Telegram delivers other bots' messages to group handlers under
         # bot-to-bot mode. Slack drops them via _is_another_app_talking, and
         # two agents feeding each other's inboxes is no better than two
@@ -1566,7 +1637,9 @@ class TelegramChannel(BaseChannel):
         sender = Identity(
             id=str(user.id),
             self_set_names=tuple(
-                n for n in (user.username, user.first_name, user.last_name) if n
+                n for n in (
+                    user.username, user.full_name, user.first_name, user.last_name,
+                ) if n
             ),
         )
 
@@ -1604,11 +1677,16 @@ class TelegramChannel(BaseChannel):
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
         # Two independent routes, as on Slack. Authorization decides the live
         # one; the source has its own grant and is asked either way, so a
         # group can feed the inbox whether or not its members may also drive
         # the agent.
-        handled = self._is_authorized(update.effective_user.id)
+        handled = self._is_authorized(user.id)
         await self._observe(update, handled=handled)
         if not handled:
             return

@@ -1022,15 +1022,14 @@ def _channel_source_schedule(value: object) -> str:
 
 @dataclass
 class ChannelSourceConfig:
-    """Which conversations feed the inbox, whoever the agent answers.
+    """Which conversations feed the inbox, independent of live routing.
 
     A separate grant from the access rules, and evaluated independently of
     them. "May this person drive the agent?" and "may this room's traffic
-    reach the agent's inbox?" are different questions, so every message in a
-    shared conversation is put to both, and either, both, or neither may say
-    yes. Deriving one answer from the other would block watching a channel
-    the agent takes no orders from, or widen command access to everything
-    worth watching.
+    reach the agent's inbox?" are different questions. A message can qualify
+    for the live route, the source route, both, or neither. Deriving one answer
+    from the other would block watching a channel the agent takes no orders
+    from, or widen command access to everything worth watching.
 
     Fail-closed twice over: off unless ``enabled``, and collecting nothing
     unless the allow list names something. An empty allow list here means
@@ -1064,14 +1063,12 @@ class ChannelSourceConfig:
     # 800-char condense threshold, so this would build an LLM client that
     # never gets used.
     condense: bool = False
-    # Cap on buffered rows per transport before the oldest are dropped. One
-    # budget for all of a transport's watched conversations, not one each.
+    # Trim target per transport, checked every 100 writes. One budget for all
+    # of a transport's watched conversations, not one each.
     max_stored_messages: int = 10_000
-    # Whether a message the channel is answering live is also collected.
-    # Off by default so the two routes do not both act on one message: the
-    # agent has already seen it as a turn, and a copy in the inbox invites a
-    # second, later pass over its own conversation. Turn it on when the
-    # source is a record — an archive, a digest — rather than a work queue.
+    # Whether a message accepted for live routing is also collected.
+    # Off by default. Turn it on only when source consumers should receive the
+    # same message later, such as when the source is an archive or digest.
     include_handled_messages: bool = False
 
     @classmethod

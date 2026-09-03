@@ -1103,7 +1103,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 warnings.append(
                     "[WARN] telegram.allowed_users is empty — the bot rejects "
                     "all DMs until you pair (run 'nerve pair', then send the "
-                    "bot /pair <code>)"
+                    "bot /pair <code> in a private chat)"
                 )
         else:
             errors.append("[ERR] Telegram enabled but bot_token not set")
@@ -1745,8 +1745,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
 def pair(ctx: click.Context) -> None:
     """Generate a Telegram pairing code.
 
-    Send /pair <code> to your bot within an hour to authorize your
-    Telegram account. The paired user ID is persisted to
+    Send /pair <code> to your bot in a private chat within an hour to
+    authorize your Telegram account. The paired user ID is persisted to
     config.local.yaml (telegram.allowed_users).
     """
     config = ctx.obj["config"]
@@ -1773,7 +1773,7 @@ def pair(ctx: click.Context) -> None:
     click.echo()
     click.secho(f"  Pairing code: {code}", bold=True)
     click.echo()
-    click.echo(f"  Send this to your bot:  /pair {code}")
+    click.echo(f"  In a private chat, send this to your bot:  /pair {code}")
     click.echo(f"  Valid for {CODE_TTL_SECONDS // 60} minutes, single use.")
     if not running:
         click.echo()
