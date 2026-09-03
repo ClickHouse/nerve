@@ -129,7 +129,7 @@ class SourceRunner:
         schedule: Crontab or interval this runner asks to be scheduled on.
             Empty means "look me up in ``config.sync.<name>``", which is how
             every pull source works. A source configured somewhere else —
-            a channel's ``observe`` block, say — carries its own cadence
+            a channel's ``source`` block, say — carries its own cadence
             here, because the alternative is a phantom ``config.sync``
             section that duplicates it, or a runner that is silently never
             scheduled. See :meth:`CronService._source_schedule`.

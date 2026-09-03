@@ -944,7 +944,7 @@ _DEFAULT_CHANNEL_SOURCE_SCHEDULE = "*/5 * * * *"
 
 
 def _pattern_list(value: object, label: str) -> list[str]:
-    """Coerce an observe allow/deny value to a list of patterns.
+    """Coerce a ``source`` allow/deny value to a list of patterns.
 
     Stricter than the generic coercion, because these lists decide whose
     messages get recorded. The case that matters is a **mapping**:
@@ -1001,9 +1001,9 @@ def _strip_display_sigil(value: object) -> str:
 
 
 def _channel_source_schedule(value: object) -> str:
-    """Coerce an observe schedule, falling back to the default.
+    """Coerce a ``source.schedule``, falling back to the default.
 
-    An observation runner carries its own schedule, so an unusable value has
+    A channel source carries its own schedule, so an unusable value has
     no ``sync.<name>`` section to fall back to — it would leave the channel
     buffering with nothing ever draining it. Fall back loudly instead.
     """
@@ -1022,13 +1022,15 @@ def _channel_source_schedule(value: object) -> str:
 
 @dataclass
 class ChannelSourceConfig:
-    """Which conversations feed the inbox without the agent answering them.
+    """Which conversations feed the inbox, whoever the agent answers.
 
-    A separate grant from the access rules on purpose. "May this person drive
-    the agent?" and "may this room's traffic reach the agent's inbox?" are
-    different questions, and answering the second with the first either
-    blocks watching a channel the agent takes no orders from, or widens
-    command access to everything worth watching.
+    A separate grant from the access rules, and evaluated independently of
+    them. "May this person drive the agent?" and "may this room's traffic
+    reach the agent's inbox?" are different questions, so every message in a
+    shared conversation is put to both, and either, both, or neither may say
+    yes. Deriving one answer from the other would block watching a channel
+    the agent takes no orders from, or widen command access to everything
+    worth watching.
 
     Fail-closed twice over: off unless ``enabled``, and collecting nothing
     unless the allow list names something. An empty allow list here means
@@ -1062,14 +1064,15 @@ class ChannelSourceConfig:
     # 800-char condense threshold, so this would build an LLM client that
     # never gets used.
     condense: bool = False
-    # Cap on buffered rows per channel before the oldest are dropped.
+    # Cap on buffered rows per transport before the oldest are dropped. One
+    # budget for all of a transport's watched conversations, not one each.
     max_stored_messages: int = 10_000
-    # Telegram only. Its sole seen-but-unanswered path is a sender refused by
-    # the allowlist, so observing there means collecting from people
-    # explicitly denied the agent — a sharper edge than Slack's "in the room
-    # but not talking to me". Kept behind its own opt-in so that is a
-    # decision rather than a side effect of enabling observation.
-    include_unauthorized_senders: bool = False
+    # Whether a message the channel is answering live is also collected.
+    # Off by default so the two routes do not both act on one message: the
+    # agent has already seen it as a turn, and a copy in the inbox invites a
+    # second, later pass over its own conversation. Turn it on when the
+    # source is a record — an archive, a digest — rather than a work queue.
+    include_handled_messages: bool = False
 
     @classmethod
     @_coerced
@@ -1107,9 +1110,9 @@ class ChannelSourceConfig:
                 d.get("condense", False), False, label="source.condense",
             ),
             max_stored_messages=d.get("max_stored_messages", 10_000),
-            include_unauthorized_senders=_as_bool(
-                d.get("include_unauthorized_senders", False), False,
-                label="source.include_unauthorized_senders",
+            include_handled_messages=_as_bool(
+                d.get("include_handled_messages", False), False,
+                label="source.include_handled_messages",
             ),
         )
 
@@ -1127,7 +1130,7 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
-    # Chats to buffer to the inbox without answering — see ChannelSourceConfig.
+    # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
@@ -1256,8 +1259,8 @@ class SlackConfig:
     # None keeps safe defaults; [] disables commands. Host-wide and
     # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
     commands: list[str] | None = None
-    # Conversations to buffer to the inbox without answering. Its own grant,
-    # not derived from allow_channels — see ChannelSourceConfig.
+    # Channels whose traffic feeds the inbox. Its own grant, not derived
+    # from allow_channels — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod

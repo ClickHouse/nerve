@@ -1072,18 +1072,18 @@ An unauthorized `/start` gets a reply with the sender's numeric ID and
 pairing instructions (rate-limited); all other messages from unauthorized
 users are ignored.
 
-### Observation
+### Channel source
 
-Telegram can feed the source inbox the same way Slack does. **See
-[sources.md](sources.md#chat-channels-slack-telegram) for what the grant does
-and does not protect you from** — read it before enabling this, because on
-Telegram the collected population is everyone the allowlist *refused*.
+Group traffic can feed the source inbox, where `poll_source`, `read_source`,
+and the `messages` cron gate read it. Nothing here starts an agent turn. It
+is a grant of its own, independent of `allowed_users`: see
+[sources.md](sources.md#chat-channels-slack-telegram) for the routing rules
+and the threat model.
 
 ```yaml
 telegram:
   source:
     enabled: true
-    include_unauthorized_senders: true   # required; see below
     allow_chats: ["-1001234567890"]
     deny_senders: ["12345"]
     schedule: "*/5 * * * *"
@@ -1091,28 +1091,27 @@ telegram:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `telegram.source.enabled` | bool | `false` | Collect unanswered messages |
-| `telegram.source.include_unauthorized_senders` | bool | `false` | **Also required** — see below |
-| `telegram.source.allow_chats` | list[str] | `[]` | Chats to watch. **Empty means none** |
-| `telegram.source.deny_chats` | list[str] | `[]` | Never watch these |
+| `telegram.source.enabled` | bool | `false` | Feed the inbox from watched chats |
+| `telegram.source.allow_chats` | list[str] | `[]` | Chats to collect. **Empty means none** |
+| `telegram.source.deny_chats` | list[str] | `[]` | Never collect these |
 | `telegram.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `telegram.source.deny_senders` | list[str] | `[]` | Skip these senders |
+| `telegram.source.include_handled_messages` | bool | `false` | Also collect messages the bot answers |
 | `telegram.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `telegram.source.batch_size` | int | `50` | Records per drain |
 | `telegram.source.condense` | bool | `false` | LLM-condense long messages |
-| `telegram.source.max_stored_messages` | int | `10000` | Buffer cap per chat |
+| `telegram.source.max_stored_messages` | int | `10000` | Buffer cap for all Telegram chats together |
 
-Reaches the inbox as the source `telegram:observed`. The keys say *chats*
-rather than *channels* because on Telegram a channel is a specific entity
-type distinct from a group, and groups are mostly what you would watch.
+Reaches the inbox as the source `telegram:observed` — distinct from the
+`telegram` sync source, which is the Telethon pull from your *user* account.
+The keys say *chats* rather than *channels* because on Telegram a channel is
+a specific entity type distinct from a group.
 
-**`include_unauthorized_senders` is a second, deliberate opt-in.** Telegram
-has no "addressed to me" test — an authorized user's every message is
-answered — so the only seen-but-unanswered path is a sender
-`telegram.allowed_users` refused. Observing here therefore means collecting
-from people explicitly denied the agent, which is a sharper edge than Slack's
-"in the room but not talking to me". Enabling observation alone does nothing
-until you say so.
+**Setup: the bot must be able to see group messages.** By default BotFather
+enables privacy mode, under which a bot receives only commands and replies to
+itself. Make the bot a group administrator, or disable privacy mode via
+BotFather (`/setprivacy` → Disable), or this collects almost nothing however
+the grant is written.
 
 **What the lists match.** Only numeric IDs may grant.
 
@@ -1128,10 +1127,7 @@ movable, so treating either as grantable would let anyone create a group
 named `ops-room` and walk into a grant meant for someone else's. Both stay
 deny-eligible, where a spoofable name can only subtract access.
 
-**Private chats are never observed**, and **other bots are skipped** —
-Telegram delivers bot-authored messages to group handlers under bot-to-bot
-mode, and two agents filling each other's inboxes is no better than two
-agents answering each other.
+**Never collected:** private chats, the bot's own messages, and other bots.
 
 ## Slack
 
@@ -1255,16 +1251,13 @@ slack:
   Deny rules alone never enable access.
 - If a required name lookup fails or omits data, Nerve refuses the message.
 
-### Observation
+### Channel source
 
-Messages the bot sees but does not answer can be buffered into the source
-inbox, where `poll_source`, `read_source`, and the `messages` cron gate reach
-them like any other source. Nothing here starts an agent turn.
-
-**This is a separate grant from the access rules above, and what it does and
-does not protect you from is documented in
-[sources.md](sources.md#chat-channels-slack-telegram).** Read that before
-enabling it; the keys below are only the surface.
+Channel traffic can feed the source inbox, where `poll_source`, `read_source`,
+and the `messages` cron gate read it. Nothing here starts an agent turn. It is
+a grant of its own, independent of the access rules above: see
+[sources.md](sources.md#chat-channels-slack-telegram) for the routing rules
+and the threat model.
 
 ```yaml
 slack:
@@ -1275,20 +1268,21 @@ slack:
     deny_senders: ["*-bot"]
     schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
     batch_size: 50
-    max_stored_messages: 10000  # per channel, before the oldest are dropped
+    max_stored_messages: 10000  # all Slack channels together
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `slack.source.enabled` | bool | `false` | Collect unanswered messages |
-| `slack.source.allow_channels` | list[str] | `[]` | Channels to watch. **Empty means none** |
-| `slack.source.deny_channels` | list[str] | `[]` | Never watch these |
+| `slack.source.enabled` | bool | `false` | Feed the inbox from watched channels |
+| `slack.source.allow_channels` | list[str] | `[]` | Channels to collect. **Empty means none** |
+| `slack.source.deny_channels` | list[str] | `[]` | Never collect these |
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
+| `slack.source.include_handled_messages` | bool | `false` | Also collect messages the bot answers |
 | `slack.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |
-| `slack.source.max_stored_messages` | int | `10000` | Buffer cap per channel |
+| `slack.source.max_stored_messages` | int | `10000` | Buffer cap for all Slack channels together |
 
 Reaches the inbox as the source `slack:observed`.
 
@@ -1305,9 +1299,9 @@ a non-empty allow list must match.
 A display name is edited by its owner, so it can only ever deny — the handle
 and email are workspace-assigned, so they may grant.
 
-**Group DMs are never observed**, along with DMs. An MPIM arrives as
-`channel_type="mpim"` on a `G` id; a `G` whose type cannot be established is
-skipped rather than guessed at.
+**Never collected:** DMs, group DMs, the bot's own posts, other apps, and
+join/leave noise. A group DM arrives as `channel_type="mpim"` on a `G` id, and
+a `G` whose type cannot be established is skipped rather than guessed at.
 
 **Prefer IDs for a busy channel.** An ID matches with no API call; any name or
 glob costs one `conversations.info` / `users.info` per distinct ID per 10
@@ -1410,11 +1404,10 @@ Three differences from the inbound policy:
 
 Sources pull data from external services on a schedule. See [sources.md](sources.md) for full details.
 
-Chat channels can also feed the inbox, but they are configured on the channel
-rather than here, because what to watch is a property of the channel: see
-`slack.source.*` and `telegram.source.*` in the sections above. They are push,
-not pull — the messages already arrived over the channel's socket — so their
-`schedule` is a drain cadence, not a poll interval.
+Chat channels also feed the inbox, but are configured on the channel — see
+`slack.source.*` and `telegram.source.*` above. They are push, not pull: the
+messages already arrived over the channel's socket, so their `schedule` is a
+drain cadence rather than a poll interval.
 
 **Common fields** (available on all sources):
 

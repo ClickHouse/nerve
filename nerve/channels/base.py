@@ -69,14 +69,14 @@ class OutboundMessage:
 
 @dataclass
 class ObservedMessage:
-    """A message a channel saw but did not answer.
+    """A message a channel collected for the source inbox.
 
     Not an :class:`InboundMessage`: nothing here starts an agent turn. It is
     a record headed for the source inbox, where the existing consumer tools
     and cron gates can act on it — so the fields are the ones a reader needs
     to make sense of a line of chat, not the ones the router needs to route.
 
-    Names are left empty when unresolved. Observation runs on the dispatch
+    Names are left empty when unresolved. Collection runs on the dispatch
     path and a display name costs an API call, so the channel buffers raw IDs
     and a reader resolves them later — or does not, if nothing asked.
     """

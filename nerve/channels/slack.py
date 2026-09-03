@@ -954,19 +954,19 @@ class SlackChannel(BaseChannel):
 
     @property
     def observation(self) -> ObservationPolicy:
-        """The observation grant, rebuilt per read so reloads apply at once."""
-        observe = self.config.slack.source
+        """The source grant, rebuilt per read so reloads apply at once."""
+        source = self.config.slack.source
         return ObservationPolicy(
-            enabled=observe.enabled,
+            enabled=source.enabled,
             conversations=PatternGate(
                 "conversation",
-                allow=list(observe.allow_conversations),
-                deny=list(observe.deny_conversations),
+                allow=list(source.allow_conversations),
+                deny=list(source.deny_conversations),
             ),
             senders=PatternGate(
                 "sender",
-                allow=list(observe.allow_senders),
-                deny=list(observe.deny_senders),
+                allow=list(source.allow_senders),
+                deny=list(source.deny_senders),
             ),
         )
 
@@ -977,10 +977,18 @@ class SlackChannel(BaseChannel):
         user_id: str,
         ts: str,
         channel_key: str,
+        handled: bool = False,
     ) -> None:
-        """Buffer a message the agent is not answering, if policy allows it.
+        """Buffer a message for the source inbox, if the source grant allows.
 
-        Private conversations are never observed. A DM the agent declined to
+        Asked of every shared-channel message, whatever the live route
+        decided: the two grants are independent, so being answered neither
+        earns nor forfeits a place in the inbox. ``handled`` says the live
+        route accepted this message, and by default that is where it stops —
+        one message should not arrive twice. ``include_handled_messages``
+        turns the copy back on for a source meant as a record.
+
+        Private conversations are never a source. A DM the agent declined to
         answer is a refusal, and quietly filing it away is not what "we do not
         talk to you" led the sender to expect. That covers multi-person DMs,
         which arrive as ``channel_type="mpim"`` on a ``G`` id — checking only
@@ -989,6 +997,13 @@ class SlackChannel(BaseChannel):
         Raw IDs are buffered and names are resolved only when a pattern needs
         one, so watching a busy channel costs no Slack API call per message.
         """
+        # Cheapest gates first: this runs on every shared-channel message
+        # now, not only the ones the live route declined.
+        source = self.config.slack.source
+        if not source.enabled:
+            return
+        if handled and not source.include_handled_messages:
+            return
         policy = self.observation
         if not policy.active:
             return
@@ -1000,7 +1015,7 @@ class SlackChannel(BaseChannel):
             return
         # A `G` is either a legacy private channel or a multi-person DM, and
         # only the declared type distinguishes them cheaply. Without one,
-        # decline: observation is opt-in, so not recording something is
+        # decline: the source is opt-in, so not recording something is
         # always the safe outcome.
         if channel_id.startswith("G") and declared not in ("channel", "group"):
             logger.debug(
@@ -1050,7 +1065,7 @@ class SlackChannel(BaseChannel):
         await self.router.observe(
             observed,
             ttl_days=self.config.sync.message_ttl_days,
-            max_stored_messages=self.config.slack.source.max_stored_messages,
+            max_stored_messages=source.max_stored_messages,
         )
 
     async def _handle_message_event(self, event: dict[str, Any]) -> None:
@@ -1083,13 +1098,25 @@ class SlackChannel(BaseChannel):
         target = format_target(channel_id, thread_ts)
         channel_key = f"slack:{target}"
 
-        if not await self._should_answer(event, channel_type, channel_key):
-            # Not addressed to the agent — but possibly worth recording.
-            # This sits below the early returns above on purpose, so our own
-            # posts, join/leave noise, and other apps never reach the inbox.
-            await self._observe(event, channel_id, user_id, ts, channel_key)
-            return
-        if not await self._authorize(user_id, channel_id, channel_type):
+        # Two independent routes. Live handling needs the message to be
+        # addressed to the agent *and* its sender authorized; the source
+        # needs its own grant and neither of those. Both are asked, then
+        # `handled` reconciles them, so an addressed message from someone
+        # refused still reaches a source that asked for that channel.
+        #
+        # The authorize call stays behind the addressed check: it is the
+        # expensive one, and running it for every remark in a busy channel
+        # would cost a lookup and a refusal log line per message.
+        handled = (
+            await self._should_answer(event, channel_type, channel_key)
+            and await self._authorize(user_id, channel_id, channel_type)
+        )
+        # Sits below the early returns above on purpose, so our own posts,
+        # join/leave noise, and other apps never reach the inbox.
+        await self._observe(
+            event, channel_id, user_id, ts, channel_key, handled=handled,
+        )
+        if not handled:
             return
 
         text = slack_to_plain(event.get("text") or "", self._bot_user_id)
