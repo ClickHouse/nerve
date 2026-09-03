@@ -940,7 +940,7 @@ class AgentConfig:
         )
 
 
-_DEFAULT_OBSERVE_SCHEDULE = "*/5 * * * *"
+_DEFAULT_CHANNEL_SOURCE_SCHEDULE = "*/5 * * * *"
 
 
 def _pattern_list(value: object, label: str) -> list[str]:
@@ -961,7 +961,7 @@ def _pattern_list(value: object, label: str) -> list[str]:
         return []
     if isinstance(value, (dict, set)):
         logger.warning(
-            "observe.%s must be a list of patterns, got %s — discarding it. "
+            "source.%s must be a list of patterns, got %s — discarding it. "
             "A mapping's keys would read as patterns, so a rule that looks "
             "switched off would grant them.",
             label, type(value).__name__,
@@ -974,7 +974,7 @@ def _pattern_list(value: object, label: str) -> list[str]:
     for entry in value:
         if isinstance(entry, (dict, list, tuple, set)):
             logger.warning(
-                "observe.%s: ignoring non-scalar entry %r", label, entry,
+                "source.%s: ignoring non-scalar entry %r", label, entry,
             )
             continue
         text = str(entry).strip()
@@ -983,28 +983,28 @@ def _pattern_list(value: object, label: str) -> list[str]:
     return patterns
 
 
-def _observe_schedule(value: object) -> str:
+def _channel_source_schedule(value: object) -> str:
     """Coerce an observe schedule, falling back to the default.
 
     An observation runner carries its own schedule, so an unusable value has
     no ``sync.<name>`` section to fall back to — it would leave the channel
-    spooling with nothing ever draining it. Fall back loudly instead.
+    buffering with nothing ever draining it. Fall back loudly instead.
     """
     if value is None:
-        return _DEFAULT_OBSERVE_SCHEDULE
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
     if not isinstance(value, str) or not value.strip():
         logger.warning(
-            "observe.schedule must be a non-empty crontab or interval "
-            "string, got %r — falling back to %r. Left unset, the spool "
+            "source.schedule must be a non-empty crontab or interval "
+            "string, got %r — falling back to %r. Left unset, the buffer "
             "would fill with nothing draining it.",
-            value, _DEFAULT_OBSERVE_SCHEDULE,
+            value, _DEFAULT_CHANNEL_SOURCE_SCHEDULE,
         )
-        return _DEFAULT_OBSERVE_SCHEDULE
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
     return value.strip()
 
 
 @dataclass
-class ObserveConfig:
+class ChannelSourceConfig:
     """Which conversations feed the inbox without the agent answering them.
 
     A separate grant from the access rules on purpose. "May this person drive
@@ -1020,7 +1020,7 @@ class ObserveConfig:
     rather than a check that already ran a sender rule first.
 
     ``schedule`` is the drain cadence, not a poll: the messages are already
-    in the spool by the time it fires.
+    in the buffer by the time it fires.
     """
 
     enabled: bool = False
@@ -1028,14 +1028,14 @@ class ObserveConfig:
     deny_conversations: list[str] = field(default_factory=list)
     allow_senders: list[str] = field(default_factory=list)
     deny_senders: list[str] = field(default_factory=list)
-    schedule: str = _DEFAULT_OBSERVE_SCHEDULE
+    schedule: str = _DEFAULT_CHANNEL_SOURCE_SCHEDULE
     batch_size: int = 50
     # Off by default: most chat messages are shorter than the runner's
     # 800-char condense threshold, so this would build an LLM client that
     # never gets used.
     condense: bool = False
-    # Cap on spooled rows per channel before the oldest are dropped.
-    max_spool_rows: int = 10_000
+    # Cap on buffered rows per channel before the oldest are dropped.
+    max_stored_messages: int = 10_000
     # Telegram only. Its sole seen-but-unanswered path is a sender refused by
     # the allowlist, so observing there means collecting from people
     # explicitly denied the agent — a sharper edge than Slack's "in the room
@@ -1045,14 +1045,14 @@ class ObserveConfig:
 
     @classmethod
     @_coerced
-    def from_dict(cls, d: dict) -> ObserveConfig:
+    def from_dict(cls, d: dict) -> ChannelSourceConfig:
         enabled = _as_bool(
-            d.get("enabled", False), False, label="observe.enabled",
+            d.get("enabled", False), False, label="source.enabled",
         )
         allow = _pattern_list(d.get("allow_conversations"), "allow_conversations")
         if enabled and not allow:
             logger.warning(
-                "observe.enabled is set but observe.allow_conversations names "
+                "source.enabled is set but observe.allow_conversations names "
                 "nothing usable — nothing will be observed. List the "
                 "conversations to watch; an empty list is not a wildcard here.",
             )
@@ -1064,15 +1064,15 @@ class ObserveConfig:
             ),
             allow_senders=_pattern_list(d.get("allow_senders"), "allow_senders"),
             deny_senders=_pattern_list(d.get("deny_senders"), "deny_senders"),
-            schedule=_observe_schedule(d.get("schedule")),
+            schedule=_channel_source_schedule(d.get("schedule")),
             batch_size=d.get("batch_size", 50),
             condense=_as_bool(
-                d.get("condense", False), False, label="observe.condense",
+                d.get("condense", False), False, label="source.condense",
             ),
-            max_spool_rows=d.get("max_spool_rows", 10_000),
+            max_stored_messages=d.get("max_stored_messages", 10_000),
             include_unauthorized_senders=_as_bool(
                 d.get("include_unauthorized_senders", False), False,
-                label="observe.include_unauthorized_senders",
+                label="source.include_unauthorized_senders",
             ),
         )
 
@@ -1090,8 +1090,8 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
-    # Chats to spool to the inbox without answering — see ObserveConfig.
-    observe: ObserveConfig = field(default_factory=ObserveConfig)
+    # Chats to buffer to the inbox without answering — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
     @_coerced
@@ -1135,7 +1135,7 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
-            observe=ObserveConfig.from_dict(d.get("observe", {})),
+            source=ChannelSourceConfig.from_dict(d.get("source", {})),
         )
 
 
@@ -1217,9 +1217,9 @@ class SlackConfig:
     # None keeps safe defaults; [] disables commands. Host-wide and
     # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
     commands: list[str] | None = None
-    # Conversations to spool to the inbox without answering. Its own grant,
-    # not derived from allow_channels — see ObserveConfig.
-    observe: ObserveConfig = field(default_factory=ObserveConfig)
+    # Conversations to buffer to the inbox without answering. Its own grant,
+    # not derived from allow_channels — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
     @_coerced
@@ -1257,7 +1257,7 @@ class SlackConfig:
             ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
-            observe=ObserveConfig.from_dict(d.get("observe", {})),
+            source=ChannelSourceConfig.from_dict(d.get("source", {})),
         )
 
 

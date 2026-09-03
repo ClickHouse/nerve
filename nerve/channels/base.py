@@ -77,7 +77,7 @@ class ObservedMessage:
     to make sense of a line of chat, not the ones the router needs to route.
 
     Names are left empty when unresolved. Observation runs on the dispatch
-    path and a display name costs an API call, so the channel spools raw IDs
+    path and a display name costs an API call, so the channel buffers raw IDs
     and a reader resolves them later — or does not, if nothing asked.
     """
 

@@ -1,17 +1,17 @@
-"""Drain the channel observation spool into the source inbox.
+"""Drain the channel observation buffer into the source inbox.
 
 Chat arrives by push; sources are pull, cursor, and cron. Rather than teach
 the sources layer about sockets — or poll a chat API that already delivered
 the same messages, paying twice in latency and rate limit for a second
-cursor to disagree with — the channel spools what it saw and this source
-drains the spool.
+cursor to disagree with — the channel buffers what it saw and this source
+drains the buffer.
 
 Everything past that is inherited. :class:`~nerve.sources.runner.SourceRunner`
 supplies filtering, condensing, TTL, health, and cursor advance, and the
 existing ``poll_source`` / ``read_source`` tools and ``MessagesGate`` work
 against the result with no channel-specific code anywhere in this layer.
 
-The cursor is the spool's autoincrement id, which is why the spool exists:
+The cursor is the buffer's autoincrement id, which is why the buffer exists:
 a monotonic integer that survives pruning makes ``WHERE id > cursor``
 trivially correct, where a chat timestamp would not be.
 """
@@ -33,7 +33,7 @@ _SUMMARY_PREVIEW = 80
 
 
 class ChannelSource(Source):
-    """A source over one channel's observation spool.
+    """A source over one channel's observation buffer.
 
     The source name is ``<channel>:observed`` — compound like
     ``gmail:<account>``, and distinct on purpose. ``telegram`` is already a
@@ -51,10 +51,10 @@ class ChannelSource(Source):
         self._db = db
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
-        """Read spooled observations past *cursor*.
+        """Read buffered observations past *cursor*.
 
         A malformed cursor is treated as "start from the beginning" rather
-        than an error: the spool is TTL-bounded, so the worst case is
+        than an error: the buffer is TTL-bounded, so the worst case is
         re-reading a bounded backlog, and ``source_messages`` is keyed
         ``(source, id)``, which makes that a no-op instead of a duplicate.
         """
@@ -65,7 +65,7 @@ class ChannelSource(Source):
             )
         except Exception as e:
             logger.error(
-                "Channel source %s: reading the spool failed: %s",
+                "Channel source %s: reading the buffer failed: %s",
                 self.channel, e, exc_info=True,
             )
             return FetchResult(records=[], next_cursor=cursor)
@@ -88,7 +88,7 @@ class ChannelSource(Source):
 
 
 def _as_id(cursor: str | None) -> int:
-    """The spool id a cursor names, or 0."""
+    """The buffer id a cursor names, or 0."""
     if not cursor:
         return 0
     try:
@@ -101,7 +101,7 @@ def _as_id(cursor: str | None) -> int:
 def _to_record(
     channel: str, source_name: str, payload: dict[str, Any],
 ) -> SourceRecord:
-    """Turn one spooled :class:`ObservedMessage` payload into a record."""
+    """Turn one buffered :class:`ObservedMessage` payload into a record."""
     conversation_id = payload.get("conversation_id") or ""
     message_id = payload.get("message_id") or ""
     text = payload.get("text") or ""
@@ -112,7 +112,7 @@ def _to_record(
     if len(text) > _SUMMARY_PREVIEW:
         preview += "..."
 
-    # The record id is the transport's own address, not the spool id, so a
+    # The record id is the transport's own address, not the buffer id, so a
     # message observed twice collapses on the inbox's (source, id) key
     # instead of arriving twice.
     return SourceRecord(
