@@ -29,7 +29,9 @@ from nerve.config import (
 )
 from nerve.db.observations import _TRIM_EVERY
 from nerve.sources.channel import ChannelSource
+from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.registry import build_source_runners
+from nerve.sources.runner import _MAX_PASSES, SourceRunner
 
 pytestmark = pytest.mark.asyncio
 
@@ -368,7 +370,9 @@ class TestSlackObserve:
         channel._web.conversations_info.assert_not_awaited()
         channel._web.users_info.assert_not_awaited()
 
-    async def test_lowercase_ids_still_cost_no_api_call(self):
+    async def test_a_lowercase_id_matches_at_the_cost_of_a_lookup(self):
+        # Shaped like both an id and a name, so it is resolved rather than
+        # assumed. It still matches; it just costs the lookup.
         channel = _slack_channel(
             enabled=True,
             allow_conversations=["c0123abcd"],
@@ -378,8 +382,24 @@ class TestSlackObserve:
         await channel._handle_message_event(_event())
 
         channel.router.observe.assert_awaited_once()
-        channel._web.conversations_info.assert_not_awaited()
-        channel._web.users_info.assert_not_awaited()
+        channel._web.conversations_info.assert_awaited()
+        channel._web.users_info.assert_awaited()
+
+    async def test_a_name_shaped_like_an_id_can_still_deny(self):
+        # Read as an id, `buildstatus` is never matched against the resolved
+        # name and the deny rule silently stops working.
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+            deny_conversations=["buildstatus"],
+        )
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "buildstatus"}},
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel.router.observe.assert_not_awaited()
 
     async def test_a_name_policy_resolves_and_records_the_name(self):
         channel = _slack_channel(enabled=True, allow_conversations=["general"])
@@ -399,6 +419,61 @@ class TestSlackObserve:
 
         observed = channel.router.observe.await_args.args[0]
         assert observed.metadata["thread_ts"] == "1699999999.000000"
+
+    async def test_an_unwatched_channel_costs_no_sender_lookup(self):
+        # The conversation settles this without a lookup. Resolving the
+        # sender first would cost a users.info call for every message in
+        # every channel the bot sits in.
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["C0111AAAA"],
+            deny_senders=["spam-bot"],
+        )
+
+        await channel._handle_message_event(_event(channel="C0999BBBB"))
+
+        channel._web.users_info.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_watched_channel_still_resolves_the_sender(self):
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+            deny_senders=["spam-bot"],
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel._web.users_info.assert_awaited_once()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_an_upload_is_recorded_by_name_not_as_a_blank(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(
+            _event(text="", files=[{"name": "outage.pdf"}]),
+        )
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[File: outage.pdf]"
+
+    async def test_an_upload_with_a_comment_keeps_both(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(
+            _event(text="see attached", files=[{"name": "outage.pdf"}]),
+        )
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[File: outage.pdf]\n\nsee attached"
+
+    async def test_a_message_carrying_nothing_at_all_is_not_buffered(self):
+        # No text and no file name is nothing worth a row.
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(_event(text=""))
+
+        channel.router.observe.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------- #
@@ -429,7 +504,15 @@ def _tg_channel(**source_kwargs):
 def _tg_update(
     chat_id=-100123, chat_type="supergroup", title="ops-room",
     user_id=42, username="mallory", is_bot=False,
+    sticker=None, document=None, photo=None,
 ):
+    """A plain text group message, unless an attachment is asked for.
+
+    The attachment fields have to be set even when absent. A real
+    ``telegram.Message`` reports ``None`` for the ones it does not carry,
+    where a MagicMock hands back a truthy stand-in for every attribute. This
+    double would then look like a message carrying all three at once.
+    """
     update = MagicMock()
     update.effective_chat.id = chat_id
     update.effective_chat.type = chat_type
@@ -447,6 +530,9 @@ def _tg_update(
     update.message.date = None
     update.message.reply_to_message = None
     update.message.media_group_id = "album"
+    update.message.sticker = sticker
+    update.message.document = document
+    update.message.photo = photo
     return update
 
 
@@ -778,6 +864,46 @@ class TestTelegramObserve:
 
         channel.router.observe.assert_not_awaited()
 
+    async def test_a_sticker_is_recorded_by_its_emoji(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update(sticker=MagicMock(emoji="🔥"))
+        update.message.text = None
+
+        await channel._observe(update)
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[Sticker: 🔥]"
+
+    async def test_an_uncaptioned_photo_is_recorded_as_one(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update(photo=[MagicMock()])
+        update.message.text = None
+
+        await channel._observe(update)
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[Photo]"
+
+    async def test_a_document_keeps_its_caption(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update(document=MagicMock(file_name="runbook.md"))
+        update.message.text = None
+        update.message.caption = "the one we wrote in March"
+
+        await channel._observe(update)
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[File: runbook.md]\n\nthe one we wrote in March"
+
+    async def test_a_message_carrying_nothing_at_all_is_not_buffered(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update()
+        update.message.text = None
+
+        await channel._observe(update)
+
+        channel.router.observe.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------- #
 #  Router seam                                                            #
@@ -1055,6 +1181,98 @@ class TestChannelSource:
 
 
 # ---------------------------------------------------------------------- #
+#  Draining a backlog                                                     #
+# ---------------------------------------------------------------------- #
+
+
+async def _fill(db, count, channel="slack"):
+    for i in range(count):
+        await db.insert_channel_observation(
+            channel, "slack:C1",
+            {
+                "conversation_id": "C1",
+                "message_id": str(i),
+                "text": f"message {i}",
+            },
+        )
+
+
+class TestDrainKeepsUp:
+    """A backlog deeper than one batch has to drain, not accumulate.
+
+    A watched channel busier than ``batch_size`` per tick would otherwise
+    fall permanently behind, and the buffer's own row cap then trims from the
+    old end, dropping the messages the drain had not reached yet.
+    """
+
+    async def test_a_backlog_past_one_batch_drains_in_one_run(self, db):
+        await _fill(db, 120)
+        runner = SourceRunner(
+            source=ChannelSource("slack", db), db=db, batch_size=50,
+        )
+
+        result = await runner.run()
+
+        assert result.records_ingested == 120
+        assert await db.get_sync_cursor("slack:observed") == "120"
+
+    async def test_the_run_stops_at_the_pass_bound_and_keeps_its_place(self, db):
+        # A bound, not a promise to empty the buffer. The next run resumes
+        # exactly where this one stopped.
+        await _fill(db, _MAX_PASSES * 2 + 5)
+        runner = SourceRunner(
+            source=ChannelSource("slack", db), db=db, batch_size=2,
+        )
+
+        first = await runner.run()
+        second = await runner.run()
+
+        assert first.records_ingested == _MAX_PASSES * 2
+        assert second.records_ingested == 5
+
+    async def test_a_source_that_never_advances_does_not_spin(self, db):
+        # has_more with a standing cursor re-reads the same batch, for nothing.
+        stuck = MagicMock()
+        stuck.source_name = "stuck:observed"
+        stuck.fetch = AsyncMock(return_value=FetchResult(
+            records=[SourceRecord(
+                id="1", source="stuck:observed", record_type="x",
+                summary="s", content="c", timestamp="",
+            )],
+            next_cursor=None,
+            has_more=True,
+        ))
+        stuck.preprocess = AsyncMock(side_effect=lambda r: r)
+        runner = SourceRunner(source=stuck, db=db, batch_size=1)
+
+        await runner.run()
+
+        assert stuck.fetch.await_count == 1
+
+    async def test_a_failure_mid_backlog_keeps_what_landed(self, db):
+        await _fill(db, 60)
+        source = ChannelSource("slack", db)
+        real_fetch = source.fetch
+        calls = []
+
+        async def fetch(cursor, limit=100):
+            calls.append(cursor)
+            if len(calls) > 1:
+                raise RuntimeError("buffer went away")
+            return await real_fetch(cursor, limit=limit)
+
+        source.fetch = fetch
+        runner = SourceRunner(source=source, db=db, batch_size=50)
+
+        result = await runner.run()
+
+        assert result.error == "buffer went away"
+        assert result.records_ingested == 50
+        # The first batch's cursor is durable, so the retry resumes past it.
+        assert await db.get_sync_cursor("slack:observed") == "50"
+
+
+# ---------------------------------------------------------------------- #
 #  Registry wiring                                                        #
 # ---------------------------------------------------------------------- #
 
@@ -1214,6 +1432,19 @@ class TestConfig:
         cfg = SlackConfig.from_dict({"source": {"schedule": bad}})
 
         assert cfg.source.schedule == "*/5 * * * *"
+
+    @pytest.mark.parametrize("bad", [0, -1, 5])
+    def test_a_row_target_that_would_empty_the_buffer_is_refused(self, bad):
+        # Zero reads like "no limit" and means the opposite: the trim keeps
+        # no rows. SQLite reads a negative OFFSET as zero, so it does the same.
+        cfg = SlackConfig.from_dict({"source": {"max_stored_messages": bad}})
+
+        assert cfg.source.max_stored_messages == 100
+
+    def test_a_usable_row_target_is_kept(self):
+        cfg = SlackConfig.from_dict({"source": {"max_stored_messages": 250}})
+
+        assert cfg.source.max_stored_messages == 250
 
     def test_each_transport_uses_its_own_noun(self):
         # On Telegram a "channel" is a specific entity type distinct from a
