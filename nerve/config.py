@@ -860,6 +860,15 @@ class AgentConfig:
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
     cli_idle_timeout_seconds: int = 900
+    # Upper bound on ONE stream-json message read from the CLI subprocess (the
+    # Agent SDK's ``max_buffer_size``).  The SDK's own default is 1 MiB and a
+    # line over it is fatal to the SDK's reader, i.e. it aborts the whole turn.
+    # Image tool results are the routine offender: the Read tool ships the
+    # base64 image TWICE per line (content block + ``tool_use_result``) and
+    # re-encodes anything over 2000 px, so a 300 KB screenshot can become a
+    # 1.3 MB line.  The CLI caps one image at 5 MiB of base64 (~10.5 MB per
+    # line worst case); 64 MiB leaves headroom for document blocks.
+    cli_max_message_bytes: int = 64 * 1024 * 1024
     # When True, background sub-agents (the Agent tool with run_in_background, or
     # background Bash) get the SAME auto-approved tool permissions as foreground
     # agents, via a PreToolUse hook that pre-approves all non-interactive tools.
@@ -923,6 +932,9 @@ class AgentConfig:
                 d.get("cache_ttl_excluded_models")
             ),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
+            cli_max_message_bytes=int(
+                d.get("cli_max_message_bytes", 64 * 1024 * 1024)
+            ),
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),

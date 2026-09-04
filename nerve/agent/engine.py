@@ -2821,6 +2821,11 @@ class AgentEngine:
                 "Could not process image" in err_str
                 or "Could not process document" in err_str
             )
+            # One oversized stream-json line (a large image tool result is
+            # the routine case — see AgentConfig.cli_max_message_bytes) kills
+            # the SDK's reader and with it the turn.  The CLI transcript is
+            # intact, so the session stays resumable; say what happened.
+            is_oversized = "exceeded maximum buffer size" in err_str
             # Preserve resumability on crashed turns (parity with the old
             # any-message early capture): the terminal event never arrived,
             # so pull the native id off the live client. _finalize_turn's
@@ -2848,6 +2853,16 @@ class AgentEngine:
                 # Clear sdk_session_id so next turn creates a fresh CLI
                 await self.db.update_session_fields(
                     session_id, {"sdk_session_id": None},
+                )
+
+            if is_oversized:
+                limit_mib = self.config.agent.cli_max_message_bytes / (1024 * 1024)
+                error_msg = (
+                    f"Agent error: a tool result exceeded the CLI transport's "
+                    f"{limit_mib:.0f} MiB per-message limit (usually a large "
+                    "image read), so the turn was aborted. The session can "
+                    "continue; downscale the image or raise "
+                    "agent.cli_max_message_bytes."
                 )
 
             await broadcaster.broadcast_error(session_id, error_msg)
