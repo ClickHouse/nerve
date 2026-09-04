@@ -71,6 +71,14 @@ class ChannelRouter:
             channel.name, channel.capabilities,
         )
 
+    def unregister(self, channel: BaseChannel) -> bool:
+        """Remove *channel* only if it is still the registered instance."""
+        if self._channels.get(channel.name) is not channel:
+            return False
+        del self._channels[channel.name]
+        logger.info("Unregistered channel: %s", channel.name)
+        return True
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a registered channel by name."""
         return self._channels.get(name)
@@ -441,9 +449,27 @@ class ChannelRouter:
             limit=limit, offset=offset, current_id=current_id,
         )
 
+    async def list_conversation_sessions(
+        self, channel_key: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List live mappings for one exact conversation and its children."""
+        return await self.engine.db.list_channel_sessions_for_conversation(
+            channel_key,
+            limit=limit,
+            exclude_statuses=("archived", "stopped"),
+        )
+
+    async def stop_session(self, session_id: str) -> bool:
+        """Stop a session through the engine lifecycle boundary."""
+        return await self.engine.stop_session(session_id)
+
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
         return await self.engine.sessions.set_starred(session_id, starred)
+
+    async def toggle_session_starred(self, session_id: str) -> bool:
+        """Toggle a session's starred state."""
+        return await self.engine.sessions.toggle_starred(session_id)
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""

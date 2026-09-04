@@ -392,6 +392,40 @@ class SessionStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def list_channel_sessions_for_conversation(
+        self,
+        channel_key: str,
+        limit: int = 20,
+        exclude_statuses: tuple[str, ...] = (),
+    ) -> list[dict]:
+        """List one conversation mapping and delimiter-bounded descendants.
+
+        Channel keys are otherwise opaque. A descendant is explicitly a key
+        beginning with ``<channel_key>:``; arbitrary string prefixes such as
+        ``chat:1`` and ``chat:12`` never share a scope.
+        """
+        escaped = (
+            channel_key.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        sql = """
+            SELECT cs.channel_key, cs.session_id, cs.updated_at,
+                   s.title, s.status, s.starred
+            FROM channel_sessions cs
+            JOIN sessions s ON s.id = cs.session_id
+            WHERE (cs.channel_key = ? OR cs.channel_key LIKE ? ESCAPE '\\')
+        """
+        params: list = [channel_key, f"{escaped}:%"]
+        if exclude_statuses:
+            placeholders = ",".join("?" for _ in exclude_statuses)
+            sql += f" AND s.status NOT IN ({placeholders})"
+            params.extend(exclude_statuses)
+        sql += " ORDER BY cs.updated_at DESC LIMIT ?"
+        params.append(limit)
+        async with self.db.execute(sql, tuple(params)) as cursor:
+            return [dict(row) async for row in cursor]
+
     async def set_channel_session(self, channel_key: str, session_id: str) -> None:
         """Persist a channel-to-session mapping."""
         now = datetime.now(timezone.utc).isoformat()
