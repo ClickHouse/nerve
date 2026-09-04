@@ -852,8 +852,16 @@ class TelegramChannel(BaseChannel):
         msg = await self._app.bot.send_message(chat_id=chat_id, text="⏳")
         return str(msg.message_id)
 
-    async def edit_message(self, target: str, message_id: str, text: str) -> None:
-        """Edit a previously sent message (for streaming updates)."""
+    async def edit_message(
+        self, target: str, message_id: str, text: str,
+        *, throttle: bool = False,
+    ) -> None:
+        """Edit a previously sent message (for streaming updates).
+
+        Telegram limits edits per chat and one chat is one session here, so
+        the caller's per-adapter interval already covers it and ``throttle``
+        needs no extra shedding.
+        """
         if self._app is None:
             return
         chat_id = int(target)

@@ -21,23 +21,13 @@
 #
 # Everything below is commented out; uncomment and edit what you want to share.
 
-# Remote-only, read-only mode. When true, config comes ONLY from this workspace
-# + ${ENV_VAR}; machine config.yaml/config.local.yaml overrides are ignored and
-# runtime edits are blocked. Secrets (incl. auth.jwt_secret) have to be supplied
-# via ${ENV_VAR} here or the environment — config.local.yaml is not read when
-# locked, so a secret that lives only there stops being read.
-# May be an env reference (lockdown: ${NERVE_LOCKDOWN}) so one repo can serve a
-# fleet where only some boxes are locked; a value that is neither true nor false —
-# an unset or blank variable included — is refused rather than read as unlocked,
-# so spell a default-unlocked box ${NERVE_LOCKDOWN:-false}.
-# NERVE_LOCKDOWN can also be set in the environment directly: put it (with
-# NERVE_WORKSPACE beside it) in the service definition and the box is locked
-# whatever any file says, which is what stops a machine-local edit from repointing
-# `workspace:` at a tree that isn't locked. Setting it here alone does not survive
-# that.
-# Anything `nerve init` writes to config.yaml has to be restated here to survive
-# locking: notably telegram.enabled, which a locked instance treats as OFF unless
-# this file says otherwise.
+# Lockdown reads only this workspace plus env references; machine config and
+# runtime edits are ignored. Supply secrets as ${ENV_VAR}.
+# Set NERVE_LOCKDOWN with NERVE_WORKSPACE in the service to prevent local
+# repointing; setting lockdown only here cannot. Invalid or unset references
+# fail closed, so use ${NERVE_LOCKDOWN:-false} for intentionally unlocked boxes.
+# Re-state machine-local flags such as telegram.enabled and slack.enabled; they
+# default off because machine config is ignored.
 # lockdown: true
 
 # timezone: America/New_York

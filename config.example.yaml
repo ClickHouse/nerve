@@ -110,6 +110,40 @@ telegram:
   # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
 
+slack:
+  # Omitting this key leaves Slack off until both tokens below are set, so an
+  # install that does not use Slack never has to say so. Set it to true to be
+  # told about a missing token instead of having the channel stay down.
+  enabled: false
+  # Socket Mode needs both tokens in config.local.yaml; no public URL is needed:
+  #   bot_token: xoxb-…   (OAuth & Permissions → Bot User OAuth Token)
+  #   app_token: xapp-…   (Basic Information → App-Level Tokens, connections:write)
+  #
+  # Access patterns match Slack IDs or names, case-insensitively with globs.
+  # Deny wins, DMs require explicit opt-in, and no allow grant refuses everyone.
+  # Grant users by member ID, handle, or email only: a member edits their own
+  # display and full name, so allow_users never matches those.
+  # allow_users: ["U0123ABC", "alex.soffronow"]
+  # deny_users: ["*-bot"]
+  allow_direct_messages: false
+  # allow_channels: ["eng-*", "C0456DEF"]
+  # deny_channels: ["*-random", "*-social"]
+  #
+  # Every shared-channel thread is its own session; DMs use one conversation.
+  #
+  # How a reply appears while the agent works. "partial" posts a placeholder
+  # and edits it as tokens and tool labels arrive, so a long turn shows
+  # progress; the finished reply is then posted as a new message. "full" waits
+  # and posts once. Prefer "full" in a busy channel, where the placeholder is
+  # visible to everyone, or where the edits crowd Slack's rate limit.
+  stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  # `/nerve` defaults to new, stop, star, unstar, and reply.
+  #   omitted  — new, stop, star, unstar, reply
+  #   []       — no slash commands at all
+  #   [all]    — everything, including doctor and restart
+  # doctor/restart affect the host; sessions lists other channels. Opt in.
+  # commands: [sessions, new, stop, reply]
+
 # Quiet hours (local timezone)
 quiet_start: "02:00"
 quiet_end: "12:00"

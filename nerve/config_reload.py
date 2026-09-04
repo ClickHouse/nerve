@@ -1,39 +1,11 @@
-"""Unified config hot-reload.
+"""Unified best-effort config hot reload.
 
-A single entry point that re-reads config from disk and reloads every subsystem
-that supports it without a restart: the process config object (so lockdown and
-settings changes engage), the long-lived services that captured that object at
-start-up, cron jobs, cron sources, MCP servers, and skills. Best-effort per
-subsystem — one failure is reported but does not abort the rest, because
-refusing a valid cron edit over an unrelated typo in ``settings.yaml`` is the
-worse outcome. Which subsystems fell over is reported, never inferred: see
-:func:`reload_failures`.
+``reload_all`` replaces process config and refreshes services, cron sources,
+MCP servers, and skills. It reports each failure without aborting the others.
+Reloads happen only through the CLI/API or workspace sync.
 
-Nothing reloads on its own. A reload happens when an operator asks for one
-(``nerve reload`` / ``POST /api/config/reload``) or when a workspace sync merges a
-change. Editing a config file on the box does not apply itself.
-
-Restart-only (NOT reloaded here): the gateway socket (host/port/SSL), the
-Telegram bot's token and allow-list, the MCP endpoint (including the
-``auth.jwt_secret`` it checks ``/mcp/v1`` against, which the web gateway reads
-per request), Langfuse, the memory bridges, the Codex thread-sync service
-(``sync.codex.*`` — a different service from the cron sources under ``sync.*``,
-and the one place those two names diverge), anything a service derived from
-config at construction, and a background loop that was never started because its
-feature was off. The hot-reload table in ``docs/config.md`` is the
-operator-facing list of exactly what a reload covers; keep the two in step.
-
-:func:`restart_required` diffs the old and new config over
-:data:`_RESTART_ONLY_PATHS` and records what changed in the summary. Without it
-the summary reports only what was applied, which a caller cannot distinguish from
-"nothing needed applying". ``gateway.host``/``port`` are the case that matters:
-they live in the tracked settings, so the change can arrive by workspace sync.
-
-It reports; it does not gate. A setting whose only protection is a line in that
-report is a setting the daemon is not applying — which is tolerable for a bound
-socket and not for a policy that was tightened. Where the holder can resolve
-config per read instead, that is the fix, and the path leaves this list: see
-:func:`_repoint`.
+``_RESTART_ONLY_PATHS`` tracks settings that cannot apply live and must match
+the operator table in ``docs/config.md``.
 """
 
 from __future__ import annotations
@@ -105,6 +77,8 @@ _SECRET_PATHS = frozenset({
     "auth.jwt_secret",
     "langfuse.public_key",
     "langfuse.secret_key",
+    "slack.app_token",
+    "slack.bot_token",
     "telegram.bot_token",
 })
 
@@ -271,6 +245,21 @@ def _repoint(new_config, engine, cron_service) -> list[str]:
     return problems
 
 
+async def _reconcile_slack(new_config, engine) -> str | None:
+    """Ask the installed Slack lifecycle owner to reconcile this generation."""
+    if engine is None:
+        return None
+    try:
+        runtime = engine.get_channel_runtime("slack")
+        if runtime is None:
+            return None
+        return await runtime.reconcile(new_config)
+    except Exception as e:  # noqa: BLE001 — report the subsystem, continue reload
+        detail = str(e) or type(e).__name__
+        logger.warning("Slack reload failed: %s", detail)
+        return f"{_ERROR_PREFIX}{detail}"
+
+
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:
     """Re-read config and hot-reload all reloadable subsystems.
 
@@ -314,6 +303,9 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
             # running the new config in some places and the old one in others,
             # which is the state worth shouting about.
             summary["services"] = f"{_ERROR_PREFIX}{'; '.join(stale)}"
+        slack = await _reconcile_slack(new_config, engine)
+        if slack is not None:
+            summary["slack"] = slack
 
     # 2. Cron jobs + sources.
     if cron_service is not None:

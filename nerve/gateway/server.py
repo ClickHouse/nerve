@@ -6,10 +6,8 @@ Single entry point for the entire Nerve gateway.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import ssl
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +15,6 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from nerve import paths
@@ -343,6 +340,21 @@ async def lifespan(app: FastAPI):
         _engine.register_channel(telegram_channel)
         await telegram_channel.start()
         logger.info("Telegram bot started")
+
+    # Install the lifecycle owner even when Slack starts disabled, so a later
+    # reload can enable it without rebuilding gateway state.
+    from nerve.channels.slack_runtime import SlackRuntime
+
+    slack_runtime = SlackRuntime(_engine.router, notification_service)
+    _engine.register_channel_runtime("slack", slack_runtime)
+    try:
+        slack_outcome = await slack_runtime.reconcile(config)
+        if slack_outcome:
+            logger.info("Slack bot %s", slack_outcome)
+    except Exception as e:
+        # Slack is optional; its runtime leaves a failed candidate absent and
+        # retryable while the web UI and other channels continue starting.
+        logger.error("Slack bot failed to start: %s", e, exc_info=True)
 
     # Start cron service
     global _cron_service
@@ -675,12 +687,13 @@ async def lifespan(app: FastAPI):
             logger.warning("External-agents sync shutdown raised: %s", e)
         _external_agents_sync = None
 
-    # Shutdown: stop telegram FIRST, before cancelling background tasks.
-    # Background task cancellation propagates through anyio cancel scopes
-    # (Starlette runs the lifespan in an anyio context), which can kill
-    # the telegram polling task before we get a chance to stop it cleanly.
+    # Shutdown: stop the chat channels FIRST, before cancelling background
+    # tasks. Background task cancellation propagates through anyio cancel
+    # scopes (Starlette runs the lifespan in an anyio context), which can kill
+    # the polling and socket tasks before we get a chance to stop them cleanly.
     if telegram_channel:
         await telegram_channel.stop()
+    await slack_runtime.shutdown()
     if ws_sync_task:
         # Exit through the loop's own stop path rather than cancelling it where
         # it stands: a cycle interrupted between the merge and the reload leaves

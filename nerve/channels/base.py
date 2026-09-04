@@ -125,8 +125,15 @@ class BaseChannel(abc.ABC):
         """
         return None
 
-    async def edit_message(self, target: str, message_id: str, text: str) -> None:
+    async def edit_message(
+        self, target: str, message_id: str, text: str,
+        *, throttle: bool = False,
+    ) -> None:
         """Edit a previously sent message (for streaming).
+
+        ``throttle`` marks an edit the caller can afford to lose, so a
+        channel may drop it to stay inside a per-conversation rate limit.
+        A final or recovery edit leaves it False and always goes out.
 
         Only called if channel declares STREAMING capability and
         constraints.supports_message_edit is True.

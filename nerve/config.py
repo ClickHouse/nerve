@@ -999,6 +999,113 @@ class TelegramConfig:
         )
 
 
+# Every `/nerve` subcommand, and the set enabled when the operator says
+# nothing. Kept here rather than in the channel so config validation can
+# name them without importing the transport.
+SLACK_ALL_COMMANDS: tuple[str, ...] = (
+    "sessions", "new", "stop", "star", "unstar", "reply", "doctor", "restart",
+)
+# `sessions` is absent on purpose: it reaches every interactive session in the
+# instance, and Slack has no ownership model yet to narrow that list. Replies
+# are safe by default because notification lookup is delivery-target scoped.
+SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
+    "new", "stop", "star", "unstar", "reply",
+)
+
+
+def _slack_commands(raw: object) -> list[str] | None:
+    """Normalize ``slack.commands``.
+
+    Absence keeps the defaults, an empty list disables commands, and a sole
+    ``all`` or ``*`` enables every command. Unknown names are warned and dropped.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "slack.commands must be a list — ignoring %r and keeping the "
+            "default set", raw,
+        )
+        return None
+
+    names = [str(v).strip().lstrip("/").lower() for v in raw if str(v).strip()]
+    if names == ["all"] or names == ["*"]:
+        return list(SLACK_ALL_COMMANDS)
+
+    kept, unknown = [], []
+    for name in names:
+        (kept if name in SLACK_ALL_COMMANDS else unknown).append(name)
+    if unknown:
+        logger.warning(
+            "slack.commands has no such subcommand(s): %s — known ones are %s",
+            ", ".join(sorted(set(unknown))), ", ".join(SLACK_ALL_COMMANDS),
+        )
+    return kept
+
+
+@dataclass
+class SlackConfig:
+    """Slack Socket Mode and access settings.
+
+    Direct messages require explicit opt-in. Sender and channel patterns match
+    Slack IDs or resolved names using :mod:`nerve.channels.access` semantics.
+    """
+
+    # Off until the workspace is set up. Slack reaches an installation that
+    # never asked for it, so an absent or credential-less section resolves to
+    # disabled and `nerve doctor` stays quiet about a channel nobody uses.
+    enabled: bool = False
+    bot_token: str = ""      # xoxb-… — Web API calls
+    app_token: str = ""      # xapp-… — Socket Mode connection
+    allow_users: list[str] = field(default_factory=list)
+    deny_users: list[str] = field(default_factory=list)
+    # Direct messages are a distinct conversation kind, not a channel name.
+    # Keep them opt-in even when a sender allow-list grants access elsewhere.
+    allow_direct_messages: bool = False
+    allow_channels: list[str] = field(default_factory=list)
+    deny_channels: list[str] = field(default_factory=list)
+    stream_mode: str = "partial"
+    # None keeps safe defaults; [] disables commands. Host-wide and
+    # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
+    commands: list[str] | None = None
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict, locked: bool = False) -> SlackConfig:
+        stream_mode = d.get("stream_mode", "partial")
+        if stream_mode not in ("partial", "full"):
+            logger.warning(
+                "slack.stream_mode %r is not one of ('partial', 'full') — "
+                "falling back to 'partial'",
+                stream_mode,
+            )
+            stream_mode = "partial"
+        bot_token = d.get("bot_token", "")
+        app_token = d.get("app_token", "")
+        # Explicit `enabled` wins. Otherwise both tokens enable Slack, except
+        # under lockdown where the machine-local opt-in is unavailable. Invalid
+        # boolean values fail closed.
+        enabled = (
+            _as_bool(d["enabled"], False, label="SlackConfig.enabled")
+            if "enabled" in d
+            else bool(bot_token and app_token) and not locked
+        )
+        return cls(
+            enabled=enabled,
+            bot_token=bot_token,
+            app_token=app_token,
+            allow_users=d.get("allow_users") or [],
+            deny_users=d.get("deny_users") or [],
+            allow_direct_messages=d.get("allow_direct_messages", False),
+            allow_channels=d.get("allow_channels") or [],
+            deny_channels=d.get("deny_channels") or [],
+            stream_mode=stream_mode,
+            commands=_slack_commands(d.get("commands")),
+        )
+
+
 @dataclass
 class TelegramSyncConfig:
     enabled: bool = True
@@ -2600,6 +2707,7 @@ class NerveConfig:
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    slack: SlackConfig = field(default_factory=SlackConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
@@ -2828,6 +2936,7 @@ class NerveConfig:
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
+            slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),
