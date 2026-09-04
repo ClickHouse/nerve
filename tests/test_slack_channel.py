@@ -1063,11 +1063,25 @@ class TestIdPredicate:
         assert is_slack_id("C0456DEF")
         assert is_slack_id("W01ABCDEFGH")
 
+    def test_a_lowercase_id_is_not_treated_as_an_id(self):
+        # Not a typo. `c0456def` is a legal channel name, so a lowercase
+        # pattern is ambiguous and only a lookup settles it. Matching stays
+        # case-insensitive, so a lowercase id still matches.
+        assert not is_slack_id("u0123abc")
+        assert not is_slack_id("c0456def")
+
     def test_an_uppercase_name_is_not_an_id(self):
         # This is the bug: a case heuristic read ALICE as an id, skipped the
         # users.info lookup, and let deny_users=["ALICE"] admit her.
         assert not is_slack_id("ALICE")
         assert not is_slack_id("ENGINEERING")
+
+    def test_a_lowercase_name_shaped_like_an_id_is_not_an_id(self):
+        # The same bug in the direction the eye misses. Ordinary names, but
+        # read as ids they skip the lookup and deny_users admits them.
+        assert not is_slack_id("beckyjones")
+        assert not is_slack_id("buildstatus")
+        assert not is_slack_id("dataplatform")
 
     def test_a_handle_or_email_is_not_an_id(self):
         assert not is_slack_id("alex.soffronow")
@@ -1093,6 +1107,38 @@ class TestGuardrailRegressions:
         )
         assert not await channel._authorize("U999", "C0456DEF", "channel")
         channel._web.users_info.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_lowercase_deny_name_still_forces_a_lookup(self):
+        # Read as an id, this handle is never matched against the resolved
+        # name and the deny rule admits her.
+        channel = _channel(deny_users=["beckyjones"], allow_channels=["C0456DEF"])
+        channel._web.users_info = AsyncMock(
+            return_value={
+                "user": {
+                    "id": "U999",
+                    "name": "beckyjones",
+                    "profile": {"email": "becky@x.com"},
+                },
+            }
+        )
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"id": "C0456DEF", "name": "eng"}}
+        )
+        assert not await channel._authorize("U999", "C0456DEF", "channel")
+        channel._web.users_info.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_lowercase_id_grants_without_needing_its_name(self):
+        # The other half: a pasted lowercase id still grants, via the lookup.
+        channel = _channel(allow_users=["u0123abc"], allow_channels=["c0456def"])
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"id": "U0123ABC", "name": "alice", "profile": {}}}
+        )
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"id": "C0456DEF", "name": "eng"}}
+        )
+        assert await channel._authorize("U0123ABC", "C0456DEF", "channel")
 
     @pytest.mark.asyncio
     async def test_a_missing_email_refuses_an_email_deny_rule(self):

@@ -940,6 +940,203 @@ class AgentConfig:
         )
 
 
+_DEFAULT_CHANNEL_SOURCE_SCHEDULE = "*/5 * * * *"
+
+
+def _pattern_list(value: object, label: str) -> list[str]:
+    """Coerce a ``source`` allow/deny value to a list of patterns.
+
+    Stricter than the generic coercion, because these lists decide whose
+    messages get recorded. The case that matters is a **mapping**:
+    ``allow_conversations: {"*": false}`` survives the general coercion
+    unchanged, and ``list()`` of it yields its *keys* — so a rule that reads
+    like a disabled wildcard silently becomes one that grants everything.
+    A mapping is discarded rather than salvaged.
+
+    A bare scalar still wraps to a single pattern. That is how a ``${VAR}``
+    env reference arrives, and dropping it would break the documented way to
+    configure a list field from the environment.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (dict, set)):
+        logger.warning(
+            "source.%s must be a list of patterns, got %s — discarding it. "
+            "A mapping's keys would read as patterns, so a rule that looks "
+            "switched off would grant them.",
+            label, type(value).__name__,
+        )
+        return []
+    if not isinstance(value, (list, tuple)):
+        text = _strip_display_sigil(value)
+        return [text] if text else []
+    patterns: list[str] = []
+    for entry in value:
+        if isinstance(entry, (dict, list, tuple, set)):
+            logger.warning(
+                "source.%s: ignoring non-scalar entry %r", label, entry,
+            )
+            continue
+        text = _strip_display_sigil(entry)
+        if text:
+            patterns.append(text)
+    return patterns
+
+
+def _strip_display_sigil(value: object) -> str:
+    """Drop a leading ``#`` or ``@`` from a pattern.
+
+    Chat UIs render a channel as ``#eng-backend`` and a person as ``@alice``,
+    so that is what an operator copies — but the API names carry no sigil and
+    matching is literal. Left alone, ``#eng-backend`` matches nothing, which
+    on an allow list means an inbox that stays empty with no error to explain
+    why.
+
+    Unambiguous to strip: neither platform lets a channel, chat, or user name
+    begin with ``#`` or ``@``. A ``@`` *inside* the value is untouched, so an
+    email pattern like ``*@example.com`` still works.
+    """
+    text = str(value).strip()
+    return text[1:].strip() if text[:1] in "#@" else text
+
+
+_MIN_STORED_MESSAGES = 100
+
+
+def _stored_message_target(value: object, default: int) -> int:
+    """Coerce a ``source.max_stored_messages``, holding it above a floor.
+
+    Zero is the case to catch: it reads like "no limit" and tells the trim to
+    keep no rows, emptying the buffer before the drain reads it. A negative
+    does the same, since SQLite reads a negative OFFSET as zero.
+    """
+    target = _lenient_int(value, default, label="source.max_stored_messages")
+    if target >= _MIN_STORED_MESSAGES:
+        return target
+    logger.warning(
+        "source.max_stored_messages is %r, which would trim the buffer to "
+        "nothing before the drain reads it. Using %d instead.",
+        value, _MIN_STORED_MESSAGES,
+    )
+    return _MIN_STORED_MESSAGES
+
+
+def _channel_source_schedule(value: object) -> str:
+    """Coerce a ``source.schedule``, falling back to the default.
+
+    A channel source carries its own schedule, so an unusable value has
+    no ``sync.<name>`` section to fall back to — it would leave the channel
+    buffering with nothing ever draining it. Fall back loudly instead.
+    """
+    if value is None:
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    if not isinstance(value, str) or not value.strip():
+        logger.warning(
+            "source.schedule must be a non-empty crontab or interval "
+            "string, got %r — falling back to %r. Left unset, the buffer "
+            "would fill with nothing draining it.",
+            value, _DEFAULT_CHANNEL_SOURCE_SCHEDULE,
+        )
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    return value.strip()
+
+
+@dataclass
+class ChannelSourceConfig:
+    """Which conversations feed the inbox, independent of live routing.
+
+    A separate grant from the access rules, and evaluated independently of
+    them. "May this person drive the agent?" and "may this room's traffic
+    reach the agent's inbox?" are different questions. A message can qualify
+    for the live route, the source route, both, or neither. Deriving one answer
+    from the other would block watching a channel the agent takes no orders
+    from, or widen command access to everything worth watching.
+
+    Fail-closed twice over: off unless ``enabled``, and collecting nothing
+    unless the allow list names something. An empty allow list here means
+    "nothing", not "everything" — the opposite of the access gates, because
+    this one is a standing grant to record other people's messages rather
+    than a check that already ran a sender rule first.
+
+    The fields are transport-neutral, but the YAML keys are not: each channel
+    passes the ``subject`` its own users would recognise, so Slack reads
+    ``allow_channels`` and Telegram reads ``allow_chats``. Sharing one noun
+    was worse than it looks — on Telegram a "channel" is a specific entity
+    type distinct from a group, so ``allow_channels`` there would name the
+    wrong thing, and "conversations" named nothing anyone could act on.
+
+    What actually matches is per transport and documented in ``config.md``;
+    the short version is that a platform id always works, and a name works
+    only where the platform, not the subject, controls it.
+
+    ``schedule`` is the drain cadence, not a poll: the messages are already
+    in the buffer by the time it fires.
+    """
+
+    enabled: bool = False
+    allow_conversations: list[str] = field(default_factory=list)
+    deny_conversations: list[str] = field(default_factory=list)
+    allow_senders: list[str] = field(default_factory=list)
+    deny_senders: list[str] = field(default_factory=list)
+    schedule: str = _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    batch_size: int = 50
+    # Off by default: most chat messages are shorter than the runner's
+    # 800-char condense threshold, so this would build an LLM client that
+    # never gets used.
+    condense: bool = False
+    # Trim target per transport, checked every 100 writes. One budget for all
+    # of a transport's watched conversations, not one each.
+    max_stored_messages: int = 10_000
+    # Whether a message accepted for live routing is also collected.
+    # Off by default. Turn it on only when source consumers should receive the
+    # same message later, such as when the source is an archive or digest.
+    include_handled_messages: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(
+        cls, d: dict, *, subject: str = "conversations",
+    ) -> ChannelSourceConfig:
+        """Parse a ``<channel>.source`` block.
+
+        ``subject`` is the noun this transport calls the thing being watched
+        — ``"channels"`` for Slack, ``"chats"`` for Telegram — and names both
+        the YAML keys and every warning, so an operator is told about the key
+        they actually wrote.
+        """
+        enabled = _as_bool(
+            d.get("enabled", False), False, label="source.enabled",
+        )
+        allow_key, deny_key = f"allow_{subject}", f"deny_{subject}"
+        allow = _pattern_list(d.get(allow_key), allow_key)
+        if enabled and not allow:
+            logger.warning(
+                "source.enabled is set but source.%s names nothing usable — "
+                "nothing will be collected. List the %s to watch; an empty "
+                "list is not a wildcard here.",
+                allow_key, subject,
+            )
+        return cls(
+            enabled=enabled,
+            allow_conversations=allow,
+            deny_conversations=_pattern_list(d.get(deny_key), deny_key),
+            allow_senders=_pattern_list(d.get("allow_senders"), "allow_senders"),
+            deny_senders=_pattern_list(d.get("deny_senders"), "deny_senders"),
+            schedule=_channel_source_schedule(d.get("schedule")),
+            batch_size=d.get("batch_size", 50),
+            condense=_as_bool(
+                d.get("condense", False), False, label="source.condense",
+            ),
+            max_stored_messages=_stored_message_target(
+                d.get("max_stored_messages"), 10_000,
+            ),
+            include_handled_messages=_as_bool(
+                d.get("include_handled_messages", False), False,
+                label="source.include_handled_messages",
+            ),
+        )
+
+
 @dataclass
 class TelegramConfig:
     enabled: bool = True
@@ -953,6 +1150,8 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
+    # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
     @_coerced
@@ -996,6 +1195,9 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="chats",
+            ),
         )
 
 
@@ -1077,6 +1279,9 @@ class SlackConfig:
     # None keeps safe defaults; [] disables commands. Host-wide and
     # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
     commands: list[str] | None = None
+    # Channels whose traffic feeds the inbox. Its own grant, not derived
+    # from allow_channels — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
     @_coerced
@@ -1114,6 +1319,9 @@ class SlackConfig:
             ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="channels",
+            ),
         )
 
 

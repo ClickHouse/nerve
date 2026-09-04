@@ -39,7 +39,14 @@ import time
 import pytest
 import pytest_asyncio
 
-from nerve.channels.slack import format_target
+from types import SimpleNamespace
+
+from nerve.channels.router import ChannelRouter
+from nerve.channels.slack import format_target, slack_ts_to_iso
+from nerve.config import ChannelSourceConfig
+from nerve.db import Database
+from nerve.sources.channel import ChannelSource
+from nerve.sources.runner import SourceRunner
 from tests.slack_live import (
     BOT_TOKEN,
     EVENT_TIMEOUT,
@@ -47,6 +54,7 @@ from tests.slack_live import (
     USER_TOKEN,
     Posted,
     RecordingRouter,
+    REFUSAL_SETTLE_SECONDS,
     SOCKET_DRAIN_SECONDS,
     build_channel,
     direct_message_guardrails,
@@ -167,6 +175,11 @@ async def live_channel(_connected_channel):
             ("commands", None),
         ):
             setattr(config.slack, field, slack_kwargs.get(field, default))
+        # The source grant is reset like the rest: left standing it would
+        # collect the next test's traffic under this test's policy.
+        config.slack.source = slack_kwargs.get(
+            "source", ChannelSourceConfig(),
+        )
         channel.apply_config(config)
         channel.router = router
         router.channel = channel
@@ -441,3 +454,249 @@ class TestReconnectWatchdog:
             # Let Slack drop this connection before module fixture cleanup
             # relies on the shared socket receiving every deletion event.
             await asyncio.sleep(SOCKET_DRAIN_SECONDS)
+
+
+# ---------------------------------------------------------------------- #
+#  Channel source — what a watched conversation feeds the inbox           #
+# ---------------------------------------------------------------------- #
+
+
+@requires_inbound
+class TestChannelSourceCollectsRealTraffic:
+    """The source gate, driven by messages a real person actually sent.
+
+    The unit tests hand ``_observe`` an event dict the test wrote, so they
+    settle the policy branches and nothing about the events Slack sends. The
+    interesting claims here are that ordinary chatter carries the fields the
+    payload is built from, that ``channel_type`` on a real public-channel
+    message clears the DM guard, and that the live route and the source route
+    really are decided independently of one another.
+    """
+
+    async def test_ordinary_chatter_is_collected_but_not_answered(
+        self, live_channel, human, posted,
+    ):
+        marker = unique_marker()
+        auth = await human.auth_test()
+        router = RecordingRouter()
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True, allow_conversations=[TEST_CHANNEL],
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL, text=f"team chatter {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+
+        observed = await router.wait_for_observation(marker)
+        assert observed.channel_name == "slack"
+        assert observed.conversation_id == TEST_CHANNEL
+        assert observed.sender_id == auth["user_id"]
+        assert observed.message_id == sent["ts"]
+        assert observed.channel_key == f"slack:{TEST_CHANNEL}:{sent['ts']}"
+        # The stamp Slack wrote, not the moment we read it.
+        assert observed.timestamp == slack_ts_to_iso(sent["ts"])
+        # No mention, so the live route declined it. That is the whole point
+        # of the source: it reaches the inbox without starting a turn.
+        assert not router.messages
+
+    async def test_a_conversation_off_the_grant_is_not_collected(
+        self, live_channel, human, posted,
+    ):
+        marker = unique_marker()
+        auth = await human.auth_test()
+        router = RecordingRouter()
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True, allow_conversations=["C0NOTTHISONE"],
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL, text=f"unwatched chatter {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+
+        await router.expect_no_observation(marker, channel)
+
+    async def test_a_channel_name_grant_resolves_the_real_name(
+        self, live_channel, human, bot, posted,
+    ):
+        marker = unique_marker()
+        auth = await human.auth_test()
+        info = await bot.conversations_info(channel=TEST_CHANNEL)
+        name = info["channel"]["name"]
+        router = RecordingRouter()
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True, allow_conversations=[name],
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL, text=f"named grant {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+
+        observed = await router.wait_for_observation(marker)
+        # Resolved for the grant, so it is recorded rather than left empty.
+        assert observed.conversation_title == name
+
+    async def test_a_sender_denied_by_handle_is_not_collected(
+        self, live_channel, human, posted,
+    ):
+        # The deny pattern is a handle, so the gate has to resolve the real
+        # sender through users.info to find out it matches.
+        marker = unique_marker()
+        auth = await human.auth_test()
+        router = RecordingRouter()
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True,
+                allow_conversations=[TEST_CHANNEL],
+                deny_senders=[auth["user"]],
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL, text=f"denied sender {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+
+        await router.expect_no_observation(marker, channel)
+
+    async def test_an_answered_mention_is_not_collected_by_default(
+        self, live_channel, human, bot, posted,
+    ):
+        marker = unique_marker()
+        auth = await human.auth_test()
+        router = RecordingRouter(reply_text="ack")
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True, allow_conversations=[TEST_CHANNEL],
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL,
+            text=f"<@{channel._bot_user_id}> handled {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+
+        await router.wait_for_message(marker)
+        replies = await bot.conversations_replies(
+            channel=TEST_CHANNEL, ts=sent["ts"],
+        )
+        for reply in replies["messages"]:
+            if reply.get("user") == channel._bot_user_id:
+                posted.note_bot(TEST_CHANNEL, reply["ts"])
+        # Answered live, so the source leaves it alone: one message should
+        # not arrive twice.
+        assert not router._matching_observed(marker)
+
+    async def test_include_handled_messages_sends_a_mention_to_both(
+        self, live_channel, human, bot, posted,
+    ):
+        marker = unique_marker()
+        auth = await human.auth_test()
+        router = RecordingRouter(reply_text="ack")
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True,
+                allow_conversations=[TEST_CHANNEL],
+                include_handled_messages=True,
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL,
+            text=f"<@{channel._bot_user_id}> both routes {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+
+        await router.wait_for_message(marker)
+        await router.wait_for_observation(marker)
+        replies = await bot.conversations_replies(
+            channel=TEST_CHANNEL, ts=sent["ts"],
+        )
+        for reply in replies["messages"]:
+            if reply.get("user") == channel._bot_user_id:
+                posted.note_bot(TEST_CHANNEL, reply["ts"])
+
+    async def test_the_bots_own_post_is_not_collected(
+        self, live_channel, bot, posted,
+    ):
+        marker = unique_marker()
+        router = RecordingRouter()
+        channel, _ = await live_channel(
+            router,
+            source=ChannelSourceConfig(
+                enabled=True, allow_conversations=[TEST_CHANNEL],
+            ),
+        )
+
+        sent = await bot.chat_postMessage(
+            channel=TEST_CHANNEL, text=f"the agent talking {marker}",
+        )
+        posted.note_bot(TEST_CHANNEL, sent["ts"])
+
+        # An agent reading its own output back is a loop, not a source.
+        await asyncio.sleep(REFUSAL_SETTLE_SECONDS)
+        assert not router._matching_observed(marker)
+
+    async def test_a_collected_message_drains_into_the_inbox(
+        self, live_channel, human, posted, tmp_path,
+    ):
+        # The whole bridge, on one real message: Slack event → buffer row →
+        # ChannelSource → an inbox record a consumer tool would read.
+        marker = unique_marker()
+        auth = await human.auth_test()
+        router = RecordingRouter()
+        channel, _ = await live_channel(
+            router,
+            allow_users=[auth["user_id"]],
+            source=ChannelSourceConfig(
+                enabled=True, allow_conversations=[TEST_CHANNEL],
+            ),
+        )
+
+        sent = await human.chat_postMessage(
+            channel=TEST_CHANNEL, text=f"drain me {marker}",
+        )
+        posted.note_user(TEST_CHANNEL, sent["ts"])
+        observed = await router.wait_for_observation(marker)
+
+        db = Database(tmp_path / "observations.db")
+        await db.connect()
+        try:
+            real_router = ChannelRouter(engine=SimpleNamespace(db=db))
+            assert await real_router.observe(observed)
+
+            result = await SourceRunner(
+                source=ChannelSource("slack", db), db=db,
+            ).run()
+
+            assert result.records_ingested == 1
+            rows, _ = await db.list_source_messages(source="slack:observed")
+            assert len(rows) == 1
+            record_id = f"{TEST_CHANNEL}:{sent['ts']}"
+            assert rows[0]["id"] == record_id
+            stored = await db.get_source_message("slack:observed", record_id)
+            assert marker in stored["content"]
+            assert stored["metadata"]["sender_id"] == auth["user_id"]
+        finally:
+            await db.close()

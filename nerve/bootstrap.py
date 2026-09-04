@@ -201,7 +201,7 @@ class SetupChoices:
     user_name: str = ""
     telegram_bot_token: str = ""
     # Telegram user IDs authorized to DM the bot. Empty = pair after setup
-    # via `nerve pair` + /pair <code>.
+    # via `nerve pair` + /pair <code> in a private chat.
     telegram_allowed_users: list[int] = field(default_factory=list)
     password: str = ""  # plaintext during wizard, hashed at write time
     enabled_crons: list[str] = field(default_factory=list)
@@ -1218,7 +1218,8 @@ class SetupWizard:
                     "  numeric Telegram user ID to authorize yourself now\n"
                     "  (message @userinfobot on Telegram to get it).\n\n"
                     "  Or press Enter to skip — after setup, run 'nerve pair'\n"
-                    "  and send the bot /pair <code> to authorize.",
+                    "  and send the bot /pair <code> in a private chat to "
+                    "authorize.",
                     dim=True,
                 )
                 click.echo()
@@ -2504,7 +2505,7 @@ class SetupWizard:
         if self.choices.telegram_bot_token and not self.choices.telegram_allowed_users:
             click.secho("  Telegram pairing:", bold=True)
             click.echo("    1. Start Nerve, then run: nerve pair")
-            click.echo("    2. Send the bot:  /pair <code>")
+            click.echo("    2. In a private chat, send the bot:  /pair <code>")
             click.echo("    (until paired, the bot ignores all DMs)")
             click.echo()
         click.secho(

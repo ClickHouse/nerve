@@ -6,7 +6,7 @@ hand-editing config files:
   1. A code is generated on the server — either automatically at channel
      startup (fresh install with no ``allowed_users``) or on demand via
      ``nerve pair``.
-  2. The user sends ``/pair <code>`` to the bot.
+  2. The user sends ``/pair <code>`` to the bot in a private chat.
   3. On a match the user's ID is appended to ``telegram.allowed_users`` in
      config.local.yaml and authorized immediately.
 

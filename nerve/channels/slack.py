@@ -13,10 +13,16 @@ import collections
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from nerve.channels.access import Decision, Identity, needs_name_resolution
+from nerve.channels.access import (
+    Decision,
+    Identity,
+    PatternGate,
+    needs_name_resolution,
+)
 from nerve.channels.archives import (
     IMAGE_EXT_TO_MIME,
     MAX_TEXT_SIZE,
@@ -28,8 +34,10 @@ from nerve.channels.base import (
     ChannelCapability,
     ChannelConstraints,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
+from nerve.channels.observation import ObservationPolicy
 from nerve.channels.slack_access import SlackAccessPolicy
 from nerve.channels.slack_presentation import (
     MAX_MSG_LEN,
@@ -110,14 +118,17 @@ _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 
 
 # Slack object ids: a type letter then uppercase alphanumerics. U/W users,
-# B bots, C/G/D/T conversations and teams. Used to decide whether an
-# allow/deny pattern can be matched against the id alone, so the shape has to
-# be exact — anything looser skips a name lookup a deny list depends on.
+# B bots, C/G/D/T conversations and teams. Decides whether a pattern can be
+# matched against the id alone, so anything looser skips a name lookup a deny
+# list depends on. Case-sensitive: `beckyjones` is a legal handle and
+# `c0456def` a legal channel name, so only a lookup tells a lowercase id from
+# a lowercase name. Matching is case-insensitive either way, so a lowercase id
+# still matches. It just costs the lookup.
 _SLACK_ID_RE = re.compile(r"^[UWBCDGT][A-Z0-9]{7,}$")
 
 
 def is_slack_id(pattern: str) -> bool:
-    """Whether *pattern* is a literal Slack object id rather than a name."""
+    """Whether *pattern* can only be a literal Slack object id, never a name."""
     return bool(_SLACK_ID_RE.match(pattern))
 
 
@@ -134,6 +145,30 @@ def parse_target(target: str) -> tuple[str, str | None]:
     """
     channel_id, sep, thread_ts = target.partition(":")
     return channel_id, (thread_ts if sep and thread_ts else None)
+
+
+def _describe_slack_files(files: list[dict[str, Any]]) -> str:
+    """Name a message's attachments without downloading them.
+
+    For an upload posted with no comment the file name is the whole message.
+    ``_extract_files`` says more but fetches the bytes to do it.
+    """
+    return " ".join(
+        f"[File: {f.get('name') or 'unnamed'}]" for f in files
+    )
+
+
+def slack_ts_to_iso(ts: str) -> str:
+    """Turn a Slack ``<seconds>.<microseconds>`` stamp into ISO 8601 UTC.
+
+    Falls back to now rather than raising. An unreadable stamp should cost an
+    observation its exact time, not drop the message.
+    """
+    try:
+        seconds = float(ts)
+    except (AttributeError, TypeError, ValueError):
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
 
 
 class SlackUnavailable(RuntimeError):
@@ -931,6 +966,136 @@ class SlackChannel(BaseChannel):
             return bool(await self.router.get_last_session(channel_key))
         return False
 
+    @property
+    def observation(self) -> ObservationPolicy:
+        """The source grant, rebuilt per read so reloads apply at once."""
+        source = self.config.slack.source
+        return ObservationPolicy(
+            enabled=source.enabled,
+            conversations=PatternGate(
+                "conversation",
+                allow=list(source.allow_conversations),
+                deny=list(source.deny_conversations),
+            ),
+            senders=PatternGate(
+                "sender",
+                allow=list(source.allow_senders),
+                deny=list(source.deny_senders),
+            ),
+        )
+
+    async def _observe(
+        self,
+        event: dict[str, Any],
+        channel_id: str,
+        user_id: str,
+        ts: str,
+        channel_key: str,
+        handled: bool = False,
+    ) -> None:
+        """Buffer a message for the source inbox, if the source grant allows.
+
+        Asked of every shared-channel message, whatever the live route
+        decided: the two grants are independent, so being answered neither
+        earns nor forfeits a place in the inbox. ``handled`` says the live
+        route accepted this message, and by default that is where it stops —
+        one message should not arrive twice. ``include_handled_messages``
+        turns the copy back on for a source meant as a record.
+
+        Private conversations are never a source. A DM the agent declined to
+        answer is a refusal, and quietly filing it away is not what "we do not
+        talk to you" led the sender to expect. That covers multi-person DMs,
+        which arrive as ``channel_type="mpim"`` on a ``G`` id — checking only
+        for ``D`` would file a group DM away as if it were a channel.
+
+        Raw IDs are buffered and names are resolved only when a pattern needs
+        one, so watching a busy channel costs no Slack API call per message.
+        """
+        # Cheapest gates first: this runs on every shared-channel message
+        # now, not only the ones the live route declined.
+        source = self.config.slack.source
+        if not source.enabled:
+            return
+        if handled and not source.include_handled_messages:
+            return
+        policy = self.observation
+        if not policy.active:
+            return
+        # The *raw* type, not the caller's derived one: that default turns an
+        # absent type into "channel", which is exactly the ambiguity this has
+        # to refuse rather than resolve.
+        declared = event.get("channel_type") or ""
+        if declared in ("im", "mpim") or channel_id.startswith("D"):
+            return
+        # A `G` is either a legacy private channel or a multi-person DM, and
+        # only the declared type distinguishes them cheaply. Without one,
+        # decline: the source is opt-in, so not recording something is
+        # always the safe outcome.
+        if channel_id.startswith("G") and declared not in ("channel", "group"):
+            logger.debug(
+                "Slack did not observe a message in %s: conversation type %r "
+                "does not distinguish a private channel from a group DM",
+                channel_id, declared or "unset",
+            )
+            return
+
+        # Conversation first: it settles most refusals, and an id-only channel
+        # grant needs no lookup. Resolving the sender first would cost one per
+        # speaker in every channel the bot sits in, watched or not.
+        conversation = await self._identify_conversation(
+            channel_id,
+            "channel",
+            needs_name_resolution(policy.conversations, is_id=is_slack_id),
+        )
+        verdict = policy.conversations.check(conversation)
+        if not verdict.allowed:
+            logger.debug("Slack did not observe a message: %s", verdict.reason)
+            return
+
+        sender = await self._identify_user(
+            user_id,
+            needs_name_resolution(policy.senders, is_id=is_slack_id),
+            need_email=policy.senders.any_deny_pattern(lambda p: "@" in p),
+        )
+        verdict = policy.senders.check(sender)
+        if not verdict.allowed:
+            logger.debug("Slack did not observe a message: %s", verdict.reason)
+            return
+
+        text = slack_to_plain(event.get("text") or "", self._bot_user_id)
+        attachments = _describe_slack_files(event.get("files") or [])
+        if attachments:
+            text = f"{attachments}\n\n{text}" if text else attachments
+        # Neither text nor a file name is nothing worth a row.
+        if not text:
+            return
+
+        observed = ObservedMessage(
+            channel_name="slack",
+            channel_key=channel_key,
+            conversation_id=channel_id,
+            sender_id=user_id,
+            text=text,
+            message_id=ts,
+            timestamp=slack_ts_to_iso(ts),
+            conversation_title=next(iter(conversation.names), ""),
+            sender_name=next(
+                iter((*sender.names, *sender.self_set_names)), "",
+            ),
+            # thread_ts lets a reader pull the parent later. A reply without
+            # its thread is often meaningless, and expanding it here would
+            # cost an API call per observation.
+            metadata={
+                "thread_ts": event.get("thread_ts") or "",
+                "subtype": event.get("subtype") or "",
+            },
+        )
+        await self.router.observe(
+            observed,
+            ttl_days=self.config.sync.message_ttl_days,
+            max_stored_messages=source.max_stored_messages,
+        )
+
     async def _handle_message_event(self, event: dict[str, Any]) -> None:
         """Turn a Slack message into an InboundMessage and hand it to the router."""
         if self._is_own_message(event):
@@ -961,9 +1126,25 @@ class SlackChannel(BaseChannel):
         target = format_target(channel_id, thread_ts)
         channel_key = f"slack:{target}"
 
-        if not await self._should_answer(event, channel_type, channel_key):
-            return
-        if not await self._authorize(user_id, channel_id, channel_type):
+        # Two independent routes. Live handling needs the message to be
+        # addressed to the agent *and* its sender authorized; the source
+        # needs its own grant and neither of those. Both are asked, then
+        # `handled` reconciles them, so an addressed message from someone
+        # refused still reaches a source that asked for that channel.
+        #
+        # The authorize call stays behind the addressed check: it is the
+        # expensive one, and running it for every remark in a busy channel
+        # would cost a lookup and a refusal log line per message.
+        handled = (
+            await self._should_answer(event, channel_type, channel_key)
+            and await self._authorize(user_id, channel_id, channel_type)
+        )
+        # Sits below the early returns above on purpose, so our own posts,
+        # join/leave noise, and other apps never reach the inbox.
+        await self._observe(
+            event, channel_id, user_id, ts, channel_key, handled=handled,
+        )
+        if not handled:
             return
 
         text = slack_to_plain(event.get("text") or "", self._bot_user_id)

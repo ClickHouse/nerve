@@ -6,6 +6,9 @@ and advances the cursor. No processing (agent/memorize/notify) —
 consumption is handled separately by consumer tools.
 
 Pipeline: fetch → source.preprocess → persist → LLM condense → advance cursor
+
+A run repeats that pipeline while the source reports ``has_more``, so a backlog
+deeper than ``batch_size`` drains in one run rather than one batch per tick.
 """
 
 from __future__ import annotations
@@ -91,6 +94,10 @@ _CONDENSE_THRESHOLD = 800  # chars
 # otherwise drop hundreds at once).
 _MAX_DROP_LOG_LINES = 10
 
+# Batches one run drains before leaving the rest for the next tick. Bounds a
+# very deep backlog, and a source whose has_more never goes false.
+_MAX_PASSES = 20
+
 _CONDENSE_PROMPT = (
     "Extract the essential information from this source record content.\n"
     "Rules:\n"
@@ -103,6 +110,17 @@ _CONDENSE_PROMPT = (
     "- Return ONLY the cleaned content, no preamble or commentary\n"
     "- If the message is mostly noise, return just the 1-2 core facts"
 )
+
+
+@dataclass
+class _BatchResult:
+    """One batch's outcome, plus what the drain loop needs to page onward."""
+
+    records_ingested: int
+    records_dropped: int = 0
+    next_cursor: str | None = None
+    has_more: bool = False
+    error: str | None = None
 
 
 class SourceRunner:
@@ -126,6 +144,13 @@ class SourceRunner:
             persist. Records that don't pass are dropped — never written to
             the inbox, never seen by the agent. An inactive/None filter is a
             no-op. See :mod:`nerve.sources.filters`.
+        schedule: Crontab or interval this runner asks to be scheduled on.
+            Empty means "look me up in ``config.sync.<name>``", which is how
+            every pull source works. A source configured somewhere else —
+            a channel's ``source`` block, say — carries its own cadence
+            here, because the alternative is a phantom ``config.sync``
+            section that duplicates it, or a runner that is silently never
+            scheduled. See :meth:`CronService._source_schedule`.
     """
 
     def __init__(
@@ -139,6 +164,7 @@ class SourceRunner:
         condense_client_factory: Callable[[], Any] | None = None,
         ttl_days: int = 7,
         inbox_filter: InboxFilter | None = None,
+        schedule: str = "",
     ):
         self.source = source
         self.db = db
@@ -153,6 +179,7 @@ class SourceRunner:
         self._client_factory = condense_client_factory
         self.ttl_days = ttl_days
         self.inbox_filter = inbox_filter
+        self.schedule = schedule
         self._lock = asyncio.Lock()
         self._condense_client: Any | None = None
         self.health = SourceHealth()
@@ -229,8 +256,58 @@ class SourceRunner:
         return result
 
     async def _run_locked(self) -> IngestResult:
-        """Actual run logic, called under lock."""
+        """Drain batches until the source reports no more, or _MAX_PASSES.
+
+        A source arriving faster than one ``batch_size`` per tick never catches
+        up on one batch per run, and a buffered one is then trimmed from the
+        old end while the drain is still behind it.
+
+        Each batch persists and advances the cursor before the next starts, so
+        stopping at the bound leaves progress durable and the next run resumes
+        there.
+        """
         cursor = await self.db.get_sync_cursor(self.source.source_name)
+        total_ingested = 0
+        total_dropped = 0
+
+        for pass_number in range(1, _MAX_PASSES + 1):
+            result = await self._ingest_batch(cursor)
+            if result.error:
+                # Earlier batches are persisted and their cursor moved. Report
+                # the failure, keep the progress.
+                return IngestResult(
+                    records_ingested=total_ingested,
+                    records_dropped=total_dropped,
+                    error=result.error,
+                )
+            total_ingested += result.records_ingested
+            total_dropped += result.records_dropped
+
+            if not result.has_more:
+                break
+            # More to read but a standing cursor would re-read the same batch.
+            if result.next_cursor == cursor:
+                logger.warning(
+                    "Source %s: reports more to read but did not advance its "
+                    "cursor (%s). Stopping this run.",
+                    self.source.source_name, cursor,
+                )
+                break
+            cursor = result.next_cursor
+            if pass_number == _MAX_PASSES:
+                logger.warning(
+                    "Source %s: still has a backlog after %d batches of %d. "
+                    "Stopping until the next run. Raise batch_size or the "
+                    "schedule if this repeats.",
+                    self.source.source_name, _MAX_PASSES, self.batch_size,
+                )
+
+        return IngestResult(
+            records_ingested=total_ingested, records_dropped=total_dropped,
+        )
+
+    async def _ingest_batch(self, cursor: str | None) -> _BatchResult:
+        """One fetch → preprocess → persist → condense → advance cycle."""
         logger.info(
             "Source %s: fetching (cursor=%s, batch_size=%d)",
             self.source.source_name, cursor, self.batch_size,
@@ -240,7 +317,7 @@ class SourceRunner:
             result = await self.source.fetch(cursor, limit=self.batch_size)
         except Exception as e:
             logger.error("Source %s fetch failed: %s", self.source.source_name, e, exc_info=True)
-            return IngestResult(records_ingested=0, error=str(e))
+            return _BatchResult(records_ingested=0, error=str(e))
 
         if not result.records:
             # Even with 0 records, advance cursor if it changed
@@ -253,7 +330,8 @@ class SourceRunner:
                 )
             else:
                 logger.info("Source %s: no new records", self.source.source_name)
-            return IngestResult(records_ingested=0)
+            # No records means nothing to page past, whatever has_more says.
+            return _BatchResult(records_ingested=0, next_cursor=result.next_cursor)
 
         # Ingestion pipeline:
         # 1. Source-specific cleanup (e.g., Gmail boilerplate stripping)
@@ -309,7 +387,12 @@ class SourceRunner:
                 self.source.source_name, len(records), result.next_cursor,
             )
 
-        return IngestResult(records_ingested=len(records), records_dropped=dropped_count)
+        return _BatchResult(
+            records_ingested=len(records),
+            records_dropped=dropped_count,
+            next_cursor=result.next_cursor,
+            has_more=result.has_more,
+        )
 
     # ------------------------------------------------------------------
     # Inbox persistence

@@ -352,10 +352,21 @@ class RecordingRouter:
 
     def __init__(self, reply_text: str | None = None):
         self.messages: list[Any] = []
+        self.observed: list[Any] = []
         self.reply_text = reply_text
         self.channel: Any = None
         self._sessions: dict[str, str] = {}
         self._arrived = asyncio.Event()
+
+    async def observe(self, msg: Any, **kwargs: Any) -> bool:
+        """Record what the channel collected for the source inbox.
+
+        The buffer itself is a plain SQLite table with its own unit tests.
+        What a live run settles is which real events reach here and what
+        Slack put in their fields.
+        """
+        self.observed.append(msg)
+        return True
 
     async def handle_message(self, msg: Any) -> str:
         self._sessions.setdefault(msg.channel_key, f"s{len(self._sessions)}")
@@ -397,6 +408,61 @@ class RecordingRouter:
         raise AssertionError(
             f"no inbound message carrying {marker!r} reached the router "
             f"within {timeout}s (saw {[m.text for m in self.messages]})",
+        )
+
+    def _matching_observed(self, marker: str) -> list[Any]:
+        return [m for m in self.observed if marker in (m.text or "")]
+
+    async def wait_for_observation(
+        self, marker: str, timeout: float = EVENT_TIMEOUT,
+    ) -> Any:
+        """Block until an observation carrying *marker* is buffered."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            found = self._matching_observed(marker)
+            if found:
+                return found[-1]
+            await asyncio.sleep(0.1)
+        raise AssertionError(
+            f"no observation carrying {marker!r} was buffered within "
+            f"{timeout}s (saw {[m.text for m in self.observed]})",
+        )
+
+    async def expect_no_observation(
+        self, marker: str, channel, timeout: float = EVENT_TIMEOUT,
+    ) -> None:
+        """Assert the source gate saw the event and declined it.
+
+        Same reasoning as :meth:`expect_no_message`: an empty list proves
+        nothing until the envelope is known to have reached the channel.
+        """
+        await self._await_arrival(marker, channel, timeout)
+        await asyncio.sleep(REFUSAL_SETTLE_SECONDS)
+        assert not self._matching_observed(marker), (
+            f"the source collected {marker!r}, which the grant should have "
+            f"declined"
+        )
+
+    async def _await_arrival(
+        self, marker: str, channel, timeout: float,
+    ) -> None:
+        """Wait until an envelope carrying *marker* reached the channel."""
+        diagnostics = getattr(channel._client, "_live_diagnostics", None)
+        assert diagnostics is not None, (
+            "the live channel has no diagnostics, so a refusal cannot be "
+            "told apart from an event that never arrived"
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if diagnostics.forwarded(marker):
+                return
+            await asyncio.sleep(0.1)
+        dropped = diagnostics.dropped(marker)
+        raise AssertionError(
+            f"no envelope carrying {marker!r} reached the channel within "
+            f"{timeout}s, so the gate was never exercised "
+            f"({'the harness dropped it as stale' if dropped else 'Slack never delivered it'})",
         )
 
     async def expect_no_message(
