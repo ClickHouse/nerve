@@ -1254,6 +1254,32 @@ warning. Slack in the list costs nothing while Slack is off.
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
 a literal channel ID, delivery is skipped with a warning.
 
+### Outbound Slack message tool
+
+The `send_channel_message` tool posts to a given conversation. That makes it usable
+from a cron run with no conversation attached.
+
+It is **off by default**: `slack.allow_outbound: true` enables the capability,
+and `slack.allow_channels` then bounds where it may go. The target must be a literal conversation id.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `slack.allow_outbound` | bool | `false` | Let an agent post to a conversation it names |
+
+While no channel is both enabled and outbound-enabled, the tool is not offered
+to the agent at all. The check reads live config per session, so a reload adds
+or removes it.
+
+Three differences from the inbound policy:
+
+- **`slack.allow_users` has no effect.** It says who may drive the
+  agent, not where the agent may broadcast.
+- **Unsolicited DMs are refused**, even with `slack.allow_direct_messages`.
+  **Group DMs count.** A `G` id is either a legacy private channel or a
+  multi-person DM, and only `conversations.info` can tell them apart, so a
+  `G` target costs one cached lookup; a lookup that cannot answer is refused
+  rather than guessed.
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
