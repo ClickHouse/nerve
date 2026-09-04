@@ -242,6 +242,53 @@ class TestNotificationBlocks:
         assert len(blocks[0]["text"]["text"]) <= 3000
 
 
+class TestNotificationDelivery:
+    @pytest.mark.asyncio
+    async def test_the_channel_owns_target_resolution_and_block_rendering(self):
+        channel = _channel(allow_channels=["engineering-*", "C0456DEF"])
+
+        delivery = await channel.post_notification(
+            "n1", "Deploy?", [("Approve", "approve")],
+        )
+
+        assert delivery == ("C0456DEF", "1.1")
+        posted = channel._web.chat_postMessage.await_args.kwargs
+        assert posted["channel"] == "C0456DEF"
+        assert posted["blocks"][1]["elements"][0]["action_id"] == (
+            "notif:n1:approve"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_dm_is_a_notification_target(self):
+        channel = _channel()
+        channel.config.notifications.slack_channel_id = "D0123ABC"
+
+        delivery = await channel.post_notification("n1", "Hello")
+
+        assert delivery == ("D0123ABC", "1.1")
+
+    @pytest.mark.asyncio
+    async def test_a_quiescing_channel_refuses_external_delivery(self):
+        channel = _channel(allow_channels=["C0456DEF"])
+        channel._state = "quiescing"
+
+        assert await channel.post_notification("n1", "Hello") is None
+        channel._web.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_expiry_replaces_the_card_without_buttons(self):
+        channel = _channel()
+
+        await channel.expire_notification("C0456DEF", "1.1", "Expired")
+
+        channel._web.chat_update.assert_awaited_once_with(
+            channel="C0456DEF",
+            ts="1.1",
+            text="Expired",
+            blocks=[],
+        )
+
+
 # ---------------------------------------------------------------------- #
 #  Channel wiring                                                         #
 # ---------------------------------------------------------------------- #
@@ -667,6 +714,36 @@ class TestReactionEvents:
             "item": {"channel": "C2", "ts": "1.1"},
         })
         channel.router.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_reaction_on_a_notification_card_opens_no_session(self):
+        # A card is posted at channel level, so routing a reaction on it
+        # would write a slack:<channel> mapping. Shared channels have no
+        # conversation-wide session, and the pickers do not list one, so
+        # nothing could stop it afterwards.
+        channel = _channel(allow_channels=["C0123ABCD"])
+        channel.config.notifications.slack_channel_id = "C0123ABCD"
+        posted = await channel.post_notification("n1", "Approve this?", None)
+        assert posted == ("C0123ABCD", "1.1")
+
+        await channel._handle_reaction_event({
+            "type": "reaction_added", "user": "U1", "reaction": "eyes",
+            "item": {"channel": "C0123ABCD", "ts": "1.1"},
+        })
+        channel.router.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_reaction_on_a_direct_message_card_still_answers(self):
+        # A DM is one conversation, so a card there has a session to join.
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        channel.config.notifications.slack_channel_id = "D0123ABCD"
+        assert await channel.post_notification("n1", "Approve this?", None)
+        await channel._handle_reaction_event({
+            "type": "reaction_added", "user": "U1", "reaction": "eyes",
+            "item": {"channel": "D0123ABCD", "ts": "1.1"},
+        })
+        msg = channel.router.handle_message.await_args[0][0]
+        assert msg.channel_key == "slack:D0123ABCD"
 
     @pytest.mark.asyncio
     async def test_a_reaction_still_reaches_its_own_thread_session(self):
@@ -2026,7 +2103,9 @@ class TestNotificationCardRoundTrip:
 class TestApprovalAttribution:
     """`answered_by="slack"` alone loses which member pressed the button."""
 
-    async def _press(self, action_id="notif:n1:approve", value="approve"):
+    async def _press(
+        self, action_id="notif:n1:approve", value="approve", **message,
+    ):
         channel = _channel(allow_users=["U0123ABC"])
         channel._replace_via_url = AsyncMock()
         service = MagicMock()
@@ -2044,10 +2123,28 @@ class TestApprovalAttribution:
                 "channel": {"id": "C1"},
                 "response_url": "https://hooks.slack.test/x",
                 "actions": [{"action_id": action_id, "value": value}],
-                "message": {"blocks": build_notification_blocks("Ship it?", "n1")},
+                "message": {
+                    "blocks": build_notification_blocks("Ship it?", "n1"),
+                    **message,
+                },
             }
         )
         return channel, service
+
+    @pytest.mark.asyncio
+    async def test_a_thread_reply_under_the_card_keeps_the_buttons_working(self):
+        # Slack fills thread_ts in on a message once it has replies, so a
+        # press after one reply was looking up "C1:1.1" while the delivery
+        # record held "C1", and every press read as already answered.
+        _, service = await self._press(ts="1.1", thread_ts="1.1")
+        kwargs = service.answer_delivered_notification.await_args.kwargs
+        assert kwargs["target"] == "C1"
+
+    @pytest.mark.asyncio
+    async def test_the_button_press_carries_the_slack_member_id(self):
+        _, service = await self._press()
+        kwargs = service.answer_delivered_notification.await_args.kwargs
+        assert kwargs["actor"] == "U0123ABC"
 
     @pytest.mark.asyncio
     async def test_the_settled_card_names_who_answered(self):

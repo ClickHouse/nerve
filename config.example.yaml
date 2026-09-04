@@ -144,6 +144,15 @@ slack:
   # doctor/restart affect the host; sessions lists other channels. Opt in.
   # commands: [sessions, new, stop, reply]
 
+# Where notify, ask_user, and propose_action deliver. The list replaces the
+# default rather than adding to it, so name every transport you want. A
+# transport that is off costs nothing here.
+notifications:
+  channels: [web, telegram, slack]
+  # Target conversation for Slack cards. Without this, the first literal ID
+  # in slack.allow_channels is used; names and globs are not resolved.
+  # slack_channel_id: "C0456DEF"
+
 # Quiet hours (local timezone)
 quiet_start: "02:00"
 quiet_end: "12:00"

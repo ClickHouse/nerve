@@ -23,7 +23,6 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -173,9 +172,40 @@ class TestSchema:
             cols = {row[1] async for row in cur}
         assert {"notification_id", "channel", "target", "message_id"} <= cols
 
+    async def test_slack_is_a_default_notification_channel(self):
+        # Cards reach nobody unless the transport is in this list, and the
+        # list replaces the default rather than extending it.
+        from nerve.config import NotificationsConfig
+
+        assert NotificationsConfig().channels == ["web", "telegram", "slack"]
+        assert NotificationsConfig.from_dict({}).channels == [
+            "web", "telegram", "slack",
+        ]
+        assert NotificationsConfig.from_dict(
+            {"channels": ["web"]},
+        ).channels == ["web"]
+
 
 @pytest.mark.asyncio
 class TestScopedAnswers:
+    async def test_latest_delivery_can_move_between_targets(
+        self, db: Database,
+    ):
+        await db.create_session("s1", source="external")
+        await db.create_notification("n1", "s1", "question", "Question")
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0123ABC", message_id="1.0",
+        )
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0456DEF", message_id="2.0",
+        )
+
+        delivery = await db.get_latest_notification_delivery("n1", "slack")
+
+        assert delivery
+        assert delivery["target"] == "C0456DEF"
+        assert delivery["message_id"] == "2.0"
+
     async def test_latest_question_is_scoped_to_delivery_target(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
@@ -218,6 +248,71 @@ class TestScopedAnswers:
 
         assert result is None
         assert (await db.get_notification("n1"))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+class TestSlackDeliveryBoundary:
+    async def test_service_records_the_reference_returned_by_the_channel(
+        self, db: Database, fake_config, fake_engine,
+    ):
+        await db.create_session("s1", source="external")
+        await db.create_notification("n1", "s1", "question", "Question")
+        channel = MagicMock(is_available=True)
+        channel.post_notification = AsyncMock(
+            return_value=("C0456DEF", "1.0"),
+        )
+        fake_engine.router.get_channel.return_value = channel
+        service = NotificationService(fake_config, db, fake_engine)
+
+        message_id = await service._deliver_slack(
+            "n1", "s1", "question", "Question", "Body", "normal", ["yes"],
+        )
+
+        assert message_id == "1.0"
+        delivery = await db.get_notification_delivery(
+            "n1", "slack", "C0456DEF",
+        )
+        assert delivery and delivery["message_id"] == "1.0"
+        options = channel.post_notification.await_args.args[2]
+        assert options == [("yes", "yes")]
+
+    async def test_quiescing_channel_is_not_used(
+        self, db: Database, fake_config, fake_engine,
+    ):
+        channel = MagicMock(is_available=False)
+        channel.post_notification = AsyncMock()
+        fake_engine.router.get_channel.return_value = channel
+        service = NotificationService(fake_config, db, fake_engine)
+
+        message_id = await service._deliver_slack(
+            "n1", "s1", "notify", "Notice", "Body", "normal", None,
+        )
+
+        assert message_id is None
+        channel.post_notification.assert_not_awaited()
+
+    async def test_expiry_uses_the_latest_recorded_target(
+        self, db: Database, fake_config, fake_engine,
+    ):
+        await db.create_session("s1", source="external")
+        await db.create_notification("n1", "s1", "question", "Question")
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0123ABC", message_id="1.0",
+        )
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0456DEF", message_id="2.0",
+        )
+        channel = MagicMock(is_available=True)
+        channel.expire_notification = AsyncMock()
+        fake_engine.router.get_channel.return_value = channel
+        service = NotificationService(fake_config, db, fake_engine)
+
+        await service._edit_slack_expired(await db.get_notification("n1"))
+
+        channel.expire_notification.assert_awaited_once()
+        args = channel.expire_notification.await_args.args
+        assert args[:2] == ("C0456DEF", "2.0")
+        assert args[2].endswith("⏰ Expired unanswered")
 
 
 # ----------------------------------------------------------------------
@@ -613,3 +708,123 @@ class TestExpiryReporting:
         assert notif["status"] == "expired"
         # HTML attempt + plain-text fallback, both swallowed.
         assert bot.edit_message_text.await_count == 2
+
+
+# ----------------------------------------------------------------------
+#  Answer attribution
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAnswerAttribution:
+    """A shared workspace needs to know which member approved an action.
+
+    ``answered_by`` names the transport and the injection path routes on
+    it, so the person travels beside it in the row's metadata rather than
+    inside the same string.
+    """
+
+    async def test_a_question_answer_records_the_actor(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        assert await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        notif = await db.get_notification(result["notification_id"])
+        assert notif["answered_by"] == "slack"
+        assert json.loads(notif["metadata"])["answered_by_actor"] == "U0123ABC"
+
+    async def test_the_transport_still_names_the_channel_on_its_own(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # engine.run is handed answered_by as the channel name, so folding
+        # the member id into that string would route the reply nowhere.
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        await asyncio.sleep(0)
+        kwargs = fake_engine.run.call_args.kwargs
+        assert kwargs["channel"] == "slack"
+        assert kwargs["source"] == "notification:slack"
+
+    async def test_an_answer_with_no_actor_leaves_the_metadata_alone(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(result["notification_id"], "yes", "web")
+        notif = await db.get_notification(result["notification_id"])
+        assert "answered_by_actor" not in json.loads(notif["metadata"])
+
+    async def test_existing_metadata_survives_the_answer(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # The column also carries option_labels, which the Telegram and web
+        # renderers read after the row is answered.
+        await db.create_session("s1")
+        await db.create_notification(
+            notification_id="n1", session_id="s1", type="question",
+            title="t", metadata={"option_labels": {"yes": "Ship it"}},
+        )
+        svc = NotificationService(fake_config, db, fake_engine)
+
+        await svc.handle_answer("n1", "yes", "slack", actor="U0123ABC")
+        metadata = json.loads((await db.get_notification("n1"))["metadata"])
+        assert metadata["option_labels"] == {"yes": "Ship it"}
+        assert metadata["answered_by_actor"] == "U0123ABC"
+
+    async def test_the_actor_reaches_the_web_broadcast(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1")
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        answered = [
+            m for _, m in patch_broadcaster
+            if m.get("type") == "notification_answered"
+        ]
+        assert answered
+        assert answered[-1]["answered_by"] == "slack"
+        assert answered[-1]["answered_by_actor"] == "U0123ABC"
+
+    async def test_an_approval_audit_record_names_the_actor(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+        audit_workspace,
+    ):
+        await db.create_session("s1")
+        _handlers.register("attribution-test", lambda *a: _handlers.DispatchResult(
+            ok=True,
+            audit_event={
+                "event": "approval-acted",
+                "target_kind": "attribution-test",
+                "decision": "approve",
+                "ok": True,
+            },
+        ))
+        svc = NotificationService(fake_config, db, fake_engine)
+        nid = await _make_approval(
+            svc, db, target_kind="attribution-test",
+        )
+
+        await svc.handle_answer(nid, "approve", "slack", actor="U0123ABC")
+        records = read_audit_jsonl(
+            audit_workspace / ".nerve" / "mechanical-actions",
+        )
+        acted = [r for r in records if r.get("event") == "approval-acted"]
+        assert acted
+        assert acted[-1]["answered_by"] == "slack"
+        assert acted[-1]["answered_by_actor"] == "U0123ABC"

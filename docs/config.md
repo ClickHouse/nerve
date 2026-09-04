@@ -1238,6 +1238,22 @@ Slack slash-command payloads have no thread ID. In a shared channel, `new` and
 `sessions` therefore refuse, while `stop`, `star`, and `unstar` select among
 that channel's active thread sessions. Commands work normally in DMs.
 
+### Notifications
+
+Question and approval cards go to Slack by default.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.channels` | list | `[web, telegram, slack]` | Where `notify`, `ask_user`, and `propose_action` deliver |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
+
+`notifications.channels` replaces the default rather than adding to it, so
+list every transport you want. A name nothing delivers to is skipped with a
+warning. Slack in the list costs nothing while Slack is off.
+
+Names and globs are not resolved for the `slack_channel_id` fallback. Without
+a literal channel ID, delivery is skipped with a warning.
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
