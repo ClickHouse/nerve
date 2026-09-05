@@ -312,6 +312,33 @@ def test_claude_options_pass_resume_session_at_only_for_forks(tmp_path):
     assert plain.resume_session_at is None
 
 
+def test_claude_options_set_stdout_buffer_from_config(tmp_path):
+    """The SDK's 1 MiB per-line default aborts the turn on any large image
+    tool result; the configured cap must reach ClaudeAgentOptions."""
+    def _opts(cfg):
+        backend = ClaudeBackend(SimpleNamespace(
+            config=lambda: cfg,
+            claude_plugins=lambda: [],
+        ))
+        spec = SessionSpec(
+            session_id="buf-opts", source="web", model=cfg.agent.model,
+            effort="high", system_prompt="p", cwd=str(tmp_path),
+        )
+        with patch.object(backend, "_build_mcp_servers", return_value={}), \
+             patch.object(backend, "_build_hooks", return_value={}):
+            return backend._build_options(spec)
+
+    default = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    assert default.agent.cli_max_message_bytes == 64 * 1024 * 1024
+    assert _opts(default).max_buffer_size == 64 * 1024 * 1024
+
+    custom = NerveConfig.from_dict({
+        "workspace": str(tmp_path),
+        "agent": {"cli_max_message_bytes": 8 * 1024 * 1024},
+    })
+    assert _opts(custom).max_buffer_size == 8 * 1024 * 1024
+
+
 @pytest.mark.asyncio
 async def test_receive_turn_disabled_when_timeout_zero():
     """idle_timeout <= 0 disables the timeout (legacy behaviour)."""
@@ -799,11 +826,15 @@ class TestValidateResumeTarget:
 # ClaudeBackend._build_hooks — background-agent permission parity
 # ---------------------------------------------------------------------------
 
-def _make_hook_backend(background_agent_permissions: bool) -> ClaudeBackend:
+def _make_hook_backend(
+    background_agent_permissions: bool,
+    cli_max_message_bytes: int = 64 * 1024 * 1024,
+) -> ClaudeBackend:
     """Minimal backend stub for exercising _build_hooks's PreToolUse wiring."""
     config = SimpleNamespace(
         agent=SimpleNamespace(
             background_agent_permissions=background_agent_permissions,
+            cli_max_message_bytes=cli_max_message_bytes,
         ),
     )
     return ClaudeBackend(SimpleNamespace(config=lambda: config))
@@ -822,6 +853,48 @@ def _catch_all_grant_hook(hooks: dict):
         if matcher.matcher is None:
             return matcher.hooks[0]
     return None
+
+
+def _read_validator_hook(backend: ClaudeBackend):
+    for matcher in backend._build_hooks(_hook_spec("sess-img"))["PreToolUse"]:
+        if matcher.matcher == "Read":
+            return matcher.hooks[0]
+    raise AssertionError("Read image validator hook not registered")
+
+
+def _fake_png(tmp_path: Path, size: int) -> str:
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * size)
+    return str(png)
+
+
+class TestReadHookTransportBound:
+    """A valid image can still be too big for the SDK transport: its result
+    is one stream-json line, and a line over max_buffer_size aborts the
+    whole turn. The Read validator refuses it up front instead."""
+
+    @pytest.mark.asyncio
+    async def test_denies_image_that_cannot_fit_the_configured_cap(self, tmp_path):
+        # 600 KB → ~820 KB of base64, shipped twice per line → > 1 MiB.
+        path = _fake_png(tmp_path, 600 * 1024)
+        hook = _read_validator_hook(
+            _make_hook_backend(True, cli_max_message_bytes=1024 * 1024),
+        )
+        out = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": path}}, "tid", None,
+        )
+        spec = out["hookSpecificOutput"]
+        assert spec.get("permissionDecision") == "deny"
+        assert "cli_max_message_bytes" in spec["permissionDecisionReason"]
+
+    @pytest.mark.asyncio
+    async def test_allows_the_same_image_under_the_default_cap(self, tmp_path):
+        path = _fake_png(tmp_path, 600 * 1024)
+        hook = _read_validator_hook(_make_hook_backend(True))
+        out = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": path}}, "tid", None,
+        )
+        assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 class TestBuildHooksBackgroundPermissions:
