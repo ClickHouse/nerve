@@ -965,6 +965,12 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
+    # When True, a Telegram *reply* is routed to the session that produced the
+    # replied-to message (and that session becomes active); a reply that can't
+    # be tied to a live session is refused rather than delivered to the active
+    # session. When False (default) a reply is context-only — it quotes the
+    # replied-to message and lands in the active session, like a plain message.
+    reply_routes_to_origin_session: bool = False
 
     @classmethod
     @_coerced
@@ -1008,6 +1014,9 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
+            reply_routes_to_origin_session=d.get(
+                "reply_routes_to_origin_session", False,
+            ),
         )
 
 
