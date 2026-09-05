@@ -854,6 +854,15 @@ class AgentConfig:
     # Substrings of model names that must never request the 1h cache TTL
     # (same matching semantics as context_1m_excluded_models).
     cache_ttl_excluded_models: list[str] = field(default_factory=list)
+    # Keep the appended system prompt byte-identical across sessions of the
+    # same workspace/source/tool set so Anthropic's exact-prefix prompt cache
+    # can share it: the per-session parts (session id, pre-recalled memories)
+    # are delivered in a <session-context> block at the top of the first user
+    # message instead of in the system prompt. With per-session bytes in the
+    # prompt, every session start is a cache WRITE of the whole block (on a
+    # fleet of ~800 cron sessions/day that was measured at ~$850/day) instead
+    # of a cache READ. False restores the legacy shape (id + recall inline).
+    static_system_prompt: bool = True
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
@@ -922,6 +931,7 @@ class AgentConfig:
             cache_ttl_excluded_models=_str_list(
                 d.get("cache_ttl_excluded_models")
             ),
+            static_system_prompt=d.get("static_system_prompt", True),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
