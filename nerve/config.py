@@ -2170,11 +2170,37 @@ _CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 # $/1M tokens; cached input bills at the discounted rate. Config values
 # under codex.pricing REPLACE entries per model key (dict deep-merge).
+# GPT-6 Astra's long-context tier (requests above 272K input tokens bill
+# 2x input / 1.5x output) is not modelled: the app-server reports usage
+# per turn, not per request, so the threshold cannot be attributed.
 _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
+    "gpt-6-astra":    {"input": 10.0, "cached_input": 1.0,  "output": 50.0},
     "gpt-5.6-sol":    {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
     "gpt-5.6-terra":  {"input": 2.5,  "cached_input": 0.25, "output": 15.0},
     "gpt-5.6-luna":   {"input": 1.0,  "cached_input": 0.1,  "output": 6.0},
 }
+
+# Catalog entries the app-server hides from its default ``model/list``
+# (served only with ``includeHidden``) that Nerve still offers in the
+# picker when the authenticated account can reach them. GPT-6 Astra is
+# hidden upstream on purpose (API-key accounts; codex-cli 0.153.1+).
+_DEFAULT_CODEX_MODELS: tuple[str, ...] = ("gpt-6-astra",)
+
+
+def _codex_models(raw: Any) -> list[str]:
+    """``codex.models``: unset → built-in list; ``[]`` → offer none."""
+    if raw is None:
+        return list(_DEFAULT_CODEX_MODELS)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return list(_DEFAULT_CODEX_MODELS)
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 @dataclass
@@ -2245,11 +2271,16 @@ class CodexConfig:
     """
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
-    min_version: str = "0.144.1"            # inclusive tested protocol range
-    max_version: str = "0.145.0"            # exclusive
+    min_version: str = "0.153.1"            # inclusive tested protocol range
+    max_version: str = "0.154.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
+    # Hidden catalog models to offer next to the visible ``model/list``
+    # (only when the live catalog serves them). Any model named here is
+    # also always accepted as a session model — the app-server stays the
+    # authority on whether a turn on it succeeds.
+    models: list[str] = field(default_factory=lambda: list(_DEFAULT_CODEX_MODELS))
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
     api_key_env: str = "OPENAI_API_KEY"     # env fallback when auth=api_key
@@ -2300,13 +2331,14 @@ class CodexConfig:
             effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
-            min_version=str(d.get("min_version", "0.144.1")),
-            max_version=str(d.get("max_version", "0.145.0")),
+            min_version=str(d.get("min_version", "0.153.1")),
+            max_version=str(d.get("max_version", "0.154.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),
             model=str(d.get("model", "gpt-5.6-sol")),
             cron_model=str(d.get("cron_model") or ""),
+            models=_codex_models(d.get("models")),
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
