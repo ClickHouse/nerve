@@ -202,13 +202,15 @@ def _translated(messages: list) -> list:
     return [event for m in messages for event in translate_message(m)]
 
 
-def _result_msg(session_id: str = "sdk-1") -> ResultMessage:
+def _result_msg(session_id: str = "sdk-1", **overrides) -> ResultMessage:
     """A terminal ResultMessage: translates to one TurnCompleted."""
-    return ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1,
-        is_error=False, num_turns=1, session_id=session_id,
-        total_cost_usd=0.5, usage={"input_tokens": 1},
-    )
+    values = {
+        "subtype": "success", "duration_ms": 1, "duration_api_ms": 1,
+        "is_error": False, "num_turns": 1, "session_id": session_id,
+        "total_cost_usd": 0.5, "usage": {"input_tokens": 1},
+    }
+    values.update(overrides)
+    return ResultMessage(**values)
 
 
 @pytest.mark.asyncio
@@ -410,6 +412,36 @@ async def test_receive_turn_completes_on_result_without_raising():
     assert len(terminal) == 1
     assert terminal[0].status == "completed"
     assert sdk.aclose_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("message", "status", "error"),
+    [
+        (
+            _result_msg(
+                subtype="error_max_turns", is_error=True,
+                terminal_reason="max_turns", num_turns=50,
+            ),
+            "failed",
+            "max turns (50) exhausted",
+        ),
+        (
+            _result_msg(is_error=True, api_error_status=529),
+            "failed",
+            "API error (HTTP 529)",
+        ),
+        (
+            _result_msg(is_error=True, terminal_reason="aborted_streaming"),
+            "interrupted",
+            "aborted streaming",
+        ),
+    ],
+)
+def test_result_message_preserves_abnormal_terminal_state(message, status, error):
+    event = translate_message(message)[0]
+
+    assert isinstance(event, ev.TurnCompleted)
+    assert (event.status, event.error) == (status, error)
 
 
 @pytest.mark.asyncio
