@@ -158,11 +158,52 @@ class TestValidateConfigKeys:
                 "dm_policy": "pairing",
                 "allowed_users": [1],
                 "stream_mode": "partial",
+                "source": {"enabled": True, "allow_chats": [-100123]},
+            },
+            "slack": {
+                "enabled": True,
+                "allow_channels": ["C0123ABC"],
+                "source": {
+                    "enabled": True,
+                    "allow_channels": ["C0123ABC"],
+                    "deny_channels": ["*-social"],
+                    "deny_senders": ["*-bot"],
+                },
             },
             "agent": {"model": "claude-opus-4-8"},
             "auth": {"jwt_secret": "s"},
         }
         assert validate_config_keys(merged) == []
+
+    def test_channel_source_subject_keys_are_not_unknown(self):
+        """``<channel>.source`` names the conversations in the transport's own
+        noun, so the working keys are not the dataclass field names.
+
+        Reported as unknown, they told an operator following the docs that a
+        key Nerve does read was being ignored — while
+        ``allow_conversations``, which no transport reads, passed silently.
+        """
+        assert validate_config_keys(
+            {"slack": {"source": {"allow_channels": ["*"], "deny_channels": []}}},
+        ) == []
+        assert validate_config_keys(
+            {"telegram": {"source": {"allow_chats": [1], "deny_chats": []}}},
+        ) == []
+
+    def test_a_typo_in_a_channel_source_is_still_reported(self):
+        """The allowance is per key, not per subtree: the near-misses these
+        keys invite are exactly what the validator exists to catch."""
+        warnings = validate_config_keys(
+            {"slack": {"source": {"allow_channel": ["*"]}}},   # singular
+        )
+        assert len(warnings) == 1
+        assert "slack.source.allow_channel" in warnings[0]
+
+        warnings = validate_config_keys(
+            {"telegram": {"source": {"allow_channels": [1]}}},  # Slack's noun
+        )
+        assert len(warnings) == 1
+        assert "telegram.source.allow_channels" in warnings[0]
 
     def test_unknown_top_level_key(self):
         warnings = validate_config_keys({"workspaec": "~/ws"})
