@@ -1486,11 +1486,14 @@ class CronService:
         # Include source runners
         for runner in self._source_runners:
             source_name = runner.source.source_name
-            config_key = source_name.split(":")[0]
             sched_job = self.scheduler.get_job(runner.job_id)
             next_run = sched_job.next_run_time if sched_job else None
-            source_config = getattr(self.config.sync, config_key, None)
-            schedule = getattr(source_config, "schedule", "?") if source_config else "?"
+            # Ask the resolver the scheduler itself used. Re-deriving this
+            # from config.sync answered "?" for any source configured outside
+            # that section — a channel source drain carries its own schedule
+            # and has no sync.<channel> block to find — so the job ran on the
+            # right trigger while the API reported no cadence for it.
+            schedule = self._source_schedule(runner) or "?"
             result.append({
                 "id": runner.job_id,
                 "type": "source",
