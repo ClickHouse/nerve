@@ -1570,6 +1570,89 @@ class TestCommandExposure:
             actor="U1",
         )
 
+    # --- scope: where a command may be run, as distinct from whether it is
+    #     enabled at all. `commands` is one flat list and cannot say "offer
+    #     this, but not to a whole shared channel".
+
+    async def _run_in(self, channel, text, channel_id, cmd=None):
+        payload = {"user_id": "U1", "channel_id": channel_id, "text": text}
+        if cmd is not None:
+            payload["command"] = cmd
+        await channel._handle_slash_command(payload)
+        return channel._web.chat_postEphemeral.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_host_command_is_refused_in_a_shared_channel(self, monkeypatch):
+        # Enabling restart says this instance offers it. It does not say every
+        # member of every shared channel may bounce the daemon.
+        #
+        # Popen is stubbed rather than trusted not to be reached: without the
+        # guard this path really does spawn `nerve restart`, so the assertion
+        # that matters is that it was never called, and a run of this test
+        # against unguarded code must not be able to restart the host.
+        spawned = []
+        import subprocess
+
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: spawned.append(a) or MagicMock(),
+        )
+        channel = self._ch(commands=["restart"])
+        said = await self._run_in(channel, "restart", "C1")
+        assert "only runs in a direct message" in said
+        assert "whole instance" in said
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_host_command_runs_in_a_dm(self, monkeypatch):
+        import nerve.cli
+
+        monkeypatch.setattr(nerve.cli, "doctor_report", lambda *a, **k: "REPORT")
+        channel = self._ch(commands=["doctor"])
+        said = await self._run_in(channel, "doctor", "D1")
+        assert "REPORT" in said
+        assert "direct message" not in said
+
+    @pytest.mark.asyncio
+    async def test_a_conversation_scoped_command_still_works_in_a_channel(self):
+        # The guard must not widen to these. `stop` picks among this channel's
+        # own thread sessions, and `reply` answers a question delivered here —
+        # which is what notifications.slack_channel_id targets.
+        channel = self._ch()
+        channel.router.list_conversation_sessions = AsyncMock(return_value=[])
+        said = await self._run_in(channel, "stop", "C1")
+        assert "only runs in a direct message" not in said
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_quotes_the_command_the_caller_typed(self):
+        # Slack registers a slash command workspace-wide, so a second instance
+        # in one workspace must register a different one.
+        channel = self._ch(commands=["reply"])
+        said = await self._run_in(channel, "restart", "C1", cmd="/nerve-dev")
+        assert "`/nerve-dev restart`" in said
+        assert "/nerve " not in said
+
+    @pytest.mark.asyncio
+    async def test_a_payload_with_no_command_name_still_reads_sensibly(self):
+        channel = self._ch(commands=["reply"])
+        said = await self._run_in(channel, "restart", "C1")
+        assert "`/nerve restart`" in said
+
+    def test_help_marks_the_entries_that_will_refuse_here(self):
+        enabled = frozenset({"reply", "restart"})
+        in_dm = SlackChannel._help_text(enabled, "/nerve", dm=True)
+        in_channel = SlackChannel._help_text(enabled, "/nerve", dm=False)
+        assert "(DM only)" not in in_dm
+        assert "`/nerve restart` — restart the daemon (DM only)" in in_channel
+        # A conversation-scoped command is never marked.
+        assert "reply <text>` — answer the latest pending question" in in_channel
+        assert "reply <text>` — answer the latest pending question (DM only)" \
+            not in in_channel
+
+    def test_help_renames_with_the_command(self):
+        text = SlackChannel._help_text(frozenset({"reply"}), "/nerve-dev")
+        assert "`/nerve-dev reply <text>`" in text
+        assert "/nerve reply" not in text
+
     def test_both_are_still_available_on_request(self):
         enabled = self._ch(commands=["sessions", "reply"]).enabled_commands
         assert enabled == frozenset({"sessions", "reply"})
