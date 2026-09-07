@@ -44,6 +44,7 @@ from nerve.channels.slack_presentation import (
 from nerve.config import (
     SLACK_ALL_COMMANDS,
     SLACK_DEFAULT_COMMANDS,
+    SLACK_HOST_COMMANDS,
     NerveConfig,
 )
 
@@ -51,6 +52,18 @@ if TYPE_CHECKING:
     from nerve.channels.router import ChannelRouter
 
 logger = logging.getLogger(__name__)
+
+# The slash command the shipped manifest registers. Only a fallback: the real
+# name comes off each payload, because Slack registers a command workspace-wide
+# and a workspace running two instances has to give the second one a different
+# one. Load-bearing for the paths that have no payload to read — a card button
+# is not a slash invocation, but the text it answers with still names one.
+_DEFAULT_SLASH_COMMAND = "/nerve"
+# Subcommands that refuse outside a DM, for the two unrelated reasons: a slash
+# payload carries no thread to bind a session to, and a host command is not a
+# per-conversation act. Only used to annotate help; each gate refuses for
+# itself and says which reason applies.
+_DM_ONLY_COMMANDS = ("sessions", "new", *SLACK_HOST_COMMANDS)
 
 # chat.update is limited to roughly one call per second per channel.
 EDIT_INTERVAL = 1.2
@@ -1378,16 +1391,22 @@ class SlackChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     async def _handle_slash_command(self, payload: dict[str, Any]) -> None:
-        """Handle ``/nerve <subcommand>``.
+        """Handle ``<command> <subcommand>``.
 
         One command with subcommands rather than one command per action:
         Slack registers commands per workspace, so ``/new`` and ``/stop``
         would collide with every other app installed there.
+
+        The command's own name is read from the payload rather than assumed
+        to be ``/nerve``. A workspace running more than one instance has to
+        give each app a distinct command, since that registration is
+        workspace-wide, and every reply here quotes the name back.
         """
         user_id = payload.get("user_id") or ""
         channel_id = payload.get("channel_id") or ""
         if not user_id or not channel_id:
             return
+        cmd = payload.get("command") or _DEFAULT_SLASH_COMMAND
 
         channel_type = "im" if channel_id.startswith("D") else "channel"
         if not await self._authorize(user_id, channel_id, channel_type):
@@ -1411,9 +1430,9 @@ class SlackChannel(BaseChannel):
             known = sub in SLACK_ALL_COMMANDS
             await self._respond_ephemeral(
                 channel_id, user_id,
-                f"`/nerve {sub}` is turned off for this workspace."
+                f"`{cmd} {sub}` is turned off for this workspace."
                 if known
-                else f"No such command `/nerve {sub}`.",
+                else f"No such command `{cmd} {sub}`.",
             )
             return
 
@@ -1423,7 +1442,22 @@ class SlackChannel(BaseChannel):
             await self._respond_ephemeral(
                 channel_id,
                 user_id,
-                self._THREADED_CHANNEL_REFUSAL.format(sub=sub),
+                self._THREADED_CHANNEL_REFUSAL.format(sub=sub, cmd=cmd),
+            )
+            return
+
+        # A host command is refused in a shared channel whatever the allow
+        # lists say. `commands` decides whether this instance offers it at
+        # all; it cannot say "yes, but not to everyone in a shared room",
+        # and a restart is not a per-conversation act. A DM is already one
+        # authorized member talking to this instance alone, so it stays the
+        # place to run one.
+        if sub in SLACK_HOST_COMMANDS and not self._has_slash_session_key(channel_id):
+            await self._respond_ephemeral(
+                channel_id,
+                user_id,
+                f"`{cmd} {sub}` acts on the whole instance, not on this "
+                f"channel, so it only runs in a direct message with the bot.",
             )
             return
 
@@ -1453,17 +1487,30 @@ class SlackChannel(BaseChannel):
                 stderr=subprocess.DEVNULL,
             )
         elif sub == "reply":
-            await self._cmd_reply(channel_id, user_id, " ".join(rest))
+            await self._cmd_reply(channel_id, user_id, " ".join(rest), cmd)
         else:
             await self._respond_ephemeral(
-                channel_id, user_id, self._help_text(enabled),
+                channel_id, user_id,
+                self._help_text(
+                    enabled, cmd, dm=self._has_slash_session_key(channel_id),
+                ),
             )
 
     @staticmethod
-    def _help_text(enabled: frozenset[str]) -> str:
-        """Help listing only what this workspace can actually run."""
+    def _help_text(
+        enabled: frozenset[str], cmd: str = _DEFAULT_SLASH_COMMAND,
+        *, dm: bool = True,
+    ) -> str:
+        """Help listing only what this workspace can actually run.
+
+        ``dm`` marks the entries that will refuse where the reader is
+        standing. Listing them unannotated in a channel invites a command
+        that answers with a refusal, and dropping them entirely hides that
+        the instance has them at all.
+        """
         lines = [
-            (name, f"• `/nerve {usage}` — {what}")
+            (name, f"• `{cmd} {usage}` — {what}"
+                   + ("" if dm or name not in _DM_ONLY_COMMANDS else " (DM only)"))
             for name, usage, what in (
                 ("sessions", "sessions", "list and switch sessions"),
                 ("new", "new [title]", "stop the current session, start a new one"),
@@ -1477,13 +1524,13 @@ class SlackChannel(BaseChannel):
             if name in enabled
         ]
         if not lines:
-            return "No `/nerve` commands are enabled for this workspace."
+            return f"No `{cmd}` commands are enabled for this workspace."
         return "*Nerve commands*\n" + "\n".join(line for _, line in lines)
 
     _THREADED_CHANNEL_REFUSAL = (
-        "`/nerve {sub}` needs a thread to bind the session to, and Slack does "
-        "not run `/nerve` inside one. Every new mention in this channel "
-        "opens its own thread and session. Use `/nerve stop` to select a "
+        "`{cmd} {sub}` needs a thread to bind the session to, and Slack does "
+        "not run `{cmd}` inside one. Every new mention in this channel "
+        "opens its own thread and session. Use `{cmd} stop` to select a "
         "running thread, or use this command in a DM."
     )
 
@@ -1676,12 +1723,15 @@ class SlackChannel(BaseChannel):
             else f"☆ Unstarred `{session_id}` — normal auto-close applies.",
         )
 
-    async def _cmd_reply(self, channel_id: str, user_id: str, answer: str) -> None:
+    async def _cmd_reply(
+        self, channel_id: str, user_id: str, answer: str,
+        cmd: str = _DEFAULT_SLASH_COMMAND,
+    ) -> None:
         if not answer:
             await self._respond_ephemeral(
                 channel_id,
                 user_id,
-                "Usage: `/nerve reply <your answer>`",
+                f"Usage: `{cmd} reply <your answer>`",
             )
             return
         if not self._notification_service:
@@ -1877,7 +1927,14 @@ class SlackChannel(BaseChannel):
         ):
             await self._replace_via_url(
                 response_url,
-                self._THREADED_CHANNEL_REFUSAL.format(sub="sessions"),
+                # A card interaction is not a slash invocation, so there is no
+                # payload naming the command. The shipped default is the best
+                # available guess; an instance that renamed its command reads
+                # one wrong word in a refusal it reached by clicking, which is
+                # better than threading a name through every card.
+                self._THREADED_CHANNEL_REFUSAL.format(
+                    sub="sessions", cmd=_DEFAULT_SLASH_COMMAND,
+                ),
             )
             return
 
