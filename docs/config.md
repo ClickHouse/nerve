@@ -1238,6 +1238,27 @@ Slack slash-command payloads have no thread ID. In a shared channel, `new` and
 `sessions` therefore refuse, while `stop`, `star`, and `unstar` select among
 that channel's active thread sessions. Commands work normally in DMs.
 
+`doctor` and `restart` are **DM-only**, whatever the allow lists say. Enabling
+one decides whether this instance offers it; it does not decide that every
+member of a shared channel may bounce the daemon, and `commands` is one flat
+list that cannot say the second thing. A DM is already one authorized member
+talking to this instance alone. The conversation-scoped commands are
+unaffected: `stop`, `star` and `unstar` reach only that channel's own thread
+sessions, and `reply` answers a question already delivered there — which is
+what `notifications.slack_channel_id` targets. `<command> help` marks the
+entries that will refuse where it is run.
+
+### More than one instance in a workspace
+
+Slack registers a slash command per **workspace**, not per app, so two Nerve
+instances cannot both own `/nerve`. Give the second app its own command in its
+manifest — `/nerve-dev`, say. Nothing else changes: the subcommand dispatch
+reads the invoked name off each payload rather than assuming `/nerve`, so every
+reply, refusal and help listing quotes back whatever the caller typed. Socket
+Mode delivers an event to only one connection per app, so each instance needs
+its **own app** — a second instance sharing one app's tokens would take events
+away from the first rather than run beside it.
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |

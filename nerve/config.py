@@ -1011,6 +1011,19 @@ SLACK_ALL_COMMANDS: tuple[str, ...] = (
 SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
     "new", "stop", "star", "unstar", "reply",
 )
+# Subcommands that act on the host rather than on the conversation they were
+# typed in, and are refused in a shared channel however the allow lists read.
+# Enabling one is a decision about this instance; letting any member of a
+# shared channel invoke it is a second decision, and `commands` — one flat
+# list — cannot express the difference.
+#
+# The rest stay channel-usable because they cannot reach past the conversation:
+# `stop`, `star` and `unstar` choose among that channel's own thread sessions,
+# and `reply` answers a question already delivered there, which is the whole
+# point of `notifications.slack_channel_id`. `sessions` and `new` are refused
+# in a channel as well, for the unrelated reason that a slash payload carries
+# no thread to bind a session to — see ``_THREADED_CHANNEL_REFUSAL``.
+SLACK_HOST_COMMANDS: tuple[str, ...] = ("doctor", "restart")
 
 
 def _slack_commands(raw: object) -> list[str] | None:
