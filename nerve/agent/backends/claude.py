@@ -208,6 +208,7 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             ev.NormalizedUsage.from_anthropic(message.usage)
             if message.usage else None
         )
+        status, error = _result_outcome(message)
         out.append(ev.TurnCompleted(
             native_session_id=message.session_id,
             model=None,  # claude reports the model per AssistantMessage
@@ -218,10 +219,33 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             duration_ms=getattr(message, "duration_ms", None),
             duration_api_ms=getattr(message, "duration_api_ms", None),
             num_turns=getattr(message, "num_turns", None),
-            status="completed",
+            status=status,
+            error=error,
         ))
 
     return out
+
+
+def _result_outcome(message: ResultMessage) -> tuple[ev.TurnStatus, str | None]:
+    reason = getattr(message, "terminal_reason", None)
+    if reason in {"aborted_streaming", "aborted_tools"}:
+        return "interrupted", reason.replace("_", " ")
+
+    subtype = getattr(message, "subtype", "")
+    if not getattr(message, "is_error", False) and subtype == "success":
+        return "completed", None
+
+    errors = getattr(message, "errors", None)
+    if errors:
+        detail = "; ".join(errors)
+    elif reason == "max_turns":
+        turns = getattr(message, "num_turns", None)
+        detail = f"max turns ({turns}) exhausted" if turns is not None else "max turns exhausted"
+    elif status := getattr(message, "api_error_status", None):
+        detail = f"API error (HTTP {status})"
+    else:
+        detail = (reason or subtype or "Claude turn failed").replace("_", " ")
+    return "failed", detail
 
 
 def _translate_tool_result(
