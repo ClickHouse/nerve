@@ -3575,8 +3575,20 @@ def lockdown_machine_local_notes(
 # YAML keys that are intentionally not dataclass fields — keyed by dotted
 # prefix ("" is the top level). claude_oauth_token / github_token are read
 # from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+#
+# The `<channel>.source` entries are the transport's own spelling of
+# ChannelSourceConfig's `allow_conversations` / `deny_conversations`:
+# `from_dict` reads `allow_{subject}`, so Slack writes `allow_channels` and
+# Telegram `allow_chats`. The validator compares against dataclass field
+# names, which inverts the answer without these — the two spellings that
+# work would be reported as ignored, and `allow_conversations`, which no
+# transport ever reads, would validate clean. Listing them here rather than
+# teaching the walk about the remap keeps a real typo (`allow_channel`)
+# reported, which making the subtree opaque would not.
 _EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
     "": {"claude_oauth_token", "github_token"},
+    "slack.source": {"allow_channels", "deny_channels"},
+    "telegram.source": {"allow_chats", "deny_chats"},
 }
 
 # Subtrees we don't descend into: free-form mappings or lists of mappings
