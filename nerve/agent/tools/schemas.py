@@ -832,6 +832,32 @@ SEND_FILE_SCHEMA = {
     "required": ["file_path"],
 }
 
+SEND_CHANNEL_MESSAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "channel": {
+            "type": "string",
+            "description": (
+                "Transport to send through, e.g. 'slack'. This is not the "
+                "conversation — that is 'target'."
+            ),
+        },
+        "target": {
+            "type": "string",
+            "description": (
+                "Conversation to post to, in that transport's own addressing. "
+                "Slack: a conversation id such as 'C0123ABCD', or "
+                "'C0123ABCD:1700000000.000100' to reply inside a thread."
+            ),
+        },
+        "text": {
+            "type": "string",
+            "description": "Message body, in Markdown.",
+        },
+    },
+    "required": ["channel", "target", "text"],
+}
+
 # ----- MCP admin tools -----
 
 NERVE_API_SCHEMA = {
