@@ -30,12 +30,18 @@ logger = logging.getLogger(__name__)
 
 GITHUB_RELEASES_API = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
 
-# Map platform.machine() → GitHub release asset suffix.
+# Map platform.machine() → GitHub release asset suffix, for Linux only; darwin
+# is resolved directly below. Windows has no entry: the downloader only opens
+# .tar.gz and the project ships Windows builds as .zip.
+#
+# CLIProxyAPI names its 64-bit ARM builds "aarch64", not "arm64". Asking for
+# "arm64" matched no asset on an Apple Silicon Mac or an ARM VPS, and the error
+# ("No CLIProxyAPI asset found for darwin_arm64") reads as a missing build
+# rather than a wrong name.
 _ARCH_MAP: dict[str, str] = {
     "x86_64": "linux_amd64",
-    "aarch64": "linux_arm64",
-    "arm64": "linux_arm64",      # macOS-style
-    "AMD64": "windows_amd64",    # Windows
+    "aarch64": "linux_aarch64",
+    "arm64": "linux_aarch64",    # macOS-style spelling of the same arch
 }
 
 
@@ -45,12 +51,27 @@ def _detect_asset_suffix() -> str:
     machine = platform.machine()
 
     if system == "darwin":
-        return "darwin_arm64" if machine in ("arm64", "aarch64") else "darwin_amd64"
+        return "darwin_aarch64" if machine in ("arm64", "aarch64") else "darwin_amd64"
     if system == "linux":
         mapped = _ARCH_MAP.get(machine)
         if mapped:
             return mapped
     raise RuntimeError(f"Unsupported platform: {system}/{machine}")
+
+
+def _select_asset_url(assets: list[dict[str, Any]], suffix: str) -> str | None:
+    """Return the download URL of the full build for ``suffix``, if published.
+
+    A release carries both ``CLIProxyAPI_<ver>_linux_aarch64.tar.gz`` and
+    ``CLIProxyAPI_<ver>_linux_aarch64_no-plugin.tar.gz``, so the suffix is a
+    substring of two assets and a substring match picks whichever GitHub lists
+    first — lately the stripped no-plugin build. Anchor on the exact tail.
+    """
+    wanted = f"_{suffix}.tar.gz"
+    for asset in assets:
+        if asset["name"].endswith(wanted):
+            return asset["browser_download_url"]
+    return None
 
 
 class ProxyService:
@@ -91,12 +112,7 @@ class ProxyService:
         logger.info("Latest CLIProxyAPI release: %s", tag)
 
         # Find matching asset.
-        asset_url: str | None = None
-        for asset in release.get("assets", []):
-            name: str = asset["name"]
-            if suffix in name and name.endswith(".tar.gz"):
-                asset_url = asset["browser_download_url"]
-                break
+        asset_url = _select_asset_url(release.get("assets", []), suffix)
 
         if not asset_url:
             raise RuntimeError(
