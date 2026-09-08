@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 
 class SourceStore:
@@ -108,6 +111,9 @@ class SourceStore:
     ) -> int:
         """Bulk insert source records into the inbox. Returns count inserted.
 
+        The batch is atomic; if any record cannot be persisted, no records are
+        committed and the exception is propagated.
+
         If a record with the same (source, id) already exists but has different
         metadata or content, the old record is deleted and re-inserted at a
         strictly-higher rowid. This ensures mutable sources (e.g. GitHub
@@ -115,8 +121,6 @@ class SourceStore:
         field changes from "author" to "mention") surface as new messages for
         consumer cursors that already read the old version.
         """
-        import logging
-        logger = logging.getLogger(__name__)
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(days=ttl_days)).isoformat()
         now_iso = now.isoformat()
@@ -190,7 +194,11 @@ class SourceStore:
                         )
                     inserted += 1
                 except Exception as e:
-                    logger.warning("Failed to insert source message %s: %s", r.id, e)
+                    logger.warning(
+                        "Failed to persist source message %s/%s: %s",
+                        source, r.id, e,
+                    )
+                    raise
         return inserted
 
     async def update_source_messages_processed(
