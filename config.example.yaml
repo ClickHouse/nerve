@@ -100,15 +100,30 @@ gateway:
 # Channels
 telegram:
   enabled: true
-  # DM authorization:
+  # Live-message authorization in private and group chats:
   #   pairing — only users in allowed_users may talk to the bot. New users
   #             authorize with a one-time code: run `nerve pair` on the
-  #             server, then send the bot `/pair <code>`. Paired IDs are
-  #             persisted to config.local.yaml automatically.
+  #             server, then send the bot `/pair <code>` in a private chat.
+  #             Paired IDs are persisted to config.local.yaml automatically.
   #   open    — anyone can talk to the bot (dangerous: full agent access).
   dm_policy: pairing
-  # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
+  # allowed_users: [123456789]   # users allowed to use the bot (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  #
+  # Feed the source inbox from watched group chats, reaching it as the source
+  # "telegram:observed". This grant is independent of allowed_users: a sender
+  # who cannot use the bot may still reach the source. A live-routed message is
+  # not collected unless include_handled_messages is true. Only numeric IDs may
+  # grant; titles and @usernames can only deny. Private chats, other bots, and
+  # /pair commands are never collected. With privacy mode enabled, a non-admin
+  # bot does not receive ordinary group messages. Make it an admin or disable
+  # privacy mode with BotFather.
+  # See docs/sources.md before enabling.
+  # source:
+  #   enabled: true
+  #   allow_chats: ["-1001234567890"]
+  #   deny_senders: ["12345"]
+  #   include_handled_messages: false   # true also collects live-routed messages
 
 slack:
   # Omitting this key leaves Slack off until both tokens below are set, so an
@@ -152,6 +167,34 @@ slack:
   #   [all]    — everything, including doctor and restart
   # doctor/restart affect the host; sessions lists other channels. Opt in.
   # commands: [sessions, new, stop, reply]
+  #
+  # Feed the source inbox from watched channels, reaching it as the source
+  # "slack:observed", where poll_source and the `messages` cron gate read it.
+  # Nothing here starts an agent turn.
+  #
+  # A SEPARATE grant from the access rules above, decided independently of
+  # them: those say who may drive the agent, this says whose traffic may reach
+  # its inbox. So an empty allow_channels collects NOTHING rather than
+  # everything. A mention from someone access refuses is still collected; a
+  # live-routed message is not collected unless include_handled_messages is true.
+  # DMs (group DMs included), other apps, and the bot's own posts are never
+  # collected.
+  #
+  # allow_channels takes a channel ID or a channel name, with globs and a
+  # leading "#" tolerated; deny_channels the same. allow_senders takes a
+  # member ID, handle, or email — a display name can only ever deny, since
+  # its owner picks it. Prefer uppercase IDs: everything else uses cached Slack
+  # API lookups.
+  #
+  # Everything collected is untrusted input: the grant decides whose messages
+  # are kept, not whether their contents can be believed. See docs/sources.md.
+  # source:
+  #   enabled: true
+  #   allow_channels: ["C0456DEF", "eng-*"]
+  #   deny_channels: ["*-social"]
+  #   deny_senders: ["*-bot"]
+  #   include_handled_messages: false   # true also collects live-routed messages
+  #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
 # default rather than adding to it, so name every transport you want. A
