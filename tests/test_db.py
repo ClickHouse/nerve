@@ -1756,3 +1756,73 @@ class TestSetCronLogSession:
 
         logs = await db.get_cron_logs(job_id="job-live2")
         assert logs[0]["session_id"] == "cron:job-live2:20260610-130000"
+
+
+class TestChannelSessionsForConversation:
+    """One conversation can own several sessions — a Slack channel keys one
+    per thread — so a caller holding only the conversation needs the set.
+    """
+
+    async def _seed(self, db, mapping, statuses=None):
+        statuses = statuses or {}
+        for channel_key, session_id in mapping.items():
+            await db.create_session(session_id, title=f"t-{session_id}")
+            if session_id in statuses:
+                await db.update_session_fields(
+                    session_id, {"status": statuses[session_id]},
+                )
+            await db.set_channel_session(channel_key, session_id)
+
+    @pytest.mark.asyncio
+    async def test_it_finds_every_thread_under_one_channel(self, db):
+        await self._seed(db, {
+            "slack:C1": "base",
+            "slack:C1:1.0": "thread_a",
+            "slack:C1:2.0": "thread_b",
+        })
+        rows = await db.list_channel_sessions_for_conversation("slack:C1")
+        assert {r["session_id"] for r in rows} == {"base", "thread_a", "thread_b"}
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_bleed_into_a_longer_channel_id(self, db):
+        # "slack:C1" is a prefix of "slack:C12" as a string.
+        await self._seed(db, {"slack:C1": "mine", "slack:C12": "theirs"})
+        rows = await db.list_channel_sessions_for_conversation("slack:C1")
+        assert {r["session_id"] for r in rows} == {"mine"}
+        rows = await db.list_channel_sessions_for_conversation("slack:C12")
+        assert {r["session_id"] for r in rows} == {"theirs"}
+
+    @pytest.mark.asyncio
+    async def test_wildcards_in_the_key_are_escaped(self, db):
+        # An unescaped _ or % would silently widen the match.
+        await self._seed(db, {"slack:C_1": "literal", "slack:CX1": "other"})
+        rows = await db.list_channel_sessions_for_conversation("slack:C_1")
+        assert {r["session_id"] for r in rows} == {"literal"}
+
+    @pytest.mark.asyncio
+    async def test_a_mapping_cannot_point_at_a_missing_session(self, db):
+        # channel_sessions.session_id is a foreign key, so the join in the
+        # prefix query is for the title and status, not to filter orphans —
+        # there are none to filter.
+        import sqlite3
+
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.set_channel_session("slack:C1:9.9", "never-created")
+
+    @pytest.mark.asyncio
+    async def test_excluded_statuses_are_left_out(self, db):
+        await self._seed(
+            db,
+            {"slack:C1:1.0": "live", "slack:C1:2.0": "gone"},
+            statuses={"gone": "archived"},
+        )
+        rows = await db.list_channel_sessions_for_conversation(
+            "slack:C1", exclude_statuses=("archived",),
+        )
+        assert {r["session_id"] for r in rows} == {"live"}
+
+    @pytest.mark.asyncio
+    async def test_rows_carry_the_session_title(self, db):
+        await self._seed(db, {"slack:C1:1.0": "s1"})
+        rows = await db.list_channel_sessions_for_conversation("slack:C1")
+        assert rows[0]["title"] == "t-s1"

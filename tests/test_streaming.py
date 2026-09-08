@@ -1,10 +1,43 @@
 """Tests for nerve.agent.streaming — StreamBroadcaster bounded buffers."""
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nerve.agent.streaming import StreamBroadcaster
+from nerve.channels.base import ChannelCapability, ChannelConstraints
+from nerve.channels.stream_adapter import StreamAdapter
+
+
+@pytest.mark.asyncio
+class TestEditThrottle:
+    """The interval has to hold across a failed edit."""
+
+    @staticmethod
+    def _adapter():
+        channel = MagicMock()
+        channel.capabilities = (
+            ChannelCapability.SEND_TEXT | ChannelCapability.STREAMING
+        )
+        channel.constraints = ChannelConstraints(
+            max_message_length=4000,
+            min_edit_interval=1.2,
+            supports_message_edit=True,
+        )
+        channel.format_response = lambda t: t
+        channel.edit_message = AsyncMock(side_effect=RuntimeError("429"))
+        adapter = StreamAdapter(channel, "C1", "s1")
+        adapter._placeholder_id = "1.1"
+        return adapter, channel
+
+    async def test_a_failed_edit_still_holds_the_interval(self):
+        # Leaving the stamp unset made every following token retry at once,
+        # and each retry can sleep on a rate limit inside the token loop.
+        adapter, channel = self._adapter()
+        for _ in range(20):
+            await adapter._handle_token("x")
+        assert channel.edit_message.await_count == 1
 
 
 @pytest.mark.asyncio

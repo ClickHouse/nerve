@@ -78,8 +78,12 @@ Abstract communication layer with three components:
 - **ChannelRouter** — centralized session resolution, streaming adapter lifecycle, interactive tool routing, and cron output delivery. Replaces per-channel session management.
 - **StreamAdapter** — translates `StreamBroadcaster` events into channel-appropriate output (edit-in-place for Telegram, accumulated send for simple channels). Created per inbound message.
 
+- **Access matching** (`access.py`) — transport-neutral identity aliases and fail-closed allow/deny pattern matching. Channels compose these primitives into their own policy before creating an `InboundMessage`.
+- **Archives** (`archives.py`) — bounded one-level ZIP unpacking shared by Telegram and Slack. The download cap is on compressed bytes, so entry count, per-entry and aggregate uncompressed size, and compression ratio are all checked against the archive directory before an entry is read.
+
 Implementations:
 - **Telegram** — python-telegram-bot v21+ with partial message streaming (edit-in-place, 1.5s rate limit), inline keyboard buttons for notification questions, `/reply` command for free-text answers
+- **Slack** — slack_sdk Socket Mode (outbound WebSocket, no public URL) with partial streaming via `chat.update`, Block Kit buttons, `/nerve` slash command, and per-thread sessions. `SlackAccessPolicy` (`slack_access.py`) composes user, channel, and DM guardrails; in channels the bot answers only on mention or in a thread it already owns.
 - **Web** — Passive channel using gateway WebSocket
 
 Adding a new channel (Discord, WhatsApp, etc.) requires implementing ~5 methods and zero session/routing logic.

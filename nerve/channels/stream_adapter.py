@@ -132,13 +132,17 @@ class StreamAdapter:
             return
 
         async with self._edit_lock:
+            # Stamped before the attempt. A failed edit still has to hold the
+            # interval, or every later token retries at once and each retry
+            # can sleep on a rate limit inside the agent's token loop.
+            self._last_edit = asyncio.get_event_loop().time()
             try:
                 indicator = STREAMING_INDICATOR
                 display = self._truncate(display, reserve=len(indicator))
                 await self.channel.edit_message(
                     self.target, self._placeholder_id, display + indicator,
+                    throttle=True,
                 )
-                self._last_edit = now
             except Exception:
                 pass  # Edit failures are non-fatal
 
@@ -170,8 +174,14 @@ class StreamAdapter:
                     await self.channel.delete_message(self.target, placeholder_id)
                 except Exception:
                     pass  # Duplicate is better than lost response
-        elif not self._supports_streaming:
-            # Non-streaming channel: send the accumulated response as one message
+        elif not self._supports_streaming or (
+            self._supports_edit and not self._placeholder_id
+        ):
+            # Non-streaming channel, or an edit-in-place channel whose
+            # placeholder never got created: send the accumulated response as
+            # one message. Without the second case a channel that reports a
+            # failed placeholder as None drops the entire reply — it matches
+            # neither the edit branch above nor a non-streaming channel.
             text = self._normalize_text(self._buffer)
             if text:
                 formatted = self.channel.format_response(text)

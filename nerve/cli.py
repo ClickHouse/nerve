@@ -1110,6 +1110,44 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] Telegram disabled")
 
+    # Check Slack
+    if config.slack.enabled:
+        missing = [
+            name for name, value in (
+                ("bot_token", config.slack.bot_token),
+                ("app_token", config.slack.app_token),
+            ) if not value
+        ]
+        if missing:
+            errors.append(
+                f"[ERR] Slack enabled but {', '.join(missing)} not set "
+                "(Socket Mode needs both)"
+            )
+        else:
+            lines.append(f"[OK] Slack bot token: ...{config.slack.bot_token[-4:]}")
+            slack = config.slack
+            if not (
+                slack.allow_users
+                or slack.allow_channels
+                or slack.allow_direct_messages
+            ):
+                warnings.append(
+                    "[WARN] slack.allow_users and slack.allow_channels are "
+                    "empty and slack.allow_direct_messages is false — the bot "
+                    "refuses every message. Add your Slack member id to "
+                    "slack.allow_users"
+                )
+            else:
+                lines.append(
+                    f"[OK] Slack guardrails: {len(slack.allow_users)} allowed "
+                    f"user(s), {len(slack.allow_channels)} allowed channel(s), "
+                    f"{len(slack.deny_users) + len(slack.deny_channels)} deny "
+                    f"rule(s), direct messages "
+                    f"{'allowed' if slack.allow_direct_messages else 'refused'}"
+                )
+    else:
+        lines.append("[--] Slack disabled")
+
     # Check SSL
     if config.gateway.ssl.enabled:
         if config.gateway.ssl.cert and config.gateway.ssl.cert.exists():

@@ -16,7 +16,7 @@
 
 ---
 
-Nerve is a self-hosted runtime for AI agents, built around the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk). It gives agents everything they need to be useful long-term: persistent memory, scheduled execution, task management, learnable skills, and channels to reach you through — web UI, Telegram, or autonomous cron jobs.
+Nerve is a self-hosted runtime for AI agents, built around the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk). It gives agents everything they need to be useful long-term: persistent memory, scheduled execution, task management, learnable skills, and channels to reach you through — web UI, Telegram, Slack, or autonomous cron jobs.
 
 Ship a **personal assistant** that develops a personality, remembers your preferences, and manages your inbox. Or deploy a **worker agent** that monitors your CI, reviews PRs, and fixes flaky tests — all plan-driven with human approval. Same engine, different mission.
 
@@ -121,6 +121,18 @@ Powered by `python-telegram-bot` v21+.
 - Inline keyboard buttons for interactive tool questions
 - `/reply` command for free-text answers
 - Configurable DM policy (`open` or `pairing`)
+
+### 💬 Slack Bot
+
+Reach your agent where your team already works — a direct message, or a channel
+you have invited it to. Nothing to expose: it connects outwards, so it runs
+behind NAT with no public URL.
+
+- Answers appear as they are written, and stay in the thread you started
+- Each thread is its own conversation, so several people can work in one channel
+- In a channel it stays quiet until you `@mention` it
+- Reply to its questions by pressing a button, or send it a file to read
+- You decide who may talk to it and where — by person, by channel, or both
 
 ### ⏰ Cron Jobs
 
@@ -231,7 +243,8 @@ nerve (single Python process)
 │
 ├── Channels
 │   ├── Web — passive WebSocket channel
-│   └── Telegram — bot with streaming + inline keyboards
+│   ├── Telegram — bot with streaming + inline keyboards
+│   └── Slack — bot with streaming + buttons, per-thread sessions
 │
 ├── Cron (APScheduler)
 │   ├── AI jobs (isolated / persistent / main session modes)

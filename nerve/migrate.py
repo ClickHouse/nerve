@@ -127,7 +127,8 @@ _SECRET_VALUE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
     r"sk-[A-Za-z0-9_-]{20,}"                        # OpenAI / Anthropic-style keys
     r"|gh[pousr]_[A-Za-z0-9]{20,}"                  # GitHub tokens
-    r"|xox[abposr]-[A-Za-z0-9-]{12,}"               # Slack tokens
+    r"|xox[abposr]-[A-Za-z0-9-]{12,}"               # Slack bot/user tokens
+    r"|xapp-[A-Za-z0-9-]{12,}"                      # Slack app-level tokens
     r"|AKIA[0-9A-Z]{12,}"                           # AWS access key ids
     r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."   # JWTs
     r")"
@@ -218,6 +219,7 @@ _MACHINE_LOCAL_PATHS = frozenset({
     "proxy",
     "docker",
     "telegram.enabled",
+    "slack.enabled",
     "sync.gmail.accounts",
     # Written into config.yaml after the fact, once the wizard has paired the
     # external agents this box runs. The gateway also rewrites it on every
