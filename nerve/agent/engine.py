@@ -254,6 +254,7 @@ class AgentEngine:
         # survives restarts without re-firing on every resume.
         self._observed_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
+        self._channel_runtimes: dict[str, Any] = {}
         # Gateways expose an ephemeral plaintext MCP listener on loopback for
         # co-located Codex processes. The gateway fills this after the listener
         # starts; the callable passed to CodexBackend reads it lazily.
@@ -713,6 +714,14 @@ class AgentEngine:
     def register_channel(self, channel: Any) -> None:
         """Register a channel with the router."""
         self.router.register(channel)
+
+    def register_channel_runtime(self, name: str, runtime: Any) -> None:
+        """Publish the lifecycle owner for a dynamically managed channel."""
+        self._channel_runtimes[name] = runtime
+
+    def get_channel_runtime(self, name: str) -> Any | None:
+        """Return a channel lifecycle owner, if one was installed."""
+        return self._channel_runtimes.get(name)
 
     # ------------------------------------------------------------------ #
     #  File snapshot for diff tracking                                     #

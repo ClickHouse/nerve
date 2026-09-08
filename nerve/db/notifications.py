@@ -6,6 +6,17 @@ import json
 from datetime import datetime, timezone
 
 
+def _loads_object(raw: object) -> dict:
+    """Parse a JSON column into a dict, tolerating NULL and bad values."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 class NotificationStore:
     """Mixin providing notification CRUD operations."""
 
@@ -96,23 +107,94 @@ class NotificationStore:
             return [dict(row) async for row in cursor]
 
     async def answer_notification(
-        self, notification_id: str, answer: str, answered_by: str,
+        self,
+        notification_id: str,
+        answer: str,
+        answered_by: str,
+        actor: str | None = None,
     ) -> bool:
+        """Record an answer and retain the transport actor in metadata."""
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
             async with self.db.execute(
-                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                """SELECT metadata FROM notifications
+                   WHERE id = ? AND status = 'pending'""",
                 (notification_id,),
             ) as cursor:
-                if not await cursor.fetchone():
+                row = await cursor.fetchone()
+                if not row:
                     return False
+                metadata = _loads_object(row[0])
+            if actor:
+                metadata["answered_by_actor"] = actor
             await self.db.execute(
                 """UPDATE notifications
-                   SET answer = ?, answered_by = ?, answered_at = ?, status = 'answered'
+                   SET answer = ?, answered_by = ?, answered_at = ?,
+                       status = 'answered', metadata = ?
                    WHERE id = ?""",
-                (answer, answered_by, now, notification_id),
+                (
+                    answer,
+                    answered_by,
+                    now,
+                    json.dumps(metadata),
+                    notification_id,
+                ),
             )
         return True
+
+    async def record_notification_delivery(
+        self,
+        notification_id: str,
+        channel: str,
+        target: str = "",
+        message_id: str = "",
+    ) -> None:
+        """Record or replace a delivery within one transport target."""
+        now = datetime.now(timezone.utc).isoformat()
+        await self._write(
+            """INSERT INTO notification_deliveries
+                   (notification_id, channel, target, message_id, delivered_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(notification_id, channel, target) DO UPDATE SET
+                   message_id = excluded.message_id,
+                   delivered_at = excluded.delivered_at""",
+            (notification_id, channel, target, message_id, now),
+        )
+
+    async def get_notification_delivery(
+        self,
+        notification_id: str,
+        channel: str,
+        target: str,
+    ) -> dict | None:
+        """Return a notification's delivery in one exact channel target."""
+        async with self.db.execute(
+            """SELECT * FROM notification_deliveries
+               WHERE notification_id = ? AND channel = ? AND target = ?""",
+            (notification_id, channel, target),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def find_pending_question_for_delivery(
+        self,
+        channel: str,
+        target: str,
+    ) -> dict | None:
+        """Find the newest pending question delivered to one exact target."""
+        async with self.db.execute(
+            """SELECT n.*, s.title AS session_title
+               FROM notification_deliveries d
+               JOIN notifications n ON n.id = d.notification_id
+               LEFT JOIN sessions s ON n.session_id = s.id
+               WHERE d.channel = ? AND d.target = ?
+                 AND n.status = 'pending' AND n.type = 'question'
+               ORDER BY n.created_at DESC
+               LIMIT 1""",
+            (channel, target),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
     async def dismiss_notification(self, notification_id: str) -> bool:
         async with self._atomic():
