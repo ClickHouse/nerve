@@ -969,11 +969,14 @@ class NotificationService:
             msg = await self._send_telegram_html(bot, chat_id, text, silent=silent)
             msg_id = str(msg.message_id)
 
-        # Cache for reaction context lookups
+        # Cache for reaction context lookups, and record the reply route so a
+        # user replying to this notification reaches the session that raised
+        # it (e.g. a cron/background session).
         if msg_id:
             channel = self._get_telegram_channel()
             if channel:
                 channel._cache_message(int(msg_id), chat_id, text)
+                channel._record_reply_route(int(msg_id), chat_id, session_id)
 
         return msg_id
 
