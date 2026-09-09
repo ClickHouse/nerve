@@ -9,10 +9,8 @@ are direct function imports (per design decision); no registry round-trip.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
 
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
@@ -28,10 +26,7 @@ from nerve.agent.tools.schemas import (
 # Direct cross-domain imports — handlers in this file can call task
 # handlers without going through the registry. This is the chosen pattern
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
-from nerve.agent.tools.handlers.tasks import (
-    task_done_handler,
-    task_update_handler,
-)
+from nerve.agent.tools.handlers.tasks import task_update_handler
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +198,19 @@ async def plan_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
 
 async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Wrapper around the shared ``plan_service.approve_plan`` helper.
+
+    The helper holds the validation + session-spawn logic shared with the
+    HTTP route and the Telegram ``/plans`` command. Exceptions are mapped
+    here to user-facing text.
+    """
+    from nerve.agent.plan_service import (
+        PlanNotFound,
+        PlanNotPending,
+        TaskNotFound,
+        approve_plan,
+    )
+
     plan_id = args["plan_id"]
 
     if not ctx.db:
@@ -210,141 +218,51 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.engine:
         return ToolResult.text("Engine not available — cannot spawn implementation session.")
 
-    plan = await ctx.db.get_plan(plan_id)
-    if not plan:
+    try:
+        result = await approve_plan(db=ctx.db, engine=ctx.engine, plan_id=plan_id)
+    except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")
-
-    if plan["status"] != "pending":
-        return ToolResult.text(
-            f"Plan is '{plan['status']}' — only pending plans can be approved."
-        )
-
-    task = await ctx.db.get_task(plan["task_id"])
-    if not task:
-        return ToolResult.text(f"Task not found: {plan['task_id']}")
-
-    now = datetime.now(timezone.utc).isoformat()
-    plan_type = plan.get("plan_type", "generic")
-
-    # Mark as implementing (prevents double-approve)
-    await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
-
-    impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
-    await ctx.engine.sessions.get_or_create(
-        impl_session_id, title=f"Implement: {task['title']}", source="web",
-    )
-    await ctx.db.update_plan(plan_id, impl_session_id=impl_session_id)
-
-    # Update task status — cross-domain call into tasks handler
-    await task_update_handler(ctx, {
-        "task_id": plan["task_id"],
-        "status": "in_progress",
-        "note": f"Plan approved — implementation started (session: {impl_session_id})",
-    })
-
-    task_content = ""
-    if task.get("file_path") and ctx.config:
-        task_file = ctx.config.workspace / task["file_path"]
-        if task_file.exists():
-            task_content = await asyncio.to_thread(
-                task_file.read_text, encoding="utf-8",
-            )
-
-    if plan_type in ("skill-create", "skill-update"):
-        prompt = (
-            f"You are implementing an approved plan for a skill task.\n\n"
-            f"## Task: {task['title']}\n\n"
-            f"### Task Content\n{task_content}\n\n"
-            f"## Approved Plan\n{plan['content']}\n\n"
-            f"## Instructions\n"
-        )
-        if plan_type == "skill-create":
-            prompt += (
-                "The plan contains a skill specification. "
-                "Use the `skill_create` tool to create the skill. "
-                "Extract the name, description, and content from the plan. "
-                "If the plan contains a full SKILL.md with frontmatter, parse out the name and description "
-                "from the frontmatter and use the body as the content.\n"
-            )
-        else:
-            prompt += (
-                "The plan contains a skill revision. "
-                "Use the `skill_update` tool to update the existing skill. "
-                "Pass the skill ID (directory name) as the name parameter and the full SKILL.md content "
-                "(frontmatter + body).\n"
-            )
-        prompt += (
-            "\nAfter the skill is created/updated, mark the task as done using "
-            "`task_done` with a note describing what was done.\n"
-        )
-    else:
-        prompt = (
-            f"You are implementing an approved plan for a task.\n\n"
-            f"## Task: {task['title']}\n\n"
-            f"### Task Content\n{task_content}\n\n"
-            f"## Approved Plan\n{plan['content']}\n\n"
-            f"## Instructions\n"
-            f"Follow the plan step by step. You have full tool access.\n"
-            f"After implementation, verify your changes work correctly.\n"
-            f"If you encounter issues not covered by the plan, use your judgment or ask the user.\n"
-        )
-
-    engine = ctx.engine
-    db = ctx.db
-
-    async def _run_impl():
-        try:
-            await engine.run(
-                session_id=impl_session_id, user_message=prompt, source="web",
-            )
-        except Exception:
-            logger.exception("Implementation session %s failed", impl_session_id)
-            try:
-                await db.update_plan(plan_id, status="failed")
-            except Exception:
-                logger.exception("Failed to mark plan %s as failed", plan_id)
-
-    asyncio.create_task(_run_impl())
+    except TaskNotFound:
+        return ToolResult.text("Task not found for this plan.")
+    except PlanNotPending as exc:
+        return ToolResult.text(str(exc))
 
     return ToolResult.text(
-        f"Plan {plan_id} approved. Implementation session started: {impl_session_id}"
+        f"Plan {result['plan_id']} approved. "
+        f"Implementation session started: {result['impl_session_id']}"
     )
 
 
 async def plan_decline_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Wrapper around the shared ``plan_service.decline_plan`` helper."""
+    from nerve.agent.plan_service import (
+        PlanNotFound,
+        PlanNotPending,
+        TaskNotFound,
+        decline_plan,
+    )
+
     plan_id = args["plan_id"]
     feedback = (args.get("feedback", "") or "").strip()
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
 
-    plan = await ctx.db.get_plan(plan_id)
-    if not plan:
-        return ToolResult.text(f"Plan not found: {plan_id}")
-
-    if plan["status"] != "pending":
-        return ToolResult.text(
-            f"Plan is '{plan['status']}' — only pending plans can be declined."
+    try:
+        result = await decline_plan(
+            db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
         )
+    except PlanNotFound:
+        return ToolResult.text(f"Plan not found: {plan_id}")
+    except TaskNotFound:
+        return ToolResult.text("Task not found for this plan.")
+    except PlanNotPending as exc:
+        return ToolResult.text(str(exc))
 
-    now = datetime.now(timezone.utc).isoformat()
-    fields: dict = {"status": "declined", "reviewed_at": now}
-    if feedback:
-        fields["feedback"] = feedback
-    await ctx.db.update_plan(plan_id, **fields)
-
-    if feedback:
-        note = f"Plan {plan_id} declined — {feedback}"
-    else:
-        note = f"Related plan {plan_id} was closed without a specified reason"
-    await task_done_handler(ctx, {
-        "task_id": plan["task_id"],
-        "note": note,
-    })
-
+    fb = result.get("feedback")
     return ToolResult.text(
         f"Plan {plan_id} declined and task moved to done."
-        + (f" Feedback: {feedback}" if feedback else "")
+        + (f" Feedback: {fb}" if fb else "")
     )
 
 
