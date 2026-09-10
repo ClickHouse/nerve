@@ -165,7 +165,7 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 1. User sends message via Telegram
 2. `TelegramChannel` receives it, resolves active session
 3. `AgentEngine.run()` is called with the message
-4. System prompt is built (SOUL.md + IDENTITY.md + memories)
+4. System prompt is built (SOUL.md + IDENTITY.md + MEMORY.md — identical across sessions); the session id and pre-recalled memories are prepended to the first message
 5. Claude Agent SDK processes the message with tools
 6. Streaming events broadcast to Telegram (edit-in-place) and any WebSocket clients
 7. Final response stored in SQLite

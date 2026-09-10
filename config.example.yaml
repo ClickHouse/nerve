@@ -67,6 +67,12 @@ agent:
   model_discovery: true
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
+  # Keep the appended system prompt byte-identical across sessions so the
+  # exact-prefix prompt cache is shared between them: the session id and the
+  # pre-recalled memories travel in a <session-context> block at the top of
+  # each session's first message instead. false → legacy shape (id + recall
+  # inline in the system prompt; every session start re-writes the cache).
+  static_system_prompt: true
   background_agent_permissions: true  # Background sub-agents (Agent run_in_background) get the same tool permissions as foreground; false denies their Write/Edit/Bash
   # Agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). The CLI gates the
   # SendMessage tool behind this flag while the Agent tool advertises it

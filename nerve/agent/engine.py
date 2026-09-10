@@ -47,8 +47,10 @@ from nerve.agent.interactive import (
     get_handler,
 )
 from nerve.agent.prompts import (
+    build_session_preamble,
     build_system_prompt,
     current_time_str,
+    prepend_session_preamble,
     set_skill_manager,
 )
 from nerve.agent.sessions import SessionManager, SessionStatus
@@ -293,6 +295,14 @@ class AgentEngine:
             )
         )
         self._session_backends: dict[str, str] = {}
+        # Per-session context awaiting delivery (static-prompt mode). The
+        # system prompt is byte-identical across sessions, so the session
+        # id and the frozen recall are rendered separately at client build
+        # (_get_or_create_client) and prepended to the FIRST user message
+        # of the native conversation by _run_inner, which pops the entry.
+        # Keyed by session id; an entry survives a client rebuild that
+        # happens before any turn was sent (the rebuild re-renders it).
+        self._pending_preambles: dict[str, str] = {}
 
     @property
     def config(self) -> NerveConfig:
@@ -1206,12 +1216,31 @@ class AgentEngine:
                 if session_meta.get("cache_ttl") != cache_ttl:
                     meta_updates["cache_ttl"] = cache_ttl
 
+            # Determine if this is a fork
+            is_fork = fork_from is not None
+
+            # Static-prompt mode (agent.static_system_prompt): the session
+            # id and the frozen recall stay OUT of the system prompt so its
+            # bytes are shared across sessions (exact-prefix cache), and
+            # are prepended to the first user message of the native
+            # conversation instead. Deliver when the transcript is fresh
+            # (no resume target), on a fork (new id; the parent's history
+            # carries the parent's), and once for a resumed session that
+            # never received one (created before this mode existed). The
+            # ``preamble_sent`` marker records the delivery so a resume
+            # doesn't repeat it; the transcript replays it on later turns.
+            static_prompt = bool(self.config.agent.static_system_prompt)
+            deliver_preamble = static_prompt and (
+                not sdk_resume_id
+                or is_fork
+                or not session_meta.get("preamble_sent")
+            )
+            if deliver_preamble and session and not session_meta.get("preamble_sent"):
+                meta_updates["preamble_sent"] = True
+
             if meta_updates and session:
                 session_meta.update(meta_updates)
                 await self.db.update_session_metadata(session_id, session_meta)
-
-            # Determine if this is a fork
-            is_fork = fork_from is not None
 
             # Create interactive hub for this session.
             # Non-web sessions (telegram, cron, hook) cannot handle
@@ -1226,9 +1255,10 @@ class AgentEngine:
             register_handler(session_id, handler)
 
             # Render the system prompt (engine-owned: identity files,
-            # frozen recall, skills; the tool list respects the backend's
-            # exclusions so the prompt never advertises a tool this
-            # session's MCP server doesn't serve).
+            # skills; the tool list respects the backend's exclusions so
+            # the prompt never advertises a tool this session's MCP server
+            # doesn't serve). In static mode the id and the frozen recall
+            # are ignored here and go into the preamble below.
             system_prompt = build_system_prompt(
                 workspace=self.config.workspace,
                 session_id=session_id,
@@ -1237,6 +1267,7 @@ class AgentEngine:
                 recalled_memories=recalled_memories or None,
                 skill_summaries=self._collect_skill_summaries(),
                 excluded_tools=backend.excluded_tools(),
+                static=static_prompt,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1308,6 +1339,12 @@ class AgentEngine:
                     session_id, {"sdk_session_id": None},
                 )
                 sdk_resume_id = None
+                # The transcript is fresh after all — it needs the preamble.
+                deliver_preamble = static_prompt
+            if deliver_preamble:
+                self._pending_preambles[session_id] = build_session_preamble(
+                    session_id, source, recalled_memories or None,
+                )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
 
@@ -2665,6 +2702,23 @@ class AgentEngine:
             # rules (e.g. the Claude CLI's slash-command interception).
             turn_input = TurnInput(text=query_text, images=images)
 
+            def _with_session_preamble(base: TurnInput) -> TurnInput:
+                # Leading session-context block (static-prompt mode): the
+                # session id and the frozen recall that the shared system
+                # prompt leaves out. Rendered at client build; popped here
+                # so it ships exactly once — with the FIRST user message of
+                # the native conversation (later turns replay the
+                # transcript). Rebuilt from ``query_text`` so a retry that
+                # re-renders it never stacks two blocks. Like the time
+                # note, not persisted to the DB message (db_text above).
+                preamble = self._pending_preambles.pop(session_id, None)
+                if not preamble:
+                    return base
+                return TurnInput(
+                    text=prepend_session_preamble(query_text, preamble),
+                    images=images,
+                )
+
             # Send query + read response, with auto-retry on runtime crash.
             # The runtime may die during start_turn (TransportDiedError) or
             # during response reading (generic Exception from the stream).
@@ -2695,6 +2749,9 @@ class AgentEngine:
                 metadata=_lf_metadata,
             ):
                 for _attempt in range(2):
+                    # Re-checked per attempt: a crash-retry that rebuilt the
+                    # client on a fresh transcript re-renders the preamble.
+                    turn_input = _with_session_preamble(turn_input)
                     try:
                         await client.start_turn(turn_input)
                     except TransportDiedError as _qerr:

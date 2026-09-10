@@ -35,7 +35,7 @@ memU provides semantic search over conversations and workspace files. It runs em
 1. **Conversation indexing** — When a session closes (daily rotation, shutdown, crash recovery), all context messages are indexed into memU
 2. **Explicit memorize** — The agent can use the `memorize` tool to save specific facts on demand
 3. **Recall** — The agent uses `memory_recall` for semantic search, `conversation_history` for event-date queries, and `memory_records_by_date` for creation/update-date queries
-4. **Pre-recall** — When a new SDK client is created, relevant memories are recalled and injected into the system prompt
+4. **Pre-recall** — When a session starts, relevant memories are recalled (frozen in session metadata and reused on every client rebuild) and delivered in a `<session-context>` block at the top of the session's first message — kept out of the system prompt so its bytes stay identical across sessions and prompt-cacheable (`agent.static_system_prompt`)
 
 ### Session Lifecycle
 

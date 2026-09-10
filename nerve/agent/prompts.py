@@ -1,4 +1,6 @@
-"""System prompt builder — loads SOUL.md, IDENTITY.md, and injects recalled memories."""
+"""System prompt builder — loads SOUL.md, IDENTITY.md, etc. into a
+cross-session-stable system prompt, and renders the per-session preamble
+(session id, recalled memories) that travels with the first user message."""
 
 from __future__ import annotations
 
@@ -103,6 +105,11 @@ def _format_skills_list(skill_summaries: list[dict] | None = None) -> str | None
     return "\n".join(lines)
 
 
+# Wrapper tag for the per-session preamble prepended to a conversation's
+# first user message (see ``prepend_session_preamble``).
+SESSION_CONTEXT_TAG = "session-context"
+
+
 def build_system_prompt(
     workspace: Path,
     session_id: str = "",
@@ -111,11 +118,25 @@ def build_system_prompt(
     timezone_name: str = "America/New_York",
     skill_summaries: list[dict] | None = None,
     excluded_tools: "set[str] | None" = None,
+    static: bool = True,
 ) -> str:
-    """Build the full system prompt for the agent.
+    """Build the system prompt for the agent.
 
-    Loads identity files from workspace, adds session context,
-    and appends any recalled memories from memU.
+    Loads identity files from the workspace, adds the session-context
+    block, the tool list and the skills summary.
+
+    ``static=True`` (default) renders a prompt that is byte-identical for
+    every session of the same workspace, source and tool set: the
+    per-session ``session_id`` and ``recalled_memories`` are accepted for
+    signature compatibility but NOT rendered — they are delivered by
+    :func:`build_session_preamble` at the top of the conversation's first
+    user message instead. Anthropic prompt caching is exact-prefix, so a
+    single differing byte (a session id, a per-session recall list) turns
+    the whole ~100K-token appended block from a cross-session cache READ
+    into a cache WRITE at every session start.
+
+    ``static=False`` restores the legacy shape: session id and recalled
+    memories inline in the system prompt.
     """
     parts: list[str] = []
 
@@ -147,7 +168,24 @@ def build_system_prompt(
     except Exception:
         today = datetime.now().strftime("%Y-%m-%d")
 
-    context = f"""# Session Context
+    if static:
+        # No per-session bytes here (see the docstring): the id and the
+        # recall land in the first user message. The pointer below is
+        # static text, so it costs nothing cache-wise.
+        context = f"""# Session Context
+- **Source:** {source}
+- **Current date:** {today}
+- **Workspace:** {workspace}
+
+Per-session details — this session's id and the memories recalled at \
+session start — are in the `<{SESSION_CONTEXT_TAG}>` block at the top of \
+this conversation's first user message. `mcp__nerve__session_context` \
+returns them live if that message is no longer in context.
+
+You have access to the following custom tools:
+{_format_tool_list(excluded_tools)}"""
+    else:
+        context = f"""# Session Context
 - **Session ID:** {session_id}
 - **Source:** {source}
 - **Current date:** {today}
@@ -162,9 +200,44 @@ You have access to the following custom tools:
     if skills_section:
         parts.append(skills_section)
 
-    # Recalled memories from memU
-    if recalled_memories:
-        memories_text = "\n".join(f"- {m}" for m in recalled_memories)
-        parts.append(f"# Recalled Memories\n\n{memories_text}")
+    # Recalled memories from memU — legacy (non-static) shape only; the
+    # static prompt delivers them via build_session_preamble.
+    if not static and recalled_memories:
+        parts.append(_format_recalled_memories(recalled_memories))
 
     return "\n\n---\n\n".join(parts)
+
+
+def _format_recalled_memories(recalled_memories: list[str]) -> str:
+    memories_text = "\n".join(f"- {m}" for m in recalled_memories)
+    return f"# Recalled Memories\n\n{memories_text}"
+
+
+def build_session_preamble(
+    session_id: str,
+    source: str = "web",
+    recalled_memories: list[str] | None = None,
+) -> str:
+    """Render the per-session context the static system prompt leaves out.
+
+    Returns the markdown block (session id, source, recalled memories)
+    that the engine prepends — wrapped by :func:`prepend_session_preamble`
+    — to the FIRST user message of a native conversation. Later turns
+    replay the transcript, so the block reaches the model exactly once.
+    """
+    context = (
+        "# Session Context\n"
+        f"- **Session ID:** {session_id}\n"
+        f"- **Source:** {source}"
+    )
+    parts = [context]
+    if recalled_memories:
+        parts.append(_format_recalled_memories(recalled_memories))
+    return "\n\n".join(parts)
+
+
+def prepend_session_preamble(text: str, preamble: str) -> str:
+    """Prepend ``preamble`` to a user message inside a ``<session-context>``
+    wrapper so the model can tell the injected context from the prompt."""
+    block = f"<{SESSION_CONTEXT_TAG}>\n{preamble}\n</{SESSION_CONTEXT_TAG}>"
+    return f"{block}\n\n{text}" if text else block
