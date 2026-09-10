@@ -1024,6 +1024,42 @@ class TestInitStatePersistence:
         mode = stat.S_IMODE(os.stat(path).st_mode)
         assert mode == 0o600
 
+    @pytest.mark.skipif(
+        not hasattr(os, "fchmod"),
+        reason="requires fchmod to isolate the post-write chmod failure",
+    )
+    def test_state_file_stays_private_if_chmod_fails(self, monkeypatch) -> None:
+        from nerve.bootstrap import _init_state_file, _save_init_state
+
+        def fail_chmod(*args, **kwargs):
+            raise OSError("chmod failed")
+
+        monkeypatch.setattr(os, "chmod", fail_chmod)
+        previous_umask = os.umask(0)
+        try:
+            _save_init_state(SetupChoices(), {"mode"})
+        finally:
+            os.umask(previous_umask)
+
+        path = _init_state_file()
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+    def test_failed_replace_preserves_existing_checkpoint(self, monkeypatch) -> None:
+        from nerve.bootstrap import _init_state_file, _save_init_state
+
+        _save_init_state(SetupChoices(), {"old"})
+        path = _init_state_file()
+        previous = path.read_text(encoding="utf-8")
+
+        def fail_replace(*args, **kwargs):
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+        _save_init_state(SetupChoices(), {"new"})
+
+        assert path.read_text(encoding="utf-8") == previous
+        assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+
     def test_choices_from_dict_ignores_unknown_keys(self) -> None:
         from nerve.bootstrap import _choices_from_dict
 
