@@ -23,6 +23,7 @@ import yaml
 
 from nerve import paths
 from nerve.config import _expand_path, _interpolate_str, workspace_settings_file
+from nerve.utils.fs import atomic_write_text
 from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
@@ -452,9 +453,7 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
         path = _init_state_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state), encoding="utf-8")
-        os.chmod(path, 0o600)  # contains API keys
+        atomic_write_text(path, json.dumps(state), mode=0o600)
     except OSError:
         pass
 
