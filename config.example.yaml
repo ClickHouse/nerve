@@ -169,6 +169,7 @@ sync:
 memory:
   recall_model: claude-sonnet-4-6
   # embed_model: text-embedding-3-small  # Only needed with openai_api_key
+  # embed_base_url: https://llm.internal/v1  # OpenAI-compatible embeddings endpoint
 
 # Cron — no path keys needed. Cron config lives in <workspace>/config/cron/
 # (system.yaml, jobs.yaml, gates/) and is resolved from the workspace, with a

@@ -87,10 +87,40 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
 
+# Fallback embeddings endpoint when memory.embed_base_url is unset.
+_OPENAI_EMBED_BASE_URL = "https://api.openai.com/v1"
+
 # Max characters for a category breadcrumb in recall() output. A category
 # summary is a whole rolled-up topic document (often 5–20KB); recall must
 # surface it as a short navigable pointer, not dump the document.
 _CATEGORY_BREADCRUMB_MAXLEN = 200
+
+
+def build_embedding_profile(
+    *, openai_api_key: str, embed_base_url: str, embed_model: str,
+) -> dict[str, str] | None:
+    """memU ``embedding`` LLM profile, or None for LLM-based recall.
+
+    Requires ``embed_model`` plus either a key or a base URL. Any endpoint
+    implementing OpenAI ``/v1/embeddings`` is accepted.
+    """
+    if not (openai_api_key or embed_base_url):
+        return None
+    base_url = embed_base_url or _OPENAI_EMBED_BASE_URL
+    if not embed_model:
+        # Without this the API is called with model="".
+        logger.warning(
+            "Embeddings endpoint %s configured but memory.embed_model is empty "
+            "— embeddings disabled, falling back to LLM-based recall", base_url,
+        )
+        return None
+    return {
+        "base_url": base_url,
+        # AsyncOpenAI rejects an unset key; the endpoint may ignore it.
+        "api_key": openai_api_key or "placeholder",
+        "embed_model": embed_model,
+        "client_backend": "sdk",
+    }
 
 
 def _category_breadcrumb(name: str, description: str, summary: str) -> str:
@@ -1663,13 +1693,13 @@ class MemUBridge:
                 },
             }
 
-            if self.config.openai_api_key:
-                llm_profiles["embedding"] = {
-                    "base_url": "https://api.openai.com/v1",
-                    "api_key": self.config.openai_api_key,
-                    "embed_model": self.config.memory.embed_model,
-                    "client_backend": "sdk",
-                }
+            embedding_profile = build_embedding_profile(
+                openai_api_key=self.config.openai_api_key,
+                embed_base_url=self.config.memory.embed_base_url,
+                embed_model=self.config.memory.embed_model,
+            )
+            if embedding_profile is not None:
+                llm_profiles["embedding"] = embedding_profile
 
             resources_dir = paths.nerve_path("memu-resources")
             resources_dir.mkdir(parents=True, exist_ok=True)

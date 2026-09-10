@@ -191,6 +191,8 @@ class SetupChoices:
     mode: str = "personal"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    embeddings_api_endpoint: str = ""  # /v1 base; empty = api.openai.com
+    embeddings_model: str = ""  # Empty = text-embedding-3-small
     use_proxy: bool = False  # Use CLIProxyAPI instead of direct API key
     # Provider
     provider_type: str = "anthropic"  # "anthropic" | "bedrock"
@@ -404,18 +406,24 @@ def _telegram_get_me(token: str, timeout: float = 7.0) -> tuple[bool, str]:
         return (False, str(e))
 
 
-def _check_openai_key(key: str, timeout: float = 7.0) -> tuple[bool, str]:
-    """Validate an OpenAI API key with a models list call."""
+def _check_openai_key(
+    key: str, timeout: float = 7.0, base_url: str = "",
+) -> tuple[bool, str]:
+    """Validate an embeddings endpoint with a models list call.
+
+    ``base_url`` is a ``/v1`` base; empty means OpenAI.
+    """
     import httpx
 
+    root = (base_url or "https://api.openai.com/v1").rstrip("/")
     try:
         resp = httpx.get(
-            "https://api.openai.com/v1/models",
+            f"{root}/models",
             headers={"Authorization": f"Bearer {key}"},
             timeout=timeout,
         )
         if resp.status_code == 200:
-            return (True, "key valid")
+            return (True, "reachable")
         detail = f"HTTP {resp.status_code}"
         try:
             detail = resp.json().get("error", {}).get("message", detail)
@@ -1550,7 +1558,9 @@ class SetupWizard:
             api_status = "API key ✓"
         else:
             api_status = "—"
-        if self.choices.openai_api_key:
+        if self.choices.embeddings_api_endpoint:
+            api_status += "  Embeddings ✓ (self-hosted)"
+        elif self.choices.openai_api_key:
             api_status += "  OpenAI ✓"
         else:
             api_status += "  OpenAI —"
@@ -2057,7 +2067,11 @@ class SetupWizard:
                 "recall_model": "claude-sonnet-4-6",
                 "memorize_model": "claude-sonnet-4-6",
                 "fast_model": "claude-haiku-4-5-20251001",
-                "embed_model": "text-embedding-3-small",
+                "embed_model": self.choices.embeddings_model or "text-embedding-3-small",
+                **(
+                    {"embed_base_url": self.choices.embeddings_api_endpoint}
+                    if self.choices.embeddings_api_endpoint else {}
+                ),
                 "categories": (
                     _PERSONAL_MEMORY_CATEGORIES if self.choices.mode == "personal"
                     else _WORKER_MEMORY_CATEGORIES
@@ -2458,15 +2472,19 @@ class SetupWizard:
                 click.secho(f" ✗ {detail}", fg="red")
                 failures.append("Telegram")
 
-        # --- OpenAI (optional embeddings) ---
-        if self.choices.openai_api_key:
-            click.echo("    · OpenAI API: testing...", nl=False)
-            ok, detail = _check_openai_key(self.choices.openai_api_key)
+        # --- Embeddings (optional) ---
+        if self.choices.openai_api_key or self.choices.embeddings_api_endpoint:
+            endpoint = self.choices.embeddings_api_endpoint
+            label = endpoint or "OpenAI API"
+            click.echo(f"    · Embeddings ({label}): testing...", nl=False)
+            ok, detail = _check_openai_key(
+                self.choices.openai_api_key, base_url=endpoint,
+            )
             if ok:
                 click.secho(f" ✓ {detail}", fg="green")
             else:
                 click.secho(f" ✗ {detail}", fg="red")
-                failures.append("OpenAI")
+                failures.append("Embeddings")
 
         if failures:
             click.echo()
@@ -2566,6 +2584,10 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     # Optional
     choices.mode = os.environ.get("NERVE_MODE", "personal")
     choices.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    choices.embeddings_api_endpoint = os.environ.get(
+        "NERVE_EMBEDDINGS_API_ENDPOINT", "",
+    ).strip()
+    choices.embeddings_model = os.environ.get("NERVE_EMBEDDINGS_MODEL", "").strip()
     default_ws = _DOCKER_WORKSPACE if is_docker else "~/nerve-workspace"
     choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", default_ws))
     choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")

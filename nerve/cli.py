@@ -1085,7 +1085,17 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             errors.append(f"[ERR] Claude API: {detail}")
 
-    if config.openai_api_key:
+    embed_endpoint = config.memory.embed_base_url
+    if embed_endpoint and not config.memory.embed_model:
+        errors.append(
+            f"[ERR] Embeddings endpoint {embed_endpoint} set but memory.embed_model "
+            "is empty (embeddings disabled)"
+        )
+    elif embed_endpoint:
+        lines.append(
+            f"[OK] Embeddings: {config.memory.embed_model} via {embed_endpoint}"
+        )
+    elif config.openai_api_key:
         lines.append(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]} (vector embeddings enabled)")
     else:
         lines.append("[--] OpenAI API key not set (using LLM-based memory recall)")
