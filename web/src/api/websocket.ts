@@ -73,12 +73,14 @@ export class NerveWebSocket {
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private _connected = false;
   private _pending: Record<string, unknown>[] = [];
+  private shouldReconnect = true;
 
   get connected() {
     return this._connected;
   }
 
   connect() {
+    this.shouldReconnect = true;
     if (this.ws?.readyState === WebSocket.OPEN) return;
 
     const token = getToken();
@@ -86,15 +88,18 @@ export class NerveWebSocket {
     const host = window.location.host;
     const url = `${protocol}//${host}/ws${token ? `?token=${token}` : ''}`;
 
-    this.ws = new WebSocket(url);
+    const socket = new WebSocket(url);
+    this.ws = socket;
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (this.ws !== socket) return;
       this._connected = true;
       this.startPing();
       this.flushPending();
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
       try {
         const msg: WSMessage = JSON.parse(event.data);
         this.handlers.forEach((h) => h(msg));
@@ -103,22 +108,29 @@ export class NerveWebSocket {
       }
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
       this._connected = false;
       this.stopPing();
-      this.scheduleReconnect();
+      if (this.shouldReconnect) this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
+    socket.onerror = () => {
+      if (this.ws !== socket) return;
       this._connected = false;
     };
   }
 
   disconnect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.shouldReconnect = false;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.stopPing();
-    this.ws?.close();
+    const socket = this.ws;
     this.ws = null;
+    socket?.close();
     this._connected = false;
     this._pending = [];
   }
@@ -206,7 +218,7 @@ export class NerveWebSocket {
   }
 
   private scheduleReconnect() {
-    if (this.reconnectTimer) return;
+    if (!this.shouldReconnect || this.reconnectTimer !== null) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
