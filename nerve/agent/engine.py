@@ -491,7 +491,9 @@ class AgentEngine:
 
         # Load Claude Code plugin directories for SDK plugins field
         from nerve.config import load_claude_code_plugins
-        self._claude_code_plugins = load_claude_code_plugins()
+        self._claude_code_plugins = load_claude_code_plugins(
+            extra_dirs=self.config.agent.claude_plugin_dirs,
+        )
 
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
@@ -542,7 +544,9 @@ class AgentEngine:
         # reload sees the same config.yaml + workspace/config/settings.yaml that
         # startup loaded.
         self._mcp_servers_cache = load_mcp_servers(self.config.config_dir)
-        self._claude_code_plugins = load_claude_code_plugins()
+        self._claude_code_plugins = load_claude_code_plugins(
+            extra_dirs=self.config.agent.claude_plugin_dirs,
+        )
         await self._sync_mcp_servers_to_db()
         logger.info(
             "MCP config reloaded: %d server(s), %d Claude Code plugin(s)",
