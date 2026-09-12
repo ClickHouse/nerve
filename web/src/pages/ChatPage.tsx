@@ -12,6 +12,7 @@ import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
+import { SessionCreator } from '../components/Chat/ActorLabel';
 import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
 import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
@@ -315,6 +316,13 @@ export function ChatPage() {
                   </span>
                 );
               })()}
+              {/* Who started this chat. Unlike the labels in the session list
+                  and the transcript, this one does not wait for a second
+                  person: the header describes one session, so the answer is
+                  never a repetition, and this is the only place it is spelled
+                  out. A session with no recorded creator — all history, and
+                  anything an ingress did not attribute — renders nothing. */}
+              <SessionCreator actorId={activeSessionRow?.created_by_actor_id} />
               {(() => {
                 const model = activeSessionRow?.model;
                 return model ? (
