@@ -26,7 +26,7 @@ from nerve.cron.jobs import (
     load_jobs,
 )
 from nerve.db import Database
-from nerve.identity import system_actor
+from nerve.identity import Actor, system_actor
 
 if TYPE_CHECKING:
     from nerve.cron.gates import CronGate
@@ -1326,22 +1326,34 @@ class CronService:
             if self.engine.sessions.is_running(session_id):
                 continue
             try:
+                # Resolve the actor BEFORE claiming. Claiming flips
+                # pending -> fired, and a fired row is never selected again,
+                # so anything that fails after it consumes the wakeup without
+                # delivering it: the prompt is gone and no sweep retries it.
+                # Resolved first, a failure leaves the row pending and the
+                # next sweep picks it up.
+                actor = await system_actor(self.db)
                 claimed = await self.db.claim_wakeup(wakeup["id"])
+                if not claimed:
+                    continue
+                self._dispatch_wakeup(session_id, wakeup, actor)
             except Exception as e:
+                # Per wakeup, so one bad row cannot abandon the ones after it.
                 logger.error(
-                    "Failed to claim wakeup %s: %s", wakeup["id"], e,
+                    "Wakeup %s not dispatched: %s", wakeup["id"], e,
+                    exc_info=True,
                 )
                 continue
-            if not claimed:
-                continue
-            await self._dispatch_wakeup(session_id, wakeup)
 
-    async def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
+    def _dispatch_wakeup(
+        self, session_id: str, wakeup: dict, actor: Actor,
+    ) -> None:
         """Spawn the engine run for a claimed wakeup with error logging.
 
-        Async only so the actor is resolved before the task is spawned:
-        an ``await`` inside the task would sit in front of ``engine.run``'s
-        per-session lock and let two due wakeups land out of order.
+        Takes the actor rather than resolving one: the resolution has to
+        happen before the claim above, and doing it inside the spawned task
+        would also put an ``await`` in front of ``engine.run``'s per-session
+        lock, letting two due wakeups land out of order.
         """
         prompt = _resolve_wakeup_prompt(wakeup["prompt"])
         # "Run later" deferrals are scheduled dispatches — fire them through
@@ -1352,11 +1364,10 @@ class CronService:
         logger.info(
             "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
         )
-        # The instance's own tick: a model-scheduled wakeup, or a deferral
-        # this service is delivering. Who wrote a run-later message is
-        # already recorded on the row the route persisted when they composed
-        # it.
-        actor = await system_actor(self.db)
+        # The actor is the instance's own: a model-scheduled wakeup, or a
+        # deferral this service is delivering. Who wrote a run-later message
+        # is already recorded on the row the route persisted when they
+        # composed it.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
