@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import bcrypt
@@ -22,6 +23,9 @@ from nerve.identity import (
     actor_for_sole_account,
     system_actor,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nerve.db import Database
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +252,7 @@ def get_token_from_request(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Not authenticated")
 
 
-def identity_store():
+def identity_store() -> "Database | None":
     """Return the request database, or ``None`` before startup completes."""
     from nerve.gateway.routes._deps import get_deps
 
@@ -259,7 +263,7 @@ def identity_store():
     return getattr(deps, "db", None)
 
 
-async def resolve_actor_from_claims(store, claims: dict) -> Actor:
+async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
     """Resolve verified token claims to their current actor."""
     if claims.get("aud") == MCP_AUDIENCE:
         return await system_actor(store)
@@ -298,7 +302,7 @@ async def require_auth(request: Request) -> Actor:
         raise HTTPException(status_code=401, detail=str(e)) from e
 
     # Middleware emits this without changing route response models.
-    if is_legacy_session_token(payload):
+    if is_legacy_session_token(payload) and actor.account_id:
         request.state.refreshed_token = create_session_token(secret, actor.account_id)
     else:
         refreshed = maybe_refresh_token(payload, secret, actor)
