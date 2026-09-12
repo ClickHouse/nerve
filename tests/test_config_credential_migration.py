@@ -216,6 +216,97 @@ class TestTheScrub:
         # still in the file.
         assert config.auth.password_hash == _HASH
 
+    async def test_a_failed_scrub_is_retried_at_the_next_start(
+        self, db: Database, tmp_path, monkeypatch,
+    ):
+        """The copy commits before the file is rewritten, so a rewrite that
+        failed leaves no account on `config` — and a one-shot scrub would then
+        never look at the file again, leaving the credential on disk for good.
+        The retirement is judged on its own every start instead."""
+        from nerve import migrate as migrate_mod
+
+        config = _install(
+            tmp_path,
+            local_yaml=f"auth:\n  password_hash: '{_HASH}'\n  jwt_secret: '{_SECRET}'\n",
+        )
+        local_yaml = config.config_dir / "config.local.yaml"
+
+        def _refuse(path, text):
+            raise paths.InsecureFileError(f"{path} cannot be created owner-only")
+
+        # First start: the copy lands, the rewrite does not.
+        monkeypatch.setattr(migrate_mod.paths, "write_private_text", _refuse)
+        first = await bootstrap_identity(db, config)
+        assert first.migrated_config_credential
+        assert not first.scrubbed_config_password
+        assert _HASH in local_yaml.read_text(encoding="utf-8")
+        assert (await db.list_accounts())[0]["credential"] == _HASH
+        # The password keeps working across all of this — the copy is what
+        # authentication depends on, and it landed.
+        assert bcrypt.checkpw(_PASSWORD.encode(), _HASH.encode())
+
+        # Second start, with the filesystem behaving: nothing left to copy, but
+        # the file is cleaned up all the same.
+        monkeypatch.undo()
+        second = await bootstrap_identity(db, load_config(config.config_dir))
+        assert not second.migrated_config_credential     # already done
+        assert second.scrubbed_config_password
+        text = local_yaml.read_text(encoding="utf-8")
+        assert "password_hash" not in text
+        assert _SECRET in text                            # nothing else disturbed
+        assert local_yaml.stat().st_mode & 0o077 == 0
+
+        # Third start: a no-op, and the account still carries the hash.
+        third = await bootstrap_identity(db, load_config(config.config_dir))
+        assert not third.scrubbed_config_password
+        assert not third.did_bootstrap
+        assert (await db.list_accounts())[0]["credential"] == _HASH
+
+    async def test_a_key_added_back_by_hand_is_retired_again(
+        self, db: Database, tmp_path,
+    ):
+        """Same mechanism from the other direction: an operator who puts the key
+        back (expecting it to do something) gets it taken away and told why,
+        rather than leaving a credential on disk that authenticates nobody."""
+        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        local_yaml = config.config_dir / "config.local.yaml"
+        await bootstrap_identity(db, config)
+        assert "password_hash" not in local_yaml.read_text(encoding="utf-8")
+
+        local_yaml.write_text(f"auth:\n  password_hash: '{_HASH}'\n", encoding="utf-8")
+        again = await bootstrap_identity(db, load_config(config.config_dir))
+        assert again.scrubbed_config_password
+        assert not again.migrated_config_credential
+        assert "password_hash" not in local_yaml.read_text(encoding="utf-8")
+
+    async def test_an_account_that_still_reads_the_value_keeps_it(
+        self, db: Database, tmp_path,
+    ):
+        """The retirement only fires when *no* account reads the value, and a
+        `none` row reads it too (see routes.accounts.account_credential).
+
+        Called below the mirror on purpose: the mirror moves every `none` row to
+        `config` while a hash is configured and 3.5 then copies it, so this
+        state does not survive a whole `bootstrap_identity`. This is the guard
+        that keeps the file safe if that order ever changes."""
+        from nerve.migrate import MigrationReport, _migrate_config_credentials
+
+        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        local_yaml = config.config_dir / "config.local.yaml"
+        for source, credential in (("local", "$2b$12$own"), ("none", None)):
+            actor = await db.create_actor_ref(kind="human")
+            await db.create_account(
+                actor_id=actor["id"], credential_source=source, credential=credential,
+            )
+        before = local_yaml.read_bytes()
+
+        report = MigrationReport()
+        await _migrate_config_credentials(db, config, report, dry_run=False)
+
+        assert not report.migrated_config_credential   # nothing was on `config`
+        assert not report.scrubbed_config_password
+        assert local_yaml.read_bytes() == before
+
 
 @pytest.mark.asyncio
 class TestLockdown:

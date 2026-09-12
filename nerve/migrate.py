@@ -1119,6 +1119,16 @@ def _scrub_password_action(scrubbed: list[Path], dry_run: bool) -> str:
     return f"{verb} auth.password_hash from {where} — nothing reads it any more"
 
 
+def _orphan_password_warning() -> str:
+    """Spec 1.3: a configured hash that does nothing, and is in no file to remove
+    it from. An hour of somebody's debugging, prevented by one log line."""
+    return (
+        "auth.password_hash is set but no account uses it: every account has its "
+        "own password (credential_source=local) or none at all. Editing the "
+        "configured value has no effect; change passwords on the accounts screen."
+    )
+
+
 def _dead_password_warning(remaining: list[Path], *, locked: bool) -> str:
     where = ", ".join(str(p) for p in remaining)
     lead = (
@@ -1155,25 +1165,43 @@ async def _migrate_config_credentials(
         account for account in await db.list_accounts()
         if account["credential_source"] == "config"
     ]
-    if not stragglers and not pending_config_rows:
-        return
-
-    report.migrated_config_credential = True
-    report.identity_actions.append(
-        _copy_action(len(stragglers) + pending_config_rows, dry_run)
-    )
-    if not dry_run:
-        for account in stragglers:
-            await db.set_account_credential(
-                account["id"],
-                credential_source="local",
-                credential=config.auth.password_hash,
-            )
-        logger.info(
-            "Identity: %d account(s) moved off the configured password onto their "
-            "own credential in nerve.db. The hash was copied, so nobody's "
-            "password changed.", len(stragglers),
+    if stragglers or pending_config_rows:
+        report.migrated_config_credential = True
+        report.identity_actions.append(
+            _copy_action(len(stragglers) + pending_config_rows, dry_run)
         )
+        if not dry_run:
+            for account in stragglers:
+                await db.set_account_credential(
+                    account["id"],
+                    credential_source="local",
+                    credential=config.auth.password_hash,
+                )
+            logger.info(
+                "Identity: %d account(s) moved off the configured password onto "
+                "their own credential in nerve.db. The hash was copied, so "
+                "nobody's password changed.", len(stragglers),
+            )
+
+    # The retirement is judged on its own, every start, and not only by the run
+    # that did the copy. The copy commits to the database before the file is
+    # rewritten — it has to, or a failed copy would leave nobody able to log in
+    # — so a rewrite that failed, or a process that stopped in between, leaves a
+    # credential on disk that nothing reads and that no later start would look
+    # at again if this were a one-shot. Recomputed from the rows rather than
+    # remembered in a "pending" flag, because a flag is another thing that can
+    # be wrong.
+    sources = [account["credential_source"] for account in await db.list_accounts()]
+    if dry_run:
+        # Nothing was written, so model what the real run would have left.
+        sources = ["local" if source == "config" else source for source in sources]
+        sources += ["local"] * pending_config_rows
+    if not sources or any(source in ("config", "none") for source in sources):
+        # Some account still authenticates against the configured value — a
+        # `none` row reads it too (see routes.accounts.account_credential) — or
+        # there are no accounts at all, which means the bootstrap has not run.
+        # Either way it is live, not dead, and is not this step's to remove.
+        return
     _retire_config_password(config, report, dry_run=dry_run)
 
 
@@ -1260,35 +1288,19 @@ def _retire_config_password(
             # exists nowhere, until the next restart reloaded it away.
             config.auth.password_hash = ""
 
+    warning = None
     if remaining:
         warning = _dead_password_warning(remaining, locked=config.lockdown)
+    elif not scrubbed:
+        # Configured, read by nobody, and in none of the files this box owns: a
+        # value set programmatically, or arriving by some route this cannot
+        # name. There is nothing to rewrite, so say what it does (spec 1.3).
+        warning = _orphan_password_warning()
+    if warning:
         report.warnings.append(warning)
         if not dry_run:
             logger.warning("Identity: %s", warning)
     return remaining
-
-
-def _warn_if_password_hash_is_dead(
-    db_sources: list[str], report: MigrationReport, *, hash_present: bool, dry_run: bool,
-) -> None:
-    """Spec 1.3: say once at startup when a configured hash does nothing.
-
-    Reached when the key is still set — a lockdown install, a value in shared
-    configuration, or one an operator added back later — and no account reads it
-    because every one of them carries its own credential. An hour of debugging,
-    prevented by one log line.
-    """
-    if not hash_present or "config" in db_sources:
-        return
-    message = (
-        "auth.password_hash is set but no account uses it: every account has its "
-        "own password (credential_source=local) or none at all. Editing the "
-        "configured value has no effect; change passwords on the accounts screen."
-    )
-    if message not in report.warnings:
-        report.warnings.append(message)
-    if not dry_run:
-        logger.warning("Identity: %s", message)
 
 
 def _secret_action(dry_run: bool) -> str:
@@ -1468,19 +1480,6 @@ async def bootstrap_identity(
     await _migrate_config_credentials(
         db, config, report, dry_run=dry_run, pending_config_rows=pending_config_rows,
     )
-    # Read the hash *after* that ran: an ordinary install has had it removed
-    # from configuration and from this object, so there is nothing stale to
-    # warn about; a lockdown install still has it, and that is the whole point
-    # of the warning.
-    _warn_if_password_hash_is_dead(
-        [account["credential_source"] for account in await db.list_accounts()]
-        + (["local"] * pending_config_rows),
-        report,
-        hash_present=bool(config.auth.password_hash) and not (
-            dry_run and report.scrubbed_config_password
-        ),
-        dry_run=dry_run,
-    )
 
     await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
     return report
@@ -1631,18 +1630,20 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
             report.identity_actions.append(_mirror_action(current, source, dry_run=True))
             settled.append(source)
 
-    on_config = [current for current in settled if current == "config"]
-    hash_present = bool(config.auth.password_hash)
-    if hash_present and on_config:
-        report.migrated_config_credential = True
-        report.identity_actions.append(_copy_action(len(on_config), dry_run=True))
-        # A dry run changes nothing, so ask what *would* be left rather than
-        # reading the config object back.
-        hash_present = bool(_retire_config_password(config, report, dry_run=True))
-        settled = ["local" if current == "config" else current for current in settled]
-    _warn_if_password_hash_is_dead(
-        settled, report, hash_present=hash_present, dry_run=True,
-    )
+    # 3.5, modelled: the copy, then the retirement — which is judged on its own
+    # every start, so a dry run reports it whether or not this run would copy.
+    if config.auth.password_hash:
+        on_config = [current for current in settled if current == "config"]
+        if on_config:
+            report.migrated_config_credential = True
+            report.identity_actions.append(_copy_action(len(on_config), dry_run=True))
+            settled = [
+                "local" if current == "config" else current for current in settled
+            ]
+        if settled and not any(
+            current in ("config", "none") for current in settled
+        ):
+            _retire_config_password(config, report, dry_run=True)
 
     stored = bool(read_instance_secret(db_path, JWT_SECRET_NAME))
     if config.auth.jwt_secret:
