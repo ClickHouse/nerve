@@ -552,41 +552,128 @@ def test_restore_installs_the_database_owner_only(workspace, config_dir, tmp_pat
     assert _stored_secret(nd2 / "nerve.db") == "backed-up-secret-32-bytes-padded!!"
 
 
-@pytest.mark.parametrize("chmod_mode", ["raises", "no-op"], ids=["chmod-raises", "chmod-no-op"])
-def test_restore_scrubs_the_key_when_the_db_cannot_be_secured(
-    workspace, config_dir, tmp_path, monkeypatch, caplog, chmod_mode,
-):
-    """A filesystem that cannot make nerve.db owner-only must not leave a
-    readable signing key: restore scrubs it (and warns); the daemon generates a
-    fresh one and rotates on next start."""
-    import logging
+class TestRestoreNeverLeavesAReadableKey:
+    """F18: the order of operations, each step verified before the next. The
+    destination directory is secured (0700, stat-verified) before anything
+    lands in it; the temporary is *created* 0600 and its mode read back through
+    the descriptor before a byte is copied; the rename is atomic; scrubbing the
+    key from an installed file is a verified last resort whose failure
+    propagates. Nothing here continues past an unverified step."""
 
-    nd = _nerve_dir_with_stored_key(tmp_path)
-    result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
+    @staticmethod
+    def _bundle(tmp_path, workspace, config_dir) -> Path:
+        nd = _nerve_dir_with_stored_key(tmp_path)
+        return backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir).path
 
-    real_chmod = os.chmod
-
-    def broken_chmod(path, mode, *args, **kwargs):
-        # Defeat only the secure-install temp so the copy still lands readable.
-        if str(path).endswith("nerve.db.restore-tmp"):
-            if chmod_mode == "raises":
-                raise PermissionError("chmod refused")
-            return None  # accepted, changes nothing (mode-less filesystem)
-        return real_chmod(path, mode, *args, **kwargs)
-
-    monkeypatch.setattr(backup_mod.os, "chmod", broken_chmod)
-    nd2 = tmp_path / "restored_nerve"
-    with caplog.at_level(logging.WARNING, logger="nerve.backup"):
-        rep = backup_mod.restore_bundle(
-            result.path, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+    @staticmethod
+    def _restore(bundle: Path, nd2: Path, tmp_path: Path):
+        return backup_mod.restore_bundle(
+            bundle, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
         )
-    assert rep.ok
-    assert (nd2 / "nerve.db").exists()
-    assert _stored_secret(nd2 / "nerve.db") is None  # scrubbed
-    assert any(
-        "scrubbed" in r.getMessage() and "nerve.db" in r.getMessage()
-        for r in caplog.records
-    ), [r.getMessage() for r in caplog.records]
+
+    def test_an_unsecurable_destination_directory_aborts_before_anything_is_written(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        nd2.mkdir(mode=0o755)  # exists, empty, reachable by others
+        real_chmod = os.chmod
+        monkeypatch.setattr(  # the directory's mode cannot be changed
+            backup_mod.os, "chmod",
+            lambda p, m, *a, **k: None if Path(p) == nd2 else real_chmod(p, m, *a, **k),
+        )
+        with pytest.raises(BackupError, match="could not be made 0700"):
+            self._restore(bundle, nd2, tmp_path)
+        assert list(nd2.iterdir()) == []  # nothing landed in it
+
+    def test_a_temporary_that_cannot_be_created_owner_only_aborts_before_the_copy(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The no-op chmod case, at the point it now matters: the temp is
+        created with mode 0600 and the descriptor reads back wide (a
+        filesystem without modes). Nothing has been copied yet — and nothing
+        is."""
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        copies: list[int] = []
+        real_copy = backup_mod.shutil.copyfileobj
+        monkeypatch.setattr(
+            backup_mod.shutil, "copyfileobj",
+            lambda *a, **k: (copies.append(1), real_copy(*a, **k))[1],
+        )
+        # Directories verify; every regular file reads back wide.
+        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: stat.S_ISDIR(st_mode))
+
+        with pytest.raises(BackupError, match="nothing was copied"):
+            self._restore(bundle, nd2, tmp_path)
+        assert copies == []
+        assert not (nd2 / "nerve.db").exists()
+        assert not (nd2 / "nerve.db.restore-tmp").exists()  # partial temporary removed
+
+    @staticmethod
+    def _installed_file_reads_back_wide(monkeypatch) -> None:
+        """The temp verifies (so the copy proceeds) and the installed file then
+        reads back wide — the one case the scrub is still for."""
+        seen = {"files": 0}
+
+        def fake(st_mode: int) -> bool:
+            if stat.S_ISDIR(st_mode):
+                return True
+            seen["files"] += 1
+            return seen["files"] == 1  # 1: the temp's fstat; 2: the final stat
+
+        monkeypatch.setattr(backup_mod, "_mode_is_private", fake)
+
+    def test_the_last_resort_scrub_removes_the_key_and_the_restore_still_fails(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """No success-with-exposure: the key is removed so nothing usable is
+        readable, and the restore is reported as failed all the same."""
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        self._installed_file_reads_back_wide(monkeypatch)
+        with pytest.raises(BackupError, match="scrubbed") as ei:
+            self._restore(bundle, nd2, tmp_path)
+        assert "not complete" in str(ei.value)
+        assert _stored_secret(nd2 / "nerve.db") is None  # scrubbed, verified
+
+    def test_a_failing_scrub_propagates_instead_of_claiming_success(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        self._installed_file_reads_back_wide(monkeypatch)
+
+        def failing_scrub(db_file: Path) -> None:
+            raise BackupError(f"could not scrub the signing secret from {db_file}: database is locked")
+
+        monkeypatch.setattr(backup_mod, "_scrub_db_secret", failing_scrub)
+        with pytest.raises(BackupError, match="could not scrub"):
+            self._restore(bundle, nd2, tmp_path)
+
+
+class TestScrubIsVerified:
+    """``_scrub_db_secret`` used to swallow every OperationalError as "older
+    bundle, no table". Now the table's absence is checked explicitly, and a
+    delete that did not happen — or cannot be verified — raises."""
+
+    def test_a_database_without_the_table_has_nothing_to_scrub(self, tmp_path):
+        old = tmp_path / "old.db"
+        _make_nerve_db(old)  # pre-v047 shape: no instance_secrets table
+        backup_mod._scrub_db_secret(old)  # no error, nothing to do
+
+    def test_a_scrub_that_cannot_write_raises_and_leaves_the_row(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses file modes")
+        nd = _nerve_dir_with_stored_key(tmp_path)
+        db_file = nd / "nerve.db"
+        os.chmod(db_file, 0o444)
+        try:
+            with pytest.raises(BackupError, match="could not (scrub|open)"):
+                backup_mod._scrub_db_secret(db_file)
+        finally:
+            os.chmod(db_file, 0o600)
+        assert _stored_secret(db_file) == "backed-up-secret-32-bytes-padded!!"
 
 
 def test_state_only_skips_workspace(nerve_dir, workspace, config_dir, tmp_path):

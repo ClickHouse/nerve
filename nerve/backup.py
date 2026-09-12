@@ -369,52 +369,128 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
         conn.close()
 
 
+def _mode_is_private(st_mode: int) -> bool:
+    """True when no group/world bit is set on a stat mode."""
+    return (stat.S_IMODE(st_mode) & 0o077) == 0
+
+
 def _scrub_db_secret(db_file: Path) -> None:
-    """Delete the stored JWT signing secret from a database file (secure_delete
-    on). Used when a restored ``nerve.db`` cannot be made owner-only, so a
-    readable file never carries a usable key. Tolerant of an older bundle whose
-    database predates the ``instance_secrets`` table."""
-    conn = _connect(db_file)
+    """Delete the stored JWT signing secret from a database file and verify it
+    is gone. Raises :class:`BackupError` on any failure — a scrub that silently
+    did nothing would install a readable key while claiming otherwise.
+
+    A database that predates the ``instance_secrets`` table (an older bundle)
+    has nothing to scrub; that is checked explicitly rather than inferred from
+    an error, so a real I/O or locking failure is never mistaken for it.
+    """
     try:
+        conn = _connect(db_file)
+    except sqlite3.Error as e:
+        raise BackupError(f"could not open {db_file} to scrub the signing secret: {e}") from e
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='instance_secrets'"
+        ).fetchone()
+        if not has_table:
+            return
         conn.execute("PRAGMA secure_delete=ON")
         conn.execute("DELETE FROM instance_secrets WHERE name='jwt_secret'")
         conn.commit()
-    except sqlite3.OperationalError:
-        pass  # no instance_secrets table (pre-v047 bundle)
+        left = conn.execute(
+            "SELECT COUNT(*) FROM instance_secrets WHERE name='jwt_secret'"
+        ).fetchone()[0]
+        if left:
+            raise BackupError(
+                f"could not scrub the signing secret from {db_file}: the row is still present"
+            )
+    except sqlite3.Error as e:
+        raise BackupError(f"could not scrub the signing secret from {db_file}: {e}") from e
     finally:
         conn.close()
 
 
-def _secure_install_db(src: Path, dst: Path) -> None:
-    """Install a secret-bearing database with no world-readable window at ``dst``.
+def _secure_directory(path: Path) -> None:
+    """Make ``path`` owner-only (0700) and verify it; :class:`BackupError` if
+    any group/world bit remains or the mode cannot be read. Nothing secret is
+    written into a directory this has not passed."""
+    try:
+        os.chmod(path, _STATE_DIR_MODE)
+    except OSError as e:
+        logger.warning("Restore: could not set %s to %04o: %s", path, _STATE_DIR_MODE, e)
+    try:
+        st_mode = os.stat(path).st_mode
+    except OSError as e:
+        raise BackupError(f"Restore: cannot inspect the mode of {path}: {e}") from e
+    if not _mode_is_private(st_mode):
+        raise BackupError(
+            f"Restore: {path} is {stat.S_IMODE(st_mode):04o} and could not be made "
+            f"{_STATE_DIR_MODE:04o}; refusing to restore secret-bearing state into a "
+            f"directory other users can reach. Fix the filesystem or choose another "
+            f"state directory."
+        )
 
-    The copy goes to a temp file in the destination directory, is tightened to
-    ``0600``, verified, and only then renamed into place atomically — so ``dst``
-    never exists at a wider mode. If the temp cannot be made owner-only (a
-    filesystem without Unix modes), the stored signing secret is scrubbed from
-    it first and a warning is logged; the daemon's ``connect()`` enforces the
-    rest (and rotates any exposed key) on the next start.
+
+def _secure_install_db(src: Path, dst: Path) -> None:
+    """Install a secret-bearing database at ``dst`` with no readable window.
+
+    Order matters, and each step is verified before the next:
+
+    1. the temporary file is *created* owner-only (``O_CREAT|O_EXCL`` with mode
+       ``0600``) and its mode read back through the open descriptor — if the
+       filesystem did not honour the mode, nothing has been copied yet and the
+       restore aborts;
+    2. the bytes are copied into it and flushed;
+    3. it is renamed over ``dst`` atomically, so ``dst`` never exists at a wider
+       mode, and the result is verified once more;
+    4. only if that final verification fails — which the earlier checks make
+       all but impossible — the stored signing secret is scrubbed from the
+       installed file as a last resort, that scrub is itself verified, and the
+       restore still fails: a readable accounts database is not a success.
+
+    A partial temporary is always removed. Failures raise :class:`BackupError`.
     """
     tmp = dst.with_name(dst.name + ".restore-tmp")
     if tmp.exists():
         tmp.unlink()
-    shutil.copyfile(src, tmp)  # contents only; the mode is set below, not copied
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
     try:
-        os.chmod(tmp, SECRET_FILE_MODE)
-    except OSError as e:
-        logger.warning("Restore: could not set %s to %04o: %s", dst, SECRET_FILE_MODE, e)
+        if not _mode_is_private(os.fstat(fd).st_mode):
+            raise BackupError(
+                f"Restore: could not create {dst} owner-only (the filesystem ignored "
+                f"mode {SECRET_FILE_MODE:04o}); nothing was copied. Fix the filesystem "
+                f"or restore to a state directory that supports Unix modes."
+            )
+    except BaseException:
+        os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
     try:
-        secured = (stat.S_IMODE(os.stat(tmp).st_mode) & 0o077) == 0
-    except OSError:
-        secured = False
-    if not secured:
-        _scrub_db_secret(tmp)
-        logger.warning(
-            "Restore: %s could not be made owner-only; the stored JWT signing "
-            "secret was scrubbed from it. A fresh secret is generated at next "
-            "start and existing sessions must re-authenticate.", dst,
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    final = os.stat(dst).st_mode
+    if not _mode_is_private(final):
+        # Last resort, verified: the file is in place but readable, so remove
+        # the key rather than leave it (_scrub_db_secret raises if it cannot) —
+        # and then still fail. A restore that leaves the accounts database
+        # readable by other users is not a successful restore, whatever was
+        # salvaged; the operator fixes the filesystem and restores again.
+        _scrub_db_secret(dst)
+        raise BackupError(
+            f"Restore: {dst} is {stat.S_IMODE(final):04o} despite a verified 0600 "
+            f"temporary, so the filesystem is not keeping it private. The stored JWT "
+            f"signing secret was scrubbed from it so no usable key is exposed, but "
+            f"the restore is not complete: fix the filesystem or choose another state "
+            f"directory, then restore again."
         )
-    os.replace(tmp, dst)
 
 
 def _db_schema_version(db_path: Path) -> int:
@@ -966,19 +1042,20 @@ def restore_bundle(
             )
             os.replace(nerve_dir, relocated)
             logger.info("Relocated existing state dir to %s", relocated)
-        nerve_dir.mkdir(parents=True, exist_ok=True)
-        # Owner-only state directory before any secret-bearing file lands in it.
-        try:
-            os.chmod(nerve_dir, _STATE_DIR_MODE)
-        except OSError as e:
-            logger.warning("Restore: could not set %s to %04o: %s", nerve_dir, _STATE_DIR_MODE, e)
+        nerve_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
+        # Owner-only, verified, before any secret-bearing file lands in it.
+        # Fatal if it cannot be: a readable key in a reachable directory is the
+        # exposure this whole path exists to prevent.
+        _secure_directory(nerve_dir)
 
         # Install state/. nerve.db carries the signing secret and the accounts,
-        # so it is installed through a verified 0600 temp + atomic rename (never
-        # a readable window at the destination); everything else copies plainly.
+        # so it goes first and through a verified 0600 temp + atomic rename
+        # (never a readable window at the destination) — first, so a failure
+        # aborts before anything else has been written into the new directory.
         staged_state = staging / "state"
         if staged_state.is_dir():
-            for entry in sorted(staged_state.iterdir()):
+            entries = sorted(staged_state.iterdir(), key=lambda p: (p.name != "nerve.db", p.name))
+            for entry in entries:
                 dst = nerve_dir / entry.name
                 if entry.is_dir():
                     shutil.copytree(entry, dst, symlinks=True, dirs_exist_ok=True)
