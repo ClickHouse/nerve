@@ -1,5 +1,42 @@
 const API_BASE = '/api';
 
+/**
+ * What the login form has to collect. `none` is a passwordless install, which
+ * is only ever one account; `password` is one account with a credential, which
+ * needs no username; `username_password` is two or more.
+ */
+export type LoginKind = 'none' | 'password' | 'username_password';
+
+/**
+ * `GET /api/auth/status` — unauthenticated, so it carries no username and no
+ * account count. Three destinations come out of it: the app (authenticated, or
+ * auto-logged-in when `login` is `none`), the login page, and `/setup`.
+ */
+export interface AuthStatus {
+  /** Kept for older clients; `login !== 'none'`. */
+  auth_required: boolean;
+  /** Identity mode. `local` in this build. */
+  mode: string;
+  login: LoginKind;
+  /** The one account has neither a password nor a username: first-run state. */
+  setup_pending: boolean;
+  multiple_accounts: boolean;
+}
+
+/** One local account, as `/api/accounts` returns it. Never carries a credential. */
+export interface Account {
+  id: string;
+  username: string | null;
+  display_name: string | null;
+  enabled: boolean;
+  has_password: boolean;
+  created_at: string;
+  updated_at: string;
+  disabled_at: string | null;
+  /** Whether this row is the signed-in account's own. */
+  is_self: boolean;
+}
+
 /** One page of a lazily-loaded sidebar group (Archived / System). */
 export interface Page {
   sessions: any[];
@@ -313,15 +350,45 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export const api = {
   // Auth
-  login: (password: string) =>
+  /**
+   * `username` is required once the instance has two accounts and must be
+   * omitted before that — the account an upgrade created has none, so the
+   * server accepts a password on its own while there is exactly one. Which of
+   * the two applies is what `authStatus().login` says.
+   */
+  login: (password: string, username?: string) =>
     request<{ token: string }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, username: username?.trim() || null }),
     }),
 
   checkAuth: () => request<{ authenticated: boolean }>('/auth/check'),
 
-  authStatus: () => request<{ auth_required: boolean }>('/auth/status'),
+  authStatus: () => request<AuthStatus>('/auth/status'),
+
+  // Accounts
+  listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
+
+  createAccount: (body: { username: string; password: string; display_name?: string }) =>
+    request<Account>('/accounts', { method: 'POST', body: JSON.stringify(body) }),
+
+  updateAccount: (id: string, body: { username?: string; display_name?: string }) =>
+    request<Account>(`/accounts/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  setAccountEnabled: (id: string, enabled: boolean) =>
+    request<Account>(
+      `/accounts/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' },
+    ),
+
+  changeOwnPassword: (body: { current_password?: string; new_password: string }) =>
+    request<Account>('/accounts/me/password', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any

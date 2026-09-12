@@ -28,6 +28,8 @@ import { UltracodePage } from './pages/UltracodePage';
 import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
+import { AccountsPage } from './pages/AccountsPage';
+import { SetupPage } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
@@ -67,7 +69,7 @@ function App() {
       <GlobalShortcuts />
       <Routes location={background ?? location}>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Navigate to="/chat" replace />} />
+          <Route path="/" element={<Home />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
           <Route path="/files/*" element={<FilesPage />} />
           <Route path="/tasks" element={<TasksPage />} />
@@ -84,6 +86,8 @@ function App() {
           <Route path="/sources" element={<SourcesPage />} />
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
+          <Route path="/accounts" element={<AccountsPage />} />
+          <Route path="/setup" element={<SetupPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -98,6 +102,21 @@ function App() {
       <ShortcutsModal />
     </>
   );
+}
+
+/**
+ * Where the app opens.
+ *
+ * Chat, unless the instance has never been set up — its one account has
+ * neither a password nor a username — in which case the setup page, so the
+ * state gets noticed rather than silently persisting. Only the *root* redirect
+ * moves: a deep link, a refresh or a bookmark still lands where it says, and
+ * the setup page is skippable, so an abandoned setup leaves a working
+ * instance.
+ */
+function Home() {
+  const setupPending = useAuthStore((s) => s.setupPending);
+  return <Navigate to={setupPending ? '/setup' : '/chat'} replace />;
 }
 
 /**
