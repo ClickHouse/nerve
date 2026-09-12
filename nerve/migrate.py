@@ -248,6 +248,12 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # box's runtime directory. Publishing it would point every instance at a
     # path that exists on exactly one of them.
     "workflows.runs_dir",
+    # The identity mode is decided on the box (or where its service is
+    # defined, via NERVE_AUTH_MODE), never by the file a configuration push
+    # delivers: the loader ignores it in the tracked layer outright (see
+    # nerve.config._drop_tracked_auth_mode), so a legacy monolith's value has
+    # to stay in config.yaml or it stops having any effect.
+    "auth.mode",
 })
 
 

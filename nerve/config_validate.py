@@ -141,6 +141,18 @@ def validate_config_bundle(
         workspace = cfg._expand_path(ws_raw) or cfg.paths.default_workspace()
 
     ws_settings = _read_workspace_settings(workspace, result)
+    # Mirror _read_config_sources: the tracked file is never a source for the
+    # identity mode. Dropped here too, so validation judges the config the
+    # daemon will actually run, and reported so the author learns why the key
+    # does nothing where they put it.
+    if isinstance(ws_settings, dict) and isinstance(ws_settings.get("auth"), dict) \
+            and "mode" in ws_settings["auth"]:
+        ws_settings["auth"].pop("mode")
+        result.warnings.append(
+            "auth.mode in the tracked settings.yaml is ignored: the identity mode is "
+            "read only from the machine-local config.yaml/config.local.yaml or "
+            f"{cfg.AUTH_MODE_ENV}, so a configuration push can never change it"
+        )
     # Mirror _read_config_sources: when the tracked settings lock the instance,
     # validate the LOCKED view (workspace-only), since that's what production runs.
     # An unreadable flag is refused rather than assumed, exactly as at load time —

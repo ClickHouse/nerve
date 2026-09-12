@@ -73,13 +73,20 @@ class TestLoading:
         with pytest.raises(ConfigError, match="auth.mode"):
             load_config(config_dir)
 
-    def test_external_in_the_tracked_settings_fails_too(self, tmp_path):
+    def test_the_tracked_settings_file_cannot_even_break_startup(self, tmp_path, caplog):
+        """A pushed file is not a source for the mode — and must not be able to
+        crash the instance either, so the key is ignored with a warning rather
+        than refused."""
         config_dir = _install(tmp_path, settings="auth:\n  mode: external\n")
-        with pytest.raises(ConfigError, match="auth.mode"):
-            load_config(config_dir)
+        with caplog.at_level("WARNING", logger="nerve.config"):
+            assert load_config(config_dir).auth.mode == "local"
+        assert any(
+            "ignoring 'auth.mode'" in r.getMessage() and "settings.yaml" in r.getMessage()
+            for r in caplog.records
+        )
 
-    def test_env_reference_in_a_file_resolves(self, tmp_path, monkeypatch):
-        config_dir = _install(tmp_path, settings="auth:\n  mode: ${NERVE_AUTH_MODE:-local}\n")
+    def test_env_reference_in_a_machine_local_file_resolves(self, tmp_path, monkeypatch):
+        config_dir = _install(tmp_path, local="auth:\n  mode: ${NERVE_AUTH_MODE:-local}\n")
         assert load_config(config_dir).auth.mode == "local"
 
     def test_validate_reports_it_instead_of_the_box_finding_out(self, tmp_path):
@@ -89,6 +96,88 @@ class TestLoading:
         result = validate_config_bundle(config_dir)
         assert not result.ok
         assert any("auth.mode" in e for e in result.errors)
+
+
+def _git_repo_with_remote(ws: Path) -> None:
+    """What a locked workspace is on a real box; the remote is never contacted."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    subprocess.run(["git", "init", "-q"], cwd=str(ws), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://example.invalid/config.git"],
+        cwd=str(ws), check=True, capture_output=True,
+    )
+
+
+class TestTrackedLayerIsNotASource:
+    """0.1: the mode is never writable by an external configuration push, and
+    the tracked workspace layer is exactly what a push or sync delivers. Only
+    the machine-local layers and ``NERVE_AUTH_MODE`` count. Only one mode
+    exists today, so a second one is pretended into existence; the point is
+    where a value is allowed to come from."""
+
+    @pytest.fixture(autouse=True)
+    def _two_modes(self, monkeypatch):
+        import nerve.config as cfgmod
+
+        monkeypatch.setattr(cfgmod, "AUTH_MODES", ("local", "other"))
+
+    def test_a_tracked_value_is_ignored_with_a_warning(self, tmp_path, caplog):
+        config_dir = _install(tmp_path, settings="auth:\n  mode: other\n")
+        with caplog.at_level("WARNING", logger="nerve.config"):
+            assert load_config(config_dir).auth.mode == "local"
+        assert any("ignoring 'auth.mode'" in r.getMessage() for r in caplog.records)
+
+    def test_a_machine_local_value_is_applied(self, tmp_path):
+        config_dir = _install(
+            tmp_path, local="auth:\n  mode: other\n", settings="auth:\n  mode: local\n",
+        )
+        assert load_config(config_dir).auth.mode == "other"
+
+    def test_the_environment_wins_over_a_machine_local_value(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(AUTH_MODE_ENV, "other")
+        config_dir = _install(tmp_path, local="auth:\n  mode: local\n")
+        assert load_config(config_dir).auth.mode == "other"
+
+    def test_a_tracked_value_does_not_leak_through_the_rest_of_the_auth_section(
+        self, tmp_path,
+    ):
+        """Only the mode is dropped; the tracked layer may still carry the
+        other auth keys (a fleet supplies ``jwt_secret`` from there)."""
+        config_dir = _install(
+            tmp_path, settings="auth:\n  mode: other\n  jwt_expiry_hours: 12\n",
+        )
+        config = load_config(config_dir)
+        assert (config.auth.mode, config.auth.jwt_expiry_hours) == ("local", 12)
+
+    def test_under_lockdown_only_the_environment_can_say_it(self, tmp_path, monkeypatch, caplog):
+        """Lockdown drops the machine layers, so a locked box's mode comes from
+        the environment or the default — never from the tracked file it runs on."""
+        from nerve.config import workspace_settings_file as settings_file
+
+        config_dir = _install(
+            tmp_path,
+            local="auth:\n  mode: other\n",  # dropped under lockdown
+            settings="lockdown: true\nauth:\n  mode: other\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
+        )
+        _git_repo_with_remote(tmp_path / "ws")
+        assert settings_file(tmp_path / "ws").exists()
+        with caplog.at_level("WARNING", logger="nerve.config"):
+            config = load_config(config_dir)
+        assert config.lockdown and config.auth.mode == "local"
+        assert any("ignoring 'auth.mode'" in r.getMessage() for r in caplog.records)
+
+        monkeypatch.setenv(AUTH_MODE_ENV, "other")
+        assert load_config(config_dir).auth.mode == "other"
+
+    def test_the_layer_table_lists_it_as_machine_local(self):
+        from nerve.migrate import _is_machine_local
+
+        assert _is_machine_local("auth.mode")
+        assert not _is_machine_local("auth.jwt_secret")
 
 
 class TestEnvironmentAnchor:

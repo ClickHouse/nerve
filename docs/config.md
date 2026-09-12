@@ -23,7 +23,7 @@ and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `workflows.runs_dir` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `workflows.runs_dir`, `auth.mode` (the one key the tracked file may never supply: a value there is ignored with a warning — see [Auth](#auth)) |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -1234,7 +1234,7 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auth.mode` | string | `local` | How the instance learns who is making a request. `local` — local accounts plus a session, authority decided in process — is the only value this version accepts; anything else is a hard error at startup and in `nerve config validate`. Startup-only (see the restart table). `NERVE_AUTH_MODE` in the environment overrides every file, so the mode can be pinned where the service is defined and no configuration push can change it |
+| `auth.mode` | string | `local` | How the instance learns who is making a request. `local` — local accounts plus a session, authority decided in process — is the only value this version accepts; anything else is a hard error at startup and in `nerve config validate`. **Machine-local only:** read from `config.yaml`/`config.local.yaml` or `NERVE_AUTH_MODE` (which wins over both). A value in the tracked `settings.yaml` is ignored with a warning, so a configuration push or workspace sync can never change it; under lockdown, where the machine layers are dropped, that leaves the environment or the default. Startup-only: read once at boot and carried across reloads (see the restart table) |
 | `auth.password_hash` | string | - | bcrypt hash for login. Unset means passwordless: every caller who can reach the gateway acts as the owner, which is only sensible on a loopback or otherwise private bind |
 | `auth.jwt_secret` | string | - | JWT signing secret. Optional: when unset, one is generated on first start and kept in `nerve.db` (never written into a config file); a configured value wins over the stored one at startup, so setting it later rotates the secret at the next restart and logs every tab out once. Pinned for the life of the process — a reload cannot change or remove it (see the restart table). See [Accounts and identity](accounts.md) |
 

@@ -15,10 +15,16 @@ the `nerve migrate --dry-run` output and the tables in `nerve.db` make sense.
 value this version implements is `local`: local accounts plus a session token,
 with the decision made in process. It is deliberately an explicit setting rather
 than something inferred from which credentials happen to be present, and it is
-startup-only — it never follows a config reload or a configuration push.
-`NERVE_AUTH_MODE` in the environment overrides every file, so the mode can be
-pinned where the service is defined. Any other value is a hard error at startup
-and in `nerve config validate`.
+startup-only — it never follows a config reload.
+
+It is also **machine-local**: it is read from `config.yaml` or
+`config.local.yaml` on the box, or from `NERVE_AUTH_MODE` in the environment
+(which wins over both), and never from the tracked `workspace/config/settings.yaml`.
+A value there is ignored with a warning, so a configuration push or a workspace
+sync can never change how an instance authenticates — nor crash it. Under
+lockdown, where the machine-local layers are dropped, that leaves the
+environment or the default: the mode is decided where the service is defined.
+Any other value is a hard error at startup and in `nerve config validate`.
 
 ## The two tables
 

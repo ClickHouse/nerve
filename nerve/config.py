@@ -468,6 +468,30 @@ def _apply_auth_mode_anchor(merged: dict[str, Any]) -> None:
         auth["mode"] = raw.strip()
 
 
+def _drop_tracked_auth_mode(ws_settings: dict[str, Any], workspace: Path) -> None:
+    """Remove ``auth.mode`` from the tracked layer, with a warning.
+
+    The identity mode is machine-local: it may be stated in ``config.yaml`` or
+    ``config.local.yaml``, or pinned with ``NERVE_AUTH_MODE``, but never in the
+    file a configuration push or a workspace sync delivers. A pushed file must
+    not be able to change how an instance authenticates — and must not be able
+    to crash it either, so the key is ignored rather than refused. Under
+    lockdown the machine layers are dropped, which leaves the environment or
+    the default: the mode is then decided where the service is defined.
+    """
+    auth = ws_settings.get("auth")
+    if not isinstance(auth, dict) or "mode" not in auth:
+        return
+    auth.pop("mode")
+    logger.warning(
+        "config: ignoring 'auth.mode' in %s — the identity mode is read only from "
+        "the machine-local config.yaml/config.local.yaml or %s, so a pushed file can "
+        "never change it. State it in config.local.yaml on the box, or set %s where "
+        "the service is defined.",
+        workspace_settings_file(workspace), AUTH_MODE_ENV, AUTH_MODE_ENV,
+    )
+
+
 def lockdown_anchor() -> bool:
     """Whether the environment forces this instance into lockdown.
 
@@ -702,6 +726,8 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
+    # The one key the tracked layer may never supply: the identity mode.
+    _drop_tracked_auth_mode(ws_settings, workspace)
 
     # Lockdown is owned by the *tracked* settings file only, so a local edit to
     # config.yaml/config.local.yaml can't unlock (or fake-lock) an instance — the
