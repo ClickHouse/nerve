@@ -46,6 +46,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -95,6 +96,11 @@ SECRET_MEMBERS: frozenset[str] = frozenset({
 # re-tightens it on every start too, but a restored file should not sit
 # world-readable until then.
 SECRET_FILE_MODE = 0o600
+# Owner-only state directory on restore, mirroring nerve.db.base._STATE_DIR_MODE.
+_STATE_DIR_MODE = 0o700
+# ``nerve.db`` is installed specially (see :func:`_secure_install_db`), so it is
+# not in this generic re-chmod list; the entry is kept only for the test that
+# documents the intent.
 _SECRET_RESTORE_PATHS: tuple[str, ...] = (
     "nerve.db",
     "mcp-token",
@@ -363,6 +369,54 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
         conn.close()
 
 
+def _scrub_db_secret(db_file: Path) -> None:
+    """Delete the stored JWT signing secret from a database file (secure_delete
+    on). Used when a restored ``nerve.db`` cannot be made owner-only, so a
+    readable file never carries a usable key. Tolerant of an older bundle whose
+    database predates the ``instance_secrets`` table."""
+    conn = _connect(db_file)
+    try:
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.execute("DELETE FROM instance_secrets WHERE name='jwt_secret'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # no instance_secrets table (pre-v047 bundle)
+    finally:
+        conn.close()
+
+
+def _secure_install_db(src: Path, dst: Path) -> None:
+    """Install a secret-bearing database with no world-readable window at ``dst``.
+
+    The copy goes to a temp file in the destination directory, is tightened to
+    ``0600``, verified, and only then renamed into place atomically — so ``dst``
+    never exists at a wider mode. If the temp cannot be made owner-only (a
+    filesystem without Unix modes), the stored signing secret is scrubbed from
+    it first and a warning is logged; the daemon's ``connect()`` enforces the
+    rest (and rotates any exposed key) on the next start.
+    """
+    tmp = dst.with_name(dst.name + ".restore-tmp")
+    if tmp.exists():
+        tmp.unlink()
+    shutil.copyfile(src, tmp)  # contents only; the mode is set below, not copied
+    try:
+        os.chmod(tmp, SECRET_FILE_MODE)
+    except OSError as e:
+        logger.warning("Restore: could not set %s to %04o: %s", dst, SECRET_FILE_MODE, e)
+    try:
+        secured = (stat.S_IMODE(os.stat(tmp).st_mode) & 0o077) == 0
+    except OSError:
+        secured = False
+    if not secured:
+        _scrub_db_secret(tmp)
+        logger.warning(
+            "Restore: %s could not be made owner-only; the stored JWT signing "
+            "secret was scrubbed from it. A fresh secret is generated at next "
+            "start and existing sessions must re-authenticate.", dst,
+        )
+    os.replace(tmp, dst)
+
+
 def _db_schema_version(db_path: Path) -> int:
     """Read the persisted schema version from a nerve.db (0 if absent)."""
     try:
@@ -586,13 +640,22 @@ def create_backup(
         state_dir = stage / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Consistent DB snapshots.
+        # 1. Consistent DB snapshots. The online-backup API creates the copy
+        # at the umask default (0644); tighten it to 0600 so the *archived
+        # member* is 0600 and extraction on restore yields an owner-only file
+        # with no readable window — the snapshot carries the signing secret and
+        # the accounts.
         for db_name in STATE_DB_FILES:
             src = nerve_dir / db_name
             if src.exists():
-                _snapshot_db(src, state_dir / db_name)
+                snapshot = state_dir / db_name
+                _snapshot_db(src, snapshot)
                 if db_name == "nerve.db" and not include_secrets:
-                    _scrub_instance_secrets(state_dir / db_name)
+                    _scrub_instance_secrets(snapshot)
+                try:
+                    os.chmod(snapshot, SECRET_FILE_MODE)
+                except OSError as e:
+                    logger.warning("Could not set %s to %04o: %s", snapshot, SECRET_FILE_MODE, e)
             else:
                 logger.warning("state DB missing, skipping: %s", src)
 
@@ -904,21 +967,32 @@ def restore_bundle(
             os.replace(nerve_dir, relocated)
             logger.info("Relocated existing state dir to %s", relocated)
         nerve_dir.mkdir(parents=True, exist_ok=True)
+        # Owner-only state directory before any secret-bearing file lands in it.
+        try:
+            os.chmod(nerve_dir, _STATE_DIR_MODE)
+        except OSError as e:
+            logger.warning("Restore: could not set %s to %04o: %s", nerve_dir, _STATE_DIR_MODE, e)
 
-        # Install state/.
+        # Install state/. nerve.db carries the signing secret and the accounts,
+        # so it is installed through a verified 0600 temp + atomic rename (never
+        # a readable window at the destination); everything else copies plainly.
         staged_state = staging / "state"
         if staged_state.is_dir():
             for entry in sorted(staged_state.iterdir()):
                 dst = nerve_dir / entry.name
                 if entry.is_dir():
                     shutil.copytree(entry, dst, symlinks=True, dirs_exist_ok=True)
+                elif entry.name == "nerve.db":
+                    _secure_install_db(entry, dst)
                 else:
                     shutil.copy2(entry, dst)
 
-        # Re-tighten secret file modes. Warn-only here: restore runs offline,
-        # and the daemon enforces the database's mode itself on the next start
-        # (refusing to keep a signing secret in a file it cannot secure).
+        # Re-tighten the remaining secret files. nerve.db is skipped — it was
+        # already installed owner-only (or scrubbed) above. Warn-only here:
+        # restore runs offline, and the daemon enforces modes on the next start.
         for secret in _SECRET_RESTORE_PATHS:
+            if secret == "nerve.db":
+                continue
             sp = nerve_dir / secret
             if sp.is_file():
                 try:

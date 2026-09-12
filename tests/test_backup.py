@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 import threading
 import time
 from pathlib import Path
@@ -482,28 +483,98 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
     assert found_secret == secret == "stable-signing-secret"
 
 
-def test_restore_warns_when_it_cannot_tighten_the_database_file(
-    nerve_dir, workspace, config_dir, tmp_path, monkeypatch, caplog,
+def _member_mode(bundle: Path, name: str) -> int | None:
+    comp = backup_mod._compression_for(bundle)
+    with backup_mod._tar_reader(bundle, comp) as tar:
+        for m in tar:
+            if m.name == name:
+                return stat.S_IMODE(m.mode)
+    return None
+
+
+def _stored_secret(db_file: Path) -> str | None:
+    conn = sqlite3.connect(str(db_file))
+    try:
+        row = conn.execute(
+            "SELECT value FROM instance_secrets WHERE name='jwt_secret'"
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def test_backup_archives_the_database_owner_only(nerve_dir, workspace, config_dir, tmp_path):
+    """The archived nerve.db member is 0600, so extraction on restore yields an
+    owner-only file with no readable window — it carries the signing secret."""
+    result = backup_mod.create_backup(nerve_dir, workspace, tmp_path / "out", config_dir=config_dir)
+    assert _member_mode(result.path, "state/nerve.db") == 0o600
+
+
+def _nerve_dir_with_stored_key(tmp_path) -> Path:
+    """A real nerve.db holding a jwt_secret row, ready to back up."""
+    import asyncio
+
+    from nerve.db import Database
+    from nerve.db.accounts import JWT_SECRET_NAME
+    from nerve.gateway.auth import unpin_jwt_secret
+
+    nd = tmp_path / "src_nerve"
+    nd.mkdir()
+
+    async def _seed():
+        db = Database(nd / "nerve.db")
+        await db.connect()
+        try:
+            await db.bootstrap_local_identity(credential_source="none")
+            await db.ensure_instance_secret(JWT_SECRET_NAME, "backed-up-secret-32-bytes-padded!!")
+        finally:
+            await db.close()
+
+    asyncio.run(_seed())
+    unpin_jwt_secret()
+    _make_memu_db(nd / "memu.sqlite")
+    return nd
+
+
+def test_restore_installs_the_database_owner_only(workspace, config_dir, tmp_path):
+    nd = _nerve_dir_with_stored_key(tmp_path)
+    result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
+
+    nd2 = tmp_path / "restored_nerve"
+    rep = backup_mod.restore_bundle(
+        result.path, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+    )
+    assert rep.ok, rep.errors
+    assert (os.stat(nd2 / "nerve.db").st_mode & 0o777) == 0o600
+    assert (os.stat(nd2).st_mode & 0o700) == 0o700
+    assert (nd2 / "nerve.db").with_name("nerve.db.restore-tmp").exists() is False
+    # A securable restore keeps the key (live sessions keep verifying).
+    assert _stored_secret(nd2 / "nerve.db") == "backed-up-secret-32-bytes-padded!!"
+
+
+@pytest.mark.parametrize("chmod_mode", ["raises", "no-op"], ids=["chmod-raises", "chmod-no-op"])
+def test_restore_scrubs_the_key_when_the_db_cannot_be_secured(
+    workspace, config_dir, tmp_path, monkeypatch, caplog, chmod_mode,
 ):
-    """Restore runs offline, so a filesystem that refuses chmod is a warning
-    here — the daemon enforces the mode itself on the next start and refuses
-    to keep a signing secret in a file it cannot secure."""
+    """A filesystem that cannot make nerve.db owner-only must not leave a
+    readable signing key: restore scrubs it (and warns); the daemon generates a
+    fresh one and rotates on next start."""
     import logging
 
-    result = backup_mod.create_backup(nerve_dir, workspace, tmp_path / "out", config_dir=config_dir)
+    nd = _nerve_dir_with_stored_key(tmp_path)
+    result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
 
     real_chmod = os.chmod
 
-    def refuse_for_db(path, mode, *args, **kwargs):
-        # Only the re-tighten call has this exact shape: shutil.copy2's
-        # copystat also chmods the freshly copied file, but passes
-        # follow_symlinks=, and that copy must go through for the restore to
-        # reach the step under test.
-        if str(path).endswith("nerve.db") and mode == backup_mod.SECRET_FILE_MODE and not kwargs:
-            raise PermissionError(f"chmod refused for {path}")
+    def broken_chmod(path, mode, *args, **kwargs):
+        # Defeat only the secure-install temp so the copy still lands readable.
+        if str(path).endswith("nerve.db.restore-tmp"):
+            if chmod_mode == "raises":
+                raise PermissionError("chmod refused")
+            return None  # accepted, changes nothing (mode-less filesystem)
         return real_chmod(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(backup_mod.os, "chmod", refuse_for_db)
+    monkeypatch.setattr(backup_mod.os, "chmod", broken_chmod)
     nd2 = tmp_path / "restored_nerve"
     with caplog.at_level(logging.WARNING, logger="nerve.backup"):
         rep = backup_mod.restore_bundle(
@@ -511,8 +582,9 @@ def test_restore_warns_when_it_cannot_tighten_the_database_file(
         )
     assert rep.ok
     assert (nd2 / "nerve.db").exists()
+    assert _stored_secret(nd2 / "nerve.db") is None  # scrubbed
     assert any(
-        "could not set" in r.getMessage() and "nerve.db" in r.getMessage()
+        "scrubbed" in r.getMessage() and "nerve.db" in r.getMessage()
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
 
