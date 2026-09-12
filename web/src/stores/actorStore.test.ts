@@ -46,6 +46,7 @@ const {
   UNNAMED_ACTOR, SYSTEM_ACTOR_NAME,
 } = await import('./actorStore');
 const { useAccountStore } = await import('./accountStore');
+const { useAuthStore } = await import('./authStore');
 
 const listActors = api.listActors as unknown as ReturnType<typeof vi.fn>;
 const listAccounts = api.listAccounts as unknown as ReturnType<typeof vi.fn>;
@@ -118,6 +119,18 @@ describe('loading the map', () => {
     expect(localStorage.length).toBe(0);
     const dump = JSON.stringify(Object.entries(localStorage));
     expect(dump).not.toContain('Alice');
+  });
+
+  it('does not outlive the session that fetched it', async () => {
+    useActorStore.getState().resolve([ALICE]);
+    await settled();
+    expect(useActorStore.getState().actors[ALICE]).toBeDefined();
+
+    useAuthStore.getState().logout();
+
+    // A map kept across a logout would be a cache, and this one is not one.
+    expect(useActorStore.getState().actors).toEqual({});
+    expect(useActorStore.getState().loaded).toBe(false);
   });
 });
 
