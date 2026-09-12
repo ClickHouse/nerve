@@ -473,6 +473,69 @@ class TestExposedKeyIsRotated:
             await db.close()
 
 
+# --------------------------------------------------------------------------- #
+#  F20 — rotation reaches the process pin                                      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestRotationReachesThePin:
+    """Same process, no ``unpin_jwt_secret()`` between the opens: a verifier
+    that kept the retired key pinned would go on accepting tokens minted with
+    the copy. Retiring the row drops a matching pin, so requests fail closed
+    until the bootstrap pins the replacement."""
+
+    async def test_the_pinned_compromised_key_is_unpinned_and_then_replaced(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        config = NerveConfig()
+
+        db = Database(db_path)
+        await db.connect()
+        await bootstrap_identity(db, config)  # generates S1 and pins it
+        s1 = await db.get_instance_secret(JWT_SECRET_NAME)
+        await db.close()
+        assert s1 and pinned_jwt_secret() == s1
+        s1_token = create_token(s1)
+
+        os.chmod(db_path, 0o644)  # exposed; someone copies S1
+
+        db2 = Database(db_path)
+        await db2.connect()  # repairs, retires S1 on disk *and* unpins it
+        try:
+            assert await db2.get_instance_secret(JWT_SECRET_NAME) is None
+            assert pinned_jwt_secret() == ""
+            assert effective_jwt_secret(config) == ""  # fail closed: nothing verifies
+            with pytest.raises(Exception):
+                decode_token(s1_token, effective_jwt_secret(config))
+
+            await bootstrap_identity(db2, config)  # pins the replacement S3
+            s3 = await db2.get_instance_secret(JWT_SECRET_NAME)
+            assert s3 and s3 != s1
+            assert effective_jwt_secret(config) == s3
+            with pytest.raises(Exception):
+                decode_token(s1_token, effective_jwt_secret(config))  # S1 rejected
+            assert decode_token(create_token(s3), effective_jwt_secret(config))  # S3 accepted
+        finally:
+            await db2.close()
+
+    async def test_a_pin_that_is_not_the_retired_key_is_left_alone(self, tmp_path):
+        """A configured secret is pinned; the database happens to hold a stale
+        stored key that gets exposed. That row is retired; the pin — which
+        never was that key — stays, and requests keep verifying."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db_with_secret(db_path, _S1)
+        pin_jwt_secret(_CONFIGURED)
+        os.chmod(db_path, 0o644)
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+            assert pinned_jwt_secret() == _CONFIGURED
+        finally:
+            await db.close()
+
+
 def test_the_round2_exception_name_still_resolves():
     assert InsecureSecretStorage is InsecureStateStorage
 

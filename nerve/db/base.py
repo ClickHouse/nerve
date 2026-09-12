@@ -399,15 +399,17 @@ class Database(
         await self._check_fts_integrity()
 
     async def _rotate_exposed_signing_secret(self) -> None:
-        """Delete a database-held signing secret that was readable by other
-        users before connect() repaired the mode.
+        """Retire a database-held signing secret that was readable by other
+        users before connect() repaired the mode — on disk *and* in memory.
 
         The key may already have been copied, so re-securing the file is not
-        enough — it is retired, and :func:`nerve.migrate.ensure_jwt_secret`
-        generates a fresh one at bootstrap. Runs in the connect path so it
-        covers every opener (gateway, ``nerve migrate``, the installer), not
-        just the gateway process. Only an actually-stored key is rotated: a
-        fresh 0644 database from old code that never held one is not an exposure.
+        enough: the row is deleted, and if this process had that very key
+        pinned, the pin is dropped so requests fail closed until the bootstrap
+        pins the replacement (:func:`nerve.migrate.ensure_jwt_secret` generates
+        a fresh one). Runs in the connect path so it covers every opener
+        (gateway, ``nerve migrate``, the installer), not just the gateway
+        process. Only an actually-stored key is rotated: a fresh 0644 database
+        from old code that never held one is not an exposure.
         """
         from nerve.db.accounts import JWT_SECRET_NAME
 
@@ -416,15 +418,30 @@ class Database(
         ) as cur:
             if await cur.fetchone() is None:
                 return  # pre-v047 or a non-nerve database
-        if await self.get_instance_secret(JWT_SECRET_NAME) is None:
+        stored = await self.get_instance_secret(JWT_SECRET_NAME)
+        if stored is None:
             return
         await self.delete_instance_secret(JWT_SECRET_NAME)
         logger.warning(
             "%s (or a sidecar) was readable by other users; the stored JWT signing "
             "secret is treated as compromised and has been retired. A fresh one is "
-            "generated at bootstrap and existing sessions must re-authenticate.",
+            "generated at bootstrap and existing sessions must re-authenticate. If "
+            "this is not the daemon's own process and the daemon is running, restart "
+            "it: it may still hold the retired key pinned until then.",
             self.db_path,
         )
+        # Memory must agree with disk: a verifier still holding the retired key
+        # would keep accepting tokens minted with the copy. Imported lazily —
+        # the gateway module is heavier than this layer needs at import time.
+        from nerve.gateway.auth import pinned_jwt_secret, unpin_jwt_secret
+
+        if pinned_jwt_secret() == stored:
+            unpin_jwt_secret()
+            logger.warning(
+                "The retired signing secret was the one pinned in this process; it "
+                "has been unpinned, so requests fail closed until the bootstrap pins "
+                "its replacement.",
+            )
 
     async def close(self) -> None:
         if self._db:
