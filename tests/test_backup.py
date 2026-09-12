@@ -482,6 +482,41 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
     assert found_secret == secret == "stable-signing-secret"
 
 
+def test_restore_warns_when_it_cannot_tighten_the_database_file(
+    nerve_dir, workspace, config_dir, tmp_path, monkeypatch, caplog,
+):
+    """Restore runs offline, so a filesystem that refuses chmod is a warning
+    here — the daemon enforces the mode itself on the next start and refuses
+    to keep a signing secret in a file it cannot secure."""
+    import logging
+
+    result = backup_mod.create_backup(nerve_dir, workspace, tmp_path / "out", config_dir=config_dir)
+
+    real_chmod = os.chmod
+
+    def refuse_for_db(path, mode, *args, **kwargs):
+        # Only the re-tighten call has this exact shape: shutil.copy2's
+        # copystat also chmods the freshly copied file, but passes
+        # follow_symlinks=, and that copy must go through for the restore to
+        # reach the step under test.
+        if str(path).endswith("nerve.db") and mode == backup_mod.SECRET_FILE_MODE and not kwargs:
+            raise PermissionError(f"chmod refused for {path}")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(backup_mod.os, "chmod", refuse_for_db)
+    nd2 = tmp_path / "restored_nerve"
+    with caplog.at_level(logging.WARNING, logger="nerve.backup"):
+        rep = backup_mod.restore_bundle(
+            result.path, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+        )
+    assert rep.ok
+    assert (nd2 / "nerve.db").exists()
+    assert any(
+        "could not set" in r.getMessage() and "nerve.db" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
 def test_state_only_skips_workspace(nerve_dir, workspace, config_dir, tmp_path):
     out = tmp_path / "out"
     result = backup_mod.create_backup(

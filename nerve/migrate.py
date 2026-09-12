@@ -298,6 +298,9 @@ class MigrationReport:
     bootstrapped_account: bool = False
     updated_credential_source: bool = False
     generated_jwt_secret: bool = False
+    # A database-held signing secret was (or would be) deleted because a
+    # configured auth.jwt_secret supersedes it.
+    retired_stored_secret: bool = False
 
     @property
     def did_anything(self) -> bool:
@@ -311,6 +314,7 @@ class MigrationReport:
             self.bootstrapped_account
             or self.updated_credential_source
             or self.generated_jwt_secret
+            or self.retired_stored_secret
         )
 
 
@@ -1020,6 +1024,56 @@ def _secret_action(dry_run: bool) -> str:
     )
 
 
+def _retire_action(dry_run: bool) -> str:
+    verb = "retire" if dry_run else "retired"
+    return (
+        f"{verb} the database-held signing secret from nerve.db "
+        "(auth.jwt_secret is configured and supersedes it)"
+    )
+
+
+class InsecureSecretStorage(RuntimeError):
+    """``nerve.db`` is readable by other users and no configured
+    ``auth.jwt_secret`` exists to use instead of a database-held secret.
+
+    Raised by the bootstrap so startup stops before a secret is generated
+    into a file other local users could read and mint tokens from.
+    """
+
+
+def _refuse_insecure_secret_storage(db: "Database", config: NerveConfig, *, log: bool) -> bool:
+    """Decide what an unsecured database means for the signing secret.
+
+    Secured (the normal case) → nothing. Unsecured with ``auth.jwt_secret``
+    configured → the instance starts, because nothing secret needs to live in
+    the database, but an error names the files, their modes and the expected
+    one (``log=True`` on the one call that should say it). Unsecured without a
+    configured secret → :class:`InsecureSecretStorage`, with both remedies.
+    Returns whether the database is unsecured.
+    """
+    files = list(getattr(db, "unsecured_files", None) or [])
+    if not files:
+        return False
+    listed = ", ".join(f"{path} is {mode:04o}" for path, mode in files)
+    if config.auth.jwt_secret:
+        if log:
+            logger.error(
+                "The database is readable by other users (%s; expected 0600). "
+                "auth.jwt_secret is configured, so no signing secret is kept there "
+                "and the gateway starts — but fix the permissions: chmod 0700 %s and "
+                "chmod 0600 %s (including its -wal/-shm sidecars).",
+                listed, db.db_path.parent, db.db_path,
+            )
+        return True
+    raise InsecureSecretStorage(
+        f"Refusing to keep a signing secret in a database other users can read "
+        f"({listed}; expected 0600). Either fix the permissions — chmod 0700 "
+        f"{db.db_path.parent} and chmod 0600 {db.db_path} (including its -wal/-shm "
+        f"sidecars) — or set auth.jwt_secret in config.local.yaml or the "
+        f"environment, in which case nothing secret is stored in the database."
+    )
+
+
 async def bootstrap_identity(
     db: "Database",
     config: NerveConfig,
@@ -1061,6 +1115,10 @@ async def bootstrap_identity(
             report.bootstrapped_account = True
             report.identity_actions.append(_account_action(source, dry_run=True))
     else:
+        # Before anything is written: a database other users can read may not
+        # receive a generated secret, and if that is what this run would have
+        # to do, it stops here rather than after creating the account.
+        _refuse_insecure_secret_storage(db, config, log=False)
         # Reported from what the transaction actually did, not from a count
         # taken before it: two bootstraps racing — a `nerve migrate` beside a
         # starting daemon — both read zero accounts, but only the one that
@@ -1105,27 +1163,39 @@ async def ensure_jwt_secret(
     """Make sure a JWT signing secret exists, and pin it for this process.
 
     ``auth.jwt_secret`` in configuration is used as-is when set, so an upgrade
-    keeps every live session. Otherwise the secret kept in ``nerve.db``
-    (``instance_secrets``) is used, and generated first if there is none —
-    once, never rotated here, never written into a config file. The value in
-    force is pinned via :func:`nerve.gateway.auth.pin_jwt_secret`, so every
-    consumer of :func:`~nerve.gateway.auth.effective_jwt_secret` sees it and
-    keeps seeing it across config reloads; the first pin in a process wins,
-    so a later call with a changed configuration returns what is pinned.
+    keeps every live session — and it *retires* any secret the database still
+    holds from a time it was not configured: a superseded key that stayed on
+    disk would come back into force the day the configured one was removed,
+    which is what key rotation exists to rule out. Otherwise the secret kept
+    in ``nerve.db`` (``instance_secrets``) is used, and generated first if
+    there is none — once, never rotated here, never written into a config
+    file. A database that other users can read never receives one (see
+    :func:`_refuse_insecure_secret_storage`).
+
+    The value in force is pinned via :func:`nerve.gateway.auth.pin_jwt_secret`,
+    so every consumer of :func:`~nerve.gateway.auth.effective_jwt_secret` sees
+    it and keeps seeing it across config reloads; the first pin in a process
+    wins, so a later call with a changed configuration returns what is pinned.
     Returns the secret in force (``""`` on a dry run that would generate).
     """
     from nerve.db.accounts import JWT_SECRET_NAME
     from nerve.gateway.auth import pin_jwt_secret, pinned_jwt_secret
 
     report = MigrationReport(dry_run=dry_run) if report is None else report
+    if not dry_run:
+        _refuse_insecure_secret_storage(db, config, log=True)
     stored = await db.get_instance_secret(JWT_SECRET_NAME)
 
     if config.auth.jwt_secret:
-        if stored:
-            logger.info(
-                "auth.jwt_secret is configured; the signing secret stored in "
-                "nerve.db is not in use",
-            )
+        if stored is not None:
+            report.retired_stored_secret = True
+            report.identity_actions.append(_retire_action(dry_run))
+            if not dry_run:
+                await db.delete_instance_secret(JWT_SECRET_NAME)
+                logger.info(
+                    "Retired the database-held signing secret: auth.jwt_secret is "
+                    "configured and supersedes it",
+                )
         secret = config.auth.jwt_secret
     elif stored:
         secret = stored
@@ -1221,7 +1291,12 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
                 continue
             report.updated_credential_source = True
             report.identity_actions.append(_mirror_action(current, source, dry_run=True))
-    if not config.auth.jwt_secret and not read_instance_secret(db_path, JWT_SECRET_NAME):
+    stored = bool(read_instance_secret(db_path, JWT_SECRET_NAME))
+    if config.auth.jwt_secret:
+        if stored:
+            report.retired_stored_secret = True
+            report.identity_actions.append(_retire_action(dry_run=True))
+    elif not stored:
         report.generated_jwt_secret = True
         report.identity_actions.append(_secret_action(dry_run=True))
 

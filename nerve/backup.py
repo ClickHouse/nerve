@@ -915,14 +915,20 @@ def restore_bundle(
                 else:
                     shutil.copy2(entry, dst)
 
-        # Re-tighten secret file modes.
+        # Re-tighten secret file modes. Warn-only here: restore runs offline,
+        # and the daemon enforces the database's mode itself on the next start
+        # (refusing to keep a signing secret in a file it cannot secure).
         for secret in _SECRET_RESTORE_PATHS:
             sp = nerve_dir / secret
             if sp.is_file():
                 try:
                     os.chmod(sp, SECRET_FILE_MODE)
-                except OSError:
-                    pass
+                except OSError as e:
+                    logger.warning(
+                        "Restore: could not set %s to %04o: %s. It may hold a "
+                        "credential; tighten it before starting the daemon.",
+                        sp, SECRET_FILE_MODE, e,
+                    )
         certs_dir = nerve_dir / "certs"
         if certs_dir.is_dir():
             for f in certs_dir.rglob("*"):

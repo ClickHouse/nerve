@@ -249,15 +249,68 @@ class TestJwtSecret:
         generated = await ensure_jwt_secret(db, NerveConfig())
         config = _cfg(jwt_secret=_SECRET)
         # Same process: the pin holds; the new configured value is reported by
-        # a reload and waits for a restart.
+        # a reload and waits for a restart. The stored key is retired at once,
+        # though — it is superseded the moment configuration supplies one.
         assert await ensure_jwt_secret(db, config) == generated
         assert effective_jwt_secret(config) == generated
-        # "Restart": the configured value wins from then on. The stored one
-        # stays in the database, unused, for a config that drops the key again.
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+        # "Restart": the configured value wins from then on.
         unpin_jwt_secret()
         assert await ensure_jwt_secret(db, config) == _SECRET
         assert effective_jwt_secret(config) == _SECRET
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+
+    async def test_rotating_to_a_configured_secret_retires_the_stored_one_for_good(
+        self, db: Database,
+    ):
+        """S1 generated → S2 configured → S2 removed again. The old stored key
+        must not come back: a token signed with S1 stays invalid under S2 and
+        under the fresh S3 the next unconfigured start generates."""
+        from fastapi import HTTPException
+
+        from nerve.gateway.auth import create_token, decode_token, unpin_jwt_secret
+
+        s1 = await ensure_jwt_secret(db, NerveConfig())
+        old_token = create_token(s1)
+        assert decode_token(old_token, effective_jwt_secret())["sub"] == "user"
+
+        unpin_jwt_secret()  # restart, S2 configured
+        report = MigrationReport()
+        assert await ensure_jwt_secret(db, _cfg(jwt_secret=_SECRET), report=report) == _SECRET
+        assert report.retired_stored_secret and report.did_bootstrap
+        assert report.identity_actions == [
+            "retired the database-held signing secret from nerve.db "
+            "(auth.jwt_secret is configured and supersedes it)",
+        ]
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+        assert read_instance_secret(db.db_path, JWT_SECRET_NAME) == ""
+        with pytest.raises(HTTPException):
+            decode_token(old_token, effective_jwt_secret())
+
+        # A second configured start has nothing left to retire.
+        unpin_jwt_secret()
+        again = MigrationReport()
+        await ensure_jwt_secret(db, _cfg(jwt_secret=_SECRET), report=again)
+        assert not again.retired_stored_secret and again.identity_actions == []
+
+        unpin_jwt_secret()  # restart, the key removed from configuration
+        s3 = await ensure_jwt_secret(db, NerveConfig())
+        assert s3 != s1 and s3 != _SECRET
+        assert await db.get_instance_secret(JWT_SECRET_NAME) == s3
+        with pytest.raises(HTTPException):
+            decode_token(old_token, effective_jwt_secret())
+
+    async def test_dry_run_reports_the_retirement_without_doing_it(self, db: Database):
+        from nerve.gateway.auth import unpin_jwt_secret
+
+        generated = await ensure_jwt_secret(db, NerveConfig())
+        unpin_jwt_secret()
+        report = MigrationReport(dry_run=True)
+        await ensure_jwt_secret(db, _cfg(jwt_secret=_SECRET), report=report, dry_run=True)
+        assert report.retired_stored_secret
+        assert report.identity_actions[0].startswith("retire the database-held signing secret")
         assert await db.get_instance_secret(JWT_SECRET_NAME) == generated
+        assert pinned_jwt_secret() == ""
 
     async def test_lockdown_without_a_configured_secret_also_generates(self, db: Database):
         """1.6 is unconditional: a locked box with no auth.jwt_secret used to

@@ -111,10 +111,23 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
 - Under lockdown the same applies: a locked box without a configured secret
   generates one rather than refusing every request. Supplying it from the fleet
   configuration lets you rotate it centrally.
-- `nerve.db` carries a credential now, so the state directory is kept `0700`
-  and the database files `0600`, re-asserted on every start and on restore. A
-  filesystem that cannot represent modes gets a warning in the log; tighten it
-  by other means.
+- **A configured secret retires the stored one.** The first start with
+  `auth.jwt_secret` set deletes the database-held secret (securely, so it does
+  not linger in freed pages). If the key is later removed from configuration,
+  the next start generates a *fresh* secret rather than reviving the old one:
+  tokens signed with a retired key never become valid again, which is what
+  rotation is for.
+- **A generated secret only lives in a file this user alone can read.**
+  `nerve.db` carries a credential now, so every start makes the state directory
+  `0700` and the database files (`nerve.db`, `-wal`, `-shm`) `0600`, then
+  checks the result. On a filesystem that cannot represent modes the check
+  fails, and Nerve will not keep a secret there: with `auth.jwt_secret`
+  configured it starts and logs an error naming the file and its mode (nothing
+  secret is stored in the database in that case); without one it refuses to
+  start, and the message gives the two ways out — fix the permissions, or set
+  `auth.jwt_secret` in `config.local.yaml` or the environment. A restore
+  re-tightens `nerve.db` too, and only warns if it cannot; the next start
+  enforces.
 - The CLI (`nerve reload`, `nerve codex token`) reads the stored secret from
   `nerve.db`, so it authenticates to the daemon on the same box without any
   configuration. With no secret anywhere — the daemon has never started — it

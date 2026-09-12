@@ -104,36 +104,74 @@ _DB_FILE_MODE = 0o600
 _DB_FILE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 
 
-def _harden_state_permissions(db_path: Path) -> None:
-    """Make the state directory 0700 and the database files 0600.
+# Any of these bits set on a database file means another user on the box can
+# read it — the condition that makes keeping a signing secret in it a hazard.
+_GROUP_WORLD_BITS = 0o077
 
-    Best-effort and idempotent: a mode that is already right is left alone,
-    a file that does not exist is skipped, and a filesystem that refuses the
-    change (some network and FAT-style mounts have no modes to set) gets a
-    warning rather than a failed startup — refusing to serve would not make
-    the file any tighter.
+
+def _mode_of(path: Path) -> int | None:
+    """Permission bits of ``path``; None when it does not exist or cannot be
+    inspected (which is logged)."""
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.warning("Could not inspect permissions on %s: %s", path, e)
+        return None
+
+
+def _harden_state_permissions(db_path: Path) -> list[tuple[Path, int]]:
+    """Make the state directory 0700 and the database files 0600; report what
+    stayed readable by other users.
+
+    Idempotent: a mode that is already right is left alone and a file that
+    does not exist is skipped. Every change is *verified* with a second
+    ``stat``, because on a filesystem without modes (some network and
+    FAT-style mounts) a ``chmod`` can succeed and change nothing. Returns the
+    database files — the main file and any existing sidecar — that still
+    carry group or world bits afterwards; an empty list means secured. The
+    directory is tightened on the same terms but only warned about: with the
+    files themselves ``0600`` it is not load-bearing.
+
+    Never raises over a permissions problem. Whether an unsecured database is
+    tolerable depends on whether a signing secret would have to live in it,
+    and that is the bootstrap's decision
+    (:func:`nerve.migrate.ensure_jwt_secret`), not this layer's.
     """
-    targets = [(db_path.parent, _STATE_DIR_MODE)]
-    targets.extend((Path(f"{db_path}{suffix}"), _DB_FILE_MODE) for suffix in _DB_FILE_SUFFIXES)
-    for path, mode in targets:
-        try:
-            current = stat.S_IMODE(path.stat().st_mode)
-        except FileNotFoundError:
+    unsecured: list[tuple[Path, int]] = []
+    targets = [(db_path.parent, _STATE_DIR_MODE, False)]
+    targets.extend(
+        (Path(f"{db_path}{suffix}"), _DB_FILE_MODE, True) for suffix in _DB_FILE_SUFFIXES
+    )
+    for path, mode, is_db_file in targets:
+        current = _mode_of(path)
+        if current is None:
             continue
-        except OSError as e:
-            logger.warning("Could not inspect permissions on %s: %s", path, e)
+        if current != mode:
+            try:
+                os.chmod(path, mode)
+            except OSError as e:
+                logger.warning(
+                    "Could not restrict permissions on %s to %04o (currently %04o): %s",
+                    path, mode, current, e,
+                )
+            # Trust the filesystem's answer, not chmod's return.
+            current = _mode_of(path)
+            if current is None:
+                continue
+        if not current & _GROUP_WORLD_BITS:
             continue
-        if current == mode:
-            continue
-        try:
-            os.chmod(path, mode)
-        except OSError as e:
+        if is_db_file:
+            unsecured.append((path, current))
+        else:
             logger.warning(
-                "Could not restrict permissions on %s to %04o (currently %04o): %s. "
-                "It may hold the signing secret; tighten it by hand if this "
-                "filesystem supports modes.",
-                path, mode, current, e,
+                "State directory %s is %04o (expected %04o) and could not be tightened; "
+                "the database files inside it are what matter, and they are checked "
+                "separately.",
+                path, current, mode,
             )
+    return unsecured
 
 
 class Database(
@@ -174,6 +212,16 @@ class Database(
         # Per-connection pragmas (see _DEFAULT_PRAGMAS). Copied per instance so
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
+        # Database files still readable by other users after connect() tried to
+        # tighten them, as (path, mode). Empty on every ordinary filesystem. The
+        # identity bootstrap consults it before it would put a signing secret
+        # in the database (see nerve.migrate.ensure_jwt_secret).
+        self.unsecured_files: list[tuple[Path, int]] = []
+
+    @property
+    def state_secured(self) -> bool:
+        """Whether the database files are readable by this user only."""
+        return not self.unsecured_files
 
     async def _apply_pragmas(self) -> None:
         """Apply the connection pragmas (see :data:`_DEFAULT_PRAGMAS`).
@@ -203,8 +251,16 @@ class Database(
         await self._apply_pragmas()
         # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
         # already existed from an earlier, wider run keeps its old mode until
-        # this second pass tightens it.
-        _harden_state_permissions(self.db_path)
+        # this second pass tightens it. Its verdict is what the bootstrap reads.
+        self.unsecured_files = _harden_state_permissions(self.db_path)
+        if self.unsecured_files:
+            logger.error(
+                "Database files readable by other users and not tightenable: %s "
+                "(expected %04o). No signing secret will be kept in this database; "
+                "startup refuses unless auth.jwt_secret is configured.",
+                ", ".join(f"{p} is {m:04o}" for p, m in self.unsecured_files),
+                _DB_FILE_MODE,
+            )
         await run_migrations(self._db)
         await self._check_fts_integrity()
 

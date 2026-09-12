@@ -440,6 +440,25 @@ class AccountStore:
         stored = await self.get_instance_secret(name)
         return stored if stored is not None else value
 
+    async def delete_instance_secret(self, name: str) -> bool:
+        """Remove a stored secret for good; True if a row was there.
+
+        ``secure_delete`` is switched on for the statement so SQLite
+        overwrites the freed pages instead of merely unlinking them — a retired
+        signing key must not linger in the file for a later dump to recover.
+        """
+        async with self._atomic():
+            await self.db.execute("PRAGMA secure_delete=ON")
+            try:
+                cursor = await self.db.execute(
+                    "DELETE FROM instance_secrets WHERE name = ?", (name,)
+                )
+                deleted = cursor.rowcount > 0
+                await cursor.close()
+            finally:
+                await self.db.execute("PRAGMA secure_delete=OFF")
+        return deleted
+
 
 # -- Out-of-process readers -------------------------------------------------- #
 #
