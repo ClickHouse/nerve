@@ -8,7 +8,7 @@ vi.mock('../../api/client', async () => {
   );
   return {
     ...actual,
-    api: { authStatus: vi.fn(), login: vi.fn(), checkAuth: vi.fn() },
+    api: { authStatus: vi.fn(), login: vi.fn(), getOwnAccount: vi.fn() },
     setToken: vi.fn(),
     clearToken: vi.fn(),
     getToken: vi.fn(() => null),
@@ -39,6 +39,7 @@ const realLogout = useAuthStore.getState().logout;
  */
 
 const login = vi.fn();
+const logout = vi.fn();
 const refreshStatus = vi.fn().mockResolvedValue(undefined);
 
 beforeEach(() => {
@@ -52,8 +53,14 @@ beforeEach(() => {
     loginMode: 'password',
     statusLoading: false,
     setupPending: false,
+    account: { id: 'acc-1', username: 'alice' },
     login,
     refreshStatus,
+  });
+  (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
+    enabled: true, has_password: true, created_at: 't', updated_at: 't',
+    disabled_at: null, is_self: true,
   });
 });
 
@@ -96,21 +103,58 @@ describe('LoginPage', () => {
 });
 
 describe('SessionExpiredOverlay', () => {
-  it('asks for the same fields the login page would', async () => {
-    useAuthStore.setState({ loginMode: 'username_password' });
+  it('unlocks the account whose app is on screen, and no other', async () => {
+    // Everything underneath belongs to that person. A form that took any
+    // username would let somebody else walk up to a colleague's expired tab,
+    // sign in, and inherit their drafts and loaded state.
+    useAuthStore.setState({
+      loginMode: 'username_password',
+      account: { id: 'acc-1', username: 'alice' },
+    });
     render(<SessionExpiredOverlay />);
 
-    await userEvent.type(screen.getByLabelText('Username'), 'bob');
+    // The username is shown, not asked for.
+    expect(screen.getByLabelText('Signed in as')).toHaveValue('alice');
+    expect(screen.getByLabelText('Signed in as')).toBeDisabled();
+    expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
+
     await userEvent.type(screen.getByLabelText('Password'), 'another-passphrase');
     await userEvent.click(screen.getByRole('button', { name: 'Unlock' }));
 
-    expect(login).toHaveBeenCalledWith('another-passphrase', 'bob');
+    expect(login).toHaveBeenCalledWith('another-passphrase', 'alice');
   });
 
   it('keeps the single-account shape unchanged', () => {
+    // No username on the account at all — the upgrade case. Nothing to show,
+    // nothing to send, and the server resolves the only account there is.
+    useAuthStore.setState({ account: { id: 'acc-1', username: null } });
     render(<SessionExpiredOverlay />);
+    expect(screen.queryByLabelText('Signed in as')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
+  });
+
+  it('offers only a sign-out when the account cannot be confirmed', async () => {
+    // Falling back to an open form over somebody's mounted session is the one
+    // thing that must not happen, so it does not fall back at all.
+    useAuthStore.setState({ account: null, logout });
+    render(<SessionExpiredOverlay />);
+
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(screen.getByText(/cannot be confirmed/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Log out' }));
+    expect(logout).toHaveBeenCalled();
+  });
+
+  it('routes a deliberate account switch through log out', async () => {
+    useAuthStore.setState({
+      account: { id: 'acc-1', username: 'alice' }, logout,
+    });
+    render(<SessionExpiredOverlay />);
+    await userEvent.click(
+      screen.getByRole('button', { name: /Log out and discard/ }),
+    );
+    expect(logout).toHaveBeenCalled();
   });
 });
 
@@ -192,7 +236,8 @@ describe('the form does not go stale', () => {
 
     render(<SessionExpiredOverlay />);
 
-    expect(await screen.findByLabelText('Username')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(useAuthStore.getState().loginMode).toBe('username_password'));
   });
 
   it('re-reads it on logout', async () => {

@@ -70,15 +70,22 @@ function upsert(accounts: Account[], account: Account): Account[] {
 async function resync(
   set: (partial: Partial<AccountState>) => void,
 ): Promise<unknown | null> {
-  try {
-    const { accounts } = await api.listAccounts();
-    set({ accounts, loading: false });
-  } catch (e) {
+  // Both, independently. They answer different questions of different servers'
+  // worth of state, and the list failing used to skip the status refresh
+  // entirely — so an install that had just set its first password or added its
+  // second account could be left with `setupPending` and `loginMode` describing
+  // the instance it was five seconds ago, purely because a list request
+  // happened to fail.
+  const [listOutcome] = await Promise.allSettled([
+    api.listAccounts(),
+    // refreshStatus swallows its own failures and keeps the last known answer.
+    useAuthStore.getState().refreshStatus(),
+  ]);
+  if (listOutcome.status === 'rejected') {
     set({ loading: false });
-    return e;
+    return listOutcome.reason;
   }
-  // refreshStatus swallows its own failures and keeps the last known answer.
-  await useAuthStore.getState().refreshStatus();
+  set({ accounts: listOutcome.value.accounts, loading: false });
   return null;
 }
 

@@ -30,6 +30,7 @@ vi.mock('../stores/helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 const client = await import('../api/client');
 const { AccountsPage } = await import('./AccountsPage');
 const { useAccountStore, errorDetail, blockedReason } = await import('../stores/accountStore');
+const { useAuthStore } = await import('../stores/authStore');
 
 const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 
@@ -65,6 +66,7 @@ beforeEach(() => {
     setup_pending: false, multiple_accounts: false,
   });
   useAccountStore.setState({ accounts: [], loading: true, busyId: null, error: null });
+  useAuthStore.setState({ loginMode: null, setupPending: true, statusLoading: false });
 });
 
 describe('the list', () => {
@@ -373,6 +375,27 @@ describe('a committed write is not a failed one', () => {
     expect(await useAccountStore.getState().setEnabled('acc-1', false)).toBe(true);
     expect(useAccountStore.getState().accounts[0].enabled).toBe(false);
     expect(useAccountStore.getState().busyId).toBeNull();
+  });
+
+  it('refreshes the login descriptor even when the list refresh fails', async () => {
+    // They answer different questions. Setting the first password or adding
+    // the second account changes what the *login form* must collect, and a
+    // failed list request used to skip that entirely — leaving a tab
+    // describing the instance it was five seconds ago.
+    api.changeOwnPassword.mockResolvedValue(account({ has_password: true }));
+    api.listAccounts.mockRejectedValue(new Error('network'));
+    api.authStatus.mockResolvedValue({
+      auth_required: true, mode: 'local', login: 'password',
+      setup_pending: false, multiple_accounts: false,
+    });
+
+    expect(await useAccountStore.getState().changeOwnPassword({
+      new_password: 'a-passphrase',
+    })).toBe(true);
+
+    expect(api.authStatus).toHaveBeenCalled();
+    expect(useAuthStore.getState().setupPending).toBe(false);
+    expect(useAuthStore.getState().loginMode).toBe('password');
   });
 
   it('lets the refresh be retried on its own', async () => {
