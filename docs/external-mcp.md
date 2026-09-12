@@ -30,8 +30,11 @@ request as either:
 * `?token=<jwt>` query parameter (handy for clients that don't let you
   set headers, e.g. some Codex configs).
 
-If `auth.jwt_secret` is empty (dev mode), the endpoint accepts all
-requests — mirrors the gateway's existing dev-mode behaviour.
+There is no unauthenticated mode. If `auth.jwt_secret` is unset, the
+gateway generates a signing secret on its first start and keeps it in
+`nerve.db`; tokens from `POST /api/auth/login` (and `nerve codex token`)
+are signed with it, and the endpoint checks against it. See
+[Accounts and identity](accounts.md).
 
 ## Configuring Codex CLI
 

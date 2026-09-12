@@ -304,16 +304,18 @@ as a warning: nothing failed, but the new value is not live yet.
 With no daemon running there is nothing to reload and the command says so. Config
 is read fresh at startup, so `nerve start` already picks the edit up.
 
-It authenticates the way the gateway asks to be authenticated, which depends on
-`auth.jwt_secret` in the config it just read:
+It authenticates the way the gateway asks to be authenticated, with the same
+signing secret the daemon resolves at startup (see [Accounts and identity](accounts.md)):
 
-- **Set** → it signs a token with it. If that is not the secret the running daemon
-  started with, the gateway rejects the request and only a restart resolves it.
-- **Empty, unlocked** → the gateway is in dev mode and does not ask for a token
-  (`require_auth` runs open), so the call goes unauthenticated.
-- **Empty, locked** → refused before anything is sent. A locked gateway never takes
-  the open path, so no request from that shell can be authenticated. If the secret
-  comes from `${ENV_VAR}`, export it in that shell too.
+- **`auth.jwt_secret` set** → it signs a token with it. If that is not the secret
+  the running daemon started with, the gateway rejects the request and only a
+  restart resolves it.
+- **Unset** → it signs with the secret the daemon generated into `nerve.db` on its
+  first start; this shell is on the same box, so it reads it from there. If the
+  daemon has never started there is no secret anywhere yet: an unlocked gateway is
+  not asking for a token either, so the call goes unauthenticated, while a locked
+  one is refused before anything is sent — if the secret is meant to come from
+  `${ENV_VAR}`, export it in that shell too.
 
 `auth.password_hash` is not an alternative here. It gates the browser login, which
 is what mints a token from it; `require_auth` reads `auth.jwt_secret` alone, so a
@@ -610,10 +612,12 @@ referenced from `settings.yaml` before you lock the box. The usual ones:
 `auth.jwt_secret`, `auth.password_hash`, `telegram.bot_token`,
 `anthropic_api_key`/`openai_api_key`, `xmemory.api_key`.
 
-`auth.jwt_secret` is the one to get right. A locked instance that ends up without
-it does not fall back to the unauthenticated dev mode an unlocked box would — the
-gateway refuses every request with a 503 and websockets are declined — so the box
-comes up unusable rather than open. Note also that a `${VAR}` left unresolved
+`auth.jwt_secret` is worth getting right even though it is no longer required. A
+locked instance that ends up without it neither runs open nor refuses every
+request: it generates a signing secret on its first start and keeps it in
+`nerve.db` — machine-local state, not configuration (see
+[Accounts and identity](accounts.md)). Supplying it from the fleet lets you rotate
+it centrally; leaving it out gives each box its own. Note also that a `${VAR}` left unresolved
 survives as its literal text, which is a perfectly usable signing key and one
 published in the config repo, so check that the variable is actually set on the box.
 

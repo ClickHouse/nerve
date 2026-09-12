@@ -132,7 +132,7 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 | `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
-| `NERVE_PASSWORD` | unset | Web UI password; unset means no authentication |
+| `NERVE_PASSWORD` | unset | Web UI password; unset means passwordless — anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)) |
 | `NERVE_TASK` | unset | Worker mode task description |
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
@@ -184,7 +184,7 @@ telegram:
 
 auth:
   password_hash: "$2b$12$..."    # Generate below
-  jwt_secret: "..."              # Generate below
+  jwt_secret: "..."              # Optional — generated into nerve.db on first start if omitted
   jwt_expiry_hours: 720          # Optional — web-session idle timeout (default 30 days)
 EOF
 ```

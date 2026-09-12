@@ -10,6 +10,8 @@ else about the routes behaves as before.
 
 from __future__ import annotations
 
+import warnings
+
 import bcrypt
 import jwt
 import pytest
@@ -31,6 +33,9 @@ from nerve.mcp_server.auth import McpAuthError, authenticate_mcp
 
 _CONFIGURED = "configured-secret-padded-to-thirty-two-bytes!!"
 _STORED = "stored-secret-padded-to-thirty-two-bytes!!!!"
+# A secret nothing was ever signed with. Padded, like the two above, so PyJWT's
+# short-HMAC-key warning does not fire on tokens that exist only to be refused.
+_FORGED = "forged-secret-padded-to-thirty-two-bytes!!!!"
 _PASSWORD = "correct horse battery staple"
 _HASH = bcrypt.hashpw(_PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
 
@@ -102,8 +107,13 @@ class TestLoginRoute:
         assert res.status_code == 200
         token = res.json()["token"]
         assert _claims(token, _STORED)["sub"] == "user"
-        with pytest.raises(jwt.InvalidSignatureError):
-            _claims(token, "dev-secret")
+        # ...and specifically not with the literal the old code used. Decoding
+        # with a ten-byte key trips PyJWT's key-length warning; that is the
+        # point of the check, not noise worth surfacing in the run.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(jwt.InvalidSignatureError):
+                _claims(token, "dev-secret")
         assert client.get("/api/auth/status").json() == {"auth_required": True}
 
     def test_no_secret_anywhere_refuses_instead_of_dev_secret(self, client, config):
@@ -145,7 +155,7 @@ class TestRequireAuthWithStoredSecret:
         assert client.get(
             "/api/thing", headers={"Authorization": f"Bearer {good}"},
         ).status_code == 200
-        forged = create_token("dev-secret")
+        forged = create_token(_FORGED)
         assert client.get(
             "/api/thing", headers={"Authorization": f"Bearer {forged}"},
         ).status_code == 401
@@ -183,7 +193,7 @@ class TestWebSocketWithStoredSecret:
         assert await authenticate_websocket(_Socket()) is False
         assert await authenticate_websocket(_Socket(token=create_token(_STORED))) is True
         assert await authenticate_websocket(_Socket(cookie=create_token(_STORED))) is True
-        assert await authenticate_websocket(_Socket(token=create_token("dev-secret"))) is False
+        assert await authenticate_websocket(_Socket(token=create_token(_FORGED))) is False
 
 
 class TestMcpWithStoredSecret:
@@ -196,7 +206,7 @@ class TestMcpWithStoredSecret:
         with pytest.raises(McpAuthError, match="Missing token"):
             authenticate_mcp(self._scope(), config)
         with pytest.raises(McpAuthError):
-            authenticate_mcp(self._scope(create_token("dev-secret")), config)
+            authenticate_mcp(self._scope(create_token(_FORGED)), config)
         payload = authenticate_mcp(self._scope(create_token(_STORED)), config)
         assert payload["sub"] == "user"
 

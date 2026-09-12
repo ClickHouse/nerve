@@ -14,6 +14,20 @@ Request:  { "password": "..." }
 Response: { "token": "eyJ..." }
 ```
 
+With no `auth.password_hash` configured the install is passwordless: any
+password is accepted and the token resolves to the single local account.
+Tokens are signed with `auth.jwt_secret`, or with the secret the gateway
+generated on first start when that is unset (see
+[Accounts and identity](accounts.md)); `503` means no signing secret exists
+yet, which only happens before the gateway has completed its first start.
+
+#### `GET /api/auth/status`
+Whether a password is required to log in. No auth required.
+
+```json
+Response: { "auth_required": true }
+```
+
 #### `GET /api/auth/check`
 Verify current authentication.
 

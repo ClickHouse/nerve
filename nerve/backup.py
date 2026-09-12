@@ -4,7 +4,11 @@ Produces a single portable bundle — ``nerve-backup-<host>-<ts>.tar.zst``
 (or ``.tar.gz`` when zstandard is unavailable) — containing a consistent
 snapshot of everything that makes a Nerve instance *this* instance:
 
-- ``nerve.db``   — sessions, messages, tasks index, notifications, plans, usage
+- ``nerve.db``   — sessions, messages, tasks index, notifications, plans, usage,
+  accounts and actor identity (so the bootstrapped identity ids survive a
+  restore). With ``--no-secrets`` its ``instance_secrets`` table — the JWT
+  signing secret generated for installs without ``auth.jwt_secret`` — is
+  emptied in the snapshot, since that flag promises no credential travels.
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -77,7 +81,9 @@ STATE_FILES: tuple[str, ...] = (
 )
 
 # Secret members (relative to the bundle root) — omitted with --no-secrets
-# and re-chmod'd to 0600 on restore.
+# and re-chmod'd to 0600 on restore. The one credential that is not a member
+# of its own — the JWT signing secret kept inside nerve.db — is handled by
+# :func:`_scrub_instance_secrets` instead.
 SECRET_MEMBERS: frozenset[str] = frozenset({
     "state/certs",
     "state/mcp-token",
@@ -326,6 +332,33 @@ def _snapshot_db(src: Path, dst: Path) -> None:
         )
 
 
+def _scrub_instance_secrets(snapshot: Path) -> None:
+    """Empty ``instance_secrets`` in a *snapshot* copy of nerve.db.
+
+    The JWT signing secret an install without ``auth.jwt_secret`` generates
+    lives in that table. It is exactly what ``--no-secrets`` promises to leave
+    out — anyone holding it can mint tokens for the live instance — but unlike
+    the other secrets it is rows inside a database rather than a file to skip.
+    So the snapshot is edited after it is taken and before it is checksummed;
+    the live database is never touched. ``secure_delete`` makes SQLite
+    overwrite the freed pages rather than merely unlink them. A snapshot from
+    before the table existed is left alone. The restored instance simply
+    generates a fresh secret on its first start.
+    """
+    conn = _connect(snapshot)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='instance_secrets'"
+        ).fetchone()
+        if not exists:
+            return
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.execute("DELETE FROM instance_secrets")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _db_schema_version(db_path: Path) -> int:
     """Read the persisted schema version from a nerve.db (0 if absent)."""
     try:
@@ -554,6 +587,8 @@ def create_backup(
             src = nerve_dir / db_name
             if src.exists():
                 _snapshot_db(src, state_dir / db_name)
+                if db_name == "nerve.db" and not include_secrets:
+                    _scrub_instance_secrets(state_dir / db_name)
             else:
                 logger.warning("state DB missing, skipping: %s", src)
 

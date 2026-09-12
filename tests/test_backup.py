@@ -375,6 +375,113 @@ def test_no_secrets_omits_and_flags(nerve_dir, workspace, config_dir, tmp_path):
     assert any(m.endswith("state/cron/jobs.yaml") for m in members)
 
 
+def _plant_instance_secret(db_path: Path) -> None:
+    """The table v047 adds, holding the generated JWT signing secret."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE instance_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL, "
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES ('jwt_secret', 'planted-signing-secret', 't')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stored_secrets(db_path: Path) -> list[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [r[0] for r in conn.execute("SELECT value FROM instance_secrets").fetchall()]
+    finally:
+        conn.close()
+
+
+def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, config_dir, tmp_path):
+    """The generated JWT signing secret lives inside nerve.db, so skipping
+    files is not enough: whoever holds it can mint tokens for the live
+    instance. It must be gone from a --no-secrets snapshot — and only there;
+    the live database is not touched."""
+    _plant_instance_secret(nerve_dir / "nerve.db")
+
+    stripped = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out1", config_dir=config_dir, include_secrets=False,
+    )
+    staging = tmp_path / "x1"
+    report = backup_mod.verify_bundle(stripped.path, extract_to=staging)
+    assert report.ok, report.errors  # checksums were taken after the scrub
+    assert _stored_secrets(staging / "state" / "nerve.db") == []
+    assert "planted-signing-secret" not in (staging / "state" / "nerve.db").read_bytes().decode(
+        "latin-1"
+    )
+    assert _stored_secrets(nerve_dir / "nerve.db") == ["planted-signing-secret"]
+
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir, include_secrets=True,
+    )
+    staging = tmp_path / "x2"
+    backup_mod.verify_bundle(kept.path, extract_to=staging)
+    assert _stored_secrets(staging / "state" / "nerve.db") == ["planted-signing-secret"]
+
+
+def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, tmp_path):
+    """Actor references must stay stable across a restore: sessions and
+    messages will point at these ids for good, so a restored instance has to
+    find the very same tenant, agent, system principal, owner and account —
+    and the same signing secret, so live sessions keep verifying."""
+    import asyncio
+
+    from nerve.db import Database
+    from nerve.db.accounts import JWT_SECRET_NAME
+
+    nd = tmp_path / "real_nerve"
+    nd.mkdir()
+
+    async def _bootstrap():
+        db = Database(nd / "nerve.db")
+        await db.connect()
+        try:
+            identity = await db.bootstrap_local_identity(credential_source="none")
+            secret = await db.ensure_instance_secret(JWT_SECRET_NAME, "stable-signing-secret")
+            return identity, secret, await db.list_accounts()
+        finally:
+            await db.close()
+
+    async def _read_back(path: Path):
+        db = Database(path)
+        await db.connect()  # already at the schema head: no migration runs
+        try:
+            return (
+                await db.get_local_identity(),
+                await db.get_instance_secret(JWT_SECRET_NAME),
+                await db.list_accounts(),
+                await db.get_system_principal(),
+            )
+        finally:
+            await db.close()
+
+    identity, secret, accounts = asyncio.run(_bootstrap())
+    _make_memu_db(nd / "memu.sqlite")
+
+    result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
+    nd2 = tmp_path / "restored_nerve"
+    rep = backup_mod.restore_bundle(
+        result.path, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+    )
+    assert rep.ok, rep.errors
+
+    found, found_secret, found_accounts, system = asyncio.run(_read_back(nd2 / "nerve.db"))
+    assert (found.tenant_id, found.agent_id, found.system_actor_id) == (
+        identity.tenant_id, identity.agent_id, identity.system_actor_id,
+    )
+    assert found_accounts == accounts
+    assert found_accounts[0]["id"] == identity.owner_account_id
+    assert system["id"] == identity.system_actor_id
+    assert found_secret == secret == "stable-signing-secret"
+
+
 def test_state_only_skips_workspace(nerve_dir, workspace, config_dir, tmp_path):
     out = tmp_path / "out"
     result = backup_mod.create_backup(
