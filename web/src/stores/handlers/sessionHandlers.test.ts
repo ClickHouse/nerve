@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
 
-import { handleSessionRunning } from './sessionHandlers';
+import { handleSessionRunning, handleUserMessage } from './sessionHandlers';
 import type { ChatState } from '../chatStore';
 import type { Get, Set } from './types';
 import type { Session } from '../../types/chat';
@@ -94,5 +94,46 @@ describe('handleSessionRunning — parked sessions', () => {
     handleSessionRunning(running(), store.get, store.set);
 
     expect(store.current().loadSessions).toHaveBeenCalled();
+  });
+});
+
+/**
+ * The live echo: another client of this session sent something, and the event
+ * names who. Carrying the id through is what lets a second tab label the bubble
+ * as it arrives instead of waiting for the next reload to read the stored row.
+ */
+describe('handleUserMessage — the sender on a live echo', () => {
+  const echo = (
+    extra: Partial<Extract<WSMessage, { type: 'user_message' }>> = {},
+  ): Extract<WSMessage, { type: 'user_message' }> => ({
+    type: 'user_message', session_id: 's1', content: 'hi', ...extra,
+  });
+
+  it('carries the actor onto the appended message', () => {
+    const store = fakeStore([row('s1')], 's1');
+
+    handleUserMessage(echo({ actor_id: 'actor-bob' }), store.get, store.set);
+
+    const [msg] = store.current().messages;
+    expect(msg.role).toBe('user');
+    expect(msg.actor_id).toBe('actor-bob');
+  });
+
+  it('records no sender when the event names none', () => {
+    const store = fakeStore([row('s1')], 's1');
+
+    handleUserMessage(echo(), store.get, store.set);
+
+    // Null, never a placeholder id or a name: an unattributed echo has to
+    // render exactly like the unattributed history above it.
+    expect(store.current().messages[0].actor_id).toBeNull();
+  });
+
+  it('ignores an echo for a session that is not open', () => {
+    const store = fakeStore([row('s1')], 'other');
+
+    handleUserMessage(echo({ actor_id: 'actor-bob' }), store.get, store.set);
+
+    expect(store.current().messages).toHaveLength(0);
   });
 });
