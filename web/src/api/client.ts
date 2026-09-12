@@ -351,10 +351,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   // Auth
   /**
-   * `username` is required once the instance has two accounts and must be
-   * omitted before that — the account an upgrade created has none, so the
-   * server accepts a password on its own while there is exactly one. Which of
-   * the two applies is what `authStatus().login` says.
+   * `username` is optional while exactly one account exists and required once
+   * there are two or more: the account an upgrade created has none, so the
+   * server accepts a password on its own while there is exactly one. A username
+   * that does resolve is accepted at any time. Which shape to collect is what
+   * `authStatus().login` says.
    */
   login: (password: string, username?: string) =>
     request<{ token: string }>('/auth/login', {

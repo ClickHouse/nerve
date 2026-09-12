@@ -183,7 +183,7 @@ Login takes a password and, once it is needed, a username.
 | Accounts | What the form collects | Why |
 |---|---|---|
 | one, passwordless | nothing (any password is accepted) | there is nothing to ask |
-| one, with a password | a password | the account an upgrade created has no username, so requiring one would lock the install out |
+| one, with a password | a password; a username is accepted but not needed | the account an upgrade created has no username, so requiring one would lock the install out |
 | two or more | a username and a password | a password alone names nobody |
 
 `GET /api/auth/status` says which of the three applies, so the browser shows the

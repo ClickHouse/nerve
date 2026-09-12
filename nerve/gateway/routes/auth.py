@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import secrets as _secrets
 
 from fastapi import APIRouter, Depends
 from fastapi import HTTPException
@@ -14,7 +13,6 @@ from nerve.gateway.auth import (
     NO_IDENTITY_DETAIL,
     create_session_token,
     effective_jwt_secret,
-    hash_password,
     identity_store,
     require_auth,
     verify_password,
@@ -51,20 +49,26 @@ _UNKNOWN_STATUS = {
     "multiple_accounts": False,
 }
 
-# A bcrypt hash of a random string nobody holds, compared against when the
-# username names no account. Without it, a request for a username that does not
-# exist returns before any hashing happens and one that does exist pays for a
-# bcrypt comparison, which is a list of who works here measured with a
-# stopwatch. Built once, lazily: hashing costs a quarter of a second and no
-# import should.
-_decoy: str | None = None
-
-
-def _decoy_hash() -> str:
-    global _decoy
-    if _decoy is None:
-        _decoy = hash_password(_secrets.token_urlsafe(32))
-    return _decoy
+# The hash compared against when the username names no account.
+#
+# Without it a request for a username that does not exist returns before any
+# hashing happens, while one that does exist pays for a bcrypt comparison —
+# which is a list of who works here, measured with a stopwatch.
+#
+# A *constant* rather than something generated, and that is the point:
+# generating it lazily made the first unknown-username request per process pay
+# for a hash **and** a comparison, so the leak this closes was still open once
+# per process; generating it at import made every CLI command pay a quarter of a
+# second for a web-login detail. Every request now performs exactly one
+# comparison, whether or not the username exists.
+#
+# This is not a credential. It is the bcrypt hash of a random string that was
+# generated once, used to produce this line and discarded; nothing knows the
+# plaintext, and nothing anywhere accepts this hash as a password — it is only
+# ever the right-hand side of a comparison that is about to fail. Cost 12 is
+# bcrypt's default, so it takes the same time as a comparison against a real
+# account's hash.
+_DECOY_HASH = "$2b$12$WSa90bUaYgZg94/cwtxqZuKQBrzC2BJA1MSEO/le348QlaMVKoaty"
 
 
 class LoginRequest(BaseModel):
@@ -131,7 +135,7 @@ async def login(req: LoginRequest):
 
     if account is None:
         # Spend the same time as a real comparison would, then refuse.
-        verify_password(req.password or "x", _decoy_hash())
+        verify_password(req.password or "x", _DECOY_HASH)
         raise HTTPException(status_code=401, detail=_INVALID)
 
     credential = account_credential(account, config)
@@ -144,7 +148,7 @@ async def login(req: LoginRequest):
         # by an account left without a password — a restored `--no-secrets`
         # bundle on a multi-account install, or a `config`-source row whose
         # configured hash has gone. Refuse rather than admit.
-        verify_password(req.password or "x", _decoy_hash())
+        verify_password(req.password or "x", _DECOY_HASH)
         raise HTTPException(status_code=401, detail=_INVALID)
     # Otherwise passwordless with exactly one account: any password is accepted
     # and resolves to it. That is the documented upgrade behaviour (0.7), and it
