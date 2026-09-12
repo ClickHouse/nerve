@@ -676,6 +676,95 @@ class TestScrubIsVerified:
         assert _stored_secret(db_file) == "backed-up-secret-32-bytes-padded!!"
 
 
+class TestTheBundleItselfIsOwnerOnly:
+    """The bundle carries nerve.db (accounts, history, and unless
+    ``--no-secrets`` scrubbed it, the signing secret) and config.local.yaml
+    with the password hash. Hardening the files it is made of and then writing
+    them into a world-readable tarball would hand the same key to the same
+    people, so the bundle is created 0600 before a byte is written."""
+
+    def test_the_bundle_is_created_owner_only(self, nerve_dir, workspace, config_dir, tmp_path):
+        result = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        )
+        assert (os.stat(result.path).st_mode & 0o777) == 0o600
+        assert not (tmp_path / "out" / (result.path.name + ".tmp")).exists()
+
+    def test_a_bundle_that_cannot_be_created_owner_only_is_refused(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The mode-less filesystem case, caught while the file is still empty:
+        no bundle, rather than one that leaks the key to every local user."""
+        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
+        with pytest.raises(BackupError, match="nothing was written"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+            )
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_a_no_secrets_bundle_is_still_written_with_a_warning(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, caplog,
+    ):
+        """``--no-secrets`` carries no credential — the signing secret is
+        scrubbed and config.local.yaml is not collected — so the same failure
+        is loud but not fatal: refusing to back up at all would be worse."""
+        import logging
+
+        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
+        with caplog.at_level(logging.WARNING, logger="nerve.backup"):
+            result = backup_mod.create_backup(
+                nerve_dir, workspace, tmp_path / "out",
+                config_dir=config_dir, include_secrets=False,
+            )
+        assert result.path.exists()
+        assert any("readable by other users" in r.getMessage() for r in caplog.records)
+
+
+class TestRestoredConfigLocalIsOwnerOnly:
+    """config.local.yaml holds ``auth.password_hash`` and the machine-local
+    secrets, and it lands in an ordinary config directory rather than the state
+    directory restore verifies — so it goes through the same verified 0600
+    temporary as nerve.db, and a failure aborts the restore instead of quietly
+    finishing without it (an instance with no configured password is
+    passwordless, which is not what a restore was asked to do)."""
+
+    def test_it_is_installed_owner_only(self, nerve_dir, workspace, config_dir, tmp_path):
+        result = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        )
+        cfg2 = tmp_path / "restored_cfg"
+        cfg2.mkdir(mode=0o755)  # an ordinary config dir, reachable by others
+        rep = backup_mod.restore_bundle(
+            result.path, tmp_path / "restored_nerve", tmp_path / "restored_ws",
+            config_dir=cfg2,
+        )
+        assert rep.ok, rep.errors
+        assert (os.stat(cfg2 / "config.local.yaml").st_mode & 0o777) == 0o600
+        assert not (cfg2 / "config.local.yaml.restore-tmp").exists()
+
+    def test_a_failure_aborts_the_restore_instead_of_dropping_the_file(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        result = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        )
+        real_create = backup_mod._secure_create
+
+        def refuse_config_temp(path, what, **kwargs):
+            if path.name.startswith("config.local.yaml"):
+                raise BackupError(f"{what}: could not create {path} owner-only")
+            return real_create(path, what, **kwargs)
+
+        monkeypatch.setattr(backup_mod, "_secure_create", refuse_config_temp)
+        cfg2 = tmp_path / "restored_cfg"
+        with pytest.raises(BackupError, match="config.local.yaml"):
+            backup_mod.restore_bundle(
+                result.path, tmp_path / "restored_nerve", tmp_path / "restored_ws",
+                config_dir=cfg2,
+            )
+        assert not (cfg2 / "config.local.yaml").exists()
+
+
 def test_state_only_skips_workspace(nerve_dir, workspace, config_dir, tmp_path):
     out = tmp_path / "out"
     result = backup_mod.create_backup(

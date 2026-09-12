@@ -54,7 +54,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -430,40 +430,60 @@ def _secure_directory(path: Path) -> None:
         )
 
 
-def _secure_install_db(src: Path, dst: Path) -> None:
-    """Install a secret-bearing database at ``dst`` with no readable window.
+def _secure_create(path: Path, what: str, *, detail: str = "nothing was copied") -> int:
+    """Create ``path`` owner-only and return the open descriptor.
+
+    ``O_CREAT|O_EXCL`` with mode ``0600``, then the mode is read back *through
+    the descriptor* — so a filesystem that accepted the mode and ignored it is
+    caught while the file is still empty. On failure nothing has been written
+    and no file is left behind. Raises :class:`BackupError`.
+    """
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+    try:
+        if not _mode_is_private(os.fstat(fd).st_mode):
+            raise BackupError(
+                f"{what}: could not create {path} owner-only (the filesystem ignored "
+                f"mode {SECRET_FILE_MODE:04o}); {detail}. Fix the filesystem "
+                f"or choose a directory that supports Unix modes."
+            )
+    except BaseException:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise
+    return fd
+
+
+def _secure_install_file(
+    src: Path,
+    dst: Path,
+    *,
+    what: str,
+    last_resort: Callable[[Path], None] | None = None,
+    exposed_detail: str = "",
+) -> None:
+    """Install a secret-bearing file at ``dst`` with no readable window.
 
     Order matters, and each step is verified before the next:
 
-    1. the temporary file is *created* owner-only (``O_CREAT|O_EXCL`` with mode
-       ``0600``) and its mode read back through the open descriptor — if the
-       filesystem did not honour the mode, nothing has been copied yet and the
-       restore aborts;
+    1. the temporary file is *created* owner-only and verified through its
+       descriptor (:func:`_secure_create`) — if the filesystem did not honour
+       the mode, nothing has been copied yet and the restore aborts;
     2. the bytes are copied into it and flushed;
     3. it is renamed over ``dst`` atomically, so ``dst`` never exists at a wider
        mode, and the result is verified once more;
     4. only if that final verification fails — which the earlier checks make
-       all but impossible — the stored signing secret is scrubbed from the
-       installed file as a last resort, that scrub is itself verified, and the
-       restore still fails: a readable accounts database is not a success.
+       all but impossible — ``last_resort`` runs on the installed file (for
+       ``nerve.db``: scrub the signing secret) and the restore **still** fails.
+       A restore that leaves a credential other users can read is not a
+       success, whatever was salvaged.
 
-    A partial temporary is always removed. Failures raise :class:`BackupError`.
+    A mode that cannot be read at step 3 counts as *not* private: unknown is
+    never treated as safe. A partial temporary is always removed. Failures
+    raise :class:`BackupError`.
     """
     tmp = dst.with_name(dst.name + ".restore-tmp")
-    if tmp.exists():
-        tmp.unlink()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
-    try:
-        if not _mode_is_private(os.fstat(fd).st_mode):
-            raise BackupError(
-                f"Restore: could not create {dst} owner-only (the filesystem ignored "
-                f"mode {SECRET_FILE_MODE:04o}); nothing was copied. Fix the filesystem "
-                f"or restore to a state directory that supports Unix modes."
-            )
-    except BaseException:
-        os.close(fd)
-        tmp.unlink(missing_ok=True)
-        raise
+    fd = _secure_create(tmp, what)
     try:
         with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
             shutil.copyfileobj(inp, out)
@@ -476,21 +496,39 @@ def _secure_install_db(src: Path, dst: Path) -> None:
         except OSError:
             pass
         raise
-    final = os.stat(dst).st_mode
-    if not _mode_is_private(final):
-        # Last resort, verified: the file is in place but readable, so remove
-        # the key rather than leave it (_scrub_db_secret raises if it cannot) —
-        # and then still fail. A restore that leaves the accounts database
-        # readable by other users is not a successful restore, whatever was
-        # salvaged; the operator fixes the filesystem and restores again.
-        _scrub_db_secret(dst)
+    try:
+        final: int | None = os.stat(dst).st_mode
+    except OSError as e:
+        # Uninspectable is not "probably fine": treat it exactly as exposed.
+        logger.warning("%s: cannot inspect the mode of %s: %s", what, dst, e)
+        final = None
+    if final is None or not _mode_is_private(final):
+        if last_resort is not None:
+            last_resort(dst)
+        found = f"is {stat.S_IMODE(final):04o}" if final is not None else "has an unreadable mode"
         raise BackupError(
-            f"Restore: {dst} is {stat.S_IMODE(final):04o} despite a verified 0600 "
-            f"temporary, so the filesystem is not keeping it private. The stored JWT "
-            f"signing secret was scrubbed from it so no usable key is exposed, but "
-            f"the restore is not complete: fix the filesystem or choose another state "
+            f"{what}: {dst} {found} despite a verified {SECRET_FILE_MODE:04o} "
+            f"temporary, so the filesystem is not keeping it private.{exposed_detail} "
+            f"The restore is not complete: fix the filesystem or choose another "
             f"directory, then restore again."
         )
+
+
+def _secure_install_db(src: Path, dst: Path) -> None:
+    """Install the restored ``nerve.db`` — accounts, actors, history and the
+    stored signing secret — through :func:`_secure_install_file`.
+
+    The last resort, should the installed file read back wide, is to scrub the
+    signing secret from it (itself verified, see :func:`_scrub_db_secret`) so
+    no usable key is left readable; the restore fails either way.
+    """
+    _secure_install_file(
+        src, dst, what="Restore", last_resort=_scrub_db_secret,
+        exposed_detail=(
+            " The stored JWT signing secret was scrubbed from it so no usable key "
+            "is exposed, but the accounts and history remain readable."
+        ),
+    )
 
 
 def _db_schema_version(db_path: Path) -> int:
@@ -818,9 +856,29 @@ def create_backup(
         )
 
         # 8. Build the tar (manifest first for cheap inspection).
+        #
+        # The bundle carries nerve.db — accounts, history and, unless
+        # ``--no-secrets`` scrubbed it, the JWT signing secret — plus
+        # config.local.yaml with the password hash. It is therefore created
+        # owner-only *before* a byte of it is written (and verified through the
+        # descriptor, so a filesystem that ignores the mode is caught while the
+        # file is still empty), rather than left at whatever the umask gives.
+        # ``os.replace`` below keeps that mode on the final bundle.
         tmp_bundle = output_dir / (final_name + ".tmp")
-        if tmp_bundle.exists():
-            tmp_bundle.unlink()
+        try:
+            os.close(_secure_create(tmp_bundle, "Backup", detail="nothing was written"))
+        except BackupError:
+            if include_secrets:
+                raise
+            # A --no-secrets bundle carries no credential: the signing secret is
+            # scrubbed from the snapshot and config.local.yaml is not collected.
+            # Its history is still private data, so this is loud — but it is not
+            # a key exposure, and refusing to back up at all would be worse.
+            logger.warning(
+                "Backup: %s could not be created owner-only; the bundle carries no "
+                "secrets (--no-secrets) but is readable by other users.", tmp_bundle,
+            )
+            tmp_bundle.unlink(missing_ok=True)
         with _tar_writer(tmp_bundle, compression) as tar:
             tar.add(stage / "manifest.json", arcname="manifest.json")
             for sub in ("config", "state", "workspace"):
@@ -1090,6 +1148,13 @@ def restore_bundle(
                         pass
 
         # Install config.local.yaml next to where the pointer says config lives.
+        # It carries auth.password_hash and any machine-local secret, and its
+        # destination is an ordinary config directory rather than the state dir
+        # verified above — so it goes through the same verified 0600 temporary
+        # as nerve.db, with no window at a wider mode. Failure is fatal rather
+        # than a warning: silently finishing without it would leave the restored
+        # instance with no configured password, which is a passwordless
+        # downgrade nobody asked for.
         staged_cfg = staging / "config" / "config.local.yaml"
         if staged_cfg.is_file():
             dest_cfg_dir = _resolve_restore_config_dir(
@@ -1097,12 +1162,27 @@ def restore_bundle(
             )
             try:
                 dest_cfg_dir.mkdir(parents=True, exist_ok=True)
-                dest = dest_cfg_dir / "config.local.yaml"
-                shutil.copy2(staged_cfg, dest)
-                os.chmod(dest, SECRET_FILE_MODE)
-                logger.info("Restored config.local.yaml to %s", dest)
             except OSError as e:
-                logger.warning("Could not restore config.local.yaml: %s", e)
+                raise BackupError(
+                    f"Restore: could not create the config directory {dest_cfg_dir} "
+                    f"for config.local.yaml (it holds the password hash and the "
+                    f"machine-local secrets): {e}"
+                ) from e
+            dest = dest_cfg_dir / "config.local.yaml"
+            try:
+                _secure_install_file(
+                    staged_cfg, dest, what="Restore",
+                    exposed_detail=(
+                        " It holds the password hash and the machine-local secrets, "
+                        "which are now readable by other users."
+                    ),
+                )
+            except OSError as e:
+                raise BackupError(
+                    f"Restore: could not install config.local.yaml to {dest} (it holds "
+                    f"the password hash and the machine-local secrets): {e}"
+                ) from e
+            logger.info("Restored config.local.yaml to %s", dest)
 
         # Install workspace BRAIN (overlay; never relocates the workspace).
         staged_ws = staging / "workspace"
