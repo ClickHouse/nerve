@@ -171,9 +171,19 @@ async def auth_status():
     |---|---|
     | ``mode`` | the identity mode — ``local`` in this build |
     | ``login`` | ``none`` (passwordless), ``password`` (one account, no username needed) or ``username_password`` |
-    | ``setup_pending`` | the sole account has neither a password nor a username: first-run state |
+    | ``setup_pending`` | nothing has been secured yet: the one account has no password, so every caller is admitted as it |
     | ``multiple_accounts`` | more than one account exists |
     | ``auth_required`` | kept for older clients; ``login != "none"`` |
+
+    ``setup_pending`` equals ``login == "none"`` today, and is a separate field
+    on purpose: it is the *question* "is this instance still unsecured", which
+    PR 6's wizard owns and may widen (a missing provider credential, say)
+    without changing what the login form collects. It deliberately does **not**
+    also require the account to be unnamed. The accounts screen can set a
+    username on its own, and an install that did that first would otherwise
+    stop reporting as pending — losing the warning and the route to the wizard
+    — while still admitting every caller, which is the exact state the wizard
+    exists to end.
 
     Deliberately **not** here: how many accounts there are, and any username.
     The spec sketched an account *count*; the boolean says everything a client
@@ -206,7 +216,7 @@ async def auth_status():
         "auth_required": login_kind != LOGIN_NONE,
         "mode": AUTH_MODE,
         "login": login_kind,
-        "setup_pending": state.setup_pending and login_kind == LOGIN_NONE,
+        "setup_pending": login_kind == LOGIN_NONE,
         "multiple_accounts": state.accounts > 1,
     }
 
