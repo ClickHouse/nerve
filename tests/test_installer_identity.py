@@ -89,7 +89,14 @@ class TestInstallerDisplayName:
             "SELECT actor.display_name, actor.kind, acc.credential_source, acc.username "
             "FROM accounts acc JOIN actor_refs actor ON actor.id = acc.actor_id",
         )
-        assert rows == [("alice", "human", "config", None)]
+        # The wizard's password hash lands on the account row rather than
+        # staying in configuration: `nerve init` bootstraps in-process, and the
+        # 3.5 migration runs in the same pass.
+        assert rows == [("alice", "human", "local", None)]
+        assert "copied auth.password_hash" in result.output
+        local_yaml = (config_dir / "config.local.yaml").read_text(encoding="utf-8")
+        assert "password_hash" not in local_yaml
+        assert _SECRET in local_yaml          # the signing secret is left alone
         # The system principal is not a person and gets no name.
         assert _db_rows(
             paths.db_path(), "SELECT display_name FROM actor_refs WHERE kind = 'system'",
