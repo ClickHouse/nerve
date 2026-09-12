@@ -285,15 +285,25 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         # and the name it collected exists nowhere else. Put the answers back so
         # a re-run resumes at the review step with the same name, and fail
         # loudly: the gateway's own bootstrap at first start would otherwise
-        # create the owner unnamed and nobody would know why.
-        if wizard is not None:
-            wizard.checkpoint()
-        remedy = (
-            " Fix the cause and run 'nerve init' again; your answers, the name "
-            "included, are saved and will be reused."
-            if wizard is not None
-            else " Fix the cause and run 'nerve init --non-interactive' again."
-        )
+        # create the owner unnamed and nobody would know why. Only promise the
+        # answers were kept if the checkpoint actually wrote — the same
+        # unwritable state filesystem can fail both the bootstrap and the save.
+        saved = wizard.checkpoint() if wizard is not None else False
+        if wizard is None:
+            remedy = " Fix the cause and run 'nerve init --non-interactive' again."
+        elif saved:
+            remedy = (
+                " Fix the cause and run 'nerve init' again; your answers, the name "
+                "included, are saved and will be reused."
+            )
+        else:
+            name = (choices.user_name or "").strip()
+            remedy = (
+                " Your answers could not be saved either; re-run 'nerve init' and "
+                "re-enter your details"
+                + (f' (your name was "{name}")' if name else "")
+                + "."
+            )
         raise click.ClickException(
             f"Setup wrote the configuration, but the local owner account could not "
             f"be created: {e}.{remedy}"

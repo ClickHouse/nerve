@@ -31,10 +31,11 @@ def _db_rows(db_path: Path, sql: str) -> list[tuple]:
         conn.close()
 
 
-def _stub_wizard(ws: Path, *, name: str, local_yaml: str):
+def _stub_wizard(ws: Path, *, name: str, local_yaml: str, checkpoint_ok: bool = True):
     """Stands in for SetupWizard: writes what the real one would and answers
     the identity step with ``name``. ``checkpoints`` counts how often the
-    installer asked it to save the answers back."""
+    installer asked it to save the answers back; ``checkpoint_ok`` is what that
+    save reports (True = written, False = could not be saved)."""
 
     class StubWizard:
         checkpoints = 0
@@ -51,8 +52,9 @@ def _stub_wizard(ws: Path, *, name: str, local_yaml: str):
             choices.user_name = name
             return choices
 
-        def checkpoint(self):
+        def checkpoint(self) -> bool:
             type(self).checkpoints += 1
+            return checkpoint_ok
 
     return StubWizard
 
@@ -181,17 +183,60 @@ class TestInstallerBootstrapFailure:
             paths.db_path(), "SELECT COUNT(*) FROM accounts",
         ) == [(0,)]
 
-    def test_the_real_checkpoint_keeps_the_name(self, tmp_path):
+    def test_a_failed_checkpoint_tells_the_truth_instead_of_promising_a_save(
+        self, tmp_path, monkeypatch,
+    ):
+        """F15: if the answers could not be saved either, the installer must not
+        claim they were — it says so and names the collected name."""
+        import nerve.migrate as migrate_mod
+        from nerve.cli import main
+
+        config_dir, ws = _install_dirs(tmp_path)
+        stub = _stub_wizard(
+            ws, name="alice", local_yaml=f"auth:\n  jwt_secret: {_SECRET}\n",
+            checkpoint_ok=False,
+        )
+        monkeypatch.setattr("nerve.bootstrap.SetupWizard", stub)
+
+        def boom(config, *, display_name=None):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
+
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "init"])
+        assert result.exit_code != 0
+        assert "could not be created" in result.output
+        assert "could not be saved" in result.output
+        assert "alice" in result.output
+        assert stub.checkpoints == 1
+
+    def test_the_real_checkpoint_keeps_the_name_and_reports_success(self, tmp_path):
         from nerve.bootstrap import SetupWizard, _load_init_state
 
         wizard = SetupWizard(tmp_path)
         wizard.choices.user_name = "alice"
         wizard._completed_steps = {"mode", "identity"}
-        wizard.checkpoint()
+        assert wizard.checkpoint() is True
 
         state = _load_init_state()
         assert state["choices"]["user_name"] == "alice"
         assert set(state["completed"]) == {"mode", "identity"}
+
+    def test_the_real_checkpoint_reports_failure_when_it_cannot_write(self, tmp_path, monkeypatch):
+        import nerve.bootstrap as bootstrap_mod
+        from nerve.bootstrap import SetupWizard, _load_init_state
+
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.user_name = "alice"
+
+        def refuse_chmod(*a, **k):
+            raise PermissionError("no modes here")
+
+        # A state filesystem that cannot make the checkpoint owner-only: the
+        # file holds API keys, so a save it cannot secure counts as no save.
+        monkeypatch.setattr(bootstrap_mod.os, "chmod", refuse_chmod)
+        assert wizard.checkpoint() is False
+        assert _load_init_state() is None  # partial file removed
 
     def test_a_headless_failure_exits_non_zero_without_pretending_to_save_answers(
         self, tmp_path, monkeypatch,

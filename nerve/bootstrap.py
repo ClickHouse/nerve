@@ -438,11 +438,18 @@ def _init_state_file() -> Path:
     return paths.nerve_path("init-state.json")
 
 
-def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
-    """Checkpoint wizard progress (best-effort — never breaks the wizard)."""
+def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
+    """Checkpoint wizard progress. Never breaks the wizard.
+
+    Returns True only when the checkpoint is on disk *and* owner-only. A write
+    that failed, or a file that could not be made 0600 (it holds API keys), is
+    treated as no checkpoint: any partial file is removed and False returned, so
+    a caller that promises the user their answers were kept can tell the truth.
+    """
     import dataclasses
     from datetime import datetime
 
+    path = _init_state_file()
     try:
         data = dataclasses.asdict(choices)
         data["workspace_path"] = str(choices.workspace_path)
@@ -451,12 +458,16 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
             "completed": sorted(completed),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
-        path = _init_state_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state), encoding="utf-8")
         os.chmod(path, 0o600)  # contains API keys
+        return True
     except OSError:
-        pass
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def _load_init_state() -> dict | None:
@@ -526,16 +537,18 @@ class SetupWizard:
         self._completed_steps.add(name)
         _save_init_state(self.choices, self._completed_steps)
 
-    def checkpoint(self) -> None:
+    def checkpoint(self) -> bool:
         """Save the answers so a re-run resumes rather than starting over.
 
         The wizard clears its checkpoint once it has applied the
         configuration. The installer calls this if the step after that —
         creating the local owner account — fails, so the collected answers
         (the owner's name among them, which is written nowhere else) survive
-        for the re-run.
+        for the re-run. Returns whether the checkpoint was actually written
+        (see :func:`_save_init_state`), so the caller does not claim answers
+        were saved when the state filesystem is full or unwritable.
         """
-        _save_init_state(self.choices, self._completed_steps)
+        return _save_init_state(self.choices, self._completed_steps)
 
     def _maybe_resume(self) -> bool:
         """Offer to resume an interrupted setup. Returns True if resumed."""
