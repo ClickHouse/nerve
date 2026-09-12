@@ -195,6 +195,22 @@ describe('startup with a token already in storage', () => {
     expect(apiLogin).toHaveBeenCalledWith('');
   });
 
+  it('opens the app when the descriptor cannot be read but the token is good',
+    async () => {
+      // The token answers "may this tab come in"; only the descriptor answers
+      // "where". With no answer, the app is the safe place to be — it is the
+      // setup *page* that is the claim, and claiming without evidence would
+      // put every working install in front of a setup notice.
+      authStatus.mockRejectedValue(new Error('network'));
+
+      renderApp();
+
+      expect(await screen.findByText('the chat page')).toBeInTheDocument();
+      await waitFor(() =>
+        expect(useAuthStore.getState().loginMode).toBe('username_password'));
+      expect(useAuthStore.getState().setupPending).toBe(false);
+    });
+
   it('a dead token on a passwordless install signs in rather than asking',
     async () => {
       authStatus.mockResolvedValue(status({ login: 'none', auth_required: false }));

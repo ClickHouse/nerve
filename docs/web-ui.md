@@ -132,6 +132,16 @@ chat: one account with no password, so everyone who can reach it is signed in as
 it. Giving that account a username does not settle it — only a password does. It
 is skippable and points here.
 
+### When a session expires
+
+The app stays mounted and asks for the password over the top, so nothing you had
+typed is lost. It unlocks **the account whose app is on screen** and no other:
+the username is shown rather than asked for, because everything underneath —
+unsent drafts, what has been read, the loaded session list — belongs to that
+person, and a form that took any username would let somebody else unlock a
+colleague's tab and inherit it. Using a different account goes through "log
+out", which is what discards all of that first.
+
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
 - **System** — Hostname, platform, memory (RSS), disk usage
