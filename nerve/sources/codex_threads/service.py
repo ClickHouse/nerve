@@ -7,8 +7,9 @@ shutdown.
 
 Cursor persistence reuses the existing ``sync_cursors`` table — each
 origin gets its own row keyed on ``codex:<origin_id>``. The service
-saves the cursor on every event so a crash never loses more than one
-event of progress.
+saves the cursor after every **successfully ingested** event, so a crash
+never loses more than one event of progress and a failure never skips one:
+see :class:`_OriginWorker`.
 """
 
 from __future__ import annotations
@@ -39,7 +40,27 @@ logger = logging.getLogger(__name__)
 
 
 class _OriginWorker:
-    """Pairs one :class:`CodexOrigin` with its dedicated :class:`CodexIngester`."""
+    """Pairs one origin with its ingester, and checkpoints what was ingested.
+
+    The origin advances its own offset *before* it yields an event (so a
+    consumer that stops mid-stream has a correct cursor), which means
+    ``origin.cursor()`` during a failed ingest already covers work that was
+    never persisted. Saving it there would skip the event permanently: the
+    next scan starts past it and nothing ever replays it.
+
+    So the worker keeps its own ``_checkpoint`` — the cursor as of the last
+    event that actually landed — and that is the only value ever written. On
+    the first failure it stops advancing for the rest of the run, because a
+    later event's cursor also covers the failed one. Ingestion is idempotent
+    (sessions are looked up first, messages are keyed on ``external_id``), so
+    the replay a restart performs is safe, and re-doing work is the only
+    outcome that cannot lose it.
+
+    The trade-off, stated plainly: an event that fails *every* time stalls the
+    checkpoint until it is dealt with, rather than being skipped silently. A
+    stuck sync with an exception in the log is the better failure — the old
+    behaviour dropped the event and left no trace but a gap.
+    """
 
     def __init__(
         self,
@@ -52,6 +73,10 @@ class _OriginWorker:
         self.db = db
         self.task: asyncio.Task | None = None
         self.cursor_key = f"codex:{origin.id}"
+        # The cursor covering only events this worker has ingested. None
+        # until the run starts; never advanced past a failure.
+        self._checkpoint: str | None = None
+        self._stalled = False
 
     async def run(self) -> None:
         try:
@@ -68,6 +93,10 @@ class _OriginWorker:
             return
 
         cursor = await self.db.get_sync_cursor(self.cursor_key)
+        # Start from where the last run left off; until an event lands, that
+        # is also the furthest this run may checkpoint to.
+        self._checkpoint = cursor
+        self._stalled = False
         try:
             async for event in self.origin.stream(cursor):
                 await self._handle(event)
@@ -88,21 +117,31 @@ class _OriginWorker:
             await self.ingester.ingest(event)
         except Exception:
             logger.exception(
-                "Codex ingest failed (origin=%s thread=%s seq=%d type=%s)",
+                "Codex ingest failed (origin=%s thread=%s seq=%d type=%s) — "
+                "the cursor stays where it was, so a restart replays it",
                 self.origin.id, event.thread_id, event.sequence, event.type,
             )
-        # Persist cursor after every event — cheap (one row update) and
-        # the safest place to checkpoint.
+            self._stalled = True
+            return
+        # Checkpoint after every event that landed — cheap (one row update),
+        # and now it means what it says.
+        self._advance_checkpoint()
         await self._save_cursor()
 
-    async def _save_cursor(self) -> None:
-        try:
-            cursor = self.origin.cursor()
-        except Exception:
-            logger.exception("Codex origin %s cursor() failed", self.origin.id)
+    def _advance_checkpoint(self) -> None:
+        """Take the origin's cursor as the new checkpoint, unless stalled."""
+        if self._stalled:
             return
         try:
-            await self.db.set_sync_cursor(self.cursor_key, cursor)
+            self._checkpoint = self.origin.cursor()
+        except Exception:
+            logger.exception("Codex origin %s cursor() failed", self.origin.id)
+
+    async def _save_cursor(self) -> None:
+        if self._checkpoint is None:
+            return
+        try:
+            await self.db.set_sync_cursor(self.cursor_key, self._checkpoint)
         except Exception:
             logger.exception(
                 "Codex origin %s set_sync_cursor failed", self.origin.id,
