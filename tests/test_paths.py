@@ -5,6 +5,8 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 from nerve import paths
 
 
@@ -102,6 +104,66 @@ class TestAccessors:
         ws = paths.default_workspace()
         assert ws == Path.home() / "nerve-workspace"
         assert (tmp_path / "state") not in ws.parents
+
+
+class TestWritePrivateText:
+    """``config.local.yaml`` carries the signing secret, the password hash and
+    the API keys, so it must never exist at a wider mode — not even between a
+    plain write and a chmod, which is how it used to be produced."""
+
+    def test_the_file_is_owner_only_and_holds_the_text(self, tmp_path):
+        target = tmp_path / "config.local.yaml"
+        assert paths.write_private_text(target, "auth:\n  password_hash: x\n") is True
+        assert target.read_text(encoding="utf-8") == "auth:\n  password_hash: x\n"
+        assert (os.stat(target).st_mode & 0o777) == 0o600
+        assert not target.with_name(target.name + ".tmp").exists()
+
+    def test_it_is_never_created_at_a_wider_mode_even_under_umask_000(self, tmp_path):
+        """The mode is the one ``os.open`` applies, so the umask can only take
+        bits away — there is no window at 0666 while the bytes land."""
+        old = os.umask(0o000)
+        try:
+            target = tmp_path / "secrets.yaml"
+            assert paths.write_private_text(target, "x: 1\n") is True
+            assert (os.stat(target).st_mode & 0o777) == 0o600
+        finally:
+            os.umask(old)
+
+    def test_it_replaces_an_existing_wide_file_with_an_owner_only_one(self, tmp_path):
+        target = tmp_path / "config.local.yaml"
+        target.write_text("old\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+        assert paths.write_private_text(target, "new\n") is True
+        assert target.read_text(encoding="utf-8") == "new\n"
+        assert (os.stat(target).st_mode & 0o777) == 0o600
+
+    def test_a_filesystem_that_ignores_modes_is_reported_not_hidden(self, tmp_path, monkeypatch):
+        """The file is still written — an install that does not work protects
+        nothing — but the caller is told it is not private, so it can say so."""
+        target = tmp_path / "config.local.yaml"
+        real_stat = os.stat
+
+        def wide_stat(path, *a, **k):
+            st = real_stat(path, *a, **k)
+            if Path(path) == target:
+                return os.stat_result((0o100644,) + tuple(st)[1:])
+            return st
+
+        monkeypatch.setattr(paths.os, "stat", wide_stat)
+        assert paths.write_private_text(target, "x: 1\n") is False
+        assert target.read_text(encoding="utf-8") == "x: 1\n"
+
+    def test_a_failed_write_leaves_no_temporary_behind(self, tmp_path, monkeypatch):
+        target = tmp_path / "config.local.yaml"
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(paths.os, "replace", boom)
+        with pytest.raises(OSError):
+            paths.write_private_text(target, "x: 1\n")
+        assert not target.exists()
+        assert not target.with_name(target.name + ".tmp").exists()
 
 
 class TestLabels:

@@ -3504,14 +3504,21 @@ def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
         return False
     users.append(user_id)
 
-    with open(local_path, "w", encoding="utf-8") as f:
-        f.write("# Nerve — Secrets (gitignored)\n")
-        f.write("# API keys, tokens, and other sensitive configuration.\n\n")
-        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-    try:
-        os.chmod(local_path, 0o600)
-    except OSError:
-        pass
+    # Rewritten through the owner-only writer: the file it is rewriting holds
+    # the signing secret and the password hash, and a plain write followed by a
+    # chmod would republish both at the umask's mode in between.
+    private = paths.write_private_text(
+        local_path,
+        "# Nerve — Secrets (gitignored)\n"
+        "# API keys, tokens, and other sensitive configuration.\n\n"
+        + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+    )
+    if not private:
+        logger.error(
+            "%s is not owner-only (0600) after rewriting it; it holds the signing "
+            "secret and the password hash, and other users on this machine can read "
+            "it.", local_path,
+        )
     logger.info("Persisted Telegram user %d to %s", user_id, local_path)
     return True
 

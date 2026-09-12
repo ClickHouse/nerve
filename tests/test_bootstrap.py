@@ -308,6 +308,29 @@ class TestConfigLocalPermissions:
         mode = oct(local_path.stat().st_mode)[-3:]
         assert mode == "600"
 
+    def test_it_is_never_created_at_a_wider_mode(self, tmp_path: Path) -> None:
+        """It holds the signing secret, the password hash and the API keys, so
+        the mode comes from the create — not from a chmod afterwards, which
+        would publish all three for the moment in between. Under a umask of 000
+        a plain write would land 0666."""
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.workspace_path = tmp_path / "workspace"
+        wizard.choices.mode = "personal"
+        wizard.choices.password = "pw-for-the-owner-account"
+
+        old = os.umask(0o000)
+        try:
+            wizard._apply()
+        finally:
+            os.umask(old)
+
+        local_path = tmp_path / "config.local.yaml"
+        assert stat.S_IMODE(local_path.stat().st_mode) == 0o600
+        assert not local_path.with_name(local_path.name + ".tmp").exists()
+        local = yaml.safe_load(local_path.read_text())
+        assert local["auth"]["jwt_secret"] and local["auth"]["password_hash"]
+
 
 class TestInsideDockerFlag:
     """Test --inside-docker wizard behavior."""

@@ -25,6 +25,7 @@ Keep this module dependency-free (only ``os``/``pathlib``) so that
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 # Environment override for the machine-local state directory.
@@ -185,3 +186,43 @@ def ensure_nerve_home() -> Path:
     home = nerve_home()
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     return home
+
+
+# Mode for a file that carries a credential: owner read/write, nothing else.
+SECRET_FILE_MODE = 0o600
+
+
+def write_private_text(path: Path, text: str) -> bool:
+    """Write ``text`` to ``path`` as a file only its owner can read.
+
+    ``config.local.yaml`` carries the signing secret, the password hash and
+    every API key the wizard collected, so it must not exist at a wider mode —
+    not even for the moment between a plain write and a ``chmod``, which is how
+    it used to be produced. The content goes to a temporary *created* ``0600``
+    (``O_CREAT|O_EXCL`` with the mode, read back through the descriptor) and is
+    renamed into place, so the destination is owner-only from its first byte
+    and readers never see a half-written file.
+
+    Returns whether the result is owner-only. ``False`` means the filesystem
+    does not keep it private (no Unix modes) — the file is still written,
+    because a secret nobody can read is not worth an install that does not
+    work, and the caller says so out loud instead. ``OSError`` from the write
+    itself propagates, exactly as the plain write it replaces did.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        return (stat.S_IMODE(os.stat(path).st_mode) & 0o077) == 0
+    except OSError:
+        return False  # unknown is never "private"
