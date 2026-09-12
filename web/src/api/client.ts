@@ -26,6 +26,12 @@ export interface AuthStatus {
 /** One local account, as `/api/accounts` returns it. Never carries a credential. */
 export interface Account {
   id: string;
+  /**
+   * The permanent identity behind the login, and what attribution is written
+   * against — a different column from `id`, and the one that outlives every
+   * rename. This is how a view that has a message's author id finds a person.
+   */
+  actor_id: string;
   username: string | null;
   display_name: string | null;
   enabled: boolean;

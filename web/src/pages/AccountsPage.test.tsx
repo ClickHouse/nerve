@@ -36,6 +36,7 @@ const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 function account(overrides: Partial<Account> = {}): Account {
   return {
     id: 'acc-1',
+    actor_id: 'actor-1',
     username: 'alice',
     display_name: 'Alice',
     enabled: true,
@@ -143,7 +144,60 @@ describe('adding a person', () => {
 });
 
 describe('disabling and enabling', () => {
-  it('calls the right endpoint for each direction', async () => {
+  it('asks before disabling, and only then calls the endpoint', async () => {
+    api.listAccounts.mockResolvedValue({
+      accounts: [
+        account(),
+        account({ id: 'acc-2', username: 'bob', is_self: false }),
+      ],
+    });
+    api.setAccountEnabled.mockResolvedValue(account());
+    renderPage();
+    await screen.findByText('bob');
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Disable' })[1]);
+    // Nothing has happened yet — the click opened a question.
+    expect(api.setAccountEnabled).not.toHaveBeenCalled();
+    expect(await screen.findByRole('alertdialog')).toHaveTextContent(/Disable bob\?/);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Disable account' }));
+    expect(api.setAccountEnabled).toHaveBeenCalledWith('acc-2', false);
+  });
+
+  it('lets the question be answered no', async () => {
+    api.listAccounts.mockResolvedValue({
+      accounts: [account(), account({ id: 'acc-2', username: 'bob', is_self: false })],
+    });
+    renderPage();
+    await screen.findByText('bob');
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Disable' })[1]);
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(api.setAccountEnabled).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('warns harder about disabling yourself, and says what it costs', async () => {
+    api.listAccounts.mockResolvedValue({
+      accounts: [account(), account({ id: 'acc-2', username: 'bob', is_self: false })],
+    });
+    api.setAccountEnabled.mockResolvedValue(account());
+    renderPage();
+    await screen.findByText('alice');
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Disable' })[0]);
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog).toHaveTextContent(/signed out/);
+    expect(dialog).toHaveTextContent(/somebody else/);
+    // A distinct label, so "confirm" is not the same word as "start".
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Disable my account' }),
+    );
+    expect(api.setAccountEnabled).toHaveBeenCalledWith('acc-1', false);
+  });
+
+  it('enables without asking — it takes nothing away', async () => {
     api.listAccounts.mockResolvedValue({
       accounts: [
         account(),
@@ -155,11 +209,9 @@ describe('disabling and enabling', () => {
     renderPage();
     await screen.findByText('alice');
 
-    await userEvent.click(screen.getAllByRole('button', { name: 'Disable' })[0]);
-    expect(api.setAccountEnabled).toHaveBeenCalledWith('acc-1', false);
-
     await userEvent.click(screen.getByRole('button', { name: 'Enable' }));
     expect(api.setAccountEnabled).toHaveBeenCalledWith('acc-2', true);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
   it('shows the last-account refusal as the server explains it', async () => {
@@ -171,6 +223,7 @@ describe('disabling and enabling', () => {
     await screen.findByText('alice');
 
     await userEvent.click(screen.getByRole('button', { name: 'Disable' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Disable my account' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('last enabled account');
   });
 });

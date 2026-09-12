@@ -86,17 +86,43 @@ export function AccountsPage() {
   );
 }
 
+/**
+ * What disabling this account costs, said before it happens.
+ *
+ * Disablement is the only destructive thing on this page — there is no delete —
+ * and the expensive case is doing it to yourself: the next request is a 401, so
+ * the click that does it is also the click that signs you out, and getting back
+ * in needs somebody else's account. One button press is not enough ceremony for
+ * that.
+ */
+function disableWarning(account: Account): string {
+  if (account.is_self) {
+    return 'Disable your own account? Your next request will be refused, so you '
+      + 'will be signed out straight away — and getting back in needs somebody '
+      + 'else to re-enable you from their account.';
+  }
+  const who = account.username ?? 'this account';
+  return `Disable ${who}? Any session they have open stops working at its next `
+    + 'request. You can re-enable them here afterwards.';
+}
+
 function AccountRow({ account }: { account: Account }) {
   const setEnabled = useAccountStore((s: AccountState) => s.setEnabled);
   const update = useAccountStore((s: AccountState) => s.update);
   const busyId = useAccountStore((s: AccountState) => s.busyId);
   const [renaming, setRenaming] = useState(false);
+  const [confirmingDisable, setConfirmingDisable] = useState(false);
   const [username, setUsername] = useState(account.username ?? '');
   const busy = busyId === account.id;
 
   const submitUsername = async (e: FormEvent) => {
     e.preventDefault();
     if (await update(account.id, { username })) setRenaming(false);
+  };
+
+  const confirmDisable = async () => {
+    await setEnabled(account.id, false);
+    setConfirmingDisable(false);
   };
 
   return (
@@ -127,16 +153,62 @@ function AccountRow({ account }: { account: Account }) {
           >
             {account.username ? 'Rename' : 'Set username'}
           </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => void setEnabled(account.id, !account.enabled)}
-            disabled={busy}
-          >
-            {account.enabled ? 'Disable' : 'Enable'}
-          </Button>
+          {/* Enabling is not destructive and goes straight through; disabling
+              asks first, because it is the one action on this page that can
+              take the caller's own access away. */}
+          {account.enabled ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setConfirmingDisable(true)}
+              disabled={busy || confirmingDisable}
+            >
+              Disable
+            </Button>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void setEnabled(account.id, true)}
+              disabled={busy}
+            >
+              Enable
+            </Button>
+          )}
         </div>
       </div>
+
+      {confirmingDisable && (
+        <div
+          role="alertdialog"
+          aria-label={`Disable ${account.username ?? 'account'}`}
+          className="flex gap-2 items-start border border-border rounded-lg
+            bg-surface p-3 mt-3"
+        >
+          <AlertTriangle size={14} className="text-hue-amber mt-0.5 shrink-0" />
+          <div className="min-w-0">
+            <p className="text-sm text-text-muted">{disableWarning(account)}</p>
+            <div className="flex items-center gap-2 mt-2">
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => void confirmDisable()}
+                disabled={busy}
+              >
+                {account.is_self ? 'Disable my account' : 'Disable account'}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setConfirmingDisable(false)}
+                disabled={busy}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {renaming && (
         <form onSubmit={submitUsername} className="flex items-center gap-2 mt-3">
