@@ -28,8 +28,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+# One definition of the kinds, shared with the value type the request path and
+# (from PR 4) the attribution columns carry. ``nerve.identity`` imports nothing
+# at runtime, so this direction — data layer depends on the identity type, never
+# the reverse — stays free of cycles.
+from nerve.identity import ACTOR_KINDS
+
 CREDENTIAL_SOURCES = ("config", "local", "none")
-ACTOR_KINDS = ("human", "system")
 
 # Slugs the singleton local rows are found by across restarts. The ids are
 # random UUIDs and persist; these are what a re-run looks them up with.
