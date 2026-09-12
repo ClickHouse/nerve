@@ -9,7 +9,10 @@ snapshot of everything that makes a Nerve instance *this* instance:
   restore). With ``--no-secrets`` the two credentials it carries are emptied in
   the snapshot, since that flag promises no credential travels: the JWT signing
   secret in ``instance_secrets`` and every account's password hash in
-  ``accounts.credential`` (see :func:`_scrub_snapshot_secrets`).
+  ``accounts.credential`` (see :func:`_scrub_snapshot_secrets`). The same flag
+  rewrites the workspace's ``config/*.yaml`` on the way into the stage, because
+  a tracked ``auth.password_hash`` the startup migration was right not to touch
+  is still a verifier (see :func:`_sanitised_config`).
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -56,6 +59,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Callable, Iterator
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +425,76 @@ def _scrub_account_credentials(snapshot: Path) -> None:
             )
     finally:
         conn.close()
+
+
+# Configuration files in the bundle that are rewritten rather than copied when
+# ``--no-secrets`` is in force. Everything under the workspace's ``config/``:
+# ``settings.yaml`` and the cron job files, whose env blocks are as good a place
+# for a credential as any.
+def _is_sanitisable_config(arcname: str) -> bool:
+    head, _, rest = arcname.partition("/")
+    return head == "config" and bool(rest) and arcname.endswith((".yaml", ".yml"))
+
+
+def _sanitised_config(src: Path) -> str | None:
+    """``src`` with every secret leaf replaced by a ``${VAR}`` placeholder.
+
+    ``None`` when there is nothing to rewrite — not a mapping, unreadable, or no
+    secret in it — in which case the caller copies the file as it stands.
+
+    The tracked workspace configuration is *supposed* to hold references rather
+    than values, and mostly does. But the startup migration deliberately leaves
+    ``auth.password_hash`` alone when it finds it in a tracked or fleet-managed
+    file (there is no safe way to rewrite somebody else's configuration), so a
+    live bcrypt verifier can legitimately be sitting in a file this bundle
+    otherwise copies verbatim — and ``--no-secrets`` promises it does not carry
+    one. Anything else the scrubber already recognises goes with it.
+    """
+    from nerve.migrate import _scrub_secrets
+
+    try:
+        raw = yaml.safe_load(src.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        # Unparseable: there is nothing to rewrite *safely*. The caller copies
+        # it, which is what happened to every such file before this existed.
+        return None
+    if not isinstance(raw, dict):
+        return None
+    tracked, _secrets, moved = _scrub_secrets(raw)
+    if not moved:
+        return None
+    logger.info(
+        "Backup: scrubbed %d credential-shaped value(s) from %s (--no-secrets)",
+        len(moved), src.name,
+    )
+    return (
+        "# Nerve backup: taken with --no-secrets. Credential-shaped values were\n"
+        "# replaced with ${ENV_VAR} placeholders and are NOT in this archive.\n\n"
+        + yaml.safe_dump(tracked, default_flow_style=False, sort_keys=False)
+    )
+
+
+def _stage_config_file(src: Path, dst: Path, *, include_secrets: bool) -> None:
+    """Put one configuration file in the stage, sanitised if it has to be.
+
+    A rewritten file is *created* owner-only and written through that same
+    descriptor, like everything else in the stage that could carry a credential:
+    the point of rewriting it is that the original had one in it, so the copy
+    must not exist at a wider mode even briefly.
+    """
+    text = None if include_secrets else _sanitised_config(src)
+    if text is None:
+        shutil.copy2(src, dst)
+        return
+    fd = _secure_create(dst, "Backup")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        _verify_still_the_created_file(fd, dst, "Backup")
+    finally:
+        os.close(fd)
 
 
 def _scrub_snapshot_secrets(snapshot: Path) -> None:
@@ -1105,7 +1180,10 @@ def create_backup(
             for src, arc in ws_files:
                 dst = ws_root / arc
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+                if _is_sanitisable_config(arc):
+                    _stage_config_file(src, dst, include_secrets=include_secrets)
+                else:
+                    shutil.copy2(src, dst)
                 try:
                     workspace_bytes += src.stat().st_size
                 except OSError:

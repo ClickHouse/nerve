@@ -12,7 +12,9 @@ from pydantic import BaseModel
 
 from nerve.config import get_config
 from nerve.gateway.auth import (
+    BCRYPT_COST,
     NO_IDENTITY_DETAIL,
+    bcrypt_cost,
     create_session_token,
     effective_jwt_secret,
     hash_password,
@@ -84,17 +86,36 @@ _DECOY_HASH = "$2b$12$WSa90bUaYgZg94/cwtxqZuKQBrzC2BJA1MSEO/le348QlaMVKoaty"
 # while the decoy is cost 12 (260 ms). Measuring the difference says the account
 # exists just as loudly as measuring whether any hashing happened at all.
 #
-# So every failure is padded to a common budget: the time one decoy comparison
-# takes on this machine, measured once, floored, and raised to cover the slowest
-# comparison this process has actually seen (an account whose hash is *more*
-# expensive than the policy would otherwise stand out the same way). Capped, so
-# one scheduling hiccup cannot make every later failure crawl.
+# So every failure is padded to a common budget, and the budget is calibrated
+# against the slowest work factor this install *actually stores* — not against
+# the decoy. Reacting to a slow comparison after making it is too late: the
+# request that discovered a cost-14 account already took a second while an
+# unknown username took a quarter of one, and that first probe is all an
+# enumeration needs. So before the first login is served the accounts are read,
+# the highest cost among them is taken, and the budget is derived for that cost.
+#
+# Derived rather than measured at that cost: bcrypt's work is exactly 2**cost
+# iterations, so one cost-12 comparison and a doubling per step above it gives
+# the number exactly, without hashing at a cost that could take seconds.
+#
+# The reactive high-water mark stays as a backstop for whatever the calibration
+# could not know — a credential stored at a higher cost after startup, or a
+# machine that is simply slower now than it was.
 #
 # The remedy for the underlying spread is upgrading the hashes, which
 # _maybe_upgrade_hash does on each owner's next successful login; the budget is
-# what holds the line until then.
+# what holds the line until then, and it comes *down* as an install converges,
+# because it is recalibrated at each process start.
 _FAILURE_BUDGET_FLOOR_SECONDS = 0.05
-_FAILURE_BUDGET_CAP_SECONDS = 2.0
+# Ceiling for the *reactive* mark, so one scheduling hiccup cannot make every
+# later refusal crawl. Not applied to the calibrated value: that one is derived
+# from a work factor an account really carries, and clamping it below the
+# comparison it exists to hide would simply put the enumeration back.
+_REACTIVE_BUDGET_CEILING_SECONDS = 2.0
+# ...and a ceiling for the calibrated value all the same, because a work factor
+# nobody could log in with in under half a minute is a misconfiguration, not a
+# case to keep padding for.
+_CALIBRATED_BUDGET_CEILING_SECONDS = 30.0
 # The budget sits this far above the comparison it was measured from. Without
 # the headroom it lands exactly on one, ordinary variation in the next
 # comparison steps over it, and the high-water mark ratchets the budget up over
@@ -103,49 +124,98 @@ _FAILURE_BUDGET_CAP_SECONDS = 2.0
 # real comparisons stay underneath and the budget settles on one value.
 _FAILURE_BUDGET_HEADROOM = 1.25
 _failure_budget: float | None = None
+# What calibration alone produced, kept apart from the reactive mark so the
+# latter's ceiling can be expressed relative to it.
+_calibrated_budget: float | None = None
 
 
-def _failure_budget_seconds() -> float:
-    """The floor every failed login is padded to, measured once per process.
+def _slowest_stored_cost(accounts: list[dict], configured_password: str) -> int:
+    """The highest bcrypt work factor this install can be asked to verify.
 
-    Measured by doing exactly what a failure does — one comparison against the
-    decoy — so the number tracks the machine rather than a guess about it.
-    Callers must take their own start time *after* calling this, or the first
-    failure of a process pays for the measurement inside its own timed window
-    and stands out from every later one.
+    Every account's own hash, plus the configured one that ``config`` and
+    ``none`` rows read. Never below the policy cost, which is what the decoy —
+    and therefore every unknown-username comparison — costs.
     """
-    global _failure_budget
-    if _failure_budget is None:
-        started = time.monotonic()
-        verify_password("measuring the login response budget", _DECOY_HASH)
-        _failure_budget = _bounded((time.monotonic() - started) * _FAILURE_BUDGET_HEADROOM)
+    candidates = [
+        bcrypt_cost(account["credential"] or "")
+        for account in accounts
+        if account["credential_source"] == "local"
+    ]
+    candidates.append(bcrypt_cost(configured_password or ""))
+    return max([cost for cost in candidates if cost is not None] + [BCRYPT_COST])
+
+
+async def prepare_login_timing(store, config) -> float:
+    """Calibrate the failure budget, once per process. Returns it.
+
+    Called at the top of :func:`login`, **before** that request takes its own
+    start time: the measurement costs a comparison, and paying for it inside a
+    request's timed window is what made the first failure of a process stand out
+    from every later one. A future startup hook may call it earlier — it is
+    idempotent and cheap after the first time — which would move that one cost
+    off the first login.
+    """
+    global _failure_budget, _calibrated_budget
+    if _failure_budget is not None:
+        return _failure_budget
+
+    started = time.monotonic()
+    verify_password("measuring the login response budget", _DECOY_HASH)
+    one_policy_comparison = time.monotonic() - started
+
+    try:
+        accounts = await store.list_accounts()
+    except Exception as e:  # noqa: BLE001 - calibration must not fail a login
+        logger.warning("Could not read accounts to calibrate login timing: %s", e)
+        accounts = []
+    slowest = _slowest_stored_cost(accounts, config.auth.password_hash)
+
+    _calibrated_budget = min(
+        _CALIBRATED_BUDGET_CEILING_SECONDS,
+        max(
+            _FAILURE_BUDGET_FLOOR_SECONDS,
+            one_policy_comparison * (2 ** (slowest - BCRYPT_COST))
+            * _FAILURE_BUDGET_HEADROOM,
+        ),
+    )
+    _failure_budget = _calibrated_budget
+    if slowest != BCRYPT_COST:
+        logger.info(
+            "Login failure budget calibrated to %.2fs: an account is stored at "
+            "bcrypt cost %d rather than %d. It drops back once that account's "
+            "owner next signs in, which re-hashes it at the current cost.",
+            _failure_budget, slowest, BCRYPT_COST,
+        )
     return _failure_budget
 
 
-def _bounded(seconds: float) -> float:
-    return min(
-        _FAILURE_BUDGET_CAP_SECONDS,
-        max(_FAILURE_BUDGET_FLOOR_SECONDS, seconds),
-    )
+def _reactive_ceiling() -> float:
+    base = _calibrated_budget or _REACTIVE_BUDGET_CEILING_SECONDS
+    return max(_REACTIVE_BUDGET_CEILING_SECONDS, base * 2)
 
 
 def _set_failure_budget(seconds: float | None) -> None:
     """Pin (or clear) the budget. For tests, which cannot afford a quarter of a
     second per failed login and need a known value to measure against."""
-    global _failure_budget
+    global _failure_budget, _calibrated_budget
     _failure_budget = seconds
+    _calibrated_budget = seconds
 
 
 def _observe_comparison(seconds: float) -> None:
     """Raise the budget to cover a comparison that took longer than it.
 
-    A stored hash at a higher work factor than the policy makes its own failures
-    slower than the budget, which is the same leak from the other direction.
-    One observation is enough to close it for every later request.
+    The backstop behind calibration: a credential stored at a higher cost after
+    startup, or a machine that has become slower, would otherwise make its own
+    failures stand out. Bounded, so one bad moment cannot make every later
+    refusal crawl.
     """
     global _failure_budget
     if _failure_budget is not None and seconds > _failure_budget:
-        _failure_budget = _bounded(seconds * _FAILURE_BUDGET_HEADROOM)
+        _failure_budget = min(
+            _reactive_ceiling(),
+            max(_FAILURE_BUDGET_FLOOR_SECONDS, seconds * _FAILURE_BUDGET_HEADROOM),
+        )
 
 
 def _timed_verify(plain: str, hashed: str) -> bool:
@@ -164,7 +234,7 @@ async def _refuse(started_at: float, detail: str) -> HTTPException:
     _refuse(...)`` at the point it happens — a helper that raises leaves the
     code after it looking reachable when it is not.
     """
-    remaining = _failure_budget_seconds() - (time.monotonic() - started_at)
+    remaining = (_failure_budget or 0.0) - (time.monotonic() - started_at)
     if remaining > 0:
         await asyncio.sleep(remaining)
     return HTTPException(status_code=401, detail=detail)
@@ -185,25 +255,40 @@ async def _maybe_upgrade_hash(store, account: dict, password: str) -> None:
     :func:`verify_password` accepted by truncating: re-hashing it would refuse,
     and hashing the truncation would store a different password from the one its
     owner types.
+
+    **Compare-and-swap.** The credential was read, compared against and is now
+    being replaced — three steps, with room between them for the account's owner
+    to change their password from another tab. Writing unconditionally would put
+    the *old* password back and leave whoever knew it still able to log in, so
+    the write is conditioned on the hash still being the one this request
+    verified against. Losing that race is a no-op: what the other writer stored
+    is newer than anything this could produce.
     """
     if account["credential_source"] != "local":
         return
-    if not needs_rehash(account["credential"] or ""):
+    stored = account["credential"] or ""
+    if not needs_rehash(stored):
         return
     if password_length_problem(password):
         return
     try:
-        await store.update_account_login(
-            account["id"], credential=hash_password(password),
+        swapped = await store.replace_credential_if_unchanged(
+            account["id"], expected=stored, credential=hash_password(password),
         )
     except Exception as e:  # noqa: BLE001 - a failed upgrade must not fail the login
         logger.warning(
             "Could not re-hash account %s at the current cost: %s", account["id"], e,
         )
-    else:
+        return
+    if swapped:
         logger.info(
             "Re-hashed account %s at the current bcrypt cost after a successful "
             "login (its stored hash carried an older work factor)", account["id"],
+        )
+    else:
+        logger.info(
+            "Skipped re-hashing account %s: its credential changed while this "
+            "login was in flight, so the newer one stands", account["id"],
         )
 
 
@@ -256,10 +341,10 @@ async def login(req: LoginRequest):
         # without the database there is no account to name.
         raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
 
-    # Before the clock starts, never inside it: the measurement costs a
-    # comparison, and paying for it within a request's own timed window is what
-    # made the *first* failure of a process stand out.
-    _failure_budget_seconds()
+    # Before the clock starts, never inside it: calibration costs a comparison
+    # and a read of the accounts, and paying for either within a request's own
+    # timed window is what made the *first* failure of a process stand out.
+    await prepare_login_timing(store, config)
     started_at = time.monotonic()
 
     state = await store.login_state()
