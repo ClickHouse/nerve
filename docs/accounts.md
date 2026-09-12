@@ -111,10 +111,21 @@ itself**:
 |---|---|---|---|
 | a login session | the account's id | `session` | that account's actor |
 | the instance's own calls — `nerve reload`, starting or stopping a session from the CLI, the agent calling its own API | `agent-system` | `system` | the agent's system principal |
-| MCP credentials: backend agent subprocesses, their Ultracode workers, and `nerve codex token` | — | `system`, with `aud: nerve-mcp` | the agent's system principal |
+| MCP credentials for the agent's own subprocesses and their Ultracode workers | `backend-agent` | `system`, with `aud: nerve-mcp` | the agent's system principal |
+| MCP credentials for a client you launched — `nerve codex token`, and the one the installer prints | `external-agent-mcp` | `system`, with `aud: nerve-mcp` | the agent's system principal |
 
 Tokens are opaque to the browser; the claims above are an implementation
 detail and will change again.
+
+`agent-system`, `backend-agent` and `external-agent-mcp` are **labels, not
+identity keys**. They say which minter issued the credential, and nothing looks
+them up: the system principal is read from the database, so those strings never
+have to match anything stored. A login session's `sub` is the one that is an
+identifier, and it is an account id.
+
+MCP credentials issued before this version carry the audience but no `typ`.
+They keep working until they expire, because the audience is what the resolver
+reads first.
 
 Two consequences worth knowing:
 

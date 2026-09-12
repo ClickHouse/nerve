@@ -30,6 +30,8 @@ from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.gateway.auth import (
     JWT_ALGORITHM,
     MCP_AUDIENCE,
+    MCP_SESSION_CLAIM,
+    MCP_WORKER_CLAIM,
     NO_IDENTITY_DETAIL,
     SESSION_TOKEN_HEADER,
     TOKEN_TYPE_CLAIM,
@@ -40,6 +42,7 @@ from nerve.gateway.auth import (
     create_system_token,
     identity_store,
     is_legacy_session_token,
+    maybe_refresh_token,
     pin_jwt_secret,
     require_auth,
     resolve_actor_from_claims,
@@ -88,6 +91,36 @@ class _Install:
             secret,
             algorithm=JWT_ALGORITHM,
         )
+
+
+def pre_typ_mcp_token(
+    *, session_id: str | None = None, worker_id: str | None = None,
+) -> str:
+    """An MCP credential of the shape minted before ``typ`` existed.
+
+    Backend subprocesses and clients started with ``nerve codex token`` are
+    holding 8-hour tokens like this across the upgrade. Hand-minted, because
+    nothing produces the shape any more: what keeps them working is the
+    **audience**, which the resolver reads before ``typ``, and this is what
+    stops a later reordering of that dispatch from cutting them off silently.
+    Without ``session_id`` it is the external (satellite) shape.
+    """
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iat": now,
+        "exp": now + timedelta(hours=8),
+        "jti": uuid4().hex,
+        "sub": "backend-agent" if session_id else "external-agent-mcp",
+        "aud": MCP_AUDIENCE,
+    }
+    if session_id:
+        payload[MCP_SESSION_CLAIM] = session_id
+    if worker_id:
+        payload[MCP_WORKER_CLAIM] = worker_id
+    return jwt.encode(payload, _SECRET, algorithm=JWT_ALGORITHM)
 
 
 @pytest_asyncio.fixture
@@ -264,6 +297,28 @@ class TestSystemPrincipal:
             assert actor.actor_id == system_actor_id
             assert actor.kind == "system" and actor.account_id is None
 
+    async def test_credentials_minted_before_typ_resolve_the_same_way(self, install):
+        """The MCP tokens already in flight when this version starts carry the
+        audience and no type claim. They resolve on the audience alone, which
+        is what the resolver reads first."""
+        system_actor_id = install.identity.system_actor_id
+        for token in (
+            pre_typ_mcp_token(session_id="engine-sess-1"),
+            pre_typ_mcp_token(
+                session_id="engine-sess-1", worker_id="ultracode-0123456789abcdef",
+            ),
+            pre_typ_mcp_token(),
+        ):
+            claims = jwt.decode(
+                token, _SECRET, algorithms=[JWT_ALGORITHM], audience=MCP_AUDIENCE,
+            )
+            assert TOKEN_TYPE_CLAIM not in claims
+            actor = await resolve_actor_from_claims(install.db, claims)
+            assert actor.actor_id == system_actor_id
+            assert actor.is_system and actor.account_id is None
+            # Still not a web session, so still no sliding.
+            assert maybe_refresh_token(claims, _SECRET, actor) is None
+
     async def test_an_mcp_credential_cannot_authenticate_a_web_route(self, install):
         """Audience-scoped tokens never pass ordinary web auth, so the system
         principal cannot arrive through the browser's door by that route."""
@@ -333,6 +388,22 @@ class TestMcpEndpointResolvesAnActor:
         actor = manager.scopes[0][MCP_ACTOR_SCOPE_KEY]
         assert actor.actor_id == install.identity.system_actor_id
         assert actor.is_system
+
+    async def test_a_credential_minted_before_typ_still_gets_in(self, install):
+        """End to end at the door the backend subprocesses actually knock on."""
+        manager = _RecordingManager()
+        async with _client(self._mounted(manager)) as client:
+            res = await client.post(
+                "/mcp/v1/",
+                headers=_bearer(pre_typ_mcp_token(session_id="engine-sess-1")),
+                content=b"{}",
+            )
+        assert res.status_code == 200
+        from nerve.mcp_server.http import MCP_ACTOR_SCOPE_KEY
+
+        assert manager.scopes[0][MCP_ACTOR_SCOPE_KEY].actor_id == (
+            install.identity.system_actor_id
+        )
 
     async def test_a_persons_token_arrives_as_that_person(self, install):
         """A session token is what an external MCP client (Codex, Claude Code)
@@ -404,6 +475,21 @@ class TestWorkerTokenExchange:
             res = await client.post(
                 "/api/codex/worker-token",
                 headers=_bearer(create_mcp_session_token(_SECRET, "engine-sess-1")),
+                json={"worker_id": worker_id},
+            )
+        assert res.status_code == 200
+        assert res.json()["worker_id"] == worker_id
+
+    async def test_a_parent_token_minted_before_typ_is_still_exchanged(
+        self, install, monkeypatch,
+    ):
+        """An Ultracode run that started before the upgrade keeps being able to
+        hand its children worker tokens."""
+        worker_id = "ultracode-0123456789abcdef"
+        async with _client(self._app(install, monkeypatch)) as client:
+            res = await client.post(
+                "/api/codex/worker-token",
+                headers=_bearer(pre_typ_mcp_token(session_id="engine-sess-1")),
                 json={"worker_id": worker_id},
             )
         assert res.status_code == 200
