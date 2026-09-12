@@ -449,3 +449,84 @@ class TestTheOldPasswordStillWorks:
         # migration changed where the hash lives, nothing else.
         assert status.json()["login"] == "password"
         assert status.json()["setup_pending"] is False
+
+
+# --------------------------------------------------------------------------- #
+#  `nerve doctor` and the login route describe the same install                #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestDoctorAgreesWithTheLoginRoute:
+    """Doctor used to judge by the row alone — so an install whose password had
+    been added by a config reload (rows still `none`, login honouring the key)
+    was told the password did nothing. Acting on that advice would have opened
+    the instance."""
+
+    async def _install_with(self, tmp_path, *sources: str) -> NerveConfig:
+        database = Database(paths.db_path())
+        await database.connect()
+        try:
+            for source in sources:
+                actor = await database.create_actor_ref(kind="human")
+                await database.create_account(
+                    actor_id=actor["id"], credential_source=source,
+                    credential="$2b$12$synthetic" if source == "local" else None,
+                )
+        finally:
+            await database.close()
+        return _install(tmp_path, local_yaml="{}\n")
+
+    async def test_a_configured_password_read_by_none_rows_is_reported_as_in_use(
+        self, tmp_path,
+    ):
+        from nerve.cli import doctor_report
+
+        config = await self._install_with(tmp_path, "none")
+        config.auth.password_hash = _HASH
+        report = doctor_report(config)
+        assert "Accounts: 1 (1 with a password)" in report
+        assert "no account uses it" not in report
+        assert "is in use by 1 account(s)" in report
+        assert "passwordless" not in report
+
+    async def test_the_same_install_without_the_key_is_passwordless(self, tmp_path):
+        from nerve.cli import doctor_report
+
+        config = await self._install_with(tmp_path, "none")
+        report = doctor_report(config)
+        assert "No password set" in report
+        assert "passwordless" in report
+
+    async def test_a_stale_key_no_row_reads_is_still_called_out(self, tmp_path):
+        from nerve.cli import doctor_report
+
+        config = await self._install_with(tmp_path, "local", "local")
+        config.auth.password_hash = _HASH
+        report = doctor_report(config)
+        assert "Accounts: 2 (2 with a password)" in report
+        assert "no account uses it" in report
+
+    async def test_it_counts_the_same_accounts_the_login_route_would_admit(
+        self, tmp_path,
+    ):
+        """The property, rather than the wording: doctor's count of accounts
+        with a password is the number the login route could authenticate."""
+        from nerve.cli import doctor_report
+        from nerve.gateway.routes.accounts import account_credential
+
+        config = await self._install_with(tmp_path, "local", "none", "config")
+        config.auth.password_hash = _HASH
+
+        database = Database(paths.db_path())
+        await database.connect()
+        try:
+            admitted = sum(
+                1 for account in await database.list_accounts()
+                if account_credential(account, config)
+            )
+        finally:
+            await database.close()
+
+        assert f"Accounts: 3 ({admitted} with a password)" in doctor_report(config)
+        assert admitted == 3

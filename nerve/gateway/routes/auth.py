@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Depends
 from fastapi import HTTPException
@@ -13,7 +15,10 @@ from nerve.gateway.auth import (
     NO_IDENTITY_DETAIL,
     create_session_token,
     effective_jwt_secret,
+    hash_password,
     identity_store,
+    needs_rehash,
+    password_length_problem,
     require_auth,
     verify_password,
 )
@@ -66,9 +71,129 @@ _UNKNOWN_STATUS = {
 # generated once, used to produce this line and discarded; nothing knows the
 # plaintext, and nothing anywhere accepts this hash as a password — it is only
 # ever the right-hand side of a comparison that is about to fail. Cost 12 is
-# bcrypt's default, so it takes the same time as a comparison against a real
-# account's hash.
+# this release's policy cost (nerve.gateway.auth.BCRYPT_COST), so it takes the
+# same time as a comparison against a hash this release wrote.
 _DECOY_HASH = "$2b$12$WSa90bUaYgZg94/cwtxqZuKQBrzC2BJA1MSEO/le348QlaMVKoaty"
+
+# How long a failed login takes, at a minimum.
+#
+# The decoy equalises *whether* a comparison happens. It does not equalise how
+# long one takes, and it cannot: bcrypt's work factor is a property of the
+# stored hash, and the startup migration copies a configured hash byte for byte
+# from whatever produced it — so one account can legitimately be cost 4 (1 ms)
+# while the decoy is cost 12 (260 ms). Measuring the difference says the account
+# exists just as loudly as measuring whether any hashing happened at all.
+#
+# So every failure is padded to a common budget: the time one decoy comparison
+# takes on this machine, measured once, floored, and raised to cover the slowest
+# comparison this process has actually seen (an account whose hash is *more*
+# expensive than the policy would otherwise stand out the same way). Capped, so
+# one scheduling hiccup cannot make every later failure crawl.
+#
+# The remedy for the underlying spread is upgrading the hashes, which
+# _maybe_upgrade_hash does on each owner's next successful login; the budget is
+# what holds the line until then.
+_FAILURE_BUDGET_FLOOR_SECONDS = 0.05
+_FAILURE_BUDGET_CAP_SECONDS = 2.0
+_failure_budget: float | None = None
+
+
+def _failure_budget_seconds() -> float:
+    """The floor every failed login is padded to, measured once per process.
+
+    Measured by doing exactly what a failure does — one comparison against the
+    decoy — so the number tracks the machine rather than a guess about it.
+    Callers must take their own start time *after* calling this, or the first
+    failure of a process pays for the measurement inside its own timed window
+    and stands out from every later one.
+    """
+    global _failure_budget
+    if _failure_budget is None:
+        started = time.monotonic()
+        verify_password("measuring the login response budget", _DECOY_HASH)
+        _failure_budget = min(
+            _FAILURE_BUDGET_CAP_SECONDS,
+            max(_FAILURE_BUDGET_FLOOR_SECONDS, time.monotonic() - started),
+        )
+    return _failure_budget
+
+
+def _set_failure_budget(seconds: float | None) -> None:
+    """Pin (or clear) the budget. For tests, which cannot afford a quarter of a
+    second per failed login and need a known value to measure against."""
+    global _failure_budget
+    _failure_budget = seconds
+
+
+def _observe_comparison(seconds: float) -> None:
+    """Raise the budget to cover a comparison that took longer than it.
+
+    A stored hash at a higher work factor than the policy makes its own failures
+    slower than the budget, which is the same leak from the other direction.
+    One observation is enough to close it for every later request.
+    """
+    global _failure_budget
+    if _failure_budget is not None and seconds > _failure_budget:
+        _failure_budget = min(_FAILURE_BUDGET_CAP_SECONDS, seconds)
+
+
+def _timed_verify(plain: str, hashed: str) -> bool:
+    """``verify_password``, with the comparison's cost fed to the budget."""
+    started = time.monotonic()
+    try:
+        return verify_password(plain, hashed)
+    finally:
+        _observe_comparison(time.monotonic() - started)
+
+
+async def _refuse(started_at: float, detail: str) -> HTTPException:
+    """Wait out the response budget, then hand back the refusal to raise.
+
+    Returned rather than raised so that every failure reads ``raise await
+    _refuse(...)`` at the point it happens — a helper that raises leaves the
+    code after it looking reachable when it is not.
+    """
+    remaining = _failure_budget_seconds() - (time.monotonic() - started_at)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+    return HTTPException(status_code=401, detail=detail)
+
+
+async def _maybe_upgrade_hash(store, account: dict, password: str) -> None:
+    """Re-hash a just-verified password at the policy cost, if it is not already.
+
+    Opportunistic and silent: it happens on a login that has already succeeded,
+    it writes through the ordinary credential path, and nothing about it reaches
+    the client. This is what drains an install of the assorted work factors a
+    migrated configuration hash can bring with it — which is what makes the
+    response budget a transitional measure rather than a permanent one.
+
+    Skipped for an account whose credential lives in configuration (moving it
+    onto the row is the startup migration's job, not a side effect of somebody
+    logging in) and for a password too long to hash, which
+    :func:`verify_password` accepted by truncating: re-hashing it would refuse,
+    and hashing the truncation would store a different password from the one its
+    owner types.
+    """
+    if account["credential_source"] != "local":
+        return
+    if not needs_rehash(account["credential"] or ""):
+        return
+    if password_length_problem(password):
+        return
+    try:
+        await store.update_account_login(
+            account["id"], credential=hash_password(password),
+        )
+    except Exception as e:  # noqa: BLE001 - a failed upgrade must not fail the login
+        logger.warning(
+            "Could not re-hash account %s at the current cost: %s", account["id"], e,
+        )
+    else:
+        logger.info(
+            "Re-hashed account %s at the current bcrypt cost after a successful "
+            "login (its stored hash carried an older work factor)", account["id"],
+        )
 
 
 class LoginRequest(BaseModel):
@@ -120,6 +245,12 @@ async def login(req: LoginRequest):
         # without the database there is no account to name.
         raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
 
+    # Before the clock starts, never inside it: the measurement costs a
+    # comparison, and paying for it within a request's own timed window is what
+    # made the *first* failure of a process stand out.
+    _failure_budget_seconds()
+    started_at = time.monotonic()
+
     state = await store.login_state()
     passwordless = instance_is_passwordless(state, config)
     username = (req.username or "").strip()
@@ -134,22 +265,22 @@ async def login(req: LoginRequest):
         account = None
 
     if account is None:
-        # Spend the same time as a real comparison would, then refuse.
-        verify_password(req.password or "x", _DECOY_HASH)
-        raise HTTPException(status_code=401, detail=_INVALID)
+        # Do the work a real comparison would, then refuse on the same budget.
+        _timed_verify(req.password, _DECOY_HASH)
+        raise await _refuse(started_at, _INVALID)
 
     credential = account_credential(account, config)
     if credential:
-        if not verify_password(req.password, credential):
-            raise HTTPException(status_code=401, detail=_INVALID)
+        if not _timed_verify(req.password, credential):
+            raise await _refuse(started_at, _INVALID)
     elif not passwordless:
         # The account carries no credential and the instance is not in the
         # passwordless state, so nothing could authenticate this caller. Reached
         # by an account left without a password — a restored `--no-secrets`
         # bundle on a multi-account install, or a `config`-source row whose
         # configured hash has gone. Refuse rather than admit.
-        verify_password(req.password or "x", _DECOY_HASH)
-        raise HTTPException(status_code=401, detail=_INVALID)
+        _timed_verify(req.password, _DECOY_HASH)
+        raise await _refuse(started_at, _INVALID)
     # Otherwise passwordless with exactly one account: any password is accepted
     # and resolves to it. That is the documented upgrade behaviour (0.7), and it
     # ends by itself the moment a second account exists.
@@ -159,8 +290,12 @@ async def login(req: LoginRequest):
     except ActorResolutionError as e:
         # A disabled (or vanished) account, learned only after the credential
         # checked out, so this message tells the right person something useful
-        # and nobody else anything at all.
-        raise HTTPException(status_code=401, detail=str(e)) from e
+        # and nobody else anything at all. Padded like every other refusal: the
+        # message already says more than the clock could.
+        raise await _refuse(started_at, str(e)) from e
+
+    if credential:
+        await _maybe_upgrade_hash(store, account, req.password)
 
     return LoginResponse(token=create_session_token(secret, actor.account_id))
 

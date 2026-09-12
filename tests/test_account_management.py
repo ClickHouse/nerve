@@ -72,6 +72,18 @@ class _Install:
         )
 
 
+@pytest.fixture(autouse=True)
+def _fast_failures():
+    """Failed logins are padded to a common response budget (see
+    ``nerve.gateway.routes.auth._failure_budget_seconds``). Nothing in this file
+    is about the padding, and paying it per refusal would add minutes."""
+    from nerve.gateway.routes import auth as auth_routes
+
+    auth_routes._set_failure_budget(0.0)
+    yield
+    auth_routes._set_failure_budget(None)
+
+
 @pytest_asyncio.fixture
 async def install(tmp_path, open_identity_db, wire_identity_store):
     set_config(NerveConfig(auth=AuthConfig(jwt_secret=_SECRET)))
@@ -527,6 +539,47 @@ class TestOwnPassword:
                 headers=install.headers(),
             )
             assert (await install.db.get_account(bob))["credential"] == before
+
+    async def test_an_omitted_current_password_is_not_an_empty_one(
+        self, install: _Install,
+    ):
+        """Omitting it is "I am not claiming to know it". Sending "" is a claim
+        that the current password is the empty string — which a credential made
+        before this release can legitimately be, so it is compared."""
+        import bcrypt
+
+        empty = bcrypt.hashpw(b"", bcrypt.gensalt(rounds=4)).decode()
+        await install.db.set_account_credential(
+            install.owner_id, credential_source="local", credential=empty,
+        )
+        async with _client(install.app) as client:
+            omitted = await client.put(
+                "/api/accounts/me/password", json={"new_password": "a-new-one"},
+                headers=install.headers(),
+            )
+            assert omitted.status_code == 403
+
+            supplied = await client.put(
+                "/api/accounts/me/password",
+                json={"current_password": "", "new_password": "a-new-one"},
+                headers=install.headers(),
+            )
+        assert supplied.status_code == 200, supplied.text
+        assert verify_password(
+            "a-new-one", (await install.db.get_account(install.owner_id))["credential"],
+        )
+
+    async def test_an_empty_current_password_is_still_wrong_when_it_is_wrong(
+        self, install: _Install,
+    ):
+        await install.secure_the_owner()
+        async with _client(install.app) as client:
+            response = await client.put(
+                "/api/accounts/me/password",
+                json={"current_password": "", "new_password": "a-new-one"},
+                headers=install.headers(),
+            )
+        assert response.status_code == 403
 
     async def test_an_empty_new_password_is_refused(self, install: _Install):
         async with _client(install.app) as client:
