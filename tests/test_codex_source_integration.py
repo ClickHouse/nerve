@@ -97,6 +97,74 @@ async def test_service_starts_origin_and_ingests_events(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_failed_ingest_is_replayed_after_a_restart(db, tmp_path):
+    """The cursor must never move past an event that was not persisted.
+
+    The origin advances its own offset before it yields, so the live cursor
+    during a failed ingest already covers the event. Checkpointing it there
+    would skip the event for good: the next scan starts past it and nothing
+    replays it. Driven with the real failure this can have — the system
+    principal not resolving — rather than a synthetic one.
+    """
+    sessions_dir = tmp_path / "sessions"
+    archive_dir = tmp_path / "archived_sessions"
+    sessions_dir.mkdir()
+    archive_dir.mkdir()
+    target_dir = sessions_dir / "2026" / "05" / "19"
+    target_dir.mkdir(parents=True)
+    shutil.copy(FIXTURE, target_dir / FIXTURE.name)
+
+    config = NerveConfig(
+        workspace=TEST_WORKSPACE,
+        sync=_sync_config(sessions_dir, archive_dir),
+    )
+    thread_id = "11111111-2222-3333-4444-555555555555"
+    sid = codex_session_id(thread_id)
+
+    # --- the run that fails -------------------------------------------------
+    real_principal = db.get_system_principal
+
+    async def _no_principal():
+        return None
+
+    db.get_system_principal = _no_principal
+    service = build_service(config, db)
+    await service.start()
+    try:
+        for _ in range(30):
+            await asyncio.sleep(0.05)
+            if await db.get_sync_cursor("codex:local-pi") is not None:
+                break
+    finally:
+        await service.stop()
+        db.get_system_principal = real_principal
+
+    assert await db.get_session(sid) is None, "nothing should have been stored"
+    assert await db.get_sync_cursor("codex:local-pi") is None, (
+        "the cursor moved past an event that was never ingested"
+    )
+
+    # --- the restart that succeeds -----------------------------------------
+    service = build_service(config, db)
+    await service.start()
+    try:
+        for _ in range(40):
+            if await db.get_session(sid) is not None:
+                if await db.get_messages(sid):
+                    break
+            await asyncio.sleep(0.1)
+    finally:
+        await service.stop()
+
+    session = await db.get_session(sid)
+    assert session is not None, "the failed event was never replayed"
+    assert {m["role"] for m in await db.get_messages(sid)} >= {"user", "assistant"}
+    assert await db.get_sync_cursor("codex:local-pi"), (
+        "a successful run should checkpoint"
+    )
+
+
+@pytest.mark.asyncio
 async def test_build_service_returns_none_when_disabled(db, tmp_path):
     config = NerveConfig(
         workspace=tmp_path,
