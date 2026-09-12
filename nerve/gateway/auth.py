@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import bcrypt
@@ -40,6 +41,9 @@ from nerve.identity import (
     actor_for_sole_account,
     system_actor,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nerve.db import Database
 
 logger = logging.getLogger(__name__)
 
@@ -374,7 +378,7 @@ def get_token_from_request(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Not authenticated")
 
 
-def identity_store():
+def identity_store() -> "Database | None":
     """The database the request path resolves actors against, or ``None``.
 
     One seam, and it is the one the routes already use: the lifespan wires the
@@ -396,7 +400,7 @@ def identity_store():
     return getattr(deps, "db", None)
 
 
-async def resolve_actor_from_claims(store, claims: dict) -> Actor:
+async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
     """The actor a verified token acts as — looked up, never inferred.
 
     Dispatch is on ``typ`` (and ``aud`` for MCP credentials), so the subject is
@@ -461,10 +465,12 @@ async def require_auth(request: Request) -> Actor:
     # Hand a fresh token back where one is due. Stashed on request.state rather
     # than returned so the response shape of every route is unchanged; the
     # gateway's http middleware picks it up and emits SESSION_TOKEN_HEADER.
-    if is_legacy_session_token(payload):
+    if is_legacy_session_token(payload) and actor.account_id:
         # Upgrade rather than slide: the tab keeps working and stops carrying
         # the legacy shape after its first call, so the grandfather clause
-        # drains itself instead of lingering for 30 days.
+        # drains itself instead of lingering for 30 days. (The sole account
+        # always has an id; without one there is simply nothing to upgrade to,
+        # and the request is served on the token it came with.)
         request.state.refreshed_token = create_session_token(secret, actor.account_id)
     else:
         refreshed = maybe_refresh_token(payload, secret, actor)
