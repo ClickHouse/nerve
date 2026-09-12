@@ -53,17 +53,14 @@ async def login(req: LoginRequest):
     if config.auth.password_hash:
         if not verify_password(req.password, config.auth.password_hash):
             raise HTTPException(status_code=401, detail="Invalid password")
-    # Otherwise passwordless: every admitted caller resolves to the single
-    # local account, so any password is accepted. Valid only while exactly one
-    # account exists; creating a second one requires setting a password first.
+    # Otherwise passwordless: any password is accepted.
 
-    # Password-only login names nobody, so it is valid exactly while there is
-    # only one account it could mean — the same bound passwordless access has
-    # (0.5), and the reason an upgrading install with no username can still log
-    # in. PR 3 adds the username and the multi-account form; until then a
-    # second account is refused at creation, so this cannot be reached with
-    # two. The account's own state (disabled) is checked on the way to its
-    # actor, so a disabled account cannot log in either.
+    # Either way the request names no person, so it is valid exactly while
+    # there is only one it could mean — the bound passwordless access already
+    # has, and what lets an upgrading install with no username keep logging in
+    # with just a password. A second account cannot be created while either
+    # applies, so this cannot be reached with two. Disabled accounts are turned
+    # away on the way to the actor, so one cannot log in either.
     try:
         actor: Actor = await actor_for_sole_account(store)
     except ActorResolutionError as e:
