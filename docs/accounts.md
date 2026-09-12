@@ -196,11 +196,41 @@ username does not clear it: a named account with no password admits exactly as
 many people as an unnamed one, so only setting a password does.
 
 Wrong username and wrong password give the same answer — a `401` reading
-`Invalid username or password` — and a username that names nobody still costs
-one password comparison, so the endpoint is not a list of who works here,
-readable with a stopwatch or otherwise. A **disabled** account is refused with a
-message saying so, but only after its password has checked out, so that answer
-reaches the person who knew the password and nobody else.
+`Invalid username or password` — and they take the same **time**, which takes
+more doing than the same words:
+
+- a username that names nobody still costs a full password comparison, against a
+  fixed decoy hash, so "did any hashing happen" says nothing;
+- an *empty* password is compared like any other rather than refused early,
+  because returning immediately for one was a probe that needed no password at
+  all;
+- and every refusal waits out a common response budget before answering, so how
+  long a particular account's hash takes to check says nothing either. See the
+  cost policy below for why that varies at all.
+
+A **disabled** account is refused with a message saying so, but only after its
+password has checked out, so that answer reaches the person who knew the
+password and nobody else.
+
+### Password hashes and their cost
+
+Passwords are stored as bcrypt hashes at a fixed work factor (currently 12).
+Hashes are *accepted* at any work factor, because a password copied off an
+upgrading install's configuration carries whatever produced it, possibly years
+ago, and refusing it would lock that install out.
+
+A hash at any other cost is **replaced at the current one the next time its
+owner logs in successfully**. It happens silently, on a login that has already
+been accepted, and it does not change anybody's password — the hash is
+recomputed from the password that was just typed. An install therefore converges
+on the current cost without anybody being asked to do anything, and the response
+budget above is what keeps the assorted costs from being visible in the meantime.
+
+Two exceptions, both deliberate: an account whose credential still lives in
+configuration is left alone (moving it is the startup migration's job, not a
+side effect of somebody logging in), and so is a password longer than bcrypt's
+72 bytes, which is accepted by truncation on an old hash and could not be
+re-hashed without storing something its owner does not type.
 
 **Creating the second account is the moment three things change**, all at once
 and all for the same reason:
