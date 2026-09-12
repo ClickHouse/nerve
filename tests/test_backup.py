@@ -428,6 +428,142 @@ def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, confi
     assert _stored_secrets(staging / "state" / "nerve.db") == ["planted-signing-secret"]
 
 
+# Obviously synthetic, and long enough to be found in the raw file bytes.
+_PLANTED_HASH = "$2b$12$planted-account-password-hash-not-a-real-one"
+
+
+def _plant_accounts(db_path: Path) -> None:
+    """The v047 accounts table, with a password hash on the row — the shape
+    every install has after the startup migration off the configured
+    credential."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE accounts ("
+            "  id TEXT PRIMARY KEY, actor_id TEXT NOT NULL UNIQUE, username TEXT,"
+            "  credential_source TEXT NOT NULL"
+            "    CHECK (credential_source IN ('config', 'local', 'none')),"
+            "  credential TEXT, enabled INTEGER NOT NULL DEFAULT 1,"
+            "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, disabled_at TEXT,"
+            "  CHECK ((credential_source = 'local' AND credential IS NOT NULL)"
+            "         OR (credential_source IN ('config', 'none') AND credential IS NULL)))"
+        )
+        conn.execute(
+            "INSERT INTO accounts VALUES "
+            "('acc-1', 'actor-1', 'alice', 'local', ?, 1, 't', 't', NULL)",
+            (_PLANTED_HASH,),
+        )
+        conn.execute(
+            "INSERT INTO accounts VALUES "
+            "('acc-2', 'actor-2', 'bob', 'none', NULL, 1, 't', 't', NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _account_credentials(db_path: Path) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT username, credential_source, credential FROM accounts ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_no_secrets_scrubs_the_account_password_hashes(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """Every account's password hash lives on its row, so a bundle carrying
+    nerve.db carries the credentials with it. --no-secrets promises it does
+    not — and the promise has to hold for rows as well as for files."""
+    _plant_accounts(nerve_dir / "nerve.db")
+
+    stripped = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out1", config_dir=config_dir, include_secrets=False,
+    )
+    staging = tmp_path / "x1"
+    report = backup_mod.verify_bundle(stripped.path, extract_to=staging)
+    assert report.ok, report.errors  # checksums were taken after the scrub
+
+    restored = staging / "state" / "nerve.db"
+    # The hash is gone, and with it the claim that the row has one — the schema
+    # refuses a `local` account with no credential, and `none` is the truth.
+    assert _account_credentials(restored) == [
+        ("alice", "none", None), ("bob", "none", None),
+    ]
+    # Not merely unlinked: secure_delete overwrites the freed pages, so the
+    # hash is not recoverable from the file either.
+    assert _PLANTED_HASH not in restored.read_bytes().decode("latin-1")
+    # ...and the live database is untouched.
+    assert _account_credentials(nerve_dir / "nerve.db") == [
+        ("alice", "local", _PLANTED_HASH), ("bob", "none", None),
+    ]
+
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir, include_secrets=True,
+    )
+    staging = tmp_path / "x2"
+    backup_mod.verify_bundle(kept.path, extract_to=staging)
+    assert _account_credentials(staging / "state" / "nerve.db") == [
+        ("alice", "local", _PLANTED_HASH), ("bob", "none", None),
+    ]
+
+
+def test_no_secrets_scrubs_both_credentials_in_one_pass(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """The signing secret and the password hashes go together: --no-secrets is
+    a promise about the bundle, not about one table."""
+    _plant_instance_secret(nerve_dir / "nerve.db")
+    _plant_accounts(nerve_dir / "nerve.db")
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir, include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    assert backup_mod.verify_bundle(bundle.path, extract_to=staging).ok
+    raw = (staging / "state" / "nerve.db").read_bytes().decode("latin-1")
+    assert "planted-signing-secret" not in raw
+    assert _PLANTED_HASH not in raw
+
+
+def test_a_database_without_the_accounts_table_is_left_alone(tmp_path):
+    """A bundle from before the accounts table existed has nothing to scrub,
+    and that is checked explicitly rather than inferred from an error."""
+    old = tmp_path / "old.db"
+    _make_nerve_db(old)
+    backup_mod._scrub_account_credentials(old)  # no error, nothing to do
+    backup_mod._scrub_snapshot_secrets(old)
+
+
+def test_an_exposed_restored_database_loses_every_credential(tmp_path, monkeypatch):
+    """The restore last resort: a file that reads back wide has the signing
+    secret *and* the password hashes taken out of it before the restore fails."""
+    src, dst = tmp_path / "src.db", tmp_path / "dst.db"
+    _make_nerve_db(src)
+    _plant_instance_secret(src)
+    _plant_accounts(src)
+
+    # The temporary verifies twice (so the copy proceeds and is published) and
+    # the installed file then reads back wide — the one case the scrub is for.
+    seen = {"files": 0}
+
+    def fake(st_mode: int) -> bool:
+        if stat.S_ISDIR(st_mode):
+            return True
+        seen["files"] += 1
+        return seen["files"] <= 2
+
+    monkeypatch.setattr(backup_mod, "_mode_is_private", fake)
+    with pytest.raises(BackupError) as excinfo:
+        backup_mod._secure_install_db(src, dst)
+    assert "password hashes" in str(excinfo.value)
+    assert _stored_secrets(dst) == []
+    assert _account_credentials(dst) == [("alice", "none", None), ("bob", "none", None)]
+
+
 def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, tmp_path):
     """Actor references must stay stable across a restore: sessions and
     messages will point at these ids for good, so a restored instance has to
