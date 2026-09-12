@@ -1,0 +1,439 @@
+"""The configuration-aware identity bootstrap in ``nerve.migrate``.
+
+What 1.9 of the local multi-user sequence asks for: idempotency across
+repeated starts, the three upgrade shapes, a lockdown install whose password
+hash is an environment reference, the exactly-one-account invariant, a
+disabled account staying disabled, an existing ``auth.jwt_secret`` being kept
+and a missing one generated once — plus the CLI surface (``nerve migrate
+--dry-run`` shows the bootstrap before it happens and writes nothing).
+"""
+
+from __future__ import annotations
+
+import shutil
+import sqlite3
+import subprocess
+from pathlib import Path
+
+import bcrypt
+import pytest
+from click.testing import CliRunner
+
+from nerve import paths
+from nerve.config import AuthConfig, NerveConfig, load_config, workspace_settings_file
+from nerve.db import Database
+from nerve.db.accounts import JWT_SECRET_NAME, read_instance_secret
+from nerve.gateway.auth import effective_jwt_secret, stored_jwt_secret
+from nerve.migrate import (
+    MigrationReport,
+    bootstrap_identity,
+    ensure_jwt_secret,
+    maybe_migrate,
+    migrate,
+)
+
+_HASH = bcrypt.hashpw(b"correct horse battery staple", bcrypt.gensalt(rounds=4)).decode()
+_SECRET = "configured-secret-padded-to-thirty-two-bytes"
+
+
+def _cfg(*, password_hash: str = "", jwt_secret: str = "", lockdown: bool = False) -> NerveConfig:
+    return NerveConfig(
+        auth=AuthConfig(password_hash=password_hash, jwt_secret=jwt_secret),
+        lockdown=lockdown,
+    )
+
+
+async def _snapshot(db: Database) -> dict:
+    """Every identity row, keyed so two snapshots compare by id."""
+    out: dict = {}
+    for table in ("tenants", "agents", "actor_refs", "accounts",
+                  "tenant_memberships", "agent_grants"):
+        async with db.db.execute(f"SELECT * FROM {table} ORDER BY id") as cur:
+            out[table] = [dict(r) async for r in cur]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  The three shapes                                                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestUpgradeShapes:
+    async def test_configured_password_gives_credential_source_config(self, db: Database):
+        report = await bootstrap_identity(db, _cfg(password_hash=_HASH, jwt_secret=_SECRET))
+        assert report.bootstrapped_account
+        assert not report.generated_jwt_secret
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "config"
+        assert account["credential"] is None       # nothing copied
+        assert account["username"] is None
+        assert account["enabled"] is True
+        assert any("credential_source=config" in a for a in report.identity_actions)
+
+    async def test_passwordless_install_gives_credential_source_none(self, db: Database):
+        report = await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "none"
+        assert account["username"] is None
+        assert any("credential_source=none" in a for a in report.identity_actions)
+
+    async def test_fresh_install_gives_passwordless_account_and_a_secret(self, db: Database):
+        """No password, no secret: the shape a headless install that omitted
+        NERVE_PASSWORD lands in. One passwordless account, and a signing secret
+        generated so the instance does not serve open."""
+        report = await bootstrap_identity(db, NerveConfig())
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "none"
+        assert report.bootstrapped_account and report.generated_jwt_secret
+        assert await db.get_instance_secret(JWT_SECRET_NAME)
+
+    async def test_owner_display_name_is_null_unless_supplied(self, db: Database):
+        await bootstrap_identity(db, NerveConfig())
+        (account,) = await db.list_accounts()
+        assert (await db.get_actor_ref(account["actor_id"]))["display_name"] is None
+
+    async def test_owner_display_name_passthrough(self, db: Database):
+        await bootstrap_identity(db, NerveConfig(), display_name="alice")
+        (account,) = await db.list_accounts()
+        owner = await db.get_actor_ref(account["actor_id"])
+        assert owner["display_name"] == "alice"
+        assert owner["kind"] == "human"
+        assert owner["email"] is None
+
+
+# --------------------------------------------------------------------------- #
+#  Idempotency and the lockout rule                                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestIdempotency:
+    async def test_repeated_starts_find_the_same_rows(self, db: Database):
+        config = _cfg(password_hash=_HASH)
+        first = await bootstrap_identity(db, config)
+        before = await _snapshot(db)
+        secret = await db.get_instance_secret(JWT_SECRET_NAME)
+
+        for _ in range(3):
+            again = await bootstrap_identity(db, config)
+            assert not again.did_bootstrap
+            assert again.identity_actions == []
+
+        assert await _snapshot(db) == before
+        assert await db.get_instance_secret(JWT_SECRET_NAME) == secret
+        assert first.bootstrapped_account and first.generated_jwt_secret
+
+    async def test_exactly_one_account_whatever_the_config_does(self, db: Database):
+        await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+        for config in (_cfg(password_hash=_HASH), NerveConfig(), _cfg(password_hash=_HASH, jwt_secret=_SECRET)):
+            await bootstrap_identity(db, config)
+            assert await db.count_accounts() == 1
+        assert len(await db.list_actor_refs(kind="human")) == 1
+        assert len(await db.list_actor_refs(kind="system")) == 1
+
+    async def test_a_disabled_account_is_not_resurrected(self, db: Database):
+        await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+        (account,) = await db.list_accounts()
+        await db.set_account_enabled(account["id"], False)
+
+        report = await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+
+        assert not report.bootstrapped_account
+        (still,) = await db.list_accounts()
+        assert still["id"] == account["id"]
+        assert still["enabled"] is False
+        assert still["disabled_at"] is not None
+
+    async def test_dry_run_reports_and_writes_nothing(self, db: Database):
+        report = await bootstrap_identity(db, _cfg(password_hash=_HASH), dry_run=True)
+        assert report.bootstrapped_account and report.generated_jwt_secret
+        assert report.identity_actions == [
+            "create the local owner account in nerve.db (credential_source=config, no username yet)",
+            "generate a JWT signing secret into nerve.db — auth.jwt_secret is not "
+            "configured (set it to override)",
+        ]
+        assert await db.count_accounts() == 0
+        assert await db.get_local_identity() is None
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+        assert stored_jwt_secret() == ""
+
+        # The real thing then reports in the past tense.
+        report = await bootstrap_identity(db, _cfg(password_hash=_HASH))
+        assert report.identity_actions[0].startswith("created the local owner account")
+        assert report.identity_actions[1].startswith("generated a JWT signing secret")
+
+
+@pytest.mark.asyncio
+class TestCredentialSourceMirrorsConfiguration:
+    """While the owner's credential lives in configuration (``config`` or
+    ``none``), the row says which of the two it is right now. Only ``local``
+    is the account's own and is never touched."""
+
+    async def test_password_added_after_bootstrap_flips_none_to_config(self, db: Database):
+        await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+        report = await bootstrap_identity(db, _cfg(password_hash=_HASH, jwt_secret=_SECRET))
+        assert report.updated_credential_source
+        assert not report.bootstrapped_account
+        assert report.identity_actions == [
+            "set credential_source none → config on the local owner account "
+            "(auth.password_hash is now configured)",
+        ]
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "config"
+        assert account["credential"] is None
+
+    async def test_password_removed_flips_config_to_none(self, db: Database):
+        await bootstrap_identity(db, _cfg(password_hash=_HASH, jwt_secret=_SECRET))
+        report = await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+        assert report.updated_credential_source
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "none"
+
+    async def test_a_local_credential_is_never_touched(self, db: Database):
+        await bootstrap_identity(db, _cfg(password_hash=_HASH, jwt_secret=_SECRET))
+        (account,) = await db.list_accounts()
+        await db.set_account_credential(
+            account["id"], credential_source="local", credential="$2b$12$own-hash",
+        )
+        for config in (_cfg(jwt_secret=_SECRET), _cfg(password_hash=_HASH, jwt_secret=_SECRET)):
+            report = await bootstrap_identity(db, config)
+            assert not report.did_bootstrap
+        (account,) = await db.list_accounts()
+        assert (account["credential_source"], account["credential"]) == ("local", "$2b$12$own-hash")
+
+    async def test_the_mirror_does_not_enable_or_create(self, db: Database):
+        await bootstrap_identity(db, _cfg(jwt_secret=_SECRET))
+        (account,) = await db.list_accounts()
+        await db.set_account_enabled(account["id"], False)
+        await bootstrap_identity(db, _cfg(password_hash=_HASH, jwt_secret=_SECRET))
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "config"
+        assert account["enabled"] is False
+
+
+# --------------------------------------------------------------------------- #
+#  auth.jwt_secret                                                             #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestJwtSecret:
+    async def test_configured_secret_is_kept_and_nothing_is_stored(self, db: Database):
+        config = _cfg(jwt_secret=_SECRET)
+        secret = await ensure_jwt_secret(db, config)
+        assert secret == _SECRET
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+        assert effective_jwt_secret(config) == _SECRET
+
+    async def test_missing_secret_is_generated_once_and_published(self, db: Database):
+        config = NerveConfig()
+        report = MigrationReport()
+        first = await ensure_jwt_secret(db, config, report=report)
+        assert report.generated_jwt_secret
+        assert len(first) == 64 and all(c in "0123456789abcdef" for c in first)
+        assert await db.get_instance_secret(JWT_SECRET_NAME) == first
+        assert effective_jwt_secret(config) == first
+        # Every consumer outside the process reads the same value.
+        assert read_instance_secret(db.db_path, JWT_SECRET_NAME) == first
+
+        again = MigrationReport()
+        assert await ensure_jwt_secret(db, config, report=again) == first
+        assert not again.generated_jwt_secret and again.identity_actions == []
+
+    async def test_a_configured_secret_added_later_wins_over_the_stored_one(self, db: Database):
+        generated = await ensure_jwt_secret(db, NerveConfig())
+        config = _cfg(jwt_secret=_SECRET)
+        assert await ensure_jwt_secret(db, config) == _SECRET
+        assert effective_jwt_secret(config) == _SECRET
+        # The stored one stays (unused) and is still what a config without a
+        # secret falls back to.
+        assert await db.get_instance_secret(JWT_SECRET_NAME) == generated
+        assert stored_jwt_secret() == generated
+
+    async def test_lockdown_without_a_configured_secret_also_generates(self, db: Database):
+        """1.6 is unconditional: a locked box with no auth.jwt_secret used to
+        answer 503 to everything; it now runs with a machine-local secret."""
+        config = _cfg(lockdown=True)
+        secret = await ensure_jwt_secret(db, config)
+        assert secret and effective_jwt_secret(config) == secret
+
+    async def test_dry_run_generates_nothing(self, db: Database):
+        report = MigrationReport(dry_run=True)
+        assert await ensure_jwt_secret(db, NerveConfig(), report=report, dry_run=True) == ""
+        assert report.generated_jwt_secret
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+        assert stored_jwt_secret() == ""
+
+
+# --------------------------------------------------------------------------- #
+#  Lockdown with an environment-referenced hash                                #
+# --------------------------------------------------------------------------- #
+
+
+def _git_repo_with_remote(ws: Path) -> None:
+    """What a locked workspace is on a real box; the remote is never contacted."""
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    subprocess.run(["git", "init", "-q"], cwd=str(ws), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://example.invalid/config.git"],
+        cwd=str(ws), check=True, capture_output=True,
+    )
+
+
+@pytest.mark.asyncio
+class TestLockdownInstall:
+    async def test_env_referenced_hash_is_used_in_place_and_nothing_is_rewritten(
+        self, db: Database, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        config_dir.mkdir()
+        (ws / "config").mkdir(parents=True)
+        _git_repo_with_remote(ws)
+        (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+        settings = workspace_settings_file(ws)
+        settings.write_text(
+            "lockdown: true\n"
+            "auth:\n"
+            "  password_hash: ${NERVE_TEST_PASSWORD_HASH}\n"
+            "  jwt_secret: ${NERVE_TEST_JWT_SECRET}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("NERVE_TEST_PASSWORD_HASH", _HASH)
+        monkeypatch.setenv("NERVE_TEST_JWT_SECRET", _SECRET)
+        before = {p: p.read_bytes() for p in (settings, config_dir / "config.yaml")}
+
+        config = load_config(config_dir)
+        assert config.lockdown and config.auth.password_hash == _HASH
+
+        report = await bootstrap_identity(db, config)
+
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "config"
+        assert account["credential"] is None            # the fleet keeps the value
+        assert not report.generated_jwt_secret           # the env supplies the secret
+        assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+        assert {p: p.read_bytes() for p in before} == before
+        assert not (config_dir / "config.local.yaml").exists()
+        # The resolved hash is not persisted anywhere in the database.
+        async with db.db.execute("SELECT * FROM accounts") as cur:
+            rows = [tuple(r) async for r in cur]
+        assert all(_HASH not in str(v) for row in rows for v in row)
+
+
+# --------------------------------------------------------------------------- #
+#  The synchronous path: nerve migrate / maybe_migrate                         #
+# --------------------------------------------------------------------------- #
+
+
+def _install(tmp_path, *, local_yaml: str | None = "{}\n") -> tuple[Path, Path]:
+    """A post-wizard install: config.yaml + config.local.yaml, nothing legacy."""
+    config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+    config_dir.mkdir()
+    (ws / "config").mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+    if local_yaml is not None:
+        (config_dir / "config.local.yaml").write_text(local_yaml, encoding="utf-8")
+    return config_dir, ws
+
+
+def _db_rows(db_path: Path, sql: str) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+class TestSyncPath:
+    def test_dry_run_inspects_without_creating_the_database(self, tmp_path):
+        config_dir, ws = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        report = migrate(config_dir, workspace=ws, dry_run=True)
+        assert not report.did_anything                  # nothing legacy to move
+        assert report.bootstrapped_account and report.generated_jwt_secret
+        assert report.identity_actions[0].startswith("create the local owner account")
+        assert "credential_source=config" in report.identity_actions[0]
+        assert not paths.db_path().exists()
+
+    def test_real_run_bootstraps_through_its_own_connection(self, tmp_path):
+        config_dir, ws = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        report = migrate(config_dir, workspace=ws)
+        assert report.did_bootstrap and not report.did_anything
+        assert report.identity_actions[0].startswith("created the local owner account")
+        rows = _db_rows(paths.db_path(), "SELECT credential_source, username FROM accounts")
+        assert rows == [("config", None)]
+        assert read_instance_secret(paths.db_path(), JWT_SECRET_NAME)
+
+        # Second pass: same rows, nothing reported.
+        again = migrate(config_dir, workspace=ws)
+        assert not again.did_bootstrap and again.identity_actions == []
+        assert _db_rows(paths.db_path(), "SELECT COUNT(*) FROM accounts") == [(1,)]
+
+    def test_fresh_install_is_left_to_the_wizard(self, tmp_path):
+        """No config.local.yaml means the wizard has not run. What it writes
+        shapes the account, so nothing is bootstrapped from here — and a
+        docker launch from the host never leaves a host-side nerve.db behind."""
+        config_dir, ws = _install(tmp_path, local_yaml=None)
+        report = migrate(config_dir, workspace=ws)
+        assert not report.did_bootstrap
+        assert not paths.db_path().exists()
+
+    def test_maybe_migrate_bootstraps_and_never_raises(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        report = maybe_migrate(config_dir, workspace=ws)
+        assert report is not None and report.bootstrapped_account
+        assert report.error is None
+        assert _db_rows(paths.db_path(), "SELECT credential_source FROM accounts") == [("none",)]
+
+    def test_a_config_object_is_honoured_when_passed(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        report = migrate(config_dir, workspace=ws, config=_cfg(password_hash=_HASH, jwt_secret=_SECRET))
+        assert report.bootstrapped_account and not report.generated_jwt_secret
+        assert _db_rows(paths.db_path(), "SELECT credential_source FROM accounts") == [("config",)]
+        assert read_instance_secret(paths.db_path(), JWT_SECRET_NAME) == ""
+
+    def test_dry_run_on_an_existing_database_sees_the_mirror_too(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        migrate(config_dir, workspace=ws)  # passwordless account exists now
+        report = migrate(
+            config_dir, workspace=ws, dry_run=True,
+            config=_cfg(password_hash=_HASH),
+        )
+        assert not report.bootstrapped_account
+        assert report.updated_credential_source
+        assert report.identity_actions == [
+            "set credential_source none → config on the local owner account "
+            "(auth.password_hash is now configured)",
+        ]
+        assert not report.generated_jwt_secret  # already stored by the first run
+        assert _db_rows(paths.db_path(), "SELECT credential_source FROM accounts") == [("none",)]
+
+
+class TestCli:
+    def test_migrate_dry_run_shows_the_bootstrap_and_writes_nothing(self, tmp_path):
+        from nerve.cli import main
+
+        config_dir, _ws = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "migrate", "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert "would create the local owner account" in result.output
+        assert "credential_source=config" in result.output
+        assert "would generate a JWT signing secret" in result.output
+        assert "Dry run — no changes written." in result.output
+        assert not paths.db_path().exists()
+
+    def test_migrate_bootstraps_then_reports_nothing_to_do(self, tmp_path):
+        from nerve.cli import main
+
+        config_dir, _ws = _install(tmp_path)
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "migrate"])
+        assert result.exit_code == 0, result.output
+        assert "created the local owner account" in result.output
+        assert "generated a JWT signing secret" in result.output
+        assert "Migration complete." in result.output
+        assert _db_rows(paths.db_path(), "SELECT credential_source FROM accounts") == [("none",)]
+
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "migrate"])
+        assert result.exit_code == 0, result.output
+        assert "Nothing to migrate" in result.output

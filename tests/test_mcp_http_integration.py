@@ -33,7 +33,10 @@ def app_with_mcp(tmp_path, monkeypatch):
     from nerve.config import NerveConfig, McpEndpointConfig
     from nerve.gateway import server as gw_server
 
-    # Build a minimal config with MCP enabled and auth off (dev mode).
+    # Build a minimal config with MCP enabled and no auth.jwt_secret. That is
+    # no longer an open instance: the lifespan's identity bootstrap generates
+    # a signing secret into the DB, so requests below authenticate with it
+    # (see _post_jsonrpc) and an unauthenticated one is refused.
     config = NerveConfig()
     config.mcp_endpoint = McpEndpointConfig(enabled=True, path="/mcp/v1")
     config.workspace = tmp_path / "workspace"
@@ -105,13 +108,26 @@ def app_with_mcp(tmp_path, monkeypatch):
     config_module._config = None
 
 
-def _post_jsonrpc(client: TestClient, body: dict, session_id: str | None = None):
+def _post_jsonrpc(
+    client: TestClient,
+    body: dict,
+    session_id: str | None = None,
+    *,
+    authenticated: bool = True,
+):
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
     if session_id:
         headers["mcp-session-id"] = session_id
+    if authenticated:
+        # The secret in force is the one the lifespan bootstrap generated
+        # (auth.jwt_secret is unset in the fixture's config), published to the
+        # process once the TestClient context has started the app.
+        from nerve.gateway.auth import create_token, effective_jwt_secret
+
+        headers["Authorization"] = f"Bearer {create_token(effective_jwt_secret())}"
     return client.post("/mcp/v1/", json=body, headers=headers)
 
 
@@ -127,6 +143,36 @@ def _parse_response(resp) -> dict:
                     return json.loads(payload)
         raise AssertionError(f"No SSE data found in: {resp.text!r}")
     return resp.json()
+
+
+def test_mcp_served_instance_is_not_open_without_a_configured_secret(app_with_mcp):
+    """The fixture configures no auth.jwt_secret. Before the identity bootstrap
+    that meant the endpoint accepted everything; now the lifespan generates a
+    secret on first start, so an unauthenticated request is refused and the
+    generated secret is what tokens are checked against."""
+    from nerve.db.accounts import JWT_SECRET_NAME
+    from nerve.gateway import server as gw
+    from nerve.gateway.auth import effective_jwt_secret
+
+    with TestClient(app_with_mcp) as client:
+        assert effective_jwt_secret()  # published by the lifespan bootstrap
+        anonymous = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "0.1"},
+            },
+        }, authenticated=False)
+        assert anonymous.status_code == 401, anonymous.text
+
+        # The same startup created the local owner account and stored the
+        # secret the endpoint just verified against. The DB lives on the
+        # app's loop, which the TestClient exposes as its blocking portal.
+        db = gw._engine.db
+        portal = client.portal
+        assert portal.call(db.count_accounts) == 1
+        assert portal.call(db.get_instance_secret, JWT_SECRET_NAME) == effective_jwt_secret()
 
 
 def test_mcp_initialize_handshake(app_with_mcp):

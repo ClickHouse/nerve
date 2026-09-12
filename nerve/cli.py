@@ -278,9 +278,13 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
+    # The same pass bootstraps the local owner account and signing secret in
+    # nerve.db (skipped on a fresh install; the gateway repeats it at startup).
     if config is not None:
         from nerve.migrate import maybe_migrate
-        report = maybe_migrate(config_dir, workspace=getattr(config, "workspace", None))
+        report = maybe_migrate(
+            config_dir, workspace=getattr(config, "workspace", None), config=config,
+        )
         if report is not None and report.did_anything:
             # The config in hand was loaded from the old locations, and migration
             # has just moved the files out from under it — cron in particular now
@@ -800,12 +804,19 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
         if rc != 0:
             raise click.ClickException("npm run build failed")
 
-    # Migrate a legacy config layout to workspace/config (idempotent).
+    # Migrate a legacy config layout to workspace/config (idempotent), and
+    # bootstrap the local owner account / signing secret in nerve.db.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
-            Path(ctx.obj["config_dir"]), workspace=getattr(config, "workspace", None)
+            Path(ctx.obj["config_dir"]),
+            workspace=getattr(config, "workspace", None),
+            config=config,
         )
+        if report and report.identity_actions:
+            click.echo("\nIdentity bootstrap:")
+            for action in report.identity_actions:
+                click.echo(f"  - {action}")
         if report and report.did_anything:
             click.echo("\nMigrated config to the workspace layout:")
             for action in report.actions:
@@ -1424,6 +1435,10 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     scrubbed into config.local.yaml as ${ENV_VAR} refs), machine-local keys stay
     in config.yaml. Also moves ~/.nerve/cron → workspace/config/cron.
     Non-destructive (originals kept as *.migrated) and idempotent.
+
+    Also bootstraps the local owner account and, when auth.jwt_secret is not
+    configured, the JWT signing secret in nerve.db — once, on the first run
+    after upgrading; the gateway repeats the check at every start.
     """
     from nerve.migrate import migrate as run_migrate
 
@@ -1431,17 +1446,25 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     config_dir = Path(ctx.obj["config_dir"])
     workspace = getattr(config, "workspace", None) if config is not None else None
     try:
-        report = run_migrate(config_dir, workspace=workspace, dry_run=dry_run)
+        report = run_migrate(
+            config_dir, workspace=workspace, dry_run=dry_run, config=config,
+        )
     except Exception as e:  # e.g. a malformed config.local.yaml
         raise click.ClickException(f"Migration failed: {e}") from e
 
-    if not report.did_anything:
-        click.secho("Nothing to migrate — already on the workspace layout.", fg="green")
+    if not report.did_anything and not report.did_bootstrap:
+        click.secho(
+            "Nothing to migrate — already on the workspace layout, and the local "
+            "account is in place.",
+            fg="green",
+        )
         for warning in report.warnings:
             click.secho(f"  Note: {warning}", fg="yellow")
         return
     prefix = "[dry-run] would " if dry_run else ""
     for action in report.actions:
+        click.echo(f"  {prefix}{action}")
+    for action in report.identity_actions:
         click.echo(f"  {prefix}{action}")
     for warning in report.warnings:
         click.secho(f"\n  Note: {warning}", fg="yellow")
@@ -1460,8 +1483,10 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
         )
     if dry_run:
         click.secho("\nDry run — no changes written.", fg="yellow")
-    else:
+    elif report.did_anything:
         click.secho("\nMigration complete. Review workspace/config/settings.yaml before committing.", fg="green")
+    else:
+        click.secho("\nMigration complete.", fg="green")
 
 
 @main.group(name="config")

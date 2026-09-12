@@ -488,3 +488,20 @@ def count_accounts_readonly(db_path: Path) -> int | None:
         return None
     finally:
         conn.close()
+
+
+def list_credential_sources_readonly(db_path: Path) -> list[str] | None:
+    """``credential_source`` of every account, oldest first, or None when the
+    database or table does not exist yet."""
+    conn = _read_only(db_path)
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT credential_source FROM accounts ORDER BY created_at, id"
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()

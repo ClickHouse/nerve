@@ -257,6 +257,17 @@ async def lifespan(app: FastAPI):
     db = await init_db(db_path, workspace=config.workspace)
     logger.info("Database initialized at %s", db_path)
 
+    # Local identity bootstrap: the owner account and the signing secret.
+    # After the schema migration in init_db() and before anything mints or
+    # checks a token. Idempotent on every start. Not best-effort: without it
+    # an install with no configured auth.jwt_secret would serve open, so a
+    # failure here stops startup.
+    from nerve.migrate import bootstrap_identity
+
+    identity_report = await bootstrap_identity(db, config)
+    for action in identity_report.identity_actions:
+        logger.info("Identity bootstrap: %s", action)
+
     # Optional Langfuse observability — must be set up BEFORE the engine
     # creates SDK clients so the configure_claude_agent_sdk() patches are
     # in place when the SDK initializes its OTEL tracer provider. Failures
