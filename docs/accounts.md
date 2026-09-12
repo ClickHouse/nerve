@@ -82,6 +82,23 @@ connection. An existing WebSocket keeps the identity it received when it
 connected. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
 
+## Attribution
+
+Sessions store who created them in `created_by_actor_id`. User messages store
+who supplied the content in `actor_id`. Both columns contain stable actor IDs;
+clients resolve display names through `GET /api/actors`.
+
+| Event | Stored actor |
+|---|---|
+| A person creates a session or sends a message | That person's actor |
+| Nerve creates a session or prompt | The system actor |
+| Telegram, Slack, or MCP input without a local account mapping | The system actor |
+| Assistant and tool output | None |
+
+Existing records remain unattributed. Nerve does not infer identity from channel
+or source metadata. Account and session administration actions are not yet
+recorded as audit events.
+
 ## Session-signing secret
 
 Nerve uses `auth.jwt_secret` when configured. Otherwise it generates a secret
