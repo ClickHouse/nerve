@@ -68,7 +68,7 @@ def _make_memu_db(path: Path, *, items: int = 5) -> None:
 def nerve_dir(tmp_path: Path) -> Path:
     """A populated ~/.nerve replica, with secrets, state, and junk."""
     nd = tmp_path / "dot_nerve"
-    nd.mkdir()
+    nd.mkdir(mode=0o700)  # as Nerve creates it; a 002 umask would otherwise give 0775
     _make_nerve_db(nd / "nerve.db")
     _make_memu_db(nd / "memu.sqlite")
 
@@ -438,7 +438,7 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
     from nerve.db.accounts import JWT_SECRET_NAME
 
     nd = tmp_path / "real_nerve"
-    nd.mkdir()
+    nd.mkdir(mode=0o700)  # as Nerve creates it; a 002 umask would otherwise give 0775
 
     async def _bootstrap():
         db = Database(nd / "nerve.db")
@@ -519,7 +519,7 @@ def _nerve_dir_with_stored_key(tmp_path) -> Path:
     from nerve.gateway.auth import unpin_jwt_secret
 
     nd = tmp_path / "src_nerve"
-    nd.mkdir()
+    nd.mkdir(mode=0o700)  # as Nerve creates it; a 002 umask would otherwise give 0775
 
     async def _seed():
         db = Database(nd / "nerve.db")

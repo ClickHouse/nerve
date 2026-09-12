@@ -122,6 +122,21 @@ _GROUP_WORLD_READ = 0o044
 _ABSENT = object()
 
 
+class InsecureStateStorage(RuntimeError):
+    """The state directory or database files are not owner-only in a way this
+    layer will not repair on its own.
+
+    Raised by :meth:`Database.connect` *before* the database is opened or
+    migrated when a database file, a sidecar or the state directory is
+    group/world-writable, or when its mode cannot be read. Write access by
+    another user means the contents — accounts, actors, history — may have
+    been altered; chmod'ing that away would erase the evidence and then trust
+    the result. The operator acknowledges by fixing the modes by hand. Also
+    raised by the bootstrap when a database-held signing secret would have to
+    live in a file other users can read (confidentiality).
+    """
+
+
 def _mode_of(path: Path):
     """Permission bits of ``path``; ``_ABSENT`` if it does not exist; ``None``
     if it exists but cannot be inspected (logged, and treated as unsafe)."""
@@ -136,15 +151,17 @@ def _mode_of(path: Path):
 
 @dataclass
 class StatePermissions:
-    """What a hardening pass found after trying to repair the modes.
+    """The modes of the state directory and database files, classified.
 
     ``writable`` (files or the directory) and ``uninspectable`` are *integrity*
     hazards — another user could replace or rewrite the database — and are fatal
-    whatever the signing-secret arrangement is. ``readable`` (files only) is a
-    *confidentiality* hazard, fatal only when a database-held secret would be
-    used. ``exposed_before_repair`` records that a database file carried
-    group/world read bits when first observed, before any chmod: the trigger to
-    rotate a stored signing key, since it may already have been copied.
+    whatever the signing-secret arrangement is; :meth:`Database.connect` refuses
+    to open on them and repairs nothing. ``readable`` (files only) is a
+    *confidentiality* hazard: repaired automatically, and fatal at bootstrap
+    only when a database-held secret would be used and the repair failed.
+    ``exposed_before_repair`` records that a database file carried group/world
+    read bits when first observed, before any chmod: the trigger to rotate a
+    stored signing key, since it may already have been copied.
     """
 
     writable: list[tuple[Path, int]] = field(default_factory=list)
@@ -154,8 +171,8 @@ class StatePermissions:
 
     @property
     def integrity_hazards(self) -> list[str]:
-        return [f"{p} is {m:04o}" for p, m in self.writable] + [
-            f"{p} is uninspectable" for p in self.uninspectable
+        return [f"{p} is {m:04o} (group/world-writable)" for p, m in self.writable] + [
+            f"{p} has a mode that cannot be read" for p in self.uninspectable
         ]
 
     @property
@@ -167,28 +184,55 @@ class StatePermissions:
         return not (self.writable or self.uninspectable or self.readable)
 
 
-def _harden_state_permissions(db_path: Path) -> StatePermissions:
-    """Make the state directory 0700 and the database files 0600, and classify
-    whatever could not be secured.
-
-    Idempotent: a mode already right is left alone and an absent path skipped.
-    Every change is *verified* by re-reading the mode, never trusting chmod's
-    return, because on a filesystem without modes a chmod can succeed and change
-    nothing. A path that exists but cannot be stat'd is ``uninspectable`` — fail
-    closed. Read exposure on a database file *before* repair is remembered so a
-    possibly-copied signing key can be rotated even after the mode is fixed.
-
-    Never raises: whether a given hazard is tolerable depends on the
-    signing-secret arrangement, which is the bootstrap's decision
-    (:func:`nerve.migrate._refuse_insecure_secret_storage`), not this layer's.
-    """
-    perms = StatePermissions()
-    # (path, desired_mode, is_db_file). The directory first.
+def _state_targets(db_path: Path) -> list[tuple[Path, int, bool]]:
+    """(path, desired mode, is a database file) for the directory and every
+    database file SQLite may leave beside the main one."""
     targets = [(db_path.parent, _STATE_DIR_MODE, False)]
     targets.extend(
         (Path(f"{db_path}{suffix}"), _DB_FILE_MODE, True) for suffix in _DB_FILE_SUFFIXES
     )
-    for path, desired, is_db_file in targets:
+    return targets
+
+
+def _inspect_state_permissions(db_path: Path) -> StatePermissions:
+    """Classify the current modes without changing anything.
+
+    The pre-open snapshot. Anything ``writable`` or ``uninspectable`` here is
+    evidence the contents may have been altered, and is what
+    :meth:`Database.connect` refuses on; ``readable``/``exposed_before_repair``
+    is what it repairs and rotates for.
+    """
+    perms = StatePermissions()
+    for path, _desired, is_db_file in _state_targets(db_path):
+        mode = _mode_of(path)
+        if mode is _ABSENT:
+            continue
+        if mode is None:
+            perms.uninspectable.append(path)
+            continue
+        if mode & _GROUP_WORLD_WRITE:
+            perms.writable.append((path, mode))
+        if is_db_file and (mode & _GROUP_WORLD_READ):
+            perms.readable.append((path, mode))
+            perms.exposed_before_repair = True
+    return perms
+
+
+def _repair_state_permissions(db_path: Path) -> StatePermissions:
+    """Make the state directory 0700 and the database files 0600, verify, and
+    classify whatever could not be secured.
+
+    Only ever reached after :func:`_inspect_state_permissions` found no
+    integrity hazard, so what it repairs is read exposure and the directory
+    mode. Idempotent: a mode already right is left alone and an absent path
+    skipped. Every change is *verified* by re-reading the mode, never trusting
+    chmod's return, because on a filesystem without modes a chmod can succeed
+    and change nothing. Read exposure on a database file *before* repair is
+    remembered so a possibly-copied signing key can be rotated even after the
+    mode is fixed.
+    """
+    perms = StatePermissions()
+    for path, desired, is_db_file in _state_targets(db_path):
         pre = _mode_of(path)
         if pre is _ABSENT:
             continue
@@ -217,6 +261,20 @@ def _harden_state_permissions(db_path: Path) -> StatePermissions:
         elif is_db_file and (final & _GROUP_WORLD_READ):
             perms.readable.append((path, final))
     return perms
+
+
+def _refusal_message(db_path: Path, perms: StatePermissions) -> str:
+    """The actionable text for an :class:`InsecureStateStorage` at open."""
+    files = " ".join(
+        str(p) for p in (Path(f"{db_path}{s}") for s in _DB_FILE_SUFFIXES) if p.exists()
+    ) or str(db_path)
+    return (
+        f"Refusing to open {db_path}: {'; '.join(perms.integrity_hazards)}. Another "
+        f"user could have altered the state (accounts, actors, history), so it is "
+        f"not repaired automatically. If you trust the contents, acknowledge by "
+        f"fixing the modes yourself — chmod 700 {db_path.parent}; chmod 600 {files} "
+        f"— then start again."
+    )
 
 
 class Database(
@@ -278,13 +336,29 @@ class Database(
             await self.db.execute(f"PRAGMA {name}={value}")
 
     async def connect(self) -> None:
-        """Open the database connection, tune it, and apply migrations."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Owner-only before anything is written: the directory, and any database
-        # files a previous run or a restore left wider than that. This first pass
-        # is what observes a pre-existing wide mode — an attacker's 0644 restart —
-        # before it is repaired, so an exposed key can be rotated below.
-        pre = _harden_state_permissions(self.db_path)
+        """Open the database connection, tune it, and apply migrations.
+
+        The state-file policy is enforced here, so every opener — the gateway,
+        each CLI command, the installer, tests — gets the same treatment:
+
+        1. Inspect before touching anything. A group/world-**writable** database
+           file, sidecar or state directory, or one whose mode cannot be read,
+           means another user may have altered the contents. That is evidence,
+           not something to chmod away: refuse to open (no migration, no
+           repair) with the manual remedy, so the operator acknowledges it.
+        2. Repair what is repairable: read exposure on the files and the
+           directory mode, verified after the chmod.
+        3. Migrate, then — if a database file was readable before the repair —
+           retire the stored signing secret, which may have been copied, and
+           drop a matching process pin so nothing accepts it meanwhile.
+        """
+        # A directory this call creates is created owner-only; one that already
+        # exists is judged as found. mkdir's mode is subject to the umask, which
+        # can only remove bits, so this never widens anything.
+        self.db_path.parent.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
+        pre = _inspect_state_permissions(self.db_path)
+        if pre.writable or pre.uninspectable:
+            raise InsecureStateStorage(_refusal_message(self.db_path, pre))
         if not self.db_path.exists():
             # Create the file owner-only *before* SQLite does. SQLite creates a
             # new database at 0644-under-umask and gives the -wal/-shm sidecars
@@ -298,19 +372,24 @@ class Database(
         await self._apply_pragmas()
         # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
         # already existed from an earlier, wider run keeps its old mode until
-        # this second pass tightens it. Its verdict is what the bootstrap reads.
-        self.state_permissions = _harden_state_permissions(self.db_path)
+        # this pass tightens it. Its verdict is what the bootstrap reads.
+        self.state_permissions = _repair_state_permissions(self.db_path)
+        if self.state_permissions.writable or self.state_permissions.uninspectable:
+            # Not reachable for anything the pre-open inspection saw; a sidecar
+            # SQLite just created inherits the main file's 0600. Kept as the
+            # backstop for whatever else a filesystem might do.
+            perms = self.state_permissions
+            await self._db.close()
+            self._db = None
+            raise InsecureStateStorage(_refusal_message(self.db_path, perms))
         exposed = pre.exposed_before_repair or self.state_permissions.exposed_before_repair
-        if not self.state_permissions.secured:
+        if self.state_permissions.readable:
             logger.error(
-                "State storage is not owner-only and could not be secured: %s "
-                "(expected directory %04o, files %04o). Startup will refuse unless "
-                "the hazard is only read exposure and auth.jwt_secret is configured.",
-                "; ".join(
-                    self.state_permissions.integrity_hazards
-                    + self.state_permissions.readable_hazards
-                ),
-                _STATE_DIR_MODE, _DB_FILE_MODE,
+                "Database files are readable by other users and could not be "
+                "tightened: %s (expected %04o). No signing secret will be kept in "
+                "this database; the bootstrap refuses unless auth.jwt_secret is "
+                "configured.",
+                "; ".join(self.state_permissions.readable_hazards), _DB_FILE_MODE,
             )
         await run_migrations(self._db)
         # After migrations (the table exists) and after repair: a key that was

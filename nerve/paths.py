@@ -169,3 +169,19 @@ def default_workspace() -> Path:
     workspace is configurable via ``config.workspace``.
     """
     return Path.home() / "nerve-workspace"
+
+
+def ensure_nerve_home() -> Path:
+    """Create the state directory if it does not exist, owner-only, and return it.
+
+    ``nerve.db`` lives here with the accounts and possibly the signing secret,
+    and :meth:`nerve.db.Database.connect` refuses to open a state directory
+    other users can write to. Creating it ``0700`` — the mode is applied by
+    ``mkdir`` itself, so there is no wider window and the umask can only
+    remove bits — means a directory Nerve created never trips that refusal
+    (a umask of ``002``, common on Ubuntu, would otherwise leave it ``0775``).
+    An existing directory is left as found: judging it is ``connect()``'s job.
+    """
+    home = nerve_home()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return home

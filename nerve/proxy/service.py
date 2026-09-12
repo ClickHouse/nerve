@@ -142,6 +142,7 @@ class ProxyService:
     def _write_proxy_config(self) -> Path:
         """Write the proxy's own config.yaml and return its path."""
         auth_dir = self.config.proxy.auth_dir.expanduser()
+        paths.ensure_nerve_home()  # the defaults live in the state dir; never create it wide
         auth_dir.mkdir(parents=True, exist_ok=True)
 
         proxy_cfg: dict[str, Any] = {
@@ -214,6 +215,7 @@ class ProxyService:
         log_file = self.config.proxy.log_file.expanduser()
 
         def _open_log():
+            paths.ensure_nerve_home()
             log_file.parent.mkdir(parents=True, exist_ok=True)
             return open(log_file, "a")  # noqa: SIM115
 

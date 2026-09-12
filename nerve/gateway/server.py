@@ -229,6 +229,10 @@ async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
     global _engine, _mcp_manager
     config = get_config()
+    # The state directory, owner-only, before anything below (the proxy, memU,
+    # the database) creates a file in it — Database.connect refuses a state
+    # directory other users can write to, and one created here never is.
+    paths.ensure_nerve_home()
 
     # Clear CLAUDECODE env var to prevent nested session detection by claude-agent-sdk
     os.environ.pop("CLAUDECODE", None)

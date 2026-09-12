@@ -1032,16 +1032,12 @@ def _retire_action(dry_run: bool) -> str:
     )
 
 
-class InsecureStateStorage(RuntimeError):
-    """The database files or their directory are not owner-only.
+# The exception lives with the policy that raises it first (Database.connect
+# refuses writable/uninspectable state before opening); the bootstrap raises the
+# same class for the confidentiality case. Re-exported here, with the round-2
+# name kept as an alias, so callers keep importing it from this module.
+from nerve.db.base import InsecureStateStorage  # noqa: E402
 
-    Raised by the bootstrap so startup stops before trusting — or writing a
-    signing secret into — a database that other local users could modify
-    (integrity) or read (confidentiality).
-    """
-
-
-# The round-2 name; kept so anything importing it still resolves.
 InsecureSecretStorage = InsecureStateStorage
 
 

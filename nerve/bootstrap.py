@@ -1735,8 +1735,7 @@ class SetupWizard:
         # 9. Create the machine-local state directory. Cron config no longer
         # lives here — it's in workspace/config/cron.
         click.echo(f"  Setting up {paths.home_label()}/...", nl=False)
-        nerve_dir = paths.nerve_home()
-        nerve_dir.mkdir(parents=True, exist_ok=True)
+        nerve_dir = paths.ensure_nerve_home()
         click.secho(" ✓", fg="green")
 
         # 10. Write cron jobs

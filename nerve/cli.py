@@ -80,7 +80,7 @@ def _is_running(pid: int) -> bool:
 
 
 def _write_pid(pid: int, config_dir: Path | None = None) -> None:
-    paths.nerve_home().mkdir(parents=True, exist_ok=True)
+    paths.ensure_nerve_home()
     paths.pid_file().write_text(str(pid))
     if config_dir is not None:
         write_config_pointer(config_dir)
@@ -398,7 +398,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
         cmd.extend(["start", "--foreground"])
 
         # Ensure log directory exists
-        paths.nerve_home().mkdir(parents=True, exist_ok=True)
+        paths.ensure_nerve_home()
 
         log_fd = open(paths.log_file(), "a")
         proc = subprocess.Popen(
@@ -498,7 +498,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     if resume_ids:
         ids = [s.strip() for s in resume_ids if s.strip()]
         if ids:
-            RESUME_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            paths.ensure_nerve_home()  # RESUME_QUEUE_FILE lives directly in the state dir
             with open(RESUME_QUEUE_FILE, "a") as fh:
                 fh.writelines(f"{sid}\n" for sid in ids)
             click.echo(f"Will resume {len(ids)} session(s) after restart.")

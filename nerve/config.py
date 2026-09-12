@@ -3069,7 +3069,7 @@ def write_config_pointer(config_dir: Path) -> None:
     """
     pointer = paths.config_pointer_file()
     try:
-        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # the state dir, owner-only
         pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
     except OSError as e:
         logger.warning("Could not write config pointer %s: %s", pointer, e)

@@ -1,6 +1,7 @@
 """Shared test fixtures for Nerve tests."""
 
 import asyncio
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -92,6 +93,24 @@ def _unpin_jwt_secret():
     unpin_jwt_secret()
     yield
     unpin_jwt_secret()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _deterministic_umask():
+    """Run the suite under umask 022, whatever the developer's shell has.
+
+    ``Database.connect`` refuses — unrepaired — to open a state directory that
+    other users can write to. A umask of 002 (Ubuntu's default with
+    user-private groups) makes every plain ``mkdir()`` in a test fixture a
+    0775, group-writable directory: a hazard the policy is right to refuse,
+    but not what those fixtures are about. Production never depends on the
+    umask (Nerve creates its state directory 0700 explicitly, see
+    ``paths.ensure_nerve_home``); the tests that *are* about the umask set
+    their own inside the test.
+    """
+    old = os.umask(0o022)
+    yield
+    os.umask(old)
 
 
 @pytest.fixture
