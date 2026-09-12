@@ -148,7 +148,16 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
   directory is made and verified `0700` first, `nerve.db` is written through a
   temporary *created* `0600` (verified before a byte is copied) and renamed into
   place, and the restore aborts rather than continue if either cannot be
-  guaranteed.
+  guaranteed. `config.local.yaml` — the password hash and the machine-local
+  secrets — is installed the same way, and a restore that cannot install it
+  fails rather than quietly leave the instance without a configured password.
+- **A backup bundle is as sensitive as what it holds.** It carries `nerve.db`
+  and, unless `--no-secrets` was used, `config.local.yaml`, so it is created
+  `0600` before a byte is written to it rather than at whatever the umask
+  gives. A filesystem that cannot keep it private refuses a backup that would
+  carry secrets, and warns when `--no-secrets` means it does not. The wizard's
+  `config.local.yaml` and its `init-state.json` checkpoint are created
+  owner-only the same way — mode first, content second.
 - **Every command opens the database the same way.** `nerve sync`, `nerve cron`,
   `nerve db prune`, `nerve db vacuum` and `nerve workflow list|status` open
   `nerve.db` exactly as the gateway does — the policy above, the migrations,
