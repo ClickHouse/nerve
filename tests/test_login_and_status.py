@@ -195,6 +195,45 @@ class TestMultiAccountLogin:
             )
         assert response.status_code == 401
 
+    async def test_an_unknown_username_costs_the_same_comparison_as_a_known_one(
+        self, install,
+    ):
+        """One bcrypt comparison either way, on every request including the
+        first one a process serves. The decoy is a constant precisely so that
+        the first unknown-username attempt does not also pay for a hash."""
+        from nerve.gateway.routes import auth as auth_routes
+
+        calls: list[str] = []
+        real = auth_routes.verify_password
+
+        def counting(plain, hashed):
+            calls.append(hashed)
+            return real(plain, hashed)
+
+        auth_routes.verify_password = counting
+        try:
+            async with _client(install.app) as client:
+                await client.post(
+                    "/api/auth/login",
+                    json={"username": "nobody-here", "password": _PASSWORD},
+                )
+                unknown = list(calls)
+                calls.clear()
+                await client.post(
+                    "/api/auth/login",
+                    json={"username": "alice", "password": "wrong"},
+                )
+                known = list(calls)
+        finally:
+            auth_routes.verify_password = real
+
+        assert len(unknown) == len(known) == 1
+        assert unknown[0] == auth_routes._DECOY_HASH
+        # ...and the decoy really is a usable bcrypt hash, or the comparison it
+        # is there to pay for would be skipped.
+        assert auth_routes._DECOY_HASH.startswith("$2b$12$")
+        assert real("anything at all", auth_routes._DECOY_HASH) is False
+
     async def test_wrong_username_and_wrong_password_are_indistinguishable(self, install):
         async with _client(install.app) as client:
             no_such_user = await client.post(
