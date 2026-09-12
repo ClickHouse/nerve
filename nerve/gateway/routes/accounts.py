@@ -34,7 +34,13 @@ from nerve.db.accounts import (
     UnnamedAccountError,
     UsernameTakenError,
 )
-from nerve.gateway.auth import hash_password, require_auth, verify_password
+from nerve.gateway.auth import (
+    PasswordTooLongError,
+    hash_password,
+    password_length_problem,
+    require_auth,
+    verify_password,
+)
 from nerve.gateway.routes._deps import get_deps
 from nerve.identity import Actor
 
@@ -59,6 +65,13 @@ class AccountOut(BaseModel):
     """
 
     id: str
+    # The account's *actor* id — the permanent identity, and the one attribution
+    # is written against. Published because a UI showing who wrote a message has
+    # only that id to go on and needs somewhere to look it up; it is not
+    # sensitive, and it is the id that outlives every rename. Note that it is a
+    # different column from ``id``: the account is the login, the actor is the
+    # person.
+    actor_id: str
     username: str | None
     display_name: str | None
     enabled: bool
@@ -93,11 +106,29 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=1)
 
 
+def _hashed(password: str) -> str:
+    """bcrypt-hash a password a request supplied, refusing an over-long one.
+
+    The password-writing boundary. bcrypt hashes at most 72 *bytes* and version
+    5 raises rather than ignoring the rest, so without this a long passphrase
+    (or nineteen emoji, which are seventy-six bytes) is a 500. `400`, because
+    the request is what is wrong and the message says what the limit is.
+    """
+    problem = password_length_problem(password)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    try:
+        return hash_password(password)
+    except PasswordTooLongError as e:  # pragma: no cover - the check above caught it
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 def _account_out(
     account: dict, actor_display: str | None, *, actor: Actor, config,
 ) -> AccountOut:
     return AccountOut(
         id=account["id"],
+        actor_id=account["actor_id"],
         username=account["username"],
         display_name=actor_display,
         enabled=bool(account["enabled"]),
@@ -183,7 +214,7 @@ async def create_account(req: AccountCreateRequest, actor: Actor = Depends(requi
     try:
         account = await db.create_managed_account(
             username=req.username,
-            credential=hash_password(req.password),
+            credential=_hashed(req.password),
             display_name=(req.display_name or None),
         )
     except _CONFLICT as e:
@@ -294,7 +325,7 @@ async def change_own_password(
 
     try:
         updated = await db.update_account_login(
-            account["id"], credential=hash_password(req.new_password),
+            account["id"], credential=_hashed(req.new_password),
         )
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
