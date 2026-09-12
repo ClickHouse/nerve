@@ -78,6 +78,22 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     _repoint_import_time_state_paths(monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def _reset_stored_jwt_secret():
+    """Clear the database-held signing secret published to this process.
+
+    ``effective_jwt_secret`` falls back to a process-level holder that the
+    identity bootstrap fills at startup. Many tests rely on an empty
+    ``auth.jwt_secret`` making ``require_auth`` a no-op; one test that
+    bootstraps an identity must not turn auth on for every test after it.
+    """
+    from nerve.gateway.auth import set_stored_jwt_secret
+
+    set_stored_jwt_secret("")
+    yield
+    set_stored_jwt_secret("")
+
+
 @pytest.fixture
 def clean_registry():
     """Snapshot ``GATE_REGISTRY`` and restore it after the test.

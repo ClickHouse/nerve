@@ -1127,12 +1127,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     if config.auth.password_hash:
         lines.append("[OK] Auth password hash configured")
     else:
-        warnings.append("[WARN] Auth password not set — running in dev mode (no auth)")
+        warnings.append(
+            "[WARN] Auth password not set — passwordless: anyone who can reach "
+            "the gateway acts as the owner"
+        )
 
     if config.auth.jwt_secret:
         lines.append("[OK] JWT secret configured")
+    elif _signing_secret(config):
+        lines.append("[OK] JWT secret: generated on first start, kept in nerve.db")
     else:
-        warnings.append("[WARN] JWT secret not set — running in dev mode")
+        lines.append(
+            "[--] JWT secret: none configured — one is generated into nerve.db on first start"
+        )
 
     # Check DB
     db_path = paths.db_path()
@@ -1276,6 +1283,23 @@ def doctor(ctx: click.Context) -> None:
 _WILDCARD_BINDS = ("", "0.0.0.0", "::", "*")
 
 
+def _signing_secret(config) -> str:
+    """The JWT secret this box's daemon signs with, as seen from a CLI process.
+
+    ``auth.jwt_secret`` from the config read here when set; otherwise the
+    secret the daemon generated into ``nerve.db`` on its first start, read
+    straight from the file (a CLI process has no live database, and the
+    daemon keeps the value in memory rather than in any config file). Empty
+    only when there is no secret anywhere yet — the daemon has never started
+    — in which case an unlocked gateway is not asking for a token either.
+    """
+    if config.auth.jwt_secret:
+        return config.auth.jwt_secret
+    from nerve.db.accounts import JWT_SECRET_NAME, read_instance_secret
+
+    return read_instance_secret(paths.db_path(), JWT_SECRET_NAME)
+
+
 def _gateway_url(config, path: str) -> str:
     """URL for a loopback call to this box's own gateway.
 
@@ -1309,13 +1333,16 @@ def reload(ctx: click.Context) -> None:
             f"Config could not be loaded ({ctx.obj.get('config_error')}); "
             "run 'nerve config validate' to see why."
         )
-    if not config.auth.jwt_secret and config.lockdown:
+    # auth.jwt_secret from the config read here, else the secret the daemon
+    # generated into nerve.db on its first start (this shell is on the same box).
+    secret = _signing_secret(config)
+    if not secret and config.lockdown:
         raise click.ClickException(
-            "No auth.jwt_secret in the config read here, and a locked gateway "
-            "never runs open, so nothing sent from this shell can be "
-            "authenticated. If the secret comes from ${ENV_VAR}, export it here "
-            "too; if the daemon has none either, it is refusing every request "
-            "and needs one before it can be reloaded."
+            "No auth.jwt_secret in the config read here and none stored in "
+            "nerve.db yet, and a locked gateway never runs open, so nothing sent "
+            "from this shell can be authenticated. If the secret comes from "
+            "${ENV_VAR}, export it here too; if the daemon has never started, "
+            "start it first."
         )
     url = _gateway_url(config, "/api/config/reload")
     # Certificate verification stands except in the one case where it cannot
@@ -1326,12 +1353,12 @@ def reload(ctx: click.Context) -> None:
     # failure there is worth hearing about rather than skipping past.
     verify = config.gateway.host not in _WILDCARD_BINDS
     # A token when there is a secret to sign one with, and otherwise none: an
-    # unlocked gateway with no auth.jwt_secret does not ask for one (require_auth
-    # runs open there), so an empty secret is not a reason to refuse to call. The
-    # operator hand-editing config on a dev box is the likeliest caller of all.
+    # unlocked gateway that has no secret anywhere yet does not ask for one
+    # (require_auth runs open there), so an empty secret is not a reason to
+    # refuse to call.
     headers = {}
-    if config.auth.jwt_secret:
-        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
+    if secret:
+        headers["Authorization"] = f"Bearer {create_token(secret)}"
     try:
         resp = httpx.post(
             url,
@@ -1636,9 +1663,10 @@ def codex_token(ctx: click.Context, hours: int) -> None:
     """
     from nerve.gateway.auth import create_external_mcp_token
 
-    secret = ctx.obj["config"].auth.jwt_secret
+    secret = _signing_secret(ctx.obj["config"])
     if not secret:
-        # Development mode bypasses MCP auth. An empty value is intentional.
+        # No secret anywhere yet (the daemon has never started): the MCP
+        # endpoint runs open until it has. An empty value is intentional.
         return
     click.echo(create_external_mcp_token(secret, ttl_seconds=hours * 60 * 60))
 
@@ -2430,10 +2458,11 @@ def _gateway_request(
     scheme = "https" if config.gateway.ssl.enabled else "http"
     url = f"{scheme}://127.0.0.1:{config.gateway.port}{path}"
     headers = {}
-    if config.auth.jwt_secret:
+    secret = _signing_secret(config)
+    if secret:
         from nerve.gateway.auth import create_token
 
-        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
+        headers["Authorization"] = f"Bearer {create_token(secret)}"
     try:
         # verify=False: gateway.ssl is normally a local self-signed cert,
         # and this call only ever targets loopback.

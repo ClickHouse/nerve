@@ -1,6 +1,14 @@
 """JWT authentication for the gateway.
 
-Single-user system: password-only login, JWT tokens, bcrypt hashing.
+Password login, HS256 session tokens, bcrypt hashing.
+
+**The signing secret.** Tokens are signed with :func:`effective_jwt_secret`:
+``auth.jwt_secret`` when configuration supplies one, otherwise the secret the
+identity bootstrap generated on first start and keeps in the database
+(``instance_secrets``). Every consumer — this module, the login route, the
+external MCP endpoint, the CLI — must go through that function rather than
+read ``config.auth.jwt_secret`` directly, or an install without a configured
+secret would sign in one place and verify against nothing in another.
 """
 
 from __future__ import annotations
@@ -13,7 +21,7 @@ import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, WebSocket
 
-from nerve.config import get_config
+from nerve.config import NerveConfig, get_config
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +64,38 @@ def session_expiry_hours() -> int:
     except Exception:  # config unreadable (very early boot / tests)
         hours = DEFAULT_JWT_EXPIRY_HOURS
     return max(1, hours)
+
+
+# The signing secret in force when configuration supplies none: generated once
+# by the identity bootstrap (nerve.migrate.bootstrap_identity) and kept in the
+# database, never written into the operator's config files. Held here rather
+# than on the config object so a config reload — which rebuilds that object
+# from disk, where the secret deliberately is not — cannot drop it mid-flight.
+_stored_jwt_secret: str = ""
+
+
+def set_stored_jwt_secret(secret: str) -> None:
+    """Publish the database-held signing secret to this process."""
+    global _stored_jwt_secret
+    _stored_jwt_secret = secret or ""
+
+
+def stored_jwt_secret() -> str:
+    """The database-held signing secret published to this process, or ``""``."""
+    return _stored_jwt_secret
+
+
+def effective_jwt_secret(config: NerveConfig | None = None) -> str:
+    """The secret tokens are signed and verified with.
+
+    ``auth.jwt_secret`` from configuration when set — so an upgrade keeps every
+    live session — else the one the bootstrap stored in the database. Empty
+    only before the bootstrap has run (and in tests that never run it): once
+    it has, an install always has a secret, which is what closed the hole
+    where an empty ``auth.jwt_secret`` left the instance open.
+    """
+    cfg = config if config is not None else get_config()
+    return cfg.auth.jwt_secret or _stored_jwt_secret
 
 
 def create_token(jwt_secret: str, expiry_hours: int | None = None) -> str:
@@ -194,24 +234,29 @@ def get_token_from_request(request: Request) -> str:
 async def require_auth(request: Request) -> dict:
     """FastAPI dependency: require valid authentication."""
     config = get_config()
-    if not config.auth.jwt_secret:
+    secret = effective_jwt_secret(config)
+    if not secret:
         if config.lockdown:
             # Fail closed: a locked instance must never fall into the open
-            # dev-mode bypass just because its jwt_secret wasn't supplied via env.
+            # bypass just because no signing secret exists yet.
             raise HTTPException(
                 status_code=503,
-                detail="Locked instance has no auth.jwt_secret (set it via "
-                "${ENV_VAR} in settings.yaml or the environment).",
+                detail="Locked instance has no signing secret yet (set "
+                "auth.jwt_secret via ${ENV_VAR} in settings.yaml or the "
+                "environment, or let the first start generate one).",
             )
-        # Auth not configured — allow access (development mode)
+        # No signing secret anywhere. Unreachable once the identity bootstrap
+        # has run at startup — it generates one when configuration has none —
+        # so this is the pre-bootstrap / test-harness path, not a mode an
+        # install can be in.
         return {"sub": "user"}
 
     token = get_token_from_request(request)
-    payload = decode_token(token, config.auth.jwt_secret)
+    payload = decode_token(token, secret)
     # Slide the session forward. Stashed on request.state rather than returned
     # so every existing caller of this dependency is unaffected; the gateway's
     # http middleware picks it up and emits SESSION_TOKEN_HEADER.
-    refreshed = maybe_refresh_token(payload, config.auth.jwt_secret)
+    refreshed = maybe_refresh_token(payload, secret)
     if refreshed:
         request.state.refreshed_token = refreshed
     return payload
@@ -224,16 +269,17 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     Returns True if authenticated, False otherwise.
     """
     config = get_config()
-    if not config.auth.jwt_secret:
+    secret = effective_jwt_secret(config)
+    if not secret:
         if config.lockdown:
             return False  # Fail closed under lockdown — never open the socket
-        return True  # Dev mode
+        return True  # No secret yet: pre-bootstrap / tests only (see require_auth)
 
     # Check query parameter
     token = websocket.query_params.get("token")
     if token:
         try:
-            decode_token(token, config.auth.jwt_secret)
+            decode_token(token, secret)
             return True
         except HTTPException:
             return False
@@ -242,7 +288,7 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     token = websocket.cookies.get("nerve_token")
     if token:
         try:
-            decode_token(token, config.auth.jwt_secret)
+            decode_token(token, secret)
             return True
         except HTTPException:
             return False
