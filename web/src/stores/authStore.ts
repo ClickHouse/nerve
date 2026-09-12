@@ -3,6 +3,7 @@ import {
   api, setToken, clearToken, getToken, setUnauthorizedHandler,
   type LoginKind,
 } from '../api/client';
+import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
@@ -78,6 +79,11 @@ export const useAuthStore = create<AuthState>((set) => ({
     // take your unsent work with it.
     clearAllDrafts();
     clearAllReads();
+    // Display names are read fresh per app session, and a deliberate logout
+    // ends one. Not a secrecy measure — the next person to sign in can read
+    // /api/actors too — but a map that outlives the session that fetched it is
+    // a cache, and the whole point of this one is that it is not.
+    useActorStore.getState().reset();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
     set({ authenticated: false, sessionExpired: false });
   },
