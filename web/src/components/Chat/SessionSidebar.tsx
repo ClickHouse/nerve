@@ -5,6 +5,8 @@ import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
+import { useVisibleActorIds } from '../../stores/actorStore';
+import { SessionCreatorMarker } from './ActorLabel';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
 import { forkChat } from '../../utils/forkChat';
@@ -103,6 +105,21 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
+
+  // Which session creators this list names. Same rule as the transcript: the
+  // agent's own principal always earns a marker, a person earns one once a
+  // second person has started something here. A one-person sidebar shows
+  // nothing new, which is what an install with one account must keep looking
+  // like. Computed over every list rendered through SessionItem — the feed, the
+  // search results and the archived group — so a row does not gain or lose its
+  // marker depending on which of them it is showing in. The System group is
+  // excluded: its rows are not SessionItems and already carry the agent glyph.
+  const creatorIds = useMemo(() => [
+    ...sessions.map(s => s.created_by_actor_id),
+    ...(searchResults ?? []).map(s => s.created_by_actor_id),
+    ...(archivedSessions ?? []).map(s => s.created_by_actor_id),
+  ], [sessions, searchResults, archivedSessions]);
+  const namedCreators = useVisibleActorIds(creatorIds);
 
   // In drawer mode the list is a modal overlay: it needs focus, Tab
   // containment, Escape, and focus restoration. Declared before the search
@@ -375,6 +392,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       onArchive={archiveSession}
       onRemoveParent={handleRemoveParent}
       onSelect={handleSelect}
+      namedCreators={namedCreators}
     />
   );
 
@@ -557,6 +575,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                       onToggleStar={toggleStar}
                       onArchive={archiveSession}
                       onSelect={handleSelect}
+                      namedCreators={namedCreators}
                       showDate
                     />
                   ))
@@ -778,6 +797,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                         onUnarchive={unarchiveSession}
                         onStarArchived={starArchivedSession}
                         onSelect={handleSelect}
+                        namedCreators={namedCreators}
                         archived
                         showDate
                       />
@@ -964,6 +984,7 @@ function SessionTree({
   session, depth, childrenByParent, expandedParents, onToggleExpand,
   activeSession, activeIsRunning, dnd,
   onDelete, onRename, onToggleStar, onArchive, onRemoveParent, onSelect,
+  namedCreators,
 }: {
   session: Session;
   depth: number;
@@ -979,6 +1000,8 @@ function SessionTree({
   onArchive: (id: string) => Promise<void>;
   onRemoveParent: (id: string) => void;
   onSelect?: () => void;
+  /** Creator actor ids worth naming on a row — see SessionSidebar. */
+  namedCreators: Set<string>;
 }) {
   const kids = childrenByParent.get(session.id);
   const hasChildren = !!kids && kids.length > 0;
@@ -1001,6 +1024,7 @@ function SessionTree({
         onArchive={onArchive}
         onRemoveParent={onRemoveParent}
         onSelect={onSelect}
+        namedCreators={namedCreators}
         draggable
         dnd={dnd}
       />
@@ -1021,6 +1045,7 @@ function SessionTree({
           onArchive={onArchive}
           onRemoveParent={onRemoveParent}
           onSelect={onSelect}
+          namedCreators={namedCreators}
         />
       ))}
     </>
@@ -1029,7 +1054,7 @@ function SessionTree({
 
 
 function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate, showUnread = false,
-  depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd }: {
+  depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd, namedCreators }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
@@ -1057,6 +1082,10 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Drag-to-nest: only feed rows are draggable; search/archived rows aren't. */
   draggable?: boolean;
   dnd?: RowDnd;
+  /** Creator actor ids worth naming — see SessionSidebar. Absent (the rename
+      row, and any future call site that has no list around it) means no
+      marker, which is the same as a session with no recorded creator. */
+  namedCreators?: Set<string>;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -1173,6 +1202,13 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       <div className="flex-1 min-w-0">
         <div className={`truncate text-xs leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
       </div>
+
+      {/* Who started it, when that tells two rows apart. A session nobody was
+          recorded for — all history, and everything on a single-account
+          install — renders no marker at all. */}
+      {session.created_by_actor_id && namedCreators?.has(session.created_by_actor_id) && (
+        <SessionCreatorMarker actorId={session.created_by_actor_id} />
+      )}
 
       {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
       {hasChildren && !expanded && childCount > 0 && (
