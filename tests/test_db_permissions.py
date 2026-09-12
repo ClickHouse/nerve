@@ -536,6 +536,54 @@ class TestRotationReachesThePin:
             await db.close()
 
 
+@pytest.mark.asyncio
+class TestAFailedConnectLeavesNothingOpen:
+    """F32: ``aiosqlite.connect`` starts a non-daemon thread. Anything that
+    fails after it — a migration, the permission backstop, a cancellation — has
+    to close the connection, or the caller gets an exception *and* a thread
+    that keeps the process alive, with a retry opening another one."""
+
+    async def test_a_failed_migration_closes_the_connection(self, tmp_path, monkeypatch):
+        import asyncio
+        import threading
+
+        db_path = tmp_path / "state" / "nerve.db"
+        before = threading.active_count()
+
+        async def boom(_conn):
+            raise sqlite3.OperationalError("migration exploded")
+
+        monkeypatch.setattr(base, "run_migrations", boom)
+        db = Database(db_path)
+        with pytest.raises(sqlite3.OperationalError, match="migration exploded"):
+            await db.connect()
+
+        assert db._db is None
+        for _ in range(50):  # the connection thread exits once it is closed
+            if threading.active_count() <= before:
+                break
+            await asyncio.sleep(0.02)
+        assert threading.active_count() <= before
+
+    async def test_the_global_is_not_published_by_a_failed_open(
+        self, tmp_path, monkeypatch,
+    ):
+        """``init_db`` used to assign the global first, so a refused open left
+        ``get_db()`` handing out a database nobody can use."""
+        import nerve.db as db_pkg
+
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o666)  # the state-file policy refuses this
+        monkeypatch.setattr(db_pkg, "_db", None)
+
+        with pytest.raises(InsecureStateStorage):
+            await init_db(db_path)
+        assert db_pkg._db is None
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await db_pkg.get_db()
+
+
 def test_the_round2_exception_name_still_resolves():
     assert InsecureSecretStorage is InsecureStateStorage
     assert InsecureStateStorage is base.InsecureStateStorage

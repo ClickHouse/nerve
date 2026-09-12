@@ -30,12 +30,18 @@ async def init_db(db_path: Path | None = None, workspace: Path | None = None) ->
         db_path: Path to the SQLite file. Defaults to ``~/.nerve/nerve.db``.
         workspace: Workspace root for resolving task file paths during FTS
             reseed. When omitted, the DB falls back to the DB's parent dir.
+
+    The global is published only once the database is open and migrated.
+    Assigning it first meant a ``connect()`` that refused — the state-file
+    policy does refuse — or a migration that failed left the global pointing at
+    a database nobody can use, and ``get_db()`` handing it out.
     """
     global _db
     if db_path is None:
         db_path = paths.db_path()
-    _db = Database(db_path, workspace=workspace)
-    await _db.connect()
+    db = Database(db_path, workspace=workspace)
+    await db.connect()
+    _db = db
     return _db
 
 

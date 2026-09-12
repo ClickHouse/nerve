@@ -366,37 +366,55 @@ class Database(
             # with no window in which the file is wider than intended.
             self.db_path.touch(mode=_DB_FILE_MODE)
         self._db = await aiosqlite.connect(str(self.db_path))
-        self._db.row_factory = aiosqlite.Row
-        # Apply pragmas BEFORE migrations so the migration writes also run under
-        # the tuned busy_timeout/synchronous settings and contend politely.
-        await self._apply_pragmas()
-        # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
-        # already existed from an earlier, wider run keeps its old mode until
-        # this pass tightens it. Its verdict is what the bootstrap reads.
-        self.state_permissions = _repair_state_permissions(self.db_path)
-        if self.state_permissions.writable or self.state_permissions.uninspectable:
-            # Not reachable for anything the pre-open inspection saw; a sidecar
-            # SQLite just created inherits the main file's 0600. Kept as the
-            # backstop for whatever else a filesystem might do.
-            perms = self.state_permissions
-            await self._db.close()
-            self._db = None
-            raise InsecureStateStorage(_refusal_message(self.db_path, perms))
-        exposed = pre.exposed_before_repair or self.state_permissions.exposed_before_repair
-        if self.state_permissions.readable:
-            logger.error(
-                "Database files are readable by other users and could not be "
-                "tightened: %s (expected %04o). No signing secret will be kept in "
-                "this database; the bootstrap refuses unless auth.jwt_secret is "
-                "configured.",
-                "; ".join(self.state_permissions.readable_hazards), _DB_FILE_MODE,
+        # The connection now exists, and aiosqlite keeps a live non-daemon
+        # thread behind it, so *every* failure below has to close it: a
+        # migration that raised used to leave both in place — the caller sees
+        # the exception, the thread goes on holding the process open, and a
+        # retry opens a second one. BaseException, so a cancellation partway
+        # through cleans up too.
+        try:
+            self._db.row_factory = aiosqlite.Row
+            # Apply pragmas BEFORE migrations so the migration writes also run
+            # under the tuned busy_timeout/synchronous settings and contend
+            # politely.
+            await self._apply_pragmas()
+            # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
+            # already existed from an earlier, wider run keeps its old mode until
+            # this pass tightens it. Its verdict is what the bootstrap reads.
+            self.state_permissions = _repair_state_permissions(self.db_path)
+            if self.state_permissions.writable or self.state_permissions.uninspectable:
+                # Not reachable for anything the pre-open inspection saw; a
+                # sidecar SQLite just created inherits the main file's 0600.
+                # Kept as the backstop for whatever else a filesystem might do.
+                raise InsecureStateStorage(
+                    _refusal_message(self.db_path, self.state_permissions)
+                )
+            exposed = (
+                pre.exposed_before_repair or self.state_permissions.exposed_before_repair
             )
-        await run_migrations(self._db)
-        # After migrations (the table exists) and after repair: a key that was
-        # readable by other users is compromised and must not be reused.
-        if exposed:
-            await self._rotate_exposed_signing_secret()
-        await self._check_fts_integrity()
+            if self.state_permissions.readable:
+                logger.error(
+                    "Database files are readable by other users and could not be "
+                    "tightened: %s (expected %04o). No signing secret will be kept in "
+                    "this database; the bootstrap refuses unless auth.jwt_secret is "
+                    "configured.",
+                    "; ".join(self.state_permissions.readable_hazards), _DB_FILE_MODE,
+                )
+            await run_migrations(self._db)
+            # After migrations (the table exists) and after repair: a key that was
+            # readable by other users is compromised and must not be reused.
+            if exposed:
+                await self._rotate_exposed_signing_secret()
+            await self._check_fts_integrity()
+        except BaseException:
+            db, self._db = self._db, None
+            try:
+                await db.close()
+            except Exception as e:  # noqa: BLE001 — never mask the real failure
+                logger.warning(
+                    "Closing %s after a failed connect raised: %s", self.db_path, e,
+                )
+            raise
 
     async def _rotate_exposed_signing_secret(self) -> None:
         """Retire a database-held signing secret that was readable by other

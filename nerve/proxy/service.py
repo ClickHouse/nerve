@@ -234,8 +234,17 @@ class ProxyService:
             self._process.pid, self.config.proxy.port,
         )
 
-        # Wait for the proxy to become healthy.
-        healthy = await self._wait_for_healthy(timeout=15)
+        # The subprocess exists from here on, in its own process group, so
+        # anything that goes wrong below must stop it — including a
+        # cancellation that arrives while the health poll is waiting. Without
+        # this, a caller that registers its cleanup only *after* start()
+        # returns never learns the process is there, and it outlives the daemon
+        # holding the port.
+        try:
+            healthy = await self._wait_for_healthy(timeout=15)
+        except BaseException:
+            await self.stop()
+            raise
         if not healthy:
             await self.stop()
             raise RuntimeError(

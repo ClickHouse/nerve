@@ -16,6 +16,7 @@ Two guarantees are pinned here:
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -140,6 +141,55 @@ async def test_a_failure_after_the_proxy_stops_it_again(harness, monkeypatch):
     assert harness["proxy"].starts == 1 and harness["proxy"].stops == 1
     assert harness["closed"] == ["db"]  # the database was closed too
     assert harness["engine"].shutdown.await_count == 0  # it never came up
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_the_proxy_is_starting_still_stops_it(harness):
+    """F32: the detached process exists from ``create_subprocess_exec``, while
+    ``start()`` is still polling for health. A cancellation there used to
+    escape registration entirely — the cleanup was appended only once start()
+    *returned* — and the subprocess outlived the daemon holding its port."""
+    started = asyncio.Event()
+
+    async def start_then_hang():
+        harness["proxy"].starts += 1
+        started.set()
+        await asyncio.Event().wait()  # the health poll that never completes
+
+    harness["proxy"].start = start_then_hang
+
+    async def _run():
+        async with harness["server"].lifespan(MagicMock()):
+            pass  # pragma: no cover
+
+    task = asyncio.create_task(_run())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert harness["proxy"].starts == 1 and harness["proxy"].stops == 1
+    assert harness["closed"] == ["db"]
+
+
+@pytest.mark.asyncio
+async def test_one_cancelled_cleanup_does_not_abandon_the_rest(harness, monkeypatch):
+    """The unwind catches ``BaseException`` per resource: a stop that is itself
+    cancelled must not leave the ones registered before it running."""
+    harness["engine"].initialize.side_effect = RuntimeError("engine exploded")
+
+    async def cancelled_stop():
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(harness["proxy"], "stop", cancelled_stop)
+
+    with pytest.raises(RuntimeError, match="engine exploded"):
+        async with harness["server"].lifespan(MagicMock()):
+            pass  # pragma: no cover
+
+    # The proxy's stop blew up, and the database — registered before it — was
+    # still closed.
+    assert harness["closed"] == ["db"]
 
 
 @pytest.mark.asyncio

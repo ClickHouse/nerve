@@ -249,13 +249,18 @@ async def lifespan(app: FastAPI):
     startup_cleanups: list[tuple[str, Callable[[], Any]]] = []
 
     async def _unwind_startup() -> None:
+        # Every cleanup runs, whatever the previous one did. ``BaseException``
+        # rather than ``Exception`` because this often runs *during* a
+        # cancellation: a CancelledError from one stop must not abandon the
+        # ones after it — which, with the proxy registered first, would be
+        # exactly the leak this exists to prevent.
         for label, stop in reversed(startup_cleanups):
             try:
                 result = stop()
                 if inspect.isawaitable(result):
                     await result
-            except Exception as e:
-                logger.warning("Startup unwind: stopping %s raised: %s", label, e)
+            except BaseException as e:  # noqa: BLE001 — one bad stop, not all of them
+                logger.warning("Startup unwind: stopping %s raised: %r", label, e)
 
     try:
         # The database first: it is the step most likely to refuse (insecure
@@ -284,9 +289,16 @@ async def lifespan(app: FastAPI):
         if config.proxy.enabled:
             from nerve.proxy.service import ProxyService
             proxy_service = ProxyService(config)
+            # Registered *before* the await: start() creates the detached
+            # subprocess and then polls for health, so a cancellation in
+            # between would otherwise leave a process nothing is tracking.
+            # ``stop()`` is a no-op when there is no process, so registering
+            # early costs nothing if it never starts. (start() also stops its
+            # own process on failure — belt and braces, for callers that do not
+            # register anything.)
+            startup_cleanups.append(("CLIProxyAPI proxy", proxy_service.stop))
             try:
                 await proxy_service.start()
-                startup_cleanups.append(("CLIProxyAPI proxy", proxy_service.stop))
                 logger.info("CLIProxyAPI proxy started on port %d", config.proxy.port)
             except Exception as e:
                 logger.error("CLIProxyAPI proxy failed to start: %s", e)
