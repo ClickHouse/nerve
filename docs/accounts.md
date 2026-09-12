@@ -100,6 +100,58 @@ private, loopback-bound install and a real exposure on anything else: Nerve does
 **not** change the bind address or refuse to start over it. Set a password
 before exposing the gateway beyond the machine.
 
+## Sessions and the actor on the request
+
+A signature proves a token was minted by this instance. It does not say who is
+holding it. So every token says what it is in a `typ` claim, and **every
+authenticated request resolves that against the database, on the request
+itself**:
+
+| Token | `sub` | `typ` | Acts as |
+|---|---|---|---|
+| a login session | the account's id | `session` | that account's actor |
+| the instance's own calls — `nerve reload`, starting or stopping a session from the CLI, the agent calling its own API | `agent-system` | `system` | the agent's system principal |
+| MCP credentials: backend agent subprocesses, their Ultracode workers, and `nerve codex token` | — | `system`, with `aud: nerve-mcp` | the agent's system principal |
+
+Tokens are opaque to the browser; the claims above are an implementation
+detail and will change again.
+
+Two consequences worth knowing:
+
+- **Disabling an account takes effect at its next request, not retroactively.**
+  A token issued before the change is still signed and unexpired, so the
+  account row is the only thing that can stop it — and it does, at every door:
+  HTTP, a new WebSocket, and the MCP endpoint.
+- **A WebSocket's identity is fixed when it connects.** A socket stays open for
+  hours, and re-reading identity mid-stream would attribute a message sent now
+  differently from one sent a minute ago. Disabling, renaming or adding an
+  account leaves open sockets exactly as they were and applies to the next
+  connection.
+
+Autonomous work — cron jobs, channel traffic, background agents, and the
+instance talking to itself — acts as the **system principal** rather than as
+whoever happens to have an account. That keeps "the agent did this" and "a
+person asked for this" apart, and keeps it true after an account is renamed or
+removed.
+
+### Sessions that predate this version
+
+Browsers hold 30-day session tokens issued before accounts existed. They name
+no account, so they cannot say who they are — but they still verify, and
+logging every open tab out on upgrade would be a poor trade. So:
+
+- with **exactly one account**, such a token resolves to that account, and the
+  reply carries a proper per-account token in the `X-Nerve-Token` header, which
+  the browser stores. One request per tab and the old shape is gone;
+- with **two or more accounts** it is refused (`401`) rather than resolved to
+  whichever account sorts first: it names nobody in particular, and a guess
+  would file one person's work under another's name. In practice the install
+  that creates its second account makes its old tabs log in again at that
+  moment, which is correct and explainable.
+
+The acceptance is temporary and is removed in a later release. Nothing mints
+that shape any more.
+
 ## The signing secret
 
 Session tokens are signed with `auth.jwt_secret` when it is configured. When it
