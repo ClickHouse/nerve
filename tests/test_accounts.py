@@ -40,8 +40,16 @@ async def _tables(db: Database) -> set[str]:
 
 @pytest.mark.asyncio
 class TestSchema:
-    async def test_v047_is_the_schema_head(self, db: Database):
-        assert SCHEMA_VERSION == 47
+    async def test_accounts_migration_is_applied_by_the_schema_head(self, db: Database):
+        """Derived from the module name rather than pinned: the file number is
+        expected to be renumbered when this lands after other migrations, and
+        later migrations will move the head past it."""
+        from nerve.db.migrations import v047_accounts
+
+        number = int(v047_accounts.__name__.rsplit(".", 1)[1].split("_", 1)[0][1:])
+        assert number <= SCHEMA_VERSION
+        async with db.db.execute("SELECT MAX(version) FROM schema_version") as cur:
+            assert (await cur.fetchone())[0] >= number
 
     async def test_tables_exist_and_start_empty(self, db: Database):
         present = await _tables(db)
