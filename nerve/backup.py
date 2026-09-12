@@ -5,8 +5,10 @@ Produces a single portable bundle — ``nerve-backup-<host>-<ts>.tar.zst``
 snapshot of everything that makes a Nerve instance *this* instance:
 
 - ``nerve.db``   — sessions, messages, tasks index, notifications, plans, usage,
-  accounts and actor identity. ``--no-secrets`` empties its
-  ``instance_secrets`` table (the generated JWT signing secret) in the snapshot.
+  accounts and actor identity. ``--no-secrets`` empties its two credentials in
+  the snapshot: the JWT signing secret in ``instance_secrets`` and each
+  account's password hash in ``accounts.credential``
+  (see :func:`_scrub_snapshot_secrets`).
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -80,8 +82,9 @@ STATE_FILES: tuple[str, ...] = (
 )
 
 # Secret members (relative to the bundle root) — omitted with --no-secrets
-# and re-chmod'd to 0600 on restore. The JWT signing secret inside nerve.db is
-# removed by :func:`_scrub_instance_secrets`.
+# and re-chmod'd to 0600 on restore. The JWT signing secret and the account
+# password hashes are rows inside nerve.db; :func:`_scrub_snapshot_secrets`
+# removes them.
 SECRET_MEMBERS: frozenset[str] = frozenset({
     "state/certs",
     "state/mcp-token",
@@ -363,9 +366,76 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
         conn.close()
 
 
+def _scrub_account_credentials(snapshot: Path) -> None:
+    """Empty ``accounts.credential`` in a *snapshot* copy of nerve.db.
+
+    Every account's password lives on its row from this release on (the startup
+    migration off ``credential_source = 'config'``), so a bundle that carries
+    ``nerve.db`` carries the password hashes with it. ``--no-secrets`` promises
+    it does not.
+
+    The row's ``credential_source`` moves to ``none`` in the same statement,
+    because the schema refuses a ``local`` account with no credential — and
+    because it is the truth about the scrubbed row. The restored instance is
+    therefore passwordless in the same way a ``--no-secrets`` restore already
+    left it: the bundle omits ``config.local.yaml`` too, so ``auth.password_hash``
+    does not come back either. With one account that is the ordinary
+    passwordless state; with two or more, nobody can log in until a password is
+    configured or a bundle *with* secrets is restored — which is the honest
+    consequence of restoring a backup that deliberately carries no credential.
+
+    Edits the snapshot after it is taken and before it is checksummed; the live
+    database is never touched. ``secure_delete`` makes SQLite overwrite the
+    freed pages rather than merely unlink them. A snapshot from before the table
+    existed is left alone.
+    """
+    conn = _connect(snapshot)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+        ).fetchone()
+        if not exists:
+            return
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.execute(
+            "UPDATE accounts SET credential = NULL, credential_source = 'none' "
+            "WHERE credential IS NOT NULL"
+        )
+        conn.commit()
+        left = conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE credential IS NOT NULL"
+        ).fetchone()[0]
+        if left:  # pragma: no cover - an UPDATE that reported success and did not
+            raise BackupError(
+                f"could not scrub account credentials from {snapshot}: "
+                f"{left} row(s) still carry one"
+            )
+    finally:
+        conn.close()
+
+
+def _scrub_snapshot_secrets(snapshot: Path) -> None:
+    """Take every credential out of a ``--no-secrets`` snapshot of nerve.db.
+
+    One call site, two credentials: the signing secret and the account password
+    hashes. Anything added to the database that is a credential belongs here as
+    well — ``--no-secrets`` is a promise about the bundle, not about one table.
+    """
+    _scrub_instance_secrets(snapshot)
+    _scrub_account_credentials(snapshot)
+
+
 def _mode_is_private(st_mode: int) -> bool:
     """True when no group/world bit is set on a stat mode."""
     return (stat.S_IMODE(st_mode) & 0o077) == 0
+
+
+def _scrub_db_credentials(db_file: Path) -> None:
+    """Take every credential out of a database file that could not be made
+    private, and verify. The restore fails either way; this is about what is
+    left on disk when it does."""
+    _scrub_db_secret(db_file)
+    _scrub_account_credentials(db_file)
 
 
 def _scrub_db_secret(db_file: Path) -> None:
@@ -644,14 +714,16 @@ def _secure_install_file(
 def _secure_install_db(src: Path, dst: Path) -> None:
     """Install the restored ``nerve.db`` through :func:`_secure_install_file`.
 
-    If the installed file reads back wide, :func:`_scrub_db_secret` removes the
-    signing secret from it, and the restore still fails.
+    If the installed file reads back wide, :func:`_scrub_db_credentials` removes
+    the signing secret and the password hashes from it, and the restore still
+    fails.
     """
     _secure_install_file(
-        src, dst, what="Restore", last_resort=_scrub_db_secret,
+        src, dst, what="Restore", last_resort=_scrub_db_credentials,
         exposed_detail=(
-            " The stored JWT signing secret was scrubbed from it so no usable key "
-            "is exposed, but the accounts and history remain readable."
+            " The stored JWT signing secret and the account password hashes were "
+            "scrubbed from it so no usable credential is exposed, but the "
+            "accounts and history remain readable."
         ),
     )
 
@@ -933,7 +1005,7 @@ def create_backup(
                 _verify_still_the_created_file(stage_fd, stage, "Backup")
                 _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
                 if db_name == "nerve.db" and not include_secrets:
-                    _scrub_instance_secrets(snapshot)
+                    _scrub_snapshot_secrets(snapshot)
                     _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
             else:
                 logger.warning("state DB missing, skipping: %s", src)
