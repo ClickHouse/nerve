@@ -26,7 +26,7 @@ web/src/
 │   ├── taskStore.ts    # Task list/detail state (Zustand)
 │   └── skillsStore.ts  # Skills CRUD + usage stats (Zustand)
 ├── components/
-│   ├── Auth/           # Login page
+│   ├── Auth/           # Login page and session-expired overlay
 │   ├── Chat/           # Message list, input, session sidebar, diff viewer
 │   │   ├── tools/      # Specialized tool call renderers
 │   │   ├── FileChangesPanel.tsx  # Modified files list + detail navigation
@@ -110,6 +110,22 @@ Generic tabbed panel that replaces the old plan-only preview panel. Auto-opens w
 - **Keyboard shortcut** — `Cmd/Ctrl + \` toggles panel visibility.
 - **Animated** — Panel slides in/out with a 200ms width transition matching the sidebar animation.
 - **Selection comments** — Select text in plan content to add/remove/improve/ask/note, same as in chat messages.
+
+### Accounts
+
+`/accounts` — the local accounts: username, display name, whether each is
+enabled and whether it has a password. Add someone, rename, disable and
+re-enable, and change your own password.
+
+Every account can do all of that to every other account; there are no roles, so
+adding a person gives them the power to disable you. The only thing the server
+refuses is disabling the last enabled account. Two more refusals apply until the
+first account has both a password and a username, which is what has to be true
+before a second account can exist — the page shows the reason rather than
+guessing at it.
+
+`/setup` is where an instance that has never been set up opens instead of the
+chat: one account, no password, no username. It is skippable and points here.
 
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
