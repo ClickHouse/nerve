@@ -434,27 +434,52 @@ def _secure_directory(path: Path) -> None:
         )
 
 
-def _secure_create(path: Path, what: str, *, detail: str = "nothing was copied") -> int:
-    """Create ``path`` owner-only and return the open descriptor.
+def _exclusive_create(path: Path, what: str) -> tuple[int, bool]:
+    """Create ``path`` as a brand-new file of our own and return ``(fd, private)``.
 
-    ``O_CREAT|O_EXCL`` with mode ``0600``, then the mode is read back *through
-    the descriptor* — so a filesystem that accepted the mode and ignored it is
-    caught while the file is still empty. On failure nothing has been written
-    and no file is left behind. Raises :class:`BackupError`.
+    ``O_CREAT|O_EXCL|O_NOFOLLOW`` at mode ``0600``: the file cannot already
+    exist, so a symlink planted at that name makes the *create* fail rather
+    than being followed to somebody else's file. ``private`` is the mode read
+    back through the descriptor — ``False`` means the filesystem did not honour
+    the mode, which is for the caller to judge; what is never negotiable is
+    that the bytes go to this descriptor and to nothing else.
+
+    A failure to create at all raises :class:`BackupError`: without a
+    descriptor there is no safe way to write the file.
     """
     path.unlink(missing_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
     try:
-        if not _mode_is_private(os.fstat(fd).st_mode):
-            raise BackupError(
-                f"{what}: could not create {path} owner-only (the filesystem ignored "
-                f"mode {SECRET_FILE_MODE:04o}); {detail}. Fix the filesystem "
-                f"or choose a directory that supports Unix modes."
-            )
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            SECRET_FILE_MODE,
+        )
+    except OSError as e:
+        raise BackupError(f"{what}: cannot create {path}: {e}") from e
+    try:
+        return fd, _mode_is_private(os.fstat(fd).st_mode)
     except BaseException:
         os.close(fd)
         path.unlink(missing_ok=True)
         raise
+
+
+def _secure_create(path: Path, what: str, *, detail: str = "nothing was copied") -> int:
+    """:func:`_exclusive_create`, refusing anything but an owner-only result.
+
+    The mode is read back *through the descriptor*, so a filesystem that
+    accepted ``0600`` and ignored it is caught while the file is still empty;
+    on failure nothing has been written and no file is left behind.
+    """
+    fd, private = _exclusive_create(path, what)
+    if not private:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+        raise BackupError(
+            f"{what}: could not create {path} owner-only (the filesystem ignored "
+            f"mode {SECRET_FILE_MODE:04o}); {detail}. Fix the filesystem "
+            f"or choose a directory that supports Unix modes."
+        )
     return fd
 
 
@@ -466,7 +491,46 @@ def _is_group_world_writable(path: Path) -> bool:
         return False
 
 
-def _stage_parent(nerve_dir: Path) -> Path | None:
+def _unsafe_stage_reason(path: Path) -> str | None:
+    """Why ``path`` may not hold a staging directory, or ``None`` if it may.
+
+    The question is who can rename or replace an entry in it — that is what
+    turns "the snapshot went into my 0700 directory" into "the snapshot went
+    into theirs". Every component of the *canonical* path is judged, because a
+    directory anyone can write to anywhere above the parent can be swapped for
+    one pointing elsewhere; resolving first also means no symlink in the chain
+    is still a symlink by the time it is checked.
+
+    A component passes when it is a directory owned by this user or by root —
+    the owner of a directory may rename its children whatever its mode says,
+    which is why the sticky bit is necessary but not sufficient — and is either
+    not group/world-writable or sticky (``/tmp``'s ``1777``: writable by all,
+    but only the owner of an entry may rename it).
+    """
+    euid = os.geteuid()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as e:
+        return f"{path} cannot be resolved ({e})"
+    for component in [resolved, *resolved.parents]:
+        try:
+            st = os.stat(component, follow_symlinks=False)
+        except OSError as e:
+            return f"{component} cannot be inspected ({e})"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{component} is not a directory"
+        if st.st_uid not in (euid, 0):
+            return (
+                f"{component} is owned by uid {st.st_uid}, who can rename anything "
+                f"inside it regardless of its mode"
+            )
+        mode = stat.S_IMODE(st.st_mode)
+        if (mode & _GROUP_WORLD_WRITE) and not (st.st_mode & stat.S_ISVTX):
+            return f"{component} is {mode:04o}: writable by other users and not sticky"
+    return None
+
+
+def _stage_parent(nerve_dir: Path) -> Path:
     """Where the staging directory goes — somewhere no other user can rename it.
 
     Not the output directory. The caller chooses that, it is routinely a shared
@@ -478,56 +542,41 @@ def _stage_parent(nerve_dir: Path) -> Path | None:
     First choice is the state directory: it already holds those files, it is on
     their filesystem (so a staging copy that does not fit fails where the data
     lives rather than halfway through), and it is owner-only. Failing that, the
-    system temp directory, whose sticky bit means only the owner may rename or
-    remove what is in it. ``None`` means "tempfile's own default", which is
-    that directory.
+    system temp directory — but only when it and its whole canonical ancestry
+    pass :func:`_unsafe_stage_reason`; a sticky ``TMPDIR`` belonging to someone
+    else is exactly the trap that check exists for. The chosen path is returned
+    explicitly (never ``None``, which would let ``mkdtemp`` re-read ``TMPDIR``
+    and pick something this never judged).
     """
-    try:
-        st = os.stat(nerve_dir)
-        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not (
-            stat.S_IMODE(st.st_mode) & _GROUP_WORLD_WRITE
-        ):
-            return nerve_dir
-        logger.info(
-            "Backup: staging in the system temp directory — %s is %04o and "
-            "another user could interfere with a staging directory there.",
-            nerve_dir, stat.S_IMODE(st.st_mode),
-        )
-    except OSError as e:
-        logger.info("Backup: staging in the system temp directory (%s: %s)", nerve_dir, e)
+    reason = _unsafe_stage_reason(nerve_dir) if nerve_dir.is_dir() else f"{nerve_dir} is not a directory"
+    if reason is None and os.stat(nerve_dir).st_uid == os.geteuid():
+        return nerve_dir
+    logger.info("Backup: staging in the system temp directory instead — %s", reason)
 
     temp_dir = Path(tempfile.gettempdir())
-    try:
-        st = os.stat(temp_dir)
-    except OSError as e:
-        raise BackupError(f"Backup: cannot inspect the temp directory {temp_dir}: {e}") from e
-    if (stat.S_IMODE(st.st_mode) & _GROUP_WORLD_WRITE) and not (st.st_mode & stat.S_ISVTX):
+    reason = _unsafe_stage_reason(temp_dir)
+    if reason is not None:
         raise BackupError(
             f"Backup: nowhere safe to stage the snapshot. {nerve_dir} is not usable "
-            f"and {temp_dir} is {stat.S_IMODE(st.st_mode):04o} without the sticky "
-            f"bit, so another user could replace a staging directory there while "
-            f"the database — signing secret included — is being copied into it."
+            f"and neither is the temp directory: {reason}. Another user could "
+            f"replace the staging directory while the database — signing secret "
+            f"included — is being copied into it. Point TMPDIR at a directory you "
+            f"own, or fix the state directory."
         )
-    return None
+    return temp_dir.resolve()
 
 
-def _verify_still_the_created_file(fd: int, path: Path, what: str) -> None:
-    """Prove ``path`` still names the file open on ``fd``, and is still private.
+def _verify_same_file(fd: int, path: Path, what: str) -> None:
+    """Prove ``path`` still names the file open on ``fd``.
 
     Everything here publishes by *name* (``os.replace``), while the bytes went
     to a descriptor. Between the two, another user with write access to the
     directory can unlink the temporary and put a symlink of their own in its
     place — then the rename publishes their file, not ours. Comparing device
     and inode (with ``follow_symlinks=False``, so a symlink is never resolved)
-    closes that window, and the mode is re-read through the descriptor, which
-    no path lookup can be tricked about. Raises :class:`BackupError`.
+    closes that window. Raises :class:`BackupError`.
     """
     st = os.fstat(fd)
-    if not _mode_is_private(st.st_mode):
-        raise BackupError(
-            f"{what}: {path} is no longer owner-only "
-            f"({stat.S_IMODE(st.st_mode):04o}); nothing is published."
-        )
     try:
         current = os.stat(path, follow_symlinks=False)
     except OSError as e:
@@ -537,6 +586,23 @@ def _verify_still_the_created_file(fd: int, path: Path, what: str) -> None:
             f"{what}: {path} was replaced while it was being written; refusing to "
             f"publish it. Nothing was installed."
         )
+
+
+def _verify_still_the_created_file(fd: int, path: Path, what: str) -> None:
+    """:func:`_verify_same_file`, and still owner-only.
+
+    The mode is re-read through the descriptor, which no path lookup can be
+    tricked about. Used wherever what was written is a credential; the identity
+    check alone is used where a wide mode has already been accepted and
+    reported (a ``--no-secrets`` bundle on a filesystem without modes).
+    """
+    st = os.fstat(fd)
+    if not _mode_is_private(st.st_mode):
+        raise BackupError(
+            f"{what}: {path} is no longer owner-only "
+            f"({stat.S_IMODE(st.st_mode):04o}); nothing is published."
+        )
+    _verify_same_file(fd, path, what)
 
 
 def _secure_install_file(
@@ -827,8 +893,13 @@ def create_backup(
     """Create a backup bundle and return a :class:`BackupResult`.
 
     Synchronous (the scheduled task wraps this in ``asyncio.to_thread``).
-    Staging happens on the *output* filesystem so disk-space failures surface
-    on the target, and the final bundle is renamed into place atomically.
+    Staging happens in a directory only this user can write to — the state
+    directory, or the system temp directory when that is unusable (see
+    :func:`_stage_parent`) — because the staged snapshot is the accounts
+    database with the signing secret still in it. The output filesystem is
+    therefore no longer where a staging copy runs out of room: the target sees
+    the bundle streamed into it, and a full target fails there. The bundle
+    itself is created owner-only and renamed into place atomically.
     """
     nerve_dir = Path(nerve_dir).expanduser()
     workspace = Path(workspace).expanduser()
@@ -861,7 +932,9 @@ def create_backup(
     stage = Path(tempfile.mkdtemp(
         prefix=".nerve-backup-stage-", dir=_stage_parent(nerve_dir),
     ))
-    stage_fd = os.open(stage, os.O_RDONLY)
+    # O_NOFOLLOW: if the name is a symlink by the time it is opened, that is
+    # already someone else's directory, not the one mkdtemp made.
+    stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     if not _mode_is_private(os.fstat(stage_fd).st_mode):  # mkdtemp promises 0700
         os.close(stage_fd)
         shutil.rmtree(stage, ignore_errors=True)
@@ -876,33 +949,41 @@ def create_backup(
             "directory anyone can write to is a poor home for backups.", output_dir,
         )
     workspace_bytes = 0
+    # Held open from creation until the archive has been read, so the finally
+    # below can close them whatever happens on the way.
+    snapshot_fds: list[tuple[int, Path]] = []
     try:
+        # Created *relative to the descriptor*, so it cannot land in a
+        # directory that took this one's name; the check right after is what
+        # turns that into a diagnosis instead of a silent detour.
+        os.mkdir("state", mode=_STATE_DIR_MODE, dir_fd=stage_fd)
         state_dir = stage / "state"
-        state_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
         _verify_still_the_created_file(stage_fd, stage, "Backup")
 
         # 1. Consistent DB snapshots. The online-backup API opens the
         # destination by name and would create it at the umask default (0644),
         # holding the accounts and — until the scrub below — the signing
-        # secret. So the file is created 0600 first, through a verified
-        # descriptor, and the mode is confirmed after: the *archived member* is
-        # 0600 and extraction on restore yields an owner-only file with no
-        # readable window.
+        # secret. So the file is created 0600 first, through a descriptor that
+        # is *held open* across the copy, the scrub and the archive read: the
+        # only thing that could redirect those bytes is a swap of the file at
+        # that name, and the descriptor is what proves that did not happen. The
+        # archived member is therefore 0600, and extraction on restore yields
+        # an owner-only file with no readable window.
         for db_name in STATE_DB_FILES:
             src = nerve_dir / db_name
             if src.exists():
                 snapshot = state_dir / db_name
-                os.close(_secure_create(snapshot, "Backup"))
+                snapshot_fd = _secure_create(snapshot, "Backup")
+                snapshot_fds.append((snapshot_fd, snapshot))
                 _snapshot_db(src, snapshot)
+                # SQLite addressed the destination by name, so before anything
+                # else touches it: the directory is still the one that was
+                # verified, and the file in it is still ours and still 0600.
+                _verify_still_the_created_file(stage_fd, stage, "Backup")
+                _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
                 if db_name == "nerve.db" and not include_secrets:
                     _scrub_instance_secrets(snapshot)
-                if not _mode_is_private(os.stat(snapshot).st_mode):
-                    raise BackupError(
-                        f"Backup: {snapshot} is "
-                        f"{stat.S_IMODE(os.stat(snapshot).st_mode):04o} after the "
-                        f"snapshot; refusing to archive a database other users can "
-                        f"read."
-                    )
+                    _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
             else:
                 logger.warning("state DB missing, skipping: %s", src)
 
@@ -928,8 +1009,9 @@ def create_backup(
         if include_secrets and config_dir is not None:
             local_cfg = Path(config_dir).expanduser() / "config.local.yaml"
             if local_cfg.is_file():
+                os.mkdir("config", mode=_STATE_DIR_MODE, dir_fd=stage_fd)
                 cfg_dir = stage / "config"
-                cfg_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
+                _verify_still_the_created_file(stage_fd, stage, "Backup")
                 shutil.copy2(local_cfg, cfg_dir / "config.local.yaml")
 
         # 5. Workspace BRAIN.
@@ -953,9 +1035,11 @@ def create_backup(
 
         # 6. Checksums for every staged file (manifest written last). Before
         # reading any of it back — and before it is archived — confirm the
-        # staging directory is still the one that was created: everything above
-        # addressed it by name.
+        # staging directory, and each snapshot in it, is still the one that was
+        # created: everything above addressed them by name.
         _verify_still_the_created_file(stage_fd, stage, "Backup")
+        for fd, snapshot in snapshot_fds:
+            _verify_still_the_created_file(fd, snapshot, "Backup")
         files_meta: dict[str, dict] = {}
         for p in sorted(stage.rglob("*")):
             if not p.is_file():
@@ -1005,37 +1089,50 @@ def create_backup(
         # to the output directory could otherwise swap the temporary for a
         # symlink and collect the whole bundle. ``os.replace`` keeps the mode.
         tmp_bundle = output_dir / (final_name + ".tmp")
-        fd: int | None = None
-        try:
-            fd = _secure_create(tmp_bundle, "Backup", detail="nothing was written")
-        except BackupError:
+        # There is no path here without a descriptor. Exclusive creation is the
+        # part that cannot be waived: it is what refuses a name somebody else
+        # planted, and writing through the descriptor is what keeps the bytes
+        # in our own file. Only the *mode* is negotiable, and only for a
+        # --no-secrets bundle — the signing secret is scrubbed from its
+        # snapshot and config.local.yaml is not collected, so a wide mode
+        # exposes history rather than a credential, and refusing to back up at
+        # all would be worse. With secrets, a mode that did not take effect
+        # stops the backup while the file is still empty.
+        fd, private = _exclusive_create(tmp_bundle, "Backup")
+        if not private:
             if include_secrets:
-                raise
-            # A --no-secrets bundle carries no credential: the signing secret is
-            # scrubbed from the snapshot and config.local.yaml is not collected.
-            # Its history is still private data, so this is loud — but it is not
-            # a key exposure, and refusing to back up at all would be worse.
+                os.close(fd)
+                tmp_bundle.unlink(missing_ok=True)
+                raise BackupError(
+                    f"Backup: could not create {tmp_bundle} owner-only (the "
+                    f"filesystem ignored mode {SECRET_FILE_MODE:04o}); nothing was "
+                    f"written. Fix the filesystem or choose a directory that "
+                    f"supports Unix modes."
+                )
             logger.warning(
                 "Backup: %s could not be created owner-only; the bundle carries no "
                 "secrets (--no-secrets) but is readable by other users.", tmp_bundle,
             )
-            tmp_bundle.unlink(missing_ok=True)
         try:
-            writer = os.fdopen(fd, "wb", closefd=False) if fd is not None else None
-            with _tar_writer(tmp_bundle, compression, fileobj=writer) as tar:
+            with _tar_writer(
+                tmp_bundle, compression, fileobj=os.fdopen(fd, "wb", closefd=False),
+            ) as tar:
                 tar.add(stage / "manifest.json", arcname="manifest.json")
                 for sub in ("config", "state", "workspace"):
                     p = stage / sub
                     if p.exists():
                         tar.add(p, arcname=sub)
-            if fd is not None:
+            # Identity always; the mode too, unless it was already accepted and
+            # reported as wide above.
+            if private:
                 _verify_still_the_created_file(fd, tmp_bundle, "Backup")
+            else:
+                _verify_same_file(fd, tmp_bundle, "Backup")
         except BaseException:
             tmp_bundle.unlink(missing_ok=True)
             raise
         finally:
-            if fd is not None:
-                os.close(fd)
+            os.close(fd)
         os.replace(tmp_bundle, final_path)
 
         size = final_path.stat().st_size
@@ -1054,8 +1151,26 @@ def create_backup(
             workspace_bytes=workspace_bytes,
         )
     finally:
+        for fd, _snapshot in snapshot_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        # Removing by name is itself a name operation: if the staging directory
+        # was swapped, that name is somebody else's directory now and deleting
+        # it is not this function's business. Our own, with the snapshot in it,
+        # is still 0700 and owned by us wherever it was moved to — unreadable
+        # to them, and named in the log for whoever cleans up.
+        try:
+            _verify_same_file(stage_fd, stage, "Backup")
+        except BackupError as e:
+            logger.error(
+                "Backup: leaving %s alone — it is no longer the staging directory "
+                "that was created (%s).", stage, e,
+            )
+        else:
+            shutil.rmtree(stage, ignore_errors=True)
         os.close(stage_fd)
-        shutil.rmtree(stage, ignore_errors=True)
 
 
 def _code_schema_version() -> int:

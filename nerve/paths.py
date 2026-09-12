@@ -235,7 +235,13 @@ def write_private_text(path: Path, text: str) -> None:
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+    # O_EXCL already refuses a name that exists; O_NOFOLLOW says the same about
+    # a symlink out loud, so the create can never be redirected.
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        SECRET_FILE_MODE,
+    )
     try:
         st = os.fstat(fd)
         if not _mode_is_private(st.st_mode):
