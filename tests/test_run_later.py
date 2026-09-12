@@ -15,8 +15,19 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nerve.db import Database
+from nerve.identity import Actor
 from nerve.gateway.routes._deps import init_deps
 from nerve.gateway.routes.sessions import RunLaterRequest, run_later
+
+# `require_auth` hands a route the actor the request resolved to. These tests
+# call the route functions directly, so they supply one; no route here reads
+# it, so any well-formed actor does.
+_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
 
 
 def _fake_engine() -> MagicMock:
@@ -33,7 +44,7 @@ async def test_run_later_timed_schedules_one_shot_wakeup(db: Database):
 
     res = await run_later(
         RunLaterRequest(session_id="rl-timed", message="do the thing", delay="30m"),
-        user={},
+        actor=_ACTOR,
     )
 
     assert res["scheduled"] is True
@@ -66,7 +77,7 @@ async def test_run_later_24h_uses_full_delay_unclamped(db: Database):
 
     await run_later(
         RunLaterRequest(session_id="rl-24h", message="tomorrow", delay="24h"),
-        user={},
+        actor=_ACTOR,
     )
 
     pending = await db.list_pending_wakeups("rl-24h")
@@ -85,7 +96,7 @@ async def test_run_later_just_accept_schedules_nothing(db: Database):
 
     res = await run_later(
         RunLaterRequest(session_id="rl-manual", message="later", delay="none"),
-        user={},
+        actor=_ACTOR,
     )
 
     assert res["scheduled"] is False
@@ -123,7 +134,7 @@ async def test_run_later_persists_all_attachments(db: Database):
             delay="none",
             file_ids=["img1", "doc1"],
         ),
-        user={},
+        actor=_ACTOR,
     )
 
     msgs = await db.get_messages("rl-files")
@@ -143,6 +154,6 @@ async def test_run_later_unknown_session_404(db: Database):
     with pytest.raises(HTTPException) as exc:
         await run_later(
             RunLaterRequest(session_id="missing", message="x", delay="1h"),
-            user={},
+            actor=_ACTOR,
         )
     assert exc.value.status_code == 404

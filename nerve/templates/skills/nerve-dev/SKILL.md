@@ -130,12 +130,18 @@ Routes are split into domain-specific modules under `nerve/gateway/routes/`. Eac
 **Dependency access pattern:**
 ```python
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 @router.get("/api/example")
-async def example(user: dict = Depends(require_auth)):
+async def example(actor: Actor = Depends(require_auth)):
     deps = get_deps()
     # Use deps.engine, deps.db, deps.notification_service
 ```
+
+`require_auth` both authenticates the request and says who made it: `actor` is
+the person's identity (or the agent's system principal for the instance's own
+calls). Declare it on every endpoint — it is the authentication gate — and pass
+it down when you store something that has an author.
 
 ## Development Workflow
 

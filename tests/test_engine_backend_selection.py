@@ -6,6 +6,17 @@ import pytest
 
 from nerve.agent.engine import AgentEngine
 from nerve.config import NerveConfig
+from nerve.identity import Actor
+
+# `require_auth` hands a route the actor the request resolved to. These tests
+# call the route functions directly, so they supply one; no route here reads
+# it, so any well-formed actor does.
+_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
 
 
 def _config(tmp_path, **agent_overrides) -> NerveConfig:
@@ -374,7 +385,7 @@ class TestCreateSessionRoute:
         )
 
         created = await routes.create_session(
-            routes.SessionCreateRequest(backend="codex"), user={"sub": "user"},
+            routes.SessionCreateRequest(backend="codex"), actor=_ACTOR,
         )
         row = await db.get_session(created["id"])
         meta = json.loads(row.get("metadata") or "{}")
@@ -384,7 +395,7 @@ class TestCreateSessionRoute:
 
         # Omitted backend → no override, config default applies.
         plain = await routes.create_session(
-            routes.SessionCreateRequest(), user={"sub": "user"},
+            routes.SessionCreateRequest(), actor=_ACTOR,
         )
         plain_row = await db.get_session(plain["id"])
         plain_meta = json.loads(plain_row.get("metadata") or "{}")
@@ -395,6 +406,6 @@ class TestCreateSessionRoute:
         with pytest.raises(HTTPException) as excinfo:
             await routes.create_session(
                 routes.SessionCreateRequest(backend="geminy"),
-                user={"sub": "user"},
+                actor=_ACTOR,
             )
         assert excinfo.value.status_code == 400

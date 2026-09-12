@@ -82,5 +82,5 @@ async def auth_status():
 
 
 @router.get("/api/auth/check")
-async def check_auth(user: dict = Depends(require_auth)):
+async def check_auth(actor: Actor = Depends(require_auth)):
     return {"authenticated": True}

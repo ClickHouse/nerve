@@ -8,12 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 router = APIRouter()
 
 
 @router.post("/api/config/reload")
-async def reload_config_route(user: dict = Depends(require_auth)):
+async def reload_config_route(actor: Actor = Depends(require_auth)):
     """Re-read config and hot-reload cron, sources, MCP, and skills (no restart).
 
     Apply config edits made on this box without restarting. Some settings
@@ -50,7 +51,7 @@ async def reload_config_route(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/config/sync")
-async def sync_workspace_route(user: dict = Depends(require_auth)):
+async def sync_workspace_route(actor: Actor = Depends(require_auth)):
     """Pull the workspace from its git remote and apply what it merged.
 
     Fast-forward only; validates the pulled bundle before applying. Applying runs
@@ -137,7 +138,7 @@ async def sync_workspace_route(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/config/sync")
-async def sync_status_route(user: dict = Depends(require_auth)):
+async def sync_status_route(actor: Actor = Depends(require_auth)):
     """What the periodic sync loop last did, and whether it is stuck.
 
     The loop is the only thing that applies merged config on its own, and until

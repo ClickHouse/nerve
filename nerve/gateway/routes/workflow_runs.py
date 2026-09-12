@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ async def list_workflow_runs(
     status: str = "",
     limit: int = 50,
     offset: int = 0,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     """List runs (newest first). ``status``: 'active', an exact status, or empty."""
     service = _service()
@@ -72,7 +73,7 @@ async def list_workflow_runs(
 
 @router.post("/api/workflow-runs")
 async def create_workflow_run(
-    req: WorkflowRunCreateRequest, user: dict = Depends(require_auth),
+    req: WorkflowRunCreateRequest, actor: Actor = Depends(require_auth),
 ):
     """Start a run; returns its wire shape (usually already 'running')."""
     service = _service()
@@ -98,7 +99,7 @@ async def create_workflow_run(
 
 
 @router.get("/api/workflow-runs/{run_id}")
-async def get_workflow_run(run_id: str, user: dict = Depends(require_auth)):
+async def get_workflow_run(run_id: str, actor: Actor = Depends(require_auth)):
     service = _service()
     run = await service.get_run(run_id)
     if run is None:
@@ -110,7 +111,7 @@ async def get_workflow_run(run_id: str, user: dict = Depends(require_auth)):
 async def kill_workflow_run(
     run_id: str,
     req: WorkflowRunKillRequest = WorkflowRunKillRequest(),
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     """Kill a run (idempotent on terminal runs); scoped to its own session."""
     service = _service()
@@ -124,7 +125,7 @@ async def kill_workflow_run(
 
 
 @router.get("/api/workflow-runs/{run_id}/journal")
-async def get_workflow_run_journal(run_id: str, user: dict = Depends(require_auth)):
+async def get_workflow_run_journal(run_id: str, actor: Actor = Depends(require_auth)):
     """Bounded read of the run's journal dir (run.json / events / result)."""
     service = _service()
     run = await service.get_run(run_id)

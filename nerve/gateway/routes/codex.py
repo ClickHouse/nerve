@@ -23,7 +23,7 @@ from nerve.gateway.auth import (
     resolve_actor_from_claims,
 )
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import ActorResolutionError
+from nerve.identity import Actor, ActorResolutionError
 from nerve.mcp_server.auth import McpAuthError, authenticate_mcp, bound_session_id
 
 router = APIRouter()
@@ -79,7 +79,7 @@ async def mint_worker_token(request: Request):
 
 
 @router.get("/api/codex/status")
-async def codex_status(user: dict = Depends(require_auth)):
+async def codex_status(actor: Actor = Depends(require_auth)):
     deps = get_deps()
     backend = deps.engine._backends.get("codex")
     preflight = await backend.preflight() if backend is not None else {
@@ -93,7 +93,7 @@ async def codex_status(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/codex/ultracode/dashboard")
-async def ultracode_dashboard_status(user: dict = Depends(require_auth)):
+async def ultracode_dashboard_status(actor: Actor = Depends(require_auth)):
     deps = _dashboard_deps()
     status = installation_status(deps.engine.config)
     return {
@@ -110,7 +110,7 @@ async def ultracode_dashboard_status(user: dict = Depends(require_auth)):
 @router.get("/api/codex/ultracode/runs")
 async def ultracode_dashboard_runs(
     limit: int = 50,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     deps = _dashboard_deps()
     return {"runs": list_dashboard_runs(deps.engine.config, limit=limit)}
@@ -119,7 +119,7 @@ async def ultracode_dashboard_runs(
 @router.get("/api/codex/ultracode/runs/{workflow_id}")
 async def ultracode_dashboard_run(
     workflow_id: str,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     deps = _dashboard_deps()
     run = read_dashboard_run(deps.engine.config, workflow_id)

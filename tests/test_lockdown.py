@@ -20,6 +20,17 @@ from nerve.config import (
     tracked_config_write_refusal,
     workspace_settings_file,
 )
+from nerve.identity import Actor
+
+# `require_auth` hands a route the actor the request resolved to. These tests
+# call the route functions directly, so they supply one; no route here reads
+# it, so any well-formed actor does.
+_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
 
 
 def _repo(ws: Path, *, remote: str | None = "origin") -> Path:
@@ -1377,7 +1388,7 @@ class TestLockdownTrackedConfigWrites:
         for path in ("config/settings.yaml", "config/cron/gates/evil.py"):
             with pytest.raises(LockdownError):
                 await write_memory_file(
-                    path, FileWriteRequest(content="lockdown: false\n"), user={},
+                    path, FileWriteRequest(content="lockdown: false\n"), actor=_ACTOR,
                 )
         assert not (ws / "config" / "settings.yaml").exists()
         assert not (ws / "config" / "cron" / "gates" / "evil.py").exists()
@@ -1394,7 +1405,7 @@ class TestLockdownTrackedConfigWrites:
         for path in ("SOUL.md", "AGENTS.md", "skills/x/SKILL.md"):
             with pytest.raises(LockdownError):
                 await write_memory_file(
-                    path, FileWriteRequest(content="do whatever you like\n"), user={},
+                    path, FileWriteRequest(content="do whatever you like\n"), actor=_ACTOR,
                 )
             assert not (ws / path).exists()
 
@@ -1413,16 +1424,16 @@ class TestLockdownTrackedConfigWrites:
         monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True, workspace=ws))
 
         listed = {f["path"]: f["read_only"] for f in
-                  (await list_memory_files(user={}))["files"]}
+                  (await list_memory_files(actor=_ACTOR))["files"]}
         assert listed == {
             "SOUL.md": True, "NOTES.md": False, "memory/notes.md": False,
         }
-        assert (await read_memory_file("SOUL.md", user={}))["read_only"] is True
-        assert (await read_memory_file("NOTES.md", user={}))["read_only"] is False
+        assert (await read_memory_file("SOUL.md", actor=_ACTOR))["read_only"] is True
+        assert (await read_memory_file("NOTES.md", actor=_ACTOR))["read_only"] is False
 
         monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=False, workspace=ws))
         unlocked = {f["path"]: f["read_only"] for f in
-                    (await list_memory_files(user={}))["files"]}
+                    (await list_memory_files(actor=_ACTOR))["files"]}
         assert not any(unlocked.values())
 
     @pytest.mark.asyncio
@@ -1437,7 +1448,7 @@ class TestLockdownTrackedConfigWrites:
             cfg, "_config", NerveConfig(lockdown=True, workspace=ws),
         )
         await write_memory_file(
-            "memory/notes.md", FileWriteRequest(content="hello\n"), user={},
+            "memory/notes.md", FileWriteRequest(content="hello\n"), actor=_ACTOR,
         )
         assert (ws / "memory" / "notes.md").read_text() == "hello\n"
 
@@ -1451,7 +1462,7 @@ class TestLockdownTrackedConfigWrites:
             cfg, "_config", NerveConfig(lockdown=False, workspace=ws),
         )
         await write_memory_file(
-            "config/settings.yaml", FileWriteRequest(content="timezone: UTC\n"), user={},
+            "config/settings.yaml", FileWriteRequest(content="timezone: UTC\n"), actor=_ACTOR,
         )
         assert (ws / "config" / "settings.yaml").exists()
 
@@ -1499,7 +1510,7 @@ class TestLockdownTrackedConfigWrites:
         with pytest.raises(LockdownError):
             await tasks_route.update_task(
                 "t1", tasks_route.TaskUpdateRequest(content="lockdown: false\n"),
-                user={},
+                actor=_ACTOR,
             )
         assert "lockdown: true" in (ws / "config" / "settings.yaml").read_text()
 

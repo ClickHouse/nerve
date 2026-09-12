@@ -6,12 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 router = APIRouter()
 
 
 @router.get("/api/cron/jobs")
-async def list_cron_jobs(user: dict = Depends(require_auth)):
+async def list_cron_jobs(actor: Actor = Depends(require_auth)):
     """List all registered cron/source jobs with schedule and next run."""
     from nerve.gateway.server import _cron_service
 
@@ -23,7 +24,7 @@ async def list_cron_jobs(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/cron/reload")
-async def reload_cron_jobs(user: dict = Depends(require_auth)):
+async def reload_cron_jobs(actor: Actor = Depends(require_auth)):
     """Re-read cron config and apply changes to the scheduler without a restart."""
     from nerve.config import ConfigError
     from nerve.gateway.server import _cron_service
@@ -39,7 +40,7 @@ async def reload_cron_jobs(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(job_id: str, user: dict = Depends(require_auth)):
+async def trigger_cron_job(job_id: str, actor: Actor = Depends(require_auth)):
     """Manually trigger a specific cron job or source runner."""
     from nerve.gateway.server import _cron_service
 
@@ -62,7 +63,7 @@ async def trigger_cron_job(job_id: str, user: dict = Depends(require_auth)):
 
 
 @router.post("/api/cron/jobs/{job_id}/rotate")
-async def rotate_cron_session(job_id: str, user: dict = Depends(require_auth)):
+async def rotate_cron_session(job_id: str, actor: Actor = Depends(require_auth)):
     """Force-rotate a persistent cron session's context."""
     from nerve.gateway.server import _cron_service
 
@@ -81,7 +82,7 @@ async def get_cron_logs(
     job_id: str = "",
     limit: int = 50,
     offset: int = 0,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     deps = get_deps()
     limit = max(1, min(limit, 200))

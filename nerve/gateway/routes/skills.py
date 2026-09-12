@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 router = APIRouter()
 
@@ -34,7 +35,7 @@ def _require_skill_manager():
 
 
 @router.get("/api/skills")
-async def list_skills(user: dict = Depends(require_auth)):
+async def list_skills(actor: Actor = Depends(require_auth)):
     """List all skills with usage stats."""
     deps = get_deps()
     skills = await deps.db.get_all_skills_with_stats()
@@ -42,7 +43,7 @@ async def list_skills(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/skills/stats")
-async def skill_stats(user: dict = Depends(require_auth)):
+async def skill_stats(actor: Actor = Depends(require_auth)):
     """Aggregate usage stats across all skills."""
     deps = get_deps()
     stats = await deps.db.get_skill_stats()
@@ -50,7 +51,7 @@ async def skill_stats(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/skills/sync")
-async def sync_skills(user: dict = Depends(require_auth)):
+async def sync_skills(actor: Actor = Depends(require_auth)):
     """Re-scan filesystem and sync skills to DB."""
     mgr = _require_skill_manager()
     skills = await mgr.discover()
@@ -58,7 +59,7 @@ async def sync_skills(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/skills/{skill_id}")
-async def get_skill_detail(skill_id: str, user: dict = Depends(require_auth)):
+async def get_skill_detail(skill_id: str, actor: Actor = Depends(require_auth)):
     """Get full skill content + metadata + usage stats."""
     deps = get_deps()
     mgr = _require_skill_manager()
@@ -94,7 +95,7 @@ async def get_skill_detail(skill_id: str, user: dict = Depends(require_auth)):
 
 
 @router.post("/api/skills")
-async def create_skill(req: SkillCreateRequest, user: dict = Depends(require_auth)):
+async def create_skill(req: SkillCreateRequest, actor: Actor = Depends(require_auth)):
     """Create a new skill."""
     mgr = _require_skill_manager()
     skill = await mgr.create_skill(
@@ -105,7 +106,7 @@ async def create_skill(req: SkillCreateRequest, user: dict = Depends(require_aut
 
 
 @router.put("/api/skills/{skill_id}")
-async def update_skill(skill_id: str, req: SkillUpdateRequest, user: dict = Depends(require_auth)):
+async def update_skill(skill_id: str, req: SkillUpdateRequest, actor: Actor = Depends(require_auth)):
     """Update a skill's SKILL.md content."""
     mgr = _require_skill_manager()
     skill = await mgr.update_skill(skill_id, req.content)
@@ -115,7 +116,7 @@ async def update_skill(skill_id: str, req: SkillUpdateRequest, user: dict = Depe
 
 
 @router.delete("/api/skills/{skill_id}")
-async def delete_skill(skill_id: str, user: dict = Depends(require_auth)):
+async def delete_skill(skill_id: str, actor: Actor = Depends(require_auth)):
     """Delete a skill."""
     mgr = _require_skill_manager()
     await mgr.delete_skill(skill_id)
@@ -123,7 +124,7 @@ async def delete_skill(skill_id: str, user: dict = Depends(require_auth)):
 
 
 @router.patch("/api/skills/{skill_id}/toggle")
-async def toggle_skill(skill_id: str, req: SkillToggleRequest, user: dict = Depends(require_auth)):
+async def toggle_skill(skill_id: str, req: SkillToggleRequest, actor: Actor = Depends(require_auth)):
     """Enable or disable a skill."""
     mgr = _require_skill_manager()
     success = await mgr.toggle_skill(skill_id, req.enabled)
@@ -133,7 +134,7 @@ async def toggle_skill(skill_id: str, req: SkillToggleRequest, user: dict = Depe
 
 
 @router.get("/api/skills/{skill_id}/usage")
-async def get_skill_usage(skill_id: str, limit: int = 50, user: dict = Depends(require_auth)):
+async def get_skill_usage(skill_id: str, limit: int = 50, actor: Actor = Depends(require_auth)):
     """Get usage history for a skill."""
     deps = get_deps()
     usage = await deps.db.get_skill_usage(skill_id, limit=min(limit, 200))
