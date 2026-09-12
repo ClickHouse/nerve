@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nerve.identity import system_actor_or_none
+from nerve.identity import system_actor
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
 
@@ -709,9 +709,7 @@ class NotificationService:
         # notification itself; putting them on the agent's prompt would be the
         # wrong claim, and 0.7 defers notification-answer attribution past
         # this gate anyway.
-        actor = await system_actor_or_none(
-            self.db, context="notification dispatch",
-        )
+        actor = await system_actor(self.db)
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,

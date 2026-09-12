@@ -24,7 +24,7 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.stream_adapter import StreamAdapter
-from nerve.identity import Actor, system_actor_or_none
+from nerve.identity import Actor, system_actor
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -89,7 +89,7 @@ class ChannelRouter:
     # (e.g. forwarded messages, rapid-fire sends) into a single batch.
     BATCH_DEBOUNCE = 0.60
 
-    async def _channel_actor(self, channel_name: str) -> Actor | None:
+    async def _channel_actor(self, channel_name: str) -> Actor:
         """The principal a channel's traffic is attributed to.
 
         The agent's system principal, for now, and deliberately: mapping a
@@ -103,10 +103,12 @@ class ChannelRouter:
 
         This is the single place channel attribution is decided; the PR that
         adds identity resolution changes this method and nothing else.
+
+        Raises if the principal cannot be resolved, which fails the inbound
+        message rather than storing it under nobody — the channel reports the
+        failure and the sender can send it again.
         """
-        return await system_actor_or_none(
-            self.engine.db, context=f"{channel_name} message",
-        )
+        return await system_actor(self.engine.db)
 
     async def handle_message(self, msg: InboundMessage) -> str:
         """Process an inbound user message.

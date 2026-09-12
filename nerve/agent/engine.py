@@ -66,7 +66,7 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
-from nerve.identity import Actor, system_actor_or_none
+from nerve.identity import Actor, system_actor
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
@@ -1626,9 +1626,7 @@ class AgentEngine:
                     # it out of the transcript anyway. Whoever was talking to
                     # the session keeps their messages; the continuation is
                     # the assistant's.
-                    actor=await system_actor_or_none(
-                        self.db, context="resume after restart",
-                    ),
+                    actor=await system_actor(self.db),
                 )
                 resumed += 1
             except Exception as e:
@@ -3393,7 +3391,7 @@ class AgentEngine:
         # A scheduled run is the instance's own work, whoever wrote the
         # schedule — the human belongs on the schedule's own mutation, which
         # 0.7 defers past this gate.
-        actor = await system_actor_or_none(self.db, context=f"cron job {job_id}")
+        actor = await system_actor(self.db)
         session = await self.sessions.create_cron_session(
             job_id, run_id=run_id, actor=actor,
         )
@@ -3436,7 +3434,7 @@ class AgentEngine:
         isolated cron for long background work).
         """
         session_id = session_id or f"cron:{job_id}"
-        actor = await system_actor_or_none(self.db, context=f"cron job {job_id}")
+        actor = await system_actor(self.db)
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
         )
@@ -3470,7 +3468,7 @@ class AgentEngine:
         task, in which case it is kept alive so the agent can resume when the
         task completes (see ``_teardown_oneshot_client``).
         """
-        actor = await system_actor_or_none(self.db, context=f"hook {hook_name}")
+        actor = await system_actor(self.db)
         session = await self.sessions.create_hook_session(
             hook_name, hook_id, actor=actor,
         )

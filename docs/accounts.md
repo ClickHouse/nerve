@@ -97,7 +97,8 @@ clients resolve display names through `GET /api/actors`.
 
 Existing records remain unattributed. Nerve does not infer identity from channel
 or source metadata. Account and session administration actions are not yet
-recorded as audit events.
+recorded as audit events. Autonomous writes fail before persisting if the system
+actor cannot be resolved, so a missing actor never means a failed lookup.
 
 ## Session-signing secret
 

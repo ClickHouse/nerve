@@ -19,6 +19,7 @@ from nerve.cron.service import (
     _parse_interval,
     _parse_timestamp,
 )
+from tests.actor_rows import mock_system_principal
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,10 @@ def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     db.cancel_wakeups_for_session = AsyncMock(return_value=0)
     db.update_session_metadata = AsyncMock()
     db.update_session_title = AsyncMock()
+    # A cron generation is attributed to the agent's system principal and the
+    # lookup happens before the row is written, so the mock has to answer it
+    # the way a bootstrapped database would.
+    mock_system_principal(db)
 
     return CronService(config, engine, db)
 
