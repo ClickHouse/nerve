@@ -317,10 +317,15 @@ async def lifespan(app: FastAPI):
         # are logged inside init_langfuse() and never propagate.
         init_langfuse(config)
 
-        # Initialize agent engine
+        # Initialize agent engine. Registered *before* the await, like the
+        # proxy and for the same reason: initialize() starts memU's dedicated
+        # thread and then does fallible database writes, so a failure or a
+        # cancellation in between leaves that thread — and a non-daemon thread
+        # keeps the process alive rather than letting a failed start exit.
+        # shutdown() is a no-op on an engine that never got that far.
         _engine = AgentEngine(config, db)
-        await _engine.initialize()
         startup_cleanups.append(("agent engine", _engine.shutdown))
+        await _engine.initialize()
 
         # Wire up routes
         init_deps(_engine, db)

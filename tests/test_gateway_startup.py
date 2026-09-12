@@ -140,7 +140,12 @@ async def test_a_failure_after_the_proxy_stops_it_again(harness, monkeypatch):
 
     assert harness["proxy"].starts == 1 and harness["proxy"].stops == 1
     assert harness["closed"] == ["db"]  # the database was closed too
-    assert harness["engine"].shutdown.await_count == 0  # it never came up
+    # And the engine is shut down even though *it* is what failed: initialize()
+    # starts memU's dedicated thread before its last database writes, so a
+    # half-initialised engine is precisely the case that needs stopping — a
+    # non-daemon thread keeps the process alive instead of letting it exit
+    # (F34).
+    assert harness["engine"].shutdown.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -169,6 +174,34 @@ async def test_cancellation_while_the_proxy_is_starting_still_stops_it(harness):
         await task
 
     assert harness["proxy"].starts == 1 and harness["proxy"].stops == 1
+    assert harness["closed"] == ["db"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_inside_initialize_still_shuts_the_engine_down(harness):
+    """F34: memU's thread is started partway through ``initialize()``. A
+    cancellation after that point must still reach ``shutdown()``, which is
+    why the cleanup is registered before the await rather than after it."""
+    started = asyncio.Event()
+
+    async def initialize_then_hang():
+        started.set()  # stands in for "memU's thread is up"
+        await asyncio.Event().wait()
+
+    harness["engine"].initialize.side_effect = initialize_then_hang
+
+    async def _run():
+        async with harness["server"].lifespan(MagicMock()):
+            pass  # pragma: no cover
+
+    task = asyncio.create_task(_run())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert harness["engine"].shutdown.await_count == 1
+    assert harness["proxy"].stops == 1
     assert harness["closed"] == ["db"]
 
 
