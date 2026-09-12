@@ -26,7 +26,7 @@ from nerve.cron.jobs import (
     load_jobs,
 )
 from nerve.db import Database
-from nerve.identity import system_actor_or_none
+from nerve.identity import system_actor
 
 if TYPE_CHECKING:
     from nerve.cron.gates import CronGate
@@ -859,7 +859,7 @@ class CronService:
         session_id = f"cron:{job_id}:{ts}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
-            actor=await system_actor_or_none(self.db, context=f"cron job {job_id}"),
+            actor=await system_actor(self.db),
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -1356,9 +1356,7 @@ class CronService:
         # this service is delivering. Who wrote a run-later message is
         # already recorded on the row the route persisted when they composed
         # it.
-        actor = await system_actor_or_none(
-            self.db, context=f"wakeup {wakeup['id']}",
-        )
+        actor = await system_actor(self.db)
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,

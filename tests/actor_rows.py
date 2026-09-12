@@ -21,7 +21,17 @@ that opens a database. Several tests count ``actor_refs`` rows.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from nerve.identity import Actor
+
+# A synthetic system principal for tests whose database is a mock. Obviously
+# not a real id, and never written anywhere — a mock has no schema to violate.
+FAKE_SYSTEM_PRINCIPAL = {
+    "id": "00000000-0000-4000-8000-00000000515e",
+    "kind": "system",
+    "display_name": "nerve",
+}
 
 
 async def ensure_actor_row(db, *actors: Actor) -> None:
@@ -37,3 +47,33 @@ async def ensure_actor_row(db, *actors: Actor) -> None:
                 display_name=actor.display_name,
                 actor_id=actor.actor_id,
             )
+
+
+async def ensure_system_principal(db) -> str:
+    """Give a test database the local identity every real database has.
+
+    The ``db`` fixture opens a schema-current database and stops there, which
+    is a state production cannot reach: every opener bootstraps the identity
+    before anything serves (PR 1). Autonomous code — cron, workflow legs, MCP
+    satellites, the Codex sync — resolves the system principal *before* it
+    writes and fails the run if it cannot, so a test driving those paths needs
+    the rows the instance it stands in for would have.
+
+    Idempotent. Returns the system principal's actor id.
+    """
+    identity = await db.get_local_identity()
+    if identity is None:
+        identity = await db.bootstrap_local_identity(credential_source="none")
+    return identity.system_actor_id
+
+
+def mock_system_principal(db) -> str:
+    """The same, for a test whose database is a ``MagicMock``.
+
+    Without this the mock answers ``get_system_principal()`` with another mock,
+    and building an :class:`Actor` out of it fails in a way that says nothing
+    about the test. Returns the actor id it will resolve to, so a caller can
+    assert against it.
+    """
+    db.get_system_principal = AsyncMock(return_value=dict(FAKE_SYSTEM_PRINCIPAL))
+    return FAKE_SYSTEM_PRINCIPAL["id"]

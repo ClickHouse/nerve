@@ -42,6 +42,12 @@ class SessionStore:
 
         Write-once by construction: the insert is ``OR IGNORE``, so
         re-resolving an existing session never re-stamps its creator.
+
+        Returns the **stored** row, not the arguments. The distinction only
+        shows up when the insert was ignored — a same-id race, or a short-id
+        collision — and there it is the difference between the caller being
+        told who owns the session and being told who asked to. Everything the
+        old shape returned is a column, so the row is a superset of it.
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
@@ -56,6 +62,11 @@ class SessionStore:
              parent_session_id, forked_from_message, backend, model, cwd,
              created_by, now, now),
         )
+        stored = await self.get_session(session_id)
+        if stored is not None:
+            return stored
+        # Unreachable while the insert above succeeded; a row deleted between
+        # the two statements should not turn session creation into a None.
         return {
             "id": session_id, "title": title or session_id,
             "source": source, "status": status,
