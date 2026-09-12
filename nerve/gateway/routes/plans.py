@@ -23,6 +23,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class PlanReviseRequest(BaseModel):
 
 
 @router.get("/api/plans")
-async def list_plans(status: str = "", task_id: str = "", user: dict = Depends(require_auth)):
+async def list_plans(status: str = "", task_id: str = "", actor: Actor = Depends(require_auth)):
     deps = get_deps()
     plans = await deps.db.list_plans(
         status=status or None,
@@ -49,7 +50,7 @@ async def list_plans(status: str = "", task_id: str = "", user: dict = Depends(r
 
 
 @router.get("/api/plans/{plan_id}")
-async def get_plan(plan_id: str, user: dict = Depends(require_auth)):
+async def get_plan(plan_id: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     plan = await deps.db.get_plan(plan_id)
     if not plan:
@@ -58,7 +59,7 @@ async def get_plan(plan_id: str, user: dict = Depends(require_auth)):
 
 
 @router.patch("/api/plans/{plan_id}")
-async def update_plan(plan_id: str, req: PlanUpdateRequest, user: dict = Depends(require_auth)):
+async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     plan = await deps.db.get_plan(plan_id)
     if not plan:
@@ -92,7 +93,7 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, user: dict = Depends
 
 
 @router.post("/api/plans/{plan_id}/revise")
-async def revise_plan(plan_id: str, req: PlanReviseRequest, user: dict = Depends(require_auth)):
+async def revise_plan(plan_id: str, req: PlanReviseRequest, actor: Actor = Depends(require_auth)):
     """Send revision feedback to the persistent planner session.
 
     Thin wrapper around ``request_plan_revision`` — the shared helper
@@ -123,7 +124,7 @@ async def revise_plan(plan_id: str, req: PlanReviseRequest, user: dict = Depends
 @router.post("/api/plans/{plan_id}/approve")
 async def approve_plan(
     plan_id: str,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     """Approve a plan and spawn an implementation session."""
     deps = get_deps()
@@ -240,7 +241,7 @@ async def approve_plan(
 
 
 @router.get("/api/tasks/{task_id}/plans")
-async def get_task_plans(task_id: str, user: dict = Depends(require_auth)):
+async def get_task_plans(task_id: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     plans = await deps.db.get_plans_for_task(task_id)
     return {"plans": plans}

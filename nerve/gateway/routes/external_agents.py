@@ -26,6 +26,7 @@ from nerve.config import ensure_not_locked, get_config, set_config
 from nerve.external_agents.registry import AGENT_REGISTRY
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class ToggleResponse(BaseModel):
 
 
 @router.get("")
-async def list_external_agents(user: dict = Depends(require_auth)) -> dict[str, Any]:
+async def list_external_agents(actor: Actor = Depends(require_auth)) -> dict[str, Any]:
     """Return per-agent status + the registry of available agents.
 
     The frontend uses ``available`` to render the "Add agent" picker
@@ -84,7 +85,7 @@ async def list_external_agents(user: dict = Depends(require_auth)) -> dict[str, 
 
 
 @router.post("/sync")
-async def trigger_sync(user: dict = Depends(require_auth)) -> dict[str, Any]:
+async def trigger_sync(actor: Actor = Depends(require_auth)) -> dict[str, Any]:
     """Run one sync sweep right now (instead of waiting for the timer).
 
     Returns the fresh status map so the UI can refresh without an extra
@@ -106,19 +107,19 @@ async def trigger_sync(user: dict = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.post("/{name}/disable", response_model=ToggleResponse)
-async def disable_agent(name: str, user: dict = Depends(require_auth)) -> ToggleResponse:
+async def disable_agent(name: str, actor: Actor = Depends(require_auth)) -> ToggleResponse:
     """Pause sync for ``name`` without removing it from config."""
     return _toggle_agent(name, enabled=False)
 
 
 @router.post("/{name}/enable", response_model=ToggleResponse)
-async def enable_agent(name: str, user: dict = Depends(require_auth)) -> ToggleResponse:
+async def enable_agent(name: str, actor: Actor = Depends(require_auth)) -> ToggleResponse:
     """Re-enable a previously paused agent."""
     return _toggle_agent(name, enabled=True)
 
 
 @router.delete("/{name}")
-async def remove_agent(name: str, user: dict = Depends(require_auth)) -> dict[str, str]:
+async def remove_agent(name: str, actor: Actor = Depends(require_auth)) -> dict[str, str]:
     """Remove ``name`` from the configured targets list.
 
     Does NOT delete the agent's config files or memory bundle — the

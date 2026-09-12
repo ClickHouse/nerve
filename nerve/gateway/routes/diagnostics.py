@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 from nerve.observability.langfuse import get_status as langfuse_status
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ async def _per_source_status(db, source: str) -> tuple[str, dict]:
 
 
 @router.get("/api/diagnostics")
-async def diagnostics(user: dict = Depends(require_auth)):
+async def diagnostics(actor: Actor = Depends(require_auth)):
     """System health and status information."""
     deps = get_deps()
     config = get_config()
@@ -185,7 +186,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/observability/status")
-async def observability_status(user: dict = Depends(require_auth)):
+async def observability_status(actor: Actor = Depends(require_auth)):
     """Lightweight status endpoint — used by the chat UI to render a
     "View in Langfuse" deep-link when observability is configured.
 
@@ -196,7 +197,7 @@ async def observability_status(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/memorization/sweep")
-async def trigger_memorization_sweep(user: dict = Depends(require_auth)):
+async def trigger_memorization_sweep(actor: Actor = Depends(require_auth)):
     """Manually trigger a memorization sweep."""
     deps = get_deps()
     if not deps.engine:

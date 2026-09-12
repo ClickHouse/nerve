@@ -29,6 +29,7 @@ from nerve import models_catalog
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 from nerve.ollama import discover_models
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ router = APIRouter()
 
 
 @router.get("/api/models")
-async def list_models(user: dict = Depends(require_auth)):
+async def list_models(actor: Actor = Depends(require_auth)):
     """List selectable chat models for the composer's model picker.
 
     Returns:
