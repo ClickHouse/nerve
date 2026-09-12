@@ -167,6 +167,69 @@ class TestNonInteractiveSetup:
         assert "inbox-processor" in choices.enabled_crons
         assert "task-planner" in choices.enabled_crons
 
+    def test_worker_mode_default_crons(self, tmp_path: Path) -> None:
+        """Worker non-interactive should enable the skill-maintenance crons.
+
+        The harvester is the inbound half of that set: skill-reviser only audits
+        skills against themselves, so without it no reviewer feedback ever
+        reaches a skill.
+        """
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Fix bugs across repos",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert "skill-extractor" in choices.enabled_crons
+        assert "skill-reviser" in choices.enabled_crons
+        assert "pr-feedback-harvester" in choices.enabled_crons
+        assert "task-planner" in choices.enabled_crons
+
+    def test_worker_crons_are_written_enabled(self, tmp_path: Path) -> None:
+        """Worker-mode crons selected above must reach system.yaml enabled."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Fix bugs across repos",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+
+        system = yaml.safe_load(
+            (tmp_path / "ws" / "config" / "cron" / "system.yaml").read_text()
+        )
+        by_id = {j["id"]: j for j in system["jobs"]}
+        harvester = by_id["pr-feedback-harvester"]
+        assert harvester["enabled"] is True
+        assert harvester["schedule"] == "0 4 * * 1"
+        assert harvester["session_mode"] == "persistent"
+
+    def test_pr_feedback_harvester_definition(self) -> None:
+        """The harvester ships weekly, and its prompt keeps its two guardrails."""
+        from nerve.bootstrap import PRODUCTIVITY_CRONS
+
+        job = next(
+            c for c in PRODUCTIVITY_CRONS if c["id"] == "pr-feedback-harvester"
+        )
+        # Weekly, and not on the same day as skill-reviser (Sun 3 AM) — both
+        # propose skill edits, so they are spaced to avoid duelling proposals.
+        assert job["schedule"] == "0 4 * * 1"
+        assert job["session_mode"] == "persistent"
+        assert job.get("requires"), "harvester needs GitHub access to do anything"
+
+        prompt = job["prompt"]
+        # Reads third-party text, then edits its own skills — the injection
+        # guard is load-bearing, not decoration.
+        assert "untrusted input" in prompt
+        # plan_type is NOT auto-detected for this source, so the prompt must
+        # tell the agent to pass it explicitly or skill plans silently become
+        # generic ones.
+        assert "plan_type" in prompt
+
     def test_inbox_processor_default_has_idle_gate(self) -> None:
         """The default inbox-processor ships gated so idle polls are skipped."""
         from nerve.bootstrap import PRODUCTIVITY_CRONS
