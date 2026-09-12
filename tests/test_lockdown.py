@@ -126,7 +126,8 @@ class TestLockdownAuthFailClosed:
         from nerve.gateway.auth import authenticate_websocket
 
         monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True))
-        assert await authenticate_websocket(websocket=None) is False
+        # No secret, so no actor — and nothing that stands in for one.
+        assert await authenticate_websocket(websocket=None) is None
 
 
 class TestValidateRespectsLockdown:

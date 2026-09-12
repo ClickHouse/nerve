@@ -34,7 +34,13 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
 from nerve.agent.tools import ToolContext, ToolRegistry
-from nerve.gateway.auth import MCP_WORKER_CLAIM, effective_jwt_secret
+from nerve.gateway.auth import (
+    MCP_WORKER_CLAIM,
+    effective_jwt_secret,
+    identity_store,
+    resolve_actor_from_claims,
+)
+from nerve.identity import ActorResolutionError
 from nerve.mcp_server.audit import build_audit_writer
 from nerve.mcp_server.auth import (
     McpAuthError,
@@ -52,6 +58,11 @@ if TYPE_CHECKING:
     from nerve.config import NerveConfig
 
 logger = logging.getLogger(__name__)
+
+# ASGI scope key carrying the resolved :class:`~nerve.identity.Actor` for an
+# MCP request. Dotted, per the ASGI convention for extension keys, and
+# per-request by construction — the scope dict belongs to one request.
+MCP_ACTOR_SCOPE_KEY = "nerve.actor"
 
 
 async def _send_status(send: Send, status: int, message: str) -> None:
@@ -267,8 +278,23 @@ def mount_deferred(
             await _send_status(send, 400, "MCP endpoint requires HTTP")
             return
         try:
-            authenticate_mcp(scope, config)
+            claims = authenticate_mcp(scope, config)
         except McpAuthError as e:
+            await _send_status(send, 401, str(e))
+            return
+
+        # Who the frames that follow are attributed to. MCP and backend-agent
+        # credentials are the agent acting on its own behalf, so they resolve
+        # to the system principal; a person's own session token resolves to
+        # them — and is refused here once their account is disabled, which a
+        # signature check alone would never notice.
+        store = identity_store()
+        if store is None:
+            await _send_status(send, 503, "MCP server is starting up")
+            return
+        try:
+            actor = await resolve_actor_from_claims(store, claims)
+        except ActorResolutionError as e:
             await _send_status(send, 401, str(e))
             return
 
@@ -276,6 +302,12 @@ def mount_deferred(
         if manager is None:
             await _send_status(send, 503, "MCP server is starting up")
             return
+
+        # Per-request, on the request's own scope — never a module global. The
+        # session-bound token is re-read per tool call for its session claim
+        # (see _bound_identity_from_request); this is the identity half of the
+        # same answer, resolved once at the door.
+        scope[MCP_ACTOR_SCOPE_KEY] = actor
 
         await manager.handle_request(scope, receive, send)
 
