@@ -12,6 +12,7 @@ import logging
 import os
 import stat
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple
 
@@ -104,74 +105,118 @@ _DB_FILE_MODE = 0o600
 _DB_FILE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 
 
-# Any of these bits set on a database file means another user on the box can
-# read it — the condition that makes keeping a signing secret in it a hazard.
-_GROUP_WORLD_BITS = 0o077
+# Group/world permission bits, split by the hazard each poses to the state DB.
+#   write (020/002) — another user can replace nerve.db or rewrite accounts,
+#                     actors and history. An integrity hazard, on the files AND
+#                     the directory (a writable dir lets a 0600 file be swapped).
+#   read  (040/004) — another user can read a signing secret out of the file.
+#                     A confidentiality hazard, and only on the files: read on
+#                     the directory is ordinary traversal (0755) and harmless.
+_GROUP_WORLD_WRITE = 0o022
+_GROUP_WORLD_READ = 0o044
+
+# _mode_of sentinel: the path does not exist (which is fine — an absent sidecar,
+# a fresh install). Distinct from ``None``, which means the path exists but its
+# mode could not be read, and must fail closed (an attacker cannot make a file
+# uninspectable to hide a wide mode, but we must not assume secure either).
+_ABSENT = object()
 
 
-def _mode_of(path: Path) -> int | None:
-    """Permission bits of ``path``; None when it does not exist or cannot be
-    inspected (which is logged)."""
+def _mode_of(path: Path):
+    """Permission bits of ``path``; ``_ABSENT`` if it does not exist; ``None``
+    if it exists but cannot be inspected (logged, and treated as unsafe)."""
     try:
-        return stat.S_IMODE(path.stat().st_mode)
+        return stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
-        return None
+        return _ABSENT
     except OSError as e:
         logger.warning("Could not inspect permissions on %s: %s", path, e)
         return None
 
 
-def _harden_state_permissions(db_path: Path) -> list[tuple[Path, int]]:
-    """Make the state directory 0700 and the database files 0600; report what
-    stayed readable by other users.
+@dataclass
+class StatePermissions:
+    """What a hardening pass found after trying to repair the modes.
 
-    Idempotent: a mode that is already right is left alone and a file that
-    does not exist is skipped. Every change is *verified* with a second
-    ``stat``, because on a filesystem without modes (some network and
-    FAT-style mounts) a ``chmod`` can succeed and change nothing. Returns the
-    database files — the main file and any existing sidecar — that still
-    carry group or world bits afterwards; an empty list means secured. The
-    directory is tightened on the same terms but only warned about: with the
-    files themselves ``0600`` it is not load-bearing.
-
-    Never raises over a permissions problem. Whether an unsecured database is
-    tolerable depends on whether a signing secret would have to live in it,
-    and that is the bootstrap's decision
-    (:func:`nerve.migrate.ensure_jwt_secret`), not this layer's.
+    ``writable`` (files or the directory) and ``uninspectable`` are *integrity*
+    hazards — another user could replace or rewrite the database — and are fatal
+    whatever the signing-secret arrangement is. ``readable`` (files only) is a
+    *confidentiality* hazard, fatal only when a database-held secret would be
+    used. ``exposed_before_repair`` records that a database file carried
+    group/world read bits when first observed, before any chmod: the trigger to
+    rotate a stored signing key, since it may already have been copied.
     """
-    unsecured: list[tuple[Path, int]] = []
+
+    writable: list[tuple[Path, int]] = field(default_factory=list)
+    uninspectable: list[Path] = field(default_factory=list)
+    readable: list[tuple[Path, int]] = field(default_factory=list)
+    exposed_before_repair: bool = False
+
+    @property
+    def integrity_hazards(self) -> list[str]:
+        return [f"{p} is {m:04o}" for p, m in self.writable] + [
+            f"{p} is uninspectable" for p in self.uninspectable
+        ]
+
+    @property
+    def readable_hazards(self) -> list[str]:
+        return [f"{p} is {m:04o}" for p, m in self.readable]
+
+    @property
+    def secured(self) -> bool:
+        return not (self.writable or self.uninspectable or self.readable)
+
+
+def _harden_state_permissions(db_path: Path) -> StatePermissions:
+    """Make the state directory 0700 and the database files 0600, and classify
+    whatever could not be secured.
+
+    Idempotent: a mode already right is left alone and an absent path skipped.
+    Every change is *verified* by re-reading the mode, never trusting chmod's
+    return, because on a filesystem without modes a chmod can succeed and change
+    nothing. A path that exists but cannot be stat'd is ``uninspectable`` — fail
+    closed. Read exposure on a database file *before* repair is remembered so a
+    possibly-copied signing key can be rotated even after the mode is fixed.
+
+    Never raises: whether a given hazard is tolerable depends on the
+    signing-secret arrangement, which is the bootstrap's decision
+    (:func:`nerve.migrate._refuse_insecure_secret_storage`), not this layer's.
+    """
+    perms = StatePermissions()
+    # (path, desired_mode, is_db_file). The directory first.
     targets = [(db_path.parent, _STATE_DIR_MODE, False)]
     targets.extend(
         (Path(f"{db_path}{suffix}"), _DB_FILE_MODE, True) for suffix in _DB_FILE_SUFFIXES
     )
-    for path, mode, is_db_file in targets:
-        current = _mode_of(path)
-        if current is None:
+    for path, desired, is_db_file in targets:
+        pre = _mode_of(path)
+        if pre is _ABSENT:
             continue
-        if current != mode:
+        if pre is None:
+            perms.uninspectable.append(path)
+            continue
+        if is_db_file and (pre & _GROUP_WORLD_READ):
+            perms.exposed_before_repair = True
+        final = pre
+        if pre != desired:
             try:
-                os.chmod(path, mode)
+                os.chmod(path, desired)
             except OSError as e:
                 logger.warning(
                     "Could not restrict permissions on %s to %04o (currently %04o): %s",
-                    path, mode, current, e,
+                    path, desired, pre, e,
                 )
-            # Trust the filesystem's answer, not chmod's return.
-            current = _mode_of(path)
-            if current is None:
+            final = _mode_of(path)  # trust the filesystem, not chmod's return
+            if final is _ABSENT:
                 continue
-        if not current & _GROUP_WORLD_BITS:
-            continue
-        if is_db_file:
-            unsecured.append((path, current))
-        else:
-            logger.warning(
-                "State directory %s is %04o (expected %04o) and could not be tightened; "
-                "the database files inside it are what matter, and they are checked "
-                "separately.",
-                path, current, mode,
-            )
-    return unsecured
+            if final is None:
+                perms.uninspectable.append(path)
+                continue
+        if final & _GROUP_WORLD_WRITE:
+            perms.writable.append((path, final))
+        elif is_db_file and (final & _GROUP_WORLD_READ):
+            perms.readable.append((path, final))
+    return perms
 
 
 class Database(
@@ -212,16 +257,16 @@ class Database(
         # Per-connection pragmas (see _DEFAULT_PRAGMAS). Copied per instance so
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
-        # Database files still readable by other users after connect() tried to
-        # tighten them, as (path, mode). Empty on every ordinary filesystem. The
-        # identity bootstrap consults it before it would put a signing secret
-        # in the database (see nerve.migrate.ensure_jwt_secret).
-        self.unsecured_files: list[tuple[Path, int]] = []
+        # What connect() found when it tried to make the state files owner-only.
+        # Secured on every ordinary filesystem. The identity bootstrap consults
+        # it before it trusts — or stores a signing secret in — the database
+        # (see nerve.migrate._refuse_insecure_secret_storage).
+        self.state_permissions: StatePermissions = StatePermissions()
 
     @property
     def state_secured(self) -> bool:
-        """Whether the database files are readable by this user only."""
-        return not self.unsecured_files
+        """Whether the state directory and database files are owner-only."""
+        return self.state_permissions.secured
 
     async def _apply_pragmas(self) -> None:
         """Apply the connection pragmas (see :data:`_DEFAULT_PRAGMAS`).
@@ -235,9 +280,11 @@ class Database(
     async def connect(self) -> None:
         """Open the database connection, tune it, and apply migrations."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Owner-only before anything is written: the directory, and any
-        # database files a previous run or a restore left wider than that.
-        _harden_state_permissions(self.db_path)
+        # Owner-only before anything is written: the directory, and any database
+        # files a previous run or a restore left wider than that. This first pass
+        # is what observes a pre-existing wide mode — an attacker's 0644 restart —
+        # before it is repaired, so an exposed key can be rotated below.
+        pre = _harden_state_permissions(self.db_path)
         if not self.db_path.exists():
             # Create the file owner-only *before* SQLite does. SQLite creates a
             # new database at 0644-under-umask and gives the -wal/-shm sidecars
@@ -252,17 +299,53 @@ class Database(
         # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
         # already existed from an earlier, wider run keeps its old mode until
         # this second pass tightens it. Its verdict is what the bootstrap reads.
-        self.unsecured_files = _harden_state_permissions(self.db_path)
-        if self.unsecured_files:
+        self.state_permissions = _harden_state_permissions(self.db_path)
+        exposed = pre.exposed_before_repair or self.state_permissions.exposed_before_repair
+        if not self.state_permissions.secured:
             logger.error(
-                "Database files readable by other users and not tightenable: %s "
-                "(expected %04o). No signing secret will be kept in this database; "
-                "startup refuses unless auth.jwt_secret is configured.",
-                ", ".join(f"{p} is {m:04o}" for p, m in self.unsecured_files),
-                _DB_FILE_MODE,
+                "State storage is not owner-only and could not be secured: %s "
+                "(expected directory %04o, files %04o). Startup will refuse unless "
+                "the hazard is only read exposure and auth.jwt_secret is configured.",
+                "; ".join(
+                    self.state_permissions.integrity_hazards
+                    + self.state_permissions.readable_hazards
+                ),
+                _STATE_DIR_MODE, _DB_FILE_MODE,
             )
         await run_migrations(self._db)
+        # After migrations (the table exists) and after repair: a key that was
+        # readable by other users is compromised and must not be reused.
+        if exposed:
+            await self._rotate_exposed_signing_secret()
         await self._check_fts_integrity()
+
+    async def _rotate_exposed_signing_secret(self) -> None:
+        """Delete a database-held signing secret that was readable by other
+        users before connect() repaired the mode.
+
+        The key may already have been copied, so re-securing the file is not
+        enough — it is retired, and :func:`nerve.migrate.ensure_jwt_secret`
+        generates a fresh one at bootstrap. Runs in the connect path so it
+        covers every opener (gateway, ``nerve migrate``, the installer), not
+        just the gateway process. Only an actually-stored key is rotated: a
+        fresh 0644 database from old code that never held one is not an exposure.
+        """
+        from nerve.db.accounts import JWT_SECRET_NAME
+
+        async with self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='instance_secrets'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                return  # pre-v047 or a non-nerve database
+        if await self.get_instance_secret(JWT_SECRET_NAME) is None:
+            return
+        await self.delete_instance_secret(JWT_SECRET_NAME)
+        logger.warning(
+            "%s (or a sidecar) was readable by other users; the stored JWT signing "
+            "secret is treated as compromised and has been retired. A fresh one is "
+            "generated at bootstrap and existing sessions must re-authenticate.",
+            self.db_path,
+        )
 
     async def close(self) -> None:
         if self._db:

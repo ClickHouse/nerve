@@ -1032,45 +1032,77 @@ def _retire_action(dry_run: bool) -> str:
     )
 
 
-class InsecureSecretStorage(RuntimeError):
-    """``nerve.db`` is readable by other users and no configured
-    ``auth.jwt_secret`` exists to use instead of a database-held secret.
+class InsecureStateStorage(RuntimeError):
+    """The database files or their directory are not owner-only.
 
-    Raised by the bootstrap so startup stops before a secret is generated
-    into a file other local users could read and mint tokens from.
+    Raised by the bootstrap so startup stops before trusting — or writing a
+    signing secret into — a database that other local users could modify
+    (integrity) or read (confidentiality).
     """
+
+
+# The round-2 name; kept so anything importing it still resolves.
+InsecureSecretStorage = InsecureStateStorage
 
 
 def _refuse_insecure_secret_storage(db: "Database", config: NerveConfig, *, log: bool) -> bool:
-    """Decide what an unsecured database means for the signing secret.
+    """Decide what unsecured state storage means, and stop startup when unsafe.
 
-    Secured (the normal case) → nothing. Unsecured with ``auth.jwt_secret``
-    configured → the instance starts, because nothing secret needs to live in
-    the database, but an error names the files, their modes and the expected
-    one (``log=True`` on the one call that should say it). Unsecured without a
-    configured secret → :class:`InsecureSecretStorage`, with both remedies.
-    Returns whether the database is unsecured.
+    Three cases, in order of severity:
+
+    * **Writable or uninspectable** database files or directory → always fatal,
+      regardless of ``auth.jwt_secret``. Another user could replace ``nerve.db``
+      or rewrite the accounts, actors and history later PRs trust; a configured
+      JWT protects none of that. Raises :class:`InsecureStateStorage`.
+    * **Readable** database files, no configured ``auth.jwt_secret`` → fatal: a
+      generated secret would sit in a file other users can read. Raises. Any
+      key that *was* stored while the file was readable has already been retired
+      on connect (it is compromised), so re-securing the file is necessary but,
+      on its own, does not un-leak the old key — the message says so.
+    * **Readable** database files, ``auth.jwt_secret`` configured → the gateway
+      starts (nothing secret is kept in the database), but an error names the
+      files so the operator fixes them; the database still holds accounts and
+      history worth protecting.
+
+    Returns whether the storage is unsecured (readable-with-configured-secret
+    is the only non-raising unsecured case). Secured → ``False``, no output.
     """
-    files = list(getattr(db, "unsecured_files", None) or [])
-    if not files:
+    perms = getattr(db, "state_permissions", None)
+    if perms is None or perms.secured:
         return False
-    listed = ", ".join(f"{path} is {mode:04o}" for path, mode in files)
+
+    if perms.writable or perms.uninspectable:
+        raise InsecureStateStorage(
+            "Refusing to run against database state other users can modify or that "
+            f"cannot be inspected ({'; '.join(perms.integrity_hazards)}; expected "
+            f"directory 0700, files 0600). Another user could replace the database "
+            f"or plant accounts, which a configured auth.jwt_secret does not "
+            f"protect against. Fix the permissions — chmod 0700 {db.db_path.parent} "
+            f"and chmod 0600 {db.db_path} (with its -wal/-shm sidecars) — or move "
+            f"the state directory to a filesystem that supports Unix modes."
+        )
+
+    listed = "; ".join(perms.readable_hazards)
     if config.auth.jwt_secret:
         if log:
             logger.error(
-                "The database is readable by other users (%s; expected 0600). "
-                "auth.jwt_secret is configured, so no signing secret is kept there "
-                "and the gateway starts — but fix the permissions: chmod 0700 %s and "
-                "chmod 0600 %s (including its -wal/-shm sidecars).",
-                listed, db.db_path.parent, db.db_path,
+                "Database files are readable by other users (%s; expected 0600). "
+                "auth.jwt_secret is configured, so no signing secret is kept in the "
+                "database and the gateway starts — but fix the permissions "
+                "(chmod 0600 %s and its -wal/-shm sidecars): the database still holds "
+                "accounts and history.",
+                listed, db.db_path,
             )
         return True
-    raise InsecureSecretStorage(
+    raise InsecureStateStorage(
         f"Refusing to keep a signing secret in a database other users can read "
-        f"({listed}; expected 0600). Either fix the permissions — chmod 0700 "
-        f"{db.db_path.parent} and chmod 0600 {db.db_path} (including its -wal/-shm "
-        f"sidecars) — or set auth.jwt_secret in config.local.yaml or the "
-        f"environment, in which case nothing secret is stored in the database."
+        f"({listed}; expected 0600). Any secret stored while the file was readable "
+        f"has already been retired as compromised, so re-securing the file is "
+        f"necessary but does not restore the old key. Either fix the permissions "
+        f"(chmod 0600 {db.db_path} and its -wal/-shm sidecars) so a fresh secret can "
+        f"be generated safely, or set auth.jwt_secret in config.local.yaml or the "
+        f"environment, in which case nothing secret is stored in the database. "
+        f"Existing sessions must re-authenticate."
     )
 
 
