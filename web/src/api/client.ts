@@ -18,7 +18,11 @@ export interface AuthStatus {
   /** Identity mode. `local` in this build. */
   mode: string;
   login: LoginKind;
-  /** The one account has neither a password nor a username: first-run state. */
+  /**
+   * Nothing has been secured yet: the sole account has no password, so every
+   * caller is admitted as it. Giving it a username does not clear this — only
+   * a password does.
+   */
   setup_pending: boolean;
   multiple_accounts: boolean;
 }
