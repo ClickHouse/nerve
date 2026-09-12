@@ -3538,19 +3538,17 @@ def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
     # Rewritten through the owner-only writer: the file it is rewriting holds
     # the signing secret and the password hash, and a plain write followed by a
     # chmod would republish both at the umask's mode in between. A filesystem
-    # that will not keep it private gets nothing written — the pairing is
-    # reported as not persisted rather than paid for with the secrets already
-    # in the file.
-    try:
-        paths.write_private_text(
-            local_path,
-            "# Nerve — Secrets (gitignored)\n"
-            "# API keys, tokens, and other sensitive configuration.\n\n"
-            + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
-        )
-    except paths.InsecureFileError as e:
-        logger.error("Cannot persist the Telegram pairing: %s", e)
-        return False
+    # that will not keep it private gets nothing written, and
+    # ``paths.InsecureFileError`` **propagates**: this function's ``False``
+    # already means "the id was already there", and folding a failure into it
+    # is how a caller ends up telling someone they are paired when nothing was
+    # saved. An exception is the one result a caller cannot ignore by accident.
+    paths.write_private_text(
+        local_path,
+        "# Nerve — Secrets (gitignored)\n"
+        "# API keys, tokens, and other sensitive configuration.\n\n"
+        + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+    )
     logger.info("Persisted Telegram user %d to %s", user_id, local_path)
     return True
 

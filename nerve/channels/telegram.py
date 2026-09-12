@@ -1089,6 +1089,11 @@ class TelegramChannel(BaseChannel):
             )
             return
         except Exception:
+            # Includes paths.InsecureFileError: the secrets file could not be
+            # rewritten owner-only, so nothing was saved. Authorization stands
+            # for this run and the reply says exactly that — telling someone
+            # they are paired when the allow-list was never written loses their
+            # access at the next restart with no explanation.
             logger.exception("Paired user %d but failed to persist to config", user_id)
             await update.message.reply_text(
                 "Paired for this run, but saving to config failed — check "
