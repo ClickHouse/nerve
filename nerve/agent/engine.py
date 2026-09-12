@@ -66,6 +66,7 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
+from nerve.identity import Actor, system_actor_or_none
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
@@ -1515,12 +1516,16 @@ class AgentEngine:
         at_message_id: str | None = None,
         title: str | None = None,
         source: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         """Fork a session. Returns the new session dict.
 
         Args:
             source: Override the source field on the fork (default: inherit
                     from parent).
+            actor: Who asked for the fork. Stamped on the new session; the
+                   copied messages keep their original senders.
         """
         parent = await self.db.get_session(source_session_id)
         if not parent:
@@ -1528,6 +1533,7 @@ class AgentEngine:
 
         fork = await self.sessions.fork_session(
             source_session_id, at_message_id, title, source=source,
+            actor=actor,
         )
         return fork
 
@@ -1616,6 +1622,13 @@ class AgentEngine:
                     user_message=_RESUME_AFTER_RESTART_PROMPT,
                     source=session.get("source") or "web",
                     internal=True,
+                    # The trigger is the instance's own, and `internal` keeps
+                    # it out of the transcript anyway. Whoever was talking to
+                    # the session keeps their messages; the continuation is
+                    # the assistant's.
+                    actor=await system_actor_or_none(
+                        self.db, context="resume after restart",
+                    ),
                 )
                 resumed += 1
             except Exception as e:
@@ -2258,7 +2271,11 @@ class AgentEngine:
         # Longer workflows that settle after finalize are handled by that merge.
         self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
-        # Store assistant message in DB
+        # Store assistant message in DB. Unattributed on purpose: the author
+        # is the model, which is not a principal, and 0.7 keeps assistant and
+        # tool authorship in ``role`` rather than folding it into an actor.
+        # Linking the turn back to whoever prompted it is ``caused_by_actor_id``,
+        # which the RFC makes optional and this release does not add.
         await self.sessions.add_message(
             session_id, "assistant", st.full_response_text,
             channel=channel,
@@ -2266,6 +2283,7 @@ class AgentEngine:
             blocks=st.ordered_blocks if st.ordered_blocks else None,
             native_turn_id=st.native_turn_id,
             bump_updated_at=bump_updated_at,
+            actor=None,
         )
 
         # Persist SDK session ID and update status
@@ -2425,10 +2443,21 @@ class AgentEngine:
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
         Args:
+            actor: Who supplied ``user_message``. The person who typed it for
+                      a web, WebSocket or API turn; the agent's system
+                      principal when the instance composed the prompt itself
+                      (cron, a wakeup, a plan revision, a workflow leg). It is
+                      stored on the persisted user message and on the session
+                      if this run has to create one — never on the assistant's
+                      reply, whose authorship is its ``role``. Required
+                      keyword-only: an autonomous caller must say so rather
+                      than inherit a person's identity by omission.
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
@@ -2475,6 +2504,7 @@ class AgentEngine:
                         internal=internal, images=images,
                         image_refs=image_refs,
                         bump_updated_at=bump_updated_at,
+                        actor=actor,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -2519,9 +2549,11 @@ class AgentEngine:
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> str:
         # Ensure session exists in DB
-        await self.sessions.get_or_create(session_id, source=source)
+        await self.sessions.get_or_create(session_id, source=source, actor=actor)
 
         session = await self.db.get_session(session_id)
 
@@ -2556,6 +2588,7 @@ class AgentEngine:
             await self.sessions.add_message(
                 session_id, "user", db_text, channel=channel,
                 blocks=image_refs,
+                actor=actor,
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
@@ -2794,6 +2827,7 @@ class AgentEngine:
                     channel=channel,
                     thinking=st.thinking_text if st.thinking_text else None,
                     blocks=st.ordered_blocks if st.ordered_blocks else None,
+                    actor=None,   # the model's own partial output
                 )
                 await broadcaster.broadcast(session_id, {
                     "type": "stopped", "session_id": session_id,
@@ -3132,6 +3166,7 @@ class AgentEngine:
                         channel=channel,
                         thinking=st.thinking_text or None,
                         blocks=st.ordered_blocks or None,
+                        actor=None,   # the model's own partial output
                     )
                     await broadcaster.broadcast(session_id, {
                         "type": "stopped", "session_id": session_id,
@@ -3355,7 +3390,13 @@ class AgentEngine:
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        session = await self.sessions.create_cron_session(job_id, run_id=run_id)
+        # A scheduled run is the instance's own work, whoever wrote the
+        # schedule — the human belongs on the schedule's own mutation, which
+        # 0.7 defers past this gate.
+        actor = await system_actor_or_none(self.db, context=f"cron job {job_id}")
+        session = await self.sessions.create_cron_session(
+            job_id, run_id=run_id, actor=actor,
+        )
         session_id = session["id"]
         await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
         try:
@@ -3365,6 +3406,7 @@ class AgentEngine:
                 source="cron",
                 model=model,  # backend default_model(source) fills cron defaults
                 effort_override=effort,
+                actor=actor,
             )
         finally:
             await self._teardown_oneshot_client(session_id)
@@ -3394,8 +3436,9 @@ class AgentEngine:
         isolated cron for long background work).
         """
         session_id = session_id or f"cron:{job_id}"
+        actor = await system_actor_or_none(self.db, context=f"cron job {job_id}")
         await self.sessions.get_or_create(
-            session_id, title=f"Cron: {job_id}", source="cron",
+            session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:
@@ -3405,6 +3448,7 @@ class AgentEngine:
                 source="cron",
                 model=model,  # backend default_model(source) fills cron defaults
                 effort_override=effort,
+                actor=actor,
             )
         finally:
             # The session is reused by the next run (until rotation), which
@@ -3426,7 +3470,10 @@ class AgentEngine:
         task, in which case it is kept alive so the agent can resume when the
         task completes (see ``_teardown_oneshot_client``).
         """
-        session = await self.sessions.create_hook_session(hook_name, hook_id)
+        actor = await system_actor_or_none(self.db, context=f"hook {hook_name}")
+        session = await self.sessions.create_hook_session(
+            hook_name, hook_id, actor=actor,
+        )
         session_id = session["id"]
         try:
             return await self.run(
@@ -3434,6 +3481,7 @@ class AgentEngine:
                 user_message=prompt,
                 source="hook",
                 model=model,  # backend default_model(source) fills cron defaults
+                actor=actor,
             )
         finally:
             await self._teardown_oneshot_client(session_id)

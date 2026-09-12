@@ -2,18 +2,20 @@
 
 This top-level module imports neither the database nor gateway at runtime, so
 both may use :class:`Actor`. Actors are resolved per request and passed down;
-there is no process-global current actor. The system actor cannot change, so
-the database caches it at connect (``Database.system_actor``). ``actor_id`` is
-permanent identity, while ``display_name`` is only a presentation snapshot.
+there is no process-global current actor. ``actor_id`` is permanent identity,
+while ``display_name`` is only a presentation snapshot.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from nerve.db.accounts import AccountStore
+
+logger = logging.getLogger(__name__)
 
 # ``actor_refs.kind``. A human is a person with a local account; the system
 # principal is the identity used for the agent's autonomous work.
@@ -94,3 +96,61 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
             "to a single account; sign in again"
         )
     return _actor_for_account_row(account)
+
+
+async def system_actor(store: "AccountStore") -> Actor:
+    """Resolve the account-less principal used for autonomous work."""
+    try:
+        row = await store.get_system_principal()
+    except RuntimeError as e:
+        # AccountStore validates this singleton when the database opens and
+        # raises if later external mutation breaks the cached invariant. Turn
+        # that storage failure into the same fail-closed resolution error every
+        # authenticated ingress already knows how to render.
+        raise ActorResolutionError(
+            "This instance has no valid system principal"
+        ) from e
+    if row is None:
+        raise ActorResolutionError(
+            "This instance has no system principal; identity bootstrap has not run"
+        )
+    return Actor(
+        actor_id=row["id"],
+        kind=row["kind"],
+        account_id=None,
+        display_name=row["display_name"],
+    )
+
+
+async def system_actor_or_none(
+    store: "AccountStore", *, context: str = "",
+) -> Actor | None:
+    """The system principal for work that must proceed without one.
+
+    :func:`system_actor` raises when identity bootstrap has not run, which is
+    right at an ingress: refusing a credential that resolves to nobody is the
+    safe direction. Attribution is the opposite case. A cron job, a channel
+    reply or a thread sync is real work with a real result, and the actor id is
+    metadata *about* that work — so a missing system principal leaves the row
+    unattributed and says so in the log, instead of failing the run and losing
+    the work as well as the attribution.
+
+    Production never takes that branch: every path that opens the database
+    bootstraps the identity first (``nerve.migrate.open_production_db`` and the
+    gateway lifespan), so the principal exists before anything can run.
+
+    Every failure is caught, not just the missing-principal one, for the same
+    reason: a database hiccup while reading two rows of metadata must not be
+    able to cancel a scheduled job or drop a channel reply that would have
+    worked a moment ago. This is deliberately *not* how a person's actor is
+    resolved — ``require_auth`` raises and the request is refused, because
+    there the identity is the authorization.
+    """
+    try:
+        return await system_actor(store)
+    except Exception as e:  # noqa: BLE001 — attribution must not fail the work
+        logger.warning(
+            "No system principal%s: %s — the row will be unattributed",
+            f" for {context}" if context else "", e,
+        )
+        return None
