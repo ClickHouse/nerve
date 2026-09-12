@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, NamedTuple
@@ -89,6 +91,51 @@ _DEFAULT_PRAGMAS: dict[str, object] = {
 }
 
 
+# Owner-only modes for the state directory and the database files. nerve.db
+# holds the JWT signing secret generated for installs without auth.jwt_secret
+# (``instance_secrets``) — a credential that used to live only in a 0600 config
+# file — so the files that carry it must be no weaker, and neither may the
+# directory that lists them. Re-asserted on every connect rather than only at
+# creation, which is what covers installs created under a permissive umask
+# before this existed and databases put in place by a restore.
+_STATE_DIR_MODE = 0o700
+_DB_FILE_MODE = 0o600
+# The main file plus every sidecar SQLite may leave beside it.
+_DB_FILE_SUFFIXES = ("", "-wal", "-shm", "-journal")
+
+
+def _harden_state_permissions(db_path: Path) -> None:
+    """Make the state directory 0700 and the database files 0600.
+
+    Best-effort and idempotent: a mode that is already right is left alone,
+    a file that does not exist is skipped, and a filesystem that refuses the
+    change (some network and FAT-style mounts have no modes to set) gets a
+    warning rather than a failed startup — refusing to serve would not make
+    the file any tighter.
+    """
+    targets = [(db_path.parent, _STATE_DIR_MODE)]
+    targets.extend((Path(f"{db_path}{suffix}"), _DB_FILE_MODE) for suffix in _DB_FILE_SUFFIXES)
+    for path, mode in targets:
+        try:
+            current = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.warning("Could not inspect permissions on %s: %s", path, e)
+            continue
+        if current == mode:
+            continue
+        try:
+            os.chmod(path, mode)
+        except OSError as e:
+            logger.warning(
+                "Could not restrict permissions on %s to %04o (currently %04o): %s. "
+                "It may hold the signing secret; tighten it by hand if this "
+                "filesystem supports modes.",
+                path, mode, current, e,
+            )
+
+
 class Database(
     SessionStore,
     MessageStore,
@@ -140,11 +187,24 @@ class Database(
     async def connect(self) -> None:
         """Open the database connection, tune it, and apply migrations."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Owner-only before anything is written: the directory, and any
+        # database files a previous run or a restore left wider than that.
+        _harden_state_permissions(self.db_path)
+        if not self.db_path.exists():
+            # Create the file owner-only *before* SQLite does. SQLite creates a
+            # new database at 0644-under-umask and gives the -wal/-shm sidecars
+            # the main file's mode, so fixing the mode first covers all three
+            # with no window in which the file is wider than intended.
+            self.db_path.touch(mode=_DB_FILE_MODE)
         self._db = await aiosqlite.connect(str(self.db_path))
         self._db.row_factory = aiosqlite.Row
         # Apply pragmas BEFORE migrations so the migration writes also run under
         # the tuned busy_timeout/synchronous settings and contend politely.
         await self._apply_pragmas()
+        # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
+        # already existed from an earlier, wider run keeps its old mode until
+        # this second pass tightens it.
+        _harden_state_permissions(self.db_path)
         await run_migrations(self._db)
         await self._check_fts_integrity()
 

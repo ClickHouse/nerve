@@ -90,9 +90,13 @@ SECRET_MEMBERS: frozenset[str] = frozenset({
     "state/telegram_sync.session",
     "config/config.local.yaml",
 })
-# Files within the bundle whose mode must be 0600 after restore.
+# Files within the bundle whose mode must be 0600 after restore. nerve.db is
+# among them because it may carry the generated JWT signing secret; the daemon
+# re-tightens it on every start too, but a restored file should not sit
+# world-readable until then.
 SECRET_FILE_MODE = 0o600
 _SECRET_RESTORE_PATHS: tuple[str, ...] = (
+    "nerve.db",
     "mcp-token",
     "telegram_sync.session",
 )
