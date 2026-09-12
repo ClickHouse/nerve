@@ -54,7 +54,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import IO, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +454,34 @@ def _secure_create(path: Path, what: str, *, detail: str = "nothing was copied")
     return fd
 
 
+def _verify_still_the_created_file(fd: int, path: Path, what: str) -> None:
+    """Prove ``path`` still names the file open on ``fd``, and is still private.
+
+    Everything here publishes by *name* (``os.replace``), while the bytes went
+    to a descriptor. Between the two, another user with write access to the
+    directory can unlink the temporary and put a symlink of their own in its
+    place — then the rename publishes their file, not ours. Comparing device
+    and inode (with ``follow_symlinks=False``, so a symlink is never resolved)
+    closes that window, and the mode is re-read through the descriptor, which
+    no path lookup can be tricked about. Raises :class:`BackupError`.
+    """
+    st = os.fstat(fd)
+    if not _mode_is_private(st.st_mode):
+        raise BackupError(
+            f"{what}: {path} is no longer owner-only "
+            f"({stat.S_IMODE(st.st_mode):04o}); nothing is published."
+        )
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as e:
+        raise BackupError(f"{what}: cannot inspect {path} before publishing it: {e}") from e
+    if (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino):
+        raise BackupError(
+            f"{what}: {path} was replaced while it was being written; refusing to "
+            f"publish it. Nothing was installed."
+        )
+
+
 def _secure_install_file(
     src: Path,
     dst: Path,
@@ -469,9 +497,12 @@ def _secure_install_file(
     1. the temporary file is *created* owner-only and verified through its
        descriptor (:func:`_secure_create`) — if the filesystem did not honour
        the mode, nothing has been copied yet and the restore aborts;
-    2. the bytes are copied into it and flushed;
-    3. it is renamed over ``dst`` atomically, so ``dst`` never exists at a wider
-       mode, and the result is verified once more;
+    2. the bytes are copied into that descriptor and flushed — never into the
+       pathname reopened, which could by then be someone else's file;
+    3. the pathname is proved to still be that file, device and inode, and
+       still private (:func:`_verify_still_the_created_file`), and only then
+       renamed over ``dst`` atomically, so ``dst`` never exists at a wider
+       mode. The result is verified once more;
     4. only if that final verification fails — which the earlier checks make
        all but impossible — ``last_resort`` runs on the installed file (for
        ``nerve.db``: scrub the signing secret) and the restore **still** fails.
@@ -485,10 +516,11 @@ def _secure_install_file(
     tmp = dst.with_name(dst.name + ".restore-tmp")
     fd = _secure_create(tmp, what)
     try:
-        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+        with os.fdopen(fd, "wb", closefd=False) as out, open(src, "rb") as inp:
             shutil.copyfileobj(inp, out)
             out.flush()
             os.fsync(out.fileno())
+        _verify_still_the_created_file(fd, tmp, what)
         os.replace(tmp, dst)
     except BaseException:
         try:
@@ -496,6 +528,8 @@ def _secure_install_file(
         except OSError:
             pass
         raise
+    finally:
+        os.close(fd)
     try:
         final: int | None = os.stat(dst).st_mode
     except OSError as e:
@@ -571,27 +605,41 @@ def _parity_counts(nerve_db: Path, memu_db: Path) -> dict:
 
 
 @contextmanager
-def _tar_writer(path: Path, compression: str) -> Iterator[tarfile.TarFile]:
-    """Open a streaming tar for writing, zstd or gzip."""
-    if compression == "zstd":
-        import zstandard
+def _tar_writer(
+    path: Path, compression: str, fileobj: "IO[bytes] | None" = None,
+) -> Iterator[tarfile.TarFile]:
+    """Open a streaming tar for writing, zstd or gzip.
 
-        cctx = zstandard.ZstdCompressor(level=10, threads=-1)
-        fh = open(path, "wb")
-        comp = cctx.stream_writer(fh)
-        tar = tarfile.open(mode="w|", fileobj=comp)
-        try:
-            yield tar
-        finally:
-            tar.close()
-            comp.close()  # flush the zstd frame
-            fh.close()
-    else:
-        tar = tarfile.open(path, mode="w:gz")
-        try:
-            yield tar
-        finally:
-            tar.close()
+    ``fileobj`` — an already-open, already-verified binary stream — is written
+    through instead of opening ``path`` by name. That is how the bundle is
+    produced: reopening the pathname a moment after checking it is exactly the
+    window another user with write access to the output directory needs to
+    point it at a file of their own (the tar carries the signing secret and
+    ``config.local.yaml``). The stream is flushed and closed here; the caller
+    keeps the descriptor underneath (``closefd=False``) so it can verify what
+    it wrote before publishing it.
+    """
+    fh = fileobj if fileobj is not None else open(path, "wb")
+    try:
+        if compression == "zstd":
+            import zstandard
+
+            cctx = zstandard.ZstdCompressor(level=10, threads=-1)
+            comp = cctx.stream_writer(fh)
+            tar = tarfile.open(mode="w|", fileobj=comp)
+            try:
+                yield tar
+            finally:
+                tar.close()
+                comp.close()  # flush the zstd frame
+        else:
+            tar = tarfile.open(mode="w:gz", fileobj=fh)
+            try:
+                yield tar
+            finally:
+                tar.close()
+    finally:
+        fh.close()
 
 
 @contextmanager
@@ -859,14 +907,18 @@ def create_backup(
         #
         # The bundle carries nerve.db — accounts, history and, unless
         # ``--no-secrets`` scrubbed it, the JWT signing secret — plus
-        # config.local.yaml with the password hash. It is therefore created
-        # owner-only *before* a byte of it is written (and verified through the
-        # descriptor, so a filesystem that ignores the mode is caught while the
-        # file is still empty), rather than left at whatever the umask gives.
-        # ``os.replace`` below keeps that mode on the final bundle.
+        # config.local.yaml with the password hash. So it is created owner-only
+        # *before* a byte of it is written (verified through the descriptor,
+        # which catches a filesystem that ignores the mode while the file is
+        # still empty), the tar is written **through that descriptor** rather
+        # than by reopening the name, and the name is proved to still be that
+        # file before the rename publishes it. Another user with write access
+        # to the output directory could otherwise swap the temporary for a
+        # symlink and collect the whole bundle. ``os.replace`` keeps the mode.
         tmp_bundle = output_dir / (final_name + ".tmp")
+        fd: int | None = None
         try:
-            os.close(_secure_create(tmp_bundle, "Backup", detail="nothing was written"))
+            fd = _secure_create(tmp_bundle, "Backup", detail="nothing was written")
         except BackupError:
             if include_secrets:
                 raise
@@ -879,12 +931,22 @@ def create_backup(
                 "secrets (--no-secrets) but is readable by other users.", tmp_bundle,
             )
             tmp_bundle.unlink(missing_ok=True)
-        with _tar_writer(tmp_bundle, compression) as tar:
-            tar.add(stage / "manifest.json", arcname="manifest.json")
-            for sub in ("config", "state", "workspace"):
-                p = stage / sub
-                if p.exists():
-                    tar.add(p, arcname=sub)
+        try:
+            writer = os.fdopen(fd, "wb", closefd=False) if fd is not None else None
+            with _tar_writer(tmp_bundle, compression, fileobj=writer) as tar:
+                tar.add(stage / "manifest.json", arcname="manifest.json")
+                for sub in ("config", "state", "workspace"):
+                    p = stage / sub
+                    if p.exists():
+                        tar.add(p, arcname=sub)
+            if fd is not None:
+                _verify_still_the_created_file(fd, tmp_bundle, "Backup")
+        except BaseException:
+            tmp_bundle.unlink(missing_ok=True)
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
         os.replace(tmp_bundle, final_path)
 
         size = final_path.stat().st_size

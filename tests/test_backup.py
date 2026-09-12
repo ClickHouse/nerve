@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import tarfile
 import threading
 import time
 from pathlib import Path
@@ -612,15 +613,18 @@ class TestRestoreNeverLeavesAReadableKey:
 
     @staticmethod
     def _installed_file_reads_back_wide(monkeypatch) -> None:
-        """The temp verifies (so the copy proceeds) and the installed file then
-        reads back wide — the one case the scrub is still for."""
+        """The temp verifies twice (so the copy proceeds and is published) and
+        the installed file then reads back wide — the one case the scrub is
+        still for."""
         seen = {"files": 0}
 
         def fake(st_mode: int) -> bool:
             if stat.S_ISDIR(st_mode):
                 return True
             seen["files"] += 1
-            return seen["files"] == 1  # 1: the temp's fstat; 2: the final stat
+            # 1: the temp's fstat at create; 2: the fstat before publishing it;
+            # 3: the final stat of the installed file.
+            return seen["files"] <= 2
 
         monkeypatch.setattr(backup_mod, "_mode_is_private", fake)
 
@@ -718,6 +722,70 @@ class TestTheBundleItselfIsOwnerOnly:
             )
         assert result.path.exists()
         assert any("readable by other users" in r.getMessage() for r in caplog.records)
+
+    def test_the_bundle_is_written_through_the_descriptor_it_verified(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """F26: the tar goes into the *descriptor* that was checked, never into
+        the pathname reopened. Another user with write access to the output
+        directory (a shared or mounted backup target) who replaces the
+        temporary with a symlink must not receive the bundle."""
+        out = tmp_path / "out"
+        out.mkdir()
+        target = tmp_path / "attacker.tar"
+        target.write_text("", encoding="utf-8")
+        os.chmod(target, 0o644)
+        real_create = backup_mod._secure_create
+        swapped: list[Path] = []
+
+        def swap_right_after_creating_it(path, what, **kwargs):
+            """The attacker's window: the instant after the temporary is
+            created and verified. Code that then reopened the *name* would
+            write the bundle straight into their file."""
+            fd = real_create(path, what, **kwargs)
+            path.unlink()
+            path.symlink_to(target)
+            swapped.append(path)
+            return fd
+
+        monkeypatch.setattr(backup_mod, "_secure_create", swap_right_after_creating_it)
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+        assert swapped, "the test did not manage to swap the temporary"
+        assert target.read_bytes() == b""  # nothing was written through the symlink
+        assert list(out.iterdir()) == []  # and no bundle was published
+
+    def test_a_swapped_restore_temporary_is_not_published_either(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The same discipline on the restore side: the installed file must be
+        the one whose mode was verified, not whatever the name points at by the
+        time of the rename."""
+        nd = _nerve_dir_with_stored_key(tmp_path)
+        bundle = backup_mod.create_backup(
+            nd, workspace, tmp_path / "out", config_dir=config_dir,
+        ).path
+        nd2 = tmp_path / "restored_nerve"
+        target = tmp_path / "attacker.db"
+        target.write_text("attacker", encoding="utf-8")
+        real_copy = backup_mod.shutil.copyfileobj
+
+        def swap_after_copy(inp, out, *a, **k):
+            result = real_copy(inp, out, *a, **k)
+            tmp = nd2 / "nerve.db.restore-tmp"
+            if tmp.is_file():
+                tmp.unlink()
+                tmp.symlink_to(target)
+            return result
+
+        monkeypatch.setattr(backup_mod.shutil, "copyfileobj", swap_after_copy)
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.restore_bundle(
+                bundle, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+            )
+        assert not (nd2 / "nerve.db").exists()
+        assert target.read_text(encoding="utf-8") == "attacker"
 
 
 class TestRestoredConfigLocalIsOwnerOnly:
