@@ -13,6 +13,17 @@ import yaml
 
 from nerve.cron.service import CronService
 from nerve.cron.jobs import CronJob, is_reserved_job_id
+from nerve.identity import Actor
+
+# `require_auth` hands a route the actor the request resolved to. These tests
+# call the route functions directly, so they supply one; no route here reads
+# it, so any well-formed actor does.
+_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
 
 
 def _write_jobs(path: Path, jobs: list[dict]) -> None:
@@ -882,7 +893,7 @@ class TestReloadRoute:
 
         monkeypatch.setattr(srv, "_cron_service", None, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs(actor=_ACTOR)
         assert ei.value.status_code == 503
 
     @pytest.mark.asyncio
@@ -896,7 +907,7 @@ class TestReloadRoute:
             return_value={"added": ["a"], "removed": [], "updated": [], "enabled": 1}
         )
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
-        result = await reload_cron_jobs(user={})
+        result = await reload_cron_jobs(actor=_ACTOR)
         assert result["reloaded"] is True
         assert result["added"] == ["a"]
 
@@ -912,7 +923,7 @@ class TestReloadRoute:
         fake.reload = AsyncMock(side_effect=ConfigError("bad cron file"))
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs(actor=_ACTOR)
         assert ei.value.status_code == 400
         assert "bad cron file" in ei.value.detail
 
@@ -931,7 +942,7 @@ class TestReloadRoute:
         )
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs(actor=_ACTOR)
         assert ei.value.status_code == 400
         assert "typo" in ei.value.detail
 

@@ -6,12 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 router = APIRouter()
 
 
 @router.get("/api/mcp-servers")
-async def list_mcp_servers(user: dict = Depends(require_auth)):
+async def list_mcp_servers(actor: Actor = Depends(require_auth)):
     """List all MCP servers with aggregated usage stats."""
     deps = get_deps()
     servers = await deps.db.get_mcp_server_stats()
@@ -19,7 +20,7 @@ async def list_mcp_servers(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/mcp-servers/{server_name}")
-async def get_mcp_server_detail(server_name: str, user: dict = Depends(require_auth)):
+async def get_mcp_server_detail(server_name: str, actor: Actor = Depends(require_auth)):
     """Get detailed info for a specific MCP server."""
     deps = get_deps()
     stats_list = await deps.db.get_mcp_server_stats()
@@ -35,7 +36,7 @@ async def get_mcp_server_detail(server_name: str, user: dict = Depends(require_a
 
 @router.get("/api/mcp-servers/{server_name}/usage")
 async def get_mcp_server_usage(
-    server_name: str, limit: int = 50, user: dict = Depends(require_auth),
+    server_name: str, limit: int = 50, actor: Actor = Depends(require_auth),
 ):
     """Get usage history for an MCP server."""
     deps = get_deps()
@@ -44,7 +45,7 @@ async def get_mcp_server_usage(
 
 
 @router.post("/api/mcp-servers/reload")
-async def reload_mcp_servers(user: dict = Depends(require_auth)):
+async def reload_mcp_servers(actor: Actor = Depends(require_auth)):
     """Re-read MCP server config from YAML files and refresh cache."""
     from nerve.config import ConfigError
 

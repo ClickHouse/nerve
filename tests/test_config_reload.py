@@ -12,6 +12,7 @@ import pytest
 import pytest_asyncio
 
 import nerve.sources.registry as registry
+from nerve.identity import Actor
 from nerve.config_reload import (
     _RESTART_ONLY_PATHS,
     _UNSET,
@@ -20,6 +21,16 @@ from nerve.config_reload import (
     reload_failures,
 )
 from nerve.cron.service import CronService
+
+# `require_auth` hands a route the actor the request resolved to. These tests
+# call the route functions directly, so they supply one; no route here reads
+# it, so any well-formed actor does.
+_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
 
 
 def _fake_runner(job_id, source_name):
@@ -781,7 +792,7 @@ class TestReloadRoute:
             "nerve.config_reload.reload_all",
             AsyncMock(return_value={"config": "reloaded"}),
         )
-        result = await route_mod.reload_config_route(user={})
+        result = await route_mod.reload_config_route(actor=_ACTOR)
         assert result["ok"] is True
         assert result["detail"] == {"config": "reloaded"}
         assert result["errors"] == {}
@@ -805,7 +816,7 @@ class TestReloadRoute:
                 "config": "error: bad yaml", "cron": {"enabled": 3},
             }),
         )
-        result = await route_mod.reload_config_route(user={})
+        result = await route_mod.reload_config_route(actor=_ACTOR)
         assert result["ok"] is False
         assert result["errors"] == {"config": "bad yaml"}
         # The rest still ran — best-effort is the point, and the detail shows it.

@@ -16,6 +16,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
+from nerve.identity import Actor
 
 router = APIRouter()
 
@@ -93,7 +94,7 @@ async def list_tasks(
     sort: str = "deadline",
     limit: int = 50,
     offset: int = 0,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     deps = get_deps()
     # Clamp inputs to sensible bounds; silently fall back on unknown sorts.
@@ -112,7 +113,7 @@ async def list_tasks(
 
 
 @router.get("/api/tasks/search")
-async def search_tasks(q: str, status: str = "", user: dict = Depends(require_auth)):
+async def search_tasks(q: str, status: str = "", actor: Actor = Depends(require_auth)):
     deps = get_deps()
     # Search is relevance-ranked (BM25); pagination would fight the ranking,
     # so we return up to 100 hits and let the UI hide pagination when active.
@@ -131,7 +132,7 @@ async def task_board(
     limit: int = _BOARD_LANE_LIMIT,
     tag: str = "",
     q: str = "",
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     """Every lane in one round trip: statuses + their ordered tasks.
 
@@ -198,7 +199,7 @@ async def task_board(
 
 @router.get("/api/tasks/tags")
 async def list_task_tags(
-    include_done: bool = False, user: dict = Depends(require_auth),
+    include_done: bool = False, actor: Actor = Depends(require_auth),
 ):
     """Tag facets for the board filter bar, most-used first."""
     deps = get_deps()
@@ -206,7 +207,7 @@ async def list_task_tags(
 
 
 @router.post("/api/tasks")
-async def create_task(req: TaskCreateRequest, user: dict = Depends(require_auth)):
+async def create_task(req: TaskCreateRequest, actor: Actor = Depends(require_auth)):
     # Route into the unified handler surface via the live registry — no
     # behavior duplication between the REST and MCP paths.
     result = await get_tool_registry().invoke(
@@ -254,7 +255,7 @@ async def create_task(req: TaskCreateRequest, user: dict = Depends(require_auth)
 
 @router.post("/api/tasks/{task_id}/move")
 async def move_task(
-    task_id: str, req: TaskMoveRequest, user: dict = Depends(require_auth),
+    task_id: str, req: TaskMoveRequest, actor: Actor = Depends(require_auth),
 ):
     """Reorder a task within a lane, or move it to another one."""
     deps = get_deps()
@@ -295,7 +296,7 @@ async def move_task(
 
 @router.get("/api/tasks/{task_id}/events")
 async def list_task_events(
-    task_id: str, limit: int = 200, user: dict = Depends(require_auth),
+    task_id: str, limit: int = 200, actor: Actor = Depends(require_auth),
 ):
     """A task's status history, oldest first."""
     deps = get_deps()
@@ -304,7 +305,7 @@ async def list_task_events(
 
 
 @router.get("/api/tasks/{task_id}")
-async def get_task(task_id: str, user: dict = Depends(require_auth)):
+async def get_task(task_id: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if not task:
@@ -319,7 +320,7 @@ async def get_task(task_id: str, user: dict = Depends(require_auth)):
 
 
 @router.patch("/api/tasks/{task_id}")
-async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends(require_auth)):
+async def update_task(task_id: str, req: TaskUpdateRequest, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if not task:
@@ -405,14 +406,14 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
 
 
 @router.get("/api/task-statuses")
-async def list_task_statuses(user: dict = Depends(require_auth)):
+async def list_task_statuses(actor: Actor = Depends(require_auth)):
     deps = get_deps()
     return {"statuses": await deps.db.list_task_statuses()}
 
 
 @router.post("/api/task-statuses")
 async def create_task_status(
-    req: TaskStatusCreateRequest, user: dict = Depends(require_auth),
+    req: TaskStatusCreateRequest, actor: Actor = Depends(require_auth),
 ):
     deps = get_deps()
     name = (req.name or "").strip().lower()
@@ -442,7 +443,7 @@ class TaskStatusReorderRequest(BaseModel):
 
 @router.post("/api/task-statuses/reorder")
 async def reorder_task_statuses(
-    req: TaskStatusReorderRequest, user: dict = Depends(require_auth),
+    req: TaskStatusReorderRequest, actor: Actor = Depends(require_auth),
 ):
     """Set board column order in one write.
 
@@ -454,7 +455,7 @@ async def reorder_task_statuses(
 
 @router.patch("/api/task-statuses/{name}")
 async def update_task_status(
-    name: str, req: TaskStatusUpdateRequest, user: dict = Depends(require_auth),
+    name: str, req: TaskStatusUpdateRequest, actor: Actor = Depends(require_auth),
 ):
     deps = get_deps()
     existing = await deps.db.get_task_status_def(name)
@@ -472,7 +473,7 @@ async def update_task_status(
 
 
 @router.delete("/api/task-statuses/{name}")
-async def delete_task_status(name: str, user: dict = Depends(require_auth)):
+async def delete_task_status(name: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     existing = await deps.db.get_task_status_def(name)
     if not existing:
