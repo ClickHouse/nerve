@@ -311,6 +311,68 @@ class TestMalformedAuthSection:
         assert not any("mapping" in e for e in validate_config_bundle(config_dir).errors)
 
 
+_HASH = "$2b$12$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTU"
+_JWT = "configured-secret-padded-to-thirty-two-bytes"
+_CREDENTIALS = f"auth:\n  password_hash: '{_HASH}'\n  jwt_secret: {_JWT}\n"
+
+
+class TestANullAuthOverlayKeepsWhatIsUnderIt:
+    """F24: a bare ``auth:`` line is a *no-op overlay*, not an eraser.
+
+    YAML null is not a mapping, so a deep merge would let it replace the
+    section below it — an ``auth:`` typed into config.local.yaml, or left
+    behind by scrubbing secrets out of a file, would silently remove a
+    configured password and turn the instance passwordless. Each layer's
+    ``auth`` is normalised to ``{}`` before the merge instead, so nothing
+    underneath is lost. Runtime and the validator agree.
+    """
+
+    @staticmethod
+    def _credentials_survive(config_dir: Path) -> None:
+        from nerve.config_validate import validate_config_bundle
+
+        config = load_config(config_dir)
+        assert config.auth.password_hash == _HASH  # still password-protected
+        assert config.auth.jwt_secret == _JWT
+        result = validate_config_bundle(config_dir)
+        assert not any("auth" in e for e in result.errors), result.errors
+
+    def test_a_null_overlay_in_config_local_does_not_erase_the_tracked_section(
+        self, tmp_path,
+    ):
+        self._credentials_survive(
+            _install(tmp_path, settings=_CREDENTIALS, local="auth:\n")
+        )
+
+    def test_a_null_overlay_in_config_yaml_does_not_erase_it_either(self, tmp_path):
+        self._credentials_survive(
+            _install(tmp_path, settings=_CREDENTIALS, base="auth:\n")
+        )
+
+    def test_a_null_overlay_does_not_erase_a_machine_local_section(self, tmp_path):
+        """The same one layer down: config.local.yaml's null over config.yaml's
+        credentials, which is also what the ``machine`` view is built from."""
+        self._credentials_survive(
+            _install(tmp_path, base=_CREDENTIALS, local="auth:\n")
+        )
+
+    def test_a_null_overlay_in_both_machine_layers_still_keeps_the_tracked_one(
+        self, tmp_path,
+    ):
+        self._credentials_survive(
+            _install(tmp_path, settings=_CREDENTIALS, base="auth:\n", local="auth:\n")
+        )
+
+    def test_a_null_mode_reads_as_absent(self, tmp_path):
+        """``mode:`` with nothing under it expresses no opinion — the default,
+        and no effect on the rest of the section."""
+        config_dir = _install(
+            tmp_path, settings=_CREDENTIALS, local="auth:\n  mode:\n",
+        )
+        assert load_config(config_dir).auth.mode == "local"
+        self._credentials_survive(config_dir)
+
+
 class TestValidatorHonoursTheEnvAnchor:
     """F14: `nerve config validate` must apply NERVE_AUTH_MODE the way runtime
     does, so a check cannot approve a config that will not start or reject one

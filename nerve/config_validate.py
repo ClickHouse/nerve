@@ -105,6 +105,18 @@ def validate_config_bundle(
         if layer is not None and p.exists()
     ]
     base, local = layers[0] or {}, layers[1] or {}
+    # Mirror _read_config_sources, *before* the merge it mirrors: a non-mapping
+    # ``auth`` in a layer is invalid (never normalised into "no auth"), and a
+    # null one becomes the empty overlay so it cannot erase the credentials
+    # below it. Checked per layer, so a broken tracked section is reported even
+    # where a machine layer would have merged over it.
+    auth_ok = True
+    for layer, where in ((base, "config.yaml"), (local, "config.local.yaml")):
+        try:
+            cfg._normalise_layer_auth(layer, where)
+        except cfg.ConfigError as e:
+            result.errors.append(str(e))
+            auth_ok = False
     machine = cfg._deep_merge(base, local)
 
     # An environment anchor forces lockdown regardless of the files, so a run in
@@ -141,6 +153,12 @@ def validate_config_bundle(
         workspace = cfg._expand_path(ws_raw) or cfg.paths.default_workspace()
 
     ws_settings = _read_workspace_settings(workspace, result)
+    if isinstance(ws_settings, dict):
+        try:
+            cfg._normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
+        except cfg.ConfigError as e:
+            result.errors.append(str(e))
+            auth_ok = False
     # Mirror _read_config_sources: the tracked file is never a source for the
     # identity mode. Dropped here too, so validation judges the config the
     # daemon will actually run, and reported so the author learns why the key
@@ -201,21 +219,6 @@ def validate_config_bundle(
     # Pin the workspace so cron paths resolve against the validated workspace.
     merged["workspace"] = str(workspace)
 
-    # Mirror _read_config_sources: a non-mapping ``auth`` in any layer is
-    # invalid, exactly as the loader refuses it — never normalised into "no
-    # auth". Checked per layer, so a broken tracked section is reported even
-    # where a machine layer would have merged over it.
-    auth_ok = True
-    for layer, where in (
-        (base, "config.yaml"),
-        (local, "config.local.yaml"),
-        (ws_settings, "workspace/config/settings.yaml"),
-    ):
-        try:
-            cfg._require_auth_mapping(layer.get("auth"), where)
-        except cfg.ConfigError as e:
-            result.errors.append(str(e))
-            auth_ok = False
     # auth.mode is machine-local, injected independently of the lockdown layer
     # selection, so validation judges the same mode the daemon will run (and
     # does not silently drop it under a locked view).

@@ -466,6 +466,36 @@ def _require_auth_mapping(value: Any, where: str) -> None:
         )
 
 
+def _normalise_layer_auth(layer: dict[str, Any], where: str) -> dict[str, Any]:
+    """Validate and normalise one layer's ``auth`` section *before* any merge.
+
+    Two things, in the only place where the second one is safe:
+
+    * a present, non-mapping ``auth`` is refused (:func:`_require_auth_mapping`);
+    * a present **null** ``auth:`` becomes the empty mapping.
+
+    The second is what keeps a bare ``auth:`` line a no-op overlay. Left as
+    ``None`` it is not a mapping, so :func:`_deep_merge` *replaces* the section
+    below it rather than merging into it: an ``auth:`` typed into
+    ``config.local.yaml`` (or left behind by hand-editing or by scrubbing
+    secrets out of a file) would erase a tracked ``password_hash`` and
+    ``jwt_secret`` and leave a passwordless instance — the silent downgrade 0.1
+    forbids. Normalised per layer, an empty section overlays nothing and every
+    key underneath survives.
+
+    Only ``auth`` is treated this way. Every other section keeps the merge
+    semantics it has always had, where a null overlay clears what is below it;
+    ``auth`` is singled out because it is the one section whose disappearance
+    *weakens* the instance instead of resetting it to a default.
+
+    Mutates and returns ``layer``.
+    """
+    _require_auth_mapping(layer.get("auth"), where)
+    if "auth" in layer and layer["auth"] is None:
+        layer["auth"] = {}
+    return layer
+
+
 def _inject_machine_auth_mode(merged: dict[str, Any], machine: dict[str, Any]) -> None:
     """Carry ``auth.mode`` from the machine-local layers into the final config.
 
@@ -745,11 +775,12 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     """
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
-    # A non-mapping ``auth`` in any layer is refused *before* merging: a deep
-    # merge would let a well-formed machine section silently replace a broken
-    # tracked one, and the tracked layer is exactly what a push delivers.
-    _require_auth_mapping(base.get("auth"), "config.yaml")
-    _require_auth_mapping(local.get("auth"), "config.local.yaml")
+    # Each layer's ``auth`` is judged and normalised *before* merging: a deep
+    # merge would otherwise let a well-formed machine section silently replace a
+    # broken tracked one (and the tracked layer is exactly what a push
+    # delivers), or let a bare ``auth:`` replace the credentials underneath it.
+    _normalise_layer_auth(base, "config.yaml")
+    _normalise_layer_auth(local, "config.local.yaml")
 
     machine = _deep_merge(base, local)
     # An env-anchored instance takes its workspace from the environment too, so
@@ -773,7 +804,7 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
-    _require_auth_mapping(ws_settings.get("auth"), "workspace/config/settings.yaml")
+    _normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
     # The one key the tracked layer may never supply: the identity mode.
     _drop_tracked_auth_mode(ws_settings, workspace)
 
