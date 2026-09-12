@@ -268,11 +268,16 @@ class TestJwtSecret:
         under the fresh S3 the next unconfigured start generates."""
         from fastapi import HTTPException
 
-        from nerve.gateway.auth import create_token, decode_token, unpin_jwt_secret
+        from nerve.gateway.auth import (
+            SYSTEM_SUBJECT,
+            create_system_token,
+            decode_token,
+            unpin_jwt_secret,
+        )
 
         s1 = await ensure_jwt_secret(db, NerveConfig())
-        old_token = create_token(s1)
-        assert decode_token(old_token, effective_jwt_secret())["sub"] == "user"
+        old_token = create_system_token(s1)
+        assert decode_token(old_token, effective_jwt_secret())["sub"] == SYSTEM_SUBJECT
 
         unpin_jwt_secret()  # restart, S2 configured
         report = MigrationReport()

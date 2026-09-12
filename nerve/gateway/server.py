@@ -13,6 +13,7 @@ import os
 import ssl
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,6 +29,7 @@ from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.gateway.auth import SESSION_TOKEN_HEADER, authenticate_websocket
+from nerve.identity import Actor
 from nerve.gateway.routes import (
     init_deps,
     register_all_routes,
@@ -87,6 +89,41 @@ def get_codex_thread_sync():
     feature is disabled or hasn't finished starting up.
     """
     return _codex_thread_sync
+
+
+@dataclass(frozen=True, slots=True)
+class WebSocketConnection:
+    """What a live WebSocket is, fixed at accept and never rewritten.
+
+    Frozen on purpose. A socket stays open for hours, so anything mutable here
+    is an identity that can change halfway through a conversation: the actor
+    resolved at accept is the actor every message on this connection is
+    attributed to, and a later disable, rename or second account leaves it
+    exactly as it was. The next connection re-resolves from scratch, which is
+    where such a change takes effect.
+
+    Session selection is deliberately *not* here — the client switches sessions
+    over the same socket, so that one is a local variable in the handler.
+    """
+
+    client_id: str
+    actor: Actor
+
+
+async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
+    """Accept a socket, authenticate it, and fix its actor for good.
+
+    The one place a WebSocket's identity is decided. Returns ``None`` after
+    closing the socket when the credential is missing, invalid, or names no
+    account this instance can act for (a disabled account, or a pre-account
+    token on an install that now has two).
+    """
+    await websocket.accept()
+    actor = await authenticate_websocket(websocket)
+    if actor is None:
+        await websocket.close(code=4001, reason="Unauthorized")
+        return None
+    return WebSocketConnection(client_id=str(uuid.uuid4())[:8], actor=actor)
 
 
 async def _send_session_status(
@@ -891,14 +928,14 @@ def create_app() -> FastAPI:
     # WebSocket endpoint
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
-        await websocket.accept()
-
-        # Authenticate
-        if not await authenticate_websocket(websocket):
-            await websocket.close(code=4001, reason="Unauthorized")
+        # Accept, authenticate and resolve the actor — once, here. Nothing
+        # below re-reads identity: this connection acts as `connection.actor`
+        # until it closes.
+        connection = await _accept_websocket(websocket)
+        if connection is None:
             return
 
-        client_id = str(uuid.uuid4())[:8]
+        client_id = connection.client_id
         router = _engine.router
         # Reuse the last session for this channel (no sticky period).
         # Only create a brand-new session if none exist at all.

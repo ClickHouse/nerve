@@ -125,9 +125,9 @@ def _post_jsonrpc(
         # The secret in force is the one the lifespan bootstrap generated
         # (auth.jwt_secret is unset in the fixture's config), published to the
         # process once the TestClient context has started the app.
-        from nerve.gateway.auth import create_token, effective_jwt_secret
+        from nerve.gateway.auth import create_system_token, effective_jwt_secret
 
-        headers["Authorization"] = f"Bearer {create_token(effective_jwt_secret())}"
+        headers["Authorization"] = f"Bearer {create_system_token(effective_jwt_secret())}"
     return client.post("/mcp/v1/", json=body, headers=headers)
 
 

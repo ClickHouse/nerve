@@ -24,8 +24,12 @@ from nerve.config import AuthConfig, NerveConfig, set_config, workspace_settings
 from nerve.gateway.auth import (
     JWT_ALGORITHM,
     NO_SECRET_DETAIL,
+    TOKEN_TYPE_CLAIM,
+    TOKEN_TYPE_SESSION,
+    TOKEN_TYPE_SYSTEM,
     authenticate_websocket,
-    create_token,
+    create_session_token,
+    create_system_token,
     effective_jwt_secret,
     pin_jwt_secret,
     pinned_jwt_secret,
@@ -33,6 +37,7 @@ from nerve.gateway.auth import (
     unpin_jwt_secret,
 )
 from nerve.gateway.routes.auth import router as auth_router
+from nerve.identity import Actor
 from nerve.mcp_server.auth import McpAuthError, authenticate_mcp
 
 _CONFIGURED = "configured-secret-padded-to-thirty-two-bytes!!"
@@ -54,24 +59,38 @@ def config():
 
 
 @pytest.fixture
-def client(config):
+def client(config, tmp_path, open_identity_db, wire_identity_store):
+    """The gateway's auth surface over a real, bootstrapped database.
+
+    A verified token still has to name an account, so these tests need the
+    identity rows first start creates. The database is opened inside the
+    client's own event loop (``portal``) so the app and the fixture share one.
+    ``client.account_id`` / ``client.actor_id`` are the ids that were created.
+    """
     app = FastAPI()
     app.include_router(auth_router)
 
     @app.get("/api/thing")
-    async def thing(user: dict = Depends(require_auth)):
-        return {"ok": True}
+    async def thing(actor: Actor = Depends(require_auth)):
+        return {"ok": True, "actor_id": actor.actor_id, "account_id": actor.account_id}
 
     with TestClient(app) as c:
-        yield c
+        database, identity = c.portal.call(open_identity_db, tmp_path / "nerve.db")
+        wire_identity_store(database)
+        c.account_id = identity.owner_account_id
+        c.actor_id = identity.owner_actor_id
+        try:
+            yield c
+        finally:
+            c.portal.call(database.close)
 
 
 def _claims(token: str, secret: str) -> dict:
     return jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
 
 
-def _bearer(secret: str) -> dict:
-    return {"Authorization": f"Bearer {create_token(secret)}"}
+def _bearer(secret: str, account_id: str) -> dict:
+    return {"Authorization": f"Bearer {create_session_token(secret, account_id)}"}
 
 
 class TestEffectiveSecret:
@@ -114,7 +133,9 @@ class TestFailClosedWithoutASecret:
         assert res.status_code == 503
         assert res.json()["detail"] == NO_SECRET_DETAIL
         # A token signed with anything at all changes nothing.
-        assert client.get("/api/thing", headers=_bearer(_FORGED)).status_code == 503
+        assert client.get(
+            "/api/thing", headers=_bearer(_FORGED, client.account_id),
+        ).status_code == 503
 
     def test_login_refuses_instead_of_minting_a_dev_secret_token(self, client, config):
         config.auth.password_hash = _HASH
@@ -128,8 +149,9 @@ class TestFailClosedWithoutASecret:
     @pytest.mark.parametrize("lockdown", [False, True], ids=["unlocked", "locked"])
     async def test_websocket_refuses(self, config, lockdown):
         config.lockdown = lockdown
-        assert await authenticate_websocket(_Socket()) is False
-        assert await authenticate_websocket(_Socket(token=create_token(_FORGED))) is False
+        assert await authenticate_websocket(_Socket()) is None
+        forged = create_system_token(_FORGED)
+        assert await authenticate_websocket(_Socket(token=forged)) is None
 
     @pytest.mark.parametrize("lockdown", [False, True], ids=["unlocked", "locked"])
     def test_mcp_refuses(self, config, lockdown):
@@ -137,7 +159,7 @@ class TestFailClosedWithoutASecret:
         with pytest.raises(McpAuthError, match="No signing secret"):
             authenticate_mcp(_scope(), config)
         with pytest.raises(McpAuthError, match="No signing secret"):
-            authenticate_mcp(_scope(create_token(_FORGED)), config)
+            authenticate_mcp(_scope(create_system_token(_FORGED)), config)
 
     def test_backend_token_minting_yields_nothing(self, config):
         from nerve.agent.engine import AgentEngine
@@ -158,7 +180,9 @@ class TestLoginRoute:
         assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
         res = client.post("/api/auth/login", json={"password": _PASSWORD})
         assert res.status_code == 200
-        assert _claims(res.json()["token"], _CONFIGURED)["sub"] == "user"
+        claims = _claims(res.json()["token"], _CONFIGURED)
+        assert claims["sub"] == client.account_id
+        assert claims[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SESSION
         assert client.get("/api/auth/status").json() == {"auth_required": True}
 
     def test_password_checked_and_token_signed_with_the_generated_secret(self, client, config):
@@ -171,7 +195,7 @@ class TestLoginRoute:
         res = client.post("/api/auth/login", json={"password": _PASSWORD})
         assert res.status_code == 200
         token = res.json()["token"]
-        assert _claims(token, _GENERATED)["sub"] == "user"
+        assert _claims(token, _GENERATED)["sub"] == client.account_id
         # ...and specifically not with the literal the old code used. Decoding
         # with a ten-byte key trips PyJWT's key-length warning; that is the
         # point of the check, not noise worth surfacing in the run.
@@ -189,7 +213,7 @@ class TestLoginRoute:
         res = client.post("/api/auth/login", json={"password": "anything at all"})
         assert res.status_code == 200
         token = res.json()["token"]
-        assert _claims(token, _GENERATED)["sub"] == "user"
+        assert _claims(token, _GENERATED)["sub"] == client.account_id
         assert client.get(
             "/api/auth/check", headers={"Authorization": f"Bearer {token}"},
         ).json() == {"authenticated": True}
@@ -199,22 +223,28 @@ class TestLoginRoute:
         pin_jwt_secret(_CONFIGURED)
         res = client.post("/api/auth/login", json={"password": ""})
         assert res.status_code == 200
-        assert _claims(res.json()["token"], _CONFIGURED)["sub"] == "user"
+        assert _claims(res.json()["token"], _CONFIGURED)["sub"] == client.account_id
 
 
 class TestRequireAuthWithAPinnedSecret:
     def test_the_pinned_secret_gates_requests(self, client, config):
         pin_jwt_secret(_GENERATED)
         assert client.get("/api/thing").status_code == 401
-        assert client.get("/api/thing", headers=_bearer(_GENERATED)).status_code == 200
-        assert client.get("/api/thing", headers=_bearer(_FORGED)).status_code == 401
+        res = client.get("/api/thing", headers=_bearer(_GENERATED, client.account_id))
+        assert res.status_code == 200
+        assert res.json()["actor_id"] == client.actor_id
+        assert client.get(
+            "/api/thing", headers=_bearer(_FORGED, client.account_id),
+        ).status_code == 401
 
     def test_a_configured_secret_that_config_no_longer_shows_still_gates(self, client, config):
         """The config object is what a reload replaces; the pin is what the
         gateway checks against."""
         pin_jwt_secret(_CONFIGURED)
         config.auth.jwt_secret = ""  # the reloaded config dropped the key
-        assert client.get("/api/thing", headers=_bearer(_CONFIGURED)).status_code == 200
+        assert client.get(
+            "/api/thing", headers=_bearer(_CONFIGURED, client.account_id),
+        ).status_code == 200
         assert client.get("/api/thing").status_code == 401  # still not open
 
 
@@ -231,12 +261,24 @@ def _scope(token: str | None = None) -> dict:
 
 @pytest.mark.asyncio
 class TestWebSocketWithAPinnedSecret:
-    async def test_the_pinned_secret_is_what_the_socket_checks(self, config):
+    async def test_the_pinned_secret_is_what_the_socket_checks(
+        self, config, tmp_path, open_identity_db, wire_identity_store,
+    ):
         pin_jwt_secret(_GENERATED)
-        assert await authenticate_websocket(_Socket()) is False
-        assert await authenticate_websocket(_Socket(token=create_token(_GENERATED))) is True
-        assert await authenticate_websocket(_Socket(cookie=create_token(_GENERATED))) is True
-        assert await authenticate_websocket(_Socket(token=create_token(_FORGED))) is False
+        database, identity = await open_identity_db(tmp_path / "nerve.db")
+        wire_identity_store(database)
+        try:
+            account_id = identity.owner_account_id
+            good = create_session_token(_GENERATED, account_id)
+            assert await authenticate_websocket(_Socket()) is None
+            accepted = await authenticate_websocket(_Socket(token=good))
+            assert accepted is not None and accepted.account_id == account_id
+            by_cookie = await authenticate_websocket(_Socket(cookie=good))
+            assert by_cookie == accepted
+            forged = create_session_token(_FORGED, account_id)
+            assert await authenticate_websocket(_Socket(token=forged)) is None
+        finally:
+            await database.close()
 
 
 class TestMcpWithAPinnedSecret:
@@ -245,9 +287,9 @@ class TestMcpWithAPinnedSecret:
         with pytest.raises(McpAuthError, match="Missing token"):
             authenticate_mcp(_scope(), config)
         with pytest.raises(McpAuthError):
-            authenticate_mcp(_scope(create_token(_FORGED)), config)
-        payload = authenticate_mcp(_scope(create_token(_GENERATED)), config)
-        assert payload["sub"] == "user"
+            authenticate_mcp(_scope(create_system_token(_FORGED)), config)
+        payload = authenticate_mcp(_scope(create_system_token(_GENERATED)), config)
+        assert payload[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SYSTEM
 
     def test_engine_mints_backend_tokens_with_the_pinned_secret(self, config):
         from nerve.agent.engine import AgentEngine
@@ -287,90 +329,102 @@ class TestReloadKeepsThePinnedSecret:
     rotates ``auth.jwt_secret`` is reported as needing a restart and changes
     nothing about which secret is in force."""
 
-    async def _start(self, tmp_path, monkeypatch):
+    async def _start(self, tmp_path, open_identity_db, wire_identity_store):
         from nerve.config import load_config
         from nerve.migrate import ensure_jwt_secret
 
         config_dir = _write_install(tmp_path, f"auth:\n  jwt_secret: {_CONFIGURED}\n")
         config = load_config(config_dir)
         set_config(config)
-        # What the lifespan does: pin the effective secret. No database is
-        # needed to pin a configured one, but go through the real function.
-        from nerve.db import Database
-
-        db = Database(tmp_path / "nerve.db")
-        await db.connect()
-        try:
-            assert await ensure_jwt_secret(db, config) == _CONFIGURED
-        finally:
-            await db.close()
+        # What the lifespan does: bootstrap the local identity, then pin the
+        # effective secret. Both go through the real functions.
+        database, identity = await open_identity_db(tmp_path / "nerve.db")
+        assert await ensure_jwt_secret(database, config) == _CONFIGURED
+        wire_identity_store(database)
         assert pinned_jwt_secret() == _CONFIGURED
-        return config_dir
+        return config_dir, database, identity.owner_account_id
 
-    async def test_removing_the_key_does_not_reopen_the_gateway(self, tmp_path, monkeypatch):
+    async def test_removing_the_key_does_not_reopen_the_gateway(
+        self, tmp_path, open_identity_db, wire_identity_store,
+    ):
         from nerve.config import get_config
         from nerve.config_reload import reload_all
 
-        config_dir = await self._start(tmp_path, monkeypatch)
-        (config_dir / "config.local.yaml").write_text("{}\n", encoding="utf-8")
+        config_dir, database, account_id = await self._start(
+            tmp_path, open_identity_db, wire_identity_store,
+        )
+        try:
+            (config_dir / "config.local.yaml").write_text("{}\n", encoding="utf-8")
 
-        summary = await reload_all(None, None, config_dir)
+            summary = await reload_all(None, None, config_dir)
 
-        assert summary["config"] == "reloaded"
-        assert "auth.jwt_secret" in summary["restart_required"]
-        assert get_config().auth.jwt_secret == ""      # the config object did change
-        assert effective_jwt_secret() == _CONFIGURED    # the secret in force did not
+            assert summary["config"] == "reloaded"
+            assert "auth.jwt_secret" in summary["restart_required"]
+            assert get_config().auth.jwt_secret == ""      # the config object did change
+            assert effective_jwt_secret() == _CONFIGURED    # the secret in force did not
 
-        app = FastAPI()
+            app = FastAPI()
 
-        @app.get("/api/thing")
-        async def thing(user: dict = Depends(require_auth)):
-            return {"ok": True}
+            @app.get("/api/thing")
+            async def thing(actor: Actor = Depends(require_auth)):
+                return {"ok": True}
 
-        with TestClient(app) as client:
-            assert client.get("/api/thing").status_code == 401  # not open
-            assert client.get("/api/thing", headers=_bearer(_CONFIGURED)).status_code == 200
-        assert await authenticate_websocket(_Socket(token=create_token(_CONFIGURED))) is True
-        assert await authenticate_websocket(_Socket()) is False
-        assert authenticate_mcp(_scope(create_token(_CONFIGURED)), get_config())["sub"] == "user"
-        with pytest.raises(McpAuthError):
-            authenticate_mcp(_scope(), get_config())
+            with TestClient(app) as client:
+                assert client.get("/api/thing").status_code == 401  # not open
+                assert client.get(
+                    "/api/thing", headers=_bearer(_CONFIGURED, account_id),
+                ).status_code == 200
+            live = create_session_token(_CONFIGURED, account_id)
+            assert await authenticate_websocket(_Socket(token=live)) is not None
+            assert await authenticate_websocket(_Socket()) is None
+            assert authenticate_mcp(
+                _scope(create_system_token(_CONFIGURED)), get_config(),
+            )[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SYSTEM
+            with pytest.raises(McpAuthError):
+                authenticate_mcp(_scope(), get_config())
+        finally:
+            await database.close()
         set_config(NerveConfig())
 
-    async def test_rotating_the_key_waits_for_a_restart(self, tmp_path, monkeypatch):
+    async def test_rotating_the_key_waits_for_a_restart(
+        self, tmp_path, open_identity_db, wire_identity_store,
+    ):
         from nerve.config import get_config
         from nerve.config_reload import reload_all
 
-        config_dir = await self._start(tmp_path, monkeypatch)
-        (config_dir / "config.local.yaml").write_text(
-            f"auth:\n  jwt_secret: {_GENERATED}\n", encoding="utf-8",
+        config_dir, database, account_id = await self._start(
+            tmp_path, open_identity_db, wire_identity_store,
         )
-
-        summary = await reload_all(None, None, config_dir)
-
-        assert "auth.jwt_secret" in summary["restart_required"]
-        assert get_config().auth.jwt_secret == _GENERATED
-        assert effective_jwt_secret() == _CONFIGURED
-        app = FastAPI()
-
-        @app.get("/api/thing")
-        async def thing(user: dict = Depends(require_auth)):
-            return {"ok": True}
-
-        with TestClient(app) as client:
-            assert client.get("/api/thing", headers=_bearer(_CONFIGURED)).status_code == 200
-            assert client.get("/api/thing", headers=_bearer(_GENERATED)).status_code == 401
-
-        # "Restart": the pin is gone, startup pins the new configured value.
-        unpin_jwt_secret()
-        from nerve.migrate import ensure_jwt_secret
-        from nerve.db import Database
-
-        db = Database(tmp_path / "nerve.db")
-        await db.connect()
         try:
-            assert await ensure_jwt_secret(db, get_config()) == _GENERATED
+            (config_dir / "config.local.yaml").write_text(
+                f"auth:\n  jwt_secret: {_GENERATED}\n", encoding="utf-8",
+            )
+
+            summary = await reload_all(None, None, config_dir)
+
+            assert "auth.jwt_secret" in summary["restart_required"]
+            assert get_config().auth.jwt_secret == _GENERATED
+            assert effective_jwt_secret() == _CONFIGURED
+            app = FastAPI()
+
+            @app.get("/api/thing")
+            async def thing(actor: Actor = Depends(require_auth)):
+                return {"ok": True}
+
+            with TestClient(app) as client:
+                assert client.get(
+                    "/api/thing", headers=_bearer(_CONFIGURED, account_id),
+                ).status_code == 200
+                assert client.get(
+                    "/api/thing", headers=_bearer(_GENERATED, account_id),
+                ).status_code == 401
+
+            # "Restart": the pin is gone, startup pins the new configured value.
+            unpin_jwt_secret()
+            from nerve.migrate import ensure_jwt_secret
+
+            assert await ensure_jwt_secret(database, get_config()) == _GENERATED
+            assert effective_jwt_secret() == _GENERATED
         finally:
-            await db.close()
-        assert effective_jwt_secret() == _GENERATED
+            await database.close()
         set_config(NerveConfig())

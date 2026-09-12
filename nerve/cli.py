@@ -1380,7 +1380,7 @@ def reload(ctx: click.Context) -> None:
     """
     import httpx
 
-    from nerve.gateway.auth import create_token
+    from nerve.gateway.auth import create_system_token
 
     config = ctx.obj["config"]
     if config is None:
@@ -1411,7 +1411,10 @@ def reload(ctx: click.Context) -> None:
     # gateway.host names a real host the certificate should match it, and a
     # failure there is worth hearing about rather than skipping past.
     verify = config.gateway.host not in _WILDCARD_BINDS
-    headers = {"Authorization": f"Bearer {create_token(secret)}"}
+    # This shell is the instance talking to itself, not a person: the token
+    # resolves to the agent's system principal rather than standing in for
+    # whichever account happens to exist.
+    headers = {"Authorization": f"Bearer {create_system_token(secret)}"}
     try:
         resp = httpx.post(
             url,
@@ -2544,9 +2547,10 @@ def _gateway_request(
     headers = {}
     secret = _signing_secret(config)
     if secret:
-        from nerve.gateway.auth import create_token
+        # The instance acting on its own behalf — see `nerve reload`.
+        from nerve.gateway.auth import create_system_token
 
-        headers["Authorization"] = f"Bearer {create_token(secret)}"
+        headers["Authorization"] = f"Bearer {create_system_token(secret)}"
     try:
         # verify=False: gateway.ssl is normally a local self-signed cert,
         # and this call only ever targets loopback.

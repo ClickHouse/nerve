@@ -37,7 +37,7 @@ from nerve.config import AuthConfig, NerveConfig
 from nerve.db import Database, init_db
 from nerve.db.accounts import JWT_SECRET_NAME
 from nerve.gateway.auth import (
-    create_token,
+    create_system_token,
     decode_token,
     effective_jwt_secret,
     pin_jwt_secret,
@@ -402,7 +402,7 @@ class TestExposedKeyIsRotated:
     async def test_automatic_repair_rotates_the_exposed_key(self, tmp_path):
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db_with_secret(db_path, _S1)
-        s1_token = create_token(_S1)
+        s1_token = create_system_token(_S1)
 
         os.chmod(db_path, 0o644)  # exposed; copy S1
         db = Database(db_path)
@@ -440,7 +440,7 @@ class TestExposedKeyIsRotated:
     async def test_exposed_with_a_configured_secret_rotates_and_uses_config(self, tmp_path):
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db_with_secret(db_path, _S1)
-        s1_token = create_token(_S1)
+        s1_token = create_system_token(_S1)
 
         os.chmod(db_path, 0o644)
         db = Database(db_path)
@@ -495,7 +495,7 @@ class TestRotationReachesThePin:
         s1 = await db.get_instance_secret(JWT_SECRET_NAME)
         await db.close()
         assert s1 and pinned_jwt_secret() == s1
-        s1_token = create_token(s1)
+        s1_token = create_system_token(s1)
 
         os.chmod(db_path, 0o644)  # exposed; someone copies S1
 
@@ -514,7 +514,7 @@ class TestRotationReachesThePin:
             assert effective_jwt_secret(config) == s3
             with pytest.raises(Exception):
                 decode_token(s1_token, effective_jwt_secret(config))  # S1 rejected
-            assert decode_token(create_token(s3), effective_jwt_secret(config))  # S3 accepted
+            assert decode_token(create_system_token(s3), effective_jwt_secret(config))  # S3 accepted
         finally:
             await db2.close()
 

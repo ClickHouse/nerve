@@ -14,12 +14,16 @@ from nerve.agent.backends.codex.ultracode import (
 )
 from nerve.gateway.auth import (
     MCP_WORKER_CLAIM,
+    NO_IDENTITY_DETAIL,
     NO_SECRET_DETAIL,
     create_mcp_session_token,
     effective_jwt_secret,
+    identity_store,
     require_auth,
+    resolve_actor_from_claims,
 )
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import ActorResolutionError
 from nerve.mcp_server.auth import McpAuthError, authenticate_mcp, bound_session_id
 
 router = APIRouter()
@@ -53,6 +57,17 @@ async def mint_worker_token(request: Request):
     try:
         payload = authenticate_mcp(request.scope, deps.engine.config)
     except McpAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    # Every ingress that verifies a token resolves an actor, this one included:
+    # the caller is a backend agent subprocess, so it resolves to the system
+    # principal, and an instance whose identity bootstrap has not run hands out
+    # no credentials at all.
+    store = identity_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
+    try:
+        await resolve_actor_from_claims(store, payload)
+    except ActorResolutionError as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
     session_id = bound_session_id(payload)
     if not session_id or (payload or {}).get(MCP_WORKER_CLAIM):

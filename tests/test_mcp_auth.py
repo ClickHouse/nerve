@@ -11,11 +11,17 @@ from __future__ import annotations
 import pytest
 
 from nerve.config import AuthConfig, NerveConfig
-from nerve.gateway.auth import create_token
+from nerve.gateway.auth import (
+    TOKEN_TYPE_CLAIM,
+    TOKEN_TYPE_SYSTEM,
+    create_system_token,
+)
 from nerve.mcp_server.auth import McpAuthError, authenticate_mcp
 
 
-_JWT_SECRET = "test-secret-for-mcp-auth"
+# 32+ bytes: a shorter HMAC key is legal but makes PyJWT warn on every
+# encode/decode, which buries real warnings in the suite's output.
+_JWT_SECRET = "test-secret-for-mcp-auth-padded-to-32-bytes"
 
 
 def _scope(
@@ -47,7 +53,7 @@ def test_no_secret_in_force_fails_closed(no_secret_config):
         authenticate_mcp(_scope(), no_secret_config)
     # Padded so PyJWT's short-key warning stays out of the run; the token is
     # only there to be refused.
-    token = create_token("a-secret-nothing-is-pinned-to-padded-to-32b")
+    token = create_system_token("a-secret-nothing-is-pinned-to-padded-32b")
     headers = [(b"authorization", f"Bearer {token}".encode())]
     with pytest.raises(McpAuthError, match="No signing secret"):
         authenticate_mcp(_scope(headers=headers), no_secret_config)
@@ -65,15 +71,15 @@ def test_invalid_bearer_token_raises(auth_config):
 
 
 def test_valid_bearer_token_passes(auth_config):
-    token = create_token(_JWT_SECRET)
+    token = create_system_token(_JWT_SECRET)
     headers = [(b"authorization", f"Bearer {token}".encode("ascii"))]
     payload = authenticate_mcp(_scope(headers=headers), auth_config)
     assert payload is not None
-    assert payload["sub"] == "user"
+    assert payload[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SYSTEM
 
 
 def test_query_param_token_passes(auth_config):
-    token = create_token(_JWT_SECRET)
+    token = create_system_token(_JWT_SECRET)
     qs = f"token={token}".encode("ascii")
     payload = authenticate_mcp(_scope(query_string=qs), auth_config)
     assert payload is not None
@@ -87,7 +93,7 @@ def test_invalid_query_param_token_raises(auth_config):
 
 def test_authorization_header_case_insensitive(auth_config):
     """Header names should be matched case-insensitively per HTTP spec."""
-    token = create_token(_JWT_SECRET)
+    token = create_system_token(_JWT_SECRET)
     headers = [(b"Authorization", f"Bearer {token}".encode("ascii"))]
     payload = authenticate_mcp(_scope(headers=headers), auth_config)
     assert payload is not None
@@ -96,7 +102,7 @@ def test_authorization_header_case_insensitive(auth_config):
 def test_header_takes_precedence_over_query(auth_config):
     """If both header and query are supplied, the header wins (and the
     bogus query is never consulted)."""
-    token = create_token(_JWT_SECRET)
+    token = create_system_token(_JWT_SECRET)
     headers = [(b"authorization", f"Bearer {token}".encode("ascii"))]
     qs = b"token=bogus"
     payload = authenticate_mcp(_scope(headers=headers, query_string=qs), auth_config)
