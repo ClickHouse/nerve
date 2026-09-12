@@ -351,6 +351,35 @@ class TestDalInvariants:
                 (system["id"],),
             )
 
+    async def test_the_trigger_backstops_re_pointing_an_account_at_a_system_actor(
+        self, db: Database,
+    ):
+        """F23: the INSERT trigger alone leaves two ways to break the invariant
+        after the fact. The first is a raw UPDATE of accounts.actor_id."""
+        human = await db.create_actor_ref(kind="human")
+        system = await db.create_actor_ref(kind="system")
+        account = await db.create_account(actor_id=human["id"], credential_source="none")
+        with pytest.raises(sqlite3.IntegrityError):
+            await db._write(
+                "UPDATE accounts SET actor_id = ? WHERE id = ?", (system["id"], account["id"]),
+            )
+        assert (await db.get_account(account["id"]))["actor_id"] == human["id"]
+
+    async def test_the_trigger_backstops_changing_a_referenced_actors_kind(
+        self, db: Database,
+    ):
+        """The second: turning the actor an account references into a system
+        principal. An unreferenced actor may still change kind."""
+        human = await db.create_actor_ref(kind="human")
+        await db.create_account(actor_id=human["id"], credential_source="none")
+        with pytest.raises(sqlite3.IntegrityError):
+            await db._write("UPDATE actor_refs SET kind = 'system' WHERE id = ?", (human["id"],))
+        assert (await db.get_actor_ref(human["id"]))["kind"] == "human"
+
+        loose = await db.create_actor_ref(kind="human")
+        await db._write("UPDATE actor_refs SET kind = 'system' WHERE id = ?", (loose["id"],))
+        assert (await db.get_actor_ref(loose["id"]))["kind"] == "system"
+
     async def test_local_requires_a_credential(self, db: Database):
         actor = await db.create_actor_ref(kind="human")
         with pytest.raises(ValueError, match="credential is required"):

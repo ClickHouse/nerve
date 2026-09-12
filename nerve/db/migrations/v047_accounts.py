@@ -142,6 +142,26 @@ WHEN (SELECT kind FROM actor_refs WHERE id = NEW.actor_id) IS NOT 'human'
 BEGIN
     SELECT RAISE(ABORT, 'accounts.actor_id must reference a human actor_ref');
 END;
+
+-- The same invariant on the two updates that could break it after the fact:
+-- re-pointing an account at another actor, and changing the kind of an actor
+-- that an account already references.
+CREATE TRIGGER IF NOT EXISTS accounts_actor_must_stay_human
+BEFORE UPDATE OF actor_id ON accounts
+FOR EACH ROW
+WHEN (SELECT kind FROM actor_refs WHERE id = NEW.actor_id) IS NOT 'human'
+BEGIN
+    SELECT RAISE(ABORT, 'accounts.actor_id must reference a human actor_ref');
+END;
+
+CREATE TRIGGER IF NOT EXISTS actor_refs_kind_frozen_while_referenced
+BEFORE UPDATE OF kind ON actor_refs
+FOR EACH ROW
+WHEN NEW.kind IS NOT 'human'
+     AND EXISTS (SELECT 1 FROM accounts WHERE actor_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'an actor_ref referenced by an account must stay human');
+END;
 """
 
 
