@@ -7,6 +7,7 @@ import pytest
 from nerve.agent.engine import AgentEngine
 from nerve.config import NerveConfig
 from nerve.identity import Actor
+from tests.actor_rows import ensure_actor_row
 
 # `require_auth` hands a route the actor the request resolved to. These tests
 # call the route functions directly, so they supply one; no route here reads
@@ -171,7 +172,7 @@ class TestScheduleWakeupTool:
         from nerve.agent.tools.registry import ToolContext
 
         engine = _engine(tmp_path, db)
-        await db.create_session("ext-1", source="external")
+        await db.create_session("ext-1", source="external", actor=None)
         ctx = ToolContext(session_id="ext-1", db=db, engine=engine)
         result = await schedule_wakeup_handler(ctx, {
             "delaySeconds": 120, "prompt": "check things",
@@ -185,7 +186,7 @@ class TestScheduleWakeupTool:
         from nerve.agent.tools.registry import ToolContext
 
         engine = _engine(tmp_path, db)
-        await db.create_session("web-1", source="web")
+        await db.create_session("web-1", source="web", actor=None)
         ctx = ToolContext(session_id="web-1", db=db, engine=engine)
         result = await schedule_wakeup_handler(ctx, {
             "delaySeconds": 120, "prompt": "check things", "reason": "test",
@@ -209,7 +210,7 @@ class TestResumeDroppedEnginePath:
         from nerve.agent.backends.base import BackendCapabilities
 
         engine = _engine(tmp_path, db)
-        await db.create_session("s-drop", source="web")
+        await db.create_session("s-drop", source="web", actor=None)
         await db.update_session_fields("s-drop", {
             "sdk_session_id": "stale-thread-1", "backend": "codex",
         })
@@ -282,7 +283,7 @@ class TestPreRecallFreeze:
         second = ["rearmed-gamma-7c1", "rearmed-delta-7c2"]
 
         engine = _engine(tmp_path, db)
-        await db.create_session("s-freeze", source="web", backend="codex")
+        await db.create_session("s-freeze", source="web", backend="codex", actor=None)
 
         bridge = MagicMock(available=True)
         bridge.recall = AsyncMock(
@@ -383,6 +384,10 @@ class TestCreateSessionRoute:
             routes, "get_deps",
             lambda: SimpleNamespace(engine=engine, db=db),
         )
+
+        # The route stamps the request actor on the session row, and
+        # sessions.created_by_actor_id references actor_refs.
+        await ensure_actor_row(db, _ACTOR)
 
         created = await routes.create_session(
             routes.SessionCreateRequest(backend="codex"), actor=_ACTOR,

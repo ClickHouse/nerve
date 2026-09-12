@@ -19,6 +19,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
+from nerve.identity import system_actor_or_none
+
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
@@ -144,11 +146,19 @@ async def request_plan_revision(
         if session_id.startswith("cron:")
         else session_id
     )
+    revision_actor = await system_actor_or_none(
+        engine.db, context=f"revision of plan {plan_id}",
+    )
     await engine.sessions.get_or_create(
-        session_id, title=session_title, source="cron",
+        session_id, title=session_title, source="cron", actor=revision_actor,
     )
     asyncio.create_task(
-        engine.run(session_id=session_id, user_message=prompt, source="cron")
+        engine.run(
+            session_id=session_id, user_message=prompt, source="cron",
+            # The revision prompt is built from a template here, not typed by
+            # the person who asked for the revision.
+            actor=revision_actor,
+        )
     )
 
     logger.info(

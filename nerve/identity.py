@@ -22,11 +22,14 @@ was stored before. Names are never identity or authorization keys.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from nerve.db.accounts import AccountStore
+
+logger = logging.getLogger(__name__)
 
 # ``actor_refs.kind``. A human is a person with a local account; the system
 # principal is what the agent's own autonomous work acts as (0.6).
@@ -152,3 +155,37 @@ async def system_actor(store: "AccountStore") -> Actor:
         account_id=None,
         display_name=row["display_name"],
     )
+
+
+async def system_actor_or_none(
+    store: "AccountStore", *, context: str = "",
+) -> Actor | None:
+    """The system principal for work that must proceed without one.
+
+    :func:`system_actor` raises when identity bootstrap has not run, which is
+    right at an ingress: refusing a credential that resolves to nobody is the
+    safe direction. Attribution is the opposite case. A cron job, a channel
+    reply or a thread sync is real work with a real result, and the actor id is
+    metadata *about* that work — so a missing system principal leaves the row
+    unattributed and says so in the log, instead of failing the run and losing
+    the work as well as the attribution.
+
+    Production never takes that branch: every path that opens the database
+    bootstraps the identity first (``nerve.migrate.open_production_db`` and the
+    gateway lifespan), so the principal exists before anything can run.
+
+    Every failure is caught, not just the missing-principal one, for the same
+    reason: a database hiccup while reading two rows of metadata must not be
+    able to cancel a scheduled job or drop a channel reply that would have
+    worked a moment ago. This is deliberately *not* how a person's actor is
+    resolved — ``require_auth`` raises and the request is refused, because
+    there the identity is the authorization.
+    """
+    try:
+        return await system_actor(store)
+    except Exception as e:  # noqa: BLE001 — attribution must not fail the work
+        logger.warning(
+            "No system principal%s: %s — the row will be unattributed",
+            f" for {context}" if context else "", e,
+        )
+        return None

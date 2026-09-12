@@ -26,6 +26,7 @@ from nerve.agent.plan_service import (
     request_plan_revision,
 )
 from nerve.db import Database
+from nerve.identity import Actor
 
 
 class FakeSessionManager:
@@ -40,11 +41,14 @@ class FakeSessionManager:
         title: str | None = None,
         source: str = "web",
         metadata: dict | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id,
             "title": title,
             "source": source,
+            "actor": actor,
         })
         return {"id": session_id, "title": title or session_id, "source": source}
 
@@ -52,8 +56,11 @@ class FakeSessionManager:
 class FakeEngine:
     """Mimics AgentEngine.run + .sessions for revision dispatch tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         self.sessions = FakeSessionManager()
+        # The revision dispatcher resolves the system principal off the
+        # engine's database before it dispatches, so the fake carries one.
+        self.db = db
         self.runs: list[dict[str, Any]] = []
         # Event flipped after every run() call so tests can await
         # dispatch deterministically instead of sleeping.
@@ -64,11 +71,14 @@ class FakeEngine:
         session_id: str,
         user_message: str,
         source: str = "web",
+        *,
+        actor: Actor | None,
     ) -> None:
         self.runs.append({
             "session_id": session_id,
             "user_message": user_message,
             "source": source,
+            "actor": actor,
         })
         self.run_event.set()
 
@@ -89,7 +99,7 @@ async def _setup(db: Database, tmp_path) -> tuple[FakeEngine, str]:
         session_id="sess-proposer", version=1, plan_type="generic",
     )
 
-    engine = FakeEngine()
+    engine = FakeEngine(db)
     tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
     return engine, task_id
 
@@ -166,7 +176,7 @@ class TestRequestPlanRevision:
         await _setup(db, tmp_path)
         # Null out session_id to simulate a legacy plan.
         await db.update_plan("plan-orig", session_id=None)
-        engine = FakeEngine()
+        engine = FakeEngine(db)
         tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
 
         await request_plan_revision(

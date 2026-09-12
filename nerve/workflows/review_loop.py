@@ -1910,6 +1910,12 @@ class ReviewLoopService:
             try:
                 await self.db.add_message(
                     session_id, "assistant", text, channel="review-loop",
+                    # A milestone is written in the assistant's voice into
+                    # the observer's chat, so it is unattributed like every
+                    # other assistant row. The loop's own sessions (its legs)
+                    # carry the system principal, stamped where they are
+                    # created in nerve/workflows/service.py.
+                    actor=None,
                 )
                 message = {
                     "role": "assistant", "content": text,

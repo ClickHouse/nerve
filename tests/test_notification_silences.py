@@ -74,7 +74,7 @@ def patch_broadcaster(monkeypatch) -> list:
 
 @pytest_asyncio.fixture
 async def svc(db: Database, fake_config, fake_engine, patch_broadcaster):
-    await db.create_session("s1")
+    await db.create_session("s1", actor=None)
     return NotificationService(fake_config, db, fake_engine)
 
 
@@ -153,7 +153,7 @@ class TestSchemaAndStore:
         assert active == {"sil-live"}
 
     async def test_create_notification_status_default_is_pending(self, db: Database):
-        await db.create_session("s2")
+        await db.create_session("s2", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s2", type="notify", title="t",
         )
@@ -161,7 +161,7 @@ class TestSchemaAndStore:
         assert notif["status"] == "pending"
 
     async def test_create_notification_explicit_status(self, db: Database):
-        await db.create_session("s2")
+        await db.create_session("s2", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s2", type="notify", title="t",
             status="silenced",

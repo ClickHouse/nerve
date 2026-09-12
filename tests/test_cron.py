@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -785,6 +785,9 @@ class TestRotation:
         # New chat is created and becomes the job's current session.
         cron_service.engine.sessions.get_or_create.assert_awaited_once_with(
             session_id, title="Cron: pers", source="cron",
+            # Who a cron generation belongs to has its own test
+            # (test_attribution.py); this one is about rotation.
+            actor=ANY,
         )
         cron_service.db.set_channel_session.assert_awaited_once_with(
             "cron:pers", session_id,

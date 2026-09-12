@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any
 from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
+from nerve.identity import system_actor_or_none
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -497,6 +498,9 @@ class WorkflowRunService:
                 f"[{parent_title}] {label}" if parent_title
                 else f"Workflow: {label}"
             )
+            leg_actor = await system_actor_or_none(
+                self.db, context=f"workflow run {run_id}",
+            )
             await self.engine.sessions.get_or_create(
                 session_id,
                 title=leg_title,
@@ -505,6 +509,7 @@ class WorkflowRunService:
                 backend=backend,
                 model=model,
                 cwd=spec.get("cwd") or None,
+                actor=leg_actor,
             )
             if origin:
                 await self.db.update_session_fields(
@@ -524,6 +529,7 @@ class WorkflowRunService:
                 source="workflow",
                 model=model,
                 effort_override=str(spec.get("effort") or "") or None,
+                actor=leg_actor,
             )
 
             # engine.run returns normally even for interrupted, cancelled,

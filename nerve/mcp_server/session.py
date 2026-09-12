@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from nerve.identity import system_actor_or_none
+
 if TYPE_CHECKING:
     from nerve.db import Database
 
@@ -73,6 +75,19 @@ class SatelliteSessionResolver:
 
     def __init__(self, db: "Database") -> None:
         self.db = db
+
+    async def _satellite_actor(self):
+        """Who a satellite session belongs to: the agent's system principal.
+
+        An MCP connection is another program talking to this instance, and the
+        satellite row exists so that traffic is visible in the session list. It
+        is the instance's own row rather than any person's — even when the
+        caller authenticated with a human's session token, which the endpoint
+        resolves and leaves on the ASGI scope
+        (``nerve.mcp_server.http.MCP_ACTOR_SCOPE_KEY``) for a later PR that
+        wants per-call attribution.
+        """
+        return await system_actor_or_none(self.db, context="MCP satellite session")
 
     @staticmethod
     def build_session_id(client_name: str, identifier: str) -> str:
@@ -143,6 +158,7 @@ class SatelliteSessionResolver:
                     source="external",
                     metadata=metadata,
                     status="active",
+                    actor=await self._satellite_actor(),
                 )
                 logger.info(
                     "Created Codex satellite session %s via MCP (mcp=%s)",
@@ -173,6 +189,7 @@ class SatelliteSessionResolver:
                 source="external",
                 metadata=metadata,
                 status="active",
+                actor=await self._satellite_actor(),
             )
             logger.info(
                 "Created satellite session %s (client=%s, mcp=%s)",

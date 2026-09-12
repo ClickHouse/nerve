@@ -941,8 +941,11 @@ def create_app() -> FastAPI:
         # Only create a brand-new session if none exist at all.
         active_session = await router.get_last_session("web:default")
         if not active_session:
-            active_session = await router.get_active_session(
-                "web:default", source="web",
+            # Not through the router: this ingress knows *who* connected, so
+            # the session it mints belongs to that person rather than to the
+            # web channel in general.
+            active_session = await _engine.sessions.get_active_session(
+                "web:default", source="web", actor=connection.actor,
             )
         logger.info("WebSocket connected: %s (session: %s)", client_id, active_session)
 
@@ -1008,14 +1011,20 @@ def create_app() -> FastAPI:
                     # parallel tabs render the user bubble live (the sender already
                     # showed it optimistically). engine.run persists it, so reloads
                     # get it from history regardless.
+                    # Carries the sender's actor so another tab can label the
+                    # bubble live; the persisted row is the source of truth
+                    # once the page reloads.
                     await broadcaster.broadcast(session_id, {
                         "type": "user_message",
                         "session_id": session_id,
                         "content": user_text,
                         "blocks": image_refs or None,
+                        "actor_id": connection.actor.actor_id,
                     }, exclude=client_id)
 
-                    # Run agent in background, store task for stop support
+                    # Run agent in background, store task for stop support.
+                    # The message is this connection's person, fixed at accept
+                    # — never re-read mid-stream.
                     task = asyncio.create_task(
                         _engine.run(
                             session_id=session_id,
@@ -1025,6 +1034,7 @@ def create_app() -> FastAPI:
                             model=selected_model,
                             images=images or None,
                             image_refs=image_refs or None,
+                            actor=connection.actor,
                         )
                     )
                     _engine.register_task(session_id, task)
@@ -1071,6 +1081,7 @@ def create_app() -> FastAPI:
                     try:
                         fork = await _engine.fork_session(
                             source_id, at_msg, title,
+                            actor=connection.actor,
                         )
                         await websocket.send_json({
                             "type": "session_forked",
