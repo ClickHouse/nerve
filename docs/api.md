@@ -21,6 +21,35 @@ generated on first start when that is unset (see
 [Accounts and identity](accounts.md)); `503` means no signing secret exists
 yet, which only happens before the gateway has completed its first start.
 
+The result is a **session token**: `sub` is the account's id and `typ` is
+`session`. Treat it as opaque — the claims are the server's business. Password-
+only login is valid while exactly one account exists, and a disabled account
+cannot log in (`401`).
+
+#### Authenticated requests
+
+Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
+or as `?token=` (for `<img src>` and downloads, which cannot set headers).
+
+Every request resolves its token to an **actor** — the account behind it, or
+the agent's system principal for credentials the instance minted for itself.
+A `401` on a token that was working means it no longer names anybody this
+instance can act for:
+
+| Situation | Response |
+|---|---|
+| account disabled since the token was issued | `401` at the next request (disabling is not retroactive) |
+| account no longer exists | `401` |
+| session predating per-account logins, on an install that now has two or more accounts | `401` — log in again |
+| no signing secret, or the gateway has not finished starting | `503` |
+
+**`X-Nerve-Token` on the response.** Once a session token is past half its
+life, the reply carries a fresh one under this header; swap it in and a tab in
+continuous use never expires, which turns `auth.jwt_expiry_hours` into an idle
+timeout. The same header carries the replacement for a session issued before
+per-account logins existed — those are upgraded on their first request rather
+than slid. The header is CORS-exposed, so a browser can read it cross-origin.
+
 #### `GET /api/auth/status`
 Whether a password is required to log in. No auth required.
 
@@ -572,7 +601,16 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 ## WebSocket Protocol
 
-Connect to `ws[s]://host:port/ws?token=<jwt>`.
+Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
+too). The token is resolved to an actor **once, at accept**, and that actor is
+what the connection acts as until it closes: an account disabled, renamed, or
+joined by a second one mid-stream leaves the open socket alone and takes effect
+on the next connection. A credential that names nobody is refused with close
+code `4001`; reconnect after logging in again.
+
+Unlike REST, a WebSocket never hands back a refreshed token — it has no
+response headers. The browser's ordinary REST traffic keeps the stored token
+fresh.
 
 ### Client → Server
 
