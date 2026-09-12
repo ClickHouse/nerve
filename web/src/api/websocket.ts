@@ -28,7 +28,10 @@ export type WSMessage =
   | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
   | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
-  | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null }
+  // `actor_id` is the sender, so a second tab can label the bubble the moment
+  // it arrives rather than waiting for the stored row to be readable. Null
+  // whenever the ingress recorded nobody, which renders exactly as before.
+  | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null; actor_id?: string | null }
   // pending_wakeup_at / has_background_tasks ride along with every transition:
   // a turn can end with the session still parked on scheduled or background
   // work, and the sidebar redraws that row straight from the event (it skips

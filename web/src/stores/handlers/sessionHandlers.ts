@@ -338,8 +338,10 @@ export function handleUserMessage(
 ): void {
   // A message sent from another client of this session — render the user
   // bubble live. The sender is excluded server-side, so this never duplicates
-  // its own optimistic message. hydrateMessage rebuilds any image/file blocks.
+  // its own optimistic message. hydrateMessage rebuilds any image/file blocks,
+  // and carries the sender's actor id so the bubble is labelled immediately
+  // with whoever the event names rather than on the next reload.
   if (msg.session_id !== get().activeSession) return;
-  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString() });
+  const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString(), actor_id: msg.actor_id ?? null });
   set(s => ({ messages: [...s.messages, hydrated] }));
 }

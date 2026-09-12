@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api, type Account } from '../api/client';
+import { useActorStore } from './actorStore';
 import { useAuthStore } from './authStore';
 
 /**
@@ -41,17 +42,25 @@ export interface AccountState {
 }
 
 /**
- * Every mutation reloads the list and re-reads `/api/auth/status`.
+ * Every mutation reloads the list, re-reads `/api/auth/status`, and re-reads
+ * the actor map.
  *
  * Not laziness: both of the things this screen does — setting the first
  * password, adding the second account — change how the *login form* behaves,
  * and a stale descriptor would leave a tab auto-logging-in or asking for the
  * wrong fields. The list is small and the call is one request.
+ *
+ * The actor map is here for the same reason one step further out: a rename is a
+ * mutation on this screen and a *label* everywhere else, and nothing stores the
+ * name it changed. Re-reading it here is what makes a rename visible in the
+ * chat without a reload. It is last and it cannot fail the mutation — see
+ * `actorStore.refresh`.
  */
 async function refreshAll(set: (partial: Partial<AccountState>) => void): Promise<void> {
   const { accounts } = await api.listAccounts();
   set({ accounts, loading: false });
   await useAuthStore.getState().refreshStatus();
+  await useActorStore.getState().refresh();
 }
 
 export const useAccountStore = create<AccountState>((set) => ({
