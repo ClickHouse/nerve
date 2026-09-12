@@ -172,15 +172,16 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 
 ### User Message (Web UI)
 1. User sends message via WebSocket
-2. Gateway's WebSocket handler receives it
-3. `AgentEngine.run()` called in background task
-4. Streaming events sent back via WebSocket
-5. Client renders tokens in real-time
+2. Gateway's WebSocket handler receives it — the connection's actor was resolved once, at accept
+3. `AgentEngine.run()` called in background task, carrying that actor
+4. The user message is stored under it; the assistant's reply is stored unattributed
+5. Streaming events sent back via WebSocket
+6. Client renders tokens in real-time
 
 ### Cron Job
 1. APScheduler triggers at schedule
 2. Isolated per-run session created (`cron:{job_id}:{timestamp}`)
-3. Agent runs with job prompt and cron model
+3. Agent runs with job prompt and cron model, acting as the system principal — the session and the prompt are attributed to it, not to whoever wrote the schedule
 4. Agent uses `notify`/`ask_user` tools to communicate with user
 5. Run logged in `cron_logs` table
 
@@ -222,8 +223,8 @@ To add a new migration: create `nerve/db/migrations/v017_your_feature.py` with a
 ### Schema
 
 SQLite with WAL mode (schema version 16):
-- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`)
-- `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads)
+- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist (NULL on rows that predate attribution)
+- `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL for assistant and tool output, whose authorship is `role`, and for history recorded before attribution existed. Nothing is backfilled — see [Accounts and identity](accounts.md)
 - `session_events` — Append-only lifecycle audit log (created, started, idle, stopped, archived, error)
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
