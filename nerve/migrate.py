@@ -1372,3 +1372,38 @@ async def _bootstrap_with_own_connection(
         await bootstrap_identity(db, config, report=report, display_name=display_name)
     finally:
         await db.close()
+
+
+async def open_production_db(
+    config: NerveConfig,
+    *,
+    db_path: Path | None = None,
+    display_name: str | None = None,
+) -> Database:
+    """The one way production code opens the state database.
+
+    ``Database.connect`` (state-file policy, then migrations) followed by the
+    configuration-aware identity bootstrap — accounts, system principal,
+    signing secret — exactly what the gateway does at startup. Every CLI
+    command that opens the database goes through here, so a maintenance
+    command that happens to be the first thing run after an upgrade leaves
+    the same state ``nerve start`` would, and refuses the same insecure state.
+    Read-only inspection paths (``nerve migrate --dry-run``, the installer's
+    pre-checks) never open a ``Database`` and are unaffected.
+
+    Returns the open database; the caller closes it. On any failure after
+    the connection is open, the connection is closed before the error
+    propagates.
+    """
+    from nerve.db import Database
+
+    db = Database(db_path or paths.db_path(), workspace=config.workspace)
+    await db.connect()
+    try:
+        report = await bootstrap_identity(db, config, display_name=display_name)
+    except BaseException:
+        await db.close()
+        raise
+    for action in report.identity_actions:
+        logger.info("Identity bootstrap: %s", action)
+    return db

@@ -1858,10 +1858,12 @@ def sync(ctx: click.Context, source: str) -> None:
 
     async def _run():
         from nerve.agent.engine import AgentEngine
-        from nerve.db import init_db, close_db
+        from nerve.migrate import open_production_db
         from nerve.sources.registry import build_source_runners
 
-        db = await init_db()
+        # The production opener: state-file policy, migrations, identity
+        # bootstrap — the same state `nerve start` would leave.
+        db = await open_production_db(config)
         try:
             engine = AgentEngine(config, db)
             await engine.initialize()
@@ -1899,10 +1901,10 @@ def sync(ctx: click.Context, source: str) -> None:
                     error=result.error,
                 )
         finally:
-            await close_db()
+            await db.close()
 
     click.echo(f"Running sync: {source}")
-    asyncio.run(_run())
+    _run_against_db(ctx, _run())
 
 
 @main.command("setup-telegram")
@@ -1953,9 +1955,9 @@ def cron(ctx: click.Context, job_id: str) -> None:
 
     async def _run():
         from nerve.agent.engine import AgentEngine
-        from nerve.db import init_db, close_db
+        from nerve.migrate import open_production_db
 
-        db = await init_db()
+        db = await open_production_db(config)
         try:
             engine = AgentEngine(config, db)
             await engine.initialize()
@@ -1995,9 +1997,9 @@ def cron(ctx: click.Context, job_id: str) -> None:
                         f"{job.description or job.schedule} ({status})"
                     )
         finally:
-            await close_db()
+            await db.close()
 
-    asyncio.run(_run())
+    _run_against_db(ctx, _run())
 
 
 @main.command()
@@ -2379,6 +2381,22 @@ def _fmt_bytes(n: int) -> str:
     return f"{(n or 0) / (1024 * 1024):.1f} MB"
 
 
+def _run_against_db(ctx: click.Context, coro):
+    """``asyncio.run`` for a command that opens the state database.
+
+    Every opener goes through ``nerve.migrate.open_production_db`` and so
+    through ``Database.connect``'s state-file policy; its refusal to open
+    writable or uninspectable state is an operator message, not a traceback.
+    """
+    from nerve.migrate import InsecureStateStorage
+
+    try:
+        return asyncio.run(coro)
+    except InsecureStateStorage as e:
+        click.echo(f"[ERR] {e}")
+        ctx.exit(1)
+
+
 @main.group(name="db")
 def db_group() -> None:
     """Database maintenance (prune old data, vacuum to reclaim space)."""
@@ -2395,7 +2413,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
     Frees space inside the DB; run ``nerve db vacuum`` afterwards to shrink the
     file on disk.
     """
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = paths.db_path()
@@ -2412,8 +2430,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
     )
 
     async def _run() -> None:
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             report = await database.run_retention(
                 retention_days=days,
@@ -2439,7 +2456,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
         if not dry_run:
             click.echo("\nFreed space inside the DB. Run `nerve db vacuum` to shrink the file.")
 
-    asyncio.run(_run())
+    _run_against_db(ctx, _run())
 
 
 @db_group.command("vacuum")
@@ -2450,7 +2467,7 @@ def db_vacuum(ctx: click.Context) -> None:
     VACUUM takes a write lock and cannot run while the daemon holds the DB.
     Stop the daemon first (`nerve stop`) for a clean run.
     """
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = paths.db_path()
@@ -2470,8 +2487,7 @@ def db_vacuum(ctx: click.Context) -> None:
     click.echo(f"Vacuuming {db_path} ({_fmt_bytes(size_before)})...")
 
     async def _run() -> None:
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             await database.vacuum()
         finally:
@@ -2570,15 +2586,14 @@ def workflow_group() -> None:
 @click.pass_context
 def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
     """List workflow runs straight from the database (daemon not required)."""
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = _workflow_db_path(ctx)
 
     async def _run() -> list[dict]:
         # Read-only concurrent access is safe alongside the daemon (WAL).
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             return await database.list_workflow_runs(
                 status=status or None, limit=limit,
@@ -2586,7 +2601,7 @@ def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
         finally:
             await database.close()
 
-    runs = asyncio.run(_run())
+    runs = _run_against_db(ctx, _run())
     if not runs:
         click.echo("No workflow runs" + (f" with status '{status}'" if status else "") + ".")
         return
@@ -2599,20 +2614,19 @@ def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
 @click.pass_context
 def workflow_status(ctx: click.Context, run_id: str) -> None:
     """Show one run's status, spend vs budget, session, and journal path."""
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = _workflow_db_path(ctx)
 
     async def _run() -> dict | None:
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             return await database.get_workflow_run(run_id)
         finally:
             await database.close()
 
-    run = asyncio.run(_run())
+    run = _run_against_db(ctx, _run())
     if run is None:
         click.echo(f"[ERR] No such workflow run: {run_id}")
         ctx.exit(1)
