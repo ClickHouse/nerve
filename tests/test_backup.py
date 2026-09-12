@@ -1421,3 +1421,150 @@ def test_gzip_fallback_roundtrip(nerve_dir, workspace, config_dir, tmp_path):
     assert result.compression == "gzip"
     report = backup_mod.verify_bundle(result.path)
     assert report.ok, report.errors
+
+
+# --------------------------------------------------------------------------- #
+#  --no-secrets and the tracked configuration                                  #
+# --------------------------------------------------------------------------- #
+
+# A real bcrypt verifier's shape, obviously synthetic. The startup migration
+# deliberately leaves a hash like this alone when it is in tracked or
+# fleet-managed configuration — there is no safe way to rewrite somebody else's
+# file — so it can legitimately still be there when a backup is taken.
+_TRACKED_HASH = "$2b$12$tracked-password-hash-left-by-the-migration"
+
+
+def _with_tracked_config(ws: Path) -> Path:
+    cfg = ws / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text(
+        "timezone: UTC\n"
+        "auth:\n"
+        f"  password_hash: '{_TRACKED_HASH}'\n"
+        "  jwt_secret: an-obviously-synthetic-signing-secret\n"
+        "agent:\n  max_turns: 40\n",
+        encoding="utf-8",
+    )
+    (cfg / "cron").mkdir(exist_ok=True)
+    (cfg / "cron" / "jobs.yaml").write_text(
+        "jobs:\n  - id: nightly\n    env:\n      SOME_API_KEY: a-fake-value\n",
+        encoding="utf-8",
+    )
+    return cfg / "settings.yaml"
+
+
+def _member(bundle: Path, name: str, staging: Path) -> str:
+    """Extract the bundle (zstd or gzip, via the module's own reader) and read
+    one file out of it."""
+    report = backup_mod.verify_bundle(bundle, extract_to=staging)
+    assert report.ok, report.errors
+    path = staging / name
+    assert path.is_file(), f"{name} not in the bundle"
+    return path.read_text(encoding="utf-8")
+
+
+def test_no_secrets_scrubs_tracked_configuration(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """`--no-secrets` promises the archive carries no credential. The tracked
+    workspace config is copied into it verbatim, and the startup migration
+    deliberately leaves a live `auth.password_hash` there when it cannot safely
+    rewrite it — so the promise has to be kept on the way into the bundle."""
+    _with_tracked_config(workspace)
+
+    stripped = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out1", config_dir=config_dir,
+        include_secrets=False,
+    )
+    settings = _member(
+        stripped.path, "workspace/config/settings.yaml", tmp_path / "x1",
+    )
+    assert _TRACKED_HASH not in settings
+    assert "an-obviously-synthetic-signing-secret" not in settings
+    # The structure survives — it is a config file, not a redaction.
+    assert "timezone: UTC" in settings
+    assert "max_turns: 40" in settings
+    assert "${" in settings          # replaced by an env reference
+    # ...and nowhere else in the archive either.
+    assert _TRACKED_HASH not in stripped.path.read_bytes().decode("latin-1")
+
+    # The cron env block goes with it; a job's environment is as good a place
+    # for a credential as the auth section.
+    jobs = _member(
+        stripped.path, "workspace/config/cron/jobs.yaml", tmp_path / "x2",
+    )
+    assert "a-fake-value" not in jobs
+    assert "nightly" in jobs
+
+
+def test_a_secrets_bundle_keeps_the_tracked_configuration_as_it_is(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    source = _with_tracked_config(workspace)
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir,
+        include_secrets=True,
+    )
+    assert _member(
+        kept.path, "workspace/config/settings.yaml", tmp_path / "x",
+    ) == source.read_text(encoding="utf-8")
+
+
+def test_a_config_file_with_nothing_secret_in_it_is_copied_unchanged(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """Most tracked config has only references in it. Rewriting those would
+    churn the bundle for nothing and lose the file's comments."""
+    cfg = workspace / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    body = "# a comment worth keeping\ntimezone: UTC\nagent:\n  max_turns: 40\n"
+    (cfg / "settings.yaml").write_text(body, encoding="utf-8")
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    assert _member(
+        bundle.path, "workspace/config/settings.yaml", tmp_path / "x",
+    ) == body
+
+
+def test_an_unparseable_config_file_is_still_archived(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """There is nothing to rewrite *safely* in a file that will not parse, and
+    dropping it would lose whatever the operator was in the middle of."""
+    cfg = workspace / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text("this: [is not: valid\n", encoding="utf-8")
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    assert "this: [is not: valid" in _member(
+        bundle.path, "workspace/config/settings.yaml", tmp_path / "x",
+    )
+
+
+def test_the_rewritten_file_is_staged_owner_only(
+    nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+):
+    """The reason it is being rewritten is that the original had a credential in
+    it, so the copy must not exist at a wider mode even briefly."""
+    _with_tracked_config(workspace)
+    seen: list[int] = []
+    real = backup_mod._secure_create
+
+    def recording(path, what, **kw):
+        fd = real(path, what, **kw)
+        if path.name == "settings.yaml":
+            seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return fd
+
+    monkeypatch.setattr(backup_mod, "_secure_create", recording)
+    backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    assert seen == [0o600]

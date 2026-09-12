@@ -646,6 +646,35 @@ class AccountStore:
                 raise UsernameTakenError("That username is already taken") from e
         return await self.get_account(account_id)
 
+    async def replace_credential_if_unchanged(
+        self, account_id: str, *, expected: str, credential: str,
+    ) -> bool:
+        """Swap one stored hash for another, only if it is still the one seen.
+
+        A compare-and-swap, and the comparison is the point. The one caller is
+        the opportunistic re-hash on the login path, whichreads a credential,
+        verifies a password against it, and then writes a replacement — three
+        steps with room between them for the account's owner to change their
+        password from another tab. An unconditional write would put the *old*
+        password back, silently, and leave whoever knew it still able to log in.
+
+        Conditioned on ``credential_source`` too, so a row that has moved off
+        its own credential in the meantime (back to the configured one, say) is
+        left alone rather than dragged back to ``local``.
+
+        Returns whether a row changed. ``False`` is a benign no-op: something
+        else got there first, and what it wrote is newer than what this had.
+        """
+        if not expected or not credential:
+            raise AccountError("both the expected and the new credential are required")
+        result = await self._write(
+            """UPDATE accounts
+                  SET credential = ?, updated_at = ?
+                WHERE id = ? AND credential = ? AND credential_source = 'local'""",
+            (credential, _now(), account_id, expected),
+        )
+        return result.rowcount > 0
+
     async def claim_sole_account(
         self,
         *,

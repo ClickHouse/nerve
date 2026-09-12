@@ -25,6 +25,7 @@ from nerve.gateway.auth import (
     bcrypt_cost,
     hash_password,
     pin_jwt_secret,
+    verify_password,
 )
 from nerve.gateway.routes import accounts as accounts_routes
 from nerve.gateway.routes import auth as auth_routes
@@ -601,6 +602,66 @@ class TestFailedLoginsCostTheSame:
         assert raised > 0.01, raised
         assert unknown >= raised * 0.9, (unknown, raised)
 
+    async def test_the_very_first_probe_covers_a_slower_stored_hash(self, install):
+        """Reacting to a slow comparison *after* making it is too late: that
+        request already took four times as long as an unknown username did, and
+        one probe is all an enumeration needs. The budget is calibrated from the
+        slowest cost the accounts actually carry, before the first login is
+        served — and the unknown username is asked first here, so nothing has
+        had a chance to observe the slow hash."""
+        from nerve.config import get_config
+
+        auth_routes._set_failure_budget(None)
+        await install.db.update_account_login(install.owner_id, username="alice")
+        slow = _cheap_hash(_PASSWORD, rounds=13)
+        await install.db.set_account_credential(
+            install.owner_id, credential_source="local", credential=slow,
+        )
+
+        # Calibration, with nothing having compared against the slow hash yet —
+        # so anything it knows, it knows from reading the accounts.
+        budget = await auth_routes.prepare_login_timing(install.db, get_config())
+        started = time.monotonic()
+        verify_password("wrong", slow)
+        one_slow_comparison = time.monotonic() - started
+        assert budget >= one_slow_comparison, (budget, one_slow_comparison)
+
+        async def elapsed(body) -> float:
+            async with _client(install.app) as client:
+                started_at = time.monotonic()
+                response = await client.post("/api/auth/login", json=body)
+                assert response.status_code == 401
+                return time.monotonic() - started_at
+
+        # Unknown first, so the known one cannot be the thing that taught the
+        # budget how slow this account is.
+        unknown = await elapsed({"username": "nobody-here", "password": "wrong"})
+        known = await elapsed({"username": "alice", "password": "wrong"})
+
+        assert unknown >= budget * 0.9, (unknown, budget)
+        assert known >= budget * 0.9, (known, budget)
+        assert abs(known - unknown) < budget * 0.5, (unknown, known, budget)
+
+    async def test_calibration_reads_the_configured_hash_too(self, install):
+        """`config` and `none` rows verify against auth.password_hash, so its
+        work factor counts as much as any stored on a row."""
+        cheap = _cheap_hash(_PASSWORD, rounds=4)
+        assert auth_routes._slowest_stored_cost([], cheap) == BCRYPT_COST
+        assert auth_routes._slowest_stored_cost(
+            [], _cheap_hash(_PASSWORD, rounds=14),
+        ) == 14
+        assert auth_routes._slowest_stored_cost(
+            [{"credential_source": "local", "credential": cheap}], "",
+        ) == BCRYPT_COST
+        assert auth_routes._slowest_stored_cost(
+            [{"credential_source": "local", "credential": _cheap_hash(_PASSWORD, 13)},
+             {"credential_source": "local", "credential": hash_password(_PASSWORD)}], "",
+        ) == 13
+        # A `config` row's own column is NULL and says nothing about cost.
+        assert auth_routes._slowest_stored_cost(
+            [{"credential_source": "config", "credential": None}], "",
+        ) == BCRYPT_COST
+
     async def test_the_budget_is_measured_outside_a_request(self, install):
         """The measurement costs a comparison. Paid inside a request's own timed
         window, it would make the first failure of a process stand out from
@@ -701,6 +762,54 @@ class TestHashesConvergeOnThePolicyCost:
                 "/api/auth/login", json={"username": "alice", "password": _PASSWORD},
             )
         assert response.status_code == 200
+
+    async def test_a_concurrent_password_change_is_not_reverted(self, install):
+        """The credential is read, compared against, and only then replaced. A
+        password changed in between must stand: writing unconditionally would
+        put the old one back and leave whoever knew it still able to log in."""
+        await install.db.update_account_login(install.owner_id, username="alice")
+        stale = _cheap_hash(_PASSWORD, rounds=4)
+        await install.db.set_account_credential(
+            install.owner_id, credential_source="local", credential=stale,
+        )
+        account = await install.db.get_account(install.owner_id)
+
+        # ...the owner changes their password from another tab...
+        await install.db.update_account_login(
+            install.owner_id, credential=hash_password(_OTHER_PASSWORD),
+        )
+
+        # ...and the in-flight login finishes, holding the row it read first.
+        await auth_routes._maybe_upgrade_hash(install.db, account, _PASSWORD)
+
+        async with _client(install.app) as client:
+            new_one = await client.post(
+                "/api/auth/login",
+                json={"username": "alice", "password": _OTHER_PASSWORD},
+            )
+            old_one = await client.post(
+                "/api/auth/login", json={"username": "alice", "password": _PASSWORD},
+            )
+        assert new_one.status_code == 200, new_one.text
+        assert old_one.status_code == 401
+
+    async def test_the_swap_is_conditioned_on_the_source_too(self, install):
+        """A row that has moved off its own credential in the meantime is left
+        alone rather than dragged back to `local`."""
+        await install.db.set_account_credential(
+            install.owner_id, credential_source="local",
+            credential=_cheap_hash(_PASSWORD, rounds=4),
+        )
+        account = await install.db.get_account(install.owner_id)
+        await install.db.set_account_credential(
+            install.owner_id, credential_source="config",
+        )
+
+        await auth_routes._maybe_upgrade_hash(install.db, account, _PASSWORD)
+
+        row = await install.db.get_account(install.owner_id)
+        assert row["credential_source"] == "config"
+        assert row["credential"] is None
 
     async def test_an_over_long_legacy_password_is_not_re_hashed(self, install):
         """verify_password accepted it by truncating. Re-hashing would refuse,
