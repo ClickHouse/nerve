@@ -6,9 +6,10 @@ import { Button } from '../components/ui';
  * Placeholder for the first-run setup wizard.
  *
  * The instance reached here because `/api/auth/status` says `setup_pending`:
- * its one account has neither a password nor a username, which is what a
- * headless install lands as when `NERVE_PASSWORD` was never set. Anyone who can
- * reach the gateway is currently signed in as the owner.
+ * its one account has no password, which is what a headless install lands as
+ * when `NERVE_PASSWORD` was never set. Anyone who can reach the gateway is
+ * currently signed in as the owner. Naming the account does not change that,
+ * so naming it does not clear this page either.
  *
  * There is deliberately no gate on this page and nothing here is required: an
  * abandoned setup must leave a working instance, so the app is one link away.
@@ -32,10 +33,12 @@ export function SetupPage() {
         </p>
 
         <p className="text-sm text-text-muted mb-6">
-          Two things finish setup, both on the accounts screen: give the account
-          a <strong className="text-text">password</strong>, and give it a{' '}
-          <strong className="text-text">username</strong> to sign in with. Both
-          are also what has to happen before a second person can be added.
+          What closes it is a <strong className="text-text">password</strong>,
+          on the accounts screen. A{' '}
+          <strong className="text-text">username</strong> is worth setting at
+          the same time — both have to be in place before a second person can
+          be added — but it is the password that secures the instance, and
+          setting a username on its own changes nothing about who gets in.
         </p>
 
         <div className="flex flex-wrap items-center gap-3">
