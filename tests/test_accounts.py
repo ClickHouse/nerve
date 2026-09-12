@@ -817,6 +817,19 @@ class TestUpdateAccountLogin:
         assert renamed["id"] == account["id"]
         assert (await db.get_actor_ref(actor["id"]))["id"] == actor["id"]
 
+    async def test_renaming_to_the_same_username_is_not_a_clash(self, db: Database):
+        """The unique index sees the row being updated as itself, and a
+        no-op rename must not be reported as somebody else's name."""
+        actor = await db.create_actor_ref(kind="human")
+        account = await db.create_account(
+            actor_id=actor["id"], credential_source="local",
+            credential="$2b$12$x", username="alice",
+        )
+        same = await db.update_account_login(account["id"], username="ALICE")
+        assert same["username"] == "alice"
+        again = await db.set_account_username(account["id"], "alice")
+        assert again["username"] == "alice"
+
     async def test_unknown_account_and_empty_update(self, db: Database):
         assert await db.update_account_login("nope", username="alice") is None
         actor = await db.create_actor_ref(kind="human")

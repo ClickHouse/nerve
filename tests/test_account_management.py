@@ -516,3 +516,76 @@ class TestOwnPassword:
                 headers=install.headers(),
             )
         assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+#  Structural: what the route surface promises                                 #
+# --------------------------------------------------------------------------- #
+
+
+class TestTheRouteSurface:
+    """Checked against the modules rather than through a client, so a route
+    added later without a gate fails here rather than in production."""
+
+    @staticmethod
+    def _endpoints():
+        import inspect
+
+        from nerve.gateway.routes import (
+            accounts, auth, codex, config, cron, diagnostics, external_agents,
+            files, mcp_servers, memory, models, notifications, plans,
+            prompt_rewrite, review_loops, sessions, skills, sources, tasks,
+            workflow_runs,
+        )
+
+        modules = [
+            accounts, auth, codex, config, cron, diagnostics, external_agents,
+            files, mcp_servers, memory, models, notifications, plans,
+            prompt_rewrite, review_loops, sessions, skills, sources, tasks,
+            workflow_runs,
+        ]
+        for module in modules:
+            for route in module.router.routes:
+                endpoint = getattr(route, "endpoint", None)
+                if endpoint is None:
+                    continue
+                gates = [
+                    p.default.dependency.__name__
+                    for p in inspect.signature(endpoint).parameters.values()
+                    if getattr(p.default, "dependency", None) is not None
+                ]
+                yield sorted(route.methods), str(route.path), gates
+
+    def test_only_three_api_endpoints_are_unauthenticated(self):
+        """Login and status are the doors themselves; the worker-token exchange
+        authenticates through the MCP path instead. Anything else appearing
+        here is a hole."""
+        open_endpoints = {
+            (tuple(methods), path)
+            for methods, path, gates in self._endpoints()
+            if path.startswith("/api")
+            and "require_auth" not in gates
+            and "require_account" not in gates
+        }
+        assert open_endpoints == {
+            (("POST",), "/api/auth/login"),
+            (("GET",), "/api/auth/status"),
+            (("POST",), "/api/codex/worker-token"),
+        }
+
+    def test_every_account_endpoint_requires_a_human_account(self):
+        account_endpoints = [
+            (tuple(methods), path, gates)
+            for methods, path, gates in self._endpoints()
+            if path.startswith("/api/accounts")
+        ]
+        assert len(account_endpoints) == 7
+        for methods, path, gates in account_endpoints:
+            assert gates == ["require_account"], (methods, path, gates)
+
+    def test_there_is_no_endpoint_that_deletes_an_account(self):
+        """Removal is disablement; the row is the tombstone that keeps a
+        grandfathered token from resolving to the wrong account."""
+        for methods, path, _ in self._endpoints():
+            if path.startswith("/api/accounts"):
+                assert "DELETE" not in methods, path

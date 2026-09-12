@@ -250,13 +250,21 @@ creates a `config` row any more.
 
 ### Rollback
 
-**After this release, a downgrade silently strips access from any second
-account.** Older code only knows the configuration password and has no account
-management, so an install that added people goes back to one credential for
-everybody who is left — and, if `auth.password_hash` was scrubbed (an ordinary
-install), to no credential at all. Restore a backup taken before the upgrade
-rather than downgrading in place. Documented rather than prevented: there is no
-way to make old code understand rows it has never heard of.
+**Do not downgrade in place after this release. Restore a backup taken before
+the upgrade instead.** Older code knows nothing about account rows, so:
+
+- **a downgrade silently strips access from any second account.** There is one
+  credential again — the configured one — and it belongs to whoever is left;
+- worse, on an ordinary install `auth.password_hash` has been *removed* from
+  configuration by then, and older code reads a config with no password hash as
+  **passwordless**: it admits every caller who can reach the gateway. The
+  migration says this in a warning at the moment it removes the key.
+
+A lockdown install is the one case that downgrades cleanly, because its
+configuration was never rewritten.
+
+Documented rather than prevented: there is no way to make old code understand
+rows it has never heard of.
 
 ## Sessions and the actor on the request
 
