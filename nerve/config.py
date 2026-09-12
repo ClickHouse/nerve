@@ -413,6 +413,60 @@ _UNRESOLVED_REF = "${"
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
 
+# How this instance learns who is making a request. ``local`` — local accounts
+# plus a session, authority decided in process — is the only mode this version
+# implements; the key exists so that the mode is an explicit, startup-only
+# setting rather than something inferred from which credentials happen to be
+# present (the class of bug behind the old "empty jwt_secret means open"
+# behaviour). It is never hot-reloaded and never taken from a configuration
+# push: the environment variable wins over every file, the same way the
+# lockdown anchor does, because an authentication mode that can be changed
+# remotely is one a configuration delivery bug can downgrade.
+AUTH_MODES = ("local",)
+AUTH_MODE_ENV = "NERVE_AUTH_MODE"
+
+
+def _as_auth_mode(value: Any) -> str:
+    """Parse ``auth.mode``, refusing anything but a supported mode.
+
+    Unset (or blank) is ``local``. Anything else must name a mode this version
+    implements; a value it does not recognise is a hard error rather than a
+    fallback, because the only default it could fall back to is the mode with
+    the weakest external guarantees, and an operator who wrote ``external``
+    must not get ``local`` in silence.
+    """
+    if value is None:
+        return AUTH_MODES[0]
+    text = str(value).strip().lower()
+    if not text:
+        return AUTH_MODES[0]
+    if text in AUTH_MODES:
+        return text
+    accepted = ", ".join(repr(m) for m in AUTH_MODES)
+    raise ConfigError(
+        f"auth.mode must be one of {accepted}, got {value!r}. This version of "
+        f"Nerve supports local accounts only; an external identity mode is not "
+        f"available yet. Unset the key (and {AUTH_MODE_ENV}) to run in local mode."
+    )
+
+
+def _apply_auth_mode_anchor(merged: dict[str, Any]) -> None:
+    """Let ``NERVE_AUTH_MODE`` override ``auth.mode`` from every file.
+
+    Applied after interpolation, so it also wins over a
+    ``${NERVE_AUTH_MODE:-local}`` reference. An unset or blank variable
+    expresses no opinion. A malformed ``auth`` section (not a mapping) is left
+    for the typed loader to report as it does today.
+    """
+    raw = os.environ.get(AUTH_MODE_ENV)
+    if raw is None or not raw.strip():
+        return
+    auth = merged.get("auth")
+    if auth is None:
+        auth = merged["auth"] = {}
+    if isinstance(auth, dict):
+        auth["mode"] = raw.strip()
+
 
 def lockdown_anchor() -> bool:
     """Whether the environment forces this instance into lockdown.
@@ -678,7 +732,9 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
 
-    return _resolve_env_refs(merged)
+    resolved = _resolve_env_refs(merged)
+    _apply_auth_mode_anchor(resolved)
+    return resolved
 
 
 @dataclass
@@ -1922,7 +1978,16 @@ class RetentionConfig:
 
 @dataclass
 class AuthConfig:
+    # Identity mode; see AUTH_MODES. Startup-only: read once at boot, listed as
+    # restart-only for reloads, and overridable from the environment
+    # (NERVE_AUTH_MODE) so no configuration push can change it.
+    mode: str = "local"
     password_hash: str = ""
+    # Signing secret for session tokens. Optional: when unset, one is generated
+    # on first start and kept in nerve.db (see nerve.migrate.ensure_jwt_secret);
+    # a configured value always wins over the stored one. Consumers read the
+    # resolved value through nerve.gateway.auth.effective_jwt_secret(), never
+    # this field directly.
     jwt_secret: str = ""
     # Web-session lifetime. This is an *idle* timeout, not a cap on a working
     # session: the gateway slides the token forward on every authenticated
@@ -1935,6 +2000,9 @@ class AuthConfig:
     @_coerced
     def from_dict(cls, d: dict) -> AuthConfig:
         return cls(
+            # Parsed strictly rather than left to @_coerced, which would fall
+            # back to the default for an unreadable value. See _as_auth_mode.
+            mode=_as_auth_mode(d.get("mode")),
             password_hash=d.get("password_hash", ""),
             jwt_secret=d.get("jwt_secret", ""),
             jwt_expiry_hours=max(1, _lenient_int(d.get("jwt_expiry_hours"), 720)),

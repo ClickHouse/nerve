@@ -71,6 +71,7 @@ _ERROR_PREFIX = "error: "
 _RESTART_ONLY_PATHS = (
     "agent.max_concurrent",
     "auth.jwt_secret",
+    "auth.mode",
     "codex.home_dir",
     "external_agents.enabled",
     "gateway.host",

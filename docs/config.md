@@ -281,6 +281,7 @@ reload cannot inspect, and are documented here only.
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
+| `auth.mode` | startup-only by design: the identity mode is read once at boot and deliberately never follows a reload or a configuration push — an authentication mode that can be changed remotely is one a configuration delivery bug can downgrade. `NERVE_AUTH_MODE` in the environment wins over every file (see [Auth](#auth)) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
@@ -1230,8 +1231,9 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auth.password_hash` | string | - | bcrypt hash for login |
-| `auth.jwt_secret` | string | - | JWT signing secret |
+| `auth.mode` | string | `local` | How the instance learns who is making a request. `local` — local accounts plus a session, authority decided in process — is the only value this version accepts; anything else is a hard error at startup and in `nerve config validate`. Startup-only (see the restart table). `NERVE_AUTH_MODE` in the environment overrides every file, so the mode can be pinned where the service is defined and no configuration push can change it |
+| `auth.password_hash` | string | - | bcrypt hash for login. Unset means passwordless: every caller who can reach the gateway acts as the owner, which is only sensible on a loopback or otherwise private bind |
+| `auth.jwt_secret` | string | - | JWT signing secret. Optional: when unset, one is generated on first start and kept in `nerve.db` (never written into a config file); a configured value always wins over the stored one, so setting it later simply rotates the secret and logs every tab out once. See [Accounts and identity](accounts.md) |
 
 ## API Keys (config.local.yaml)
 
