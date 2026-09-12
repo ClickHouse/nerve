@@ -17,6 +17,7 @@ from nerve.gateway.routes._deps import (
     set_notification_service,
 )
 from nerve.gateway.routes import (
+    accounts,
     auth,
     sessions,
     tasks,
@@ -51,6 +52,7 @@ def register_all_routes() -> APIRouter:
     """Assemble and return the combined API router."""
     router = APIRouter()
     router.include_router(auth.router)
+    router.include_router(accounts.router)
     router.include_router(sessions.router)
     router.include_router(tasks.router)
     router.include_router(plans.router)
