@@ -437,3 +437,65 @@ class TestCli:
         result = CliRunner().invoke(main, ["-c", str(config_dir), "migrate"])
         assert result.exit_code == 0, result.output
         assert "Nothing to migrate" in result.output
+
+
+# --------------------------------------------------------------------------- #
+#  Two bootstraps at once                                                      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestConcurrentBootstrap:
+    async def test_two_connections_create_one_owner_and_report_it_once(self, tmp_path):
+        """A `nerve migrate` beside a starting daemon: two connections, one
+        database. BEGIN IMMEDIATE lets exactly one create the owner, and the
+        report has to say what each transaction did — not what a count taken
+        before it suggested."""
+        import asyncio
+
+        path = tmp_path / "shared.db"
+        a, b = Database(path), Database(path)
+        await a.connect()
+        await b.connect()
+        try:
+            config = _cfg(jwt_secret=_SECRET)
+            ra, rb = await asyncio.gather(
+                bootstrap_identity(a, config), bootstrap_identity(b, config),
+            )
+            winners = [r for r in (ra, rb) if r.bootstrapped_account]
+            assert len(winners) == 1
+            loser = rb if ra.bootstrapped_account else ra
+            assert loser.identity_actions == []
+            assert not loser.updated_credential_source
+
+            assert await a.count_accounts() == 1
+            assert len(await a.list_actor_refs()) == 2
+            ia, ib = await a.get_local_identity(), await b.get_local_identity()
+            assert (ia.tenant_id, ia.agent_id, ia.system_actor_id) == (
+                ib.tenant_id, ib.agent_id, ib.system_actor_id,
+            )
+        finally:
+            await a.close()
+            await b.close()
+
+    async def test_the_caller_that_finds_the_owner_still_mirrors_its_configuration(
+        self, tmp_path,
+    ):
+        """The second half of the race, run sequentially so the outcome is
+        deterministic: a caller whose configuration snapshot differs from the
+        creator's brings credential_source in line after the transaction."""
+        path = tmp_path / "shared.db"
+        a, b = Database(path), Database(path)
+        await a.connect()
+        await b.connect()
+        try:
+            ra = await bootstrap_identity(a, _cfg(jwt_secret=_SECRET))
+            assert ra.bootstrapped_account
+            rb = await bootstrap_identity(b, _cfg(password_hash=_HASH, jwt_secret=_SECRET))
+            assert not rb.bootstrapped_account
+            assert rb.updated_credential_source
+            (account,) = await b.list_accounts()
+            assert account["credential_source"] == "config"
+        finally:
+            await a.close()
+            await b.close()

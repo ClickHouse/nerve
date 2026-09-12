@@ -1048,35 +1048,40 @@ async def bootstrap_identity(
     report = MigrationReport(dry_run=dry_run) if report is None else report
     source = _credential_source_for(config)
 
-    if await db.count_accounts() == 0:
-        report.bootstrapped_account = True
-        report.identity_actions.append(_account_action(source, dry_run))
-        if not dry_run:
-            identity = await db.bootstrap_local_identity(
-                credential_source=source, display_name=display_name,
-            )
+    if dry_run:
+        if await db.count_accounts() == 0:
+            report.bootstrapped_account = True
+            report.identity_actions.append(_account_action(source, dry_run=True))
+    else:
+        # Reported from what the transaction actually did, not from a count
+        # taken before it: two bootstraps racing — a `nerve migrate` beside a
+        # starting daemon — both read zero accounts, but only the one that
+        # wins BEGIN IMMEDIATE creates the owner, and only it may say so.
+        identity = await db.bootstrap_local_identity(
+            credential_source=source, display_name=display_name,
+        )
+        if "owner" in identity.created:
+            report.bootstrapped_account = True
+            report.identity_actions.append(_account_action(source, dry_run=False))
             logger.info(
                 "Identity bootstrap: local tenant %s, agent %s, owner account %s "
                 "(actor %s, credential_source=%s), system principal %s",
                 identity.tenant_id, identity.agent_id, identity.owner_account_id,
                 identity.owner_actor_id, source, identity.system_actor_id,
             )
-    else:
+
+    # The mirror runs after the transaction whoever won it, so a caller that
+    # lost the race with a different configuration snapshot still brings the
+    # row in line with its own. For the winner it is a no-op: the account it
+    # just created already carries ``source``.
+    for account in await db.list_accounts():
+        current = account["credential_source"]
+        if current == "local" or current == source:
+            continue
+        report.updated_credential_source = True
+        report.identity_actions.append(_mirror_action(current, source, dry_run))
         if not dry_run:
-            # Finds the singleton rows (creating none of them in practice —
-            # they were made in the same transaction as the account) and
-            # leaves every existing account exactly as it is.
-            await db.bootstrap_local_identity(
-                credential_source=source, display_name=display_name,
-            )
-        for account in await db.list_accounts():
-            current = account["credential_source"]
-            if current == "local" or current == source:
-                continue
-            report.updated_credential_source = True
-            report.identity_actions.append(_mirror_action(current, source, dry_run))
-            if not dry_run:
-                await db.set_account_credential(account["id"], credential_source=source)
+            await db.set_account_credential(account["id"], credential_source=source)
 
     await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
     return report
