@@ -1,5 +1,8 @@
 import { create } from 'zustand';
-import { api, setToken, clearToken, getToken, setUnauthorizedHandler } from '../api/client';
+import {
+  api, setToken, clearToken, getToken, setUnauthorizedHandler,
+  type LoginKind,
+} from '../api/client';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
@@ -18,9 +21,23 @@ interface AuthState {
    * where you were.
    */
   sessionExpired: boolean;
-  login: (password: string) => Promise<void>;
+  /**
+   * What the login form must collect, from `/api/auth/status`.
+   *
+   * Defaults to `'password'` — never `'none'`. A status call that fails must
+   * not leave the app believing the instance is passwordless, because that is
+   * the one value that makes it log itself in without asking.
+   */
+  loginMode: LoginKind;
+  /** The instance has never been set up: no password and no username on its
+   *  one account. Routed to `/setup`. */
+  setupPending: boolean;
+  login: (password: string, username?: string) => Promise<void>;
   logout: () => void;
   checkAuth: () => Promise<void>;
+  /** Re-read the descriptor after something that can change it (adding the
+   *  second account, setting the first password). */
+  refreshStatus: () => Promise<void>;
 }
 
 /**
@@ -39,11 +56,13 @@ export const useAuthStore = create<AuthState>((set) => ({
   checking: !getToken(),
   error: null,
   sessionExpired: false,
+  loginMode: 'password',
+  setupPending: false,
 
-  login: async (password: string) => {
+  login: async (password: string, username?: string) => {
     set({ loading: true, error: null });
     try {
-      const { token } = await api.login(password);
+      const { token } = await api.login(password, username);
       setToken(token);
       sessionEstablished = true;
       set({ authenticated: true, loading: false, sessionExpired: false });
@@ -63,22 +82,47 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ authenticated: false, sessionExpired: false });
   },
 
+  refreshStatus: async () => {
+    try {
+      const status = await api.authStatus();
+      set({ loginMode: status.login, setupPending: status.setup_pending });
+    } catch {
+      // Leave the last known shape in place rather than guessing.
+    }
+  },
+
   checkAuth: async () => {
+    // Asked on *both* branches, unlike before. A tab that starts with a valid
+    // token still needs to know what the login form should collect, because
+    // its session can expire later and the overlay has to ask for the right
+    // thing — and because a passwordless install that has never been set up
+    // belongs on /setup however it arrived.
+    let status: Awaited<ReturnType<typeof api.authStatus>> | null = null;
+    try {
+      status = await api.authStatus();
+      set({ loginMode: status.login, setupPending: status.setup_pending });
+    } catch {
+      // Status unreadable — fall through with the safe default (a password is
+      // required, setup is not pending), which asks rather than assumes.
+    }
+
     if (!getToken()) {
-      // No token — check if auth is even required
-      try {
-        const { auth_required } = await api.authStatus();
-        if (!auth_required) {
-          // No password configured — auto-login
+      // Auto-login only for the one state where there is genuinely nothing to
+      // ask for: a passwordless install, which by construction has exactly one
+      // account. It must not survive into a multi-account install, where an
+      // empty password names nobody and the server refuses it.
+      if (status?.login === 'none') {
+        try {
           const { token } = await api.login('');
           setToken(token);
+          sessionEstablished = true;
           // checking must be cleared here too — App renders null while it
           // is true, so leaving it set blanks the app after auto-login.
           set({ authenticated: true, checking: false });
           return;
+        } catch {
+          // Fall through to the login page.
         }
-      } catch {
-        // Status check failed — fall through to login page
       }
       set({ authenticated: false, checking: false });
       return;

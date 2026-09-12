@@ -1,14 +1,16 @@
 import { useState, type FormEvent } from 'react';
 import { useAuthStore } from '../../stores/authStore';
-import { Button, TextField } from '../ui';
+import { Button } from '../ui';
+import { CredentialFields } from './CredentialFields';
 
 export function LoginPage() {
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const { login, loading, error } = useAuthStore();
+  const { login, loading, error, loginMode } = useAuthStore();
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    login(password);
+    login(password, username);
   };
 
   return (
@@ -18,14 +20,12 @@ export function LoginPage() {
         className="bg-surface-raised p-8 rounded-lg border border-border-subtle w-80"
       >
         <h1 className="text-xl font-semibold mb-6 text-center">Nerve</h1>
-        <TextField
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Password"
-          aria-label="Password"
-          autoFocus
-          className="mb-4"
+        <CredentialFields
+          loginMode={loginMode}
+          username={username}
+          password={password}
+          onUsername={setUsername}
+          onPassword={setPassword}
         />
         {error && <p className="text-error text-sm mb-3">{error}</p>}
         {/* `type="submit"` is explicit: Button defaults to `button`, because
