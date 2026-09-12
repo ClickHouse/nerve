@@ -323,11 +323,24 @@ class TestStatusDescriptor:
             "setup_pending": True, "multiple_accounts": False,
         }
 
-    async def test_naming_the_account_ends_setup_but_not_passwordless(self, install):
+    async def test_naming_the_account_does_not_end_setup(self, install):
+        """The accounts screen can set a username on its own. Doing that first
+        must not stop the instance reporting as unsecured — it still admits
+        every caller, which is the state the wizard exists to end."""
         await install.db.set_account_username(install.owner_id, "alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
         assert body["login"] == "none"
+        assert body["setup_pending"] is True
+
+    async def test_only_a_password_ends_setup(self, install):
+        await install.db.set_account_username(install.owner_id, "alice")
+        await install.db.update_account_login(
+            install.owner_id, credential=hash_password(_PASSWORD),
+        )
+        async with _client(install.app) as client:
+            body = (await client.get("/api/auth/status")).json()
+        assert body["login"] == "password"
         assert body["setup_pending"] is False
 
     async def test_password_only(self, install):
