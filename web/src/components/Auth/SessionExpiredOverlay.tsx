@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { useAuthStore } from '../../stores/authStore';
-import { Button, TextField } from '../ui';
+import { Button } from '../ui';
+import { CredentialFields } from './CredentialFields';
 
 /**
  * Password prompt shown *over* the running app when a session expires.
@@ -12,12 +13,13 @@ import { Button, TextField } from '../ui';
  * composer at the time.
  */
 export function SessionExpiredOverlay() {
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const { login, loading, error, logout } = useAuthStore();
+  const { login, loading, error, logout, loginMode } = useAuthStore();
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    login(password);
+    login(password, username);
   };
 
   return (
@@ -37,14 +39,12 @@ export function SessionExpiredOverlay() {
         <p className="text-sm text-text-muted mb-6 text-center">
           Your work is still here — log back in to continue.
         </p>
-        <TextField
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Password"
-          aria-label="Password"
-          autoFocus
-          className="mb-4"
+        <CredentialFields
+          loginMode={loginMode}
+          username={username}
+          password={password}
+          onUsername={setUsername}
+          onPassword={setPassword}
         />
         {error && <p className="text-error text-sm mb-3">{error}</p>}
         <Button type="submit" variant="primary" size="md" fullWidth disabled={loading}>
