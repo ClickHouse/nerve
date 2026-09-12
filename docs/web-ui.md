@@ -127,8 +127,10 @@ first account has both a password and a username, which is what has to be true
 before a second account can exist — the page shows the reason rather than
 guessing at it.
 
-`/setup` is where an instance that has never been set up opens instead of the
-chat: one account, no password, no username. It is skippable and points here.
+`/setup` is where an instance that has never been secured opens instead of the
+chat: one account with no password, so everyone who can reach it is signed in as
+it. Giving that account a username does not settle it — only a password does. It
+is skippable and points here.
 
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:

@@ -34,7 +34,7 @@ import { NotificationToast } from './components/Notifications/NotificationToast'
 import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
-  const { authenticated, checking, checkAuth, sessionExpired } = useAuthStore();
+  const { authenticated, ready, checkAuth, sessionExpired } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
@@ -49,7 +49,10 @@ function App() {
     return () => { unsub(); ws.disconnect(); };
   }, [authenticated]);
 
-  if (checking) return null;
+  // Nothing renders until startup has decided where this tab belongs. A stored
+  // token is not that decision: the instance may still be unset-up, and
+  // rendering on the token alone landed on /chat before the answer arrived.
+  if (!ready) return null;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
   // overlay, so nothing you had typed is thrown away to ask for it.
@@ -107,9 +110,11 @@ function App() {
 /**
  * Where the app opens.
  *
- * Chat, unless the instance has never been set up — its one account has
- * neither a password nor a username — in which case the setup page, so the
- * state gets noticed rather than silently persisting. Only the *root* redirect
+ * Chat, unless the instance has never been secured — its one account has no
+ * password, so everyone who can reach it is signed in as it — in which case the
+ * setup page, so the state gets noticed rather than silently persisting.
+ * Naming the account does not settle it; only a password does.
+ * Only the *root* redirect
  * moves: a deep link, a refresh or a bookmark still lands where it says, and
  * the setup page is skippable, so an abandoned setup leaves a working
  * instance.
