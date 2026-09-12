@@ -15,6 +15,7 @@ from typing import AsyncIterator, NamedTuple
 
 import aiosqlite
 
+from nerve.db.accounts import AccountStore
 from nerve.db.audit import AuditStore
 from nerve.db.cron import CronStore
 from nerve.db.files import FileStore
@@ -105,6 +106,7 @@ class Database(
     WakeupStore,
     WorkflowRunStore,
     ReviewLoopStore,
+    AccountStore,
     MaintenanceStore,
 ):
     """Async SQLite database wrapper.
