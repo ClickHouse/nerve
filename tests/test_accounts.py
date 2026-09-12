@@ -20,6 +20,7 @@ from nerve.db.accounts import (
     InvalidUsernameError,
     LastAccountError,
     LoginState,
+    NotClaimableError,
     PasswordlessInstanceError,
     ReservedUsernameError,
     UnnamedAccountError,
@@ -839,3 +840,91 @@ class TestUpdateAccountLogin:
         account = await db.create_account(actor_id=actor["id"], credential_source="none")
         with pytest.raises(ValueError):
             await db.update_account_login(account["id"], credential="")
+
+
+@pytest.mark.asyncio
+class TestClaimingTheSoleAccount:
+    """The first-run "claim and secure" step, for the setup wizard. One
+    transaction, and the precondition checked inside it."""
+
+    async def _unclaimed(self, db: Database) -> dict:
+        actor = await db.create_actor_ref(kind="human")
+        return await db.create_account(actor_id=actor["id"], credential_source="none")
+
+    async def test_names_and_secures_in_one_step(self, db: Database):
+        account = await self._unclaimed(db)
+        claimed = await db.claim_sole_account(
+            username="Alice", credential="$2b$12$claimed", display_name="Alice A",
+        )
+        assert claimed["id"] == account["id"]
+        assert claimed["username"] == "alice"          # normalised on the way in
+        assert claimed["credential_source"] == "local"
+        assert claimed["credential"] == "$2b$12$claimed"
+        actor = await db.get_actor_ref(account["actor_id"])
+        assert actor["display_name"] == "Alice A"
+        assert actor["profile_version"] == 2
+        assert not (await db.login_state()).passwordless
+
+    async def test_the_display_name_is_optional(self, db: Database):
+        account = await self._unclaimed(db)
+        await db.update_actor_profile(account["actor_id"], display_name="Existing")
+        await db.claim_sole_account(username="alice", credential="$2b$12$x")
+        actor = await db.get_actor_ref(account["actor_id"])
+        assert actor["display_name"] == "Existing"     # not cleared by omission
+
+    async def test_an_already_claimed_account_is_refused(self, db: Database):
+        await self._unclaimed(db)
+        await db.claim_sole_account(username="alice", credential="$2b$12$first")
+        with pytest.raises(NotClaimableError):
+            await db.claim_sole_account(username="bob", credential="$2b$12$second")
+        (account,) = await db.list_accounts()
+        assert account["username"] == "alice"
+        assert account["credential"] == "$2b$12$first"
+
+    async def test_an_install_with_two_accounts_is_refused(self, db: Database):
+        await self._unclaimed(db)
+        await self._unclaimed(db)
+        with pytest.raises(NotClaimableError):
+            await db.claim_sole_account(username="alice", credential="$2b$12$x")
+
+    async def test_an_install_with_no_accounts_is_refused(self, db: Database):
+        with pytest.raises(NotClaimableError):
+            await db.claim_sole_account(username="alice", credential="$2b$12$x")
+
+    async def test_the_username_rules_apply(self, db: Database):
+        await self._unclaimed(db)
+        with pytest.raises(ReservedUsernameError):
+            await db.claim_sole_account(username="user", credential="$2b$12$x")
+        with pytest.raises(InvalidUsernameError):
+            await db.claim_sole_account(username="no spaces", credential="$2b$12$x")
+        with pytest.raises(ValueError):
+            await db.claim_sole_account(username="alice", credential="")
+        (account,) = await db.list_accounts()
+        assert account["credential_source"] == "none"   # nothing half-applied
+
+    async def test_two_connections_racing_to_claim_leave_one_winner(
+        self, db: Database, tmp_path,
+    ):
+        """The reason this exists rather than get_sole_account() +
+        update_account_login(): those are two transactions, so the second caller
+        reads "one account, no password" before the first commits and quietly
+        replaces its password with its own."""
+        import asyncio
+
+        await self._unclaimed(db)
+        other = Database(db.db_path)
+        await other.connect()
+        try:
+            results = await asyncio.gather(
+                db.claim_sole_account(username="alice", credential="$2b$12$alice"),
+                other.claim_sole_account(username="bob", credential="$2b$12$bob"),
+                return_exceptions=True,
+            )
+        finally:
+            await other.close()
+        refused = [r for r in results if isinstance(r, NotClaimableError)]
+        won = [r for r in results if isinstance(r, dict)]
+        assert len(refused) == 1 and len(won) == 1, results
+        (account,) = await db.list_accounts()
+        assert account["username"] == won[0]["username"]
+        assert account["credential"] == won[0]["credential"]

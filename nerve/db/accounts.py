@@ -127,6 +127,15 @@ class UnnamedAccountError(AccountError):
     """
 
 
+class NotClaimableError(AccountError):
+    """The sole-account claim found something other than one unsecured account.
+
+    Either more than one account exists, or none does, or the one that does
+    already has a password — in which case somebody has already claimed it and
+    a second claim would be taking it from them.
+    """
+
+
 class LastAccountError(AccountError):
     """The last enabled account cannot be disabled — that is a locked-out install.
 
@@ -636,6 +645,84 @@ class AccountStore:
             except sqlite3.IntegrityError as e:
                 raise UsernameTakenError("That username is already taken") from e
         return await self.get_account(account_id)
+
+    async def claim_sole_account(
+        self,
+        *,
+        username: str,
+        credential: str,
+        display_name: str | None = None,
+    ) -> dict:
+        """Name and secure the one unclaimed account, in a single transaction.
+
+        First-run "claim and secure": the account an install is created with has
+        no password and no username, and this is what gives it both. One
+        transaction, so a half-claimed account — named but still open, or
+        secured but unreachable — never exists, not even between two requests.
+
+        The *precondition* is checked inside the transaction as well, which is
+        the difference between this and ``get_sole_account()`` followed by
+        ``update_account_login()``: those are two transactions, so two callers
+        racing to claim a fresh install can both read "one account, no
+        password" and the second one silently overwrites the first's password
+        with its own. Under ``BEGIN IMMEDIATE`` the loser reads the winner's
+        committed row and raises :class:`NotClaimableError`.
+
+        Raises :class:`NotClaimableError` unless exactly one account exists and
+        it has no credential, and the username errors of
+        :func:`normalise_username`. ``display_name`` also renames the account's
+        actor, in the same transaction.
+
+        Note what this does **not** do: decide who may call it. A passwordless
+        install admits everybody, so the caller is responsible for the guard
+        that makes claiming meaningful (a setup token, or proof that the request
+        came from the machine itself).
+        """
+        username = normalise_username(username)
+        if not credential:
+            raise AccountError("A password is required")
+
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            async with self.db.execute(
+                "SELECT id, actor_id, credential_source FROM accounts"
+            ) as cursor:
+                rows = [dict(row) async for row in cursor]
+            if len(rows) != 1:
+                raise NotClaimableError(
+                    "Claiming is for an install with exactly one account; this "
+                    f"one has {len(rows)}."
+                )
+            account = rows[0]
+            if account["credential_source"] != "none":
+                raise NotClaimableError(
+                    "This account already has a password, so it has been claimed "
+                    "already. Sign in instead."
+                )
+
+            now = _now()
+            try:
+                await self.db.execute(
+                    """UPDATE accounts
+                          SET username = ?, credential_source = 'local',
+                              credential = ?, updated_at = ?
+                        WHERE id = ?""",
+                    (username, credential, now, account["id"]),
+                )
+            except sqlite3.IntegrityError as e:  # pragma: no cover - one account
+                raise UsernameTakenError(
+                    f"The username '{username}' is already taken"
+                ) from e
+            if display_name is not None:
+                await self.db.execute(
+                    """UPDATE actor_refs
+                          SET display_name = ?,
+                              profile_version = profile_version + 1,
+                              updated_at = ?
+                        WHERE id = ?""",
+                    (display_name or None, now, account["actor_id"]),
+                )
+        return await self.get_account(account["id"])  # type: ignore[return-value]
 
     async def disable_account(self, account_id: str) -> dict | None:
         """Disable an account unless it is the last enabled one.
