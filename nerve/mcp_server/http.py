@@ -134,7 +134,9 @@ def _bound_identity_from_request(
     Claude MCP. Ordinary tokens return ``None`` → satellite attribution.
 
     The signature was already verified at the ASGI mount; this re-decode
-    only extracts the (signed) claim — cheap HS256, per tool call.
+    only extracts the (signed) claim — cheap HS256, per tool call. *Identity*
+    is not re-derived here: the mount resolved the actor once and left it on
+    the request's scope under :data:`MCP_ACTOR_SCOPE_KEY`.
     """
     secret = effective_jwt_secret(config)
     if not secret:

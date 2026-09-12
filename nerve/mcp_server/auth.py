@@ -115,8 +115,11 @@ def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict:
 def bound_session_id(payload: dict | None) -> str | None:
     """The engine session a decoded MCP token is bound to (or ``None``).
 
-    Only ``aud=nerve-mcp`` tokens carry the claim; ordinary tokens (and a
-    ``None`` payload) return ``None`` → satellite attribution.
+    Read from the audience and the session claim, never from the subject: a
+    web session's ``sub`` is an account id and said nothing about binding even
+    back when it was the fixed string ``user``. Only ``aud=nerve-mcp`` tokens
+    carry the claim; a session token, a system token and a ``None`` payload all
+    return ``None`` → satellite attribution.
     """
     if not payload:
         return None
