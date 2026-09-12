@@ -24,11 +24,11 @@ from nerve.config import (
 from nerve.config_reload import _RESTART_ONLY_PATHS, restart_required
 
 
-def _install(tmp_path: Path, *, local: str = "", settings: str = "") -> Path:
+def _install(tmp_path: Path, *, base: str = "", local: str = "", settings: str = "") -> Path:
     config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
     config_dir.mkdir()
     (ws / "config").mkdir(parents=True)
-    (config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+    (config_dir / "config.yaml").write_text(f"workspace: {ws}\n{base}", encoding="utf-8")
     (config_dir / "config.local.yaml").write_text(local, encoding="utf-8")
     if settings:
         workspace_settings_file(ws).write_text(settings, encoding="utf-8")
@@ -244,6 +244,27 @@ class TestMalformedAuthSection:
     def test_a_malformed_machine_local_section_is_refused(self, tmp_path, bad_auth):
         config_dir = _install(tmp_path, local=bad_auth)
         with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    @_MALFORMED
+    def test_a_malformed_config_yaml_section_is_refused(self, tmp_path, bad_auth):
+        """The third layer: the machine-local ``config.yaml`` under the merged
+        ``config.local.yaml``. Every layer is checked before the merge, so the
+        one that carries the malformed value is named whichever it is."""
+        config_dir = _install(tmp_path, base=bad_auth)
+        with pytest.raises(ConfigError, match="auth in config.yaml must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    def test_a_well_formed_local_layer_does_not_paper_over_config_yaml(self, tmp_path):
+        """The deep merge would replace the broken section with the good one;
+        the per-layer check runs first precisely so it cannot."""
+        config_dir = _install(
+            tmp_path, base="auth: garbage\n",
+            local="auth:\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
+        )
+        with pytest.raises(ConfigError, match="auth in config.yaml must be a mapping"):
             load_config(config_dir)
         self._validation_names_it(config_dir)
 

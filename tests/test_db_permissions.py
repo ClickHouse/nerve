@@ -538,10 +538,10 @@ class TestRotationReachesThePin:
 
 def test_the_round2_exception_name_still_resolves():
     assert InsecureSecretStorage is InsecureStateStorage
+    assert InsecureStateStorage is base.InsecureStateStorage
 
 
 def test_restore_re_tightens_the_database_file():
     from nerve import backup
 
     assert "nerve.db" in backup._SECRET_RESTORE_PATHS
-    assert InsecureStateStorage is base.InsecureStateStorage
