@@ -192,37 +192,81 @@ def ensure_nerve_home() -> Path:
 SECRET_FILE_MODE = 0o600
 
 
-def write_private_text(path: Path, text: str) -> bool:
+class InsecureFileError(RuntimeError):
+    """A credential-bearing file could not be created owner-only.
+
+    Raised by :func:`write_private_text` *before* any content is written, so
+    nothing secret reaches a file other users could read. Not an ``OSError``
+    subclass on purpose: the generic ``except OSError`` a writer wraps its I/O
+    in must not be able to swallow this one.
+    """
+
+
+def _mode_is_private(st_mode: int) -> bool:
+    """True when a stat mode carries no group/world permission bit."""
+    return (stat.S_IMODE(st_mode) & 0o077) == 0
+
+
+def write_private_text(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` as a file only its owner can read.
 
     ``config.local.yaml`` carries the signing secret, the password hash and
     every API key the wizard collected, so it must not exist at a wider mode —
     not even for the moment between a plain write and a ``chmod``, which is how
-    it used to be produced. The content goes to a temporary *created* ``0600``
-    (``O_CREAT|O_EXCL`` with the mode, read back through the descriptor) and is
-    renamed into place, so the destination is owner-only from its first byte
-    and readers never see a half-written file.
+    it used to be produced.
 
-    Returns whether the result is owner-only. ``False`` means the filesystem
-    does not keep it private (no Unix modes) — the file is still written,
-    because a secret nobody can read is not worth an install that does not
-    work, and the caller says so out loud instead. ``OSError`` from the write
-    itself propagates, exactly as the plain write it replaces did.
+    The order is the one the state-file policy requires everywhere:
+
+    1. create a temporary with ``O_CREAT|O_EXCL`` at ``0600``;
+    2. ``fstat`` **that descriptor** — before a single byte is written. A
+       filesystem that accepted the mode and ignored it is caught while the
+       file is still empty, and :class:`InsecureFileError` is raised with
+       nothing written and nothing left behind;
+    3. write through the descriptor, flush, fsync;
+    4. confirm the path still names the file just written — comparing device
+       and inode against the descriptor, so a temporary swapped for a symlink
+       cannot be what gets published — then rename it into place.
+
+    The destination is therefore owner-only from its first byte, readers never
+    see a half-written file, and a caller that cannot write privately learns it
+    by exception rather than by a flag it might ignore. ``OSError`` from the
+    write itself propagates, exactly as the plain write this replaced did.
     """
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     tmp.unlink(missing_ok=True)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        st = os.fstat(fd)
+        if not _mode_is_private(st.st_mode):
+            raise InsecureFileError(
+                f"{path} cannot be created owner-only ({SECRET_FILE_MODE:04o}): the "
+                f"filesystem reports mode {stat.S_IMODE(st.st_mode):04o} on a file "
+                f"just created with it. Nothing was written. It holds credentials, so "
+                f"it is not written at a mode other users can read — put the "
+                f"configuration on a filesystem with Unix permissions, or keep the "
+                f"secrets in the environment and reference them as ${{VAR}}."
+            )
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        # Publication is by name, so prove the name still refers to what was
+        # written: another user who replaced the temporary with a symlink
+        # between the create and the rename would otherwise have that symlink
+        # renamed into place.
+        current = os.stat(tmp, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino):
+            raise InsecureFileError(
+                f"{tmp} was replaced while it was being written; refusing to install "
+                f"it as {path}. Nothing was published."
+            )
         os.replace(tmp, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # never mask the failure being raised
         raise
-    try:
-        return (stat.S_IMODE(os.stat(path).st_mode) & 0o077) == 0
-    except OSError:
-        return False  # unknown is never "private"
+    finally:
+        os.close(fd)

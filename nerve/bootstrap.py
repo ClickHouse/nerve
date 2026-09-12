@@ -2340,23 +2340,21 @@ class SetupWizard:
         # The file holds the signing secret, the password hash and every API key
         # collected above, so it is *created* owner-only rather than written and
         # chmod'ed afterwards — which left all of that readable for the moment
-        # in between. A filesystem without modes still gets the file (an install
-        # that does not work protects nothing), and the user is told instead.
+        # in between. If the filesystem will not keep it private, nothing is
+        # written and setup fails: an instance whose secrets every local user
+        # can read is not a successful install, and it would start happily.
         local_path = self.config_dir / "config.local.yaml"
-        private = paths.write_private_text(
-            local_path,
-            "# Nerve — Secrets (gitignored)\n"
-            "# API keys, tokens, and other sensitive configuration.\n\n"
-            + yaml.safe_dump(local, default_flow_style=False, sort_keys=False),
-        )
-        if not private:
-            click.secho(
-                f"  [WARN] {local_path} could not be made owner-only (0600). It holds "
-                f"your API keys, the signing secret and your password hash, and other "
-                f"users on this machine can read it — move the configuration to a "
-                f"filesystem with Unix permissions.",
-                fg="yellow",
+        try:
+            paths.write_private_text(
+                local_path,
+                "# Nerve — Secrets (gitignored)\n"
+                "# API keys, tokens, and other sensitive configuration.\n\n"
+                + yaml.safe_dump(local, default_flow_style=False, sort_keys=False),
             )
+        except paths.InsecureFileError as e:
+            raise click.ClickException(
+                f"Setup stopped: {e} Nothing was written to {local_path}."
+            ) from e
 
     def _write_cron_jobs(self) -> None:
         """Write system crons to system.yaml and scaffold jobs.yaml for user crons."""

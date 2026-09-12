@@ -106,14 +106,24 @@ class TestAccessors:
         assert (tmp_path / "state") not in ws.parents
 
 
+def _pretend_modes_are_ignored(monkeypatch) -> None:
+    """A filesystem that accepts ``0600`` on create and stores ``0644``.
+
+    Patched at ``_mode_is_private`` rather than at ``fstat`` so the test says
+    what it means: every regular file this writer creates reads back wide.
+    """
+    monkeypatch.setattr(paths, "_mode_is_private", lambda st_mode: False)
+
+
 class TestWritePrivateText:
     """``config.local.yaml`` carries the signing secret, the password hash and
     the API keys, so it must never exist at a wider mode — not even between a
-    plain write and a chmod, which is how it used to be produced."""
+    plain write and a chmod, which is how it used to be produced, and not even
+    for the length of one write on a filesystem that ignores the mode."""
 
     def test_the_file_is_owner_only_and_holds_the_text(self, tmp_path):
         target = tmp_path / "config.local.yaml"
-        assert paths.write_private_text(target, "auth:\n  password_hash: x\n") is True
+        paths.write_private_text(target, "auth:\n  password_hash: x\n")
         assert target.read_text(encoding="utf-8") == "auth:\n  password_hash: x\n"
         assert (os.stat(target).st_mode & 0o777) == 0o600
         assert not target.with_name(target.name + ".tmp").exists()
@@ -124,7 +134,7 @@ class TestWritePrivateText:
         old = os.umask(0o000)
         try:
             target = tmp_path / "secrets.yaml"
-            assert paths.write_private_text(target, "x: 1\n") is True
+            paths.write_private_text(target, "x: 1\n")
             assert (os.stat(target).st_mode & 0o777) == 0o600
         finally:
             os.umask(old)
@@ -133,25 +143,57 @@ class TestWritePrivateText:
         target = tmp_path / "config.local.yaml"
         target.write_text("old\n", encoding="utf-8")
         os.chmod(target, 0o644)
-        assert paths.write_private_text(target, "new\n") is True
+        paths.write_private_text(target, "new\n")
         assert target.read_text(encoding="utf-8") == "new\n"
         assert (os.stat(target).st_mode & 0o777) == 0o600
 
-    def test_a_filesystem_that_ignores_modes_is_reported_not_hidden(self, tmp_path, monkeypatch):
-        """The file is still written — an install that does not work protects
-        nothing — but the caller is told it is not private, so it can say so."""
+    def test_a_filesystem_that_ignores_modes_gets_no_bytes_at_all(
+        self, tmp_path, monkeypatch,
+    ):
+        """F25: the descriptor is `fstat`ed before a single byte is written, so
+        a mode that did not take effect stops the write instead of being
+        reported after the secrets are already on disk."""
         target = tmp_path / "config.local.yaml"
-        real_stat = os.stat
+        _pretend_modes_are_ignored(monkeypatch)
+        with pytest.raises(paths.InsecureFileError, match="Nothing was written"):
+            paths.write_private_text(target, "jwt_secret: do-not-write-me\n")
+        assert not target.exists()
+        assert not target.with_name(target.name + ".tmp").exists()
 
-        def wide_stat(path, *a, **k):
-            st = real_stat(path, *a, **k)
-            if Path(path) == target:
-                return os.stat_result((0o100644,) + tuple(st)[1:])
-            return st
+    def test_an_existing_file_is_left_untouched_when_the_write_is_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        """Refusing must not destroy what is already there: the rename never
+        happens, so the previous secrets file survives intact."""
+        target = tmp_path / "config.local.yaml"
+        target.write_text("auth:\n  password_hash: keep-me\n", encoding="utf-8")
+        os.chmod(target, 0o600)
+        _pretend_modes_are_ignored(monkeypatch)
+        with pytest.raises(paths.InsecureFileError):
+            paths.write_private_text(target, "replacement\n")
+        assert target.read_text(encoding="utf-8") == "auth:\n  password_hash: keep-me\n"
 
-        monkeypatch.setattr(paths.os, "stat", wide_stat)
-        assert paths.write_private_text(target, "x: 1\n") is False
-        assert target.read_text(encoding="utf-8") == "x: 1\n"
+    def test_a_temporary_swapped_for_a_symlink_is_not_published(
+        self, tmp_path, monkeypatch,
+    ):
+        """Publication is by name, so the name is proved to still be the file
+        that was written (device + inode) before the rename."""
+        target = tmp_path / "config.local.yaml"
+        tmp = target.with_name(target.name + ".tmp")
+        elsewhere = tmp_path / "attacker.yaml"
+        elsewhere.write_text("attacker\n", encoding="utf-8")
+        real_fsync = os.fsync
+
+        def swap_then_fsync(fd):
+            real_fsync(fd)
+            tmp.unlink()
+            tmp.symlink_to(elsewhere)  # the name now points somewhere else
+
+        monkeypatch.setattr(paths.os, "fsync", swap_then_fsync)
+        with pytest.raises(paths.InsecureFileError, match="replaced while"):
+            paths.write_private_text(target, "secret\n")
+        assert not target.exists()
+        assert elsewhere.read_text(encoding="utf-8") == "attacker\n"
 
     def test_a_failed_write_leaves_no_temporary_behind(self, tmp_path, monkeypatch):
         target = tmp_path / "config.local.yaml"

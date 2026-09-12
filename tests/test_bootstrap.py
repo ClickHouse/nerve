@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -330,6 +331,48 @@ class TestConfigLocalPermissions:
         assert not local_path.with_name(local_path.name + ".tmp").exists()
         local = yaml.safe_load(local_path.read_text())
         assert local["auth"]["jwt_secret"] and local["auth"]["password_hash"]
+
+    def test_setup_fails_rather_than_write_secrets_a_filesystem_will_not_protect(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """F25: a filesystem that ignores the mode gets no secrets file at all.
+
+        The instance would otherwise start perfectly well with its API keys,
+        password hash and signing secret readable by every local user, which is
+        not an install that succeeded."""
+        from nerve import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.workspace_path = tmp_path / "workspace"
+        wizard.choices.mode = "personal"
+        wizard.choices.password = "pw-for-the-owner-account"
+
+        with pytest.raises(click.ClickException) as ei:
+            wizard._apply()
+        assert "Nothing was written" in str(ei.value)
+        assert not (tmp_path / "config.local.yaml").exists()
+        assert not (tmp_path / "config.local.yaml.tmp").exists()
+
+    def test_nerve_init_exits_non_zero_on_that_filesystem(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from nerve import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+        result = CliRunner().invoke(
+            main,
+            ["-c", str(tmp_path), "init", "--non-interactive"],
+            env={
+                "ANTHROPIC_API_KEY": "sk-ant-api03-clitest",
+                "NERVE_MODE": "personal",
+                "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            },
+        )
+        assert result.exit_code != 0
+        assert "owner-only" in result.output and "Nothing was written" in result.output
+        assert not (tmp_path / "config.local.yaml").exists()
 
 
 class TestInsideDockerFlag:
