@@ -101,12 +101,22 @@ export interface ChatMessage {
   /** Backend-native turn id recorded on completed assistant rows — the
       anchor that makes "fork from here" possible at this point. */
   native_turn_id?: string | null;
+  /** Who sent this message: an actor id to resolve against GET /api/actors.
+      Null on assistant and tool rows (their authorship is `role`) and on
+      everything recorded before attribution existed — render those exactly
+      as today rather than as an error. */
+  actor_id?: string | null;
 }
 
 export interface Session {
   id: string;
   title: string;
   source: string;
+  /** Who created this session: an actor id to resolve against
+      GET /api/actors. Null for sessions that predate attribution. Note this
+      is an *actor* id, not an account id — the two are different columns and
+      only the actor id is permanent. */
+  created_by_actor_id?: string | null;
   updated_at: string;
   // V3 lifecycle fields
   status?: string;
