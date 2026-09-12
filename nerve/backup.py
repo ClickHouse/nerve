@@ -548,20 +548,34 @@ def _stage_parent(nerve_dir: Path) -> Path:
     explicitly (never ``None``, which would let ``mkdtemp`` re-read ``TMPDIR``
     and pick something this never judged).
     """
-    reason = _unsafe_stage_reason(nerve_dir) if nerve_dir.is_dir() else f"{nerve_dir} is not a directory"
+    reason = (
+        _unsafe_stage_reason(nerve_dir) if nerve_dir.is_dir()
+        else f"{nerve_dir} is not a directory"
+    )
     if reason is None and os.stat(nerve_dir).st_uid == os.geteuid():
         return nerve_dir
     logger.info("Backup: staging in the system temp directory instead — %s", reason)
+    return _vetted_temp_dir(f"{nerve_dir} is not usable")
 
+
+def _vetted_temp_dir(context: str = "") -> Path:
+    """The system temp directory, judged the way a staging parent must be.
+
+    Anything that puts ``nerve.db`` on disk outside the state directory —
+    staging a snapshot, extracting a bundle to verify or restore it — lands
+    here, so it gets the same check rather than trusting ``TMPDIR`` because it
+    is sticky. Returns the resolved path so the caller can hand it to
+    ``mkdtemp`` explicitly. Raises :class:`BackupError`.
+    """
     temp_dir = Path(tempfile.gettempdir())
     reason = _unsafe_stage_reason(temp_dir)
     if reason is not None:
         raise BackupError(
-            f"Backup: nowhere safe to stage the snapshot. {nerve_dir} is not usable "
-            f"and neither is the temp directory: {reason}. Another user could "
-            f"replace the staging directory while the database — signing secret "
-            f"included — is being copied into it. Point TMPDIR at a directory you "
-            f"own, or fix the state directory."
+            f"Backup: nowhere safe to put the database. "
+            + (f"{context}, and " if context else "")
+            + f"the temp directory will not do either: {reason}. Another user "
+            f"could replace that directory while the database — signing secret "
+            f"included — is inside it. Point TMPDIR at a directory you own."
         )
     return temp_dir.resolve()
 
@@ -1219,8 +1233,13 @@ def verify_bundle(path: Path, extract_to: Path | None = None) -> VerifyReport:
         raise BackupError(f"bundle not found: {path}")
 
     own_tmp = extract_to is None
+    # Extraction puts nerve.db — accounts, and the signing secret unless the
+    # bundle was made with --no-secrets — on disk, so it goes in a directory
+    # vetted the same way staging is (see _stage_parent): a temp parent
+    # somebody else owns can have its children renamed by that owner whatever
+    # the sticky bit says.
     work = Path(extract_to) if extract_to else Path(
-        tempfile.mkdtemp(prefix=".nerve-verify-")
+        tempfile.mkdtemp(prefix=".nerve-verify-", dir=_vetted_temp_dir())
     )
     errors: list[str] = []
     warnings: list[str] = []
@@ -1351,7 +1370,10 @@ def restore_bundle(
         )
 
     # Verify into a staging dir we then install from (extract once).
-    staging = Path(tempfile.mkdtemp(prefix=".nerve-restore-"))
+    # Extracted here first, so the same rule as staging: the bundle contains
+    # nerve.db, and a temp parent somebody else owns can have its children
+    # renamed by that owner however sticky it is.
+    staging = Path(tempfile.mkdtemp(prefix=".nerve-restore-", dir=_vetted_temp_dir()))
     try:
         report = verify_bundle(path, extract_to=staging)
         if not report.ok:

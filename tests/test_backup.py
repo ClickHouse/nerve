@@ -763,6 +763,34 @@ class TestStagingIsOutOfReach:
         with pytest.raises(BackupError, match="owned by uid"):
             backup_mod._stage_parent(nd)
 
+    def test_verify_and_restore_stage_in_the_vetted_temp_directory_too(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The sweep: extracting a bundle puts nerve.db on disk just as staging
+        does, so verify and restore take the same vetted parent rather than
+        whatever ``TMPDIR`` says."""
+        import tempfile
+
+        bundle = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        ).path
+        seen: list = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def watch(*a, **k):
+            seen.append(k.get("dir"))
+            return real_mkdtemp(*a, **k)
+
+        monkeypatch.setattr(backup_mod.tempfile, "mkdtemp", watch)
+        vetted = backup_mod._vetted_temp_dir()
+
+        backup_mod.verify_bundle(bundle)
+        backup_mod.restore_bundle(
+            bundle, tmp_path / "restored", tmp_path / "restored_ws",
+            config_dir=tmp_path / "restored_cfg",
+        )
+        assert seen and all(d == vetted for d in seen), seen
+
     def test_an_unsafe_ancestor_is_refused(self, tmp_path, monkeypatch):
         """The check walks the canonical ancestry: a directory anyone can write
         to *above* the parent can be swapped for one pointing elsewhere."""
