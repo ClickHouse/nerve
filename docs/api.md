@@ -36,7 +36,7 @@ The result is a **session token**: `sub` is the account's id and `typ` is
 
 | Outcome | Response |
 |---|---|
-| wrong password, unknown username, or no username where one is required | `401` `Invalid username or password` — identical in all three cases, and identical in how long it takes: a username that names nobody still costs a password comparison, an empty password is compared rather than refused early, and every refusal waits out a common response budget so that no account's work factor is visible in the timing |
+| wrong password, unknown username, or no username where one is required | `401` `Invalid username or password` — identical in all three cases, and identical in how long it takes: a username that names nobody still costs a password comparison, an empty password is compared rather than refused early, and every refusal waits out a response budget calibrated from the slowest hash the install stores, so that no account's work factor is visible in the timing |
 | correct password, account disabled | `401` naming the reason, and only after the password checked out |
 | no signing secret, or identity storage not wired yet | `503` |
 

@@ -675,6 +675,49 @@ class AccountStore:
         )
         return result.rowcount > 0
 
+    async def set_account_credential_if_source(
+        self,
+        account_id: str,
+        *,
+        expected_source: str,
+        credential_source: str,
+        credential: str | None = None,
+    ) -> bool:
+        """Move an account's credential, only if it is still where it was seen.
+
+        The startup migration's version of the compare-and-swap that guards the
+        login path's re-hash, and it exists for the same reason. ``nerve sync``
+        and friends run the identity bootstrap against a *live* daemon, so the
+        migration's "read every account, then write the ones that need it" has a
+        window in it: an account whose owner changes their password in that
+        window would have the configured hash written over their new one, or
+        have it cleared entirely by the mirror. Conditioning the write on the
+        source the caller read makes the loser of that race a no-op, and the
+        newer of the two writes is always the deliberate one.
+
+        Returns whether a row changed.
+        """
+        for source in (expected_source, credential_source):
+            if source not in CREDENTIAL_SOURCES:
+                raise ValueError(
+                    f"credential_source must be one of {CREDENTIAL_SOURCES}, "
+                    f"got {source!r}"
+                )
+        if credential_source == "local":
+            if not credential:
+                raise ValueError(
+                    "credential is required when moving to credential_source='local'"
+                )
+        else:
+            credential = None
+        result = await self._write(
+            """UPDATE accounts
+                  SET credential_source = ?, credential = ?, updated_at = ?
+                WHERE id = ? AND credential_source = ?""",
+            (credential_source, credential, _now(), account_id, expected_source),
+        )
+        return result.rowcount > 0
+
     async def claim_sole_account(
         self,
         *,

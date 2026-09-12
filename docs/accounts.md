@@ -219,6 +219,15 @@ Hashes are *accepted* at any work factor, because a password copied off an
 upgrading install's configuration carries whatever produced it, possibly years
 ago, and refusing it would lock that install out.
 
+The response budget is **calibrated from the highest work factor the accounts
+actually carry**, before the first login is served — not from the current one.
+Reacting to a slow comparison after making it would be one probe too late: that
+request has already taken four times as long as an unknown username did, and
+that is the whole of an enumeration. The budget therefore comes down on its own
+as an install converges, since it is worked out afresh at each start. An
+operator who stores a very high work factor makes every *failed* login that slow
+for as long as the account keeps it, which is the honest price of hiding it.
+
 A hash at any other cost is **replaced at the current one the next time its
 owner logs in successfully**. It happens silently, on a login that has already
 been accepted, and it does not change anybody's password — the hash is
@@ -461,17 +470,25 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
 `nerve.db` is part of every backup, so a restore brings back the same actor,
 account, tenant and agent ids and the same signing secret.
 
-A `--no-secrets` bundle carries **no credential at all**, which now means two
-things inside `nerve.db` as well as the files it omits:
+A `--no-secrets` bundle carries **no credential at all**, which takes three
+things beyond omitting the obvious files:
 
-- `instance_secrets` is emptied in the snapshot, so the restored instance
-  generates a fresh signing secret on its first start;
+- `instance_secrets` is emptied in the snapshot of `nerve.db`, so the restored
+  instance generates a fresh signing secret on its first start;
 - every account's password hash is emptied too, and those rows move to
-  `credential_source = 'none'`.
+  `credential_source = 'none'`;
+- and the workspace's `config/*.yaml` is **rewritten** on the way into the
+  bundle, with credential-shaped values replaced by `${ENV_VAR}` placeholders.
+  That last one is not hypothetical: the startup migration deliberately leaves
+  `auth.password_hash` alone when it is in a tracked or fleet-managed file (see
+  above), so a live verifier can be sitting in exactly the file the bundle
+  otherwise copies verbatim. A cron job's `env:` block goes the same way.
 
-The live database is never touched; the snapshot is edited after it is taken and
-before it is checksummed, and SQLite overwrites the freed pages rather than
-merely unlinking them.
+The live database and the real config files are never touched; the snapshot is
+edited after it is taken and before it is checksummed, SQLite overwrites the
+freed pages rather than merely unlinking them, and the rewritten config is
+staged through the same owner-only, create-then-verify path everything else
+credential-bearing uses.
 
 The consequence is worth knowing before you restore one: such a bundle omits
 `config.local.yaml` as well, so `auth.password_hash` does not come back either.

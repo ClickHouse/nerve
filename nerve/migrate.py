@@ -1149,6 +1149,7 @@ def _dead_password_warning(remaining: list[Path], *, locked: bool) -> str:
 async def _migrate_config_credentials(
     db: "Database", config: NerveConfig, report: MigrationReport, *,
     dry_run: bool, pending_config_rows: int = 0,
+    stragglers: list[dict] | None = None,
 ) -> None:
     """Move every account off ``credential_source = 'config'`` (3.5).
 
@@ -1161,26 +1162,35 @@ async def _migrate_config_credentials(
         # Nothing to copy. A row still on `config` with no configured hash is
         # brought back to `none` by the mirror, which has already run.
         return
-    stragglers = [
-        account for account in await db.list_accounts()
-        if account["credential_source"] == "config"
-    ]
+    if stragglers is None:
+        stragglers = [
+            account for account in await db.list_accounts()
+            if account["credential_source"] == "config"
+        ]
     if stragglers or pending_config_rows:
         report.migrated_config_credential = True
         report.identity_actions.append(
             _copy_action(len(stragglers) + pending_config_rows, dry_run)
         )
         if not dry_run:
+            moved = 0
             for account in stragglers:
-                await db.set_account_credential(
+                # Conditioned on the row still being on `config`. This runs from
+                # every CLI command that opens the database, which can be
+                # alongside a live daemon — so an account whose owner set a
+                # password between the read above and this write must keep it,
+                # not have the configured hash put back over it.
+                if await db.set_account_credential_if_source(
                     account["id"],
+                    expected_source="config",
                     credential_source="local",
                     credential=config.auth.password_hash,
-                )
+                ):
+                    moved += 1
             logger.info(
-                "Identity: %d account(s) moved off the configured password onto "
-                "their own credential in nerve.db. The hash was copied, so "
-                "nobody's password changed.", len(stragglers),
+                "Identity: %d of %d account(s) moved off the configured password "
+                "onto their own credential in nerve.db. The hash was copied, so "
+                "nobody's password changed.", moved, len(stragglers),
             )
 
     # The retirement is judged on its own, every start, and not only by the run
@@ -1466,7 +1476,12 @@ async def bootstrap_identity(
         report.updated_credential_source = True
         report.identity_actions.append(_mirror_action(current, source, dry_run))
         if not dry_run:
-            await db.set_account_credential(account["id"], credential_source=source)
+            # Same condition, same reason: a row that has moved to `local` since
+            # it was read has a password of its own now, and the mirror clearing
+            # it would lock that person out.
+            await db.set_account_credential_if_source(
+                account["id"], expected_source=current, credential_source=source,
+            )
 
     # Then straight off `config` again (3.5). The order matters in one
     # direction: the mirror may have *just* put a row on `config` (a passwordless

@@ -1568,3 +1568,112 @@ def test_the_rewritten_file_is_staged_owner_only(
         include_secrets=False,
     )
     assert seen == [0o600]
+
+
+def test_no_secrets_leaves_no_credential_anywhere_in_the_archive(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """The promise, checked as a promise rather than a list of mechanisms.
+
+    A distinct marker is planted in every place a credential can live — the two
+    inside nerve.db, the machine-local overlay, the tracked workspace config, a
+    cron job's environment, and the state files that are omitted by name — and
+    then the finished bundle is searched for every one of them, in the extracted
+    members and in the compressed bytes. Anything added to the backup later that
+    carries a credential fails here without anyone having to remember to look.
+    """
+    markers = {
+        "jwt secret in nerve.db": "MARKER-jwt-secret-in-the-database",
+        "account hash on the row": "$2b$12$MARKER-account-password-hash",
+        "hash in config.local.yaml": "$2b$12$MARKER-local-config-hash",
+        "api key in config.local.yaml": "MARKER-anthropic-key",
+        "hash in tracked settings.yaml": "$2b$12$MARKER-tracked-hash",
+        "jwt secret in tracked settings.yaml": "MARKER-tracked-jwt",
+        "token in a cron env block": "MARKER-cron-token",
+        "mcp-token file": "MARKER-mcp-token",
+        "telegram session": "MARKER-telegram",
+    }
+
+    conn = sqlite3.connect(str(nerve_dir / "nerve.db"))
+    try:
+        conn.execute(
+            "CREATE TABLE instance_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL,"
+            " created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES ('jwt_secret', ?, 't')",
+            (markers["jwt secret in nerve.db"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _plant_accounts(nerve_dir / "nerve.db")
+    conn = sqlite3.connect(str(nerve_dir / "nerve.db"))
+    try:
+        conn.execute(
+            "UPDATE accounts SET credential = ? WHERE credential IS NOT NULL",
+            (markers["account hash on the row"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    (config_dir / "config.local.yaml").write_text(
+        f"auth:\n  password_hash: '{markers['hash in config.local.yaml']}'\n"
+        f"anthropic_api_key: {markers['api key in config.local.yaml']}\n",
+        encoding="utf-8",
+    )
+    cfg = workspace / "config"
+    (cfg / "cron").mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text(
+        "timezone: UTC\nauth:\n"
+        f"  password_hash: '{markers['hash in tracked settings.yaml']}'\n"
+        f"  jwt_secret: {markers['jwt secret in tracked settings.yaml']}\n",
+        encoding="utf-8",
+    )
+    (cfg / "cron" / "jobs.yaml").write_text(
+        "jobs:\n  - id: nightly\n    env:\n"
+        f"      GH_TOKEN: {markers['token in a cron env block']}\n",
+        encoding="utf-8",
+    )
+    (nerve_dir / "mcp-token").write_text(markers["mcp-token file"], encoding="utf-8")
+    (nerve_dir / "telegram_sync.session").write_text(
+        markers["telegram session"], encoding="utf-8",
+    )
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    assert backup_mod.verify_bundle(bundle.path, extract_to=staging).ok
+
+    blob = bundle.path.read_bytes().decode("latin-1")
+    extracted = {
+        str(p.relative_to(staging)): p.read_bytes().decode("latin-1")
+        for p in staging.rglob("*") if p.is_file()
+    }
+    leaks = {
+        label: [name for name, body in extracted.items() if value in body]
+        for label, value in markers.items()
+        if value in blob or any(value in body for body in extracted.values())
+    }
+    assert leaks == {}, leaks
+
+    # ...and the same bundle taken *with* secrets does carry them, or the test
+    # above would pass against a backup that archived nothing at all.
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir,
+        include_secrets=True,
+    )
+    kept_staging = tmp_path / "x2"
+    assert backup_mod.verify_bundle(kept.path, extract_to=kept_staging).ok
+    kept_bodies = "".join(
+        p.read_bytes().decode("latin-1")
+        for p in kept_staging.rglob("*") if p.is_file()
+    )
+    for label in (
+        "hash in tracked settings.yaml", "hash in config.local.yaml",
+        "account hash on the row", "jwt secret in nerve.db",
+    ):
+        assert markers[label] in kept_bodies, label
