@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { useAuthStore } from '../../stores/authStore';
 import { Button } from '../ui';
 import { CredentialFields } from './CredentialFields';
@@ -15,7 +15,12 @@ import { CredentialFields } from './CredentialFields';
 export function SessionExpiredOverlay() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const { login, loading, error, logout, loginMode } = useAuthStore();
+  const { login, loading, error, logout, loginMode, refreshStatus } = useAuthStore();
+
+  // The session has been open for a while; the instance may have gained its
+  // second account in that time, and then this form needs a username it was
+  // not going to ask for.
+  useEffect(() => { void refreshStatus(); }, [refreshStatus]);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -47,7 +52,13 @@ export function SessionExpiredOverlay() {
           onPassword={setPassword}
         />
         {error && <p className="text-error text-sm mb-3">{error}</p>}
-        <Button type="submit" variant="primary" size="md" fullWidth disabled={loading}>
+        <Button
+          type="submit"
+          variant="primary"
+          size="md"
+          fullWidth
+          disabled={loading || loginMode === null}
+        >
           {loading ? '...' : 'Unlock'}
         </Button>
         {/* Explicit escape hatch. Unlike the overlay this *does* clear unsent

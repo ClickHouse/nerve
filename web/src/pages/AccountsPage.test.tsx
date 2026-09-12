@@ -55,6 +55,11 @@ function renderPage() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  api.listAccounts.mockReset();
+  api.createAccount.mockReset();
+  api.setAccountEnabled.mockReset();
+  api.changeOwnPassword.mockReset();
+  api.updateAccount.mockReset();
   api.authStatus.mockResolvedValue({
     auth_required: true, mode: 'local', login: 'password',
     setup_pending: false, multiple_accounts: false,
@@ -316,5 +321,90 @@ describe('errorDetail', () => {
 
   it('falls back to the raw text when it is not JSON', () => {
     expect(errorDetail(new Error('Failed to fetch'))).toBe('Failed to fetch');
+  });
+});
+
+describe('a committed write is not a failed one', () => {
+  it('reports success when only the follow-up list refresh fails', async () => {
+    // Retrying a create that already happened is a username conflict; retrying
+    // a password change uses a current password that is no longer current. So
+    // "did the write land" and "could the page redraw" have to be different
+    // answers.
+    api.listAccounts.mockResolvedValueOnce({ accounts: [account()] });
+    await useAccountStore.getState().load();
+
+    const created = account({ id: 'acc-2', username: 'bob', is_self: false });
+    api.createAccount.mockResolvedValue(created);
+    api.listAccounts.mockRejectedValue(new Error('500: {"detail": "gone"}'));
+
+    const ok = await useAccountStore.getState().create({
+      username: 'bob', password: 'a-passphrase',
+    });
+
+    expect(ok).toBe(true);
+    // The row the server returned is on screen even though the list is stale...
+    expect(useAccountStore.getState().accounts.map((a) => a.id))
+      .toEqual(['acc-1', 'acc-2']);
+    // ...and the message says what actually happened.
+    expect(useAccountStore.getState().error).toMatch(/Saved/);
+    expect(useAccountStore.getState().error).not.toMatch(/Could not create/);
+  });
+
+  it('reports failure when the write itself fails', async () => {
+    api.createAccount.mockRejectedValue(
+      new Error('409: {"detail": "The username is already taken"}'),
+    );
+    const ok = await useAccountStore.getState().create({
+      username: 'bob', password: 'a-passphrase',
+    });
+    expect(ok).toBe(false);
+    expect(useAccountStore.getState().error).toMatch(/already taken/);
+  });
+
+  it('applies an updated row from the response, not only from the refresh', async () => {
+    api.listAccounts.mockResolvedValueOnce({ accounts: [account()] });
+    await useAccountStore.getState().load();
+
+    api.setAccountEnabled.mockResolvedValue(
+      account({ enabled: false, disabled_at: '2026-08-06T00:00:00Z' }),
+    );
+    api.listAccounts.mockRejectedValue(new Error('network'));
+
+    expect(await useAccountStore.getState().setEnabled('acc-1', false)).toBe(true);
+    expect(useAccountStore.getState().accounts[0].enabled).toBe(false);
+    expect(useAccountStore.getState().busyId).toBeNull();
+  });
+
+  it('lets the refresh be retried on its own', async () => {
+    api.changeOwnPassword.mockResolvedValue(account());
+    api.listAccounts.mockRejectedValueOnce(new Error('network'));
+    expect(await useAccountStore.getState().changeOwnPassword({
+      new_password: 'a-passphrase',
+    })).toBe(true);
+    expect(useAccountStore.getState().error).toMatch(/Saved/);
+
+    api.listAccounts.mockResolvedValue({ accounts: [account()] });
+    await useAccountStore.getState().load();
+    expect(useAccountStore.getState().error).toBeNull();
+  });
+
+  it('keeps the add form open only when the write failed', async () => {
+    api.listAccounts.mockResolvedValue({ accounts: [account()] });
+    api.createAccount.mockResolvedValue(
+      account({ id: 'acc-2', username: 'bob', is_self: false }),
+    );
+    renderPage();
+    await screen.findByText('alice');
+
+    await userEvent.click(screen.getAllByRole('button', { name: /Add account/ })[0]);
+    const form = screen.getByRole('form', { name: 'Add account' });
+    await userEvent.type(within(form).getByLabelText('New account username'), 'bob');
+    await userEvent.type(within(form).getByLabelText('New account password'), 'a-passphrase');
+    // The list refresh fails *after* the create commits.
+    api.listAccounts.mockRejectedValue(new Error('network'));
+    await userEvent.click(within(form).getByRole('button', { name: 'Create' }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole('form', { name: 'Add account' })).not.toBeInTheDocument());
   });
 });

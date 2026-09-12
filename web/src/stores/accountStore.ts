@@ -40,18 +40,46 @@ export interface AccountState {
   clearError: () => void;
 }
 
+/** What is said when the write landed and only the redraw did not. */
+const SAVED_BUT_STALE =
+  'Saved. The list could not be refreshed — reload to see the current state.';
+
+/** Replace an account in the list, or append it if it is new. */
+function upsert(accounts: Account[], account: Account): Account[] {
+  const index = accounts.findIndex((existing) => existing.id === account.id);
+  if (index === -1) return [...accounts, account];
+  const next = accounts.slice();
+  next[index] = account;
+  return next;
+}
+
 /**
- * Every mutation reloads the list and re-reads `/api/auth/status`.
+ * Re-read the list and `/api/auth/status`. Returns the failure, or `null`.
  *
- * Not laziness: both of the things this screen does — setting the first
- * password, adding the second account — change how the *login form* behaves,
- * and a stale descriptor would leave a tab auto-logging-in or asking for the
- * wrong fields. The list is small and the call is one request.
+ * The status half is not laziness: both of the things this screen does —
+ * setting the first password, adding the second account — change how the *login
+ * form* behaves, and a stale descriptor would leave a tab auto-logging-in or
+ * asking for the wrong fields.
+ *
+ * Deliberately **not** part of any mutation's error path. A refresh that fails
+ * after a write that committed is a redraw problem, and reporting it as a
+ * failed write is how a caller ends up retrying a create that already happened
+ * (username taken) or a password change with a current password that is no
+ * longer current.
  */
-async function refreshAll(set: (partial: Partial<AccountState>) => void): Promise<void> {
-  const { accounts } = await api.listAccounts();
-  set({ accounts, loading: false });
+async function resync(
+  set: (partial: Partial<AccountState>) => void,
+): Promise<unknown | null> {
+  try {
+    const { accounts } = await api.listAccounts();
+    set({ accounts, loading: false });
+  } catch (e) {
+    set({ loading: false });
+    return e;
+  }
+  // refreshStatus swallows its own failures and keeps the last known answer.
   await useAuthStore.getState().refreshStatus();
+  return null;
 }
 
 export const useAccountStore = create<AccountState>((set) => ({
@@ -63,66 +91,61 @@ export const useAccountStore = create<AccountState>((set) => ({
   clearError: () => set({ error: null }),
 
   load: async () => {
-    try {
-      await refreshAll(set);
-      set({ error: null });
-    } catch (e) {
-      set({ loading: false, error: errorDetail(e, 'Could not load accounts') });
-    }
-  },
-
-  create: async (body) => {
     set({ error: null });
-    try {
-      await api.createAccount(body);
-      await refreshAll(set);
-      return true;
-    } catch (e) {
-      set({ error: errorDetail(e, 'Could not create the account') });
-      return false;
+    const failure = await resync(set);
+    if (failure) {
+      // The one place the caller wants the reason: nothing was written, so
+      // there is nothing to be confused about.
+      set({ error: errorDetail(failure, 'Could not load accounts') });
     }
   },
 
-  update: async (id, body) => {
-    set({ error: null, busyId: id });
-    try {
-      await api.updateAccount(id, body);
-      await refreshAll(set);
-      return true;
-    } catch (e) {
-      set({ error: errorDetail(e, 'Could not update the account') });
-      return false;
-    } finally {
-      set({ busyId: null });
-    }
-  },
+  create: async (body) => applyWrite(
+    set, () => api.createAccount(body), 'Could not create the account',
+  ),
 
-  setEnabled: async (id, enabled) => {
-    set({ error: null, busyId: id });
-    try {
-      await api.setAccountEnabled(id, enabled);
-      await refreshAll(set);
-      return true;
-    } catch (e) {
-      set({ error: errorDetail(e, 'Could not change the account') });
-      return false;
-    } finally {
-      set({ busyId: null });
-    }
-  },
+  update: async (id, body) => applyWrite(
+    set, () => api.updateAccount(id, body), 'Could not update the account', id,
+  ),
 
-  changeOwnPassword: async (body) => {
-    set({ error: null });
-    try {
-      await api.changeOwnPassword(body);
-      await refreshAll(set);
-      return true;
-    } catch (e) {
-      set({ error: errorDetail(e, 'Could not change the password') });
-      return false;
-    }
-  },
+  setEnabled: async (id, enabled) => applyWrite(
+    set, () => api.setAccountEnabled(id, enabled), 'Could not change the account', id,
+  ),
+
+  changeOwnPassword: async (body) => applyWrite(
+    set, () => api.changeOwnPassword(body), 'Could not change the password',
+  ),
 }));
+
+/**
+ * Run one mutation, then redraw — and keep the two apart.
+ *
+ * `true` means **the write committed**, which is the only thing the caller can
+ * act on: it is what tells a form to clear itself, and clearing a form whose
+ * write landed is the difference between "done" and a retry that cannot
+ * succeed. A redraw that fails afterwards leaves the row the server returned in
+ * place and says so; `load()` is the independent retry.
+ */
+async function applyWrite(
+  set: (partial: Partial<AccountState> | ((s: AccountState) => Partial<AccountState>)) => void,
+  write: () => Promise<Account>,
+  fallback: string,
+  busyId?: string,
+): Promise<boolean> {
+  set({ error: null, ...(busyId ? { busyId } : {}) });
+  let account: Account;
+  try {
+    account = await write();
+  } catch (e) {
+    set({ error: errorDetail(e, fallback), busyId: null });
+    return false;
+  }
+  // Committed. Show what the server returned, whatever happens next.
+  set((state) => ({ accounts: upsert(state.accounts, account) }));
+  const failure = await resync(set);
+  set({ busyId: null, ...(failure ? { error: SAVED_BUT_STALE } : {}) });
+  return true;
+}
 
 /** The signed-in account's own row, once the list has loaded. */
 export function selectSelf(state: AccountState): Account | undefined {

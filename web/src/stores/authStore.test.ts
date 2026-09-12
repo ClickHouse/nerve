@@ -43,10 +43,11 @@ beforeEach(() => {
   useAuthStore.setState({
     authenticated: false,
     loading: false,
-    checking: true,
+    ready: false,
     error: null,
     sessionExpired: false,
-    loginMode: 'password',
+    loginMode: null,
+    statusLoading: false,
     setupPending: false,
   });
 });
@@ -62,7 +63,7 @@ describe('checkAuth: where a cold start lands', () => {
     expect(api.login).toHaveBeenCalledWith('');
     expect(setToken).toHaveBeenCalledWith('a-token');
     expect(useAuthStore.getState().authenticated).toBe(true);
-    expect(useAuthStore.getState().checking).toBe(false);
+    expect(useAuthStore.getState().ready).toBe(true);
   });
 
   it('never auto-logs-in on a single account that has a password', async () => {
@@ -94,11 +95,13 @@ describe('checkAuth: where a cold start lands', () => {
 
     await useAuthStore.getState().checkAuth();
 
-    // The dangerous default would be 'none', which logs itself in.
+    // The dangerous default would be 'none', which logs itself in. Failing
+    // closed means asking for both fields, which a single-account install
+    // still accepts with the username left blank.
     expect(api.login).not.toHaveBeenCalled();
-    expect(useAuthStore.getState().loginMode).toBe('password');
+    expect(useAuthStore.getState().loginMode).toBe('username_password');
     expect(useAuthStore.getState().authenticated).toBe(false);
-    expect(useAuthStore.getState().checking).toBe(false);
+    expect(useAuthStore.getState().ready).toBe(true);
   });
 
   it('falls through to the login page when the auto-login is refused', async () => {
@@ -109,7 +112,7 @@ describe('checkAuth: where a cold start lands', () => {
     await useAuthStore.getState().checkAuth();
 
     expect(useAuthStore.getState().authenticated).toBe(false);
-    expect(useAuthStore.getState().checking).toBe(false);
+    expect(useAuthStore.getState().ready).toBe(true);
   });
 
   it('routes an unset-up instance to /setup', async () => {
@@ -189,9 +192,18 @@ describe('refreshStatus', () => {
   });
 
   it('keeps the last known shape when the call fails', async () => {
-    useAuthStore.setState({ loginMode: 'username_password' });
+    useAuthStore.setState({ loginMode: 'password' });
     api.authStatus.mockRejectedValue(new Error('network'));
     await useAuthStore.getState().refreshStatus();
+    expect(useAuthStore.getState().loginMode).toBe('password');
+  });
+
+  it('fails closed when it has never had an answer', async () => {
+    api.authStatus.mockRejectedValue(new Error('network'));
+    await useAuthStore.getState().refreshStatus();
+    // Never null — the form would be stranded on its loading state — and never
+    // 'none', which is the value that logs the app in without asking.
     expect(useAuthStore.getState().loginMode).toBe('username_password');
+    expect(useAuthStore.getState().statusLoading).toBe(false);
   });
 });

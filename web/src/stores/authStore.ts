@@ -6,10 +6,31 @@ import {
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
+/**
+ * What the login form collects when nobody has told us yet.
+ *
+ * Both fields. A username the server does not need is accepted and ignored
+ * while one account exists — and a blank one is accepted too — so asking for it
+ * costs a field, never a login. Guessing the other way (a password-only form on
+ * an instance that now has two accounts) costs every submission.
+ */
+const FAIL_CLOSED_LOGIN: LoginKind = 'username_password';
+
 interface AuthState {
   authenticated: boolean;
   loading: boolean;
-  checking: boolean;
+  /**
+   * Startup has finished deciding where this tab belongs.
+   *
+   * Nothing renders before it, including for a tab that arrives holding a
+   * token: a token says the tab may come in, not *where* it should land. The
+   * instance may still be unset-up, and that is decided from the status
+   * descriptor, which arrives a moment after a token can be read out of
+   * storage. The app used to render on the token alone and navigate to /chat
+   * before the answer came back — by which time the component that would have
+   * redirected was already unmounted.
+   */
+  ready: boolean;
   error: string | null;
   /**
    * The session died under a mounted app (token expired, or the gateway
@@ -24,19 +45,30 @@ interface AuthState {
   /**
    * What the login form must collect, from `/api/auth/status`.
    *
-   * Defaults to `'password'` — never `'none'`. A status call that fails must
-   * not leave the app believing the instance is passwordless, because that is
-   * the one value that makes it log itself in without asking.
+   * `null` means it has never been answered, and the form shows its loading
+   * state rather than guessing. A *failed* read falls back to
+   * {@link FAIL_CLOSED_LOGIN} rather than staying null — so the form is never
+   * stranded — and never to `'none'`, which is the one value that makes the app
+   * log itself in without asking.
    */
-  loginMode: LoginKind;
-  /** The instance has never been set up: no password and no username on its
-   *  one account. Routed to `/setup`. */
+  loginMode: LoginKind | null;
+  /** A descriptor read is in flight. */
+  statusLoading: boolean;
+  /**
+   * The sole account has no password, so everyone who can reach this instance
+   * is signed in as it. Routed to `/setup`. Giving the account a username does
+   * not change it; only a password does.
+   */
   setupPending: boolean;
   login: (password: string, username?: string) => Promise<void>;
   logout: () => void;
   checkAuth: () => Promise<void>;
-  /** Re-read the descriptor after something that can change it (adding the
-   *  second account, setting the first password). */
+  /**
+   * Re-read the descriptor. Called on entry to every login surface and after
+   * anything that can change it, because it goes stale without this tab doing
+   * anything at all: another tab — or a colleague — creating the second account
+   * is what turns a password-only form into one that can never succeed again.
+   */
   refreshStatus: () => Promise<void>;
 }
 
@@ -50,13 +82,14 @@ interface AuthState {
  */
 let sessionEstablished = false;
 
-export const useAuthStore = create<AuthState>((set) => ({
+export const useAuthStore = create<AuthState>((set, get) => ({
   authenticated: !!getToken(),
   loading: false,
-  checking: !getToken(),
+  ready: false,
   error: null,
   sessionExpired: false,
-  loginMode: 'password',
+  loginMode: null,
+  statusLoading: false,
   setupPending: false,
 
   login: async (password: string, username?: string) => {
@@ -68,6 +101,9 @@ export const useAuthStore = create<AuthState>((set) => ({
       set({ authenticated: true, loading: false, sessionExpired: false });
     } catch (e: any) {
       set({ error: e.message || 'Login failed', loading: false });
+      // A refused sign-in is a good moment to find out the form was asking for
+      // the wrong thing, which is what a stale descriptor looks like from here.
+      void get().refreshStatus();
     }
   },
 
@@ -79,82 +115,103 @@ export const useAuthStore = create<AuthState>((set) => ({
     clearAllDrafts();
     clearAllReads();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
-    set({ authenticated: false, sessionExpired: false });
+    set({ authenticated: false, sessionExpired: false, error: null });
+    void get().refreshStatus();
   },
 
   refreshStatus: async () => {
+    set({ statusLoading: true });
     try {
       const status = await api.authStatus();
-      set({ loginMode: status.login, setupPending: status.setup_pending });
+      set({
+        loginMode: status.login,
+        setupPending: status.setup_pending,
+        statusLoading: false,
+      });
     } catch {
-      // Leave the last known shape in place rather than guessing.
+      // Keep the last known answer over a transient failure, and fail closed
+      // only when there has never been one.
+      set((state) => ({
+        loginMode: state.loginMode ?? FAIL_CLOSED_LOGIN,
+        statusLoading: false,
+      }));
     }
   },
 
   checkAuth: async () => {
-    // Asked on *both* branches, unlike before. A tab that starts with a valid
-    // token still needs to know what the login form should collect, because
-    // its session can expire later and the overlay has to ask for the right
-    // thing — and because a passwordless install that has never been set up
-    // belongs on /setup however it arrived.
-    let status: Awaited<ReturnType<typeof api.authStatus>> | null = null;
-    try {
-      status = await api.authStatus();
-      set({ loginMode: status.login, setupPending: status.setup_pending });
-    } catch {
-      // Status unreadable — fall through with the safe default (a password is
-      // required, setup is not pending), which asks rather than assumes.
+    const token = getToken();
+    set({ statusLoading: true });
+    // Both at once. Nothing renders until both have answered — that is what
+    // `ready` means — so asking in sequence would double the blank screen.
+    const [statusOutcome, sessionOutcome] = await Promise.allSettled([
+      api.authStatus(),
+      token ? api.checkAuth() : Promise.resolve(null),
+    ]);
+
+    const status = statusOutcome.status === 'fulfilled' ? statusOutcome.value : null;
+    if (status) {
+      set({
+        loginMode: status.login,
+        setupPending: status.setup_pending,
+        statusLoading: false,
+      });
+    } else {
+      set((state) => ({
+        loginMode: state.loginMode ?? FAIL_CLOSED_LOGIN,
+        statusLoading: false,
+      }));
     }
 
-    if (!getToken()) {
+    if (!token) {
       // Auto-login only for the one state where there is genuinely nothing to
       // ask for: a passwordless install, which by construction has exactly one
       // account. It must not survive into a multi-account install, where an
       // empty password names nobody and the server refuses it.
       if (status?.login === 'none') {
         try {
-          const { token } = await api.login('');
-          setToken(token);
+          const { token: fresh } = await api.login('');
+          setToken(fresh);
           sessionEstablished = true;
-          // checking must be cleared here too — App renders null while it
-          // is true, so leaving it set blanks the app after auto-login.
-          set({ authenticated: true, checking: false });
+          set({ authenticated: true, ready: true });
           return;
         } catch {
           // Fall through to the login page.
         }
       }
-      set({ authenticated: false, checking: false });
+      set({ authenticated: false, ready: true });
       return;
     }
-    try {
-      await api.checkAuth();
+
+    if (sessionOutcome.status === 'fulfilled') {
       sessionEstablished = true;
-      set({ authenticated: true, checking: false });
-    } catch {
-      // On the startup path the stored token was already dead on arrival — a
-      // cold start, not an expiry under a live app, so fall through to the
-      // plain login page. Keyed off sessionEstablished rather than hardcoded
-      // so a later re-check of a session that *was* working still gets the
-      // overlay instead of silently discarding the screen.
-      clearToken();
-      set({ authenticated: false, checking: false, sessionExpired: sessionEstablished });
+      set({ authenticated: true, ready: true });
+      return;
     }
+    // On the startup path the stored token was already dead on arrival — a
+    // cold start, not an expiry under a live app, so fall through to the
+    // plain login page. Keyed off sessionEstablished rather than hardcoded
+    // so a later re-check of a session that *was* working still gets the
+    // overlay instead of silently discarding the screen.
+    clearToken();
+    set({ authenticated: false, ready: true, sessionExpired: sessionEstablished });
   },
 }));
 
 // Any 401 from the API layer lands here. Flag the session as expired instead
 // of reloading the page: the app stays mounted, unsent drafts stay in the
 // composer, and SessionExpiredOverlay collects the password over the top.
-// `checking: false` guards the case where a 401 arrives during the initial
-// checkAuth() — App renders nothing while `checking` is true.
+// `ready: true` covers a 401 arriving during the initial checkAuth(): nothing
+// renders until startup has decided, and a 401 has decided.
 setUnauthorizedHandler(() => {
   useAuthStore.setState({
     authenticated: false,
-    checking: false,
+    ready: true,
     // Only a session that was actually working gets the overlay treatment. A
     // 401 on a tab that never authenticated is just "logged out" — the normal
     // login page, not an overlay over an empty app.
     sessionExpired: sessionEstablished,
   });
+  // Whatever ended the session may also have changed what signing back in
+  // takes — a second account, most of all. Ask before drawing the form.
+  void useAuthStore.getState().refreshStatus();
 });
