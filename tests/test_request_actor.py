@@ -287,6 +287,144 @@ class TestSystemPrincipal:
 
 
 # --------------------------------------------------------------------------- #
+#  The MCP endpoint and the worker-token exchange                              #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingManager:
+    """Stands in for the MCP session manager; remembers the scope it saw."""
+
+    def __init__(self):
+        self.scopes = []
+
+    async def handle_request(self, scope, receive, send):
+        self.scopes.append(scope)
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+
+
+@pytest.mark.asyncio
+class TestMcpEndpointResolvesAnActor:
+    def _mounted(self, manager):
+        from nerve.config import McpEndpointConfig, get_config
+        from nerve.mcp_server.http import mount_deferred
+
+        config = get_config()
+        config.mcp_endpoint = McpEndpointConfig(enabled=True, path="/mcp/v1")
+        app = FastAPI()
+        mount_deferred(app, config, lambda: manager)
+        return app
+
+    async def test_a_backend_credential_arrives_as_the_system_principal(self, install):
+        manager = _RecordingManager()
+        async with _client(self._mounted(manager)) as client:
+            res = await client.post(
+                "/mcp/v1/",
+                headers=_bearer(create_mcp_session_token(_SECRET, "engine-sess-1")),
+                content=b"{}",
+            )
+        assert res.status_code == 200
+        from nerve.mcp_server.http import MCP_ACTOR_SCOPE_KEY
+
+        actor = manager.scopes[0][MCP_ACTOR_SCOPE_KEY]
+        assert actor.actor_id == install.identity.system_actor_id
+        assert actor.is_system
+
+    async def test_a_persons_token_arrives_as_that_person(self, install):
+        """A session token is what an external MCP client (Codex, Claude Code)
+        presents after logging in through the web flow; it is that person, and
+        the endpoint says so rather than flattening everyone to the agent."""
+        manager = _RecordingManager()
+        async with _client(self._mounted(manager)) as client:
+            res = await client.post(
+                "/mcp/v1/", headers=_bearer(install.session_token()), content=b"{}",
+            )
+        assert res.status_code == 200
+        from nerve.mcp_server.http import MCP_ACTOR_SCOPE_KEY
+
+        actor = manager.scopes[0][MCP_ACTOR_SCOPE_KEY]
+        assert actor.account_id == install.account_id and actor.is_human
+
+    async def test_a_disabled_account_is_refused_at_the_mcp_door(self, install):
+        """What a signature check alone would never notice."""
+        manager = _RecordingManager()
+        app = self._mounted(manager)
+        token = install.session_token()
+        async with _client(app) as client:
+            assert (
+                await client.post("/mcp/v1/", headers=_bearer(token), content=b"{}")
+            ).status_code == 200
+            await install.db.set_account_enabled(install.account_id, False)
+            refused = await client.post(
+                "/mcp/v1/", headers=_bearer(token), content=b"{}",
+            )
+        assert refused.status_code == 401
+        assert "disabled" in refused.json()["error"]
+        assert len(manager.scopes) == 1  # the refused frame never reached it
+
+    async def test_it_refuses_before_the_manager_exists(self, install):
+        from nerve.config import McpEndpointConfig, get_config
+
+        from nerve.mcp_server.http import mount_deferred
+
+        config = get_config()
+        config.mcp_endpoint = McpEndpointConfig(enabled=True, path="/mcp/v1")
+        app = FastAPI()
+        mount_deferred(app, config, lambda: None)
+        async with _client(app) as client:
+            res = await client.post(
+                "/mcp/v1/", headers=_bearer(install.session_token()), content=b"{}",
+            )
+        assert res.status_code == 503
+
+
+@pytest.mark.asyncio
+class TestWorkerTokenExchange:
+    def _app(self, install, monkeypatch):
+        from types import SimpleNamespace
+
+        from nerve.config import get_config
+        from nerve.gateway.routes import codex as codex_routes
+
+        monkeypatch.setattr(
+            codex_routes, "get_deps",
+            lambda: SimpleNamespace(engine=SimpleNamespace(config=get_config())),
+        )
+        app = FastAPI()
+        app.include_router(codex_routes.router)
+        return app
+
+    async def test_a_parent_session_token_is_exchanged(self, install, monkeypatch):
+        worker_id = "ultracode-0123456789abcdef"
+        async with _client(self._app(install, monkeypatch)) as client:
+            res = await client.post(
+                "/api/codex/worker-token",
+                headers=_bearer(create_mcp_session_token(_SECRET, "engine-sess-1")),
+                json={"worker_id": worker_id},
+            )
+        assert res.status_code == 200
+        assert res.json()["worker_id"] == worker_id
+
+    async def test_a_disabled_account_cannot_exchange(self, install, monkeypatch):
+        """The actor is resolved before the token's shape is judged, so a
+        credential whose account is gone is refused as unauthenticated rather
+        than as the wrong kind of token."""
+        await install.db.set_account_enabled(install.account_id, False)
+        async with _client(self._app(install, monkeypatch)) as client:
+            res = await client.post(
+                "/api/codex/worker-token",
+                headers=_bearer(install.session_token()),
+                json={"worker_id": "ultracode-0123456789abcdef"},
+            )
+        assert res.status_code == 401
+        assert "disabled" in res.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
 #  The grandfather clause                                                      #
 # --------------------------------------------------------------------------- #
 
