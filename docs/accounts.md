@@ -70,12 +70,12 @@ The account's `credential_source` says where its password is:
 
 | Value | Meaning |
 |---|---|
-| `config` | `auth.password_hash` in your configuration. Nothing is copied, no file is rewritten; a lockdown install whose hash is an `${ENV_VAR}` reference keeps working unchanged |
+| `local` | a bcrypt hash stored on the account row. Where every account's password lives |
 | `none` | passwordless |
-| `local` | a hash stored on the account row (not produced by this version; reserved for account management) |
+| `config` | `auth.password_hash` in your configuration. Transitional — see [Moving off the configuration password](#moving-off-the-configuration-password), which every install does automatically at the first start on this version |
 
-An existing install with a password gets `config`; a passwordless one, and a
-fresh install, gets `none`. The username stays empty — password-only login
+An existing install with a password gets `config` and is then moved to `local`
+in the same start; a passwordless one, and a fresh install, gets `none`. The username stays empty — password-only login
 remains valid while exactly one account exists, so nothing needs one yet. The
 display name is the answer you gave `nerve init` at "Your name": the installer
 creates the account itself, in the same run, because nothing it writes carries
@@ -84,8 +84,8 @@ owner is unnamed until something sets one.
 
 While the account is on `config` or `none`, the value is re-derived from
 configuration at every start: add `auth.password_hash` to a passwordless install
-and the row moves to `config`; remove it and the row moves back. A row that has
-moved to `local` is never touched by this.
+and the row moves to `config` — and straight on to `local`, with the hash copied
+onto the row. A row on `local` is never touched by this.
 
 `nerve migrate --dry-run` shows what the bootstrap would do before it happens;
 `nerve start`, `nerve upgrade` and `nerve migrate` report what it did. The
@@ -94,11 +94,169 @@ an account.
 
 ## Passwordless
 
-With no `auth.password_hash`, every caller who can reach the gateway logs in
-with any password and acts as the owner. That is the intended behaviour for a
-private, loopback-bound install and a real exposure on anything else: Nerve does
-**not** change the bind address or refuse to start over it. Set a password
-before exposing the gateway beyond the machine.
+With no password anywhere — none on the account row and no `auth.password_hash`
+— every caller who can reach the gateway logs in with any password and acts as
+the owner. That is the intended behaviour for a private, loopback-bound install
+and a real exposure on anything else: Nerve does **not** change the bind address
+or refuse to start over it. Set a password before exposing the gateway beyond
+the machine; the accounts screen is where.
+
+**Passwordless is bounded to one account.** With two accounts it is not a weaker
+login, it is an unanswerable question: nothing distinguishes the callers, so
+every one of them would be whoever the code picked. So a second account cannot
+be created while the instance is passwordless — the create is refused with a
+`409` saying to set a password first, rather than startup being refused, which
+would break the upgrade promise in an unrelated way.
+
+## Account management
+
+Every account has full permissions. Any account can list, create, rename,
+disable and re-enable accounts, and any account can use the agent. There is no
+role model and no account-management bit.
+
+The consequence is worth stating plainly rather than discovering later:
+**adding a person gives them the power to remove you.** That is acceptable for
+a trusted team and it is the chosen property, not an oversight. The accounts
+screen says so on the form.
+
+The only guard is **the last enabled account cannot be disabled**, which is what
+stops an install locking everybody out. Everything else is allowed right up to
+that point.
+
+Two more refusals, both about the *instance* rather than about the request, and
+both reported as `409` with what to do first:
+
+- a second account cannot be created while the instance is passwordless (above);
+- a second account cannot be created while an existing account has no username,
+  because an account without one cannot be signed in to once a username is
+  required.
+
+Setting a password is own-account only. Nobody can set anyone else's — and an
+account that already has one must supply it, so a stolen session token is not on
+its own enough to take the account over. The account that has *no* password yet
+is the single exception, which is also the state the whole screen exists to end.
+
+### Usernames
+
+A username is a **lookup key, not an identity**. The identity is the actor id,
+which never moves: renaming an account changes what it signs in as and what is
+displayed, and rewrites nothing that was attributed to it.
+
+| Rule | Value |
+|---|---|
+| Pattern | `^[a-z0-9][a-z0-9._-]{1,31}$` after trimming and lower-casing |
+| Length | 2–32 characters |
+| Case | stored lower-cased; uniqueness is case-insensitive, so `Alice` and `alice` are one name |
+| Reserved | `user`, `admin`, `system`, `nerve`, `agent-system`, `backend-agent`, `external-agent-mcp`, `root`, `me` |
+
+ASCII only, deliberately: SQLite's case-insensitive collation folds ASCII and
+nothing else, so a character set with no non-ASCII letters in it leaves no room
+for a look-alike to sit beside an existing name. `user` is reserved because the
+session tokens issued before per-account logins use that exact string as their
+subject (see [Sessions that predate this version](#sessions-that-predate-this-version));
+`agent-system`, `backend-agent` and `external-agent-mcp` are the other token
+subjects; `me` is a URL path segment; the rest read as an authority this model
+does not have.
+
+### There is no way to delete an account
+
+Deliberate. Removal is **disablement**, and the row stays forever — it is the
+tombstone.
+
+The reason is the grandfather clause. Sessions issued before per-account logins
+carry `sub: "user"` and resolve to the sole account *while exactly one account
+exists*. If an install that had two accounts could go back to one, every such
+token sitting in a browser would start resolving again — to whichever account
+happened to remain, which is somebody else's. Keeping the row makes the account
+count monotone, so "exactly one account has ever existed" is a one-way door: the
+moment a second account is created, grandfathered tokens, password-only login
+and passwordless access are all off, permanently.
+
+It also matches the attribution rule: `actor_refs` rows are never deleted
+either, because the sessions and messages a later release attributes will point
+at them for good.
+
+## Logging in
+
+Login takes a password and, once it is needed, a username.
+
+| Accounts | What the form collects | Why |
+|---|---|---|
+| one, passwordless | nothing (any password is accepted) | there is nothing to ask |
+| one, with a password | a password | the account an upgrade created has no username, so requiring one would lock the install out |
+| two or more | a username and a password | a password alone names nobody |
+
+`GET /api/auth/status` says which of the three applies, so the browser shows the
+right fields without guessing (see [the API reference](api.md)). Existing users
+keep typing just a password and notice nothing.
+
+Wrong username and wrong password give the same answer — a `401` reading
+`Invalid username or password` — and a username that names nobody still costs
+one password comparison, so the endpoint is not a list of who works here,
+readable with a stopwatch or otherwise. A **disabled** account is refused with a
+message saying so, but only after its password has checked out, so that answer
+reaches the person who knew the password and nobody else.
+
+**Creating the second account is the moment three things change**, all at once
+and all for the same reason:
+
+1. sessions issued before per-account logins stop resolving;
+2. password-only login stops being unambiguous, so a username is required;
+3. passwordless access is refused.
+
+In practice the install that adds its second person makes its open tabs sign in
+again at that moment, which is correct and explainable.
+
+## Moving off the configuration password
+
+`auth.password_hash` in configuration was always a transitional home for the
+credential: it is what an upgrading install had, and copying it at the time
+would have made that upgrade irreversible. Every install leaves it at the first
+start on this version.
+
+At startup, for every account still on `credential_source = 'config'`, the
+configured bcrypt hash is **copied** onto the account row and the row moves to
+`local`. A copy, not a re-hash — **nobody's password changes** and every open
+session stays valid. `nerve migrate --dry-run` shows it before it happens, and
+`nerve start`, `nerve upgrade` and `nerve init` report it after.
+
+What happens to the now-dead configuration value depends on the install:
+
+- **Ordinary install.** The key is removed from this box's own `config.yaml`
+  and `config.local.yaml`. Both are machine-local and gitignored. The rewrite
+  goes through the same owner-only writer everything credential-bearing does:
+  created `0600`, the mode confirmed on the open file before a byte is written,
+  and nothing written at all if the filesystem will not honour it (in which case
+  the value is left alone and a warning says to remove it by hand). Comments at
+  the top of the file are kept; comments further down are not.
+- **Lockdown install.** Nothing is written. Configuration is fleet-managed and
+  the value may be an `${ENV_VAR}` reference the next push reasserts. A startup
+  warning names the file and the key and says plainly that **the fleet-managed
+  value no longer authenticates anybody** — a fleet that rotates the password
+  through configuration after this point would otherwise believe it had changed
+  a credential when it had not.
+- **A value in the tracked `workspace/config/settings.yaml`** is reported the
+  same way on any install: it is shared configuration, not this box's to
+  rewrite.
+
+A configured `auth.password_hash` that no account reads is logged once at every
+start, and `nerve doctor` says the same thing. That is the kind of thing an
+operator otherwise debugs for an hour.
+
+`config` stays a *readable* credential source for one release, so a downgrade to
+the previous version still authenticates against `auth.password_hash` if it is
+still there. The enum value is removed in the release after this one; nothing
+creates a `config` row any more.
+
+### Rollback
+
+**After this release, a downgrade silently strips access from any second
+account.** Older code only knows the configuration password and has no account
+management, so an install that added people goes back to one credential for
+everybody who is left — and, if `auth.password_hash` was scrubbed (an ordinary
+install), to no credential at all. Restore a backup taken before the upgrade
+rather than downgrading in place. Documented rather than prevented: there is no
+way to make old code understand rows it has never heard of.
 
 ## Sessions and the actor on the request
 
@@ -258,7 +416,25 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
 ## Backups
 
 `nerve.db` is part of every backup, so a restore brings back the same actor,
-account, tenant and agent ids and the same signing secret. A `--no-secrets`
-bundle empties `instance_secrets` in the snapshot, exactly as it omits
-`config.local.yaml`; the restored instance generates a fresh secret on first
-start.
+account, tenant and agent ids and the same signing secret.
+
+A `--no-secrets` bundle carries **no credential at all**, which now means two
+things inside `nerve.db` as well as the files it omits:
+
+- `instance_secrets` is emptied in the snapshot, so the restored instance
+  generates a fresh signing secret on its first start;
+- every account's password hash is emptied too, and those rows move to
+  `credential_source = 'none'`.
+
+The live database is never touched; the snapshot is edited after it is taken and
+before it is checksummed, and SQLite overwrites the freed pages rather than
+merely unlinking them.
+
+The consequence is worth knowing before you restore one: such a bundle omits
+`config.local.yaml` as well, so `auth.password_hash` does not come back either.
+With **one** account the restored instance is passwordless, which is the
+ordinary first-run state — set a password. With **two or more**, nobody can sign
+in until a password is configured (`auth.password_hash` applies to every account
+that has none, and the next start copies it onto each row) or a bundle *with*
+secrets is restored. That is the honest consequence of restoring a backup that
+deliberately carries no credential.
