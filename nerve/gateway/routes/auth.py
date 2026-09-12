@@ -49,15 +49,8 @@ async def login(req: LoginRequest):
     if config.auth.password_hash:
         if not verify_password(req.password, config.auth.password_hash):
             raise HTTPException(status_code=401, detail="Invalid password")
-    # A sole passwordless account accepts any password.
-
-    # Password-only login names nobody, so it is valid exactly while there is
-    # only one account it could mean — the same bound passwordless access has
-    # (0.5), and the reason an upgrading install with no username can still log
-    # in. PR 3 adds the username and the multi-account form; until then a
-    # second account is refused at creation, so this cannot be reached with
-    # two. The account's own state (disabled) is checked on the way to its
-    # actor, so a disabled account cannot log in either.
+    # Password-only login resolves to the sole account; passwordless accepts
+    # any password.
     try:
         actor: Actor = await actor_for_sole_account(store)
     except ActorResolutionError as e:
