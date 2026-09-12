@@ -106,12 +106,18 @@ An account is:
 
 ```json
 {
-  "id": "…", "username": "alice", "display_name": "Alice",
+  "id": "…", "actor_id": "…", "username": "alice", "display_name": "Alice",
   "enabled": true, "has_password": true,
   "created_at": "…", "updated_at": "…", "disabled_at": null,
   "is_self": true
 }
 ```
+
+`id` is the login; `actor_id` is the person. They are different columns on the
+same row, and only `actor_id` is permanent — it is what attribution is recorded
+against and what survives a rename, so it is the id to resolve a displayed
+author through. `has_password` is the only thing published about the credential;
+where the hash lives is not.
 
 | Endpoint | Does |
 |---|---|
@@ -127,7 +133,7 @@ Failures:
 
 | Response | When |
 |---|---|
-| `400` | the username is malformed or reserved — a fact about the request |
+| `400` | the username is malformed or reserved, or the password is longer than bcrypt's 72 **bytes** (accented letters and emoji cost two to four each) — all facts about the request |
 | `403` | the system principal; or a password change without the current password |
 | `404` | no such account |
 | `409` | the username is taken; the instance is passwordless; an existing account has no username; this is the last enabled account. All four describe the *instance*, and the message says what to do first |
