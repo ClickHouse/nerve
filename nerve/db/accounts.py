@@ -22,6 +22,7 @@ installs that configure none.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -48,6 +49,138 @@ JWT_SECRET_NAME = "jwt_secret"
 # Sentinel for "leave this field alone" in partial updates, distinct from None
 # (which clears a nullable field).
 _UNSET = object()
+
+
+# --------------------------------------------------------------------------- #
+#  Usernames                                                                   #
+# --------------------------------------------------------------------------- #
+#
+# A username is a *lookup key*, never an identity (0.7): ``actor_refs.id`` is
+# the identity, and renaming an account changes what it logs in as and what is
+# displayed without moving one byte of stored authorship.
+
+# Two to thirty-two characters, starting with a letter or a digit, then letters,
+# digits, dot, underscore or hyphen. ASCII only and stored lower-cased, which is
+# what makes the case-insensitive uniqueness complete: SQLite's NOCASE collation
+# folds ASCII and nothing else, so a charset with no non-ASCII letters in it
+# leaves no room for a unicode look-alike to sit beside an existing name.
+USERNAME_PATTERN = r"^[a-z0-9][a-z0-9._-]{1,31}$"
+_USERNAME_RE = re.compile(USERNAME_PATTERN)
+USERNAME_MIN_LENGTH = 2
+USERNAME_MAX_LENGTH = 32
+
+# Names that must never become a login.
+#
+# ``user`` is the load-bearing one: PR 2 grandfathers web sessions minted before
+# per-account logins, whose subject is the literal string ``user``
+# (``nerve.gateway.auth.LEGACY_SUBJECT``), so allowing it as a username would
+# let a person's name collide with a token subject while that clause lives.
+# ``agent-system``/``backend-agent``/``external-agent-mcp`` are the other token
+# subjects, reserved for the same reason. ``me`` is a path segment
+# (``/api/accounts/me``). The rest read as an authority this model does not have
+# (0.4: every account has full permissions) and would mislead.
+RESERVED_USERNAMES = frozenset({
+    "user",
+    "admin",
+    "system",
+    "nerve",
+    "agent-system",
+    "backend-agent",
+    "external-agent-mcp",
+    "root",
+    "me",
+})
+
+
+class AccountError(ValueError):
+    """A rule about accounts was broken. Ingress turns these into 4xx."""
+
+
+class InvalidUsernameError(AccountError):
+    """The username is empty, too short or long, or outside the character set."""
+
+
+class ReservedUsernameError(AccountError):
+    """The username is one this instance keeps for itself."""
+
+
+class UsernameTakenError(AccountError):
+    """Another account already has this username (compared case-insensitively)."""
+
+
+class PasswordlessInstanceError(AccountError):
+    """A second account cannot exist while the first one has no password (0.5).
+
+    Passwordless admits every caller as the one account. With two accounts that
+    is not a weaker login, it is an unanswerable question: nothing distinguishes
+    the callers, so every one of them would be whoever the code picked.
+    """
+
+
+class UnnamedAccountError(AccountError):
+    """An existing account has no username, so a second one cannot be told apart.
+
+    The account an upgrade creates has ``username IS NULL`` on purpose — nothing
+    needed one while password-only login was unambiguous. The moment a second
+    account exists it does, and an account with no username cannot be logged
+    into at all.
+    """
+
+
+class LastAccountError(AccountError):
+    """The last enabled account cannot be disabled — that is a locked-out install.
+
+    The only guard in the model (0.4). Everything else any account may do to any
+    other account, including this, right up to the point where nobody is left.
+    """
+
+
+def normalise_username(raw: str | None) -> str:
+    """Canonicalise and validate a username, or raise.
+
+    Surrounding whitespace is stripped and the result lower-cased, so
+    ``" Alice "`` and ``"alice"`` are one name rather than two that happen to
+    collide in the index. Raises :class:`InvalidUsernameError` for anything
+    outside :data:`USERNAME_PATTERN` and :class:`ReservedUsernameError` for
+    :data:`RESERVED_USERNAMES`.
+    """
+    if raw is None:
+        raise InvalidUsernameError("A username is required")
+    candidate = str(raw).strip().lower()
+    if not candidate:
+        raise InvalidUsernameError("A username is required")
+    if not _USERNAME_RE.match(candidate):
+        raise InvalidUsernameError(
+            f"Usernames are {USERNAME_MIN_LENGTH}–{USERNAME_MAX_LENGTH} characters, "
+            "start with a letter or digit, and may otherwise contain letters, "
+            "digits, '.', '_' and '-'."
+        )
+    if candidate in RESERVED_USERNAMES:
+        raise ReservedUsernameError(f"'{candidate}' is reserved; choose another username")
+    return candidate
+
+
+@dataclass(frozen=True, slots=True)
+class LoginState:
+    """What the instance's accounts say about how a caller may log in.
+
+    The "exactly one account" predicate, stated once so the three rules bounded
+    by it cannot drift apart: grandfathered ``sub: "user"`` tokens (PR 2),
+    password-only login, and passwordless access (0.5).
+
+    Deliberately carries **no username and no credential** — it is what the
+    unauthenticated ``/api/auth/status`` descriptor is built from, so there is
+    nothing on it that must not be published.
+    """
+
+    accounts: int
+    single_account: bool
+    # Exactly one account and it has no credential at all: any password is
+    # accepted and resolves to it.
+    passwordless: bool
+    # Passwordless *and* unnamed — the first-run state PR 6's wizard claims.
+    setup_pending: bool
+    sole_account_id: str | None = None
 
 
 def new_id() -> str:
@@ -170,8 +303,14 @@ class AccountStore:
         Enforces the identity invariants the schema also guards, with clearer
         errors: the actor must be human (never the system principal), a
         ``local`` account carries a credential and a ``config``/``none`` one
-        does not, and ``disabled_at`` is set iff the account is disabled.
-        Username rules (character set, reserved names) remain the caller's.
+        does not, and ``disabled_at`` is set iff the account is disabled. A
+        username, when given, goes through :func:`normalise_username` — every
+        username that reaches the table does, whichever method put it there.
+
+        The low-level primitive: it creates the account row and nothing else.
+        Adding a *person* is :meth:`create_managed_account`, which also creates
+        the actor in the same transaction and applies the account-management
+        guards.
         """
         if credential_source not in CREDENTIAL_SOURCES:
             raise ValueError(
@@ -192,6 +331,8 @@ class AccountStore:
                 "account actor_id must reference a human actor_ref, "
                 f"not a {actor['kind']!r} principal"
             )
+        if username is not None:
+            username = normalise_username(username)
         account_id = account_id or new_id()
         now = _now()
         disabled_at = None if enabled else now
@@ -294,12 +435,267 @@ class AccountStore:
         return await self.get_account(account_id)
 
     async def set_account_username(self, account_id: str, username: str | None) -> dict | None:
-        """Set the login identifier. Uniqueness is case-insensitive (unique
-        index); the caller validates the character set and reserved names."""
-        await self._write(
-            "UPDATE accounts SET username = ?, updated_at = ? WHERE id = ?",
-            (username, _now(), account_id),
+        """Set the login identifier, validating it.
+
+        ``None`` clears it. Anything else goes through
+        :func:`normalise_username` (character set, length, reserved names) and
+        is stored lower-cased; a clash with another account raises
+        :class:`UsernameTakenError` — the unique index is what decides, so two
+        callers racing on the same name cannot both win.
+        """
+        if username is not None:
+            username = normalise_username(username)
+        try:
+            await self._write(
+                "UPDATE accounts SET username = ?, updated_at = ? WHERE id = ?",
+                (username, _now(), account_id),
+            )
+        except sqlite3.IntegrityError as e:
+            raise UsernameTakenError(f"The username '{username}' is already taken") from e
+        return await self.get_account(account_id)
+
+    # -- account management (PR 3) -------------------------------------------
+    #
+    # Every guard below is evaluated *inside* the transaction that acts on it,
+    # under BEGIN IMMEDIATE. A count read before a write is not a guard: two
+    # callers can both read "two enabled accounts" and both disable one.
+    #
+    # Note what is deliberately absent: there is no way to delete an account.
+    # Removal is disablement, and the row stays forever. That keeps the account
+    # count monotone, which is what stops an install that briefly had two
+    # accounts from falling back into the single-account relaxations — a
+    # grandfathered ``sub: "user"`` token would otherwise start resolving again,
+    # to whichever account happened to remain. The row is the tombstone.
+    # ``actor_refs`` rows are never deleted either (0.9): attribution written by
+    # PR 4 references them permanently.
+
+    async def login_state(self) -> LoginState:
+        """The account-shaped facts that decide how a caller may log in.
+
+        One read, one predicate — see :class:`LoginState`. ``passwordless``
+        keys off ``credential_source = 'none'``; a ``config`` row counts as
+        having a credential because the startup mirror keeps that value in step
+        with ``auth.password_hash`` (a row is only left on ``config`` while one
+        is configured), and PR 3's startup migration moves every such row to
+        ``local`` anyway.
+        """
+        accounts = await self.list_accounts()
+        if len(accounts) != 1:
+            return LoginState(
+                accounts=len(accounts),
+                single_account=False,
+                passwordless=False,
+                setup_pending=False,
+            )
+        sole = accounts[0]
+        passwordless = sole["credential_source"] == "none"
+        return LoginState(
+            accounts=1,
+            single_account=True,
+            passwordless=passwordless,
+            setup_pending=passwordless and not sole["username"],
+            sole_account_id=sole["id"],
         )
+
+    async def create_managed_account(
+        self,
+        *,
+        username: str,
+        credential: str,
+        display_name: str | None = None,
+    ) -> dict:
+        """Add a person: one ``actor_refs`` row and one ``accounts`` row, atomically.
+
+        The actor and the account are created in the same transaction. Two DAL
+        calls would leave an orphaned actor behind whenever the second failed —
+        and an orphaned *human* actor is not inert: it is a row a later bug
+        could attach a login to.
+
+        Refuses, inside that transaction:
+
+        * :class:`PasswordlessInstanceError` — the instance is passwordless
+          (0.5). Set a password on the existing account first.
+        * :class:`UnnamedAccountError` — an existing account has no username,
+          so it could not be logged into once this one exists.
+        * :class:`UsernameTakenError` / :class:`InvalidUsernameError` /
+          :class:`ReservedUsernameError` — see :func:`normalise_username`.
+
+        The new account always carries its own credential (``local``): an
+        account with no password is either an open door or unreachable,
+        depending on how many accounts there are, and neither is worth creating.
+        """
+        username = normalise_username(username)
+        if not credential:
+            raise AccountError("A new account needs a password")
+
+        actor_id, account_id = new_id(), new_id()
+        async with self._atomic():
+            # The write lock up front: the guards below are read-then-write, and
+            # a deferred transaction would let two callers both read a state
+            # that permits the insert and then both perform it.
+            await self.db.execute("BEGIN IMMEDIATE")
+
+            async with self.db.execute(
+                "SELECT username, credential_source FROM accounts"
+            ) as cursor:
+                existing = [dict(row) async for row in cursor]
+
+            if len(existing) == 1 and existing[0]["credential_source"] == "none":
+                raise PasswordlessInstanceError(
+                    "This instance is passwordless, so a second account could not "
+                    "be told apart from the first. Set a password on the existing "
+                    "account before adding anyone."
+                )
+            if existing and any(not row["username"] for row in existing):
+                raise UnnamedAccountError(
+                    "An existing account has no username, and an account without "
+                    "one cannot be logged into once a second account exists. Give "
+                    "the existing account a username first."
+                )
+
+            async with self.db.execute(
+                "SELECT 1 FROM accounts WHERE username = ? COLLATE NOCASE", (username,)
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise UsernameTakenError(
+                        f"The username '{username}' is already taken"
+                    )
+
+            now = _now()
+            await self.db.execute(
+                """INSERT INTO actor_refs
+                       (id, kind, display_name, email, profile_version,
+                        created_at, updated_at)
+                   VALUES (?, 'human', ?, NULL, 1, ?, ?)""",
+                (actor_id, display_name, now, now),
+            )
+            try:
+                await self.db.execute(
+                    """INSERT INTO accounts
+                           (id, actor_id, username, credential_source, credential,
+                            enabled, created_at, updated_at, disabled_at)
+                       VALUES (?, ?, ?, 'local', ?, 1, ?, ?, NULL)""",
+                    (account_id, actor_id, username, credential, now, now),
+                )
+            except sqlite3.IntegrityError as e:
+                # The unique index is the real arbiter of the check above: two
+                # processes racing on the same name are serialised by it, not by
+                # the SELECT. The actor insert rolls back with this.
+                raise UsernameTakenError(
+                    f"The username '{username}' is already taken"
+                ) from e
+
+        return await self.get_account(account_id)  # type: ignore[return-value]
+
+    async def update_account_login(
+        self,
+        account_id: str,
+        *,
+        username: str | object = _UNSET,
+        credential: str | object = _UNSET,
+    ) -> dict | None:
+        """Change what an account logs in *as* and *with*, in one transaction.
+
+        Either or both. Setting a credential moves the row to
+        ``credential_source = 'local'``, so a password set here supersedes
+        ``auth.password_hash`` for this account and the configuration value
+        stops applying to it.
+
+        Both at once is PR 6's "claim and secure" step: the sole passwordless,
+        unnamed account gets a username and a password together, so a
+        half-claimed account — named but still open, or secured but unreachable
+        — never exists, not even between two requests.
+
+        Returns the updated row, or ``None`` if there is no such account.
+        """
+        sets: list[str] = []
+        params: list = []
+        if username is not _UNSET:
+            normalised = normalise_username(username)  # type: ignore[arg-type]
+            sets.append("username = ?")
+            params.append(normalised)
+        if credential is not _UNSET:
+            if not credential:
+                raise AccountError("A password is required")
+            sets.append("credential_source = 'local'")
+            sets.append("credential = ?")
+            params.append(credential)
+        if not sets:
+            return await self.get_account(account_id)
+
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            async with self.db.execute(
+                "SELECT 1 FROM accounts WHERE id = ?", (account_id,)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            sets.append("updated_at = ?")
+            params.extend([_now(), account_id])
+            try:
+                await self.db.execute(
+                    f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", tuple(params),
+                )
+            except sqlite3.IntegrityError as e:
+                raise UsernameTakenError("That username is already taken") from e
+        return await self.get_account(account_id)
+
+    async def disable_account(self, account_id: str) -> dict | None:
+        """Disable an account unless it is the last enabled one.
+
+        The lockout guard (0.4), enforced by the statement itself as well as by
+        the surrounding transaction: the ``UPDATE`` carries the "more than one
+        enabled account" condition in its ``WHERE``, so even a caller that
+        somehow reached it with a stale count cannot make it fire. Raises
+        :class:`LastAccountError` rather than reporting a count, so no caller
+        can forget to look.
+
+        Idempotent: disabling an already-disabled account returns it unchanged
+        (and is never the lockout case — nothing changes).
+
+        Returns ``None`` if there is no such account. The row is *never*
+        removed; see the note at the top of this section.
+        """
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            account = await self.get_account(account_id)
+            if account is None:
+                return None
+            if not account["enabled"]:
+                return account
+            now = _now()
+            cursor = await self.db.execute(
+                """UPDATE accounts
+                      SET enabled = 0, updated_at = ?, disabled_at = COALESCE(disabled_at, ?)
+                    WHERE id = ? AND enabled = 1
+                      AND (SELECT COUNT(*) FROM accounts WHERE enabled = 1) > 1""",
+                (now, now, account_id),
+            )
+            changed = cursor.rowcount
+            await cursor.close()
+            if not changed:
+                raise LastAccountError(
+                    "This is the last enabled account. Disabling it would lock "
+                    "everybody out, so it is refused — add another account first, "
+                    "or disable a different one."
+                )
+        return await self.get_account(account_id)
+
+    async def enable_account(self, account_id: str) -> dict | None:
+        """Re-enable an account. Idempotent; ``None`` if there is no such account."""
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            account = await self.get_account(account_id)
+            if account is None:
+                return None
+            if account["enabled"]:
+                return account
+            await self.db.execute(
+                """UPDATE accounts
+                      SET enabled = 1, updated_at = ?, disabled_at = NULL
+                    WHERE id = ?""",
+                (_now(), account_id),
+            )
         return await self.get_account(account_id)
 
     # -- local identity ------------------------------------------------------
