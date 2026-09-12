@@ -967,6 +967,27 @@ class TestStoredActorsAlwaysResolve:
             await install.db.create_session("ghost-message", actor=None)
             await install.db.add_message("ghost-message", "user", "hi", actor=ghost)
 
+    async def test_attribution_is_write_once(self, install):
+        """Nothing re-stamps a row. Re-resolving a session keeps its original
+        creator (the insert is ``OR IGNORE``), and the column is not in the
+        allowlist the session-update path writes through, so no route can move
+        somebody else's work onto itself.
+        """
+        async with _client(install.app()) as client:
+            session_id = (
+                await client.post("/api/sessions", headers=install.alice, json={})
+            ).json()["id"]
+
+        bob = Actor(
+            actor_id=install.bob_actor, kind="human",
+            account_id=install.bob_account,
+        )
+        await install.db.create_session(session_id, actor=bob)
+        await install.db.update_session_fields(
+            session_id, {"created_by_actor_id": install.bob_actor},
+        )
+        assert await install.creator_of(session_id) == install.alice_actor
+
     async def test_no_actor_at_all_is_always_allowed(self, install):
         """NULL is exempt from the reference, which is what lets history that
         predates attribution stay exactly as it was."""
