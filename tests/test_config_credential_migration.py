@@ -309,6 +309,57 @@ class TestTheScrub:
 
 
 @pytest.mark.asyncio
+class TestAConcurrentPasswordChange:
+    """The bootstrap runs from every CLI command that opens the database, which
+    can be alongside a live daemon. Its writes are conditioned on the source it
+    read, so a password set in that window is never written over."""
+
+    async def test_the_copy_does_not_overwrite_a_password_set_meanwhile(
+        self, db: Database, tmp_path,
+    ):
+        from nerve.migrate import MigrationReport, _migrate_config_credentials
+
+        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        actor = await db.create_actor_ref(kind="human")
+        account = await db.create_account(
+            actor_id=actor["id"], credential_source="config",
+        )
+        # What `list_accounts()` saw a moment ago...
+        stale = await db.get_account(account["id"])
+        # ...and what the owner did in the meantime, from the running daemon.
+        await db.update_account_login(account["id"], credential="$2b$12$their-own")
+
+        report = MigrationReport()
+        await _migrate_config_credentials(
+            db, config, report, dry_run=False, stragglers=[stale],
+        )
+
+        row = await db.get_account(account["id"])
+        assert row["credential"] == "$2b$12$their-own"
+        assert row["credential_source"] == "local"
+
+    async def test_the_mirror_does_not_clear_a_password_set_meanwhile(
+        self, db: Database, tmp_path,
+    ):
+        """The other direction: the mirror moves `config`/`none` rows to match
+        configuration, and a row that has become `local` must be left alone even
+        if it was `none` when the loop read it."""
+        actor = await db.create_actor_ref(kind="human")
+        account = await db.create_account(
+            actor_id=actor["id"], credential_source="none",
+        )
+        await db.update_account_login(account["id"], credential="$2b$12$their-own")
+
+        changed = await db.set_account_credential_if_source(
+            account["id"], expected_source="none", credential_source="config",
+        )
+
+        assert changed is False
+        row = await db.get_account(account["id"])
+        assert row["credential"] == "$2b$12$their-own"
+
+
+@pytest.mark.asyncio
 class TestLockdown:
     def _locked(self, tmp_path, monkeypatch) -> NerveConfig:
         config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
