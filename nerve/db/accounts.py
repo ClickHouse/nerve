@@ -162,23 +162,41 @@ class AccountStore:
     ) -> dict:
         """Insert an account for an existing human actor_ref.
 
-        Username rules (character set, reserved names) are the caller's; this
-        only enforces what the schema does — case-insensitive uniqueness.
+        Enforces the identity invariants the schema also guards, with clearer
+        errors: the actor must be human (never the system principal), a
+        ``local`` account carries a credential and a ``config``/``none`` one
+        does not, and ``disabled_at`` is set iff the account is disabled.
+        Username rules (character set, reserved names) remain the caller's.
         """
         if credential_source not in CREDENTIAL_SOURCES:
             raise ValueError(
                 f"credential_source must be one of {CREDENTIAL_SOURCES}, "
                 f"got {credential_source!r}"
             )
+        if credential_source == "local" and not credential:
+            raise ValueError("credential is required when credential_source='local'")
+        if credential_source in ("config", "none") and credential is not None:
+            raise ValueError(
+                f"credential must be None when credential_source={credential_source!r}"
+            )
+        # A login belongs to a human. An unknown actor_id is left to the foreign
+        # key / trigger (IntegrityError); a known non-human is rejected here.
+        actor = await self.get_actor_ref(actor_id)
+        if actor is not None and actor["kind"] != "human":
+            raise ValueError(
+                "account actor_id must reference a human actor_ref, "
+                f"not a {actor['kind']!r} principal"
+            )
         account_id = account_id or new_id()
         now = _now()
+        disabled_at = None if enabled else now
         await self._write(
             """INSERT INTO accounts
                    (id, actor_id, username, credential_source, credential, enabled,
                     created_at, updated_at, disabled_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (account_id, actor_id, username, credential_source, credential,
-             1 if enabled else 0, now, now),
+             1 if enabled else 0, now, now, disabled_at),
         )
         return await self.get_account(account_id)  # type: ignore[return-value]
 
@@ -255,7 +273,12 @@ class AccountStore:
                 f"credential_source must be one of {CREDENTIAL_SOURCES}, "
                 f"got {credential_source!r}"
             )
-        if credential_source != "local":
+        if credential_source == "local":
+            if not credential:
+                raise ValueError(
+                    "credential is required when moving to credential_source='local'"
+                )
+        else:
             credential = None
         await self._write(
             """UPDATE accounts

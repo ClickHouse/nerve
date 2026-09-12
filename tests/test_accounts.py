@@ -327,3 +327,79 @@ class TestInstanceSecrets:
         conn.close()
         assert read_instance_secret(old, JWT_SECRET_NAME) == ""
         assert count_accounts_readonly(old) is None
+
+
+@pytest.mark.asyncio
+class TestDalInvariants:
+    """F16: the DAL and the schema reject internally inconsistent identity rows,
+    so a later PR cannot attach a login to the system principal, keep a
+    credential on a config/none account, create an unusable local account, or
+    leave disablement half-set."""
+
+    async def test_account_must_reference_a_human_actor(self, db: Database):
+        system = await db.create_actor_ref(kind="system")
+        with pytest.raises(ValueError, match="human"):
+            await db.create_account(actor_id=system["id"], credential_source="none")
+
+    async def test_the_trigger_backstops_a_raw_insert_for_a_system_actor(self, db: Database):
+        system = await db.create_actor_ref(kind="system")
+        with pytest.raises(sqlite3.IntegrityError):
+            await db._write(
+                """INSERT INTO accounts (id, actor_id, credential_source, enabled,
+                                         created_at, updated_at)
+                   VALUES ('x', ?, 'none', 1, 't', 't')""",
+                (system["id"],),
+            )
+
+    async def test_local_requires_a_credential(self, db: Database):
+        actor = await db.create_actor_ref(kind="human")
+        with pytest.raises(ValueError, match="credential is required"):
+            await db.create_account(actor_id=actor["id"], credential_source="local")
+
+    async def test_config_and_none_reject_a_credential(self, db: Database):
+        a1 = await db.create_actor_ref(kind="human")
+        a2 = await db.create_actor_ref(kind="human")
+        with pytest.raises(ValueError, match="must be None"):
+            await db.create_account(
+                actor_id=a1["id"], credential_source="config", credential="$2b$12$x",
+            )
+        with pytest.raises(ValueError, match="must be None"):
+            await db.create_account(
+                actor_id=a2["id"], credential_source="none", credential="$2b$12$x",
+            )
+
+    async def test_credential_check_holds_for_a_raw_insert(self, db: Database):
+        actor = await db.create_actor_ref(kind="human")
+        # local without a credential violates the schema CHECK directly.
+        with pytest.raises(sqlite3.IntegrityError):
+            await db._write(
+                """INSERT INTO accounts (id, actor_id, credential_source, credential,
+                                         enabled, created_at, updated_at)
+                   VALUES ('x', ?, 'local', NULL, 1, 't', 't')""",
+                (actor["id"],),
+            )
+
+    async def test_set_credential_local_requires_a_credential(self, db: Database):
+        actor = await db.create_actor_ref(kind="human")
+        account = await db.create_account(actor_id=actor["id"], credential_source="none")
+        with pytest.raises(ValueError, match="credential is required"):
+            await db.set_account_credential(account["id"], credential_source="local")
+
+    async def test_creating_a_disabled_account_sets_disabled_at(self, db: Database):
+        actor = await db.create_actor_ref(kind="human")
+        account = await db.create_account(
+            actor_id=actor["id"], credential_source="none", enabled=False,
+        )
+        assert account["enabled"] is False
+        assert account["disabled_at"] is not None
+
+    async def test_disabled_at_check_holds_for_a_raw_insert(self, db: Database):
+        actor = await db.create_actor_ref(kind="human")
+        # enabled=0 with disabled_at NULL is an inconsistent disablement state.
+        with pytest.raises(sqlite3.IntegrityError):
+            await db._write(
+                """INSERT INTO accounts (id, actor_id, credential_source, enabled,
+                                         created_at, updated_at, disabled_at)
+                   VALUES ('x', ?, 'none', 0, 't', 't', NULL)""",
+                (actor["id"],),
+            )

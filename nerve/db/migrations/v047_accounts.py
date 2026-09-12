@@ -74,7 +74,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     enabled           INTEGER NOT NULL DEFAULT 1,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
-    disabled_at       TEXT
+    disabled_at       TEXT,
+    -- A credential lives on the row only for 'local'; 'config'/'none' keep
+    -- none, so a stale hash can never linger on a config/passwordless account.
+    CHECK ((credential_source = 'local' AND credential IS NOT NULL)
+           OR (credential_source IN ('config', 'none') AND credential IS NULL)),
+    -- disabled_at is set exactly when the account is disabled.
+    CHECK ((enabled = 1 AND disabled_at IS NULL)
+           OR (enabled = 0 AND disabled_at IS NOT NULL))
 );
 
 -- Usernames are looked up case-insensitively. NULLs are distinct in a SQLite
@@ -122,6 +129,19 @@ CREATE TABLE IF NOT EXISTS instance_secrets (
     value      TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- An account is a *human* login. The agent's system principal (and any future
+-- non-human actor) must never get one — attaching a login to it would let
+-- autonomous work be authenticated as a person. A CHECK cannot reference
+-- another table, so this is a trigger; a missing actor (NULL kind) trips it
+-- too, alongside the foreign key.
+CREATE TRIGGER IF NOT EXISTS accounts_actor_must_be_human
+BEFORE INSERT ON accounts
+FOR EACH ROW
+WHEN (SELECT kind FROM actor_refs WHERE id = NEW.actor_id) IS NOT 'human'
+BEGIN
+    SELECT RAISE(ABORT, 'accounts.actor_id must reference a human actor_ref');
+END;
 """
 
 
