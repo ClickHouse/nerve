@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1080,12 +1081,9 @@ class AgentEngine:
                         "Client process for session %s is dead, recreating",
                         session_id,
                     )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id)
-                    self._session_backends.pop(session_id, None)
-                    self._session_models.pop(session_id, None)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
+                    await self._teardown_live_client(
+                        session_id, client, drop_bindings=True,
+                    )
                     client = None
                 elif bound_model is not None and bound_model != requested_model:
                     # Model switched mid-session (e.g. the composer's picker
@@ -1095,12 +1093,9 @@ class AgentEngine:
                         "Session %s model changed (%s → %s), recreating client",
                         session_id, bound_model, requested_model,
                     )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id)
-                    self._session_backends.pop(session_id, None)
-                    self._session_models.pop(session_id, None)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
+                    await self._teardown_live_client(
+                        session_id, client, drop_bindings=True,
+                    )
                     client = None
                     # Deliberate switch — drop the observed-model baseline so
                     # the first message on the new model doesn't fire a
@@ -1374,9 +1369,109 @@ class AgentEngine:
                 "Failed to reset cost baseline for %s: %s", session_id, e,
             )
 
+    async def _reconcile_bg_tasks_on_teardown(self, session_id: str) -> None:
+        """Terminalize a torn-down session's still-"running" bg-task entries.
+
+        The registry models background tasks from the CLI's event stream. Once
+        the delivering client (and its idle-stream watcher) is gone, a terminal
+        event for those tasks can never arrive — so any entry still "running"
+        here is orphaned. Mark such entries done, prune them, and broadcast
+        so the sidebar's "parked" dot clears at once instead of lingering until
+        the next daemon restart (the registry is in-memory).
+
+        "done" (not "stopped") matches the bg registry's existing terminal
+        vocabulary — the task_notification handler already maps a CLI "stopped"
+        outcome to "done", and the frontend background_tasks_update contract
+        only knows running/done/failed/timeout.
+
+        Also settles any orphaned Workflow snapshots (the parallel
+        ``_workflows`` registry) so a workflow panel's spinner clears too.
+
+        Called from ``_discard_client`` and the client-replacement/error paths
+        (``_teardown_live_client``) — every path that removes a client.
+        """
+        registry = self._bg_task_registry.get(session_id)
+        bg_changed = False
+        if registry:
+            for entry in registry.values():
+                if entry.get("status") == "running":
+                    entry["status"] = "done"
+                    entry["last_event_at"] = time.monotonic()
+                    bg_changed = True
+        wf_changed = await self._settle_orphaned_workflows(session_id)
+        if not (bg_changed or wf_changed):
+            return
+        if bg_changed:
+            await broadcaster.broadcast(session_id, {
+                "type": "background_tasks_update",
+                "session_id": session_id,
+                "tasks": list(registry.values()),
+            })
+        # Prunes settled bg entries AND settled workflow snapshots.
+        self._prune_bg_tasks(session_id)
+        # background_tasks_update only refreshes the active session's task
+        # panel; the sidebar's parked dot is driven by has_background_tasks on
+        # the global session_running event, so emit that too to clear it live.
+        await self._broadcast_session_running(
+            session_id, self.is_session_running(session_id),
+        )
+        logger.info(
+            "Reconciled orphaned background tasks/workflows on teardown for "
+            "session %s", session_id,
+        )
+
+    async def _settle_orphaned_workflows(self, session_id: str) -> bool:
+        """Mark still-running Workflow snapshots terminal when the client is
+        torn down, so the workflow panel spinner settles instead of spinning
+        forever (``_workflows`` is the finer-grained sibling of
+        ``_bg_task_registry``). Persists each settled snapshot so a reload
+        reconstructs it. Returns whether anything was settled — the caller
+        prunes and broadcasts.
+        """
+        wf_reg = self._workflows.get(session_id)
+        if not wf_reg:
+            return False
+        settled = False
+        for tuid, cached in wf_reg.items():
+            snap = cached.get("snapshot")
+            if snap and snap.get("status") not in ("completed", "failed", "stopped"):
+                snap["status"] = "stopped"
+                settled = True
+                await broadcaster.broadcast_workflow_progress(session_id, tuid, snap)
+                try:
+                    await self.db.merge_workflow_into_call(session_id, tuid, snap)
+                except Exception as e:  # persistence is best-effort
+                    logger.debug(
+                        "merge_workflow_into_call on teardown failed for %s: %s",
+                        tuid, e,
+                    )
+        return settled
+
+    async def _teardown_live_client(
+        self, session_id: str, client: Any, *, drop_bindings: bool = False,
+    ) -> None:
+        """Reconcile background tasks, then fully detach a live client that is
+        being replaced on an error/recreate path (dead subprocess, model
+        switch, transport retry). The client's subprocess is going, so its
+        run_in_background entries are orphaned — terminalize them first so they
+        don't pin a phantom "parked" dot after the swap, and so the idle sweep
+        (which can't see a session that has no client) never has to.
+
+        ``drop_bindings`` also clears the cached backend/model for the session,
+        for teardowns not immediately followed by a same-binding recreate.
+        """
+        await self._reconcile_bg_tasks_on_teardown(session_id)
+        self._stop_idle_watcher(session_id)
+        self.sessions.remove_client(session_id)
+        if drop_bindings:
+            self._session_backends.pop(session_id, None)
+            self._session_models.pop(session_id, None)
+        unregister_handler(session_id)
+        await self._safe_disconnect(client)
+
     async def _discard_client(
         self, session_id: str, clear_resume: bool = False,
-        background_memorize: bool = False,
+        background_memorize: bool = False, only_if_idle: bool = False,
     ) -> None:
         """Disconnect and remove a client.
 
@@ -1389,12 +1484,32 @@ class AgentEngine:
                 blocks the caller for the whole queue wait — for cron runs
                 that kept the run log "running" (and APScheduler skipping
                 subsequent fires) long after the agent turn had finished.
+            only_if_idle: If True (the idle sweep), abort the discard when a
+                new turn has started on — or replaced — the client during the
+                teardown's awaits (reconcile + memorize), so the sweep never
+                disconnects a client a freshly-started turn is using.
         """
+        # Capture the client we intend to discard: the awaits below can let a
+        # new turn reuse or replace it before we actually remove it.
+        target_client = self.sessions.get_client(session_id)
+        # The client that delivers these tasks' completion is about to go —
+        # terminalize any still-"running" entries so they don't pin a phantom
+        # "parked" dot on the session forever.
+        await self._reconcile_bg_tasks_on_teardown(session_id)
         self._stop_idle_watcher(session_id)
         if background_memorize:
             await self.schedule_memorize(session_id)
         else:
             await self._memorize_session(session_id)
+        if only_if_idle and (
+            self.sessions.is_running(session_id)
+            or self.sessions.get_client(session_id) is not target_client
+        ):
+            logger.info(
+                "Idle discard aborted for session %s — a new turn reused the "
+                "client during teardown", session_id,
+            )
+            return
         client = self.sessions.remove_client(session_id)
         self._session_backends.pop(session_id, None)
         self._session_models.pop(session_id, None)
@@ -1977,9 +2092,16 @@ class AgentEngine:
         if entry is None:
             entry = {
                 "task_id": task_id, "label": "", "tool": "Bash",
-                "status": "running",
+                "status": "running", "last_event_at": time.monotonic(),
             }
             registry[task_id] = entry
+
+        # Any event for this task is proof of life — refresh the liveness
+        # stamp unconditionally (even for events that don't change the UI
+        # chip, e.g. a workflow's repeated task_progress once its label is
+        # set). _has_live_background_tasks uses this to distinguish a task
+        # that has genuinely gone silent from one still emitting.
+        entry["last_event_at"] = time.monotonic()
 
         changed = True
         if subtype == "task_started":
@@ -2704,10 +2826,7 @@ class AgentEngine:
                             "Agent runtime dead for session %s (query phase): %s — retrying",
                             session_id, _qerr,
                         )
-                        self._stop_idle_watcher(session_id)
-                        self.sessions.remove_client(session_id)
-                        unregister_handler(session_id)
-                        await self._safe_disconnect(client)
+                        await self._teardown_live_client(session_id, client)
                         client = await self._get_or_create_client(
                             session_id, source, model,
                             effort_override=effort_override,
@@ -2741,10 +2860,7 @@ class AgentEngine:
                             "(no content yet): %s — retrying with fresh client",
                             session_id, _recv_err,
                         )
-                        self._stop_idle_watcher(session_id)
-                        self.sessions.remove_client(session_id)
-                        unregister_handler(session_id)
-                        await self._safe_disconnect(client)
+                        await self._teardown_live_client(session_id, client)
                         client = await self._get_or_create_client(
                             session_id, source, model,
                             effort_override=effort_override,
@@ -2779,6 +2895,9 @@ class AgentEngine:
             await self.sessions.mark_stopped(session_id)
             self._stop_idle_watcher(session_id)
             unregister_handler(session_id)
+            # A cancelled turn tears down the client — settle any orphaned
+            # background tasks so the session keeps no phantom parked dot.
+            await self._reconcile_bg_tasks_on_teardown(session_id)
             client = self.sessions.remove_client(session_id)
             if client:
                 await self._safe_disconnect(client)
@@ -2874,6 +2993,9 @@ class AgentEngine:
             # Clear resume — CLI state may be corrupted after error
             self._stop_idle_watcher(session_id)
             unregister_handler(session_id)
+            # An errored turn tears down the client — settle any orphaned
+            # background tasks so the session keeps no phantom parked dot.
+            await self._reconcile_bg_tasks_on_teardown(session_id)
             client = self.sessions.remove_client(session_id)
             await self.sessions.mark_error(session_id, error_msg)
             if client:
@@ -3447,11 +3569,42 @@ class AgentEngine:
         discarding tears down the idle-stream watcher (``_idle_stream_watcher``)
         that delivers the task's completion turn, so the session would never
         wake when the task settles.
+
+        A ``"running"`` entry is only trusted while it keeps producing events.
+        The registry is event-driven, so a missed terminal event (a detached
+        ``&`` child the CLI stops observing, a dropped notification, a client
+        torn down before completion) would otherwise pin the entry "running"
+        forever — the session's client is never reaped and the sidebar shows a
+        permanent "parked" dot. An entry silent for longer than the configured
+        staleness window is therefore treated as not-live, which lets the idle
+        sweep proceed and reconcile it (``_reconcile_bg_tasks_on_teardown``).
+
+        The window must stay well above the longest legitimately-silent
+        background task — a from-scratch build or a long test suite can run for
+        an hour or more without emitting a single event — so this never reaps a
+        genuinely-running task. This method is a pure predicate: it does not
+        mutate the registry, so the teardown reconcile still finds the entry to
+        terminalize and broadcast.
         """
         registry = self._bg_task_registry.get(session_id)
-        return bool(registry) and any(
-            entry.get("status") == "running" for entry in registry.values()
-        )
+        if not registry:
+            return False
+        now = time.monotonic()
+        stale_seconds: float | None = None
+        for entry in registry.values():
+            if entry.get("status") != "running":
+                continue
+            if stale_seconds is None:  # resolved lazily — only if something runs
+                stale_seconds = self.config.sessions.bg_task_stale_minutes * 60
+            if stale_seconds <= 0:
+                return True  # staleness check disabled — legacy behaviour
+            # Missing stamp → treat as just-seen (live): fail toward keeping a
+            # possibly-live task, never toward reaping one. Every entry created
+            # by _handle_system_event carries a stamp, so this only guards
+            # entries built by other means.
+            if now - entry.get("last_event_at", now) < stale_seconds:
+                return True
+        return False
 
     async def run_idle_client_sweep(self) -> int:
         """Disconnect clients that have been idle beyond the configured timeout.
@@ -3481,7 +3634,10 @@ class AgentEngine:
             logger.info("Auto-closing idle client for session %s", sid)
             # background_memorize: free the claude subprocess now; indexing
             # follows whenever the memorize queue drains.
-            await self._discard_client(sid, background_memorize=True)
+            # only_if_idle: abort if a new turn reused the client mid-teardown.
+            await self._discard_client(
+                sid, background_memorize=True, only_if_idle=True,
+            )
             discarded += 1
 
         if discarded:

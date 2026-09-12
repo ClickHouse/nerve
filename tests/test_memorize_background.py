@@ -23,6 +23,7 @@ def _make_engine() -> AgentEngine:
     """AgentEngine with mocked config/db — no initialize(), no IO."""
     config = MagicMock()
     config.sessions.sticky_period_minutes = 5
+    config.sessions.bg_task_stale_minutes = 360
     config.agent.max_concurrent = 3
     config.mcp_servers = []
     db = AsyncMock()
