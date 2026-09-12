@@ -60,8 +60,10 @@ someone else's tree — have to pass ``legacy_cron_dir=`` as well (or set
 
 **Identity bootstrap.** :func:`bootstrap_identity` is the part of the accounts
 migration that reads configuration. The v047 schema migration creates the
-tables; this step creates the first account and, if ``auth.jwt_secret`` is
-unset, a signing secret. Only the gateway, at every start, and ``nerve init``
+tables; this step creates the first account, moves ``auth.password_hash`` onto
+the account row and out of the configuration files
+(:func:`_migrate_config_credentials`), and, if ``auth.jwt_secret`` is unset,
+creates a signing secret. Only the gateway, at every start, and ``nerve init``
 run it. :func:`migrate` reports what the gateway will do and writes nothing to
 ``nerve.db``. Other CLI commands open the database with
 :func:`open_production_db`, which loads the signing secret and creates no
@@ -1025,8 +1027,6 @@ def _mirror_action(current: str, expected: str, dry_run: bool) -> str:
 # password changes, and every open session stays valid. Copy first, scrub
 # second — the other order locks everybody out if the copy fails.
 
-# Config keys the credential lives under, and where 3.5 may rewrite.
-_PASSWORD_HASH_KEY = "auth.password_hash"
 # Only the machine-local layers are ever rewritten. The tracked settings file is
 # shared configuration (possibly under version control and possibly delivered by
 # a fleet), so a value there is reported, never edited.
@@ -1228,6 +1228,18 @@ def _retire_config_password(
     if scrubbed:
         report.scrubbed_config_password = True
         report.identity_actions.append(_scrub_password_action(scrubbed, dry_run))
+        # Said at the moment it becomes true, because it is the one consequence
+        # an operator cannot see from the outside: older code knows nothing
+        # about account rows, so it reads a config with no password_hash as a
+        # passwordless install and admits every caller.
+        report.warnings.append(
+            f"auth.password_hash {'is about to be' if dry_run else 'has been'} "
+            "removed from configuration now that the account carries its own. A "
+            "downgrade to a previous release would find no configured password and "
+            "treat this instance as passwordless, which admits every caller — "
+            "restore a backup taken before the upgrade instead of downgrading in "
+            "place."
+        )
         if not dry_run and not remaining:
             # Keep this process's view of the world in step with the file it just
             # rewrote: a config object that still shows a password hash would
