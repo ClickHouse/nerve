@@ -6,6 +6,7 @@ Single entry point for the entire Nerve gateway.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import ssl
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -237,418 +239,478 @@ async def lifespan(app: FastAPI):
     # Clear CLAUDECODE env var to prevent nested session detection by claude-agent-sdk
     os.environ.pop("CLAUDECODE", None)
 
-    # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
-    proxy_service = None
-    if config.proxy.enabled:
-        from nerve.proxy.service import ProxyService
-        proxy_service = ProxyService(config)
-        try:
-            await proxy_service.start()
-            logger.info("CLIProxyAPI proxy started on port %d", config.proxy.port)
-        except Exception as e:
-            logger.error("CLIProxyAPI proxy failed to start: %s", e)
-            raise
-    elif config.ollama.enabled:
-        # Ollama needs the proxy as its Anthropic↔OpenAI translation layer.
-        logger.warning(
-            "ollama.enabled is true but proxy.enabled is false — Ollama "
-            "models require the CLIProxyAPI proxy and will NOT be offered. "
-            "Set proxy.enabled: true to use local Ollama models.",
-        )
+    # Everything from here to the ``yield`` starts something. A failure before
+    # the yield means the shutdown half of this function never runs, so each
+    # resource records how to stop it the moment it is up and the unwind below
+    # runs those in reverse. Without it, a startup that got as far as the proxy
+    # and then failed — the state-file policy can refuse to open the database
+    # at connect() — left that detached subprocess (its own process group, see
+    # ProxyService.start) holding its port, with nothing left to stop it.
+    startup_cleanups: list[tuple[str, Callable[[], Any]]] = []
 
-    # Initialize database
-    db_path = paths.db_path()
-    db = await init_db(db_path, workspace=config.workspace)
-    logger.info("Database initialized at %s", db_path)
-
-    # Local identity bootstrap: the owner account and the signing secret.
-    # After the schema migration in init_db() and before anything mints or
-    # checks a token. Idempotent on every start. Not best-effort: without it
-    # an install with no configured auth.jwt_secret would serve open, so a
-    # failure here stops startup.
-    from nerve.migrate import bootstrap_identity
-
-    identity_report = await bootstrap_identity(db, config)
-    for action in identity_report.identity_actions:
-        logger.info("Identity bootstrap: %s", action)
-
-    # Optional Langfuse observability — must be set up BEFORE the engine
-    # creates SDK clients so the configure_claude_agent_sdk() patches are
-    # in place when the SDK initializes its OTEL tracer provider. Failures
-    # are logged inside init_langfuse() and never propagate.
-    init_langfuse(config)
-
-    # Initialize agent engine
-    _engine = AgentEngine(config, db)
-    await _engine.initialize()
-
-    # Wire up routes
-    init_deps(_engine, db)
-
-    # Prime the Anthropic model catalog so the composer's model picker
-    # offers every model these credentials can reach (instead of a built-in
-    # list that goes stale on each release). Off the critical path and
-    # best-effort: until it lands — or if it fails — the picker falls back
-    # to the configured/built-in list. Runs after the proxy is up, since
-    # discovery goes through it when proxy.enabled.
-    models_prime_task = None
-    if config.agent.model_discovery:
-        from nerve import models_catalog
-
-        models_prime_task = asyncio.create_task(models_catalog.prime(config))
-
-    # Initialize notification service. The engine has a setter so the
-    # per-session ``ToolContext`` constructed inside ``engine.run()``
-    # picks up the live reference. We also seed the legacy module
-    # global on ``nerve.agent.tools`` so older test fixtures that patch
-    # ``tools._notification_service`` directly continue to work.
-    from nerve.notifications.service import NotificationService
-    from nerve.agent import tools as agent_tools
-
-    notification_service = NotificationService(config, db, _engine)
-    _engine.set_notification_service(notification_service)
-    agent_tools._notification_service = notification_service
-    set_notification_service(notification_service)
-
-    # Start the external MCP manager and its Codex-facing loopback listener
-    # before cron scheduling. The loopback listener serves the ASGI app
-    # directly and is independent of the public gateway socket/TLS setup.
-    mcp_run_ctx = None
-    mcp_loopback_server = None
-    if config.mcp_endpoint.enabled:
-        try:
-            _mcp_manager = _build_mcp_manager(_engine, _engine.registry, config)
-            mcp_run_ctx = _mcp_manager.run()
-            await mcp_run_ctx.__aenter__()
-            logger.info(
-                "MCP endpoint live at %s (include_hoa=%s)",
-                config.mcp_endpoint.path, config.mcp_endpoint.include_hoa,
-            )
-        except Exception as e:
-            logger.error("Failed to start MCP endpoint: %s", e)
-            mcp_run_ctx = None
-            _mcp_manager = None
-
-        if _mcp_manager is not None:
+    async def _unwind_startup() -> None:
+        for label, stop in reversed(startup_cleanups):
             try:
-                from nerve.gateway.routes.codex import router as codex_router
+                result = stop()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning("Startup unwind: stopping %s raised: %s", label, e)
 
-                loopback_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-                _mount_mcp_deferred(
-                    loopback_app, config, lambda: _mcp_manager,
+    try:
+        # The database first: it is the step most likely to refuse (insecure
+        # state, a failed migration, an identity bootstrap that cannot store a
+        # signing secret), and nothing about opening it needs the proxy. Doing
+        # it before anything is started means the common failure stops the
+        # start with nothing yet to clean up.
+        db_path = paths.db_path()
+        db = await init_db(db_path, workspace=config.workspace)
+        startup_cleanups.append(("database", close_db))
+        logger.info("Database initialized at %s", db_path)
+
+        # Local identity bootstrap: the owner account and the signing secret.
+        # After the schema migration in init_db() and before anything mints or
+        # checks a token. Idempotent on every start. Not best-effort: without it
+        # an install with no configured auth.jwt_secret would serve open, so a
+        # failure here stops startup.
+        from nerve.migrate import bootstrap_identity
+
+        identity_report = await bootstrap_identity(db, config)
+        for action in identity_report.identity_actions:
+            logger.info("Identity bootstrap: %s", action)
+
+        # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
+        proxy_service = None
+        if config.proxy.enabled:
+            from nerve.proxy.service import ProxyService
+            proxy_service = ProxyService(config)
+            try:
+                await proxy_service.start()
+                startup_cleanups.append(("CLIProxyAPI proxy", proxy_service.stop))
+                logger.info("CLIProxyAPI proxy started on port %d", config.proxy.port)
+            except Exception as e:
+                logger.error("CLIProxyAPI proxy failed to start: %s", e)
+                raise
+        elif config.ollama.enabled:
+            # Ollama needs the proxy as its Anthropic↔OpenAI translation layer.
+            logger.warning(
+                "ollama.enabled is true but proxy.enabled is false — Ollama "
+                "models require the CLIProxyAPI proxy and will NOT be offered. "
+                "Set proxy.enabled: true to use local Ollama models.",
+            )
+
+        # Optional Langfuse observability — must be set up BEFORE the engine
+        # creates SDK clients so the configure_claude_agent_sdk() patches are
+        # in place when the SDK initializes its OTEL tracer provider. Failures
+        # are logged inside init_langfuse() and never propagate.
+        init_langfuse(config)
+
+        # Initialize agent engine
+        _engine = AgentEngine(config, db)
+        await _engine.initialize()
+        startup_cleanups.append(("agent engine", _engine.shutdown))
+
+        # Wire up routes
+        init_deps(_engine, db)
+
+        # Prime the Anthropic model catalog so the composer's model picker
+        # offers every model these credentials can reach (instead of a built-in
+        # list that goes stale on each release). Off the critical path and
+        # best-effort: until it lands — or if it fails — the picker falls back
+        # to the configured/built-in list. Runs after the proxy is up, since
+        # discovery goes through it when proxy.enabled.
+        models_prime_task = None
+        if config.agent.model_discovery:
+            from nerve import models_catalog
+
+            models_prime_task = asyncio.create_task(models_catalog.prime(config))
+            startup_cleanups.append(("models_prime_task", models_prime_task.cancel))
+
+        # Initialize notification service. The engine has a setter so the
+        # per-session ``ToolContext`` constructed inside ``engine.run()``
+        # picks up the live reference. We also seed the legacy module
+        # global on ``nerve.agent.tools`` so older test fixtures that patch
+        # ``tools._notification_service`` directly continue to work.
+        from nerve.notifications.service import NotificationService
+        from nerve.agent import tools as agent_tools
+
+        notification_service = NotificationService(config, db, _engine)
+        _engine.set_notification_service(notification_service)
+        agent_tools._notification_service = notification_service
+        set_notification_service(notification_service)
+
+        # Start the external MCP manager and its Codex-facing loopback listener
+        # before cron scheduling. The loopback listener serves the ASGI app
+        # directly and is independent of the public gateway socket/TLS setup.
+        mcp_run_ctx = None
+        mcp_loopback_server = None
+        if config.mcp_endpoint.enabled:
+            try:
+                _mcp_manager = _build_mcp_manager(_engine, _engine.registry, config)
+                mcp_run_ctx = _mcp_manager.run()
+                await mcp_run_ctx.__aenter__()
+                startup_cleanups.append(
+                    ("MCP manager", lambda: mcp_run_ctx.__aexit__(None, None, None)),
                 )
-                loopback_app.include_router(codex_router)
-                mcp_loopback_server = await McpLoopbackServer.start(loopback_app)
-                _engine.set_mcp_loopback_port(mcp_loopback_server.port)
                 logger.info(
-                    "Codex MCP loopback listener live on 127.0.0.1:%d",
-                    mcp_loopback_server.port,
+                    "MCP endpoint live at %s (include_hoa=%s)",
+                    config.mcp_endpoint.path, config.mcp_endpoint.include_hoa,
                 )
             except Exception as e:
-                logger.error("Failed to start Codex MCP loopback listener: %s", e)
+                logger.error("Failed to start MCP endpoint: %s", e)
+                mcp_run_ctx = None
+                _mcp_manager = None
 
-    # Start Telegram bot if enabled
-    telegram_channel = None
-    if config.telegram.enabled and config.telegram.bot_token:
-        from nerve.channels.telegram import TelegramChannel
-        # get_config, not the object read above: the channel resolves config per
-        # use so a reload reaches the reads that happen per update (dm_policy).
-        telegram_channel = TelegramChannel(get_config, _engine.router)
-        telegram_channel.set_notification_service(notification_service)
-        _engine.register_channel(telegram_channel)
-        await telegram_channel.start()
-        logger.info("Telegram bot started")
+            if _mcp_manager is not None:
+                try:
+                    from nerve.gateway.routes.codex import router as codex_router
 
-    # Start cron service
-    global _cron_service
-    cron_task = None
-    ws_sync_task = None
-    ws_sync_stop = None
-    try:
-        from nerve.cron.service import CronService
-        cron = CronService(config, _engine, db)
-        # Wire health-alert notifications before start() so source runners built
-        # during start (and any later reload) pick it up.
-        cron.notification_service = notification_service
-        await cron.start()
-        cron_task = cron
-        _cron_service = cron
-        logger.info("Cron service started")
+                    loopback_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+                    _mount_mcp_deferred(
+                        loopback_app, config, lambda: _mcp_manager,
+                    )
+                    loopback_app.include_router(codex_router)
+                    mcp_loopback_server = await McpLoopbackServer.start(loopback_app)
+                    startup_cleanups.append(
+                        ("MCP loopback listener", mcp_loopback_server.close),
+                    )
+                    _engine.set_mcp_loopback_port(mcp_loopback_server.port)
+                    logger.info(
+                        "Codex MCP loopback listener live on 127.0.0.1:%d",
+                        mcp_loopback_server.port,
+                    )
+                except Exception as e:
+                    logger.error("Failed to start Codex MCP loopback listener: %s", e)
 
-        # Register cron jobs that suppress the session label in notifications
-        for job in cron._jobs:
-            if not job.show_session_label:
-                notification_service.hide_session_label_for(f"cron:{job.id}")
-    except Exception as e:
-        logger.warning("Cron service failed to start: %s", e)
+        # Start Telegram bot if enabled
+        telegram_channel = None
+        if config.telegram.enabled and config.telegram.bot_token:
+            from nerve.channels.telegram import TelegramChannel
+            # get_config, not the object read above: the channel resolves config per
+            # use so a reload reaches the reads that happen per update (dm_policy).
+            telegram_channel = TelegramChannel(get_config, _engine.router)
+            telegram_channel.set_notification_service(notification_service)
+            _engine.register_channel(telegram_channel)
+            await telegram_channel.start()
+            startup_cleanups.append(("Telegram bot", telegram_channel.stop))
+            logger.info("Telegram bot started")
 
-    # Start the workflow-run service (budget-capped multi-agent jobs).
-    # After notification_service wiring so budget alerts can deliver, and
-    # after engine init so runs execute against live backends. A startup
-    # failure here must be LOUD, not a silent warning — runs are
-    # budget-enforced only while this service is alive.
-    global _workflow_run_service
-    try:
-        from nerve.workflows import init_workflow_run_service
-
-        _workflow_run_service = init_workflow_run_service(config, db, _engine)
-        if _workflow_run_service is not None:
-            await _workflow_run_service.start()
-            logger.info("Workflow run service started")
-    except Exception as e:
-        logger.error("Workflow run service failed to start: %s", e)
-        _workflow_run_service = None
+        # Start cron service
+        global _cron_service
+        cron_task = None
+        ws_sync_task = None
+        ws_sync_stop = None
         try:
-            # Drop the module singleton too — otherwise REST/MCP/cron keep
-            # reaching a monitor-less service and "budgeted" runs start with
-            # no budget enforcement (fail-open).
-            from nerve.workflows import reset_workflow_run_service
+            from nerve.cron.service import CronService
+            cron = CronService(config, _engine, db)
+            # Wire health-alert notifications before start() so source runners built
+            # during start (and any later reload) pick it up.
+            cron.notification_service = notification_service
+            await cron.start()
+            cron_task = cron
+            startup_cleanups.append(("cron service", cron.stop))
+            _cron_service = cron
+            logger.info("Cron service started")
 
-            reset_workflow_run_service()
-        except Exception:
-            pass
-        try:
-            await notification_service.send_notification(
-                session_id="system",
-                title="Workflow run service failed to start",
-                body=f"Budget-capped workflow runs are unavailable: {e}",
-                priority="high",
-            )
-        except Exception:
-            pass
-
-    # Review loops ride on workflow runs. STRICTLY after
-    # workflow_run_service.start(): the runs orphan-recovery pass must
-    # finish before the loop recovery pass reads leg statuses (and the
-    # completion listener must not observe recovery transitions).
-    global _review_loop_service
-    if _workflow_run_service is not None:
-        try:
-            from nerve.workflows import init_review_loop_service
-
-            _review_loop_service = init_review_loop_service(
-                get_config, db, _engine, _workflow_run_service,
-            )
-            if _review_loop_service is not None:
-                await _review_loop_service.start()
-                logger.info("Review loop service started")
+            # Register cron jobs that suppress the session label in notifications
+            for job in cron._jobs:
+                if not job.show_session_label:
+                    notification_service.hide_session_label_for(f"cron:{job.id}")
         except Exception as e:
-            logger.error("Review loop service failed to start: %s", e)
-            _review_loop_service = None
-            try:
-                # Drop the module singleton too — routes/MCP must see the
-                # feature as unavailable, not a half-started zombie whose
-                # worker/reconcile tasks never came up.
-                from nerve.workflows import reset_review_loop_service
+            logger.warning("Cron service failed to start: %s", e)
 
-                reset_review_loop_service()
+        # Start the workflow-run service (budget-capped multi-agent jobs).
+        # After notification_service wiring so budget alerts can deliver, and
+        # after engine init so runs execute against live backends. A startup
+        # failure here must be LOUD, not a silent warning — runs are
+        # budget-enforced only while this service is alive.
+        global _workflow_run_service
+        try:
+            from nerve.workflows import init_workflow_run_service
+
+            _workflow_run_service = init_workflow_run_service(config, db, _engine)
+            if _workflow_run_service is not None:
+                await _workflow_run_service.start()
+                startup_cleanups.append(
+                    ("workflow run service", _workflow_run_service.stop),
+                )
+                logger.info("Workflow run service started")
+        except Exception as e:
+            logger.error("Workflow run service failed to start: %s", e)
+            _workflow_run_service = None
+            try:
+                # Drop the module singleton too — otherwise REST/MCP/cron keep
+                # reaching a monitor-less service and "budgeted" runs start with
+                # no budget enforcement (fail-open).
+                from nerve.workflows import reset_workflow_run_service
+
+                reset_workflow_run_service()
             except Exception:
                 pass
             try:
                 await notification_service.send_notification(
                     session_id="system",
-                    title="Review loop service failed to start",
-                    body=f"Review loops are unavailable: {e}",
+                    title="Workflow run service failed to start",
+                    body=f"Budget-capped workflow runs are unavailable: {e}",
                     priority="high",
                 )
             except Exception:
                 pass
 
-    # One-shot cleanup of retired houseofagents artifacts. Gated on the
-    # NERVE-MANAGED binary existing (our own bin/ is ours): a standalone
-    # houseofagents install the user runs outside Nerve keeps its
-    # ~/.config/houseofagents/config.toml untouched. When it was ours, the
-    # config.toml holds plaintext API keys Nerve wrote — park it out of the
-    # way; the binary is re-downloadable and just deleted. Best-effort —
-    # never blocks startup. The two Nerve-owned paths go through the path
-    # provider so a NERVE_HOME install cleans up its own artifacts instead of
-    # inspecting a directory it never wrote to; the houseofagents config path
-    # is that tool's own and stays literal.
-    try:
-        hoa_binary = paths.nerve_path("bin", "houseofagents")
-        if hoa_binary.exists():
-            hoa_config = Path("~/.config/houseofagents/config.toml").expanduser()
-            if hoa_config.exists() and not hoa_config.is_symlink():
-                retired_dir = paths.nerve_path("houseofagents-retired")
-                retired_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-                hoa_config.rename(retired_dir / "config.toml.bak")
-                logger.info(
-                    "houseofagents retired: moved %s to %s",
-                    hoa_config, retired_dir / "config.toml.bak",
+        # Review loops ride on workflow runs. STRICTLY after
+        # workflow_run_service.start(): the runs orphan-recovery pass must
+        # finish before the loop recovery pass reads leg statuses (and the
+        # completion listener must not observe recovery transitions).
+        global _review_loop_service
+        if _workflow_run_service is not None:
+            try:
+                from nerve.workflows import init_review_loop_service
+
+                _review_loop_service = init_review_loop_service(
+                    get_config, db, _engine, _workflow_run_service,
                 )
-            hoa_binary.unlink()
-            logger.info("houseofagents retired: deleted binary %s", hoa_binary)
-    except Exception as e:
-        logger.warning("houseofagents artifact cleanup failed: %s", e)
-
-    # Periodically pull the workspace from its git remote and apply (opt-in).
-    if config.workspace_sync.enabled:
-        from nerve.sync_service import run_periodic_sync
-        ws_sync_stop = asyncio.Event()
-        ws_sync_task = asyncio.create_task(
-            run_periodic_sync(config, _engine, _cron_service, ws_sync_stop)
-        )
-
-    # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
-    # it tightens to hourly only when the opt-in interactive idle auto-close
-    # (sessions.interactive_archive_after_hours > 0) is enabled and needs finer resolution.
-    #
-    # This and the loops below re-read get_config() per cycle rather than closing
-    # over the start-up object: a config reload replaces that object, and a loop
-    # holding the old one would keep applying settings the operator has already
-    # changed, with nothing to show for it.
-    async def _periodic_cleanup():
-        while True:
-            interval = (
-                3600
-                if get_config().sessions.interactive_archive_after_hours > 0
-                else 6 * 3600
-            )
-            await asyncio.sleep(interval)
-            try:
-                if _engine:
-                    sessions = get_config().sessions
-                    stats = await _engine.sessions.run_cleanup(
-                        archive_after_days=sessions.archive_after_days,
-                        max_sessions=sessions.max_sessions,
-                        interactive_archive_after_hours=sessions.interactive_archive_after_hours,
+                if _review_loop_service is not None:
+                    await _review_loop_service.start()
+                    startup_cleanups.append(
+                        ("review loop service", _review_loop_service.stop),
                     )
-                    if (
-                        stats.get("archived_stale")
-                        or stats.get("archived_overflow")
-                        or stats.get("archived_interactive")
-                    ):
-                        logger.info("Session cleanup: %s", stats)
+                    logger.info("Review loop service started")
             except Exception as e:
-                logger.error("Session cleanup failed: %s", e)
+                logger.error("Review loop service failed to start: %s", e)
+                _review_loop_service = None
+                try:
+                    # Drop the module singleton too — routes/MCP must see the
+                    # feature as unavailable, not a half-started zombie whose
+                    # worker/reconcile tasks never came up.
+                    from nerve.workflows import reset_review_loop_service
 
-            # Clean up expired source messages (TTL)
-            try:
-                deleted = await db.cleanup_expired_messages()
-                if deleted:
-                    logger.info("Cleaned up %d expired source messages", deleted)
-            except Exception as e:
-                logger.error("Source message cleanup failed: %s", e)
-
-    cleanup_task = asyncio.create_task(_periodic_cleanup())
-
-    # Periodic memorization sweep
-    _memorize_stats["interval_minutes"] = config.sessions.memorize_interval_minutes
-
-    async def _periodic_memorize():
-        from datetime import datetime, timezone
-        while True:
-            interval_minutes = get_config().sessions.memorize_interval_minutes
-            # Keep the diagnostics figure honest about the cadence in force.
-            _memorize_stats["interval_minutes"] = interval_minutes
-            await asyncio.sleep(interval_minutes * 60)
-            try:
-                if _engine:
-                    result = await _engine.run_memorization_sweep()
-                    _memorize_stats["last_run_at"] = datetime.now(timezone.utc).isoformat()
-                    _memorize_stats["last_result"] = result
-                    _memorize_stats["total_runs"] += 1
-            except Exception as e:
-                logger.error("Memorization sweep failed: %s", e)
-                _memorize_stats["total_errors"] += 1
-                _memorize_stats["last_result"] = {"error": str(e)}
-
-    memorize_task = asyncio.create_task(_periodic_memorize())
-
-    # Periodic idle client sweep (every 5 minutes)
-    async def _periodic_idle_sweep():
-        while True:
-            await asyncio.sleep(5 * 60)
-            try:
-                if _engine:
-                    await _engine.run_idle_client_sweep()
-            except Exception as e:
-                logger.error("Idle client sweep failed: %s", e)
-
-    idle_sweep_task = asyncio.create_task(_periodic_idle_sweep())
-
-    # Periodic notification maintenance (every 15 minutes): re-deliver
-    # snoozed rows, then expire stale ones. Ordered so a row whose
-    # redeliver_at AND expires_at both passed gets its last chance
-    # (re-delivery restarts the expiry window) instead of dying.
-    async def _periodic_notify_maintenance():
-        while True:
-            await asyncio.sleep(15 * 60)
-            try:
-                redelivered = await notification_service.redeliver_due()
-                if redelivered:
-                    logger.info(
-                        "Re-delivered %d snoozed notifications", redelivered,
+                    reset_review_loop_service()
+                except Exception:
+                    pass
+                try:
+                    await notification_service.send_notification(
+                        session_id="system",
+                        title="Review loop service failed to start",
+                        body=f"Review loops are unavailable: {e}",
+                        priority="high",
                     )
-            except Exception as e:
-                logger.error("Notification re-delivery failed: %s", e)
-            try:
-                expired = await notification_service.expire_stale()
-                if expired:
-                    logger.info("Expired %d stale notifications", expired)
-            except Exception as e:
-                logger.error("Notification expiry failed: %s", e)
+                except Exception:
+                    pass
 
-    notify_maintenance_task = asyncio.create_task(_periodic_notify_maintenance())
-
-    # Both opt-in, both no-ops unless their config says otherwise; see their
-    # docstrings for which of their settings survive a config reload.
-    db_retention_task = asyncio.create_task(_periodic_db_retention(db))
-    backup_task = asyncio.create_task(_periodic_backup(notification_service))
-
-    # Start the external-agents sync service. It re-renders
-    # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace
-    # identity files on a timer (config.external_agents.sync_interval_minutes).
-    # Failure here is non-fatal: external agents just won't receive
-    # automatic updates, but the gateway and MCP endpoint still work.
-    global _external_agents_sync
-    if config.external_agents.enabled and config.external_agents.targets:
+        # One-shot cleanup of retired houseofagents artifacts. Gated on the
+        # NERVE-MANAGED binary existing (our own bin/ is ours): a standalone
+        # houseofagents install the user runs outside Nerve keeps its
+        # ~/.config/houseofagents/config.toml untouched. When it was ours, the
+        # config.toml holds plaintext API keys Nerve wrote — park it out of the
+        # way; the binary is re-downloadable and just deleted. Best-effort —
+        # never blocks startup. The two Nerve-owned paths go through the path
+        # provider so a NERVE_HOME install cleans up its own artifacts instead of
+        # inspecting a directory it never wrote to; the houseofagents config path
+        # is that tool's own and stays literal.
         try:
-            from nerve.external_agents.sync_service import SyncService
-            _external_agents_sync = SyncService(config)
-            await _external_agents_sync.start()
-            set_external_agents_sync(_external_agents_sync)
-            logger.info(
-                "External-agents sync started (%d target(s), interval=%dm)",
-                len(config.external_agents.targets),
-                config.external_agents.sync_interval_minutes,
+            hoa_binary = paths.nerve_path("bin", "houseofagents")
+            if hoa_binary.exists():
+                hoa_config = Path("~/.config/houseofagents/config.toml").expanduser()
+                if hoa_config.exists() and not hoa_config.is_symlink():
+                    retired_dir = paths.nerve_path("houseofagents-retired")
+                    retired_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    hoa_config.rename(retired_dir / "config.toml.bak")
+                    logger.info(
+                        "houseofagents retired: moved %s to %s",
+                        hoa_config, retired_dir / "config.toml.bak",
+                    )
+                hoa_binary.unlink()
+                logger.info("houseofagents retired: deleted binary %s", hoa_binary)
+        except Exception as e:
+            logger.warning("houseofagents artifact cleanup failed: %s", e)
+
+        # Periodically pull the workspace from its git remote and apply (opt-in).
+        if config.workspace_sync.enabled:
+            from nerve.sync_service import run_periodic_sync
+            ws_sync_stop = asyncio.Event()
+            ws_sync_task = asyncio.create_task(
+                run_periodic_sync(config, _engine, _cron_service, ws_sync_stop)
+            )
+            startup_cleanups.append(("workspace sync", ws_sync_task.cancel))
+
+        # Periodic session cleanup. Default cadence is every 6 hours (unchanged);
+        # it tightens to hourly only when the opt-in interactive idle auto-close
+        # (sessions.interactive_archive_after_hours > 0) is enabled and needs finer resolution.
+        #
+        # This and the loops below re-read get_config() per cycle rather than closing
+        # over the start-up object: a config reload replaces that object, and a loop
+        # holding the old one would keep applying settings the operator has already
+        # changed, with nothing to show for it.
+        async def _periodic_cleanup():
+            while True:
+                interval = (
+                    3600
+                    if get_config().sessions.interactive_archive_after_hours > 0
+                    else 6 * 3600
+                )
+                await asyncio.sleep(interval)
+                try:
+                    if _engine:
+                        sessions = get_config().sessions
+                        stats = await _engine.sessions.run_cleanup(
+                            archive_after_days=sessions.archive_after_days,
+                            max_sessions=sessions.max_sessions,
+                            interactive_archive_after_hours=sessions.interactive_archive_after_hours,
+                        )
+                        if (
+                            stats.get("archived_stale")
+                            or stats.get("archived_overflow")
+                            or stats.get("archived_interactive")
+                        ):
+                            logger.info("Session cleanup: %s", stats)
+                except Exception as e:
+                    logger.error("Session cleanup failed: %s", e)
+
+                # Clean up expired source messages (TTL)
+                try:
+                    deleted = await db.cleanup_expired_messages()
+                    if deleted:
+                        logger.info("Cleaned up %d expired source messages", deleted)
+                except Exception as e:
+                    logger.error("Source message cleanup failed: %s", e)
+
+        cleanup_task = asyncio.create_task(_periodic_cleanup())
+        startup_cleanups.append(("cleanup_task", cleanup_task.cancel))
+
+        # Periodic memorization sweep
+        _memorize_stats["interval_minutes"] = config.sessions.memorize_interval_minutes
+
+        async def _periodic_memorize():
+            from datetime import datetime, timezone
+            while True:
+                interval_minutes = get_config().sessions.memorize_interval_minutes
+                # Keep the diagnostics figure honest about the cadence in force.
+                _memorize_stats["interval_minutes"] = interval_minutes
+                await asyncio.sleep(interval_minutes * 60)
+                try:
+                    if _engine:
+                        result = await _engine.run_memorization_sweep()
+                        _memorize_stats["last_run_at"] = datetime.now(timezone.utc).isoformat()
+                        _memorize_stats["last_result"] = result
+                        _memorize_stats["total_runs"] += 1
+                except Exception as e:
+                    logger.error("Memorization sweep failed: %s", e)
+                    _memorize_stats["total_errors"] += 1
+                    _memorize_stats["last_result"] = {"error": str(e)}
+
+        memorize_task = asyncio.create_task(_periodic_memorize())
+        startup_cleanups.append(("memorize_task", memorize_task.cancel))
+
+        # Periodic idle client sweep (every 5 minutes)
+        async def _periodic_idle_sweep():
+            while True:
+                await asyncio.sleep(5 * 60)
+                try:
+                    if _engine:
+                        await _engine.run_idle_client_sweep()
+                except Exception as e:
+                    logger.error("Idle client sweep failed: %s", e)
+
+        idle_sweep_task = asyncio.create_task(_periodic_idle_sweep())
+        startup_cleanups.append(("idle_sweep_task", idle_sweep_task.cancel))
+
+        # Periodic notification maintenance (every 15 minutes): re-deliver
+        # snoozed rows, then expire stale ones. Ordered so a row whose
+        # redeliver_at AND expires_at both passed gets its last chance
+        # (re-delivery restarts the expiry window) instead of dying.
+        async def _periodic_notify_maintenance():
+            while True:
+                await asyncio.sleep(15 * 60)
+                try:
+                    redelivered = await notification_service.redeliver_due()
+                    if redelivered:
+                        logger.info(
+                            "Re-delivered %d snoozed notifications", redelivered,
+                        )
+                except Exception as e:
+                    logger.error("Notification re-delivery failed: %s", e)
+                try:
+                    expired = await notification_service.expire_stale()
+                    if expired:
+                        logger.info("Expired %d stale notifications", expired)
+                except Exception as e:
+                    logger.error("Notification expiry failed: %s", e)
+
+        notify_maintenance_task = asyncio.create_task(_periodic_notify_maintenance())
+        startup_cleanups.append(("notify_maintenance_task", notify_maintenance_task.cancel))
+
+        # Both opt-in, both no-ops unless their config says otherwise; see their
+        # docstrings for which of their settings survive a config reload.
+        db_retention_task = asyncio.create_task(_periodic_db_retention(db))
+        startup_cleanups.append(("db_retention_task", db_retention_task.cancel))
+        backup_task = asyncio.create_task(_periodic_backup(notification_service))
+        startup_cleanups.append(("backup_task", backup_task.cancel))
+
+        # Start the external-agents sync service. It re-renders
+        # ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, etc. from the workspace
+        # identity files on a timer (config.external_agents.sync_interval_minutes).
+        # Failure here is non-fatal: external agents just won't receive
+        # automatic updates, but the gateway and MCP endpoint still work.
+        global _external_agents_sync
+        if config.external_agents.enabled and config.external_agents.targets:
+            try:
+                from nerve.external_agents.sync_service import SyncService
+                _external_agents_sync = SyncService(config)
+                await _external_agents_sync.start()
+                startup_cleanups.append(
+                    ("external-agents sync", _external_agents_sync.stop),
+                )
+                set_external_agents_sync(_external_agents_sync)
+                logger.info(
+                    "External-agents sync started (%d target(s), interval=%dm)",
+                    len(config.external_agents.targets),
+                    config.external_agents.sync_interval_minutes,
+                )
+            except Exception as e:
+                logger.error("Failed to start external-agents sync: %s", e, exc_info=True)
+                _external_agents_sync = None
+
+        # Start the Codex thread sync service if enabled. Background tasks
+        # are spawned by the service itself — we only need to keep the
+        # handle so shutdown can cancel them cleanly.
+        global _codex_thread_sync
+        try:
+            from nerve.sources.codex_threads import build_service as _build_codex_sync
+            codex_sync = _build_codex_sync(config, db, broadcaster=broadcaster)
+            if codex_sync is not None:
+                await codex_sync.start()
+                startup_cleanups.append(("Codex thread sync", codex_sync.stop))
+                _codex_thread_sync = codex_sync
+        except Exception as e:
+            logger.error("Failed to start Codex thread sync: %s", e, exc_info=True)
+            _codex_thread_sync = None
+
+        logger.info("Nerve started on %s:%d", config.gateway.host, config.gateway.port)
+
+        # Send startup notification to the user (Telegram only, silent)
+        try:
+            await notification_service.send_notification(
+                session_id="system",
+                title=f"Nerve started (pid {os.getpid()})",
+                priority="low",
+                channels=["telegram"],
+                silent=True,
             )
         except Exception as e:
-            logger.error("Failed to start external-agents sync: %s", e, exc_info=True)
-            _external_agents_sync = None
+            logger.error("Failed to send startup notification: %s", e)
 
-    # Start the Codex thread sync service if enabled. Background tasks
-    # are spawned by the service itself — we only need to keep the
-    # handle so shutdown can cancel them cleanly.
-    global _codex_thread_sync
-    try:
-        from nerve.sources.codex_threads import build_service as _build_codex_sync
-        codex_sync = _build_codex_sync(config, db, broadcaster=broadcaster)
-        if codex_sync is not None:
-            await codex_sync.start()
-            _codex_thread_sync = codex_sync
-    except Exception as e:
-        logger.error("Failed to start Codex thread sync: %s", e, exc_info=True)
-        _codex_thread_sync = None
-
-    logger.info("Nerve started on %s:%d", config.gateway.host, config.gateway.port)
-
-    # Send startup notification to the user (Telegram only, silent)
-    try:
-        await notification_service.send_notification(
-            session_id="system",
-            title=f"Nerve started (pid {os.getpid()})",
-            priority="low",
-            channels=["telegram"],
-            silent=True,
+        # Re-drive any sessions enrolled via `nerve restart --resume`. Runs as a
+        # background task so a (possibly long) resumed turn never blocks startup;
+        # the engine, notification service and channels are all wired by now.
+        asyncio.create_task(_engine.resume_enrolled_sessions())
+    except BaseException:
+        # Nothing below the yield will run, so stop what did start — in reverse,
+        # and without letting a failing stop hide the failure that got us here.
+        logger.error(
+            "Startup failed; stopping what had already started", exc_info=True,
         )
-    except Exception as e:
-        logger.error("Failed to send startup notification: %s", e)
-
-    # Re-drive any sessions enrolled via `nerve restart --resume`. Runs as a
-    # background task so a (possibly long) resumed turn never blocks startup;
-    # the engine, notification service and channels are all wired by now.
-    asyncio.create_task(_engine.resume_enrolled_sessions())
+        await _unwind_startup()
+        raise
 
     yield
 
