@@ -16,6 +16,7 @@ Two complementary defences are tested here:
 """
 
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -223,3 +224,97 @@ async def test_normal_completion_settles_and_prunes(db, tmp_path):
         assert engine._has_live_background_tasks(sid) is False
         engine._prune_bg_tasks(sid)
         assert engine._bg_task_registry.get(sid) in (None, {})
+
+
+# --------------------------------------------------------------------------- #
+#  Client-replacement / error paths reconcile too (#2)                        #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_teardown_live_client_reconciles_and_detaches(db, tmp_path):
+    """_teardown_live_client (used by the dead-client/model-switch/transport
+    error paths) terminalizes orphaned entries and fully detaches the client —
+    so an entry can't be left running with no client for the sweep to reach."""
+    sid = "replace"
+    engine = await _make_engine(db, tmp_path, sid)
+    fake_client = SimpleNamespace(disconnect=AsyncMock())
+    engine.sessions.set_client(sid, fake_client)
+    engine._session_backends[sid] = object()
+    engine._session_models[sid] = "m"
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        await _feed(engine, sid, "task_started", task_id="t1", description="build")
+        assert engine._has_live_background_tasks(sid) is True
+
+        await engine._teardown_live_client(sid, fake_client, drop_bindings=True)
+
+        assert engine._has_live_background_tasks(sid) is False
+        assert engine.sessions.get_client(sid) is None
+        assert sid not in engine._session_backends
+        fake_client.disconnect.assert_awaited_once()
+
+
+# --------------------------------------------------------------------------- #
+#  Idle-sweep teardown never disconnects a reused client (#3)                 #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_discard_only_if_idle_aborts_when_turn_resumes(db, tmp_path):
+    """With only_if_idle, if a new turn is running on the client by the time
+    teardown reaches removal, the discard aborts — the active client survives."""
+    sid = "reused"
+    engine = await _make_engine(db, tmp_path, sid)
+    engine._memorize_session = AsyncMock()
+    engine.schedule_memorize = AsyncMock()
+    fake_client = SimpleNamespace(disconnect=AsyncMock())
+    engine.sessions.set_client(sid, fake_client)
+    engine.sessions.is_running = lambda _sid: True  # a turn reused the client
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        await engine._discard_client(sid, only_if_idle=True)
+
+    assert engine.sessions.get_client(sid) is fake_client  # not torn down
+    fake_client.disconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discard_only_if_idle_proceeds_when_idle(db, tmp_path):
+    """Control: with only_if_idle and a genuinely idle session, the discard
+    proceeds and removes the client."""
+    sid = "still-idle"
+    engine = await _make_engine(db, tmp_path, sid)
+    engine._memorize_session = AsyncMock()
+    fake_client = SimpleNamespace(disconnect=AsyncMock())
+    engine.sessions.set_client(sid, fake_client)
+    engine.sessions.is_running = lambda _sid: False
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        await engine._discard_client(sid, only_if_idle=True)
+
+    assert engine.sessions.get_client(sid) is None
+    fake_client.disconnect.assert_awaited_once()
+
+
+# --------------------------------------------------------------------------- #
+#  Orphaned Workflow snapshots settle too (#4)                                #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_reconcile_settles_orphaned_workflow(db, tmp_path):
+    """A still-running Workflow snapshot is settled (stopped), persisted,
+    broadcast, and pruned on teardown — the panel spinner clears."""
+    sid = "wf"
+    engine = await _make_engine(db, tmp_path, sid)
+    engine.db.merge_workflow_into_call = AsyncMock()
+    engine._workflows[sid] = {
+        "tuid1": {"name": "WF", "snapshot": {"name": "WF", "status": "running"}},
+    }
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_workflow_progress = AsyncMock()
+        await engine._reconcile_bg_tasks_on_teardown(sid)
+
+    bc.broadcast_workflow_progress.assert_awaited_once()
+    engine.db.merge_workflow_into_call.assert_awaited_once()
+    # settled snapshot pruned from the live registry
+    assert engine._workflows.get(sid) in (None, {})
