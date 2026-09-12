@@ -110,6 +110,37 @@ SYSTEM_SUBJECT = "agent-system"
 LEGACY_SUBJECT = "user"
 
 
+# bcrypt hashes at most this many *bytes* of a password. Up to and including
+# 4.x the library silently ignored the rest; 5.0 raises instead, which turns a
+# long or emoji-laden password into a 500 unless something upstream says no
+# first. That something is here, once, rather than at each caller.
+PASSWORD_MAX_BYTES = 72
+
+
+class PasswordTooLongError(ValueError):
+    """A password longer than bcrypt will hash. Ingress turns it into a 4xx."""
+
+
+def password_length_problem(plain: str) -> str | None:
+    """Why this password cannot be stored, or ``None``.
+
+    Measured in **UTF-8 bytes, not characters**: nineteen emoji are nineteen
+    characters and seventy-six bytes, and it is the bytes bcrypt counts. Said in
+    the message too, because "too long" on a password a user can see is twelve
+    characters long is not a usable error.
+    """
+    if not plain:
+        return "A password is required"
+    size = len(plain.encode("utf-8"))
+    if size > PASSWORD_MAX_BYTES:
+        return (
+            f"That password is {size} bytes long; the maximum is "
+            f"{PASSWORD_MAX_BYTES} bytes. Note that this is bytes rather than "
+            "characters — accented letters and emoji cost two to four each."
+        )
+    return None
+
+
 def hash_password(plain: str) -> str:
     """bcrypt-hash a password for storage on an account row.
 
@@ -118,9 +149,17 @@ def hash_password(plain: str) -> str:
     and one produced there are interchangeable — which is what lets PR 3's
     startup migration *copy* the configured hash onto the account row instead of
     re-hashing it and changing somebody's password.
+
+    Raises :class:`PasswordTooLongError` rather than letting bcrypt's own
+    ``ValueError`` escape as a 500. The ingress that collects a password checks
+    :func:`password_length_problem` first and answers `400`; this is the
+    backstop for anything that does not (a later wizard, a script), and it
+    refuses rather than truncating, because a stored credential whose last bytes
+    were silently dropped is a password that is not the one its owner set.
     """
-    if not plain:
-        raise ValueError("a password is required")
+    problem = password_length_problem(plain)
+    if problem:
+        raise PasswordTooLongError(problem)
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
@@ -131,11 +170,23 @@ def verify_password(plain: str, hashed: str) -> bool:
     all. An operator can put anything in ``auth.password_hash``, and a
     credential that cannot be parsed must read as "does not match" rather than
     as a 500 that tells the caller their guess was interesting.
+
+    **An over-long candidate is truncated to bcrypt's 72 bytes rather than
+    refused**, which is the asymmetry with :func:`hash_password` and is
+    deliberate. Every hash that reaches this function from before bcrypt 5 was
+    made from the first 72 bytes of whatever was typed, because that is what the
+    library did; refusing the full password now would lock out anybody whose
+    password is longer than that and who could log in yesterday — and this
+    release's whole premise is that an upgrade preserves authentication. It
+    weakens nothing: the bytes past 72 were already not part of that hash, and
+    no hash this release *creates* can have any, since hashing refuses them.
     """
     if not plain or not hashed:
         return False
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        return bcrypt.checkpw(
+            plain.encode("utf-8")[:PASSWORD_MAX_BYTES], hashed.encode("utf-8"),
+        )
     except (ValueError, TypeError):
         return False
 

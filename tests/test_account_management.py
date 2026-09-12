@@ -93,7 +93,7 @@ async def install(tmp_path, open_identity_db, wire_identity_store):
 # rather than "credential not in response": a column added to the table later
 # must not be able to arrive in a response unnoticed.
 _ACCOUNT_FIELDS = {
-    "id", "username", "display_name", "enabled", "has_password",
+    "id", "actor_id", "username", "display_name", "enabled", "has_password",
     "created_at", "updated_at", "disabled_at", "is_self",
 }
 
@@ -151,6 +151,25 @@ class TestNoCredentialEverLeaves:
         assert len(listed) == 2
         for row in listed:
             assert set(row) == _ACCOUNT_FIELDS
+
+    async def test_the_actor_id_is_published_and_is_not_the_account_id(
+        self, install: _Install,
+    ):
+        """Attribution is written against the actor id, so a UI showing who did
+        something has to be able to look one up. It is a different column from
+        the account id, and it is the one that outlives a rename."""
+        async with _client(install.app) as client:
+            me = (await client.get("/api/accounts/me", headers=install.headers())).json()
+        row = await install.db.get_account(install.owner_id)
+        assert me["actor_id"] == row["actor_id"]
+        assert me["actor_id"] != me["id"]
+
+        await install.db.update_account_login(install.owner_id, username="renamed")
+        async with _client(install.app) as client:
+            after = (await client.get(
+                "/api/accounts/me", headers=install.headers(),
+            )).json()
+        assert after["actor_id"] == me["actor_id"]
 
     async def test_has_password_stands_in_for_the_credential(self, install: _Install):
         async with _client(install.app) as client:
@@ -589,3 +608,108 @@ class TestTheRouteSurface:
         for methods, path, _ in self._endpoints():
             if path.startswith("/api/accounts"):
                 assert "DELETE" not in methods, path
+
+
+# --------------------------------------------------------------------------- #
+#  How long a password may be                                                  #
+# --------------------------------------------------------------------------- #
+
+# bcrypt hashes at most 72 *bytes*, and version 5 raises rather than ignoring
+# the rest. Both boundaries that write a password have to say so themselves, or
+# a long passphrase is a 500.
+_AT_THE_LIMIT = "p" * 72
+_OVER_THE_LIMIT = "p" * 73
+# Nineteen emoji: nineteen characters, seventy-six bytes. The case that makes
+# "measure characters" wrong rather than merely imprecise.
+_MULTIBYTE_OVER = "\U0001F600" * 19
+# Eighteen is seventy-two bytes exactly.
+_MULTIBYTE_AT_THE_LIMIT = "\U0001F600" * 18
+
+
+@pytest.mark.asyncio
+class TestPasswordLength:
+    @pytest.mark.parametrize("password,status", [
+        (_AT_THE_LIMIT, 201),
+        (_MULTIBYTE_AT_THE_LIMIT, 201),
+        (_OVER_THE_LIMIT, 400),
+        (_MULTIBYTE_OVER, 400),
+    ])
+    async def test_creating_an_account(self, install: _Install, password, status):
+        await install.secure_the_owner()
+        async with _client(install.app) as client:
+            response = await client.post(
+                "/api/accounts", json={"username": "bob", "password": password},
+                headers=install.headers(),
+            )
+        assert response.status_code == status, response.text
+        if status == 400:
+            detail = response.json()["detail"]
+            assert "bytes" in detail
+            assert "72" in detail
+
+    @pytest.mark.parametrize("password,status", [
+        (_AT_THE_LIMIT, 200),
+        (_MULTIBYTE_AT_THE_LIMIT, 200),
+        (_OVER_THE_LIMIT, 400),
+        (_MULTIBYTE_OVER, 400),
+    ])
+    async def test_changing_your_own_password(self, install: _Install, password, status):
+        async with _client(install.app) as client:
+            response = await client.put(
+                "/api/accounts/me/password", json={"new_password": password},
+                headers=install.headers(),
+            )
+        assert response.status_code == status, response.text
+
+    async def test_a_password_at_the_limit_still_logs_in(self, install: _Install):
+        async with _client(install.app) as client:
+            assert (await client.put(
+                "/api/accounts/me/password", json={"new_password": _AT_THE_LIMIT},
+                headers=install.headers(),
+            )).status_code == 200
+            assert (await client.post(
+                "/api/auth/login", json={"password": _AT_THE_LIMIT},
+            )).status_code == 200
+
+    async def test_an_over_long_guess_is_refused_rather_than_crashing(
+        self, install: _Install,
+    ):
+        """The login route verifies rather than hashes, so it sees over-long
+        input too — and must answer, not raise."""
+        await install.secure_the_owner()
+        async with _client(install.app) as client:
+            response = await client.post(
+                "/api/auth/login",
+                json={"username": "alice", "password": _OVER_THE_LIMIT},
+            )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid username or password"
+
+    async def test_a_password_hashed_before_bcrypt_5_still_verifies(self):
+        """bcrypt used to ignore everything past 72 bytes, so a hash from an
+        older install was made from the first 72 of whatever was typed.
+        Refusing the full password now would lock out somebody who could log in
+        yesterday, which is the one thing this release promises not to do."""
+        import bcrypt
+
+        from nerve.gateway.auth import verify_password
+
+        legacy = bcrypt.hashpw(
+            _OVER_THE_LIMIT.encode()[:72], bcrypt.gensalt(rounds=4),
+        ).decode()
+        assert verify_password(_OVER_THE_LIMIT, legacy) is True
+        assert verify_password("something else entirely", legacy) is False
+
+    async def test_the_hashing_helper_refuses_defensively(self):
+        """For the callers that are not HTTP — a later wizard, a script. It
+        refuses rather than truncating: a stored credential whose last bytes
+        were dropped is not the password its owner set."""
+        from nerve.gateway.auth import PasswordTooLongError, hash_password
+
+        with pytest.raises(PasswordTooLongError):
+            hash_password(_OVER_THE_LIMIT)
+        with pytest.raises(PasswordTooLongError):
+            hash_password(_MULTIBYTE_OVER)
+        with pytest.raises(ValueError):
+            hash_password("")
+        assert hash_password(_AT_THE_LIMIT)
