@@ -17,7 +17,7 @@ from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import Actor, system_actor_or_none
+from nerve.identity import Actor, system_actor
 
 logger = logging.getLogger(__name__)
 
@@ -506,13 +506,13 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
             "project. Archive its project Task (keep the ## Updates audit trail) and deregister it "
             "from the task-heartbeat registry, then stop."
         )
-        # The trigger text is Nerve's, not the person's — starring is the
-        # human action, and 0.7 puts the human on that mutation, which is
-        # deferred past this gate. ``internal`` persists no user row anyway.
-        hook_actor = await system_actor_or_none(
-            deps.db, context="star-project hook",
-        )
         try:
+            # The trigger text is Nerve's, not the person's — starring is the
+            # human action, and 0.7 puts the human on that mutation, which is
+            # deferred past this gate. ``internal`` persists no user row
+            # anyway. Inside the guard: an instance that cannot resolve its
+            # own principal must not also fail the star.
+            hook_actor = await system_actor(deps.db)
             asyncio.create_task(
                 deps.engine.run(
                     session_id=session_id, user_message=trigger,

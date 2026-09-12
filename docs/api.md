@@ -226,10 +226,10 @@ Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_b
 ```
 
 `created_by_actor_id` is whoever the request resolved to — an actor id for
-[`GET /api/actors`](#actors), not an account id. It is `null` on sessions that
-predate attribution, and on the ones the instance creates for itself when
-identity bootstrap has not run. Every session payload carries it, including the
-sidebar feeds above.
+[`GET /api/actors`](#actors), not an account id. It is `null` only on sessions
+that predate attribution; everything created since carries one, because a write
+that cannot resolve its actor fails rather than storing the row anonymously.
+Every session payload carries the field, including the sidebar feeds above.
 
 #### `GET /api/sessions/{id}`
 Get session details.

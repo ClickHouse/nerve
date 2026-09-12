@@ -32,7 +32,7 @@ from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.gateway.auth import create_session_token, hash_password, pin_jwt_secret
 from nerve.gateway.routes import init_deps, register_all_routes
 from nerve.gateway.server import create_app
-from nerve.identity import Actor
+from nerve.identity import Actor, ActorResolutionError
 from nerve.mcp_server.session import SatelliteSessionResolver
 
 _SECRET = "test-secret-for-attribution-padded-to-32b"
@@ -106,6 +106,20 @@ class _Install:
         return [
             (m["role"], m["actor_id"])
             for m in await self.db.get_messages(session_id)
+        ]
+
+    async def said_in(self, session_id: str) -> list[tuple[str, str | None]]:
+        """``(content, actor_id)`` for a session's *user* messages.
+
+        What every two-people assertion has to compare. Checking the set of
+        actor ids, or even their order, cannot tell a correct pair of rows from
+        two rows whose senders were swapped — which is precisely the bug a
+        shared actor produces.
+        """
+        return [
+            (m["content"], m["actor_id"])
+            for m in await self.db.get_messages(session_id)
+            if m["role"] == "user"
         ]
 
 
@@ -191,10 +205,9 @@ class TestTwoPeopleOverHttp:
             assert (await _run_later(client, install.bob, shared, "and mine")).status_code == 200
 
         assert await install.creator_of(shared) == install.alice_actor
-        rows = await install.senders_in(shared)
-        assert [(r, a) for r, a in rows if r == "user"] == [
-            ("user", install.alice_actor),
-            ("user", install.bob_actor),
+        assert await install.said_in(shared) == [
+            ("mine", install.alice_actor),
+            ("and mine", install.bob_actor),
         ]
 
     async def test_a_chat_turn_stores_the_person_who_typed_it(
@@ -321,11 +334,9 @@ class TestTwoPeopleOverTheWebSocket:
             }]))
             await _wait_for_messages(install, session_id, n)
 
-        assert [
-            (r, a) for r, a in await install.senders_in(session_id) if r == "user"
-        ] == [
-            ("user", install.alice_actor),
-            ("user", install.bob_actor),
+        assert await install.said_in(session_id) == [
+            ("from her", install.alice_actor),
+            ("from him", install.bob_actor),
         ]
 
     async def test_a_session_minted_at_connect_belongs_to_the_connection(
@@ -361,9 +372,7 @@ class TestTwoPeopleOverTheWebSocket:
 
         echo = next(m for m in seen if m.get("type") == "user_message")
         assert echo["actor_id"] == install.alice_actor
-        assert [
-            (r, a) for r, a in await install.senders_in(session_id) if r == "user"
-        ] == [("user", install.alice_actor)]
+        assert await install.said_in(session_id) == [("hi", install.alice_actor)]
 
 
 async def _wait_for_messages(install, session_id: str, count: int) -> None:
@@ -473,31 +482,80 @@ class TestAutonomousWorkIsTheSystemPrincipal:
             ("assistant", None),
         ]
 
-    async def test_a_missing_system_principal_does_not_cancel_the_work(
-        self, install, monkeypatch,
+    async def test_an_unresolvable_principal_writes_nothing_and_says_so(
+        self, install, monkeypatch, caplog,
     ):
-        """Attribution is metadata about the work, so it must never be able to
-        stop the work. Unreachable in production — bootstrap runs before
-        anything can serve — which is why it is asserted rather than assumed.
+        """Unreachable in production — every opener bootstraps the identity
+        before it can serve — so what matters is *which way* it fails if it
+        ever is reached. A run that wrote its rows unattributed would leave
+        audit gaps indistinguishable from history that predates attribution,
+        and nothing could repair them afterwards. A run that fails is reported
+        and can be run again.
+
+        Every autonomous path resolves the principal before its first write, so
+        the failure costs no rows — which is what this asserts for each of
+        them, not just for one.
         """
+        from nerve.channels.base import InboundMessage
+        from nerve.sources.codex_threads.base import WorkspaceFilter
+        from nerve.sources.codex_threads.ingester import CodexIngester
+
         _no_model(install.engine, monkeypatch)
 
         async def _gone():
             return None
 
         monkeypatch.setattr(install.db, "get_system_principal", _gone)
-        await install.engine.run_cron(job_id="orphan", prompt="still runs")
 
-        sessions = [
-            s for s in await install.db.list_sessions(limit=50)
-            if s["source"] == "cron"
-        ]
-        assert len(sessions) == 1
-        assert sessions[0]["created_by_actor_id"] is None
-        assert await install.senders_in(sessions[0]["id"]) == [
-            ("user", None), ("assistant", None),
-        ]
+        with pytest.raises(ActorResolutionError):
+            await install.engine.run_cron(job_id="orphan", prompt="never runs")
+        with pytest.raises(ActorResolutionError):
+            await install.engine.run_hook(
+                hook_name="orphan", hook_id="1", prompt="never runs",
+            )
+        with pytest.raises(ActorResolutionError):
+            await install.engine.run_persistent_cron(
+                job_id="orphan", prompt="never runs",
+            )
 
+        channel = SimpleNamespace(
+            name="telegram", capabilities=set(), format_response=lambda t: t,
+        )
+        router = install.engine.router
+        router._channels["telegram"] = channel
+        with pytest.raises(ActorResolutionError):
+            await router.handle_message(InboundMessage(
+                channel_name="telegram", channel_key="telegram:9",
+                sender_id="9", text="never lands",
+            ))
+
+        workspace = str(install.config.workspace)
+        ingester = CodexIngester(
+            install.db,
+            origin_id="origin-1",
+            workspace_filter=WorkspaceFilter(
+                mode="nerve_workspace",
+                nerve_workspace_path=pathlib.Path(workspace),
+            ),
+            broadcaster=_SilentBroadcaster(),
+        )
+        with pytest.raises(ActorResolutionError):
+            for event in _codex_thread("thread-orphan", workspace):
+                await ingester.ingest(event)
+
+        # The MCP resolver already swallows a failed satellite create into its
+        # log rather than failing the connection — so there it is reported, and
+        # what matters is the same: no row.
+        with caplog.at_level("ERROR"):
+            await SatelliteSessionResolver(install.db).resolve(
+                client_name="claude-code", mcp_session_id="mcp-orphan",
+            )
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+        # Not one row anywhere. The fixture creates no sessions, so an empty
+        # list is the whole claim: nothing was written unattributed, and
+        # nothing was written at all.
+        assert await install.db.list_sessions(limit=100) == []
 
 async def _noop(*args, **kwargs):
     return None
@@ -725,8 +783,12 @@ class TestNoProcessGlobalActor:
             finally:
                 install.db.add_message = original
 
-        senders = {a for r, a in await install.senders_in(shared) if r == "user"}
-        assert senders == {install.alice_actor, install.bob_actor}
+        # Each person's own words under their own name: a set of actor ids, or
+        # even an ordered list of them, would pass if the two were swapped.
+        assert sorted(await install.said_in(shared)) == sorted([
+            ("hers", install.alice_actor),
+            ("his", install.bob_actor),
+        ])
 
     async def test_two_people_resolved_at_the_same_moment_do_not_swap(
         self, install,
@@ -943,8 +1005,8 @@ class TestRenamingChangesTheNameNotTheHistory:
         # The stored ids did not move, which is the whole point of storing an
         # id rather than a name.
         assert await install.creator_of(session_id) == install.bob_actor
-        assert [a for r, a in await install.senders_in(session_id) if r == "user"] == [
-            install.bob_actor,
+        assert await install.said_in(session_id) == [
+            ("before the rename", install.bob_actor),
         ]
 
 
@@ -988,6 +1050,28 @@ class TestStoredActorsAlwaysResolve:
         )
         assert await install.creator_of(session_id) == install.alice_actor
 
+    async def test_a_repeated_id_returns_the_stored_creator(self, install):
+        """The insert is ``OR IGNORE``, so the second caller's row is
+        discarded — and the dict handed back has to say so. Returning what was
+        asked for would make ``created_by_actor_id`` a claim about a row that
+        does not exist, and that field is what the API publishes.
+        """
+        alice = Actor(
+            actor_id=install.alice_actor, kind="human",
+            account_id=install.alice_account,
+        )
+        bob = Actor(
+            actor_id=install.bob_actor, kind="human",
+            account_id=install.bob_account,
+        )
+        first = await install.db.create_session("repeat", title="Hers", actor=alice)
+        second = await install.db.create_session("repeat", title="His", actor=bob)
+
+        assert first["created_by_actor_id"] == install.alice_actor
+        assert second["created_by_actor_id"] == install.alice_actor
+        assert second["title"] == "Hers"
+        assert await install.creator_of("repeat") == install.alice_actor
+
     async def test_no_actor_at_all_is_always_allowed(self, install):
         """NULL is exempt from the reference, which is what lets history that
         predates attribution stay exactly as it was."""
@@ -1019,6 +1103,4 @@ class TestForkingKeepsTheOriginalSenders:
         assert fork.status_code == 200
         fork_id = fork.json()["id"]
         assert await install.creator_of(fork_id) == install.bob_actor
-        assert [a for r, a in await install.senders_in(fork_id) if r == "user"] == [
-            install.alice_actor,
-        ]
+        assert await install.said_in(fork_id) == [("hers", install.alice_actor)]

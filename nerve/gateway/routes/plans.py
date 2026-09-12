@@ -23,7 +23,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
-from nerve.identity import Actor, system_actor_or_none
+from nerve.identity import Actor, system_actor
 
 logger = logging.getLogger(__name__)
 
@@ -228,9 +228,7 @@ async def approve_plan(
     # plan — nobody typed it — so the turn is the instance's own work even
     # though a person's approval started it. The session above carries who
     # approved.
-    impl_actor = await system_actor_or_none(
-        deps.db, context=f"implementation of plan {plan_id}",
-    )
+    impl_actor = await system_actor(deps.db)
 
     async def _run_impl():
         try:

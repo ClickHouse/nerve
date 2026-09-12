@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from nerve.config import (
     CodexOriginConfig,
@@ -22,6 +23,21 @@ from nerve.config import (
 )
 from nerve.sources.codex_threads import build_service
 from nerve.sources.codex_threads.ingester import codex_session_id
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap.
+
+    Autonomous code resolves the agent's system principal before it writes and
+    fails the run rather than storing a row under nobody, so the paths this
+    file drives need the identity every real database has: production opens
+    nothing without bootstrapping it first.
+    """
+    await ensure_system_principal(db)
+    return db
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codex" / "rollouts" / "in_scope.jsonl"
 TEST_WORKSPACE = Path("/tmp/nerve-test-ws")

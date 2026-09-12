@@ -432,6 +432,15 @@ render as a blank name. That is safe precisely because actor rows are never
 deleted and accounts are tombstoned rather than removed (above). `NULL` is
 exempt, so unattributed history is unaffected.
 
+**`NULL` means one of two things, and never "the lookup failed".** Autonomous
+work resolves the system principal *before* it writes anything, and a run that
+cannot resolve it fails and is reported rather than storing rows under nobody.
+Every production database has been bootstrapped before it serves, so this is
+the shape of a regression rather than a state to expect — but it is worth
+saying which way it breaks, because a row written unattributed would be
+indistinguishable from history that predates this release, forever, and nothing
+could repair it afterwards. A failed run can simply be run again.
+
 **Ids are permanent.** If an install later moves to an external identity
 provider, work done before the move keeps the local actor ids it has now and
 new work gets the provider's, with nothing merged and no history rewritten. The

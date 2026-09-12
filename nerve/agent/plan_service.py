@@ -19,7 +19,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from nerve.identity import system_actor_or_none
+from nerve.identity import system_actor
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -146,9 +146,7 @@ async def request_plan_revision(
         if session_id.startswith("cron:")
         else session_id
     )
-    revision_actor = await system_actor_or_none(
-        engine.db, context=f"revision of plan {plan_id}",
-    )
+    revision_actor = await system_actor(engine.db)
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron", actor=revision_actor,
     )

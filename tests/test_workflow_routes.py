@@ -18,6 +18,21 @@ import pytest_asyncio
 
 from nerve.db import Database
 
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap.
+
+    Autonomous code resolves the agent's system principal before it writes and
+    fails the run rather than storing a row under nobody, so the paths this
+    file drives need the identity every real database has: production opens
+    nothing without bootstrapping it first.
+    """
+    await ensure_system_principal(db)
+    return db
+
 
 class FakeSessionManager:
     """Records get_or_create calls; the service passes backend/model/cwd.
