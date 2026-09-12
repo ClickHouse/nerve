@@ -39,6 +39,7 @@ from nerve.gateway.auth import (
     hash_password,
     password_length_problem,
     require_auth,
+    source_authenticates,
     verify_password,
 )
 from nerve.gateway.routes._deps import get_deps
@@ -310,6 +311,12 @@ async def change_own_password(
     that may set a first password without proving anything beyond being signed
     in, which is also what it has to do before a second account can exist.
 
+    An **omitted** current password and an **empty** one are different things.
+    The first is "I am not claiming to know it"; the second is a claim that the
+    current password is the empty string, which a credential made before this
+    release can legitimately be, so it is compared rather than rejected out of
+    hand.
+
     Setting a password moves the account to its own credential, after which
     ``auth.password_hash`` no longer applies to it.
     """
@@ -320,7 +327,8 @@ async def change_own_password(
 
     existing = account_credential(account, get_config())
     if existing:
-        if not req.current_password or not verify_password(req.current_password, existing):
+        supplied = req.current_password
+        if supplied is None or not verify_password(supplied, existing):
             raise HTTPException(status_code=403, detail="Current password is incorrect")
 
     try:
@@ -353,10 +361,16 @@ def account_credential(account: dict, config) -> str:
     ``config`` is kept readable for one release so a downgrade to code that only
     knows the configuration value still authenticates; the startup migration
     empties that case out.
+
+    The *gate* — which sources have a credential at all — is
+    :func:`nerve.gateway.auth.source_authenticates`, shared with ``nerve
+    doctor`` so that the two cannot describe the same install differently.
     """
-    if account["credential_source"] == "local":
-        return account["credential"] or ""
-    return config.auth.password_hash or ""
+    source = account["credential_source"]
+    configured = config.auth.password_hash or ""
+    if not source_authenticates(source, configured_password=bool(configured)):
+        return ""
+    return (account["credential"] or "") if source == "local" else configured
 
 
 def instance_is_passwordless(state, config) -> bool:
