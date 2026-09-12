@@ -28,6 +28,15 @@ so flipping the tracked `lockdown` flag — which otherwise drops the machine
 layers — cannot reset the mode either. Any other value is a hard error at
 startup and in `nerve config validate`.
 
+The `auth` section as a whole is read carefully, because it is the one section
+whose *disappearance* weakens an instance rather than resetting it to a
+default. An `auth:` that is present but not a mapping (`auth: something`) is a
+hard error rather than being read as "no authentication"; an `auth:` with
+nothing under it is an empty overlay, so a bare line in a higher-precedence
+file leaves the password hash and signing secret in the file below it exactly
+where they were. Both rules apply per file, before the layers are merged, and
+`nerve config validate` reports what startup would.
+
 ## The two tables
 
 | Table | Holds | Exists in |
@@ -154,10 +163,22 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
 - **A backup bundle is as sensitive as what it holds.** It carries `nerve.db`
   and, unless `--no-secrets` was used, `config.local.yaml`, so it is created
   `0600` before a byte is written to it rather than at whatever the umask
-  gives. A filesystem that cannot keep it private refuses a backup that would
-  carry secrets, and warns when `--no-secrets` means it does not. The wizard's
-  `config.local.yaml` and its `init-state.json` checkpoint are created
-  owner-only the same way — mode first, content second.
+  gives, and written through that same open file rather than by reopening its
+  name — which is what stops anyone who can write to the backup directory from
+  redirecting the bundle to a file of their own. A filesystem that cannot keep
+  it private refuses a backup that would carry secrets, and warns when
+  `--no-secrets` means it does not.
+- **A file that would hold your secrets in the clear is not written.** The
+  wizard's `config.local.yaml` — API keys, password hash, signing secret — and
+  its `init-state.json` checkpoint are created owner-only the same way: the
+  mode is set on creation and checked on the open file *before* anything is
+  written. If the filesystem will not honour it (a share or a volume without
+  Unix permissions), `nerve init` stops with nothing written rather than
+  leaving those readable by everyone with an account on the machine; put the
+  configuration on a filesystem with permissions, or keep the secrets in the
+  environment and reference them as `${VAR}`. Adding a Telegram user rewrites
+  the same file, and reports the pairing as not saved rather than republishing
+  its contents.
 - **Every command opens the database the same way.** `nerve sync`, `nerve cron`,
   `nerve db prune`, `nerve db vacuum` and `nerve workflow list|status` open
   `nerve.db` exactly as the gateway does — the policy above, the migrations,
