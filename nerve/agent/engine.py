@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1374,6 +1375,47 @@ class AgentEngine:
                 "Failed to reset cost baseline for %s: %s", session_id, e,
             )
 
+    async def _reconcile_bg_tasks_on_teardown(self, session_id: str) -> None:
+        """Terminalize a torn-down session's still-"running" bg-task entries.
+
+        The registry models background tasks from the CLI's event stream. Once
+        the delivering client (and its idle-stream watcher) is gone, a terminal
+        event for those tasks can never arrive — so any entry still "running"
+        here is orphaned. Mark such entries stopped, prune them, and broadcast
+        so the sidebar's "parked" dot clears at once instead of lingering until
+        the next daemon restart (the registry is in-memory).
+
+        Called from ``_discard_client`` — the client-teardown path the idle
+        sweep, the idle-stream watcher, and one-shot runs all funnel through.
+        """
+        registry = self._bg_task_registry.get(session_id)
+        if not registry:
+            return
+        changed = False
+        for entry in registry.values():
+            if entry.get("status") == "running":
+                entry["status"] = "stopped"
+                entry["last_event_at"] = time.monotonic()
+                changed = True
+        if not changed:
+            return
+        await broadcaster.broadcast(session_id, {
+            "type": "background_tasks_update",
+            "session_id": session_id,
+            "tasks": list(registry.values()),
+        })
+        self._prune_bg_tasks(session_id)
+        # background_tasks_update only refreshes the active session's task
+        # panel; the sidebar's parked dot is driven by has_background_tasks on
+        # the global session_running event, so emit that too to clear it live.
+        await self._broadcast_session_running(
+            session_id, self.is_session_running(session_id),
+        )
+        logger.info(
+            "Reconciled orphaned background tasks on teardown for session %s",
+            session_id,
+        )
+
     async def _discard_client(
         self, session_id: str, clear_resume: bool = False,
         background_memorize: bool = False,
@@ -1390,6 +1432,10 @@ class AgentEngine:
                 that kept the run log "running" (and APScheduler skipping
                 subsequent fires) long after the agent turn had finished.
         """
+        # The client that delivers these tasks' completion is about to go —
+        # terminalize any still-"running" entries so they don't pin a phantom
+        # "parked" dot on the session forever.
+        await self._reconcile_bg_tasks_on_teardown(session_id)
         self._stop_idle_watcher(session_id)
         if background_memorize:
             await self.schedule_memorize(session_id)
@@ -1977,9 +2023,16 @@ class AgentEngine:
         if entry is None:
             entry = {
                 "task_id": task_id, "label": "", "tool": "Bash",
-                "status": "running",
+                "status": "running", "last_event_at": time.monotonic(),
             }
             registry[task_id] = entry
+
+        # Any event for this task is proof of life — refresh the liveness
+        # stamp unconditionally (even for events that don't change the UI
+        # chip, e.g. a workflow's repeated task_progress once its label is
+        # set). _has_live_background_tasks uses this to distinguish a task
+        # that has genuinely gone silent from one still emitting.
+        entry["last_event_at"] = time.monotonic()
 
         changed = True
         if subtype == "task_started":
@@ -3447,11 +3500,42 @@ class AgentEngine:
         discarding tears down the idle-stream watcher (``_idle_stream_watcher``)
         that delivers the task's completion turn, so the session would never
         wake when the task settles.
+
+        A ``"running"`` entry is only trusted while it keeps producing events.
+        The registry is event-driven, so a missed terminal event (a detached
+        ``&`` child the CLI stops observing, a dropped notification, a client
+        torn down before completion) would otherwise pin the entry "running"
+        forever — the session's client is never reaped and the sidebar shows a
+        permanent "parked" dot. An entry silent for longer than the configured
+        staleness window is therefore treated as not-live, which lets the idle
+        sweep proceed and reconcile it (``_reconcile_bg_tasks_on_teardown``).
+
+        The window must stay well above the longest legitimately-silent
+        background task — a from-scratch build or a long test suite can run for
+        an hour or more without emitting a single event — so this never reaps a
+        genuinely-running task. This method is a pure predicate: it does not
+        mutate the registry, so the teardown reconcile still finds the entry to
+        terminalize and broadcast.
         """
         registry = self._bg_task_registry.get(session_id)
-        return bool(registry) and any(
-            entry.get("status") == "running" for entry in registry.values()
-        )
+        if not registry:
+            return False
+        now = time.monotonic()
+        stale_seconds: float | None = None
+        for entry in registry.values():
+            if entry.get("status") != "running":
+                continue
+            if stale_seconds is None:  # resolved lazily — only if something runs
+                stale_seconds = self.config.sessions.bg_task_stale_minutes * 60
+            if stale_seconds <= 0:
+                return True  # staleness check disabled — legacy behaviour
+            # Missing stamp → treat as just-seen (live): fail toward keeping a
+            # possibly-live task, never toward reaping one. Every entry created
+            # by _handle_system_event carries a stamp, so this only guards
+            # entries built by other means.
+            if now - entry.get("last_event_at", now) < stale_seconds:
+                return True
+        return False
 
     async def run_idle_client_sweep(self) -> int:
         """Disconnect clients that have been idle beyond the configured timeout.

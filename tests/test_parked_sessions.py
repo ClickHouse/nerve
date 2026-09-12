@@ -102,6 +102,9 @@ class TestEnginePendingWork:
         eng = AgentEngine.__new__(AgentEngine)
         eng.db = db
         eng._bg_task_registry = {}
+        eng.config = SimpleNamespace(
+            sessions=SimpleNamespace(bg_task_stale_minutes=360),
+        )
         await db.create_session("s1", source="web")
         return eng
 

@@ -39,6 +39,10 @@ def _make_engine() -> AgentEngine:
             cli_idle_timeout_seconds=2,
             context_1m=False,
         ),
+        sessions=SimpleNamespace(
+            client_idle_timeout_minutes=60,
+            bg_task_stale_minutes=360,
+        ),
     )
     engine._bg_task_registry = {}
     engine._workflows = {}
@@ -620,7 +624,9 @@ async def test_idle_sweep_skips_sessions_with_live_background_tasks():
     idle sweep — discarding its client would tear down the idle-stream watcher
     that delivers the task's completion turn (the lost-wakeup bug)."""
     engine = _make_engine()
-    engine.config.sessions = SimpleNamespace(client_idle_timeout_minutes=60)
+    engine.config.sessions = SimpleNamespace(
+        client_idle_timeout_minutes=60, bg_task_stale_minutes=360,
+    )
     engine.sessions = SimpleNamespace(
         get_idle_client_ids=lambda _timeout: ["busy", "free"],
         _clients={"busy": object(), "free": object()},
