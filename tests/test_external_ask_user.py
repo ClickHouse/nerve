@@ -31,7 +31,7 @@ async def test_external_session_answer_does_not_call_engine_run(db):
     await db.create_session(
         session_id="external:codex:t1",
         source="external",
-        metadata={"client_name": "codex"},
+        metadata={"client_name": "codex"}, actor=None,
     )
     await db.create_notification(
         notification_id="ask-ext-1",
@@ -59,7 +59,7 @@ async def test_native_session_answer_still_injects(db):
     behaviour: spawn an ``engine.run()`` task to inject the answer."""
     await db.create_session(
         session_id="native-session-1",
-        source="web",
+        source="web", actor=None,
     )
     await db.create_notification(
         notification_id="ask-native-1",
@@ -95,7 +95,7 @@ async def test_external_session_answer_broadcasts_to_global(db):
     await db.create_session(
         session_id="external:codex:t2",
         source="external",
-        metadata={"client_name": "codex"},
+        metadata={"client_name": "codex"}, actor=None,
     )
     await db.create_notification(
         notification_id="ask-ext-2",

@@ -138,7 +138,7 @@ async def test_tool_call_via_mcp_dedups_with_synced_tool_call(db, tmp_path):
             "tool": "mcp__nerve__task_list",
             "input": {"limit": 3},
             "tool_use_id": call_id,
-        }],
+        }], actor=None,
     )
     assert msg_id is not None
 

@@ -26,6 +26,7 @@ from nerve.cron.jobs import (
     load_jobs,
 )
 from nerve.db import Database
+from nerve.identity import system_actor_or_none
 
 if TYPE_CHECKING:
     from nerve.cron.gates import CronGate
@@ -858,6 +859,7 @@ class CronService:
         session_id = f"cron:{job_id}:{ts}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
+            actor=await system_actor_or_none(self.db, context=f"cron job {job_id}"),
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -1332,10 +1334,15 @@ class CronService:
                 continue
             if not claimed:
                 continue
-            self._dispatch_wakeup(session_id, wakeup)
+            await self._dispatch_wakeup(session_id, wakeup)
 
-    def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
-        """Spawn the engine run for a claimed wakeup with error logging."""
+    async def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
+        """Spawn the engine run for a claimed wakeup with error logging.
+
+        Async only so the actor is resolved before the task is spawned:
+        an ``await`` inside the task would sit in front of ``engine.run``'s
+        per-session lock and let two due wakeups land out of order.
+        """
         prompt = _resolve_wakeup_prompt(wakeup["prompt"])
         # "Run later" deferrals are scheduled dispatches — fire them through
         # the cron source so they mirror plan_service/cron-dispatched runs;
@@ -1345,12 +1352,20 @@ class CronService:
         logger.info(
             "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
         )
+        # The instance's own tick: a model-scheduled wakeup, or a deferral
+        # this service is delivering. Who wrote a run-later message is
+        # already recorded on the row the route persisted when they composed
+        # it.
+        actor = await system_actor_or_none(
+            self.db, context=f"wakeup {wakeup['id']}",
+        )
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
                 user_message=prompt,
                 source=source,
                 internal=True,
+                actor=actor,
                 # A run-later deferral is a message the user wrote and asked
                 # to be delivered now, so it belongs back at the top of the
                 # sidebar. A model's own ScheduleWakeup tick is the session

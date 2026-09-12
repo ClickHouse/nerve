@@ -107,7 +107,7 @@ def _make_engine(db) -> MagicMock:
             source=kwargs.get("source", "web"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
         return {"id": session_id}
 
@@ -196,7 +196,7 @@ async def services(db, engine, tmp_path):
 
 
 async def _mk_observer(db, session_id: str = "obs00001") -> str:
-    await db.create_session(session_id, source="web")
+    await db.create_session(session_id, source="web", actor=None)
     return session_id
 
 
@@ -775,7 +775,7 @@ class TestRecovery:
             created_by=f"review-loop:{loop['id']}",
         )
         await db.transition_workflow_run(run_id, "running", expect=("pending",))
-        await db.create_session(session_id, source="workflow")
+        await db.create_session(session_id, source="workflow", actor=None)
         await db.update_workflow_run(run_id, {"session_id": session_id})
         await db.transition_workflow_run(
             run_id, "done", expect=("running",), result="did it",
@@ -878,7 +878,7 @@ class TestRecovery:
             created_by=f"review-loop:{loop['id']}",
         )
         await db.transition_workflow_run(run_id, "running", expect=("pending",))
-        await db.create_session(session_id, source="workflow")
+        await db.create_session(session_id, source="workflow", actor=None)
         await db.update_workflow_run(run_id, {"session_id": session_id})
         await db.transition_workflow_run(
             run_id, "done", expect=("running",), result="did it",
@@ -953,7 +953,7 @@ class TestReviewLoopTools:
         assert not killed.is_error
 
     async def test_start_rejected_for_workflow_sessions(self, db, engine, wired):
-        await db.create_session("workflow:wfr-x", source="workflow")
+        await db.create_session("workflow:wfr-x", source="workflow", actor=None)
         result = await review_loop_start_handler(
             self._ctx(db, engine, session_id="workflow:wfr-x"),
             {"goal": "g", "verifier": "- a"},

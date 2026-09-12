@@ -77,8 +77,8 @@ class TestWakeupFireAt:
 class TestWakeupStore:
     @pytest_asyncio.fixture
     async def seeded_db(self, db):
-        await db.create_session("s1", source="web")
-        await db.create_session("s2", source="web")
+        await db.create_session("s1", source="web", actor=None)
+        await db.create_session("s2", source="web", actor=None)
         return db
 
     @pytest.mark.asyncio
@@ -140,7 +140,7 @@ class TestWakeupStore:
 class TestWakeupSweep:
     @pytest_asyncio.fixture
     async def svc(self, db):
-        await db.create_session("s1", source="web")
+        await db.create_session("s1", source="web", actor=None)
         config = MagicMock()
         config.timezone = "UTC"
         engine = AsyncMock()
@@ -222,7 +222,7 @@ class TestRecordWakeup:
 
     @pytest_asyncio.fixture
     async def seeded_db(self, db):
-        await db.create_session("s1", source="web")
+        await db.create_session("s1", source="web", actor=None)
         return db
 
     @pytest.mark.asyncio

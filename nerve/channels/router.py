@@ -24,6 +24,7 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.stream_adapter import StreamAdapter
+from nerve.identity import Actor, system_actor_or_none
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -88,6 +89,25 @@ class ChannelRouter:
     # (e.g. forwarded messages, rapid-fire sends) into a single batch.
     BATCH_DEBOUNCE = 0.60
 
+    async def _channel_actor(self, channel_name: str) -> Actor | None:
+        """The principal a channel's traffic is attributed to.
+
+        The agent's system principal, for now, and deliberately: mapping a
+        Telegram or Slack sender to a local account needs a provider-identity
+        table that 0.8 puts outside this sequence. Attributing channel traffic
+        to a *person* before that mapping exists would mean guessing from a
+        display name or a chat id — exactly the inference RFC 3.3 forbids — so
+        the honest answer is "the instance received this", and the transport
+        and sender stay where they already are, in the message's own
+        provenance.
+
+        This is the single place channel attribution is decided; the PR that
+        adds identity resolution changes this method and nothing else.
+        """
+        return await system_actor_or_none(
+            self.engine.db, context=f"{channel_name} message",
+        )
+
     async def handle_message(self, msg: InboundMessage) -> str:
         """Process an inbound user message.
 
@@ -103,6 +123,8 @@ class ChannelRouter:
         if not channel:
             raise ValueError(f"Unknown channel: {msg.channel_name}")
 
+        actor = await self._channel_actor(msg.channel_name)
+
         # Resolve session
         if msg.session_id:
             session_id = msg.session_id
@@ -111,7 +133,7 @@ class ChannelRouter:
             )
         else:
             session_id = await self.engine.sessions.get_active_session(
-                msg.channel_key, source=msg.channel_name,
+                msg.channel_key, source=msg.channel_name, actor=actor,
             )
 
         # Store message context for reaction support
@@ -144,11 +166,11 @@ class ChannelRouter:
                 try:
                     if len(pending) == 1:
                         response = await self._run_single(
-                            channel, pending[0][0], session_id,
+                            channel, pending[0][0], session_id, actor,
                         )
                     else:
                         response = await self._run_batch(
-                            channel, pending, session_id,
+                            channel, pending, session_id, actor,
                         )
                 except asyncio.CancelledError:
                     for _, fut in pending:
@@ -176,6 +198,7 @@ class ChannelRouter:
         channel: BaseChannel,
         msg: InboundMessage,
         session_id: str,
+        actor: Actor | None,
     ) -> str:
         """Run the engine for a single message with streaming."""
         if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
@@ -198,6 +221,7 @@ class ChannelRouter:
                 source=msg.channel_name,
                 channel=msg.channel_name,
                 images=images,
+                actor=actor,
             )
         )
         self.engine.register_task(session_id, task)
@@ -217,6 +241,7 @@ class ChannelRouter:
         channel: BaseChannel,
         pending: list[tuple[InboundMessage, asyncio.Future[str]]],
         session_id: str,
+        actor: Actor | None,
     ) -> str:
         """Combine pending messages into one turn and run."""
         last_msg = pending[-1][0]
@@ -259,6 +284,7 @@ class ChannelRouter:
                 source=last_msg.channel_name,
                 channel=last_msg.channel_name,
                 images=all_images or None,
+                actor=actor,
             )
         )
         self.engine.register_task(session_id, task)
@@ -393,9 +419,15 @@ class ChannelRouter:
     async def get_active_session(
         self, channel_key: str, source: str,
     ) -> str:
-        """Get or create the active session for a channel."""
+        """Get or create the active session for a channel.
+
+        A session created here belongs to the channel, so it is attributed to
+        the channel's principal (:meth:`_channel_actor`). An ingress that knows
+        which *person* is asking — the WebSocket endpoint — calls
+        ``engine.sessions.get_active_session`` itself with that actor instead.
+        """
         return await self.engine.sessions.get_active_session(
-            channel_key, source=source,
+            channel_key, source=source, actor=await self._channel_actor(source),
         )
 
     async def get_last_session(self, channel_key: str) -> str | None:
@@ -420,6 +452,7 @@ class ChannelRouter:
         session_id = str(uuid.uuid4())[:8]
         await self.engine.sessions.get_or_create(
             session_id, title=title, source=source,
+            actor=await self._channel_actor(source),
         )
         await self.engine.sessions.set_active_session(
             channel_key, session_id,

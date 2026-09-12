@@ -607,7 +607,7 @@ async def _engine_with_scripted_clients(db, tmp_path, session_id, scripts):
     })
     engine = AgentEngine(cfg, db)
     await engine.sessions.get_or_create(
-        session_id, title="t", source="web", backend="claude",
+        session_id, title="t", source="web", backend="claude", actor=None,
     )
     made: list[_ScriptedClient] = []
 
@@ -633,7 +633,7 @@ async def test_engine_retries_fresh_client_when_eof_precedes_content(db, tmp_pat
         db, tmp_path, "eof-no-content",
         [[("raise",)], [("text", "recovered"), ("result", "sdk-ok")]],
     )
-    out = await engine.run("eof-no-content", "hello", source="web", channel="web")
+    out = await engine.run("eof-no-content", "hello", source="web", channel="web", actor=None)
     assert out == "recovered"
     # Exactly one retry: the dead client was disconnected, the fresh one kept.
     assert [c.label for c in made] == ["c0", "c1"]
@@ -654,7 +654,7 @@ async def test_engine_fails_turn_when_eof_follows_content(db, tmp_path):
         db, tmp_path, "eof-after-content",
         [[("text", "half an answer"), ("raise",)]],
     )
-    out = await engine.run("eof-after-content", "hello", source="web", channel="web")
+    out = await engine.run("eof-after-content", "hello", source="web", channel="web", actor=None)
     # No retry: the return value carries the error, not the partial text.
     assert [c.label for c in made] == ["c0"]
     assert out.startswith("Agent error:")
@@ -686,7 +686,7 @@ async def test_workflow_session_never_forks_from_parent(db, tmp_path):
     )
     # Parent with a resumable native session — the fork target.
     await engine.sessions.get_or_create(
-        "parent", title="t", source="web", backend="claude",
+        "parent", title="t", source="web", backend="claude", actor=None,
     )
     await db.update_session_fields("parent", {"sdk_session_id": "sdk-parent"})
 
@@ -701,18 +701,18 @@ async def test_workflow_session_never_forks_from_parent(db, tmp_path):
 
     # Workflow leg nested under the parent, still in 'created' state.
     await engine.sessions.get_or_create(
-        "workflow:wfr-x", title="t", source="workflow", backend="claude",
+        "workflow:wfr-x", title="t", source="workflow", backend="claude", actor=None,
     )
     await db.update_session_fields("workflow:wfr-x", {"parent_session_id": "parent"})
-    await engine.run("workflow:wfr-x", "go", source="workflow", channel="web")
+    await engine.run("workflow:wfr-x", "go", source="workflow", channel="web", actor=None)
     assert forks["workflow:wfr-x"] is None
 
     # Control: a non-workflow child with the same setup DOES fork.
     await engine.sessions.get_or_create(
-        "web-child", title="t", source="web", backend="claude",
+        "web-child", title="t", source="web", backend="claude", actor=None,
     )
     await db.update_session_fields("web-child", {"parent_session_id": "parent"})
-    await engine.run("web-child", "go", source="web", channel="web")
+    await engine.run("web-child", "go", source="web", channel="web", actor=None)
     assert forks["web-child"] == "sdk-parent"
 
 

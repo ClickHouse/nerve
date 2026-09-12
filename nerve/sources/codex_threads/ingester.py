@@ -16,6 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from nerve.agent.streaming import broadcaster as default_broadcaster
+from nerve.identity import system_actor_or_none
 from nerve.sources.codex_threads.base import (
     SessionMeta,
     ThreadEvent,
@@ -196,6 +197,11 @@ class CodexIngester:
             status="active",
             backend="codex",
             cwd=meta.cwd,
+            # The sync created this row, not a person — the Codex thread it
+            # mirrors was started outside Nerve entirely.
+            actor=await system_actor_or_none(
+                self.db, context=f"Codex thread ingest ({self.origin_id})",
+            ),
         )
         await self.db.bind_native_thread("codex", meta.thread_id, session_id)
         logger.info(
@@ -315,12 +321,25 @@ class CodexIngester:
             )
 
         created_at = msg.created_at.isoformat() if msg.created_at else None
+        # A synced Codex turn was typed into another program, by somebody this
+        # instance has no way to identify — Nerve sees a rollout file, not a
+        # login. The honest answer is that the instance ingested it, so the
+        # user rows carry the system principal; the assistant and tool rows
+        # keep their own authorship and stay unattributed, exactly like a
+        # native turn's.
+        actor = (
+            await system_actor_or_none(
+                self.db, context=f"Codex thread ingest ({self.origin_id})",
+            )
+            if msg.role == "user" else None
+        )
         try:
             inserted = await self.db.add_message_idempotent(
                 session_id=session_id,
                 role=msg.role,
                 content=msg.content,
                 external_id=msg.external_id,
+                actor=actor,
                 channel=msg.channel,
                 thinking=msg.thinking,
                 blocks=msg.blocks,

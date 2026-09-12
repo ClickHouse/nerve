@@ -157,7 +157,7 @@ class TestSchema:
         assert "redelivery_count" in cols
 
         # Old-style insert (no new columns touched) → sane defaults.
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1",
             type="question", title="t",
@@ -182,7 +182,7 @@ class TestSnooze:
         snooze_until = _iso(24)
         _handlers.register("lifecycle-test", _snooze_dispatcher(snooze_until))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db, expiry_hours=2)
 
         ok = await svc.handle_answer(nid, "snooze_24h", "web")
@@ -206,7 +206,7 @@ class TestSnooze:
         assert answered[0]["snooze_until"] == snooze_until
 
     async def test_db_snooze_rejects_non_pending(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1", type="approval", title="t",
         )
@@ -226,7 +226,7 @@ class TestRedelivery:
     ):
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(-0.5)))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
         await svc.handle_answer(nid, "snooze_24h", "web")
         patch_broadcaster.clear()
@@ -259,7 +259,7 @@ class TestRedelivery:
     ):
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(24)))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
         await svc.handle_answer(nid, "snooze_24h", "web")
 
@@ -274,7 +274,7 @@ class TestRedelivery:
         """Snooze is repeatable: each click buys another cycle."""
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(-1)))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
 
         await svc.handle_answer(nid, "snooze_24h", "web")
@@ -298,7 +298,7 @@ class TestRedelivery:
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(-1)))
         fake_config.notifications.max_redeliveries = 2
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
 
         for cycle in range(2):
@@ -343,7 +343,7 @@ class TestRedelivery:
         """Ordering guarantee: redeliver-before-expire means a row whose
         redeliver_at AND expires_at both passed gets its last chance."""
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1", type="approval",
             title="both due", options=["approve", "decline", "snooze_24h"],
@@ -383,7 +383,7 @@ class TestExpiryReporting:
     async def test_expired_question_injected_into_origin_session(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc)
         # The origin session is mid-turn: injection must STILL be
@@ -414,7 +414,7 @@ class TestExpiryReporting:
     async def test_multiple_questions_same_session_single_injection(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         await self._expired_question(db, svc, title="first question")
         await self._expired_question(db, svc, title="second question")
@@ -430,7 +430,7 @@ class TestExpiryReporting:
     async def test_external_session_broadcast_only(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("sat-1", source="external")
+        await db.create_session("sat-1", source="external", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc, session_id="sat-1")
 
@@ -447,7 +447,7 @@ class TestExpiryReporting:
     async def test_archived_and_missing_sessions_broadcast_only(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1", status="archived")
+        await db.create_session("s1", status="archived", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         await self._expired_question(db, svc, session_id="s1")
         # A question whose session row vanished entirely.
@@ -470,7 +470,7 @@ class TestExpiryReporting:
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
         audit_workspace: Path,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await _make_approval(svc, db)
         await db.update_notification(nid, expires_at=_iso(-1))
@@ -493,7 +493,7 @@ class TestExpiryReporting:
     async def test_notify_kind_expiry_stays_silent(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         await db.create_notification(
             notification_id="fyi-1", session_id="s1",
@@ -522,7 +522,7 @@ class TestExpiryReporting:
         channel._app.bot = bot
         fake_engine.router.get_channel.return_value = channel
 
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc, title="tg question")
         await db.update_notification(
@@ -548,7 +548,7 @@ class TestExpiryReporting:
         channel._app.bot = bot
         fake_engine.router.get_channel.return_value = channel
 
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc)
         await db.update_notification(

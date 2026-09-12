@@ -116,7 +116,7 @@ class TestResetCostBaseline:
     async def test_baseline_zeroed(self, db: Database):
         from nerve.agent.engine import AgentEngine
 
-        await db.create_session("sess-base", source="web")
+        await db.create_session("sess-base", source="web", actor=None)
         await db.update_session_metadata(
             "sess-base", {"_sdk_cumulative_cost": 4.2, "other_key": "kept"},
         )
@@ -132,7 +132,7 @@ class TestResetCostBaseline:
     async def test_noop_when_baseline_absent(self, db: Database):
         from nerve.agent.engine import AgentEngine
 
-        await db.create_session("sess-nobase", source="web")
+        await db.create_session("sess-nobase", source="web", actor=None)
         await db.update_session_metadata("sess-nobase", {"other_key": "kept"})
 
         await AgentEngine._reset_cost_baseline(await self._shim(db), "sess-nobase")
@@ -189,7 +189,7 @@ class TestBackfillMigration:
     async def _seed(self, db: Database) -> None:
         # Session A: two swallowed turns (one with the 5m/1h split, one
         # aggregate-only + web searches) plus one correctly-priced turn.
-        await db.create_session("sess-a", source="cron")
+        await db.create_session("sess-a", source="cron", actor=None)
         await db.record_turn_usage(
             session_id="sess-a",
             input_tokens=_ROW_SPLIT["input_tokens"],
@@ -225,7 +225,7 @@ class TestBackfillMigration:
         await db.update_session_fields("sess-a", {"total_cost_usd": 1.0})
 
         # Session B: a zero-cost row with zero tokens — NOT a target.
-        await db.create_session("sess-b", source="web")
+        await db.create_session("sess-b", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-b",
             input_tokens=0, output_tokens=0,
@@ -236,7 +236,7 @@ class TestBackfillMigration:
         await db.update_session_fields("sess-b", {"total_cost_usd": 0})
 
         # Session C: swallowed turn with unknown model → default pricing.
-        await db.create_session("sess-c", source="telegram")
+        await db.create_session("sess-c", source="telegram", actor=None)
         await db.record_turn_usage(
             session_id="sess-c",
             input_tokens=1_000_000, output_tokens=0,
@@ -250,7 +250,7 @@ class TestBackfillMigration:
         # Session D: total accumulated from usage rows that telemetry
         # pruning has since deleted.  The migration must NOT re-sum this
         # to zero — pruned history is legitimate spend.
-        await db.create_session("sess-d", source="web")
+        await db.create_session("sess-d", source="web", actor=None)
         await db.update_session_fields("sess-d", {"total_cost_usd": 10.0})
 
     async def test_backfill_recomputes_from_tokens(self, db: Database):

@@ -67,26 +67,26 @@ class TestSessionCRUD:
     """Test session create/read/update/delete operations."""
 
     async def test_create_session(self, db: Database):
-        session = await db.create_session("test-1", title="Test", source="web")
+        session = await db.create_session("test-1", title="Test", source="web", actor=None)
         assert session["id"] == "test-1"
         assert session["title"] == "Test"
         assert session["status"] == "created"
 
     async def test_create_session_defaults(self, db: Database):
-        session = await db.create_session("test-defaults")
+        session = await db.create_session("test-defaults", actor=None)
         assert session["title"] == "test-defaults"  # title defaults to ID
         assert session["status"] == "created"
 
     async def test_create_session_with_parent(self, db: Database):
-        await db.create_session("parent-1")
+        await db.create_session("parent-1", actor=None)
         session = await db.create_session(
             "fork-1", parent_session_id="parent-1",
-            forked_from_message="msg-xyz",
+            forked_from_message="msg-xyz", actor=None,
         )
         assert session["parent_session_id"] == "parent-1"
 
     async def test_get_session(self, db: Database):
-        await db.create_session("get-test", title="Get Test")
+        await db.create_session("get-test", title="Get Test", actor=None)
         session = await db.get_session("get-test")
         assert session is not None
         assert session["title"] == "Get Test"
@@ -98,22 +98,22 @@ class TestSessionCRUD:
 
     async def test_create_session_idempotent(self, db: Database):
         """INSERT OR IGNORE should not overwrite existing session."""
-        await db.create_session("idem-1", title="First")
-        await db.create_session("idem-1", title="Second")
+        await db.create_session("idem-1", title="First", actor=None)
+        await db.create_session("idem-1", title="Second", actor=None)
         session = await db.get_session("idem-1")
         assert session["title"] == "First"
 
     async def test_delete_session(self, db: Database):
-        await db.create_session("del-1")
-        await db.add_message("del-1", "user", "hello")
+        await db.create_session("del-1", actor=None)
+        await db.add_message("del-1", "user", "hello", actor=None)
         await db.log_session_event("del-1", "created", {})
         await db.delete_session("del-1")
         assert await db.get_session("del-1") is None
 
     async def test_delete_session_cleans_up_related(self, db: Database):
         """Delete should remove messages, events, and channel mappings."""
-        await db.create_session("del-related")
-        await db.add_message("del-related", "user", "test")
+        await db.create_session("del-related", actor=None)
+        await db.add_message("del-related", "user", "test", actor=None)
         await db.log_session_event("del-related", "created", {})
         await db.set_channel_session("tg:123", "del-related")
 
@@ -132,13 +132,13 @@ class TestUpdateSessionFields:
     """Test the partial field update method."""
 
     async def test_update_single_field(self, db: Database):
-        await db.create_session("upd-1")
+        await db.create_session("upd-1", actor=None)
         await db.update_session_fields("upd-1", {"status": "active"})
         session = await db.get_session("upd-1")
         assert session["status"] == "active"
 
     async def test_update_multiple_fields(self, db: Database):
-        await db.create_session("upd-2")
+        await db.create_session("upd-2", actor=None)
         await db.update_session_fields("upd-2", {
             "status": "active",
             "sdk_session_id": "sdk-abc",
@@ -150,7 +150,7 @@ class TestUpdateSessionFields:
         assert session["connected_at"] == "2024-01-01T00:00:00"
 
     async def test_update_ignores_unknown_fields(self, db: Database):
-        await db.create_session("upd-3")
+        await db.create_session("upd-3", actor=None)
         # Should not raise, just ignore unknown fields
         await db.update_session_fields("upd-3", {
             "status": "active",
@@ -161,7 +161,7 @@ class TestUpdateSessionFields:
 
     async def test_update_sets_none(self, db: Database):
         """Setting a field to None should clear it."""
-        await db.create_session("upd-4")
+        await db.create_session("upd-4", actor=None)
         await db.update_session_fields("upd-4", {"sdk_session_id": "abc"})
         await db.update_session_fields("upd-4", {"sdk_session_id": None})
         session = await db.get_session("upd-4")
@@ -171,14 +171,14 @@ class TestUpdateSessionFields:
         """updated_at means "last message activity": metadata writes (status
         flips, star/rename, watermarks) must not reorder the session list.
         Only message inserts (and the explicit touch_session) bump it."""
-        await db.create_session("upd-5")
+        await db.create_session("upd-5", actor=None)
         before = (await db.get_session("upd-5"))["updated_at"]
         import asyncio
         await asyncio.sleep(0.01)
         await db.update_session_fields("upd-5", {"status": "active", "starred": 1})
         assert (await db.get_session("upd-5"))["updated_at"] == before
         # A real message DOES bump it.
-        await db.add_message("upd-5", "user", "hello")
+        await db.add_message("upd-5", "user", "hello", actor=None)
         assert (await db.get_session("upd-5"))["updated_at"] > before
 
 
@@ -187,16 +187,16 @@ class TestListSessions:
     """Test listing with archived filter."""
 
     async def test_list_excludes_archived(self, db: Database):
-        await db.create_session("list-active", status="active")
-        await db.create_session("list-archived", status="archived")
+        await db.create_session("list-active", status="active", actor=None)
+        await db.create_session("list-archived", status="archived", actor=None)
         sessions = await db.list_sessions(include_archived=False)
         ids = [s["id"] for s in sessions]
         assert "list-active" in ids
         assert "list-archived" not in ids
 
     async def test_list_includes_archived(self, db: Database):
-        await db.create_session("list-a2", status="active")
-        await db.create_session("list-arch2", status="archived")
+        await db.create_session("list-a2", status="active", actor=None)
+        await db.create_session("list-arch2", status="archived", actor=None)
         sessions = await db.list_sessions(include_archived=True)
         ids = [s["id"] for s in sessions]
         assert "list-a2" in ids
@@ -207,11 +207,11 @@ class TestListSessions:
         cutoff; the limit only applies to non-starred sessions."""
         import asyncio
 
-        await db.create_session("lim-starred")
+        await db.create_session("lim-starred", actor=None)
         await db.update_session_fields("lim-starred", {"starred": 1})
         for i in range(3):
             await asyncio.sleep(0.01)
-            await db.create_session(f"lim-{i}")
+            await db.create_session(f"lim-{i}", actor=None)
 
         sessions = await db.list_sessions(limit=2)
         ids = [s["id"] for s in sessions]
@@ -228,11 +228,11 @@ class TestListSessions:
     async def test_starred_bypasses_limit_include_archived(self, db: Database):
         import asyncio
 
-        await db.create_session("slim-starred", status="archived")
+        await db.create_session("slim-starred", status="archived", actor=None)
         await db.update_session_fields("slim-starred", {"starred": 1})
         for i in range(2):
             await asyncio.sleep(0.01)
-            await db.create_session(f"slim-{i}")
+            await db.create_session(f"slim-{i}", actor=None)
 
         sessions = await db.list_sessions(limit=1, include_archived=True)
         ids = [s["id"] for s in sessions]
@@ -243,7 +243,7 @@ class TestListSessions:
     async def test_starred_archived_stays_hidden(self, db: Database):
         """The starred bypass does not leak archived sessions into the
         default (non-archived) listing."""
-        await db.create_session("arch-star", status="archived")
+        await db.create_session("arch-star", status="archived", actor=None)
         await db.update_session_fields("arch-star", {"starred": 1})
         sessions = await db.list_sessions(include_archived=False)
         assert "arch-star" not in [s["id"] for s in sessions]
@@ -254,7 +254,7 @@ class TestSessionEvents:
     """Test lifecycle event logging."""
 
     async def test_log_and_get_events(self, db: Database):
-        await db.create_session("ev-1")
+        await db.create_session("ev-1", actor=None)
         await db.log_session_event("ev-1", "created", {"source": "web"})
         await db.log_session_event("ev-1", "started", {"sdk": "abc"})
         events = await db.get_session_events("ev-1")
@@ -271,7 +271,7 @@ class TestChannelSessions:
     """Test persistent channel-to-session mapping."""
 
     async def test_set_and_get(self, db: Database):
-        await db.create_session("ch-sess-1")
+        await db.create_session("ch-sess-1", actor=None)
         await db.set_channel_session("telegram:123", "ch-sess-1")
         row = await db.get_channel_session("telegram:123")
         assert row["session_id"] == "ch-sess-1"
@@ -281,8 +281,8 @@ class TestChannelSessions:
         assert row is None
 
     async def test_overwrite(self, db: Database):
-        await db.create_session("ch-a")
-        await db.create_session("ch-b")
+        await db.create_session("ch-a", actor=None)
+        await db.create_session("ch-b", actor=None)
         await db.set_channel_session("tg:1", "ch-a")
         await db.set_channel_session("tg:1", "ch-b")
         row = await db.get_channel_session("tg:1")
@@ -294,16 +294,16 @@ class TestMessages:
     """Test message operations and counter."""
 
     async def test_add_message_increments_count(self, db: Database):
-        await db.create_session("msg-1")
-        await db.add_message("msg-1", "user", "hello")
-        await db.add_message("msg-1", "assistant", "hi")
+        await db.create_session("msg-1", actor=None)
+        await db.add_message("msg-1", "user", "hello", actor=None)
+        await db.add_message("msg-1", "assistant", "hi", actor=None)
         session = await db.get_session("msg-1")
         assert session["message_count"] == 2
 
     async def test_get_messages_ordered(self, db: Database):
-        await db.create_session("msg-2")
-        await db.add_message("msg-2", "user", "first")
-        await db.add_message("msg-2", "assistant", "second")
+        await db.create_session("msg-2", actor=None)
+        await db.add_message("msg-2", "user", "first", actor=None)
+        await db.add_message("msg-2", "assistant", "second", actor=None)
         msgs = await db.get_messages("msg-2")
         assert len(msgs) == 2
         assert msgs[0]["content"] == "first"
@@ -315,7 +315,7 @@ class TestCleanupQueries:
     """Test stale session detection and cleanup queries."""
 
     async def test_get_stale_sessions(self, db: Database):
-        await db.create_session("stale-1", status="idle")
+        await db.create_session("stale-1", status="idle", actor=None)
         await db.update_session_fields("stale-1", {
             "status": "idle",
         })
@@ -330,7 +330,7 @@ class TestCleanupQueries:
         assert "stale-1" in ids
 
     async def test_get_stale_excludes_active(self, db: Database):
-        await db.create_session("active-not-stale", status="active")
+        await db.create_session("active-not-stale", status="active", actor=None)
         await db.db.execute(
             "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = 'active-not-stale'"
         )
@@ -341,7 +341,7 @@ class TestCleanupQueries:
         assert "active-not-stale" not in ids
 
     async def test_get_stale_excludes_by_id(self, db: Database):
-        await db.create_session("stale-excl", status="idle")
+        await db.create_session("stale-excl", status="idle", actor=None)
         await db.db.execute(
             "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = 'stale-excl'"
         )
@@ -354,17 +354,17 @@ class TestCleanupQueries:
         assert "stale-excl" not in ids
 
     async def test_count_active_sessions(self, db: Database):
-        await db.create_session("count-1", status="active")
-        await db.create_session("count-2", status="idle")
-        await db.create_session("count-3", status="archived")
+        await db.create_session("count-1", status="active", actor=None)
+        await db.create_session("count-2", status="idle", actor=None)
+        await db.create_session("count-3", status="archived", actor=None)
         count = await db.count_active_sessions()
         # count-1 and count-2 are not archived
         assert count >= 2
 
     async def test_get_sessions_by_status(self, db: Database):
-        await db.create_session("stat-1", status="active")
-        await db.create_session("stat-2", status="error")
-        await db.create_session("stat-3", status="idle")
+        await db.create_session("stat-1", status="active", actor=None)
+        await db.create_session("stat-2", status="error", actor=None)
+        await db.create_session("stat-3", status="idle", actor=None)
         active = await db.get_sessions_by_status(["active"])
         ids = [s["id"] for s in active]
         assert "stat-1" in ids
@@ -376,15 +376,15 @@ class TestMemorizationQuery:
     """Test get_sessions_needing_memorization."""
 
     async def test_never_memorized_session_returned(self, db: Database):
-        await db.create_session("memo-never", status="active")
-        await db.add_message("memo-never", "user", "hello")
+        await db.create_session("memo-never", status="active", actor=None)
+        await db.add_message("memo-never", "user", "hello", actor=None)
         sessions = await db.get_sessions_needing_memorization()
         ids = [s["id"] for s in sessions]
         assert "memo-never" in ids
 
     async def test_fully_memorized_session_excluded(self, db: Database):
-        await db.create_session("memo-done", status="active")
-        await db.add_message("memo-done", "user", "hello")
+        await db.create_session("memo-done", status="active", actor=None)
+        await db.add_message("memo-done", "user", "hello", actor=None)
         # Set watermark to the future so all messages are "memorized"
         await db.update_session_fields("memo-done", {
             "last_memorized_at": "2099-01-01T00:00:00",
@@ -394,26 +394,26 @@ class TestMemorizationQuery:
         assert "memo-done" not in ids
 
     async def test_partially_memorized_session_returned(self, db: Database):
-        await db.create_session("memo-partial", status="active")
-        await db.add_message("memo-partial", "user", "old message")
+        await db.create_session("memo-partial", status="active", actor=None)
+        await db.add_message("memo-partial", "user", "old message", actor=None)
         # Set watermark to past, then add a newer message
         await db.update_session_fields("memo-partial", {
             "last_memorized_at": "2020-01-01T00:00:00",
         })
-        await db.add_message("memo-partial", "user", "new message")
+        await db.add_message("memo-partial", "user", "new message", actor=None)
         sessions = await db.get_sessions_needing_memorization()
         ids = [s["id"] for s in sessions]
         assert "memo-partial" in ids
 
     async def test_archived_session_excluded(self, db: Database):
-        await db.create_session("memo-archived", status="archived")
-        await db.add_message("memo-archived", "user", "hello")
+        await db.create_session("memo-archived", status="archived", actor=None)
+        await db.add_message("memo-archived", "user", "hello", actor=None)
         sessions = await db.get_sessions_needing_memorization()
         ids = [s["id"] for s in sessions]
         assert "memo-archived" not in ids
 
     async def test_empty_session_excluded(self, db: Database):
-        await db.create_session("memo-empty", status="active")
+        await db.create_session("memo-empty", status="active", actor=None)
         sessions = await db.get_sessions_needing_memorization()
         ids = [s["id"] for s in sessions]
         assert "memo-empty" not in ids
@@ -424,7 +424,7 @@ class TestMetadataBackwardCompat:
     """Test that update_session_metadata still syncs to dedicated columns."""
 
     async def test_metadata_syncs_sdk_session_id(self, db: Database):
-        await db.create_session("meta-sync")
+        await db.create_session("meta-sync", actor=None)
         await db.update_session_metadata("meta-sync", {
             "sdk_session_id": "sdk-xyz",
             "connected_at": "2024-06-01T12:00:00",
@@ -1127,9 +1127,9 @@ class TestDiagnosticsHelpers:
     endpoint. These exist to keep /api/diagnostics off full-table scans."""
 
     async def test_count_sessions(self, db: Database):
-        await db.create_session("d-1", title="One", source="web")
-        await db.create_session("d-2", title="Two", source="web")
-        await db.create_session("d-3", title="Three", source="web")
+        await db.create_session("d-1", title="One", source="web", actor=None)
+        await db.create_session("d-2", title="Two", source="web", actor=None)
+        await db.create_session("d-3", title="Three", source="web", actor=None)
         # Archive d-3 directly via the status field.
         await db.update_session_fields("d-3", {"status": "archived"})
 
@@ -1184,11 +1184,11 @@ class TestToolCallsColumnDropped:
         assert "blocks" in cols  # ensure we didn't accidentally drop the wrong one
 
     async def test_add_message_no_longer_accepts_tool_calls_kwarg(self, db: Database):
-        await db.create_session("s-1", title="T", source="web")
+        await db.create_session("s-1", title="T", source="web", actor=None)
         # Should succeed without tool_calls.
         msg_id = await db.add_message(
             "s-1", "assistant", "ok",
-            blocks=[{"type": "text", "content": "ok"}],
+            blocks=[{"type": "text", "content": "ok"}], actor=None,
         )
         assert msg_id is not None
         # Tool_calls is no longer a valid parameter.
@@ -1197,14 +1197,14 @@ class TestToolCallsColumnDropped:
         assert "tool_calls" not in sig.parameters
 
     async def test_get_messages_returns_blocks_not_tool_calls(self, db: Database):
-        await db.create_session("s-2", title="T", source="web")
+        await db.create_session("s-2", title="T", source="web", actor=None)
         await db.add_message(
             "s-2", "assistant", "hi",
             blocks=[
                 {"type": "thinking", "content": "thinking..."},
                 {"type": "tool_call", "tool": "Bash", "input": {}, "tool_use_id": "x"},
                 {"type": "text", "content": "done"},
-            ],
+            ], actor=None,
         )
         msgs = await db.get_messages("s-2")
         assert len(msgs) == 1
@@ -1566,8 +1566,8 @@ class TestCronLogSessions:
 
     @pytest.mark.asyncio
     async def test_latest_cron_session_per_run(self, db: Database):
-        await db.create_session("cron:job-a:20260101-000000", source="cron")
-        await db.create_session("cron:job-a:20260102-000000", source="cron")
+        await db.create_session("cron:job-a:20260101-000000", source="cron", actor=None)
+        await db.create_session("cron:job-a:20260102-000000", source="cron", actor=None)
         await db.db.execute(
             "UPDATE sessions SET last_activity_at = ? WHERE id = ?",
             ("2026-01-01T00:00:10+00:00", "cron:job-a:20260101-000000"),
@@ -1583,14 +1583,14 @@ class TestCronLogSessions:
 
     @pytest.mark.asyncio
     async def test_latest_cron_session_persistent(self, db: Database):
-        await db.create_session("cron:job-b", source="cron")
+        await db.create_session("cron:job-b", source="cron", actor=None)
         latest = await db.get_latest_cron_session_id("job-b")
         assert latest == "cron:job-b"
 
     @pytest.mark.asyncio
     async def test_latest_cron_session_no_prefix_bleed(self, db: Database):
         """job-a must not match job-a-extended's sessions."""
-        await db.create_session("cron:job-a-extended:20260101-000000", source="cron")
+        await db.create_session("cron:job-a-extended:20260101-000000", source="cron", actor=None)
         assert await db.get_latest_cron_session_id("job-a") is None
 
     @pytest.mark.asyncio
@@ -1600,9 +1600,9 @@ class TestCronLogSessions:
     @pytest.mark.asyncio
     async def test_latest_cron_session_underscore_not_wildcard(self, db: Database):
         """LIKE special chars in job ids must be escaped."""
-        await db.create_session("cron:jobXa:20260101-000000", source="cron")
+        await db.create_session("cron:jobXa:20260101-000000", source="cron", actor=None)
         assert await db.get_latest_cron_session_id("job_a") is None
-        await db.create_session("cron:job_a:20260102-000000", source="cron")
+        await db.create_session("cron:job_a:20260102-000000", source="cron", actor=None)
         assert (
             await db.get_latest_cron_session_id("job_a")
             == "cron:job_a:20260102-000000"
@@ -1637,7 +1637,7 @@ class TestCronLogSessionBackfill:
         from nerve.db.migrations import v034_backfill_cron_log_sessions as v034
 
         # Per-run session + a matching log row one second later.
-        await db.create_session("cron:iso-job:20260110-120000", source="cron")
+        await db.create_session("cron:iso-job:20260110-120000", source="cron", actor=None)
         iso_log = await db.log_cron_start("iso-job")
         await db.db.execute(
             "UPDATE cron_logs SET started_at = '2026-01-10 12:00:01' WHERE id = ?",
@@ -1649,11 +1649,11 @@ class TestCronLogSessionBackfill:
         await db.db.commit()
 
         # Persistent session + a log row with no per-run candidate.
-        await db.create_session("cron:pers-job", source="cron")
+        await db.create_session("cron:pers-job", source="cron", actor=None)
         pers_log = await db.log_cron_start("pers-job")
 
         # Log too far from the only run session (outside tolerance).
-        await db.create_session("cron:far-job:20260101-000000", source="cron")
+        await db.create_session("cron:far-job:20260101-000000", source="cron", actor=None)
         far_log = await db.log_cron_start("far-job")
         await db.db.execute(
             "UPDATE cron_logs SET started_at = '2026-01-05 00:00:00' WHERE id = ?",
@@ -1681,7 +1681,7 @@ class TestCronLogSessionBackfill:
     async def test_backfill_does_not_touch_existing_links(self, db: Database):
         from nerve.db.migrations import v034_backfill_cron_log_sessions as v034
 
-        await db.create_session("cron:job-x:20260110-120000", source="cron")
+        await db.create_session("cron:job-x:20260110-120000", source="cron", actor=None)
         log_id = await db.log_cron_start("job-x")
         await db.log_cron_finish(
             log_id, "success", output="ok", session_id="cron:job-x:custom",
@@ -1697,8 +1697,8 @@ class TestCronLogSessionBackfill:
     async def test_backfill_picks_closest_run(self, db: Database):
         from nerve.db.migrations import v034_backfill_cron_log_sessions as v034
 
-        await db.create_session("cron:multi:20260110-120000", source="cron")
-        await db.create_session("cron:multi:20260110-120130", source="cron")
+        await db.create_session("cron:multi:20260110-120000", source="cron", actor=None)
+        await db.create_session("cron:multi:20260110-120130", source="cron", actor=None)
         log_id = await db.log_cron_start("multi")
         await db.db.execute(
             "UPDATE cron_logs SET started_at = '2026-01-10 12:01:25' WHERE id = ?",
