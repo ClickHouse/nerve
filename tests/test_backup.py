@@ -680,6 +680,88 @@ class TestScrubIsVerified:
         assert _stored_secret(db_file) == "backed-up-secret-32-bytes-padded!!"
 
 
+class TestStagingIsOutOfReach:
+    """F27: the staged snapshot of ``nerve.db`` is every account and the
+    signing secret, in the clear — ``--no-secrets`` scrubs it only *after* the
+    snapshot exists. It used to be staged under the caller's output directory,
+    where another user could rename the ``0700`` staging directory away and
+    leave a readable one in its place. Staging now happens somewhere the
+    caller does not choose, and the directory's identity is re-checked before
+    anything secret is written into it and again before any of it is read back
+    to be archived."""
+
+    def test_staging_does_not_happen_in_the_output_directory(
+        self, nerve_dir, workspace, config_dir, tmp_path,
+    ):
+        out = tmp_path / "out"
+        out.mkdir()
+        seen: list[list[str]] = []
+        real_snapshot = backup_mod._snapshot_db
+
+        def watch(src, dst):
+            seen.append([p.name for p in out.iterdir()])
+            return real_snapshot(src, dst)
+
+        backup_mod._snapshot_db = watch
+        try:
+            result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+        finally:
+            backup_mod._snapshot_db = real_snapshot
+        # While the database was being copied, the output directory held at
+        # most the bundle temporary — never the staged secrets.
+        assert seen and all(
+            all(name.endswith(".tmp") for name in names) for names in seen
+        ), seen
+        assert result.path.exists()
+
+    def test_the_staging_parent_is_never_the_output_directory(self, tmp_path):
+        """Directly: the chosen parent is the state dir when it is owner-only,
+        and the system temp dir otherwise — never the caller's target."""
+        nd = tmp_path / "state"
+        nd.mkdir(mode=0o700)
+        assert backup_mod._stage_parent(nd) == nd
+
+        os.chmod(nd, 0o777)  # a state dir anyone can write in is not usable
+        try:
+            assert backup_mod._stage_parent(nd) is None  # the system temp dir
+        finally:
+            os.chmod(nd, 0o700)
+        assert backup_mod._stage_parent(tmp_path / "missing") is None
+
+    @pytest.mark.parametrize("include_secrets", [True, False], ids=["secrets", "no-secrets"])
+    def test_a_swapped_staging_directory_is_refused(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, include_secrets,
+    ):
+        """The reproduction: replace the staging directory after it is created.
+        Both bundle kinds must refuse — ``--no-secrets`` included, since the
+        snapshot carries the key until the scrub runs on it."""
+        attacker = tmp_path / "attacker-stage"
+        swapped: list[Path] = []
+        real_writable = backup_mod._is_group_world_writable
+
+        def swap_then_check(path):
+            """Runs between the staging directory being opened and its first
+            use — the attacker's window."""
+            if not swapped:
+                for stage in nerve_dir.glob(".nerve-backup-stage-*"):
+                    stage.rename(attacker)
+                    stage.mkdir(mode=0o777)  # a readable one in its place
+                    swapped.append(stage)
+            return real_writable(path)
+
+        monkeypatch.setattr(backup_mod, "_is_group_world_writable", swap_then_check)
+        out = tmp_path / "out"
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, out,
+                config_dir=config_dir, include_secrets=include_secrets,
+            )
+
+        assert swapped, "the test did not manage to swap the staging directory"
+        assert not (swapped[0] / "state").exists()  # no database was copied into it
+        assert not out.exists() or list(out.iterdir()) == []  # nothing published
+
+
 class TestTheBundleItselfIsOwnerOnly:
     """The bundle carries nerve.db (accounts, history, and unless
     ``--no-secrets`` scrubbed it, the signing secret) and config.local.yaml
@@ -694,17 +776,37 @@ class TestTheBundleItselfIsOwnerOnly:
         assert (os.stat(result.path).st_mode & 0o777) == 0o600
         assert not (tmp_path / "out" / (result.path.name + ".tmp")).exists()
 
+    @staticmethod
+    def _output_filesystem_ignores_modes(monkeypatch, out: Path) -> None:
+        """Only the *output* directory's filesystem loses the mode.
+
+        That is the realistic split — a normal state directory, a bundle
+        written to an exotic mount — and it is the only way to reach the
+        bundle's own check, since the staging directory and the snapshot are
+        verified before it (F27)."""
+        real_create = backup_mod._secure_create
+
+        def fake(path, what, **kwargs):
+            if path.parent == out:
+                raise BackupError(
+                    f"{what}: could not create {path} owner-only (the filesystem "
+                    f"ignored mode 0600); nothing was written."
+                )
+            return real_create(path, what, **kwargs)
+
+        monkeypatch.setattr(backup_mod, "_secure_create", fake)
+
     def test_a_bundle_that_cannot_be_created_owner_only_is_refused(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """The mode-less filesystem case, caught while the file is still empty:
-        no bundle, rather than one that leaks the key to every local user."""
-        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
+        """Caught while the file is still empty: no bundle, rather than one
+        that leaks the key to every local user."""
+        out = tmp_path / "out"
+        out.mkdir()
+        self._output_filesystem_ignores_modes(monkeypatch, out)
         with pytest.raises(BackupError, match="nothing was written"):
-            backup_mod.create_backup(
-                nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
-            )
-        assert list((tmp_path / "out").iterdir()) == []
+            backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+        assert list(out.iterdir()) == []
 
     def test_a_no_secrets_bundle_is_still_written_with_a_warning(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, caplog,
@@ -714,14 +816,28 @@ class TestTheBundleItselfIsOwnerOnly:
         is loud but not fatal: refusing to back up at all would be worse."""
         import logging
 
-        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
+        out = tmp_path / "out"
+        out.mkdir()
+        self._output_filesystem_ignores_modes(monkeypatch, out)
         with caplog.at_level(logging.WARNING, logger="nerve.backup"):
             result = backup_mod.create_backup(
-                nerve_dir, workspace, tmp_path / "out",
-                config_dir=config_dir, include_secrets=False,
+                nerve_dir, workspace, out, config_dir=config_dir, include_secrets=False,
             )
         assert result.path.exists()
         assert any("readable by other users" in r.getMessage() for r in caplog.records)
+
+    def test_a_state_filesystem_that_ignores_modes_refuses_before_the_snapshot(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """And when it is the *staging* filesystem that loses the mode, the
+        refusal comes before the database is copied anywhere at all."""
+        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
+        with pytest.raises(BackupError, match="owner-only"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+            )
+        assert list((tmp_path / "out").iterdir()) == []
+        assert not list(nerve_dir.glob(".nerve-backup-stage-*"))  # cleaned up
 
     def test_the_bundle_is_written_through_the_descriptor_it_verified(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
@@ -741,11 +857,14 @@ class TestTheBundleItselfIsOwnerOnly:
         def swap_right_after_creating_it(path, what, **kwargs):
             """The attacker's window: the instant after the temporary is
             created and verified. Code that then reopened the *name* would
-            write the bundle straight into their file."""
+            write the bundle straight into their file. Only the bundle
+            temporary is swapped — the staged snapshot is a different file in
+            a directory this attacker cannot reach (F27)."""
             fd = real_create(path, what, **kwargs)
-            path.unlink()
-            path.symlink_to(target)
-            swapped.append(path)
+            if path.parent == out:
+                path.unlink()
+                path.symlink_to(target)
+                swapped.append(path)
             return fd
 
         monkeypatch.setattr(backup_mod, "_secure_create", swap_right_after_creating_it)

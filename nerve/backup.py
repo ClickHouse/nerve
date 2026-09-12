@@ -98,6 +98,10 @@ SECRET_MEMBERS: frozenset[str] = frozenset({
 SECRET_FILE_MODE = 0o600
 # Owner-only state directory on restore, mirroring nerve.db.base._STATE_DIR_MODE.
 _STATE_DIR_MODE = 0o700
+# Group/world write bits. A directory carrying either is one another user can
+# rename or replace entries in, which is what rules it out as a place to stage
+# secrets (see _stage_parent) — the same integrity rule nerve.db.base applies.
+_GROUP_WORLD_WRITE = 0o022
 # ``nerve.db`` is installed specially (see :func:`_secure_install_db`), so it is
 # not in this generic re-chmod list; the entry is kept only for the test that
 # documents the intent.
@@ -454,6 +458,59 @@ def _secure_create(path: Path, what: str, *, detail: str = "nothing was copied")
     return fd
 
 
+def _is_group_world_writable(path: Path) -> bool:
+    """True when ``path`` exists and other users may write in it."""
+    try:
+        return bool(stat.S_IMODE(os.stat(path).st_mode) & _GROUP_WORLD_WRITE)
+    except OSError:
+        return False
+
+
+def _stage_parent(nerve_dir: Path) -> Path | None:
+    """Where the staging directory goes — somewhere no other user can rename it.
+
+    Not the output directory. The caller chooses that, it is routinely a shared
+    or mounted backup target, and staging there means the snapshot of
+    ``nerve.db`` — accounts, history, and the signing secret, which
+    ``--no-secrets`` only scrubs *after* the snapshot exists — is written
+    through a path another user can replace with a directory of their own.
+
+    First choice is the state directory: it already holds those files, it is on
+    their filesystem (so a staging copy that does not fit fails where the data
+    lives rather than halfway through), and it is owner-only. Failing that, the
+    system temp directory, whose sticky bit means only the owner may rename or
+    remove what is in it. ``None`` means "tempfile's own default", which is
+    that directory.
+    """
+    try:
+        st = os.stat(nerve_dir)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not (
+            stat.S_IMODE(st.st_mode) & _GROUP_WORLD_WRITE
+        ):
+            return nerve_dir
+        logger.info(
+            "Backup: staging in the system temp directory — %s is %04o and "
+            "another user could interfere with a staging directory there.",
+            nerve_dir, stat.S_IMODE(st.st_mode),
+        )
+    except OSError as e:
+        logger.info("Backup: staging in the system temp directory (%s: %s)", nerve_dir, e)
+
+    temp_dir = Path(tempfile.gettempdir())
+    try:
+        st = os.stat(temp_dir)
+    except OSError as e:
+        raise BackupError(f"Backup: cannot inspect the temp directory {temp_dir}: {e}") from e
+    if (stat.S_IMODE(st.st_mode) & _GROUP_WORLD_WRITE) and not (st.st_mode & stat.S_ISVTX):
+        raise BackupError(
+            f"Backup: nowhere safe to stage the snapshot. {nerve_dir} is not usable "
+            f"and {temp_dir} is {stat.S_IMODE(st.st_mode):04o} without the sticky "
+            f"bit, so another user could replace a staging directory there while "
+            f"the database — signing secret included — is being copied into it."
+        )
+    return None
+
+
 def _verify_still_the_created_file(fd: int, path: Path, what: str) -> None:
     """Prove ``path`` still names the file open on ``fd``, and is still private.
 
@@ -796,28 +853,56 @@ def create_backup(
     final_path = _unique_bundle_path(output_dir, host, stamp, ext)
     final_name = final_path.name
 
-    stage = Path(tempfile.mkdtemp(prefix=".nerve-backup-stage-", dir=output_dir))
+    # Staging goes somewhere the caller does not control (see _stage_parent):
+    # the snapshot of nerve.db is the signing secret and every account, and it
+    # exists in the clear there before --no-secrets scrubs anything. The
+    # directory is kept open so its identity can be re-checked before the
+    # secrets are written into it and again before they are archived.
+    stage = Path(tempfile.mkdtemp(
+        prefix=".nerve-backup-stage-", dir=_stage_parent(nerve_dir),
+    ))
+    stage_fd = os.open(stage, os.O_RDONLY)
+    if not _mode_is_private(os.fstat(stage_fd).st_mode):  # mkdtemp promises 0700
+        os.close(stage_fd)
+        shutil.rmtree(stage, ignore_errors=True)
+        raise BackupError(
+            f"Backup: the staging directory {stage} is not owner-only; refusing to "
+            f"copy the database into it."
+        )
+    if _is_group_world_writable(output_dir):
+        logger.warning(
+            "Backup: %s is writable by other users. The bundle itself is created "
+            "owner-only and published through a verified descriptor, but a "
+            "directory anyone can write to is a poor home for backups.", output_dir,
+        )
     workspace_bytes = 0
     try:
         state_dir = stage / "state"
-        state_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
+        _verify_still_the_created_file(stage_fd, stage, "Backup")
 
-        # 1. Consistent DB snapshots. The online-backup API creates the copy
-        # at the umask default (0644); tighten it to 0600 so the *archived
-        # member* is 0600 and extraction on restore yields an owner-only file
-        # with no readable window — the snapshot carries the signing secret and
-        # the accounts.
+        # 1. Consistent DB snapshots. The online-backup API opens the
+        # destination by name and would create it at the umask default (0644),
+        # holding the accounts and — until the scrub below — the signing
+        # secret. So the file is created 0600 first, through a verified
+        # descriptor, and the mode is confirmed after: the *archived member* is
+        # 0600 and extraction on restore yields an owner-only file with no
+        # readable window.
         for db_name in STATE_DB_FILES:
             src = nerve_dir / db_name
             if src.exists():
                 snapshot = state_dir / db_name
+                os.close(_secure_create(snapshot, "Backup"))
                 _snapshot_db(src, snapshot)
                 if db_name == "nerve.db" and not include_secrets:
                     _scrub_instance_secrets(snapshot)
-                try:
-                    os.chmod(snapshot, SECRET_FILE_MODE)
-                except OSError as e:
-                    logger.warning("Could not set %s to %04o: %s", snapshot, SECRET_FILE_MODE, e)
+                if not _mode_is_private(os.stat(snapshot).st_mode):
+                    raise BackupError(
+                        f"Backup: {snapshot} is "
+                        f"{stat.S_IMODE(os.stat(snapshot).st_mode):04o} after the "
+                        f"snapshot; refusing to archive a database other users can "
+                        f"read."
+                    )
             else:
                 logger.warning("state DB missing, skipping: %s", src)
 
@@ -844,7 +929,7 @@ def create_backup(
             local_cfg = Path(config_dir).expanduser() / "config.local.yaml"
             if local_cfg.is_file():
                 cfg_dir = stage / "config"
-                cfg_dir.mkdir(parents=True, exist_ok=True)
+                cfg_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
                 shutil.copy2(local_cfg, cfg_dir / "config.local.yaml")
 
         # 5. Workspace BRAIN.
@@ -866,7 +951,11 @@ def create_backup(
                     workspace_bytes / (1024 ** 3),
                 )
 
-        # 6. Checksums for every staged file (manifest written last).
+        # 6. Checksums for every staged file (manifest written last). Before
+        # reading any of it back — and before it is archived — confirm the
+        # staging directory is still the one that was created: everything above
+        # addressed it by name.
+        _verify_still_the_created_file(stage_fd, stage, "Backup")
         files_meta: dict[str, dict] = {}
         for p in sorted(stage.rglob("*")):
             if not p.is_file():
@@ -965,6 +1054,7 @@ def create_backup(
             workspace_bytes=workspace_bytes,
         )
     finally:
+        os.close(stage_fd)
         shutil.rmtree(stage, ignore_errors=True)
 
 
