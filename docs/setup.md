@@ -183,11 +183,18 @@ telegram:
   bot_token: "123456:ABC..."
 
 auth:
-  password_hash: "$2b$12$..."    # Generate below
+  password_hash: "$2b$12$..."    # Generate below — see the note under this block
   jwt_secret: "..."              # Optional — generated into nerve.db on first start if omitted
   jwt_expiry_hours: 720          # Optional — web-session idle timeout (default 30 days)
 EOF
 ```
+
+`auth.password_hash` here is a **starting** password, not where the password
+lives. The first start copies it onto the local account and removes the key from
+this file; after that, passwords are managed on the accounts screen in the web
+UI and this key does nothing. Leaving it out is fine too — the install is then
+passwordless until you set a password there, which is what a headless install
+lands as. See [Accounts and identity](accounts.md).
 
 `jwt_expiry_hours` is an **idle** timeout, not a cap on a working session: the
 gateway re-mints the token whenever a request arrives past half its lifetime,
