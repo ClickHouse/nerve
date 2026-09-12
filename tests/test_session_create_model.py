@@ -59,7 +59,7 @@ class FakeSessionManager:
             metadata=kwargs.get("metadata"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
 
 

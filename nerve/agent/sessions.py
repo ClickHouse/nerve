@@ -19,6 +19,7 @@ from enum import StrEnum
 from typing import Any
 
 from nerve.db import Database
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -98,13 +99,21 @@ class SessionManager:
         backend: str | None = None,
         model: str | None = None,
         cwd: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
-        """Get an existing session or create a new one."""
+        """Get an existing session or create a new one.
+
+        ``actor`` is only used when a row is actually created — an existing
+        session keeps the creator it was stamped with, so re-resolving a
+        session someone else started never re-attributes it. Required
+        keyword-only, like the store method underneath it.
+        """
         session = await self.db.get_session(session_id)
         if not session:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
-                backend=backend, model=model, cwd=cwd,
+                backend=backend, model=model, cwd=cwd, actor=actor,
             )
         return session
 
@@ -119,6 +128,8 @@ class SessionManager:
         backend: str | None = None,
         model: str | None = None,
         cwd: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -142,6 +153,7 @@ class SessionManager:
             backend=backend,
             model=model,
             cwd=cwd,
+            actor=actor,
         )
         await self.db.log_session_event(session_id, "created", {
             "source": source,
@@ -250,13 +262,17 @@ class SessionManager:
         return None
 
     async def get_active_session(
-        self, channel_key: str, source: str = "web",
+        self, channel_key: str, source: str = "web", *, actor: Actor | None,
     ) -> str:
         """Get or create the active session for a channel.
 
         Reuses the channel's mapped session when it is currently active
         (a turn is in flight) or when its last activity falls within the
         sticky period. Otherwise creates a fresh session and remaps.
+
+        ``actor`` is stamped on the fresh session only — the person whose
+        message rolled the channel over to a new conversation. A reused
+        session keeps whoever started it.
         """
         row = await self.db.get_channel_session(channel_key)
         if row:
@@ -266,7 +282,7 @@ class SessionManager:
 
         # Create a fresh session
         session_id = self._generate_session_id()
-        await self._create_session(session_id, source=source)
+        await self._create_session(session_id, source=source, actor=actor)
         await self.db.set_channel_session(channel_key, session_id)
         return session_id
 
@@ -497,6 +513,8 @@ class SessionManager:
         at_message_id: str | None = None,
         title: str | None = None,
         source: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         """Create a forked session from an existing one.
 
@@ -512,6 +530,10 @@ class SessionManager:
 
         Args:
             source: Override the source field (default: inherit from parent).
+            actor: Who asked for the fork — stamped on the new session. The
+                copied messages keep their own senders (see
+                ``copy_messages_to_session``), so forking someone else's chat
+                never rewrites who said what in it.
         """
         parent = await self.db.get_session(source_session_id)
         if not parent:
@@ -549,6 +571,7 @@ class SessionManager:
             backend=parent.get("backend") or "claude",
             model=parent.get("model"),
             cwd=parent.get("cwd"),
+            actor=actor,
         )
         copied = await self.db.copy_messages_to_session(
             source_session_id, fork_id, up_to_native_turn_id=fork_turn_id,
@@ -578,28 +601,31 @@ class SessionManager:
     # ------------------------------------------------------------------ #
 
     async def create_cron_session(
-        self, job_id: str, run_id: str | None = None,
+        self, job_id: str, run_id: str | None = None, *, actor: Actor | None,
     ) -> dict:
         """Create an isolated session for a single cron run.
 
         When run_id is provided, each run gets its own session to prevent
         unbounded message accumulation.
+
+        ``actor`` is the agent's system principal in production: a scheduled
+        run is the instance's own work, whoever wrote the schedule (0.7).
         """
         if run_id:
             session_id = f"cron:{job_id}:{run_id}"
         else:
             session_id = f"cron:{job_id}"
         return await self.get_or_create(
-            session_id, title=f"Cron: {job_id}", source="cron",
+            session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
         )
 
     async def create_hook_session(
-        self, hook_name: str, hook_id: str,
+        self, hook_name: str, hook_id: str, *, actor: Actor | None,
     ) -> dict:
         """Create an isolated session for a webhook."""
         session_id = f"hook:{hook_name}:{hook_id}"
         return await self.get_or_create(
-            session_id, title=f"Hook: {hook_name}", source="hook",
+            session_id, title=f"Hook: {hook_name}", source="hook", actor=actor,
         )
 
     # ------------------------------------------------------------------ #
@@ -616,8 +642,14 @@ class SessionManager:
         blocks: list | None = None,
         native_turn_id: str | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> int:
         """Add a message to a session's history.
+
+        ``actor`` is the principal whose input this row records, or ``None``
+        for assistant and tool output — see
+        :meth:`nerve.db.messages.MessageStore.add_message`.
 
         ``bump_updated_at=False`` records the message without moving the
         session's place in the sidebar — see
@@ -628,6 +660,7 @@ class SessionManager:
             thinking=thinking, blocks=blocks,
             native_turn_id=native_turn_id,
             bump_updated_at=bump_updated_at,
+            actor=actor,
         )
 
     async def get_conversation_history(

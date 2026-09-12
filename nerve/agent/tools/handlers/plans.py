@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
+from nerve.identity import system_actor_or_none
 from nerve.agent.tools.schemas import (
     PLAN_APPROVE_SCHEMA,
     PLAN_DECLINE_SCHEMA,
@@ -230,8 +231,14 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
 
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
+    impl_actor = await system_actor_or_none(
+        ctx.db, context=f"implementation of plan {plan_id}",
+    )
+    # The agent approved this plan through its own tool, so both the session
+    # and the run it dispatches are the instance's own work.
     await ctx.engine.sessions.get_or_create(
         impl_session_id, title=f"Implement: {task['title']}", source="web",
+        actor=impl_actor,
     )
     await ctx.db.update_plan(plan_id, impl_session_id=impl_session_id)
 
@@ -296,6 +303,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
+                actor=impl_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

@@ -75,7 +75,7 @@ def _make_engine(db) -> MagicMock:
             source=kwargs.get("source", "web"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
         return {"id": session_id}
 
@@ -134,7 +134,7 @@ async def test_background_run_result_taken_from_final_auto_turn(db, engine, serv
     while await db.get_session(session_id) is None:
         assert time.monotonic() < deadline, "leg session never appeared"
         await asyncio.sleep(0.01)
-    await db.add_message(session_id, "assistant", "FINAL: the real verdict")
+    await db.add_message(session_id, "assistant", "FINAL: the real verdict", actor=None)
     await _drain(service, timeout=20)
     fresh = await db.get_workflow_run(run["id"])
     assert fresh["status"] == "done"
@@ -148,7 +148,7 @@ async def _seed_running(db, run_id: str, budget, engine_kind: str = ENGINE_CLAUD
     session_id = f"workflow:{run_id}"
     await db.create_workflow_run(run_id, engine_kind, {"prompt": "p"}, budget)
     await db.transition_workflow_run(run_id, "running", expect=("pending",))
-    await db.create_session(session_id, source="workflow")
+    await db.create_session(session_id, source="workflow", actor=None)
     await db.update_workflow_run(run_id, {"session_id": session_id})
     return session_id
 
@@ -309,7 +309,7 @@ class TestWorkflowRunStore:
 
 @pytest.mark.asyncio
 async def test_get_session_effective_cost_billed_plus_estimate_fallback(db):
-    await db.create_session("workflow:wfr-cost", source="workflow")
+    await db.create_session("workflow:wfr-cost", source="workflow", actor=None)
     # Billed turn: cost_usd wins even when an estimate is present.
     await db.record_turn_usage(
         "workflow:wfr-cost", 100, 50, 0, 0, 200000,
@@ -458,7 +458,7 @@ class TestExecute:
     async def test_leg_is_nested_and_named_after_origin_session(self, service, db, engine):
         """The leg nests under the session the run was started from AND is
         titled ``[<origin title>] <slug>`` so the sidebar shows the lineage."""
-        await db.create_session("human-1", source="web", title="Azure 403")
+        await db.create_session("human-1", source="web", title="Azure 403", actor=None)
         run = await service.start_run(
             ENGINE_CLAUDE, {"prompt": "p"}, 5.0, title="fix the thing",
             created_by="session:human-1",
@@ -482,7 +482,7 @@ class TestExecute:
     async def test_origin_session_id_resolves_every_created_by_shape(self, service, db):
         """created_by → origin session: direct (session:/mcp:), review-loop leg
         (→ observer), and None for non-session/dangling origins."""
-        await db.create_session("s1", source="web")
+        await db.create_session("s1", source="web", actor=None)
         await db.create_review_loop(
             "rvl-orig", title="t", session_id="s1", goal_prompt="g",
             verifier_prompt="v", criteria_adoption="no", criteria=[],
@@ -765,7 +765,7 @@ class TestWorkflowRunTools:
     async def test_external_session_rejected_for_start_and_kill_only(
         self, tool_service, db, engine,
     ):
-        await db.create_session("ext-1", source="external")
+        await db.create_session("ext-1", source="external", actor=None)
         ctx = _ctx(db, engine, session_id="ext-1")
 
         start = await workflow_run_start_handler(ctx, {
@@ -968,7 +968,7 @@ class TestReviewRegressions:
 
         service = WorkflowRunService(_make_config(tmp_path), db, engine)
         monkeypatch.setattr(workflows_mod, "_service", service)
-        await db.create_session("workflow:wfr-parent01", source="workflow")
+        await db.create_session("workflow:wfr-parent01", source="workflow", actor=None)
         ctx = ToolContext(session_id="workflow:wfr-parent01", db=db, engine=engine)
 
         start = await workflow_run_start_handler(ctx, {
