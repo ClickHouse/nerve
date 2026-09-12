@@ -3,6 +3,7 @@ import {
   api, setToken, clearToken, getToken, setUnauthorizedHandler,
   type Account, type LoginKind,
 } from '../api/client';
+import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
@@ -20,6 +21,11 @@ export interface SignedInAccount {
 function purgeAccountScopedState(): void {
   clearAllDrafts();
   clearAllReads();
+  // Display names are read fresh per app session, and both occasions this runs
+  // on end one. Not a secrecy measure — whoever signs in next can read
+  // /api/actors too — but a map that outlives the session that fetched it is a
+  // cache, and the whole point of this one is that it is not.
+  useActorStore.getState().reset();
 }
 
 /**
