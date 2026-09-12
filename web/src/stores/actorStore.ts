@@ -108,8 +108,14 @@ export const useActorStore = create<ActorState>((set, get) => {
         set({ loading: false });
       }
     })();
-    inFlight = run.finally(() => { inFlight = null; });
-    return inFlight;
+    // Clear the slot only if it is still this fetch's: a forced re-read waits
+    // for the one in flight and then starts its own, so an earlier `finally`
+    // must not blank out a later fetch's entry and let a third one start.
+    const tracked: Promise<void> = run.finally(() => {
+      if (inFlight === tracked) inFlight = null;
+    });
+    inFlight = tracked;
+    return tracked;
   }
 
   return {
