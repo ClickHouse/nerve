@@ -26,6 +26,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from nerve.config import get_config
 from nerve.db.accounts import (
     AccountError,
     LastAccountError,
@@ -92,13 +93,19 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=1)
 
 
-def _account_out(account: dict, actor_display: str | None, *, actor: Actor) -> AccountOut:
+def _account_out(
+    account: dict, actor_display: str | None, *, actor: Actor, config,
+) -> AccountOut:
     return AccountOut(
         id=account["id"],
         username=account["username"],
         display_name=actor_display,
         enabled=bool(account["enabled"]),
-        has_password=account["credential_source"] != "none",
+        # From the same resolution the login route uses, not from the row's
+        # source column: an account on `none` while auth.password_hash is
+        # configured does have a password, and saying otherwise would invite a
+        # password change that skips proving the current one.
+        has_password=bool(account_credential(account, config)),
         created_at=account["created_at"],
         updated_at=account["updated_at"],
         disabled_at=account["disabled_at"],
@@ -108,7 +115,10 @@ def _account_out(account: dict, actor_display: str | None, *, actor: Actor) -> A
 
 async def _render(db, account: dict, *, actor: Actor) -> AccountOut:
     ref = await db.get_actor_ref(account["actor_id"])
-    return _account_out(account, ref["display_name"] if ref else None, actor=actor)
+    return _account_out(
+        account, ref["display_name"] if ref else None,
+        actor=actor, config=get_config(),
+    )
 
 
 async def require_account(actor: Actor = Depends(require_auth)) -> Actor:
@@ -141,11 +151,12 @@ async def list_accounts(actor: Actor = Depends(require_account)):
     db = get_deps().db
     accounts = await db.list_accounts()
     refs = {ref["id"]: ref for ref in await db.list_actor_refs(kind="human")}
+    config = get_config()
     return AccountListResponse(accounts=[
         _account_out(
             account,
             (refs.get(account["actor_id"]) or {}).get("display_name"),
-            actor=actor,
+            actor=actor, config=config,
         )
         for account in accounts
     ])
@@ -271,8 +282,6 @@ async def change_own_password(
     Setting a password moves the account to its own credential, after which
     ``auth.password_hash`` no longer applies to it.
     """
-    from nerve.config import get_config
-
     db = get_deps().db
     account = await db.get_account(actor.account_id)
     if account is None:  # pragma: no cover - resolved a moment ago
@@ -298,20 +307,34 @@ async def change_own_password(
 def account_credential(account: dict, config) -> str:
     """The bcrypt hash this account authenticates against, or ``""``.
 
-    One function so the login route and the password change agree about where an
-    account's credential lives:
+    One function so the login route, the status descriptor and the password
+    change agree about where an account's credential lives:
 
-    * ``local`` — the hash on the row (what every account has after PR 3's
-      startup migration);
-    * ``config`` — ``auth.password_hash``, still read for one release so a
-      downgrade to code that only knows the configuration value still
-      authenticates. The startup migration empties this case out;
-    * ``none`` — passwordless: no hash, and admission is decided by the caller
-      (only ever while exactly one account exists).
+    * ``local`` — the hash on the row. What every account has after PR 3's
+      startup migration, and what a password set through the API produces;
+    * ``config`` / ``none`` — both mean "whatever configuration says", so both
+      read ``auth.password_hash``. The startup mirror keeps the row's value in
+      step with that key, but a config *reload* that adds a password takes
+      effect before the next restart writes the row, and honouring it at once
+      is the safe direction: the alternative is an instance that stays
+      passwordless for a while after its operator set a password.
+
+    ``config`` is kept readable for one release so a downgrade to code that only
+    knows the configuration value still authenticates; the startup migration
+    empties that case out.
     """
-    source = account["credential_source"]
-    if source == "local":
+    if account["credential_source"] == "local":
         return account["credential"] or ""
-    if source == "config":
-        return config.auth.password_hash or ""
-    return ""
+    return config.auth.password_hash or ""
+
+
+def instance_is_passwordless(state, config) -> bool:
+    """Whether anyone reaching the gateway is admitted as the one account.
+
+    The 0.5 state: exactly one account, and no credential anywhere — neither on
+    its row nor in configuration. Both halves matter, and both are read here so
+    the login route and ``/api/auth/status`` cannot disagree about which state
+    the instance is in (a status that says "passwordless" while login wants a
+    password is a browser that logs itself out in a loop).
+    """
+    return state.passwordless and not config.auth.password_hash
