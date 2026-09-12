@@ -118,8 +118,11 @@ enabled and whether it has a password. Add someone, rename, disable and
 re-enable, and change your own password.
 
 Every account can do all of that to every other account; there are no roles, so
-adding a person gives them the power to disable you. The only thing the server
-refuses is disabling the last enabled account. Two more refusals apply until the
+adding a person gives them the power to disable you. Disabling is the only
+destructive action here — there is no delete — and it asks before it acts, with
+stronger wording for your own account, because the click that disables you is
+also the click that signs you out and getting back in needs somebody else. The
+only thing the server refuses outright is disabling the last enabled account. Two more refusals apply until the
 first account has both a password and a username, which is what has to be true
 before a second account can exist — the page shows the reason rather than
 guessing at it.
