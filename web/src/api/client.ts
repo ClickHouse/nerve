@@ -380,6 +380,15 @@ export const api = {
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
 
+  /**
+   * The signed-in account. Doubles as the authentication check at startup: it
+   * needs a valid session *and* answers which account the session belongs to,
+   * which is what binds a re-authentication to the person whose app is on
+   * screen. `403` for the instance's own system credential, which has no
+   * account — a browser never holds one.
+   */
+  getOwnAccount: () => request<Account>('/accounts/me'),
+
   createAccount: (body: { username: string; password: string; display_name?: string }) =>
     request<Account>('/accounts', { method: 'POST', body: JSON.stringify(body) }),
 
