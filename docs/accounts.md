@@ -119,17 +119,42 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
   the next start generates a *fresh* secret rather than reviving the old one:
   tokens signed with a retired key never become valid again, which is what
   rotation is for.
-- **A generated secret only lives in a file this user alone can read.**
-  `nerve.db` carries a credential now, so every start makes the state directory
-  `0700` and the database files (`nerve.db`, `-wal`, `-shm`) `0600`, then
-  checks the result. On a filesystem that cannot represent modes the check
-  fails, and Nerve will not keep a secret there: with `auth.jwt_secret`
-  configured it starts and logs an error naming the file and its mode (nothing
-  secret is stored in the database in that case); without one it refuses to
-  start, and the message gives the two ways out — fix the permissions, or set
-  `auth.jwt_secret` in `config.local.yaml` or the environment. A restore
-  re-tightens `nerve.db` too, and only warns if it cannot; the next start
-  enforces.
+- **A file another user could have changed is not opened at all.** `nerve.db`
+  carries the accounts and may carry the signing secret, so every open — the
+  gateway, each CLI command, the installer — applies the same policy before
+  anything else happens. It first *inspects*: if the state directory or any
+  database file (`nerve.db`, `-wal`, `-shm`) is group- or world-writable, or its
+  mode cannot be read, Nerve refuses to open it — no migration, no repair —
+  because another user could have altered the contents, and fixing the mode
+  would only hide that. The message names the file, its mode and the remedy:
+  `chmod 700` the directory, `chmod 600` the files, then start again. Nerve
+  creates its own state directory `0700`, so a fresh install never sees this;
+  a `~/.nerve` created by an older version under a permissive umask (`0775` is
+  what a `002` umask leaves) is refused once, and that one `chmod 700` is the
+  acknowledgement.
+- **A generated secret only lives in a file this user alone can read.** A file
+  that is merely *readable* by others is repaired — directory `0700`, files
+  `0600` — and the result re-checked, never assumed from `chmod` succeeding. A
+  stored signing secret that was readable before the repair is treated as
+  copied and retired: on disk, and in memory too if this process had it pinned,
+  so nothing accepts tokens signed with it while the replacement is generated
+  (every open tab logs in again once). On a filesystem that cannot represent
+  modes the check fails, and Nerve will not keep a secret there: with
+  `auth.jwt_secret` configured it starts and logs an error naming the file and
+  its mode (nothing secret is stored in the database in that case); without one
+  it refuses to start, and the message gives the two ways out — fix the
+  permissions, or set `auth.jwt_secret` in `config.local.yaml` or the
+  environment. A restore holds itself to the same rule: the destination
+  directory is made and verified `0700` first, `nerve.db` is written through a
+  temporary *created* `0600` (verified before a byte is copied) and renamed into
+  place, and the restore aborts rather than continue if either cannot be
+  guaranteed.
+- **Every command opens the database the same way.** `nerve sync`, `nerve cron`,
+  `nerve db prune`, `nerve db vacuum` and `nerve workflow list|status` open
+  `nerve.db` exactly as the gateway does — the policy above, the migrations,
+  then the identity bootstrap — so the first command run after an upgrade
+  leaves the same owner account, system principal and signing secret `nerve
+  start` would. `nerve migrate --dry-run` inspects without opening.
 - The CLI (`nerve reload`, `nerve codex token`) reads the stored secret from
   `nerve.db`, so it authenticates to the daemon on the same box without any
   configuration. With no secret anywhere — the daemon has never started — it
