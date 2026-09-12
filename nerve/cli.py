@@ -252,6 +252,7 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         ):
             return
 
+    wizard = None
     if non_interactive:
         choices = run_non_interactive(config_dir)
     else:
@@ -279,15 +280,26 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     display_name = (choices.user_name or "").strip() or None
     try:
         report = bootstrap_identity_sync(config, display_name=display_name)
-    except Exception as e:  # noqa: BLE001 — the gateway repeats this at first start
-        click.secho(
-            f"  The local account could not be created now ({e}); it will be "
-            "created when Nerve first starts.",
-            fg="yellow",
+    except Exception as e:  # noqa: BLE001 — anything here means the account is not there
+        # The wizard cleared its checkpoint when it applied the configuration,
+        # and the name it collected exists nowhere else. Put the answers back so
+        # a re-run resumes at the review step with the same name, and fail
+        # loudly: the gateway's own bootstrap at first start would otherwise
+        # create the owner unnamed and nobody would know why.
+        if wizard is not None:
+            wizard.checkpoint()
+        remedy = (
+            " Fix the cause and run 'nerve init' again; your answers, the name "
+            "included, are saved and will be reused."
+            if wizard is not None
+            else " Fix the cause and run 'nerve init --non-interactive' again."
         )
-    else:
-        for action in report.identity_actions:
-            click.echo(f"  {action}")
+        raise click.ClickException(
+            f"Setup wrote the configuration, but the local owner account could not "
+            f"be created: {e}.{remedy}"
+        ) from e
+    for action in report.identity_actions:
+        click.echo(f"  {action}")
 
 
 @main.command()

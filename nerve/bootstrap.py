@@ -526,6 +526,17 @@ class SetupWizard:
         self._completed_steps.add(name)
         _save_init_state(self.choices, self._completed_steps)
 
+    def checkpoint(self) -> None:
+        """Save the answers so a re-run resumes rather than starting over.
+
+        The wizard clears its checkpoint once it has applied the
+        configuration. The installer calls this if the step after that —
+        creating the local owner account — fails, so the collected answers
+        (the owner's name among them, which is written nowhere else) survive
+        for the re-run.
+        """
+        _save_init_state(self.choices, self._completed_steps)
+
     def _maybe_resume(self) -> bool:
         """Offer to resume an interrupted setup. Returns True if resumed."""
         state = _load_init_state()

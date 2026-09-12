@@ -33,9 +33,12 @@ def _db_rows(db_path: Path, sql: str) -> list[tuple]:
 
 def _stub_wizard(ws: Path, *, name: str, local_yaml: str):
     """Stands in for SetupWizard: writes what the real one would and answers
-    the identity step with ``name``."""
+    the identity step with ``name``. ``checkpoints`` counts how often the
+    installer asked it to save the answers back."""
 
     class StubWizard:
+        checkpoints = 0
+
         def __init__(self, cfg_dir, inside_docker=False):
             self.config_dir = cfg_dir
 
@@ -47,6 +50,9 @@ def _stub_wizard(ws: Path, *, name: str, local_yaml: str):
             choices = SetupChoices()
             choices.user_name = name
             return choices
+
+        def checkpoint(self):
+            type(self).checkpoints += 1
 
     return StubWizard
 
@@ -138,3 +144,74 @@ class TestInstallerDisplayName:
         ) == [(None,)]
         # The headless installer always writes a jwt_secret, so none is generated.
         assert "generated a JWT signing secret" not in result.output
+
+
+class TestInstallerBootstrapFailure:
+    """The wizard clears its checkpoint when it applies the configuration, and
+    the name it collected exists nowhere else. If creating the owner then
+    fails, the installer must not shrug: it saves the answers back and exits
+    non-zero, so a re-run resumes with the same name instead of the gateway
+    quietly creating an unnamed owner at first start."""
+
+    def test_a_failed_bootstrap_keeps_the_answers_and_exits_non_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        import nerve.migrate as migrate_mod
+        from nerve.cli import main
+
+        config_dir, ws = _install_dirs(tmp_path)
+        stub = _stub_wizard(ws, name="alice", local_yaml=f"auth:\n  jwt_secret: {_SECRET}\n")
+        monkeypatch.setattr("nerve.bootstrap.SetupWizard", stub)
+
+        def boom(config, *, display_name=None):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
+
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "init"])
+
+        assert result.exit_code != 0
+        assert "could not be created" in result.output
+        assert "database is locked" in result.output
+        assert "answers" in result.output and "saved" in result.output
+        assert stub.checkpoints == 1
+        # The configuration the wizard wrote stays; only the account is missing.
+        assert (config_dir / "config.local.yaml").exists()
+        assert not paths.db_path().exists() or _db_rows(
+            paths.db_path(), "SELECT COUNT(*) FROM accounts",
+        ) == [(0,)]
+
+    def test_the_real_checkpoint_keeps_the_name(self, tmp_path):
+        from nerve.bootstrap import SetupWizard, _load_init_state
+
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.user_name = "alice"
+        wizard._completed_steps = {"mode", "identity"}
+        wizard.checkpoint()
+
+        state = _load_init_state()
+        assert state["choices"]["user_name"] == "alice"
+        assert set(state["completed"]) == {"mode", "identity"}
+
+    def test_a_headless_failure_exits_non_zero_without_pretending_to_save_answers(
+        self, tmp_path, monkeypatch,
+    ):
+        import nerve.migrate as migrate_mod
+        from nerve.cli import main
+
+        def boom(config, *, display_name=None):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-test-key-for-the-headless-path",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        result = CliRunner().invoke(
+            main, ["-c", str(tmp_path), "init", "--non-interactive"], env=env,
+        )
+        assert result.exit_code != 0
+        assert "could not be created" in result.output
+        assert "--non-interactive" in result.output
+        assert "answers" not in result.output
