@@ -204,6 +204,92 @@ class TestTrackedLayerIsNotASource:
         assert not _is_machine_local("auth.jwt_secret")
 
 
+_MALFORMED = pytest.mark.parametrize(
+    "bad_auth",
+    ["auth: garbage\n", "auth:\n  - a\n  - b\n", "auth: 42\n"],
+    ids=["string", "list", "number"],
+)
+
+
+class TestMalformedAuthSection:
+    """F19: an ``auth`` section that is present but not a mapping is refused,
+    never normalised to ``{}`` — that would turn a broken or hostile push into
+    a passwordless instance. Every layer is held to it, locked or not, and the
+    loader and the validator agree."""
+
+    @staticmethod
+    def _validation_names_it(config_dir: Path) -> None:
+        from nerve.config_validate import validate_config_bundle
+
+        result = validate_config_bundle(config_dir)
+        assert not result.ok
+        assert any("auth" in e and "mapping" in e for e in result.errors), result.errors
+
+    @_MALFORMED
+    def test_a_malformed_tracked_section_is_refused(self, tmp_path, bad_auth):
+        config_dir = _install(tmp_path, settings=bad_auth)
+        with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    @_MALFORMED
+    def test_a_malformed_tracked_section_is_refused_under_lockdown(self, tmp_path, bad_auth):
+        config_dir = _install(tmp_path, settings="lockdown: true\n" + bad_auth)
+        _git_repo_with_remote(tmp_path / "ws")
+        with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    @_MALFORMED
+    def test_a_malformed_machine_local_section_is_refused(self, tmp_path, bad_auth):
+        config_dir = _install(tmp_path, local=bad_auth)
+        with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    @_MALFORMED
+    def test_a_malformed_machine_local_section_is_refused_under_lockdown(
+        self, tmp_path, bad_auth,
+    ):
+        """Lockdown drops the machine layers for everything else, but auth.mode
+        is still read from them — so a malformed machine ``auth`` is refused,
+        not skipped."""
+        config_dir = _install(
+            tmp_path, local=bad_auth,
+            settings="lockdown: true\nauth:\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
+        )
+        _git_repo_with_remote(tmp_path / "ws")
+        with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    def test_a_well_formed_machine_mode_does_not_paper_over_a_malformed_tracked_section(
+        self, tmp_path,
+    ):
+        """The injection of the machine-local mode only ever writes into a
+        mapping; it must not turn ``auth: garbage`` into ``{mode: local}``."""
+        config_dir = _install(tmp_path, local="auth:\n  mode: local\n", settings="auth: garbage\n")
+        with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    def test_the_environment_anchor_does_not_paper_over_it_either(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(AUTH_MODE_ENV, "local")
+        config_dir = _install(tmp_path, settings="auth: garbage\n")
+        with pytest.raises(ConfigError, match="auth .* must be a mapping"):
+            load_config(config_dir)
+        self._validation_names_it(config_dir)
+
+    def test_an_empty_section_is_not_malformed(self, tmp_path):
+        """``auth:`` with nothing under it is YAML null — an absent section,
+        loaded with the defaults, in both files."""
+        from nerve.config_validate import validate_config_bundle
+
+        config_dir = _install(tmp_path, local="auth:\n", settings="auth:\n")
+        assert load_config(config_dir).auth.mode == "local"
+        assert not any("mapping" in e for e in validate_config_bundle(config_dir).errors)
+
+
 class TestValidatorHonoursTheEnvAnchor:
     """F14: `nerve config validate` must apply NERVE_AUTH_MODE the way runtime
     does, so a check cannot approve a config that will not start or reject one

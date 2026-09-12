@@ -450,22 +450,62 @@ def _as_auth_mode(value: Any) -> str:
     )
 
 
+def _require_auth_mapping(value: Any, where: str) -> None:
+    """Refuse an ``auth`` section that is present but not a mapping.
+
+    A malformed ``auth:`` (a string, a list, a number) must never be read as
+    "no auth" — replacing it with an empty mapping would turn a broken or
+    tampered configuration push into a passwordless instance, the exact
+    downgrade 0.1 forbids. It is a hard error, at load and in validation.
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigError(
+            f"auth in {where} must be a mapping of settings, got "
+            f"{type(value).__name__} {value!r}. A malformed auth section is refused "
+            f"rather than read as 'no authentication'."
+        )
+
+
+def _inject_machine_auth_mode(merged: dict[str, Any], machine: dict[str, Any]) -> None:
+    """Carry ``auth.mode`` from the machine-local layers into the final config.
+
+    The mode is machine-local and must survive the lockdown layer selection
+    (which drops the machine layers), so it is injected here whether locked or
+    not. Only into a valid mapping: a non-mapping ``auth`` anywhere is refused
+    (:func:`_require_auth_mapping`), never replaced.
+    """
+    machine_auth = machine.get("auth")
+    _require_auth_mapping(machine_auth, "config.yaml/config.local.yaml")
+    final_auth = merged.get("auth")
+    _require_auth_mapping(final_auth, "the effective configuration (workspace/config/settings.yaml)")
+    if final_auth is None and "auth" in merged:
+        # ``auth:`` with nothing under it is YAML null: a present, empty section.
+        # It carries no settings, so reading it as the empty mapping discards
+        # nothing — unlike a string or a list, which is refused above.
+        final_auth = merged["auth"] = {}
+    if isinstance(machine_auth, dict) and "mode" in machine_auth:
+        if final_auth is None:
+            merged["auth"] = {"mode": machine_auth["mode"]}
+        else:
+            final_auth["mode"] = machine_auth["mode"]
+
+
 def _apply_auth_mode_anchor(merged: dict[str, Any]) -> None:
     """Let ``NERVE_AUTH_MODE`` override ``auth.mode`` from every file.
 
     Applied after interpolation, so it also wins over a
     ``${NERVE_AUTH_MODE:-local}`` reference. An unset or blank variable
-    expresses no opinion. A malformed ``auth`` section (not a mapping) is left
-    for the typed loader to report as it does today.
+    expresses no opinion. A malformed ``auth`` section (not a mapping) is
+    refused, never replaced.
     """
     raw = os.environ.get(AUTH_MODE_ENV)
     if raw is None or not raw.strip():
         return
     auth = merged.get("auth")
+    _require_auth_mapping(auth, "the effective configuration")
     if auth is None:
         auth = merged["auth"] = {}
-    if isinstance(auth, dict):
-        auth["mode"] = raw.strip()
+    auth["mode"] = raw.strip()
 
 
 def _drop_tracked_auth_mode(ws_settings: dict[str, Any], workspace: Path) -> None:
@@ -705,6 +745,11 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     """
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
+    # A non-mapping ``auth`` in any layer is refused *before* merging: a deep
+    # merge would let a well-formed machine section silently replace a broken
+    # tracked one, and the tracked layer is exactly what a push delivers.
+    _require_auth_mapping(base.get("auth"), "config.yaml")
+    _require_auth_mapping(local.get("auth"), "config.local.yaml")
 
     machine = _deep_merge(base, local)
     # An env-anchored instance takes its workspace from the environment too, so
@@ -728,6 +773,7 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
+    _require_auth_mapping(ws_settings.get("auth"), "workspace/config/settings.yaml")
     # The one key the tracked layer may never supply: the identity mode.
     _drop_tracked_auth_mode(ws_settings, workspace)
 
@@ -766,12 +812,9 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     # default — an external change to authentication, which 0.1 forbids. So the
     # value is taken from the machine layers (config.yaml/config.local.yaml) and
     # injected here whether locked or not; a tracked-file value was already
-    # stripped above, and NERVE_AUTH_MODE still wins in the anchor below.
-    _machine_auth = machine.get("auth")
-    if isinstance(_machine_auth, dict) and "mode" in _machine_auth:
-        if not isinstance(merged.get("auth"), dict):
-            merged["auth"] = {}
-        merged["auth"]["mode"] = _machine_auth["mode"]
+    # stripped above, and NERVE_AUTH_MODE still wins in the anchor below. A
+    # non-mapping ``auth`` in any layer is a hard error here, never normalised.
+    _inject_machine_auth_mode(merged, machine)
 
     resolved = _resolve_env_refs(merged)
     _apply_auth_mode_anchor(resolved)

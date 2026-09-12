@@ -201,15 +201,26 @@ def validate_config_bundle(
     # Pin the workspace so cron paths resolve against the validated workspace.
     merged["workspace"] = str(workspace)
 
-    # Mirror _read_config_sources: auth.mode is machine-local, injected
-    # independently of the lockdown layer selection, so validation judges the
-    # same mode the daemon will run (and does not silently drop it under a
-    # locked view).
-    _machine_auth = machine.get("auth")
-    if isinstance(_machine_auth, dict) and "mode" in _machine_auth:
-        if not isinstance(merged.get("auth"), dict):
-            merged["auth"] = {}
-        merged["auth"]["mode"] = _machine_auth["mode"]
+    # Mirror _read_config_sources: a non-mapping ``auth`` in any layer is
+    # invalid, exactly as the loader refuses it — never normalised into "no
+    # auth". Checked per layer, so a broken tracked section is reported even
+    # where a machine layer would have merged over it.
+    auth_ok = True
+    for layer, where in (
+        (base, "config.yaml"),
+        (local, "config.local.yaml"),
+        (ws_settings, "workspace/config/settings.yaml"),
+    ):
+        try:
+            cfg._require_auth_mapping(layer.get("auth"), where)
+        except cfg.ConfigError as e:
+            result.errors.append(str(e))
+            auth_ok = False
+    # auth.mode is machine-local, injected independently of the lockdown layer
+    # selection, so validation judges the same mode the daemon will run (and
+    # does not silently drop it under a locked view).
+    if auth_ok:
+        cfg._inject_machine_auth_mode(merged, machine)
 
     # Lenient env interpolation — collect unset refs without raising.
     missing: list[str] = []
@@ -217,7 +228,8 @@ def validate_config_bundle(
     # Apply the NERVE_AUTH_MODE anchor exactly as runtime does (after
     # interpolation), so validation and startup agree on the mode in both
     # directions — env overriding a file value, and a bad env value failing.
-    cfg._apply_auth_mode_anchor(merged)
+    if auth_ok:
+        cfg._apply_auth_mode_anchor(merged)
     env_names = ", ".join(sorted(set(missing)))
     result.unresolved_env = sorted(set(missing))
     if missing:
