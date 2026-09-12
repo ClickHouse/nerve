@@ -201,9 +201,23 @@ def validate_config_bundle(
     # Pin the workspace so cron paths resolve against the validated workspace.
     merged["workspace"] = str(workspace)
 
+    # Mirror _read_config_sources: auth.mode is machine-local, injected
+    # independently of the lockdown layer selection, so validation judges the
+    # same mode the daemon will run (and does not silently drop it under a
+    # locked view).
+    _machine_auth = machine.get("auth")
+    if isinstance(_machine_auth, dict) and "mode" in _machine_auth:
+        if not isinstance(merged.get("auth"), dict):
+            merged["auth"] = {}
+        merged["auth"]["mode"] = _machine_auth["mode"]
+
     # Lenient env interpolation — collect unset refs without raising.
     missing: list[str] = []
     merged = cfg._interpolate_env(merged, missing)
+    # Apply the NERVE_AUTH_MODE anchor exactly as runtime does (after
+    # interpolation), so validation and startup agree on the mode in both
+    # directions — env overriding a file value, and a bad env value failing.
+    cfg._apply_auth_mode_anchor(merged)
     env_names = ", ".join(sorted(set(missing)))
     result.unresolved_env = sorted(set(missing))
     if missing:

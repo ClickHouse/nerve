@@ -153,31 +153,83 @@ class TestTrackedLayerIsNotASource:
         config = load_config(config_dir)
         assert (config.auth.mode, config.auth.jwt_expiry_hours) == ("local", 12)
 
-    def test_under_lockdown_only_the_environment_can_say_it(self, tmp_path, monkeypatch, caplog):
-        """Lockdown drops the machine layers, so a locked box's mode comes from
-        the environment or the default — never from the tracked file it runs on."""
-        from nerve.config import workspace_settings_file as settings_file
-
+    def test_a_machine_local_mode_survives_lockdown(self, tmp_path):
+        """F13: lockdown drops the machine layers for everything else, but the
+        identity mode is resolved from them independently — a locked box still
+        reads its mode from config.local.yaml, never from the tracked file."""
         config_dir = _install(
             tmp_path,
-            local="auth:\n  mode: other\n",  # dropped under lockdown
-            settings="lockdown: true\nauth:\n  mode: other\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
+            local="auth:\n  mode: other\n",
+            settings="lockdown: true\nauth:\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
         )
         _git_repo_with_remote(tmp_path / "ws")
-        assert settings_file(tmp_path / "ws").exists()
-        with caplog.at_level("WARNING", logger="nerve.config"):
-            config = load_config(config_dir)
-        assert config.lockdown and config.auth.mode == "local"
-        assert any("ignoring 'auth.mode'" in r.getMessage() for r in caplog.records)
+        config = load_config(config_dir)
+        assert config.lockdown and config.auth.mode == "other"
 
-        monkeypatch.setenv(AUTH_MODE_ENV, "other")
-        assert load_config(config_dir).auth.mode == "other"
+    def test_a_tracked_lockdown_flip_cannot_change_the_mode(self, tmp_path):
+        """The reproduction behind F13: flipping only the tracked lockdown flag
+        must not move a machine-local mode. It did before, because lockdown
+        dropped the layer that held it — an external push changing auth."""
+        def _mode_with_lockdown(sub: str, locked: bool) -> str:
+            root = tmp_path / sub
+            root.mkdir()
+            config_dir = _install(
+                root,
+                local="auth:\n  mode: other\n",
+                settings=f"lockdown: {'true' if locked else 'false'}\n"
+                         "auth:\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
+            )
+            _git_repo_with_remote(root / "ws")
+            return load_config(config_dir).auth.mode
+
+        assert _mode_with_lockdown("unlocked", False) == "other"
+        assert _mode_with_lockdown("locked", True) == "other"
+
+    def test_the_environment_still_overrides_a_machine_local_mode_under_lockdown(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv(AUTH_MODE_ENV, "local")
+        config_dir = _install(
+            tmp_path,
+            local="auth:\n  mode: other\n",
+            settings="lockdown: true\nauth:\n  jwt_secret: test-secret-padded-to-32-bytes!!\n",
+        )
+        _git_repo_with_remote(tmp_path / "ws")
+        assert load_config(config_dir).auth.mode == "local"
 
     def test_the_layer_table_lists_it_as_machine_local(self):
         from nerve.migrate import _is_machine_local
 
         assert _is_machine_local("auth.mode")
         assert not _is_machine_local("auth.jwt_secret")
+
+
+class TestValidatorHonoursTheEnvAnchor:
+    """F14: `nerve config validate` must apply NERVE_AUTH_MODE the way runtime
+    does, so a check cannot approve a config that will not start or reject one
+    that will. A second mode is mocked so the anchor has something to carry."""
+
+    @pytest.fixture(autouse=True)
+    def _two_modes(self, monkeypatch):
+        import nerve.config as cfgmod
+
+        monkeypatch.setattr(cfgmod, "AUTH_MODES", ("local", "other"))
+
+    def test_a_bad_env_value_fails_validation_like_runtime(self, tmp_path, monkeypatch):
+        from nerve.config_validate import validate_config_bundle
+
+        monkeypatch.setenv(AUTH_MODE_ENV, "bogus")
+        result = validate_config_bundle(_install(tmp_path))
+        assert not result.ok
+        assert any("auth.mode" in e for e in result.errors)
+
+    def test_env_overrides_an_invalid_file_value_in_validation_too(self, tmp_path, monkeypatch):
+        from nerve.config_validate import validate_config_bundle
+
+        monkeypatch.setenv(AUTH_MODE_ENV, "local")
+        config_dir = _install(tmp_path, local="auth:\n  mode: bogus\n")
+        result = validate_config_bundle(config_dir)
+        assert not any("auth.mode" in e for e in result.errors)
 
 
 class TestEnvironmentAnchor:

@@ -21,10 +21,12 @@ It is also **machine-local**: it is read from `config.yaml` or
 `config.local.yaml` on the box, or from `NERVE_AUTH_MODE` in the environment
 (which wins over both), and never from the tracked `workspace/config/settings.yaml`.
 A value there is ignored with a warning, so a configuration push or a workspace
-sync can never change how an instance authenticates — nor crash it. Under
-lockdown, where the machine-local layers are dropped, that leaves the
-environment or the default: the mode is decided where the service is defined.
-Any other value is a hard error at startup and in `nerve config validate`.
+sync can never change how an instance authenticates — nor crash it. The mode is
+resolved from the machine layers *independently of lockdown*: a locked box still
+reads it from its own `config.yaml`/`config.local.yaml` (or `NERVE_AUTH_MODE`),
+so flipping the tracked `lockdown` flag — which otherwise drops the machine
+layers — cannot reset the mode either. Any other value is a hard error at
+startup and in `nerve config validate`.
 
 ## The two tables
 

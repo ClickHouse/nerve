@@ -475,9 +475,11 @@ def _drop_tracked_auth_mode(ws_settings: dict[str, Any], workspace: Path) -> Non
     ``config.local.yaml``, or pinned with ``NERVE_AUTH_MODE``, but never in the
     file a configuration push or a workspace sync delivers. A pushed file must
     not be able to change how an instance authenticates — and must not be able
-    to crash it either, so the key is ignored rather than refused. Under
-    lockdown the machine layers are dropped, which leaves the environment or
-    the default: the mode is then decided where the service is defined.
+    to crash it either, so the key is ignored rather than refused. The machine
+    value is injected back independently of the lockdown layer selection (see
+    :func:`_read_config_sources`), so even a locked box keeps the mode its own
+    config.yaml/config.local.yaml or ``NERVE_AUTH_MODE`` states — a tracked
+    ``lockdown`` flip cannot reset it by dropping the machine layers.
     """
     auth = ws_settings.get("auth")
     if not isinstance(auth, dict) or "mode" not in auth:
@@ -757,6 +759,19 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         merged = _deep_merge(_deep_merge(ws_settings, base), local)
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
+
+    # auth.mode is machine-local, resolved independently of the lockdown layer
+    # selection. Lockdown otherwise drops the machine layers, which would let a
+    # tracked ``lockdown: true`` push silently reset a machine-local mode to the
+    # default — an external change to authentication, which 0.1 forbids. So the
+    # value is taken from the machine layers (config.yaml/config.local.yaml) and
+    # injected here whether locked or not; a tracked-file value was already
+    # stripped above, and NERVE_AUTH_MODE still wins in the anchor below.
+    _machine_auth = machine.get("auth")
+    if isinstance(_machine_auth, dict) and "mode" in _machine_auth:
+        if not isinstance(merged.get("auth"), dict):
+            merged["auth"] = {}
+        merged["auth"]["mode"] = _machine_auth["mode"]
 
     resolved = _resolve_env_refs(merged)
     _apply_auth_mode_anchor(resolved)
