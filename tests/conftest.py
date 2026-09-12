@@ -79,19 +79,44 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_stored_jwt_secret():
-    """Clear the database-held signing secret published to this process.
+def _unpin_jwt_secret():
+    """Forget the signing secret pinned to this process.
 
-    ``effective_jwt_secret`` falls back to a process-level holder that the
-    identity bootstrap fills at startup. Many tests rely on an empty
-    ``auth.jwt_secret`` making ``require_auth`` a no-op; one test that
-    bootstraps an identity must not turn auth on for every test after it.
+    Startup pins the effective secret once for the life of the daemon; in the
+    suite each test is its own "process", so a test that bootstraps an
+    identity (or pins a secret directly) must not leave it pinned for the
+    tests after it.
     """
-    from nerve.gateway.auth import set_stored_jwt_secret
+    from nerve.gateway.auth import unpin_jwt_secret
 
-    set_stored_jwt_secret("")
+    unpin_jwt_secret()
     yield
-    set_stored_jwt_secret("")
+    unpin_jwt_secret()
+
+
+@pytest.fixture
+def bypass_auth():
+    """Install a stand-in for ``require_auth`` on a test app.
+
+    There is no unauthenticated mode: with no signing secret in force every
+    auth check fails closed. Route tests that are not about authentication
+    therefore override the dependency on the app they build instead of
+    relying on an empty ``auth.jwt_secret``. Yields a function taking the app
+    (returns it, for chaining). Auth tests must not use it — they exercise the
+    real dependency with real tokens.
+    """
+    from nerve.gateway.auth import require_auth
+
+    apps = []
+
+    def _bypass(app):
+        app.dependency_overrides[require_auth] = lambda: {"sub": "user"}
+        apps.append(app)
+        return app
+
+    yield _bypass
+    for app in apps:
+        app.dependency_overrides.pop(require_auth, None)
 
 
 @pytest.fixture

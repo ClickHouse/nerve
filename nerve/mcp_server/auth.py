@@ -8,10 +8,10 @@ received from ``POST /api/auth/login`` either as an
 ``Authorization: Bearer <jwt>`` header or as a ``?token=<jwt>`` query
 parameter.
 
-When no signing secret exists at all the gateway runs open and this module
-mirrors that. Once the identity bootstrap has run at startup a secret always
-exists (it generates one when configuration supplies none), so in a served
-instance that branch is never taken.
+There is no unauthenticated mode. The secret is pinned at startup by the
+identity bootstrap (a configured ``auth.jwt_secret``, else one generated into
+the database); until that has happened no secret is in force and every request
+is refused, the same way the web gateway refuses.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from nerve.config import NerveConfig
 from nerve.gateway.auth import (
     MCP_AUDIENCE,
     MCP_SESSION_CLAIM,
+    NO_SECRET_DETAIL,
     decode_token,
     effective_jwt_secret,
 )
@@ -87,17 +88,17 @@ def decode_mcp_token(token: str, jwt_secret: str) -> dict:
     return decode_token(token, jwt_secret, audience=MCP_AUDIENCE)
 
 
-def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict | None:
+def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict:
     """Validate the JWT on an incoming MCP request.
 
-    Returns the decoded JWT payload on success, ``None`` when no signing
-    secret exists yet (pre-bootstrap; see the module docstring), and
-    raises :class:`McpAuthError` on auth failure.
+    Returns the decoded JWT payload. Raises :class:`McpAuthError` on a
+    missing or invalid token — and when no signing secret is in force at
+    all, which only happens before startup has pinned one: the endpoint
+    fails closed rather than open, like ``require_auth``.
     """
     secret = effective_jwt_secret(config)
     if not secret:
-        # No secret anywhere — matches gateway.auth.require_auth's bypass.
-        return None
+        raise McpAuthError(NO_SECRET_DETAIL)
 
     token = _extract_token_from_scope(scope)
     if not token:
@@ -114,9 +115,8 @@ def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict | None:
 def bound_session_id(payload: dict | None) -> str | None:
     """The engine session a decoded MCP token is bound to (or ``None``).
 
-    Only ``aud=nerve-mcp`` tokens carry the claim; ordinary tokens (and
-    the ``None`` payload of an unauthenticated pre-bootstrap request)
-    return ``None`` → satellite attribution.
+    Only ``aud=nerve-mcp`` tokens carry the claim; ordinary tokens (and a
+    ``None`` payload) return ``None`` → satellite attribution.
     """
     if not payload:
         return None

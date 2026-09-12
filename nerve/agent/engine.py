@@ -377,7 +377,9 @@ class AgentEngine:
 
         secret = effective_jwt_secret(self.config)
         if not secret:
-            return ""  # no secret yet (pre-bootstrap) — endpoint runs open
+            # Nothing pinned yet — only before startup has completed. An empty
+            # token grants nothing: the endpoint fails closed without a secret.
+            return ""
         return create_mcp_session_token(secret, session_id)
 
     def _backend_for(self, session: dict | None, source: str) -> AgentBackend:

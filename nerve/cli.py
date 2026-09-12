@@ -1368,14 +1368,18 @@ def reload(ctx: click.Context) -> None:
         )
     # auth.jwt_secret from the config read here, else the secret the daemon
     # generated into nerve.db on its first start (this shell is on the same box).
+    # With neither there is nothing to sign with, and the gateway refuses every
+    # unauthenticated request, so say so here instead of reporting its refusal.
     secret = _signing_secret(config)
-    if not secret and config.lockdown:
+    if not secret:
         raise click.ClickException(
-            "No auth.jwt_secret in the config read here and none stored in "
-            "nerve.db yet, and a locked gateway never runs open, so nothing sent "
-            "from this shell can be authenticated. If the secret comes from "
-            "${ENV_VAR}, export it here too; if the daemon has never started, "
-            "start it first."
+            "No signing secret is available to this shell: auth.jwt_secret is not "
+            "in the config read here and nerve.db holds no generated one yet. The "
+            "gateway refuses unauthenticated requests"
+            + (", and a locked gateway never runs open" if config.lockdown else "")
+            + ", so nothing sent from here can succeed. If the secret comes from "
+            "${ENV_VAR}, export it in this shell too; if the daemon has never "
+            "started, start it first."
         )
     url = _gateway_url(config, "/api/config/reload")
     # Certificate verification stands except in the one case where it cannot
@@ -1385,13 +1389,7 @@ def reload(ctx: click.Context) -> None:
     # gateway.host names a real host the certificate should match it, and a
     # failure there is worth hearing about rather than skipping past.
     verify = config.gateway.host not in _WILDCARD_BINDS
-    # A token when there is a secret to sign one with, and otherwise none: an
-    # unlocked gateway that has no secret anywhere yet does not ask for one
-    # (require_auth runs open there), so an empty secret is not a reason to
-    # refuse to call.
-    headers = {}
-    if secret:
-        headers["Authorization"] = f"Bearer {create_token(secret)}"
+    headers = {"Authorization": f"Bearer {create_token(secret)}"}
     try:
         resp = httpx.post(
             url,
@@ -1712,8 +1710,9 @@ def codex_token(ctx: click.Context, hours: int) -> None:
 
     secret = _signing_secret(ctx.obj["config"])
     if not secret:
-        # No secret anywhere yet (the daemon has never started): the MCP
-        # endpoint runs open until it has. An empty value is intentional.
+        # No secret anywhere yet (the daemon has never started), so there is
+        # nothing to sign with — and nothing the endpoint would accept. An
+        # empty value is intentional.
         return
     click.echo(create_external_mcp_token(secret, ttl_seconds=hours * 60 * 60))
 

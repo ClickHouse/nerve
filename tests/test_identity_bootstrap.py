@@ -23,7 +23,7 @@ from nerve import paths
 from nerve.config import AuthConfig, NerveConfig, load_config, workspace_settings_file
 from nerve.db import Database
 from nerve.db.accounts import JWT_SECRET_NAME, read_instance_secret
-from nerve.gateway.auth import effective_jwt_secret, stored_jwt_secret
+from nerve.gateway.auth import effective_jwt_secret, pinned_jwt_secret
 from nerve.migrate import (
     MigrationReport,
     bootstrap_identity,
@@ -156,7 +156,7 @@ class TestIdempotency:
         assert await db.count_accounts() == 0
         assert await db.get_local_identity() is None
         assert await db.get_instance_secret(JWT_SECRET_NAME) is None
-        assert stored_jwt_secret() == ""
+        assert pinned_jwt_secret() == ""
 
         # The real thing then reports in the past tense.
         report = await bootstrap_identity(db, _cfg(password_hash=_HASH))
@@ -241,15 +241,23 @@ class TestJwtSecret:
         assert await ensure_jwt_secret(db, config, report=again) == first
         assert not again.generated_jwt_secret and again.identity_actions == []
 
-    async def test_a_configured_secret_added_later_wins_over_the_stored_one(self, db: Database):
+    async def test_a_configured_secret_added_later_takes_effect_at_the_next_start(
+        self, db: Database,
+    ):
+        from nerve.gateway.auth import unpin_jwt_secret
+
         generated = await ensure_jwt_secret(db, NerveConfig())
         config = _cfg(jwt_secret=_SECRET)
+        # Same process: the pin holds; the new configured value is reported by
+        # a reload and waits for a restart.
+        assert await ensure_jwt_secret(db, config) == generated
+        assert effective_jwt_secret(config) == generated
+        # "Restart": the configured value wins from then on. The stored one
+        # stays in the database, unused, for a config that drops the key again.
+        unpin_jwt_secret()
         assert await ensure_jwt_secret(db, config) == _SECRET
         assert effective_jwt_secret(config) == _SECRET
-        # The stored one stays (unused) and is still what a config without a
-        # secret falls back to.
         assert await db.get_instance_secret(JWT_SECRET_NAME) == generated
-        assert stored_jwt_secret() == generated
 
     async def test_lockdown_without_a_configured_secret_also_generates(self, db: Database):
         """1.6 is unconditional: a locked box with no auth.jwt_secret used to
@@ -263,7 +271,7 @@ class TestJwtSecret:
         assert await ensure_jwt_secret(db, NerveConfig(), report=report, dry_run=True) == ""
         assert report.generated_jwt_secret
         assert await db.get_instance_secret(JWT_SECRET_NAME) is None
-        assert stored_jwt_secret() == ""
+        assert pinned_jwt_secret() == ""
 
 
 # --------------------------------------------------------------------------- #

@@ -131,6 +131,33 @@ class TestRestartOnly:
     def test_listed_as_restart_only(self):
         assert "auth.mode" in _RESTART_ONLY_PATHS
 
+    @pytest.mark.asyncio
+    async def test_a_reload_reports_a_changed_mode_but_does_not_apply_it(
+        self, tmp_path, monkeypatch,
+    ):
+        """Startup-pinned: the mode the daemon started with is carried onto
+        every reloaded config object, so a reload — or a workspace sync — can
+        report the change but cannot make it live. Only one mode exists today,
+        so a second one is pretended into existence for the file to ask for;
+        the point is what a reload does with a changed value."""
+        import nerve.config as cfgmod
+        from nerve.config import set_config
+        from nerve.config_reload import reload_all
+
+        config_dir = _install(tmp_path)
+        workspace_settings_file(tmp_path / "ws").write_text("timezone: UTC\n", encoding="utf-8")
+        set_config(load_config(config_dir))
+        assert cfgmod.get_config().auth.mode == "local"
+
+        monkeypatch.setattr(cfgmod, "AUTH_MODES", ("local", "other"))
+        (config_dir / "config.local.yaml").write_text("auth:\n  mode: other\n", encoding="utf-8")
+        summary = await reload_all(None, None, config_dir)
+
+        assert summary["config"] == "reloaded"
+        assert "auth.mode" in summary.get("restart_required", "")
+        assert cfgmod.get_config().auth.mode == "local"
+        set_config(NerveConfig())
+
     def test_a_changed_mode_is_reported_not_applied(self):
         old = NerveConfig(auth=AuthConfig(mode="local"))
         # Constructed directly: the loader would refuse this value, which is

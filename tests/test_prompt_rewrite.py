@@ -81,9 +81,9 @@ class _FakeClient:
 
 
 @pytest.fixture
-def rewrite_app(tmp_path):
+def rewrite_app(tmp_path, bypass_auth):
     """Minimal FastAPI app with the prompt-rewrite router and a clean
-    global config (no jwt_secret → require_auth is a no-op)."""
+    global config; auth is overridden, these routes are not about it."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -91,7 +91,6 @@ def rewrite_app(tmp_path):
 
     cfg = NerveConfig()
     cfg.workspace = tmp_path
-    cfg.auth.jwt_secret = ""
     cfg.anthropic_api_key = "test-key"
     cfg_mod._config = cfg
 
@@ -99,6 +98,7 @@ def rewrite_app(tmp_path):
 
     app = FastAPI()
     app.include_router(router)
+    bypass_auth(app)
     client = TestClient(app)
 
     yield SimpleNamespace(client=client, config=cfg)

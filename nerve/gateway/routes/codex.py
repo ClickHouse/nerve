@@ -14,6 +14,7 @@ from nerve.agent.backends.codex.ultracode import (
 )
 from nerve.gateway.auth import (
     MCP_WORKER_CLAIM,
+    NO_SECRET_DETAIL,
     create_mcp_session_token,
     effective_jwt_secret,
     require_auth,
@@ -45,10 +46,10 @@ async def mint_worker_token(request: Request):
         raise HTTPException(status_code=400, detail="Invalid Ultracode worker id")
     secret = effective_jwt_secret(deps.engine.config)
     if not secret:
-        # No signing secret yet (pre-bootstrap), so there is no credential to
-        # exchange. Keep workers functional; tool calls follow the endpoint's
-        # existing unauthenticated satellite attribution policy.
-        return {"token": "", "worker_id": worker_id, "expires_in": 0}
+        # Fail closed: nothing is pinned until startup has completed, there
+        # is no credential to exchange, and an empty token would only be
+        # refused by the endpoint anyway.
+        raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
     try:
         payload = authenticate_mcp(request.scope, deps.engine.config)
     except McpAuthError as e:

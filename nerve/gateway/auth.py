@@ -2,13 +2,15 @@
 
 Password login, HS256 session tokens, bcrypt hashing.
 
-**The signing secret.** Tokens are signed with :func:`effective_jwt_secret`:
-``auth.jwt_secret`` when configuration supplies one, otherwise the secret the
-identity bootstrap generated on first start and keeps in the database
+**The signing secret.** Tokens are signed with :func:`effective_jwt_secret`,
+which returns the secret *pinned* at startup by the identity bootstrap:
+``auth.jwt_secret`` when configuration supplied one, otherwise the secret the
+bootstrap generated on first start and keeps in the database
 (``instance_secrets``). Every consumer — this module, the login route, the
 external MCP endpoint, the CLI — must go through that function rather than
-read ``config.auth.jwt_secret`` directly, or an install without a configured
-secret would sign in one place and verify against nothing in another.
+read ``config.auth.jwt_secret`` directly: the config object is rebuilt on every
+reload, and the secret is restart-only. With no secret in force every check
+fails closed; there is no unauthenticated mode.
 """
 
 from __future__ import annotations
@@ -45,6 +47,10 @@ REFRESH_AFTER_RATIO = 0.5
 # Response header carrying a slid session token back to the browser.
 SESSION_TOKEN_HEADER = "X-Nerve-Token"
 
+# What every fail-closed check says when no signing secret is in force. Shared
+# so the HTTP, MCP and worker-token paths agree, and so a test can match it.
+NO_SECRET_DETAIL = "No signing secret is in force; the gateway has not completed startup"
+
 # Audience claim on session-bound MCP tokens (see create_mcp_session_token).
 MCP_AUDIENCE = "nerve-mcp"
 # Claim carrying the bound nerve session id on MCP tokens.
@@ -66,36 +72,63 @@ def session_expiry_hours() -> int:
     return max(1, hours)
 
 
-# The signing secret in force when configuration supplies none: generated once
-# by the identity bootstrap (nerve.migrate.bootstrap_identity) and kept in the
-# database, never written into the operator's config files. Held here rather
-# than on the config object so a config reload — which rebuilds that object
-# from disk, where the secret deliberately is not — cannot drop it mid-flight.
-_stored_jwt_secret: str = ""
+# The signing secret in force for this process. Fixed once at startup by the
+# identity bootstrap (nerve.migrate.ensure_jwt_secret): auth.jwt_secret when
+# configuration supplied one, else the secret kept in the database. Pinned here
+# rather than read from the config object per request because the secret is
+# restart-only: a reload rebuilds that object from disk, and an edit that
+# removed or changed the key must neither reopen the instance nor swap the key
+# under live sessions. `restart_required` reports such a change; the next
+# restart applies it.
+_pinned_jwt_secret: str = ""
 
 
-def set_stored_jwt_secret(secret: str) -> None:
-    """Publish the database-held signing secret to this process."""
-    global _stored_jwt_secret
-    _stored_jwt_secret = secret or ""
+def pin_jwt_secret(secret: str) -> None:
+    """Fix the signing secret for the rest of this process's life.
+
+    The first pin wins. A later call offering a *different* value is ignored
+    with a warning rather than honoured, because a swap after startup is
+    exactly what pinning exists to rule out; the same value is a no-op, which
+    is what the CLI pass followed by the gateway's own bootstrap produces.
+    """
+    global _pinned_jwt_secret
+    secret = secret or ""
+    if not secret:
+        return
+    if _pinned_jwt_secret and _pinned_jwt_secret != secret:
+        logger.warning(
+            "A signing secret is already pinned for this process; a different one "
+            "was offered and ignored. The secret is restart-only: restart to change it.",
+        )
+        return
+    _pinned_jwt_secret = secret
 
 
-def stored_jwt_secret() -> str:
-    """The database-held signing secret published to this process, or ``""``."""
-    return _stored_jwt_secret
+def unpin_jwt_secret() -> None:
+    """Forget the pinned secret. For tests, which are each their own "process";
+    a running daemon never does this."""
+    global _pinned_jwt_secret
+    _pinned_jwt_secret = ""
+
+
+def pinned_jwt_secret() -> str:
+    """The secret pinned to this process, or ``""`` before startup pinned one."""
+    return _pinned_jwt_secret
 
 
 def effective_jwt_secret(config: NerveConfig | None = None) -> str:
     """The secret tokens are signed and verified with.
 
-    ``auth.jwt_secret`` from configuration when set — so an upgrade keeps every
-    live session — else the one the bootstrap stored in the database. Empty
-    only before the bootstrap has run (and in tests that never run it): once
-    it has, an install always has a secret, which is what closed the hole
-    where an empty ``auth.jwt_secret`` left the instance open.
+    Once startup has pinned one, that — whatever the config object says by
+    now. Before that (a CLI process, the installer, tests) it is
+    ``auth.jwt_secret`` from the given configuration, or nothing; every
+    consumer treats nothing as fail-closed, so an instance that has not
+    completed startup refuses rather than admits.
     """
+    if _pinned_jwt_secret:
+        return _pinned_jwt_secret
     cfg = config if config is not None else get_config()
-    return cfg.auth.jwt_secret or _stored_jwt_secret
+    return cfg.auth.jwt_secret or ""
 
 
 def create_token(jwt_secret: str, expiry_hours: int | None = None) -> str:
@@ -233,23 +266,14 @@ def get_token_from_request(request: Request) -> str:
 
 async def require_auth(request: Request) -> dict:
     """FastAPI dependency: require valid authentication."""
-    config = get_config()
-    secret = effective_jwt_secret(config)
+    secret = effective_jwt_secret(get_config())
     if not secret:
-        if config.lockdown:
-            # Fail closed: a locked instance must never fall into the open
-            # bypass just because no signing secret exists yet.
-            raise HTTPException(
-                status_code=503,
-                detail="Locked instance has no signing secret yet (set "
-                "auth.jwt_secret via ${ENV_VAR} in settings.yaml or the "
-                "environment, or let the first start generate one).",
-            )
-        # No signing secret anywhere. Unreachable once the identity bootstrap
-        # has run at startup — it generates one when configuration has none —
-        # so this is the pre-bootstrap / test-harness path, not a mode an
-        # install can be in.
-        return {"sub": "user"}
+        # Fail closed. Startup pins a secret before the gateway serves — the
+        # configured one, or one generated into the database — so this is only
+        # reachable before startup has completed. An empty secret must never
+        # mean an open instance, locked or not: inferring "no auth" from a
+        # missing credential is the class of bug this seam exists to end.
+        raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
 
     token = get_token_from_request(request)
     payload = decode_token(token, secret)
@@ -268,12 +292,9 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     Checks token from query parameter or first message.
     Returns True if authenticated, False otherwise.
     """
-    config = get_config()
-    secret = effective_jwt_secret(config)
+    secret = effective_jwt_secret(get_config())
     if not secret:
-        if config.lockdown:
-            return False  # Fail closed under lockdown — never open the socket
-        return True  # No secret yet: pre-bootstrap / tests only (see require_auth)
+        return False  # fail closed, locked or not — see require_auth
 
     # Check query parameter
     token = websocket.query_params.get("token")

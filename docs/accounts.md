@@ -59,8 +59,11 @@ The account's `credential_source` says where its password is:
 
 An existing install with a password gets `config`; a passwordless one, and a
 fresh install, gets `none`. The username stays empty — password-only login
-remains valid while exactly one account exists, so nothing needs one yet — and
-the display name is empty until something sets it.
+remains valid while exactly one account exists, so nothing needs one yet. The
+display name is the answer you gave `nerve init` at "Your name": the installer
+creates the account itself, in the same run, because nothing it writes carries
+that answer. A headless (`--non-interactive`) install collects no name, so its
+owner is unnamed until something sets one.
 
 While the account is on `config` or `none`, the value is re-derived from
 configuration at every start: add `auth.password_hash` to a passwordless install
@@ -85,21 +88,33 @@ before exposing the gateway beyond the machine.
 Session tokens are signed with `auth.jwt_secret` when it is configured. When it
 is not, the first start generates a secret and keeps it in `nerve.db`
 (`instance_secrets`) — machine-local state, never written into a config file.
-There is no unauthenticated mode any more: the old behaviour, where an empty
-secret made the gateway accept every request and the login route mint tokens
-signed with a fixed string, is gone.
+There is no unauthenticated mode: the old behaviour, where an empty secret made
+the gateway accept every request and the login route mint tokens signed with a
+fixed string, is gone, and until a secret is in force every request — HTTP, the
+WebSocket handshake and the MCP endpoint — is refused, locked or not.
 
-- A configured `auth.jwt_secret` always wins over the stored one. Setting it on
-  an install that had generated one simply rotates the secret; every open tab
-  logs in again once.
+- **The secret is pinned at startup.** Whichever value is in force when the
+  gateway starts — configured or generated — stays in force for the life of the
+  process. A config reload or workspace sync that changes or removes
+  `auth.jwt_secret` is reported as needing a restart and changes nothing live:
+  removing the key does not reopen the instance, and rotating it does not swap
+  the key under live sessions half-way. The next restart applies it.
+- A configured `auth.jwt_secret` wins over the stored one at startup. Setting it
+  on an install that had generated one rotates the secret at the next restart;
+  every open tab logs in again once.
 - Under lockdown the same applies: a locked box without a configured secret
   generates one rather than refusing every request. Supplying it from the fleet
   configuration lets you rotate it centrally.
+- `nerve.db` carries a credential now, so the state directory is kept `0700`
+  and the database files `0600`, re-asserted on every start and on restore. A
+  filesystem that cannot represent modes gets a warning in the log; tighten it
+  by other means.
 - The CLI (`nerve reload`, `nerve codex token`) reads the stored secret from
   `nerve.db`, so it authenticates to the daemon on the same box without any
-  configuration.
+  configuration. With no secret anywhere — the daemon has never started — it
+  refuses rather than sending a request the gateway would reject.
 - To rotate a generated secret, set `auth.jwt_secret`, or delete the row
-  (`DELETE FROM instance_secrets WHERE name = 'jwt_secret'`) and restart.
+  (`DELETE FROM instance_secrets WHERE name = 'jwt_secret'`), and restart.
 
 ## Backups
 

@@ -14,7 +14,7 @@ from nerve.db import Database
 @pytest.mark.asyncio
 class TestSidebarListRoutes:
     @pytest_asyncio.fixture
-    async def setup(self, db: Database):
+    async def setup(self, db: Database, bypass_auth):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -24,7 +24,6 @@ class TestSidebarListRoutes:
         from nerve.gateway.routes.sessions import router as sessions_router
 
         cfg = NerveConfig()
-        cfg.auth.jwt_secret = ""      # require_auth becomes a no-op
         cfg_mod._config = cfg
 
         sm = SessionManager(db)
@@ -37,6 +36,7 @@ class TestSidebarListRoutes:
 
         app = FastAPI()
         app.include_router(sessions_router)
+        bypass_auth(app)  # these routes are not about auth
         yield SimpleNamespace(client=TestClient(app), db=db, sm=sm, cfg=cfg)
 
         cfg_mod._config = None

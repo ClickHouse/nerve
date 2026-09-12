@@ -1096,18 +1096,20 @@ async def ensure_jwt_secret(
     report: MigrationReport | None = None,
     dry_run: bool = False,
 ) -> str:
-    """Make sure a JWT signing secret exists, and publish it to this process.
+    """Make sure a JWT signing secret exists, and pin it for this process.
 
     ``auth.jwt_secret`` in configuration is used as-is when set, so an upgrade
     keeps every live session. Otherwise the secret kept in ``nerve.db``
     (``instance_secrets``) is used, and generated first if there is none —
-    once, never rotated here, never written into a config file. Whatever the
-    database holds is handed to :func:`nerve.gateway.auth.set_stored_jwt_secret`
-    so every consumer of :func:`~nerve.gateway.auth.effective_jwt_secret` sees
-    it. Returns the secret in force (``""`` on a dry run that would generate).
+    once, never rotated here, never written into a config file. The value in
+    force is pinned via :func:`nerve.gateway.auth.pin_jwt_secret`, so every
+    consumer of :func:`~nerve.gateway.auth.effective_jwt_secret` sees it and
+    keeps seeing it across config reloads; the first pin in a process wins,
+    so a later call with a changed configuration returns what is pinned.
+    Returns the secret in force (``""`` on a dry run that would generate).
     """
     from nerve.db.accounts import JWT_SECRET_NAME
-    from nerve.gateway.auth import set_stored_jwt_secret
+    from nerve.gateway.auth import pin_jwt_secret, pinned_jwt_secret
 
     report = MigrationReport(dry_run=dry_run) if report is None else report
     stored = await db.get_instance_secret(JWT_SECRET_NAME)
@@ -1133,9 +1135,10 @@ async def ensure_jwt_secret(
             "(auth.jwt_secret is not configured)",
         )
 
-    if not dry_run:
-        set_stored_jwt_secret(stored or "")
-    return secret
+    if dry_run:
+        return secret
+    pin_jwt_secret(secret)
+    return pinned_jwt_secret()
 
 
 def _bootstrap_identity_sync(

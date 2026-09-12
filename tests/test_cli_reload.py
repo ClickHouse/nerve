@@ -171,31 +171,60 @@ class TestReloadCommand:
         assert "jwt_secret" in result.output
         assert "Traceback" not in result.output
 
-    def test_no_jwt_secret_still_calls_the_gateway(self, tmp_path, monkeypatch):
-        """An unlocked gateway with no auth.jwt_secret does not ask for a token —
-        require_auth runs open there. Refusing to send one would refuse the reload
-        the endpoint would have accepted, on the dev box where the hand edits this
-        command exists for are most of the edits there are."""
+    def test_no_secret_anywhere_refuses_before_calling(self, tmp_path, monkeypatch):
+        """No auth.jwt_secret in the config read here and no generated one in
+        nerve.db means the daemon has never started: there is nothing to sign
+        with, and the gateway refuses unauthenticated requests, so the command
+        says so instead of reporting the gateway's refusal."""
+        calls: list = []
+        monkeypatch.setattr(httpx, "post", _post(calls))
+        (tmp_path / "config.yaml").write_text("timezone: UTC\n", encoding="utf-8")
+        result = CliRunner().invoke(main, ["-c", str(tmp_path), "reload"])
+        assert result.exit_code != 0
+        assert "signing secret" in result.output
+        assert "locked gateway" not in result.output
+        assert not calls
+
+    def test_a_password_hash_is_not_a_second_source_of_a_token(self, tmp_path, monkeypatch):
+        """auth.password_hash gates the browser login, which is what mints a token
+        from it. require_auth checks the signing secret alone, so a password
+        neither authenticates this command nor gives it anything to sign with."""
+        calls: list = []
+        monkeypatch.setattr(httpx, "post", _post(calls))
+        (tmp_path / "config.yaml").write_text(
+            "auth:\n  password_hash: $2b$12$notarealhashatall\n", encoding="utf-8"
+        )
+        result = CliRunner().invoke(main, ["-c", str(tmp_path), "reload"])
+        assert result.exit_code != 0
+        assert "signing secret" in result.output
+        assert not calls
+
+    def test_the_generated_secret_in_nerve_db_is_used(self, tmp_path, monkeypatch):
+        """The daemon has started once with no configured secret: the one it
+        generated into nerve.db is what this shell signs with."""
+        import asyncio
+
+        from nerve import paths
+        from nerve.db import Database
+        from nerve.db.accounts import JWT_SECRET_NAME
+
+        async def _store():
+            db = Database(paths.db_path())
+            await db.connect()
+            try:
+                await db.ensure_instance_secret(
+                    JWT_SECRET_NAME, "generated-secret-padded-to-thirty-two-bytes",
+                )
+            finally:
+                await db.close()
+
+        asyncio.run(_store())
         calls: list = []
         monkeypatch.setattr(httpx, "post", _post(calls, payload={"ok": True}))
         (tmp_path / "config.yaml").write_text("timezone: UTC\n", encoding="utf-8")
         result = CliRunner().invoke(main, ["-c", str(tmp_path), "reload"])
         assert result.exit_code == 0, result.output
-        assert len(calls) == 1
-        assert "Authorization" not in calls[0]["headers"]
-
-    def test_a_password_hash_is_not_a_second_source_of_a_token(self, tmp_path, monkeypatch):
-        """auth.password_hash gates the browser login, which is what mints a token
-        from it. require_auth reads auth.jwt_secret alone, so a password neither
-        makes the endpoint ask for a token nor gives this command one to sign."""
-        calls: list = []
-        monkeypatch.setattr(httpx, "post", _post(calls, payload={"ok": True}))
-        (tmp_path / "config.yaml").write_text(
-            "auth:\n  password_hash: $2b$12$notarealhashatall\n", encoding="utf-8"
-        )
-        result = CliRunner().invoke(main, ["-c", str(tmp_path), "reload"])
-        assert result.exit_code == 0, result.output
-        assert "Authorization" not in calls[0]["headers"]
+        assert calls[0]["headers"]["Authorization"].startswith("Bearer ")
 
     def test_lockdown_without_a_secret_refuses_before_calling(self, tmp_path, monkeypatch):
         """The one case where an empty secret is a dead end: a locked gateway never

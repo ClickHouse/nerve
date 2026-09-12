@@ -14,9 +14,11 @@ Nothing reloads on its own. A reload happens when an operator asks for one
 change. Editing a config file on the box does not apply itself.
 
 Restart-only (NOT reloaded here): the gateway socket (host/port/SSL), the
-Telegram bot's token and allow-list, the MCP endpoint (including the
-``auth.jwt_secret`` it checks ``/mcp/v1`` against, which the web gateway reads
-per request), Langfuse, the memory bridges, the Codex thread-sync service
+Telegram bot's token and allow-list, the MCP endpoint, the signing secret
+(``auth.jwt_secret`` is pinned at startup for every consumer, web gateway and
+MCP endpoint alike — see :mod:`nerve.gateway.auth`), the identity mode
+(``auth.mode``, carried over from the running config so a reload cannot change
+it — see :data:`_STARTUP_PINNED_PATHS`), Langfuse, the memory bridges, the Codex thread-sync service
 (``sync.codex.*`` — a different service from the cron sources under ``sync.*``,
 and the one place those two names diverge), anything a service derived from
 config at construction, and a background loop that was never started because its
@@ -100,6 +102,15 @@ _RESTART_ONLY_PATHS = (
     "xmemory",
 )
 
+# Restart-only settings that are *pinned* for the life of the process rather
+# than merely reported: the value the daemon started with is carried onto every
+# reloaded config object, so a reload — or a workspace sync — can report the
+# change but cannot make it live. Reporting alone is not enough for a setting
+# whose live drift would weaken authentication. ``auth.jwt_secret`` is pinned
+# separately, in ``nerve.gateway.auth``, because the value in force may be a
+# database-held one that is not on the config object at all.
+_STARTUP_PINNED_PATHS = ("auth.mode",)
+
 # Paths whose value the summary must not carry. It is logged and returned over
 # HTTP, so a secret printed here is a secret in the log file as well.
 _SECRET_PATHS = frozenset({
@@ -156,6 +167,23 @@ def restart_required(old_config, new_config) -> list[str]:
         if before != after:
             changed.append(_describe(path, before, after))
     return changed
+
+
+def _carry_startup_pinned(old_config, new_config) -> None:
+    """Copy the startup-pinned values from the running config onto the new one.
+
+    Called after :func:`restart_required` has compared the two, so the change
+    is still reported; it just never takes effect in this process.
+    """
+    if old_config is None or new_config is None:
+        return
+    for path in _STARTUP_PINNED_PATHS:
+        section, _, attr = path.rpartition(".")
+        old_holder = _dotted_attr(old_config, section) if section else old_config
+        new_holder = _dotted_attr(new_config, section) if section else new_config
+        if old_holder is _UNSET or new_holder is _UNSET or not hasattr(old_holder, attr):
+            continue
+        setattr(new_holder, attr, getattr(old_holder, attr))
 
 
 def reload_failures(summary: dict) -> dict[str, str]:
@@ -309,6 +337,9 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
                 "config reload: these changed but need a restart to take "
                 "effect: %s", summary["restart_required"],
             )
+        # After the comparison, so the change above is reported; before the
+        # hand-over, so no holder ever sees the un-pinned value.
+        _carry_startup_pinned(old_config, new_config)
         stale = _repoint(new_config, engine, cron_service)
         if stale:
             # The config itself loaded, so this is its own line: the daemon is

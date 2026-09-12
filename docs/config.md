@@ -238,7 +238,7 @@ A reload is always explicit. Two things cause one:
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | ✅ read per request. Only the gateway's own auth: the MCP endpoint checks `/mcp/v1` against the `auth.jwt_secret` it was mounted with, so rotating that secret is half-hot (see the restart table). `auth.jwt_expiry_hours` governs tokens minted *after* the reload; already-issued tokens keep the window they were signed with until they next slide |
+| Web gateway auth (`auth.*`) | partly. `auth.password_hash` and `auth.jwt_expiry_hours` are read per login/request and follow a reload (`jwt_expiry_hours` governs tokens minted *after* it; already-issued tokens keep the window they were signed with until they next slide). `auth.jwt_secret` and `auth.mode` do not: both are pinned at startup, for the web gateway and the MCP endpoint alike (see the restart table) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -280,7 +280,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
-| `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
+| `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `auth.mode` | startup-only by design: the identity mode is read once at boot and deliberately never follows a reload or a configuration push — an authentication mode that can be changed remotely is one a configuration delivery bug can downgrade. `NERVE_AUTH_MODE` in the environment wins over every file (see [Auth](#auth)) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -304,18 +304,17 @@ as a warning: nothing failed, but the new value is not live yet.
 With no daemon running there is nothing to reload and the command says so. Config
 is read fresh at startup, so `nerve start` already picks the edit up.
 
-It authenticates the way the gateway asks to be authenticated, with the same
-signing secret the daemon resolves at startup (see [Accounts and identity](accounts.md)):
+It authenticates with the same signing secret the daemon pinned at startup (see
+[Accounts and identity](accounts.md)):
 
 - **`auth.jwt_secret` set** → it signs a token with it. If that is not the secret
-  the running daemon started with, the gateway rejects the request and only a
-  restart resolves it.
+  the running daemon started with — the key was changed in config without a
+  restart — the gateway rejects the request and only a restart resolves it.
 - **Unset** → it signs with the secret the daemon generated into `nerve.db` on its
-  first start; this shell is on the same box, so it reads it from there. If the
-  daemon has never started there is no secret anywhere yet: an unlocked gateway is
-  not asking for a token either, so the call goes unauthenticated, while a locked
-  one is refused before anything is sent — if the secret is meant to come from
-  `${ENV_VAR}`, export it in that shell too.
+  first start; this shell is on the same box, so it reads it from there. With no
+  secret anywhere the daemon has never started, and the command refuses before
+  sending anything: the gateway takes no unauthenticated request, locked or not.
+  If the secret is meant to come from `${ENV_VAR}`, export it in that shell too.
 
 `auth.password_hash` is not an alternative here. It gates the browser login, which
 is what mints a token from it; `require_auth` reads `auth.jwt_secret` alone, so a
@@ -1237,7 +1236,7 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 |-----|------|---------|-------------|
 | `auth.mode` | string | `local` | How the instance learns who is making a request. `local` — local accounts plus a session, authority decided in process — is the only value this version accepts; anything else is a hard error at startup and in `nerve config validate`. Startup-only (see the restart table). `NERVE_AUTH_MODE` in the environment overrides every file, so the mode can be pinned where the service is defined and no configuration push can change it |
 | `auth.password_hash` | string | - | bcrypt hash for login. Unset means passwordless: every caller who can reach the gateway acts as the owner, which is only sensible on a loopback or otherwise private bind |
-| `auth.jwt_secret` | string | - | JWT signing secret. Optional: when unset, one is generated on first start and kept in `nerve.db` (never written into a config file); a configured value always wins over the stored one, so setting it later simply rotates the secret and logs every tab out once. See [Accounts and identity](accounts.md) |
+| `auth.jwt_secret` | string | - | JWT signing secret. Optional: when unset, one is generated on first start and kept in `nerve.db` (never written into a config file); a configured value wins over the stored one at startup, so setting it later rotates the secret at the next restart and logs every tab out once. Pinned for the life of the process — a reload cannot change or remove it (see the restart table). See [Accounts and identity](accounts.md) |
 
 ## API Keys (config.local.yaml)
 

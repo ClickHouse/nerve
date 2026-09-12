@@ -25,7 +25,7 @@ from nerve.db import Database
 @pytest.mark.asyncio
 class TestTaskBoardRoutes:
     @pytest_asyncio.fixture
-    async def setup(self, db: Database, tmp_path):
+    async def setup(self, db: Database, tmp_path, bypass_auth):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -39,11 +39,8 @@ class TestTaskBoardRoutes:
         (workspace / "memory" / "tasks" / "active").mkdir(parents=True)
         (workspace / "memory" / "tasks" / "done").mkdir(parents=True)
 
-        # require_auth reads get_config().auth.jwt_secret — an empty secret
-        # makes it a no-op.
         cfg = NerveConfig()
         cfg.workspace = workspace
-        cfg.auth.jwt_secret = ""
         cfg_mod._config = cfg
 
         # build_route_tool_context() pulls collaborators off the engine; the
@@ -59,6 +56,7 @@ class TestTaskBoardRoutes:
 
         app = FastAPI()
         app.include_router(tasks_router)
+        bypass_auth(app)  # these routes are not about auth
 
         yield SimpleNamespace(
             client=TestClient(app), db=db, workspace=workspace, cfg=cfg,
