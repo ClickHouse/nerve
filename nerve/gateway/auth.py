@@ -110,9 +110,34 @@ SYSTEM_SUBJECT = "agent-system"
 LEGACY_SUBJECT = "user"
 
 
+def hash_password(plain: str) -> str:
+    """bcrypt-hash a password for storage on an account row.
+
+    The same construction the installer uses for ``auth.password_hash``
+    (:mod:`nerve.bootstrap`), at bcrypt's default cost, so a hash produced here
+    and one produced there are interchangeable — which is what lets PR 3's
+    startup migration *copy* the configured hash onto the account row instead of
+    re-hashing it and changing somebody's password.
+    """
+    if not plain:
+        raise ValueError("a password is required")
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash."""
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    """Verify a plaintext password against a bcrypt hash.
+
+    ``False`` — never an exception — when ``hashed`` is not a bcrypt hash at
+    all. An operator can put anything in ``auth.password_hash``, and a
+    credential that cannot be parsed must read as "does not match" rather than
+    as a 500 that tells the caller their guess was interesting.
+    """
+    if not plain or not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
 
 
 def session_expiry_hours() -> int:
