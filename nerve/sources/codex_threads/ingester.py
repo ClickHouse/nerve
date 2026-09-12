@@ -16,7 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from nerve.agent.streaming import broadcaster as default_broadcaster
-from nerve.identity import system_actor_or_none
+from nerve.identity import system_actor
 from nerve.sources.codex_threads.base import (
     SessionMeta,
     ThreadEvent,
@@ -199,9 +199,7 @@ class CodexIngester:
             cwd=meta.cwd,
             # The sync created this row, not a person — the Codex thread it
             # mirrors was started outside Nerve entirely.
-            actor=await system_actor_or_none(
-                self.db, context=f"Codex thread ingest ({self.origin_id})",
-            ),
+            actor=await system_actor(self.db),
         )
         await self.db.bind_native_thread("codex", meta.thread_id, session_id)
         logger.info(
@@ -328,10 +326,7 @@ class CodexIngester:
         # keep their own authorship and stay unattributed, exactly like a
         # native turn's.
         actor = (
-            await system_actor_or_none(
-                self.db, context=f"Codex thread ingest ({self.origin_id})",
-            )
-            if msg.role == "user" else None
+            await system_actor(self.db) if msg.role == "user" else None
         )
         try:
             inserted = await self.db.add_message_idempotent(
