@@ -127,6 +127,52 @@ guessing at it.
 `/setup` is where an instance that has never been set up opens instead of the
 chat: one account, no password, no username. It is skippable and points here.
 
+### Attribution
+
+Who sent a message and who started a session, for installs where more than one
+person shares the agent.
+
+Sessions and messages store an *actor id* and never a name. The UI turns the id
+into a name at render time from `GET /api/actors`, so renaming somebody changes
+every label and rewrites no stored row. Nothing caches a name: the map is held
+in memory by `actorStore`, never in `localStorage`, and never written onto a
+message or session object.
+
+**Where labels appear.** A label has to earn its space by telling two things
+apart, so it is not shown everywhere an id exists:
+
+- **A message** is labelled with its sender's name when the sender is the
+  agent's own principal, or when two or more distinct people have spoken in
+  that session. One person talking to themselves — every conversation on a
+  single-account install — shows no labels at all. The first message from a
+  second person labels the earlier ones too, because that is the moment they
+  became ambiguous.
+- **A session list row** is marked under the same rule: a glyph for sessions the
+  agent started itself, a truncated name for a person once a second person has
+  started something. The System group is not marked; its rows already carry the
+  agent glyph.
+- **The chat header** names the creator of the open session whenever there is
+  one, without waiting for a second person: it describes one session, so it is
+  an answer rather than a repetition. It hides below the `md` breakpoint, like
+  the backend and model chips beside it.
+
+**The null rule.** `actor_id` and `created_by_actor_id` are frequently `null`,
+and `null` renders *exactly* as the UI did before attribution existed: no chip,
+no placeholder, no "unknown user". That covers every assistant and tool row
+(their authorship is their role), everything recorded before the columns
+existed, and the optimistic bubble of a message you have just sent, which has no
+id until the server's copy comes back.
+
+**Names are snapshots.** An actor with no display name, and an id this instance
+does not know, both read `Unnamed account`; the raw id is in the tooltip, never
+in the label. The agent's own principal reads `Nerve` with a bot glyph and a
+tooltip saying it is scheduled or autonomous work. The map is re-read once per
+app session, again when an id it has not seen appears (somebody added in another
+tab), and again after every mutation on `/accounts` — which is what makes a
+rename show up in the chat without a reload. An id that a completed read did not
+know is never requested again, so history pointing at an actor this instance has
+never had costs one request rather than one per render.
+
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
 - **System** — Hostname, platform, memory (RSS), disk usage
@@ -171,6 +217,9 @@ cd web && npx vite build
 
 Uses Zustand for lightweight state management:
 - `authStore` — Login/logout, token management
+- `actorStore` — The actor id → display name map behind attribution labels. In
+  memory only and re-read rather than remembered, so a rename is visible without
+  a reload and no stale name can outlive it
 - `chatStore` — Sessions, messages, streaming state, agent status, side panel state (tabs, visibility, width), pending interactions (mid-turn user input), sidebar collapsed state, text selection quotes, modified files tracking. WebSocket message handling is dispatched to domain-specific handler modules under `handlers/`, with stateless helpers under `helpers/`.
 - `taskStore` — Task list, search, filters, detail view with content editing
 - `skillsStore` — Skills list with usage stats, detail view with SKILL.md editor, create/update/delete/toggle, filesystem sync
