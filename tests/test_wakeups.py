@@ -224,6 +224,60 @@ class TestWakeupSweep:
         svc.engine.run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_a_failed_lookup_leaves_the_wakeup_for_the_next_sweep(self, svc):
+        """Claiming is what consumes a wakeup: pending -> fired, and a fired
+        row is never selected again. So anything that can fail has to fail
+        before the claim, or the prompt is gone and nothing retries it."""
+        await svc.db.add_wakeup("s1", prompt="ping", fire_at=_past())
+        real = svc.db.get_system_principal
+
+        async def _no_principal():
+            return None
+
+        svc.db.get_system_principal = _no_principal
+        await svc._sweep_wakeups()
+        await asyncio.sleep(0.05)
+
+        svc.engine.run.assert_not_called()
+        assert len(await svc.db.list_pending_wakeups("s1")) == 1, (
+            "the wakeup was consumed by a failure that delivered nothing"
+        )
+
+        svc.db.get_system_principal = real
+        await svc._sweep_wakeups()
+        await asyncio.sleep(0.05)
+
+        svc.engine.run.assert_awaited_once()
+        assert await svc.db.list_pending_wakeups("s1") == []
+
+    @pytest.mark.asyncio
+    async def test_one_bad_wakeup_does_not_abandon_the_rest(self, svc):
+        """A sweep is a batch of unrelated rows; one that cannot be dispatched
+        must not take the others with it."""
+        await svc.db.create_session("s2", source="web", actor=None)
+        await svc.db.add_wakeup("s1", prompt="first", fire_at=_past())
+        await svc.db.add_wakeup("s2", prompt="second", fire_at=_past())
+
+        real_claim = svc.db.claim_wakeup
+        calls = {"n": 0}
+
+        async def _first_claim_explodes(wakeup_id: int) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("database hiccup")
+            return await real_claim(wakeup_id)
+
+        svc.db.claim_wakeup = _first_claim_explodes
+        await svc._sweep_wakeups()
+        await asyncio.sleep(0.05)
+        svc.db.claim_wakeup = real_claim
+
+        svc.engine.run.assert_awaited_once()
+        assert svc.engine.run.await_args.kwargs["user_message"] == "second"
+        # The one that failed is still pending, so the next sweep retries it.
+        assert len(await svc.db.list_pending_wakeups("s1")) == 1
+
+    @pytest.mark.asyncio
     async def test_no_double_fire_across_sweeps(self, svc):
         await svc.db.add_wakeup("s1", prompt="ping", fire_at=_past())
         await svc._sweep_wakeups()
