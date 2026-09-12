@@ -1178,13 +1178,32 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] SSL not configured")
 
-    # Check auth
-    if config.auth.password_hash:
-        lines.append("[OK] Auth password hash configured")
-    else:
+    # Check auth. The credential lives on the account row, not in configuration:
+    # the startup migration copied auth.password_hash across and removed the key,
+    # so reading it here would call a perfectly well-secured install
+    # "passwordless". Read-only, and tolerant of a database that does not exist
+    # yet (None) — that is a fresh install, which the wizard is about to shape.
+    from nerve.db.accounts import list_credential_sources_readonly
+
+    sources = list_credential_sources_readonly(paths.db_path())
+    if sources is None:
+        lines.append("[--] Accounts: nerve.db not created yet (first start will)")
+    elif not sources:
+        warnings.append("[WARN] No local account yet — the next start creates one")
+    elif all(source == "none" for source in sources):
         warnings.append(
-            "[WARN] Auth password not set — passwordless: anyone who can reach "
+            "[WARN] No password set — passwordless: anyone who can reach "
             "the gateway acts as the owner"
+        )
+    else:
+        with_password = sum(1 for source in sources if source != "none")
+        lines.append(
+            f"[OK] Accounts: {len(sources)} ({with_password} with a password)"
+        )
+    if config.auth.password_hash and "config" not in (sources or []):
+        warnings.append(
+            "[WARN] auth.password_hash is set but no account uses it — every "
+            "account has its own password now; the configured value does nothing"
         )
 
     if config.auth.jwt_secret:
