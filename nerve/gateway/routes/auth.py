@@ -95,6 +95,13 @@ _DECOY_HASH = "$2b$12$WSa90bUaYgZg94/cwtxqZuKQBrzC2BJA1MSEO/le348QlaMVKoaty"
 # what holds the line until then.
 _FAILURE_BUDGET_FLOOR_SECONDS = 0.05
 _FAILURE_BUDGET_CAP_SECONDS = 2.0
+# The budget sits this far above the comparison it was measured from. Without
+# the headroom it lands exactly on one, ordinary variation in the next
+# comparison steps over it, and the high-water mark ratchets the budget up over
+# a process's life — which does not say which account was named, but does make a
+# process's later failures slower than its earlier ones for no reason. With it,
+# real comparisons stay underneath and the budget settles on one value.
+_FAILURE_BUDGET_HEADROOM = 1.25
 _failure_budget: float | None = None
 
 
@@ -111,11 +118,15 @@ def _failure_budget_seconds() -> float:
     if _failure_budget is None:
         started = time.monotonic()
         verify_password("measuring the login response budget", _DECOY_HASH)
-        _failure_budget = min(
-            _FAILURE_BUDGET_CAP_SECONDS,
-            max(_FAILURE_BUDGET_FLOOR_SECONDS, time.monotonic() - started),
-        )
+        _failure_budget = _bounded((time.monotonic() - started) * _FAILURE_BUDGET_HEADROOM)
     return _failure_budget
+
+
+def _bounded(seconds: float) -> float:
+    return min(
+        _FAILURE_BUDGET_CAP_SECONDS,
+        max(_FAILURE_BUDGET_FLOOR_SECONDS, seconds),
+    )
 
 
 def _set_failure_budget(seconds: float | None) -> None:
@@ -134,7 +145,7 @@ def _observe_comparison(seconds: float) -> None:
     """
     global _failure_budget
     if _failure_budget is not None and seconds > _failure_budget:
-        _failure_budget = min(_FAILURE_BUDGET_CAP_SECONDS, seconds)
+        _failure_budget = _bounded(seconds * _FAILURE_BUDGET_HEADROOM)
 
 
 def _timed_verify(plain: str, hashed: str) -> bool:
