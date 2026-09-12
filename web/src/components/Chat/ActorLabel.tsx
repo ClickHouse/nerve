@@ -111,6 +111,12 @@ export function SessionCreator({ actorId }: { actorId: string | null | undefined
  * sessions, which need no name because there is only ever one of it, and a
  * truncated name for a person, which is the whole point when two people share
  * a sidebar. As with messages, whether it appears is the caller's decision.
+ *
+ * `text-dim` rather than the `text-faint` the row's other trailing markers use,
+ * because the *selected* row's background is `bg-accent/10` over the surface,
+ * and the ramp in `index.css` is solved against the three flat backgrounds
+ * rather than that tint. Measured with axe on the real page: `text-faint` lands
+ * at 3.72:1 there, under AA; `text-dim` clears it in both themes.
  */
 export function SessionCreatorMarker({ actorId }: { actorId: string | null | undefined }) {
   const attribution = useAttribution(actorId);
@@ -123,7 +129,7 @@ export function SessionCreatorMarker({ actorId }: { actorId: string | null | und
         role="img"
         aria-label={label}
         title={label}
-        className="shrink-0 flex items-center text-text-faint"
+        className="shrink-0 flex items-center text-text-dim"
       >
         <Bot size={11} />
       </span>
@@ -133,7 +139,7 @@ export function SessionCreatorMarker({ actorId }: { actorId: string | null | und
     <span
       data-attribution="session-row"
       title={label}
-      className="shrink-0 max-w-[4.5rem] truncate text-2xs text-text-faint"
+      className="shrink-0 max-w-[4.5rem] truncate text-2xs text-text-dim"
     >
       {attribution.name}
     </span>
