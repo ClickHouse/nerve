@@ -15,7 +15,7 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_v039_backfills_null_backend_to_claude(db):
-    await db.create_session("legacy", backend="claude")
+    await db.create_session("legacy", backend="claude", actor=None)
     await db._write("UPDATE sessions SET backend = NULL WHERE id = ?", ("legacy",))
     await apply_v039(db.db)
     await db.db.commit()
@@ -24,7 +24,7 @@ async def test_v039_backfills_null_backend_to_claude(db):
 
 
 async def test_legacy_null_row_never_uses_changed_global_default(db, tmp_path):
-    await db.create_session("legacy", backend="claude")
+    await db.create_session("legacy", backend="claude", actor=None)
     await db._write("UPDATE sessions SET backend = NULL WHERE id = ?", ("legacy",))
     cfg = NerveConfig.from_dict({
         "workspace": str(tmp_path),
@@ -39,14 +39,14 @@ async def test_legacy_null_row_never_uses_changed_global_default(db, tmp_path):
 async def test_fork_inherits_backend_model_and_cwd(db, tmp_path):
     manager = SessionManager(db)
     await db.create_session(
-        "parent", backend="codex", model="gpt-test", cwd=str(tmp_path),
+        "parent", backend="codex", model="gpt-test", cwd=str(tmp_path), actor=None,
     )
     await db.update_session_fields("parent", {"sdk_session_id": "thread-p"})
-    await db.add_message("parent", "user", "q")
+    await db.add_message("parent", "user", "q", actor=None)
     anchor = await db.add_message(
-        "parent", "assistant", "a", native_turn_id="turn-1",
+        "parent", "assistant", "a", native_turn_id="turn-1", actor=None,
     )
-    fork = await manager.fork_session("parent", at_message_id=str(anchor))
+    fork = await manager.fork_session("parent", at_message_id=str(anchor), actor=None)
     row = await db.get_session(fork["id"])
     assert row["backend"] == "codex"
     assert row["model"] == "gpt-test"
@@ -55,10 +55,10 @@ async def test_fork_inherits_backend_model_and_cwd(db, tmp_path):
 
 
 async def test_native_turn_lookup_and_thread_mapping(db):
-    await db.create_session("s1", backend="codex")
-    user_id = await db.add_message("s1", "user", "question")
+    await db.create_session("s1", backend="codex", actor=None)
+    user_id = await db.add_message("s1", "user", "question", actor=None)
     assistant_id = await db.add_message(
-        "s1", "assistant", "answer", native_turn_id="turn-1",
+        "s1", "assistant", "answer", native_turn_id="turn-1", actor=None,
     )
     assert await db.get_native_turn_at_message("s1", user_id) == "turn-1"
     assert await db.get_native_turn_at_message("s1", assistant_id) == "turn-1"
@@ -89,12 +89,12 @@ async def test_codex_engine_run_persists_reloadable_output(
         session_id,
         title="Persistence test",
         source="web",
-        backend="codex",
+        backend="codex", actor=None,
     )
 
     try:
         response = await engine.run(
-            session_id, "hello", source="web", channel="web",
+            session_id, "hello", source="web", channel="web", actor=None,
         )
         assert response == "Hello "
 
@@ -114,7 +114,7 @@ async def test_codex_engine_run_persists_reloadable_output(
 
 
 async def test_chatgpt_estimate_is_not_billed_cost(db):
-    await db.create_session("s1", backend="codex")
+    await db.create_session("s1", backend="codex", actor=None)
     await db.record_turn_usage(
         "s1", 10, 5, 0, 0, 100,
         model="gpt-test",

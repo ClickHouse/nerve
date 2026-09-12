@@ -23,7 +23,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
-from nerve.identity import Actor
+from nerve.identity import Actor, system_actor_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +153,8 @@ async def approve_plan(
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
     await deps.engine.sessions.get_or_create(
         impl_session_id, title=f"Implement: {task['title']}", source="web",
+        # The session exists because this person approved the plan.
+        actor=actor,
     )
     await deps.db.update_plan(plan_id, impl_session_id=impl_session_id)
 
@@ -222,10 +224,19 @@ async def approve_plan(
     # session (without registration, the asyncio.Task is invisible to
     # `engine.stop_session` and the only way to recover is a daemon
     # restart).
+    # The prompt is assembled by Nerve from the task file and the approved
+    # plan — nobody typed it — so the turn is the instance's own work even
+    # though a person's approval started it. The session above carries who
+    # approved.
+    impl_actor = await system_actor_or_none(
+        deps.db, context=f"implementation of plan {plan_id}",
+    )
+
     async def _run_impl():
         try:
             await deps.engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
+                actor=impl_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

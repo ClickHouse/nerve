@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nerve.identity import system_actor_or_none
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
 
@@ -491,7 +492,7 @@ class NotificationService:
         # dispatcher. The old ``is_running`` skip here silently dropped
         # answers that arrived while the session was busy.
         try:
-            self._dispatch_into_session(
+            await self._dispatch_into_session(
                 session_id,
                 injected_message,
                 source=f"notification:{answered_by}",
@@ -680,7 +681,7 @@ class NotificationService:
                 exc, event.get("event"),
             )
 
-    def _dispatch_into_session(
+    async def _dispatch_into_session(
         self,
         session_id: str,
         message: str,
@@ -696,7 +697,21 @@ class NotificationService:
         any in-flight turn and runs when it finishes (FIFO) — the
         wakeup-dispatcher pattern. Never skip-on-busy here; that drops
         the message.
+
+        Async only so the actor can be resolved *before* the task is spawned.
+        Resolving it inside the task would put an ``await`` in front of the
+        lock acquisition, and two answers dispatched in quick succession
+        could then reach the session in the other order — the exact FIFO
+        property this method exists to provide.
         """
+        # The text is this service's — an answer relayed into the session, or
+        # a redelivery notice. The person who answered is recorded on the
+        # notification itself; putting them on the agent's prompt would be the
+        # wrong claim, and 0.7 defers notification-answer attribution past
+        # this gate anyway.
+        actor = await system_actor_or_none(
+            self.db, context="notification dispatch",
+        )
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -704,6 +719,7 @@ class NotificationService:
                 source=source,
                 channel=channel,
                 internal=internal,
+                actor=actor,
             )
         )
         task.add_done_callback(self._on_answer_task_done)
@@ -1271,7 +1287,7 @@ class NotificationService:
             )
             message = f"[Questions expired unanswered]\n{titles}"
 
-        self._dispatch_into_session(
+        await self._dispatch_into_session(
             session_id,
             message,
             source="notification:expiry",
