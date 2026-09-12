@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { api, getToken, type Account } from '../api/client';
+import { api, type Account } from '../api/client';
+import { useActorStore } from './actorStore';
 import { useAuthStore } from './authStore';
 
 /**
@@ -54,12 +55,16 @@ function upsert(accounts: Account[], account: Account): Account[] {
 }
 
 /**
- * Re-read the list and `/api/auth/status`. Returns the failure, or `null`.
+ * Re-read the list, `/api/auth/status`, and the actor map. Returns the failure,
+ * or `null`.
  *
  * The status half is not laziness: both of the things this screen does —
  * setting the first password, adding the second account — change how the *login
  * form* behaves, and a stale descriptor would leave a tab auto-logging-in or
  * asking for the wrong fields.
+ *
+ * Refreshing the actor map makes a renamed account visible in chat without a
+ * page reload; messages store actor ids rather than names.
  *
  * A refresh failure is not a mutation failure. Once the write has committed,
  * reporting a redraw problem as a failed write can make the caller retry a
@@ -69,42 +74,24 @@ function upsert(accounts: Account[], account: Account): Account[] {
 async function resync(
   set: (partial: Partial<AccountState>) => void,
 ): Promise<unknown | null> {
-  // Both, independently. They answer different questions of different servers'
-  // worth of state, and the list failing used to skip the status refresh
-  // entirely — so an install that had just set its first password or added its
-  // second account could be left with `loginMode` describing
-  // the instance it was five seconds ago, purely because a list request
-  // happened to fail.
-  const sessionToken = getToken();
-  const identity = useAuthStore.getState().account;
-  const [listOutcome, identityOutcome] = await Promise.allSettled([
+  // All three, independently. They answer different questions of different
+  // servers' worth of state, and the list failing used to skip the status
+  // refresh entirely — so an install that had just set its first password or
+  // added its second account could be left with `loginMode`
+  // describing the instance it was five seconds ago, purely because a list
+  // request happened to fail. A rename whose label never updated because the
+  // list redraw failed is the same bug wearing different clothes.
+  const [listOutcome] = await Promise.allSettled([
     api.listAccounts(),
-    identity ? Promise.resolve(identity) : api.getOwnAccount(),
-    // refreshStatus swallows its own failures and keeps the last known answer.
+    // Both of these swallow their own failures and keep the last known answer.
     useAuthStore.getState().refreshStatus(),
+    useActorStore.getState().refresh(),
   ]);
-  const auth = useAuthStore.getState();
-  if (
-    !identity
-    && identityOutcome.status === 'fulfilled'
-    && identityOutcome.value
-    && auth.authenticated
-    && !auth.account
-    && getToken() === sessionToken
-  ) {
-    useAuthStore.setState({
-      account: {
-        id: identityOutcome.value.id,
-        username: identityOutcome.value.username,
-      },
-    });
-  }
   if (listOutcome.status === 'rejected') {
     set({ loading: false });
     return listOutcome.reason;
   }
   set({ accounts: listOutcome.value.accounts, loading: false });
-  if (identityOutcome.status === 'rejected') return identityOutcome.reason;
   return null;
 }
 
