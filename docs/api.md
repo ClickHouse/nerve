@@ -137,6 +137,32 @@ nobody.
 Disabling takes effect at the account's **next** request, not retroactively, and
 an open WebSocket keeps the identity it was accepted with until it reconnects.
 
+### Actors
+
+An actor is *who* something is attributed to: a person, or the agent's system
+principal. Sessions and messages store an actor id, never a name, so this is
+where a name is looked up at render time — a rename changes every label and
+moves no stored row.
+
+```json
+{ "id": "…", "kind": "human", "display_name": "Alice", "profile_version": 3 }
+```
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/actors` | `{ "actors": [...] }`, oldest first. One row per person plus the system principal, so a single call labels a whole list |
+| `GET /api/actors/{id}` | one actor; `404` if no such actor |
+
+`kind` is `human` or `system`. `profile_version` advances on every rename, so a
+client can tell a stale cached name from a current one without comparing
+strings.
+
+This is an identity, not an account: nothing from `accounts` appears here (no
+username, no `enabled`, no `has_password`), and an actor need not have an
+account at all — the system principal does not. A disabled person's actor is
+still readable, because their history stays in the UI after their access ends.
+Email is never published: it is always NULL on a local install.
+
 #### `GET /api/auth/check`
 Verify current authentication.
 
@@ -187,8 +213,14 @@ Create a new session.
 
 ```json
 Request:  { "title": "My Session" }
-Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web" }
+Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…" }
 ```
+
+`created_by_actor_id` is whoever the request resolved to — an actor id for
+[`GET /api/actors`](#actors), not an account id. It is `null` on sessions that
+predate attribution, and on the ones the instance creates for itself when
+identity bootstrap has not run. Every session payload carries it, including the
+sidebar feeds above.
 
 #### `GET /api/sessions/{id}`
 Get session details.
@@ -197,8 +229,15 @@ Get session details.
 Get messages for a session.
 
 ```json
-Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "..." }] }
+Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…" }] }
 ```
+
+`actor_id` is who supplied the message: the person who typed it, or the agent's
+system principal for a prompt the instance composed for itself (a cron job, a
+wakeup, a channel message). It is `null` on assistant and tool rows — their
+authorship is `role` — and on everything recorded before attribution existed.
+`channel` stays transport provenance and is never identity. See
+[Accounts and identity](accounts.md) for what is and is not attributed.
 
 #### `DELETE /api/sessions/{id}`
 Delete a session (cannot delete "main"). Disconnects any active SDK client before deletion.
@@ -743,6 +782,10 @@ fresh.
 
 // Error occurred
 { type: "error", session_id: "main", error: "..." }
+
+// Another client of this session sent a message (the sender sees its own
+// optimistically; actor_id is who sent it, matching the stored row)
+{ type: "user_message", session_id: "main", content: "Hello", blocks: null, actor_id: "…" }
 
 // Session switch confirmed (includes running state, lifecycle status, buffered events for reconnect)
 { type: "session_status", session_id: "abc123", is_running: true, status: "active", buffered_events: [...] }

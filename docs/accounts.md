@@ -329,6 +329,75 @@ logging every open tab out on upgrade would be a poor trade. So:
 The acceptance is temporary and is removed in a later release. Nothing mints
 that shape any more.
 
+## What gets attributed, and what does not
+
+Two nullable columns hold the answer, and both hold an **actor id** — never a
+name:
+
+| Column | Means |
+|---|---|
+| `sessions.created_by_actor_id` | who caused this session to exist |
+| `messages.actor_id` | whose input this message records |
+
+A name is a snapshot. Storing one would freeze it the moment somebody is
+renamed, so the id is what is stored and the name is looked up when something
+is displayed (`GET /api/actors`). Renaming an account changes every label and
+rewrites nothing.
+
+**Who ends up on a row:**
+
+| The row | The actor |
+|---|---|
+| A session you created — from the sidebar, a fork, an approved plan | you |
+| A message you typed — in the browser, over the WebSocket, through `/api/chat`, or composed and deferred with "run later" | you |
+| A session or a prompt the instance produced for itself — a cron generation, a scheduled wakeup, a webhook, a workflow leg, a plan's implementation prompt, a relayed notification answer | the agent's system principal |
+| A Telegram or Slack message | the system principal — see below |
+| An MCP satellite session, or a Codex thread the sync ingested | the system principal |
+| Anything the assistant or a tool produced, including Nerve's own status lines written in the assistant's voice | nobody — the column stays `NULL` |
+
+The dividing line for a message is **who supplied the content**. A person
+clicking "approve" on a plan gets the implementation session, because they
+caused it; the implementation prompt itself is the instance's, because nobody
+typed it. Recording the person on the *earlier* action — the approval, the
+schedule, the task edit — is a separate row of the attribution map and is not
+implemented yet.
+
+Assistant and tool rows stay unattributed on purpose. Their authorship is
+`role`, and turning "the model answered" into "a person wrote this" would be
+false. Linking a turn back to whoever prompted it is a separate column
+(`caused_by_actor_id`) that this release does not add.
+
+**Channel messages are the agent's, for now.** Telegram and Slack senders are
+provider identities, and matching one to a local account needs a mapping table
+Nerve does not have. The alternatives were guessing from a display name — which
+is exactly what an identity system must never do — or refusing the message, so
+channel traffic is recorded as received by the instance. The transport and the
+sender are still on the message as provenance; they are simply not identity.
+
+**History from before this version says nothing about who wrote it**, and that
+is deliberate. Both columns are `NULL` on every pre-existing row, nothing is
+backfilled, and no actor is inferred from a session's `source` or a message's
+`channel`: those are legacy provenance strings, not identity bindings, and
+turning them into attribution would invent an audit trail that never existed.
+Anything reading these columns has to treat `NULL` as "not recorded" rather
+than as an error.
+
+**A stored id always resolves.** Both columns reference `actor_refs(id)`, so an
+id that names nobody cannot be written — attribution nobody can look up would
+render as a blank name. That is safe precisely because actor rows are never
+deleted and accounts are tombstoned rather than removed (above). `NULL` is
+exempt, so unattributed history is unaffected.
+
+**Ids are permanent.** If an install later moves to an external identity
+provider, work done before the move keeps the local actor ids it has now and
+new work gets the provider's, with nothing merged and no history rewritten. The
+same person can legitimately appear as two actors, and both are real.
+
+What is *not* attributed yet, and is known to be missing: renaming, archiving,
+deleting, stopping or resuming a session; task and schedule changes; who
+answered a notification; and who requested or decided a workflow or a review.
+Those are the remaining rows of the attribution map.
+
 ## The signing secret
 
 Session tokens are signed with `auth.jwt_secret` when it is configured. When it
