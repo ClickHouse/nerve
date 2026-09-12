@@ -14,9 +14,12 @@ Request:  { "password": "...", "username": "alice" }
 Response: { "token": "eyJ..." }
 ```
 
-`username` is **required once two or more accounts exist, and must be omitted
-before that** — the account an upgrade created has none. Ask
-`GET /api/auth/status` which applies rather than guessing.
+`username` is **optional while exactly one account exists and required once
+there are two or more.** The account an upgrade created has none, so requiring
+one would lock that install out; supplying a username that does resolve is
+accepted at any time, so a client that always sends one keeps working the moment
+the account is named. Ask `GET /api/auth/status` which shape to collect rather
+than guessing.
 
 With no password anywhere — none on the account row and no `auth.password_hash`
 — the install is passwordless: any password is accepted and the token resolves
