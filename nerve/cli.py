@@ -253,10 +253,10 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
             return
 
     if non_interactive:
-        run_non_interactive(config_dir)
+        choices = run_non_interactive(config_dir)
     else:
         wizard = SetupWizard(config_dir, inside_docker=inside_docker)
-        wizard.run()
+        choices = wizard.run()
 
     # Remember where the config lives so every future `nerve` command
     # finds it regardless of the caller's working directory.
@@ -266,6 +266,28 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     config = load_config(config_dir)
     set_config(config)
     ctx.obj["config"] = config
+
+    # Create the local owner account now, while the name the wizard collected
+    # ("Your name") is still in hand: nothing the wizard writes carries it, and
+    # the gateway's own bootstrap at first start would otherwise create the
+    # owner unnamed. Headless installs collect no name and get an unnamed owner
+    # (renameable later). This runs in the process that ran the wizard — inside
+    # the container for a docker install, which is where `--inside-docker` runs;
+    # the host-side wizard for docker never reaches this point.
+    from nerve.migrate import bootstrap_identity_sync
+
+    display_name = (choices.user_name or "").strip() or None
+    try:
+        report = bootstrap_identity_sync(config, display_name=display_name)
+    except Exception as e:  # noqa: BLE001 — the gateway repeats this at first start
+        click.secho(
+            f"  The local account could not be created now ({e}); it will be "
+            "created when Nerve first starts.",
+            fg="yellow",
+        )
+    else:
+        for action in report.identity_actions:
+            click.echo(f"  {action}")
 
 
 @main.command()

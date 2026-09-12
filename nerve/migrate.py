@@ -1029,9 +1029,11 @@ async def bootstrap_identity(
     anything mints or verifies a token. Idempotent and cheap on a re-run:
     finds the same rows, changes nothing that exists, and returns the same
     ids. Only ``accounts`` being empty creates an account (1.5 of the
-    sequence); ``display_name`` is applied to that new owner only and is
-    ``None`` unless the caller knows better — the interactive installer's
-    "Your name" answer is not persisted anywhere the runtime can read.
+    sequence); ``display_name`` is applied to that new owner only. The
+    interactive installer passes the name it collected ("Your name") — it
+    runs this in-process before exiting, since nothing it writes carries the
+    answer — while the gateway's own pass at startup has none to give, so an
+    owner it creates is unnamed until renamed.
 
     One thing is re-derived on every run: while the owner's
     ``credential_source`` is ``config`` or ``none`` — both meaning "the
@@ -1215,14 +1217,46 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
         report.identity_actions.append(_secret_action(dry_run=True))
 
 
+def bootstrap_identity_sync(
+    config: NerveConfig, *, display_name: str | None = None,
+) -> MigrationReport:
+    """The identity bootstrap from synchronous code, on a fresh connection.
+
+    For the installer: ``nerve init`` has the owner's name in hand only while
+    it runs, so it creates the owner here rather than leaving that to the
+    gateway's first start, which would create it unnamed. Unlike the CLI
+    migration pass this does not skip a "fresh" install — the installer has
+    just written the configuration — and it never dry-runs. Raises on
+    failure; the caller decides how loudly to say so, since the gateway
+    repeats the bootstrap at first start regardless.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "bootstrap_identity_sync() cannot run inside an event loop; "
+            "await bootstrap_identity() instead"
+        )
+    report = MigrationReport()
+    asyncio.run(
+        _bootstrap_with_own_connection(config, paths.db_path(), report, display_name)
+    )
+    return report
+
+
 async def _bootstrap_with_own_connection(
-    config: NerveConfig, db_path: Path, report: MigrationReport,
+    config: NerveConfig,
+    db_path: Path,
+    report: MigrationReport,
+    display_name: str | None = None,
 ) -> None:
     from nerve.db import Database
 
     db = Database(db_path, workspace=config.workspace)
     await db.connect()
     try:
-        await bootstrap_identity(db, config, report=report)
+        await bootstrap_identity(db, config, report=report, display_name=display_name)
     finally:
         await db.close()
