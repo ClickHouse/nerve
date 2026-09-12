@@ -537,26 +537,26 @@ class TestLoginState:
     async def test_no_accounts(self, db: Database):
         state = await db.login_state()
         assert (state.accounts, state.single_account) == (0, False)
-        assert not state.passwordless and not state.setup_pending
+        assert not state.passwordless
 
-    async def test_sole_passwordless_unnamed_account_is_setup_pending(self, db: Database):
+    async def test_a_sole_account_with_no_credential_is_passwordless(self, db: Database):
         actor = await db.create_actor_ref(kind="human")
         account = await db.create_account(actor_id=actor["id"], credential_source="none")
         state = await db.login_state()
         assert state == LoginState(
             accounts=1, single_account=True, passwordless=True,
-            setup_pending=True, sole_account_id=account["id"],
+            sole_account_id=account["id"],
         )
 
-    async def test_naming_the_sole_account_ends_setup_without_ending_passwordless(
-        self, db: Database,
-    ):
+    async def test_naming_it_does_not_make_it_secure(self, db: Database):
+        """A named account with no password is still an open one. The state
+        keys off the credential alone, so setting a username first cannot make
+        an unsecured instance look settled."""
         actor = await db.create_actor_ref(kind="human")
         account = await db.create_account(actor_id=actor["id"], credential_source="none")
         await db.set_account_username(account["id"], "alice")
         state = await db.login_state()
         assert state.passwordless is True
-        assert state.setup_pending is False
 
     @pytest.mark.parametrize("source,credential", [
         ("config", None), ("local", "$2b$12$synthetic"),
@@ -569,7 +569,6 @@ class TestLoginState:
         state = await db.login_state()
         assert state.single_account is True
         assert state.passwordless is False
-        assert state.setup_pending is False
 
     async def test_two_accounts_are_never_single(self, db: Database):
         for _ in range(2):
@@ -577,7 +576,7 @@ class TestLoginState:
             await db.create_account(actor_id=actor["id"], credential_source="none")
         state = await db.login_state()
         assert (state.accounts, state.single_account) == (2, False)
-        assert not state.passwordless and not state.setup_pending
+        assert not state.passwordless
         assert state.sole_account_id is None
 
     async def test_a_disabled_account_still_counts(self, db: Database):
@@ -795,8 +794,7 @@ class TestUpdateAccountLogin:
         assert claimed["username"] == "alice"
         assert claimed["credential_source"] == "local"
         assert claimed["credential"] == "$2b$12$claimed"
-        state = await db.login_state()
-        assert not state.passwordless and not state.setup_pending
+        assert not (await db.login_state()).passwordless
 
     async def test_setting_only_a_password_moves_a_config_row_to_local(self, db: Database):
         actor = await db.create_actor_ref(kind="human")

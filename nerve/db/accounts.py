@@ -176,10 +176,12 @@ class LoginState:
     accounts: int
     single_account: bool
     # Exactly one account and it has no credential at all: any password is
-    # accepted and resolves to it.
+    # accepted and resolves to it. This is also the first-run state PR 6's
+    # wizard claims — deliberately *not* a second field, because a second field
+    # is a second thing to keep in step, and the one that existed keyed off the
+    # username as well and therefore went false when a passwordless account was
+    # merely named. A named account with no password is still an open one.
     passwordless: bool
-    # Passwordless *and* unnamed — the first-run state PR 6's wizard claims.
-    setup_pending: bool
     sole_account_id: str | None = None
 
 
@@ -482,18 +484,13 @@ class AccountStore:
         accounts = await self.list_accounts()
         if len(accounts) != 1:
             return LoginState(
-                accounts=len(accounts),
-                single_account=False,
-                passwordless=False,
-                setup_pending=False,
+                accounts=len(accounts), single_account=False, passwordless=False,
             )
         sole = accounts[0]
-        passwordless = sole["credential_source"] == "none"
         return LoginState(
             accounts=1,
             single_account=True,
-            passwordless=passwordless,
-            setup_pending=passwordless and not sole["username"],
+            passwordless=sole["credential_source"] == "none",
             sole_account_id=sole["id"],
         )
 

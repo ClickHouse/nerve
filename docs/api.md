@@ -78,7 +78,7 @@ Response: {
 |---|---|
 | `mode` | the identity mode. `local` in this build |
 | `login` | what the form must collect: `none` (passwordless — send any password), `password` (one account, no username), `username_password` (two or more) |
-| `setup_pending` | the one account has neither a password nor a username: nothing has been set up yet |
+| `setup_pending` | nothing has been secured yet: the one account has no password, so every caller is admitted as it. Equals `login == "none"` today; it is a separate field because it is the question "is this instance still unsecured", which the setup wizard owns and may widen. Setting a username does **not** clear it |
 | `multiple_accounts` | more than one account exists |
 | `auth_required` | kept for older clients; equals `login != "none"` |
 

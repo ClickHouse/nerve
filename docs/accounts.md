@@ -190,6 +190,11 @@ Login takes a password and, once it is needed, a username.
 right fields without guessing (see [the API reference](api.md)). Existing users
 keep typing just a password and notice nothing.
 
+The same descriptor carries `setup_pending`, which is true while the one account
+has no password — the state a headless install lands in. Giving that account a
+username does not clear it: a named account with no password admits exactly as
+many people as an unnamed one, so only setting a password does.
+
 Wrong username and wrong password give the same answer — a `401` reading
 `Invalid username or password` — and a username that names nobody still costs
 one password comparison, so the endpoint is not a list of who works here,
