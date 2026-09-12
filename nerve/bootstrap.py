@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import secrets
 import shutil
 import subprocess
@@ -438,18 +439,29 @@ def _init_state_file() -> Path:
     return paths.nerve_path("init-state.json")
 
 
+def _private_fd(fd: int) -> bool:
+    """True when the open file carries no group/world permission bits."""
+    try:
+        return (stat.S_IMODE(os.fstat(fd).st_mode) & 0o077) == 0
+    except OSError:
+        return False
+
+
 def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
     """Checkpoint wizard progress. Never breaks the wizard.
 
-    Returns True only when the checkpoint is on disk *and* owner-only. A write
-    that failed, or a file that could not be made 0600 (it holds API keys), is
-    treated as no checkpoint: any partial file is removed and False returned, so
-    a caller that promises the user their answers were kept can tell the truth.
+    Returns True only when the checkpoint is on disk *and* verified owner-only.
+    The file holds API keys, so it is created ``0600`` atomically
+    (``O_CREAT|O_EXCL`` with the mode, read back through the descriptor before
+    a byte is written) and renamed into place; a filesystem that ignores the
+    mode, or any write failure, leaves no checkpoint behind and returns False,
+    so a caller that promises the user their answers were kept tells the truth.
     """
     import dataclasses
     from datetime import datetime
 
     path = _init_state_file()
+    tmp = path.with_name(path.name + ".tmp")
     try:
         data = dataclasses.asdict(choices)
         data["workspace_path"] = str(choices.workspace_path)
@@ -458,15 +470,30 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
             "completed": sorted(completed),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state), encoding="utf-8")
-        os.chmod(path, 0o600)  # contains API keys
+        # The checkpoint lives in the state directory; if this is what creates
+        # it, it is created owner-only (Database.connect refuses a wider one).
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if not _private_fd(fd):
+            os.close(fd)
+            tmp.unlink(missing_ok=True)
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(state))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+            path.unlink(missing_ok=True)
+            return False
         return True
     except OSError:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for p in (tmp, path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
         return False
 
 

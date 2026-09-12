@@ -9,7 +9,9 @@ first start then finds that account rather than creating an unnamed one.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 from pathlib import Path
 
 import bcrypt
@@ -211,7 +213,7 @@ class TestInstallerBootstrapFailure:
         assert stub.checkpoints == 1
 
     def test_the_real_checkpoint_keeps_the_name_and_reports_success(self, tmp_path):
-        from nerve.bootstrap import SetupWizard, _load_init_state
+        from nerve.bootstrap import SetupWizard, _init_state_file, _load_init_state
 
         wizard = SetupWizard(tmp_path)
         wizard.choices.user_name = "alice"
@@ -221,6 +223,30 @@ class TestInstallerBootstrapFailure:
         state = _load_init_state()
         assert state["choices"]["user_name"] == "alice"
         assert set(state["completed"]) == {"mode", "identity"}
+        # It holds API keys: owner-only, and no temporary left beside it.
+        path = _init_state_file()
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        assert not path.with_name(path.name + ".tmp").exists()
+
+    def test_the_real_checkpoint_reports_failure_when_the_mode_is_not_honoured(
+        self, tmp_path, monkeypatch,
+    ):
+        """F22: the checkpoint is created 0600 and the mode is read back through
+        the descriptor before a byte is written. A filesystem that accepts the
+        mode and ignores it — the no-op chmod case — yields no checkpoint
+        rather than a readable one, and the wizard is told so."""
+        import nerve.bootstrap as bootstrap_mod
+        from nerve.bootstrap import SetupWizard, _init_state_file, _load_init_state
+
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.user_name = "alice"
+        monkeypatch.setattr(bootstrap_mod, "_private_fd", lambda fd: False)
+
+        assert wizard.checkpoint() is False
+        assert _load_init_state() is None
+        path = _init_state_file()
+        assert not path.exists()
+        assert not path.with_name(path.name + ".tmp").exists()  # partial removed
 
     def test_the_real_checkpoint_reports_failure_when_it_cannot_write(self, tmp_path, monkeypatch):
         import nerve.bootstrap as bootstrap_mod
@@ -228,15 +254,16 @@ class TestInstallerBootstrapFailure:
 
         wizard = SetupWizard(tmp_path)
         wizard.choices.user_name = "alice"
+        real_open = os.open
 
-        def refuse_chmod(*a, **k):
-            raise PermissionError("no modes here")
+        def refuse_open(path, flags, mode=0o777, *a, **k):
+            if str(path).endswith(".tmp"):
+                raise PermissionError("read-only state directory")
+            return real_open(path, flags, mode, *a, **k)
 
-        # A state filesystem that cannot make the checkpoint owner-only: the
-        # file holds API keys, so a save it cannot secure counts as no save.
-        monkeypatch.setattr(bootstrap_mod.os, "chmod", refuse_chmod)
+        monkeypatch.setattr(bootstrap_mod.os, "open", refuse_open)
         assert wizard.checkpoint() is False
-        assert _load_init_state() is None  # partial file removed
+        assert _load_init_state() is None
 
     def test_a_headless_failure_exits_non_zero_without_pretending_to_save_answers(
         self, tmp_path, monkeypatch,
