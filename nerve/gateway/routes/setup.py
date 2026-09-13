@@ -205,6 +205,26 @@ class CronToggleOut(BaseModel):
     enabled: bool
 
 
+class SetupValuesOut(BaseModel):
+    """What the forms need in order to open on the instance's own answers.
+
+    A form that opens on defaults is a form that submits defaults, which is
+    how re-entering a step to change one thing changed the rest. Secrets are
+    reported as **present or not** — the wizard writes credentials and never
+    reads them back, and a checklist screen is not a place to display one.
+    """
+
+    timezone: str
+    display_name: str | None
+    has_anthropic_key: bool
+    has_openai_key: bool
+    has_telegram_token: bool
+    sync_github: bool
+    sync_gmail: bool
+    sync_telegram: bool
+    gmail_accounts: list[str]
+
+
 class SetupStateOut(BaseModel):
     """Everything the checklist screen needs, in one read."""
 
@@ -224,6 +244,7 @@ class SetupStateOut(BaseModel):
     finished: bool
     steps: list[SetupStepOut]
     crons: list[CronToggleOut]
+    values: SetupValuesOut
 
 
 class ProviderRequest(BaseModel):
@@ -542,6 +563,19 @@ def _render(context: _Context) -> SetupStateOut:
         and all(s.status in {"done", "skipped"} for s in steps)
     )
 
+    sync = config.sync
+    values = SetupValuesOut(
+        timezone=config.timezone,
+        display_name=context.display_name,
+        has_anthropic_key=bool(config.anthropic_api_key),
+        has_openai_key=bool(config.openai_api_key),
+        has_telegram_token=bool(config.telegram.bot_token),
+        sync_github=bool(sync.github.enabled),
+        sync_gmail=bool(sync.gmail.enabled),
+        sync_telegram=bool(sync.telegram.enabled),
+        gmail_accounts=list(sync.gmail.accounts or []),
+    )
+
     return SetupStateOut(
         setup_pending=context.unclaimed,
         lockdown=bool(config.lockdown),
@@ -558,6 +592,7 @@ def _render(context: _Context) -> SetupStateOut:
             )
             for c in crons
         ],
+        values=values,
     )
 
 

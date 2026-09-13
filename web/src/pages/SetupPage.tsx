@@ -4,10 +4,14 @@ import {
   AlertTriangle, Check, CircleDashed, Lock, RefreshCw, ShieldQuestion,
 } from '../components/ui/icons';
 import { Badge, Button, Checkbox, TextField } from '../components/ui';
-import { api, type SetupCron, type SetupStep } from '../api/client';
+import {
+  api, type SetupCron, type SetupStep, type SetupValues,
+} from '../api/client';
 import { actorName, useActorRef } from '../stores/actorStore';
 import { useAuthStore } from '../stores/authStore';
-import { useSetupStore, type SetupStoreState } from '../stores/setupStore';
+import {
+  setupIsUnfinished, useSetupStore, type SetupStoreState,
+} from '../stores/setupStore';
 
 /**
  * The first-run setup wizard: a guarded claim, then a checklist.
@@ -245,7 +249,11 @@ function StepCard(
             <Button
               variant="ghost"
               size="sm"
-              disabled={busy === step.id}
+              // Any write in flight, not just this card's: the server takes
+              // one at a time and the checklist it returns is the whole
+              // state, so a second submission would be answered with a view
+              // that does not include it yet.
+              disabled={busy !== null}
               onClick={() => void skip(step.id, step.status !== 'skipped')}
             >
               {step.status === 'skipped' ? 'Put back' : 'Skip'}
@@ -272,10 +280,10 @@ function Checklist() {
   if (!state) return null;
 
   const forms: Record<string, ReactNode> = {
-    provider: <ProviderForm />,
-    profile: <ProfileForm />,
-    channels: <ChannelsForm />,
-    automation: <AutomationForm crons={state.crons} />,
+    provider: <ProviderForm values={state.values} />,
+    profile: <ProfileForm values={state.values} />,
+    channels: <ChannelsForm values={state.values} />,
+    automation: <AutomationForm crons={state.crons} values={state.values} />,
   };
 
   return (
@@ -317,7 +325,7 @@ function SignedInAs() {
   return <p className="text-2xs text-text-dim">Signed in as {name}.</p>;
 }
 
-function ProviderForm() {
+function ProviderForm({ values }: { values: SetupValues }) {
   const save = useSetupStore((s: SetupStoreState) => s.save);
   const busy = useSetupStore((s: SetupStoreState) => s.busy);
   const [anthropic, setAnthropic] = useState('');
@@ -341,6 +349,10 @@ function ProviderForm() {
         A browser cannot reach your laptop's keychain or{' '}
         <code>~/.claude/.credentials.json</code>, so paste a key here or set one
         up with <code>nerve init</code> on the machine instead.
+        {(values.has_anthropic_key || values.has_openai_key) && (
+          <> A key is already configured; anything you type here replaces it,
+            and a field left blank leaves it alone.</>
+        )}
       </p>
       <TextField
         type="password"
@@ -363,7 +375,7 @@ function ProviderForm() {
           type="submit"
           variant="primary"
           size="sm"
-          disabled={busy === 'provider' || (!anthropic && !openai)}
+          disabled={busy !== null || (!anthropic && !openai)}
         >
           Save
         </Button>
@@ -372,28 +384,52 @@ function ProviderForm() {
   );
 }
 
-function ProfileForm() {
+const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+
+function ProfileForm({ values }: { values: SetupValues }) {
   const save = useSetupStore((s: SetupStoreState) => s.save);
   const busy = useSetupStore((s: SetupStoreState) => s.busy);
-  const [timezone, setTimezone] = useState(
-    () => Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-  );
-  const [displayName, setDisplayName] = useState('');
+  // Opened on what the instance says, not on what this browser thinks: the
+  // timezone here is the one scheduled work runs in, and a form that opens on
+  // the browser's guess submits that guess every time somebody edits their
+  // name.
+  const [timezone, setTimezone] = useState(values.timezone);
+  const [displayName, setDisplayName] = useState(values.display_name ?? '');
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    await save('profile', () => api.setupProfile({
-      timezone: timezone || undefined,
-      display_name: displayName || undefined,
-    }));
+    // Only what changed. Each field is written independently on the server,
+    // so an untouched one is genuinely untouched.
+    const body: { timezone?: string; display_name?: string } = {};
+    if (timezone && timezone !== values.timezone) body.timezone = timezone;
+    if (displayName !== (values.display_name ?? '')) body.display_name = displayName;
+    if (!body.timezone && body.display_name === undefined) return;
+    await save('profile', () => api.setupProfile(body));
   };
+
+  const changed = (
+    (!!timezone && timezone !== values.timezone)
+    || displayName !== (values.display_name ?? '')
+  );
 
   return (
     <form onSubmit={submit} aria-label="Timezone and name" className="flex flex-col gap-2">
       <p className="text-2xs text-text-dim">
         The time zone is shared configuration — it decides when scheduled work
-        runs. The display name is yours, and is what the chat shows beside your
-        messages.
+        runs, so it is left alone unless you change it here. The display name
+        is yours, and is what the chat shows beside your messages.
+        {browserZone && browserZone !== values.timezone && (
+          <>
+            {' '}This browser is in{' '}
+            <button
+              type="button"
+              className="underline"
+              onClick={() => setTimezone(browserZone)}
+            >
+              {browserZone}
+            </button>.
+          </>
+        )}
       </p>
       <TextField
         value={timezone}
@@ -414,7 +450,7 @@ function ProfileForm() {
           type="submit"
           variant="primary"
           size="sm"
-          disabled={busy === 'profile' || (!timezone && !displayName)}
+          disabled={busy !== null || !changed}
         >
           Save
         </Button>
@@ -423,7 +459,7 @@ function ProfileForm() {
   );
 }
 
-function ChannelsForm() {
+function ChannelsForm({ values }: { values: SetupValues }) {
   const save = useSetupStore((s: SetupStoreState) => s.save);
   const busy = useSetupStore((s: SetupStoreState) => s.busy);
   const [token, setToken] = useState('');
@@ -440,7 +476,9 @@ function ChannelsForm() {
       <p className="text-2xs text-text-dim">
         A bot token from <code>@BotFather</code>. Stored with the other secrets;
         who may talk to the bot is decided afterwards by pairing
-        (<code>nerve pair</code>), not here.
+        (<code>nerve pair</code>), not here — saving a token leaves the people
+        already paired alone.
+        {values.has_telegram_token && <> A token is already configured.</>}
       </p>
       <TextField
         type="password"
@@ -455,7 +493,7 @@ function ChannelsForm() {
           type="submit"
           variant="primary"
           size="sm"
-          disabled={busy === 'channels' || !token}
+          disabled={busy !== null || !token.trim()}
         >
           Save
         </Button>
@@ -464,24 +502,37 @@ function ChannelsForm() {
   );
 }
 
-function AutomationForm({ crons }: { crons: SetupCron[] }) {
+function AutomationForm(
+  { crons, values }: { crons: SetupCron[]; values: SetupValues },
+) {
   const save = useSetupStore((s: SetupStoreState) => s.save);
   const busy = useSetupStore((s: SetupStoreState) => s.busy);
   const [enabled, setEnabled] = useState<string[]>(
     () => crons.filter((c) => c.enabled).map((c) => c.id),
   );
-  const [github, setGithub] = useState(false);
-  const [gmail, setGmail] = useState(false);
+  // Hydrated, so re-entering this step to change a cron does not submit two
+  // switched-off sources somebody configured on another screen.
+  const [github, setGithub] = useState(values.sync_github);
+  const [gmail, setGmail] = useState(values.sync_gmail);
 
   const toggle = (id: string) => setEnabled((ids) => (
     ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]
   ));
 
+  const before = crons.filter((c) => c.enabled).map((c) => c.id).sort().join(',');
+  const cronsChanged = [...enabled].sort().join(',') !== before;
+
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    await save('automation', () => api.setupAutomation({
-      crons: enabled, github, gmail,
-    }));
+    // Only what changed: the server leaves an omitted field exactly as it is,
+    // and that is the whole point of the shape.
+    const body: {
+      crons?: string[]; github?: boolean; gmail?: boolean;
+    } = {};
+    if (cronsChanged) body.crons = enabled;
+    if (github !== values.sync_github) body.github = github;
+    if (gmail !== values.sync_gmail) body.gmail = gmail;
+    await save('automation', () => api.setupAutomation(body));
   };
 
   return (
@@ -521,7 +572,7 @@ function AutomationForm({ crons }: { crons: SetupCron[] }) {
         labelSize="sm"
       />
       <div>
-        <Button type="submit" variant="primary" size="sm" disabled={busy === 'automation'}>
+        <Button type="submit" variant="primary" size="sm" disabled={busy !== null}>
           Save
         </Button>
       </div>
@@ -545,14 +596,17 @@ function RestartCard() {
           <h2 className="text-sm font-medium text-text">Restart to apply</h2>
           <p className="text-2xs text-text-dim mt-1">
             {state.restart_pending
-              ? `Waiting on a restart: ${state.restart_pending_paths.join(', ')}.`
+              ? `Waiting on a restart: ${[
+                ...state.restart_pending_paths,
+                ...state.restart_pending_reasons,
+              ].join('; ')}.`
               : 'Nothing is waiting on a restart.'}
           </p>
         </div>
         <Button
           variant={state.restart_pending ? 'primary' : 'ghost'}
           size="sm"
-          disabled={busy === 'restart'}
+          disabled={busy !== null}
           onClick={() => void restart()}
         >
           <RefreshCw size={14} className="mr-1" />
@@ -590,15 +644,19 @@ function Reconnecting() {
  *
  * An overlay rather than a bar in the layout, like the notification toast it
  * sits beside: every page in this app is a full-height flex box, and a strip
- * inserted above them would cost each one the strip's height. It shows only
- * while the instance is *unclaimed* — the one state that is a real exposure.
- * A half-finished checklist beyond that is not worth a permanent banner; the
- * setup page is a link away and says what is left.
+ * inserted above them would cost each one the strip's height.
+ *
+ * It follows the checklist, not the claim. Hiding it the moment a password
+ * exists is how an abandoned *post-claim* checklist becomes invisible —
+ * which is the state the affordance is for, since an unclaimed instance
+ * already redirects to this page by itself. Gone for good once the server
+ * says the list is finished, and never on the page it points at.
  */
 export function SetupReminder() {
-  const setupPending = useAuthStore((s) => s.setupPending);
+  const unclaimed = useAuthStore((s) => s.setupPending);
+  const unfinished = useSetupStore(setupIsUnfinished);
   const { pathname } = useLocation();
-  if (!setupPending || pathname.startsWith('/setup')) return null;
+  if ((!unclaimed && !unfinished) || pathname.startsWith('/setup')) return null;
   return (
     <Link
       to="/setup"
@@ -608,8 +666,11 @@ export function SetupReminder() {
     >
       <AlertTriangle size={14} className="text-hue-amber shrink-0 mt-0.5" />
       <span>
-        This instance has no password — anyone who can reach it is signed in as
-        the owner. <span className="text-text underline">Finish setup</span>.
+        {unclaimed
+          ? 'This instance has no password — anyone who can reach it is signed '
+            + 'in as the owner. '
+          : 'Setup is not finished on this instance. '}
+        <span className="text-text underline">Finish setup</span>.
       </span>
     </Link>
   );
