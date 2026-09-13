@@ -76,6 +76,7 @@ from nerve.setup_writer import (
     build_config_local,
     leaf_paths,
     list_optional_crons,
+    merge_machine_paths,
     merge_private_paths,
     merge_settings_paths,
     set_optional_crons,
@@ -539,16 +540,21 @@ def _apply(
     machine_updates = {p: machine_flat[p] for p in machine_paths if p in machine_flat}
     secret_updates = {p: secret_flat[p] for p in secret_paths if p in secret_flat}
     if machine_updates or secret_updates:
-        # Both machine-local files go through the fail-closed private writer:
-        # config.local.yaml because it holds credentials, and config.yaml
-        # because the startup migration already rewrites it that way.
+        # Two writers, because the two files are not the same kind of file.
+        # config.local.yaml holds credentials and is forced owner-only, failing
+        # closed if that cannot be guaranteed. config.yaml holds this box's
+        # shape — no secret, and the file an operator edits by hand — so it is
+        # republished at the mode and ownership it already had: in Docker the
+        # container is root over a bind-mounted checkout, and a fresh
+        # root-owned 0600 inode there locks the host's own CLI out of the file
+        # it needs to recognise a Docker install.
         try:
             if secret_updates:
                 merge_private_paths(
                     config_dir / "config.local.yaml", secret_updates,
                 )
             if machine_updates:
-                merge_private_paths(
+                merge_machine_paths(
                     config_dir / "config.yaml", machine_updates,
                     header=CONFIG_YAML_HEADER,
                 )
