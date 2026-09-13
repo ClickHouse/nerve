@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -115,16 +116,32 @@ _RESTART_DELAY_SECONDS = 0.75
 # One restart per process. The helper takes this process's pid; a second one
 # would race it over the same pid and the same pid file, and there is nothing
 # a second restart could achieve that the first is not already doing.
-_restart_lock = asyncio.Lock()
 _restart_requested = False
 
 # One mutation at a time. Every step reads the checklist's notes, changes them
 # and writes them back, so two requests in flight — two tabs, or one tab's form
 # and another's skip — would each save over a snapshot taken before the other.
-# An asyncio.Lock is enough because the daemon is one process with one event
-# loop; a multi-worker server would need a lock the processes share. See the
-# handoff.
-_state_lock = asyncio.Lock()
+#
+# One lock per event loop rather than one module-level lock, because an
+# `asyncio.Lock` binds itself to the loop that first *waits* on it and refuses
+# every other one afterwards. The daemon has exactly one loop, so this is one
+# lock there; it is the test process — many loops in one interpreter — that
+# needs the distinction, and a lock that only works until something contends
+# it is worse than no lock, since it passes every test that does not.
+#
+# A lock the *processes* share would be needed for a multi-worker server. There
+# is no such mode today; see the handoff.
+_locks: "weakref.WeakKeyDictionary[Any, dict[str, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _loop_lock(name: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    locks = _locks.setdefault(loop, {})
+    if name not in locks:
+        locks[name] = asyncio.Lock()
+    return locks[name]
 
 # What a rewritten cron file the scheduler has not re-read amounts to.
 _CRON_DEBT = "the scheduler is still running the cron settings it started with"
@@ -435,7 +452,7 @@ async def _context(actor: Actor) -> _Context:
     Retires an earlier process's notes *in memory* — anything left behind
     describes a write that has since been picked up, or undone by hand, and
     the instance is the better witness either way. It does not persist that:
-    this runs inside ``_state_lock`` for a mutation (which saves the retired
+    this runs inside the state lock for a mutation (which saves the retired
     state with its own change) and outside it for a plain read, and a save
     from outside the lock is exactly the interleaving the lock exists to
     prevent. :func:`get_setup` persists it under the lock instead.
@@ -611,7 +628,7 @@ async def get_setup(actor: Actor = Depends(require_account)):
     notes are retired on the first read after a restart, and persisting that
     from outside the lock would race a step that is saving its own change.
     """
-    async with _state_lock:
+    async with _loop_lock("state"):
         context = await _context(actor)
         if context.state.boot == boot.boot_id() and context.state.retired:
             # Best-effort: a state file that cannot be rewritten must not stop
@@ -788,7 +805,7 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_acco
             detail="Give an Anthropic API key, an OpenAI key, or skip this step.",
         )
 
-    async with _state_lock:
+    async with _loop_lock("state"):
         context = await _context(actor)
         applied = _write(
             context,
@@ -828,7 +845,7 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
                 detail=f"{timezone!r} is not a time zone this machine knows.",
             ) from e
 
-    async with _state_lock:
+    async with _loop_lock("state"):
         context = await _context(actor)
         db = get_deps().db
 
@@ -877,7 +894,7 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_acco
             detail="A Telegram bot token is required here; skip the step instead.",
         )
 
-    async with _state_lock:
+    async with _loop_lock("state"):
         context = await _context(actor)
         allowed = req.telegram_allowed_users
         choices = SetupChoices(
@@ -912,7 +929,7 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
     left exactly as it is: re-entering this step to turn one cron on must not
     switch off the sync sources somebody configured on another screen.
     """
-    async with _state_lock:
+    async with _loop_lock("state"):
         context = await _context(actor)
         _require_writable(context.config)
         live = context.config.sync
@@ -1050,7 +1067,7 @@ async def restart_system(actor: Actor = Depends(require_account)):
     # be answering the same question less reliably.
     old_pid = os.getpid()
 
-    async with _restart_lock:
+    async with _loop_lock("restart"):
         global _restart_requested
         if _restart_requested:
             # A second helper would race the first over the same pid and pid
