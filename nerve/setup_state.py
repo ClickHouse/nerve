@@ -81,6 +81,10 @@ class SetupState:
     #: Only ever this process's writes: an entry that outlived its writer says
     #: nothing a restart has not already answered.
     applied: dict[str, Any] = field(default_factory=dict)
+    #: Things this run changed that the running process has not picked up and
+    #: that are not configuration keys — a cron file the scheduler has not
+    #: re-read. Transitional in exactly the same way as ``applied``.
+    debts: set[str] = field(default_factory=set)
     #: The generation that wrote the entries above, or ``""`` for a state that
     #: has not been written yet.
     boot: str = ""
@@ -91,6 +95,7 @@ class SetupState:
             "skipped": sorted(self.skipped),
             "done": sorted(self.done),
             "applied": dict(self.applied),
+            "debts": sorted(self.debts),
             "boot": boot.boot_id(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -153,6 +158,7 @@ def load_state() -> SetupState:
         skipped=_string_set(raw.get("skipped")),
         done=_string_set(raw.get("done")),
         applied=_string_map(raw.get("applied")),
+        debts=_string_set(raw.get("debts")),
         boot=written_by if isinstance(written_by, str) else "",
     )
 
@@ -173,8 +179,12 @@ def retire_transitional(state: SetupState, transitional_done: set[str]) -> bool:
     """
     if state.boot == boot.boot_id():
         return False
-    retired = bool(state.applied) or bool(state.done & transitional_done)
+    retired = (
+        bool(state.applied) or bool(state.debts)
+        or bool(state.done & transitional_done)
+    )
     state.applied = {}
+    state.debts = set()
     state.done -= transitional_done
     state.boot = boot.boot_id()
     return retired
