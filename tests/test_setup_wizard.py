@@ -1012,6 +1012,72 @@ class TestTheChecklist:
             state = (await http.get("/api/setup")).json()
         assert _status_of(state, "automation") == "done"
 
+    async def test_an_openai_only_answer_survives_the_restart(self, claimed):
+        """The step accepts an OpenAI key on its own, so the instance has to
+        recognise one on its own — otherwise a valid answer goes back to "to
+        do" at exactly the restart the wizard tells you to perform."""
+        async with _http(claimed) as http:
+            saved = (await http.put(
+                "/api/setup/provider", json={"openai_api_key": "openai-key-placeholder"},
+            )).json()
+        assert _status_of(saved, "provider") == "done"
+
+        claimed.restarted(openai_api_key="openai-key-placeholder")
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "provider") == "done"
+        assert "OpenAI" in next(
+            s["detail"] for s in state["steps"] if s["id"] == "provider"
+        )
+
+    async def test_a_timezone_only_answer_survives_the_restart(self, claimed):
+        """Nothing else records that somebody answered the profile step: no
+        display name was set, and the marker is retired with the process that
+        wrote it. A timezone that is not the installer's default is the
+        answer, and it is on disk."""
+        async with _http(claimed) as http:
+            saved = (await http.put(
+                "/api/setup/profile", json={"timezone": "Europe/Berlin"},
+            )).json()
+        assert _status_of(saved, "profile") == "done"
+
+        claimed.restarted(timezone="Europe/Berlin")
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "profile") == "done"
+        assert state["restart_pending"] is False
+
+    async def test_the_installers_own_default_is_not_an_answer(self, claimed):
+        """...and the other direction: an install nobody has touched must not
+        report the profile step as done because the default exists."""
+        claimed.restarted(timezone=setup_routes.DEFAULT_TIMEZONE)
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "profile") == "pending"
+
+    async def test_an_answered_checklist_stays_finished_across_a_restart(
+        self, claimed,
+    ):
+        """The whole point of the two above, end to end: the wizard tells you
+        to restart, so the restart must not undo the wizard."""
+        async with _http(claimed) as http:
+            await http.put(
+                "/api/setup/provider", json={"openai_api_key": "openai-key-placeholder"},
+            )
+            await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})
+            await http.post("/api/setup/steps/channels/skip")
+            await http.post("/api/setup/steps/automation/skip")
+
+        claimed.restarted(
+            openai_api_key="openai-key-placeholder", timezone="Europe/Berlin",
+        )
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert state["restart_pending"] is False
+        assert state["finished"] is True, [
+            (s["id"], s["status"]) for s in state["steps"]
+        ]
+
     async def test_finished_once_everything_is_answered(self, claimed):
         async with _http(claimed) as http:
             await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})

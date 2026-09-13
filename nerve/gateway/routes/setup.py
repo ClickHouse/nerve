@@ -46,7 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from nerve import boot, daemon, paths, setup_state
-from nerve.config import get_config
+from nerve.config import NerveConfig, get_config
 from nerve.db.accounts import AccountError, NotClaimableError, UsernameTakenError
 from nerve.gateway.auth import (
     NO_IDENTITY_DETAIL,
@@ -179,6 +179,12 @@ _SKIPPABLE = {step for step, _title, required in _STEPS if not required}
 # `automation` is deliberately absent: which crons an operator wanted is a
 # decision nothing else records.
 _TRANSITIONAL_STEPS = {STEP_PROVIDER, STEP_PROFILE, STEP_CHANNELS}
+
+# What `nerve init` writes when nobody chose one (nerve/config.py's own
+# default). A timezone that differs from it is an answer somebody gave, which
+# is what makes "the profile step was answered" derivable after a restart
+# rather than only remembered.
+DEFAULT_TIMEZONE = NerveConfig().timezone
 
 
 # --------------------------------------------------------------------------- #
@@ -514,8 +520,16 @@ def _provider_detail(config) -> str:
         return f"AWS Bedrock in {config.provider.aws_region or 'an unset region'}"
     if config.proxy.enabled:
         return "A local proxy (CLIProxyAPI) is configured"
+    if config.anthropic_api_key and config.openai_api_key:
+        return "An Anthropic API key and an OpenAI key are configured"
     if config.anthropic_api_key:
         return "An Anthropic API key is configured"
+    if config.openai_api_key:
+        # The step accepts an OpenAI key on its own, so the derivation has to
+        # recognise one on its own: otherwise a valid answer goes back to
+        # "to do" at the first restart, which is exactly when the wizard is
+        # asking whether it is finished.
+        return "An OpenAI key is configured"
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         # A Docker install is handed its credential in the environment, and
         # `claude_oauth_token` in config.local.yaml is read by the entrypoint
@@ -555,7 +569,17 @@ def _step_status(
         return ("skipped" if step in state.skipped else "pending"), ""
 
     if step == STEP_PROFILE:
-        if step in state.done or context.display_name:
+        # Three ways this is answered, and two of them outlive a restart: a
+        # display name is on the actor, and a timezone that is not the
+        # installer's default was chosen by somebody. The third — the
+        # transitional marker — covers the moment between writing a timezone
+        # and the process that reads it.
+        answered = (
+            step in state.done
+            or bool(context.display_name)
+            or config.timezone != DEFAULT_TIMEZONE
+        )
+        if answered:
             return "done", (
                 f"{context.display_name}, {config.timezone}"
                 if context.display_name else config.timezone
