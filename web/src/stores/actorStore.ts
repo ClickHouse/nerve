@@ -72,45 +72,89 @@ export interface ActorState {
  * Request state lives outside the store because it is not rendered: putting an
  * in-flight promise in zustand state would re-render every subscriber twice per
  * fetch for nothing.
+ *
+ * `generation` is what makes a response commit only if it is still the answer
+ * anybody is waiting for. Every request takes a number on the way out and
+ * checks it on the way back; `reset()` bumps it. Without it, two failures are
+ * reachable and neither is loud: a slow response landing after a logout
+ * repopulates a map that was deliberately emptied, and two overlapping forced
+ * re-reads commit in whatever order the network returns them, so the older
+ * snapshot can land last and undo the rename that prompted the newer one.
  */
 let inFlight: Promise<void> | null = null;
 let pending = new Set<string>();
+let generation = 0;
+
+/**
+ * A hard stop on the follow-up chain in `drain`.
+ *
+ * Production cannot reach it: every completed request either resolves a queued
+ * id or records it in `unresolved`, and `resolve` skips both, so each round has
+ * strictly fewer ids to ask about than the last. It is here because this is a
+ * loop that makes network requests, and a loop that makes network requests
+ * should not be able to run forever on the strength of an argument.
+ */
+const MAX_FOLLOW_UPS = 4;
 
 export const useActorStore = create<ActorState>((set, get) => {
-  async function load(force = false): Promise<void> {
-    if (inFlight) {
-      // Coalesce: forty bubbles mounting together make one request.
-      if (!force) return inFlight;
-      // A forced re-read that arrives while a fetch is in flight has to wait
-      // for it and then start its own — the one in flight may have been sent
-      // before the rename this call exists to pick up.
-      await inFlight.catch(() => {});
-    }
+  /** One request. Returns false when it failed or was superseded. */
+  async function fetchOnce(): Promise<boolean> {
+    const mine = ++generation;
     const claimed = pending;
     pending = new Set();
     set({ loading: true });
-    const run = (async () => {
-      try {
-        const { actors } = await api.listActors();
-        const map: Record<string, ActorRef> = {};
-        for (const actor of actors) map[actor.id] = actor;
-        // Anything asked about that a completed fetch still does not know is
-        // recorded so it is never asked about again; anything previously
-        // missing that now resolves drops back out.
-        const unresolved = [...new Set([...get().unresolved, ...claimed])]
-          .filter((id) => !(id in map));
-        set({ actors: map, loaded: true, loading: false, unresolved });
-      } catch {
-        // Keep the last known map and stay un-`loaded`, so the next render that
-        // needs a name tries again. That retry is driven by an id changing, not
-        // by a timer, so a server that is down costs one request per navigation
-        // rather than a loop.
-        set({ loading: false });
+    try {
+      const { actors } = await api.listActors();
+      // Superseded — a newer request, or a logout, happened while this was in
+      // flight. Committing now would undo whatever replaced it.
+      if (mine !== generation) return false;
+      const map: Record<string, ActorRef> = {};
+      for (const actor of actors) map[actor.id] = actor;
+      // Anything asked about that a completed fetch still does not know is
+      // recorded so it is never asked about again; anything previously missing
+      // that now resolves drops back out.
+      const unresolved = [...new Set([...get().unresolved, ...claimed])]
+        .filter((id) => !(id in map));
+      set({ actors: map, loaded: true, loading: false, unresolved });
+      // Ids that arrived while this request was open are still queued. Drop the
+      // ones this answer settled; whatever is left is what a follow-up is for.
+      for (const id of [...pending]) {
+        if (id in map || unresolved.includes(id)) pending.delete(id);
       }
-    })();
-    // Clear the slot only if it is still this fetch's: a forced re-read waits
-    // for the one in flight and then starts its own, so an earlier `finally`
-    // must not blank out a later fetch's entry and let a third one start.
+      return true;
+    } catch {
+      if (mine !== generation) return false;
+      // Keep the last known map and stay un-`loaded`, so the next render that
+      // needs a name tries again. That retry is driven by an id changing, not
+      // by a timer, so a server that is down costs one request per navigation
+      // rather than a loop. The ids this attempt claimed go back in the queue
+      // so they are not silently dropped on the floor.
+      for (const id of claimed) pending.add(id);
+      set({ loading: false });
+      return false;
+    }
+  }
+
+  /**
+   * Request, then follow up on anything that arrived while it was open.
+   *
+   * The follow-up is the point. `resolve` cannot start a second request while
+   * one is in flight — that is the coalescing forty mounting bubbles depend on
+   * — so without this, an id first seen during a lookup (a second person's live
+   * message, arriving between the map being fetched and it landing) would sit
+   * in the queue with nothing to drain it, and read `Unnamed account` until the
+   * next navigation.
+   */
+  async function drain(): Promise<void> {
+    for (let round = 0; round <= MAX_FOLLOW_UPS; round++) {
+      if (!(await fetchOnce())) return;
+      if (pending.size === 0) return;
+    }
+  }
+
+  /** Start a request chain and publish it as the one to coalesce onto. */
+  function start(): Promise<void> {
+    const run = drain();
     const tracked: Promise<void> = run.finally(() => {
       if (inFlight === tracked) inFlight = null;
     });
@@ -134,7 +178,8 @@ export const useActorStore = create<ActorState>((set, get) => {
         pending.add(id);
         wanted = true;
       }
-      if (wanted) void load();
+      // Queued either way: a request already in flight will follow up on it.
+      if (wanted && !inFlight) void start();
     },
 
     refresh: async () => {
@@ -142,10 +187,16 @@ export const useActorStore = create<ActorState>((set, get) => {
       // is exactly what an account mutation means.
       for (const id of get().unresolved) pending.add(id);
       set({ unresolved: [] });
-      await load(true);
+      // Deliberately not coalesced onto `inFlight`: a request already in flight
+      // may have been sent before the rename this call exists to pick up. The
+      // generation guard is what keeps the older one from committing after.
+      await start();
     },
 
     reset: () => {
+      // Bump first: a response already on the wire must not repopulate the map
+      // this just emptied.
+      generation++;
       inFlight = null;
       pending = new Set();
       set({ actors: {}, loaded: false, loading: false, unresolved: [] });
@@ -164,6 +215,58 @@ export function actorName(actor: ActorRef | undefined): string {
 /** Whether this is the agent's own principal rather than a person. */
 export function isSystemActor(actor: ActorRef | undefined): boolean {
   return actor?.kind === 'system';
+}
+
+/**
+ * A stable, short tail of an actor id, for telling two identical names apart.
+ *
+ * Six characters off the end rather than the front: these are UUIDs, and two of
+ * them are far likelier to share a prefix — some generators put a timestamp
+ * there — than a tail. It is only ever a hint; the full id stays in the
+ * tooltip, and the id itself is what the label is derived from, so the same
+ * actor gets the same suffix on every surface and across reloads.
+ */
+export function actorDiscriminator(id: string): string {
+  return id.length > 6 ? id.slice(-6) : id;
+}
+
+let ambiguousCache: { actors: Record<string, ActorRef>; ids: Set<string> } | null = null;
+
+/**
+ * Actors whose label is not unique — two people called Alex, or two accounts
+ * with no display name at all.
+ *
+ * Display names are not identity and nothing stops two of them being equal
+ * (0.7: names are never identity keys), so a label that is only a name can name
+ * two different people. These ids get a discriminator appended.
+ *
+ * Collisions are computed over **the whole map, not the list being rendered**.
+ * Per-list would be narrower and would show the suffix less often, but the same
+ * person would then gain and lose it depending on which surface you were
+ * looking at, and a label that changes shape when nothing about the actor
+ * changed is worse than one that is occasionally more precise than it needs to
+ * be. The map is a handful of rows, and the result is memoised on its identity,
+ * so every label on a page shares one computation.
+ *
+ * Ids the map does not know are absent from this set and keep the plain
+ * fallback: there is nothing to compare them against, and their tooltip already
+ * carries the id.
+ */
+export function ambiguousActorIds(actors: Record<string, ActorRef>): Set<string> {
+  if (ambiguousCache?.actors === actors) return ambiguousCache.ids;
+  const byLabel = new Map<string, string[]>();
+  for (const actor of Object.values(actors)) {
+    const label = actorName(actor);
+    const seen = byLabel.get(label);
+    if (seen) seen.push(actor.id);
+    else byLabel.set(label, [actor.id]);
+  }
+  const ids = new Set<string>();
+  for (const sharing of byLabel.values()) {
+    if (sharing.length > 1) for (const id of sharing) ids.add(id);
+  }
+  ambiguousCache = { actors, ids };
+  return ids;
 }
 
 /**
