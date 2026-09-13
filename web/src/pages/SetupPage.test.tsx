@@ -86,7 +86,6 @@ function state(overrides: Partial<SetupState> = {}): SetupState {
       sync_github: true,
       sync_gmail: false,
       sync_telegram: false,
-      gmail_accounts: [],
     },
     ...overrides,
   };

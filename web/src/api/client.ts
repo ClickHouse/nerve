@@ -49,7 +49,6 @@ export interface SetupValues {
   sync_github: boolean;
   sync_gmail: boolean;
   sync_telegram: boolean;
-  gmail_accounts: string[];
 }
 
 /** `GET /api/setup` — the whole checklist screen in one read. */
