@@ -17,7 +17,14 @@ vi.mock('./api/client', async () => {
   const actual = await vi.importActual<typeof import('./api/client')>('./api/client');
   return {
     ...actual,
-    api: { authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn() },
+    api: {
+      authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(),
+      // The setup page is the wizard now (PR 6), and it reads its checklist
+      // once it has a session. These tests are about *where a tab lands*, so
+      // the checklist is stubbed rather than exercised.
+      setupState: vi.fn().mockRejectedValue(new Error('not part of this test')),
+      listActors: vi.fn().mockResolvedValue({ actors: [] }),
+    },
     setToken: vi.fn(),
     clearToken: vi.fn(),
     getToken: vi.fn(() => null),
@@ -114,7 +121,7 @@ describe('startup with a token already in storage', () => {
 
     renderApp();
 
-    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -145,8 +152,8 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
 
-    answer(status({ login: 'none', auth_required: false }));
-    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+    answer(status({ login: 'none', auth_required: false, setup_pending: true }));
+    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
   });
 
   it('reaches accounts on a real reload, not just with a reset store', async () => {
@@ -160,7 +167,7 @@ describe('startup with a token already in storage', () => {
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
 
-    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -191,7 +198,7 @@ describe('startup with a token already in storage', () => {
 
     renderApp();
 
-    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
     expect(apiLogin).toHaveBeenCalledWith('');
   });
 
@@ -219,7 +226,7 @@ describe('startup with no token', () => {
 
     renderApp();
 
-    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
     expect(apiLogin).toHaveBeenCalledWith('');
   });
 

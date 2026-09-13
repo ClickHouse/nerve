@@ -53,6 +53,7 @@ from nerve.gateway.auth import (
     effective_jwt_secret,
     hash_password,
     identity_store,
+    password_length_problem,
     require_auth,
 )
 from nerve.gateway.routes._deps import get_deps
@@ -275,13 +276,14 @@ async def claim(req: ClaimRequest, request: Request):
             detail="This instance has already been claimed. Sign in instead.",
         )
 
-    try:
-        credential = hash_password(req.password)
-    except ValueError as e:
-        # bcrypt refuses a password past 72 bytes, and an empty one never gets
-        # here (the model requires one). Either way it is the request that is
-        # wrong, not the instance.
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    problem = password_length_problem(req.password)
+    if problem:
+        # Checked before hashing, as the accounts routes do: bcrypt refuses a
+        # password past 72 *bytes*, and the message has to say so in bytes —
+        # "too long" on a password a person can see is twelve characters long
+        # is not a usable error. `hash_password` raises as a backstop.
+        raise HTTPException(status_code=400, detail=problem)
+    credential = hash_password(req.password)
 
     try:
         account = await store.claim_sole_account(
