@@ -1704,7 +1704,7 @@ class TestMutationsAreActuallySerialised:
             body = inspect.getsource(getattr(setup_routes, name))
             assert '_loop_lock("state")' in body, name
         # ...and nothing mutates the notes outside one.
-        assert source.count("setup_state.save_state(") == 3, (
+        assert source.count("setup_state.save_state(") == 4, (
             "a new call site for save_state: check it runs under the lock"
         )
 
@@ -1912,12 +1912,30 @@ class TestAFailureSaysWhatLanded:
         assert "sync settings were saved" in detail
         assert "crons are unchanged" in detail
 
-        # What landed is on disk, and the checklist knows it owes a restart
-        # rather than having lost that with the failure.
+        # What landed is on disk and the checklist knows it owes a restart for
+        # it — but the step is *not* done, and there is no cron debt for a file
+        # that was never written.
         assert claimed.tracked()["sync"]["github"]["enabled"] is True
         state = setup_state.load_state()
         assert state.applied.get("sync.github.enabled") is True
-        assert state.debts
+        assert "automation" not in state.done
+        assert state.debts == set(), (
+            "a debt was recorded for a cron file that was never published"
+        )
+
+        async with _http(claimed) as http:
+            after = (await http.get("/api/setup")).json()
+        assert _status_of(after, "automation") == "pending"
+        assert after["finished"] is False
+
+        # And the restart does not launder it: automation's completion is a
+        # durable note, so a step marked done here would have stayed done
+        # while the cron file never changed.
+        claimed.restarted()
+        async with _http(claimed) as http:
+            restarted = (await http.get("/api/setup")).json()
+        assert _status_of(restarted, "automation") == "pending"
+        assert restarted["finished"] is False
 
     async def test_a_failed_name_only_profile_leaves_no_marker(
         self, claimed, monkeypatch,
