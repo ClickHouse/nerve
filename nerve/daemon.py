@@ -15,7 +15,6 @@ restart.
 
 from __future__ import annotations
 
-import logging
 import os
 import signal
 import subprocess
@@ -24,8 +23,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nerve import paths
-
-logger = logging.getLogger(__name__)
 
 
 def pid_file_pid() -> int | None:
