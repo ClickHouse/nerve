@@ -19,12 +19,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from nerve.sources.codex_threads.base import (
     ThreadEvent,
     WorkspaceFilter,
 )
 from nerve.sources.codex_threads.ingester import CodexIngester, codex_session_id
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 # ``db`` fixture is supplied by tests/conftest.py
 
@@ -180,7 +190,7 @@ async def test_native_thread_reuses_nerve_session_and_does_not_archive_it(
 ):
     tid = "native-thread-1"
     await db.create_session(
-        "nerve-chat", source="web", backend="codex", status="active",
+        "nerve-chat", source="web", backend="codex", status="active", actor=None,
     )
     await db.bind_native_thread("codex", tid, "nerve-chat")
     ing = CodexIngester(
@@ -239,7 +249,7 @@ async def test_existing_satellite_session_is_merged_not_duplicated(
             "runtime": "codex-external",
             "origin_ids": ["nerve-mcp-detected"],
         },
-        status="active",
+        status="active", actor=None,
     )
 
     ing = CodexIngester(

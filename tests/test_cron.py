@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -19,6 +19,7 @@ from nerve.cron.service import (
     _parse_interval,
     _parse_timestamp,
 )
+from tests.actor_rows import mock_system_principal
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,10 @@ def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     db.cancel_wakeups_for_session = AsyncMock(return_value=0)
     db.update_session_metadata = AsyncMock()
     db.update_session_title = AsyncMock()
+    # A cron generation is attributed to the agent's system principal and the
+    # lookup happens before the row is written, so the mock has to answer it
+    # the way a bootstrapped database would.
+    mock_system_principal(db)
 
     return CronService(config, engine, db)
 
@@ -785,6 +790,9 @@ class TestRotation:
         # New chat is created and becomes the job's current session.
         cron_service.engine.sessions.get_or_create.assert_awaited_once_with(
             session_id, title="Cron: pers", source="cron",
+            # Who a cron generation belongs to has its own test
+            # (test_attribution.py); this one is about rotation.
+            actor=ANY,
         )
         cron_service.db.set_channel_session.assert_awaited_once_with(
             "cron:pers", session_id,

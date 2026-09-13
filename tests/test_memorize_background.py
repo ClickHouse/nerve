@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nerve.agent.engine import AgentEngine
+from tests.actor_rows import mock_system_principal
 
 _CONNECTED_AT = "2026-01-01T00:00:00+00:00"
 
@@ -26,6 +27,9 @@ def _make_engine() -> AgentEngine:
     config.agent.max_concurrent = 3
     config.mcp_servers = []
     db = AsyncMock()
+    # Cron and hook runs resolve the agent's system principal before they
+    # write anything, so the mock answers that lookup like a real database.
+    mock_system_principal(db)
     return AgentEngine(config, db)
 
 

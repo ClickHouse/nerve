@@ -33,6 +33,17 @@ export interface Account {
   created_at: string;
 }
 
+/** One actor, as `/api/actors` returns it: an identity plus the name to show
+ *  for it *right now*. Sessions and messages store the id, never the name, so
+ *  a rename changes every label without touching a stored row. Carries
+ *  nothing from the account behind it — an actor may have no account (the
+ *  agent's system principal). */
+export interface ActorRef {
+  id: string;
+  kind: 'human' | 'system';
+  display_name: string | null;
+}
+
 /** One page of a lazily-loaded sidebar group (Archived / System). */
 export interface Page {
   sessions: any[];
@@ -395,6 +406,11 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
+
+  // Actors — resolve the ids stored on sessions and messages to names.
+  // One row per person plus the system principal, so a single fetch labels a
+  // whole list; re-fetch after a rename rather than caching a name anywhere.
+  listActors: () => request<{ actors: ActorRef[] }>('/actors'),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any

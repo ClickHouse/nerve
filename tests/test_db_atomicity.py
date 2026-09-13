@@ -224,20 +224,20 @@ class TestWriteResultPlumbing:
     """lastrowid/rowcount survive the migration to _write()."""
 
     async def test_lastrowid_via_log_session_event(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         first = await db.log_session_event("s1", "created")
         second = await db.log_session_event("s1", "connected")
         assert isinstance(first, int) and isinstance(second, int)
         assert second > first
 
     async def test_rowcount_via_claim_wakeup(self, db: Database):
-        await db.create_session("s2")
+        await db.create_session("s2", actor=None)
         wid = await db.add_wakeup("s2", "wake", "2999-01-01T00:00:00+00:00")
         assert await db.claim_wakeup(wid) is True
         assert await db.claim_wakeup(wid) is False  # already fired
 
     async def test_rowcount_via_cancel_wakeups(self, db: Database):
-        await db.create_session("s3")
+        await db.create_session("s3", actor=None)
         await db.add_wakeup("s3", "wake", "2999-01-01T00:00:00+00:00")
         assert await db.cancel_wakeups_for_session("s3") == 1
         assert await db.cancel_wakeups_for_session("s3") == 0

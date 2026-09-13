@@ -16,6 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from nerve.agent.streaming import broadcaster as default_broadcaster
+from nerve.identity import system_actor
 from nerve.sources.codex_threads.base import (
     SessionMeta,
     ThreadEvent,
@@ -118,15 +119,20 @@ class CodexIngester:
             return
 
         if event.thread_id not in self._in_scope:
-            # We saw a message before session_meta — common when an
-            # origin replays a half-written file. Refuse to create a
-            # session out of thin air; let the service replay from the
-            # beginning of the file when session_meta arrives.
-            logger.debug(
-                "Ingester: dropping %s for thread %s (no session_meta yet)",
-                event.type, event.thread_id,
+            # A persisted cursor can resume after session_meta in a fresh
+            # process. Rehydrate that decision from the session it created;
+            # without this, a correctly retained message cursor would replay
+            # into a new ingester that silently drops the event.
+            existing = await self.db.get_session(
+                await self._session_id_for(event.thread_id)
             )
-            return
+            if existing is None:
+                logger.debug(
+                    "Ingester: dropping %s for thread %s (no session_meta yet)",
+                    event.type, event.thread_id,
+                )
+                return
+            self.mark_in_scope(event.thread_id)
 
         if event.type in ("turn_started", "turn_completed"):
             # Metadata only — no message row. Useful as a hook for
@@ -196,6 +202,9 @@ class CodexIngester:
             status="active",
             backend="codex",
             cwd=meta.cwd,
+            # The sync created this row, not a person — the Codex thread it
+            # mirrors was started outside Nerve entirely.
+            actor=await system_actor(self.db),
         )
         await self.db.bind_native_thread("codex", meta.thread_id, session_id)
         logger.info(
@@ -251,6 +260,7 @@ class CodexIngester:
                 await self.db.update_session_fields(session_id, {"status": "active"})
             except Exception:
                 logger.exception("Failed to reactivate session %s", session_id)
+                raise
 
     async def _archive_session(self, thread_id: str) -> None:
         session_id = await self._session_id_for(thread_id)
@@ -266,6 +276,7 @@ class CodexIngester:
                 logger.info("Codex thread %s: archived", thread_id[:8])
         except Exception:
             logger.exception("Failed to archive Codex session %s", session_id)
+            raise
 
     async def _session_id_for(self, thread_id: str) -> str:
         mapped = await self.db.get_session_for_native_thread("codex", thread_id)
@@ -321,6 +332,9 @@ class CodexIngester:
                 role=msg.role,
                 content=msg.content,
                 external_id=msg.external_id,
+                # Imported human input has no provider-to-person mapping.
+                # Assistant and tool output is also unattributed by design.
+                actor=None,
                 channel=msg.channel,
                 thinking=msg.thinking,
                 blocks=msg.blocks,
@@ -331,7 +345,10 @@ class CodexIngester:
                 "Codex ingest: insert failed for %s (external_id=%s)",
                 session_id, msg.external_id,
             )
-            return
+            # The origin worker may only checkpoint an event that landed.
+            # Propagate so it keeps its last successful cursor and replays this
+            # idempotent insert after restart.
+            raise
 
         if inserted is None:
             self.stats["messages_skipped_duplicate"] += 1
