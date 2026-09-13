@@ -12,11 +12,13 @@ Two things cannot be derived, and only those are stored:
   got to Telegram yet" unless somebody writes it down, and a checklist that
   keeps nagging about a decision you already made is a checklist people
   abandon.
-* **applied** — which configuration paths a step wrote. Comparing them against
-  the *running* config object is what makes "a restart is pending" true until
-  the restart and false afterwards, without anything having to remember to
-  clear it. Secret paths are recorded as ``true``/``false``, never as their
-  value: this file is bookkeeping, not a credential store.
+* **applied** — which configuration paths a step wrote, and when. Comparing
+  them against the *running* config object is what makes "a restart is
+  pending" true until the restart and false afterwards, without anything
+  having to remember to clear it. Secret paths are recorded as
+  ``true``/``false``, never as their value: this file is bookkeeping, not a
+  credential store — which is why the timestamp is there too, since a key
+  pasted over an existing one reads as "present" either way.
 
 The file lives in the machine-local state directory beside the database. A
 missing or unreadable one reads as empty state — the wizard's own scratch file
@@ -53,6 +55,13 @@ _SECRET_PATHS = frozenset({
 
 _UNSET = object()
 
+# When this process started, near enough: the module is imported while the
+# gateway is starting. It is what makes a *secret* that was replaced count as
+# pending — the value comparison below cannot see that, because a secret is
+# recorded as "present" rather than as itself, and a key pasted over an
+# existing one is present either way while only the old one is in force.
+PROCESS_STARTED = datetime.now(timezone.utc)
+
 
 def state_file() -> Path:
     """Resolved per call, never at import: ``NERVE_HOME`` moves under tests."""
@@ -65,6 +74,9 @@ class SetupState:
     done: set[str] = field(default_factory=set)
     # dotted config path -> the value written (or True/False for a secret)
     applied: dict[str, Any] = field(default_factory=dict)
+    # dotted config path -> when it was written, so a secret replaced during
+    # this process is known to be on disk and not yet in force
+    applied_at: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +84,7 @@ class SetupState:
             "skipped": sorted(self.skipped),
             "done": sorted(self.done),
             "applied": dict(self.applied),
+            "applied_at": dict(self.applied_at),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -93,6 +106,10 @@ def load_state() -> SetupState:
         done={str(s) for s in raw.get("done") or [] if isinstance(s, str)},
         applied={
             str(k): v for k, v in (raw.get("applied") or {}).items()
+            if isinstance(k, str)
+        },
+        applied_at={
+            str(k): str(v) for k, v in (raw.get("applied_at") or {}).items()
             if isinstance(k, str)
         },
     )
@@ -118,10 +135,12 @@ def save_state(state: SetupState) -> bool:
 
 def record_applied(state: SetupState, updates: dict[str, Any]) -> None:
     """Note what a step wrote, with secrets reduced to "present"."""
+    now = datetime.now(timezone.utc).isoformat()
     for dotted, value in updates.items():
         state.applied[dotted] = (
             bool(value) if dotted in _SECRET_PATHS else value
         )
+        state.applied_at[dotted] = now
 
 
 def dotted_value(config, dotted: str):
@@ -148,8 +167,24 @@ def pending_paths(state: SetupState, config) -> list[str]:
         if live is _UNSET:
             continue
         if dotted in _SECRET_PATHS:
-            if bool(live) != bool(written):
+            # Two ways a secret is not in force: there is none where one was
+            # written, or one was *replaced* while this process was running —
+            # which the value comparison cannot see, since both the old and the
+            # new one read as "present".
+            if bool(live) != bool(written) or _written_this_process(state, dotted):
                 pending.append(dotted)
         elif live != written:
             pending.append(dotted)
     return pending
+
+
+def _written_this_process(state: SetupState, dotted: str) -> bool:
+    stamp = state.applied_at.get(dotted)
+    if not stamp:
+        # Written before this field existed, or by an older version: fall back
+        # to the value comparison, which is what the caller already did.
+        return False
+    try:
+        return datetime.fromisoformat(stamp) > PROCESS_STARTED
+    except ValueError:
+        return False
