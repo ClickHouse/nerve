@@ -220,7 +220,7 @@ class AccountStore:
     async def _account_identity(self, account_id: str) -> dict | None:
         """The request-resolution fields for one account, or ``None``."""
         async with self.db.execute(
-            """SELECT a.id AS account_id, a.enabled,
+            """SELECT a.id AS account_id, a.enabled, a.session_epoch,
                       r.id AS actor_id, r.kind AS actor_kind, r.display_name
                  FROM accounts a
                  LEFT JOIN actor_refs r ON r.id = a.actor_id
@@ -237,7 +237,7 @@ class AccountStore:
     async def _sole_account_identity(self) -> dict | None:
         """The request-resolution fields when exactly one account exists."""
         async with self.db.execute(
-            """SELECT a.id AS account_id, a.enabled,
+            """SELECT a.id AS account_id, a.enabled, a.session_epoch,
                       r.id AS actor_id, r.kind AS actor_kind, r.display_name
                  FROM accounts a
                  LEFT JOIN actor_refs r ON r.id = a.actor_id
@@ -467,8 +467,36 @@ class AccountStore:
     ) -> dict:
         """Atomically name and secure exactly one unclaimed account.
 
-        The caller must separately authorize the claim; this DAL method only
-        makes its precondition and writes indivisible.
+        First-run "claim and secure": the account an install is created with has
+        no password and no username, and this is what gives it both. One
+        transaction, so a half-claimed account — named but still open, or
+        secured but unreachable — never exists, not even between two requests.
+
+        The *precondition* is checked inside the transaction as well, which is
+        the difference between this and ``get_sole_account()`` followed by
+        ``update_account_login()``: those are two transactions, so two callers
+        racing to claim a fresh install can both read "one account, no
+        password" and the second one silently overwrites the first's password
+        with its own. Under ``BEGIN IMMEDIATE`` the loser reads the winner's
+        committed row and raises :class:`NotClaimableError`.
+
+        Raises :class:`NotClaimableError` unless exactly one account exists and
+        it has no credential, and the username errors of
+        :func:`normalise_username`. ``display_name`` also renames the account's
+        actor, in the same transaction.
+
+        **It also ends every session that existed before it**, by bumping
+        ``session_epoch`` in the same statement that sets the password. A
+        passwordless install hands a session to everyone who can reach it, and
+        those tokens are signed, unexpired and name this same account — so
+        without the bump the claim would secure the *next* caller and leave the
+        previous ones with owner authority for the rest of their thirty days,
+        which is the window claiming exists to close. See ``v049``.
+
+        Note what this does **not** do: decide who may call it. A passwordless
+        install admits everybody, so the caller is responsible for the guard
+        that makes claiming meaningful (a setup token, or proof that the request
+        came from the machine itself).
         """
         username = normalise_username(username)
         if not credential:
@@ -496,7 +524,8 @@ class AccountStore:
                 await self.db.execute(
                     """UPDATE accounts
                           SET username = ?, credential_source = 'local',
-                              credential = ?
+                              credential = ?,
+                              session_epoch = session_epoch + 1
                         WHERE id = ?""",
                     (username, credential, account["id"]),
                 )

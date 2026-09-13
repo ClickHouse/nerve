@@ -49,6 +49,9 @@ MCP_SESSION_CLAIM = "nerve_session_id"
 MCP_WORKER_CLAIM = "nerve_worker_id"
 
 TOKEN_TYPE_CLAIM = "typ"
+# Claiming an installation increments the account epoch and invalidates tokens
+# issued while it was passwordless. Missing claims use the initial epoch, 0.
+SESSION_EPOCH_CLAIM = "sep"
 TOKEN_TYPE_SESSION = "session"
 TOKEN_TYPE_SYSTEM = "system"
 
@@ -186,9 +189,25 @@ def effective_jwt_secret(config: NerveConfig | None = None) -> str:
 
 
 def create_session_token(
-    jwt_secret: str, account_id: str, expiry_hours: int | None = None,
+    jwt_secret: str,
+    account_id: str,
+    expiry_hours: int | None = None,
+    *,
+    session_epoch: int = 0,
 ) -> str:
-    """Create a typed web-session JWT whose subject is an account id."""
+    """Create a web-session JWT for one local account.
+
+    ``sub`` is the account id, so every request the browser makes afterwards
+    says *which* person is making it. ``typ`` says what the token is, which is
+    what the refresh gate and the MCP endpoint read — never the subject string.
+
+    ``session_epoch`` is the account's epoch at the moment of minting, and the
+    caller passes the value it just read from the row. It defaults to 0 rather
+    than being required because 0 is where every account starts and what a
+    token minted before the column existed reads as; a caller that mints for an
+    account which has been claimed **must** pass the row's value, or the token
+    it hands out is stale on arrival.
+    """
     if not account_id:
         raise ValueError("a session token must name an account")
     hours = max(1, int(expiry_hours)) if expiry_hours else session_expiry_hours()
@@ -198,6 +217,7 @@ def create_session_token(
         "iat": now,
         "sub": account_id,
         TOKEN_TYPE_CLAIM: TOKEN_TYPE_SESSION,
+        SESSION_EPOCH_CLAIM: int(session_epoch or 0),
     }
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
 
@@ -225,7 +245,7 @@ def is_legacy_session_token(payload: dict) -> bool:
 
 
 def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
-    """Refresh an account session after its refresh threshold."""
+    """Refresh an account session while preserving its session epoch."""
     if payload.get("aud") or payload.get(TOKEN_TYPE_CLAIM) != TOKEN_TYPE_SESSION:
         return None
     account_id = payload.get("sub")
@@ -240,7 +260,22 @@ def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
     age = datetime.now(timezone.utc).timestamp() - iat
     if age < lifetime * REFRESH_AFTER_RATIO:
         return None
-    return create_session_token(jwt_secret, account_id)
+    return create_session_token(
+        jwt_secret, account_id,
+        session_epoch=session_epoch_of(payload),
+    )
+
+
+def session_epoch_of(claims: dict) -> int:
+    """The epoch a session token was minted under. Absent or unusable reads 0.
+
+    Said once so the three readers — the slide, the resolution check and the
+    tests — cannot disagree about what a missing claim means.
+    """
+    raw = claims.get(SESSION_EPOCH_CLAIM)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0
+    return int(raw)
 
 
 def create_mcp_session_token(
@@ -342,9 +377,11 @@ async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
     if token_type == TOKEN_TYPE_SYSTEM:
         return store.system_actor
     if token_type == TOKEN_TYPE_SESSION:
-        return await actor_for_account(store, claims.get("sub"))
+        return await actor_for_account(
+            store, claims.get("sub"), session_epoch=session_epoch_of(claims),
+        )
     if is_legacy_session_token(claims):
-        return await actor_for_sole_account(store)
+        return await actor_for_sole_account(store, session_epoch=0)
 
     raise ActorResolutionError("This credential names no actor")
 

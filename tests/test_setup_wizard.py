@@ -17,10 +17,11 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import jwt
 import pytest
 import pytest_asyncio
 import yaml
@@ -30,6 +31,7 @@ from nerve import setup_state, setup_token
 from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.db.accounts import JWT_SECRET_NAME
 from nerve.gateway.auth import (
+    JWT_ALGORITHM,
     create_session_token,
     hash_password,
     pin_jwt_secret,
@@ -52,6 +54,23 @@ _LOOPBACK = ("127.0.0.1", 41000)
 _REMOTE = ("203.0.113.7", 41000)     # TEST-NET-3, never routable
 _ANTHROPIC_KEY = "anthropic-key-placeholder"
 _TELEGRAM_TOKEN = "0000000000:telegram-bot-token-placeholder"
+
+
+def _legacy_token(secret: str = _SECRET) -> str:
+    """What a browser that logged in before per-account sessions is holding."""
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {"iat": now, "exp": now + timedelta(hours=720), "sub": "user"},
+        secret, algorithm=JWT_ALGORITHM,
+    )
+
+
+class _FakeSocket:
+    """Enough of a WebSocket for ``authenticate_websocket``: a token and no cookies."""
+
+    def __init__(self, token: str):
+        self.query_params = {"token": token}
+        self.cookies: dict[str, str] = {}
 
 
 def _app() -> FastAPI:
@@ -452,6 +471,121 @@ class TestClaimingFromSomewhereElse:
         assert (await _claim(install)).status_code == 200
         response = await _claim(install, client=_REMOTE, body={"username": "bob"})
         assert response.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+#  What the claim does to the sessions that came before it                     #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestClaimingEndsTheSessionsBeforeIt:
+    """The point of step one, and the thing it did not do in round 1.
+
+    A passwordless install hands a session to everybody who reaches it. Those
+    tokens name the account the claim secures, are signed with the same secret
+    and have thirty days left, so unless the claim ends them it secures the
+    *next* caller and leaves every previous one with owner authority — which is
+    the window the claim exists to close.
+    """
+
+    async def test_a_session_from_before_the_claim_is_refused_after_it(
+        self, install,
+    ):
+        # What any visitor gets on a passwordless install: an ordinary login.
+        async with _client(install.app) as http:
+            before = (await http.post(
+                "/api/auth/login", json={"password": "anything at all"},
+            )).json()["token"]
+        async with _client(install.app, token=before) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+
+        assert (await _claim(install)).status_code == 200
+
+        async with _client(install.app, token=before) as http:
+            after = await http.get("/api/auth/check")
+        assert after.status_code == 401, after.text
+
+    async def test_the_claimer_keeps_working(self, install):
+        claimed = (await _claim(install)).json()["token"]
+        async with _client(install.app, token=claimed) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+            assert (await http.get("/api/setup")).status_code == 200
+
+    async def test_a_websocket_holding_one_is_refused_too(self, install):
+        """The other door into the same identity."""
+        from nerve.gateway.auth import authenticate_websocket
+
+        async with _client(install.app) as http:
+            before = (await http.post(
+                "/api/auth/login", json={"password": "anything at all"},
+            )).json()["token"]
+
+        socket = _FakeSocket(before)
+        assert await authenticate_websocket(socket) is not None
+
+        assert (await _claim(install)).status_code == 200
+        assert await authenticate_websocket(_FakeSocket(before)) is None
+
+    async def test_a_legacy_token_dies_with_them(self, install):
+        """A tab from before per-account sessions carries no epoch at all, so
+        it reads as 0 and stops the moment the account is claimed — which is
+        right: it was minted while the instance admitted everybody."""
+        async with _client(install.app, token=_legacy_token()) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+        assert (await _claim(install)).status_code == 200
+        async with _client(install.app, token=_legacy_token()) as http:
+            assert (await http.get("/api/auth/check")).status_code == 401
+
+    async def test_an_upgrade_logs_nobody_out(self, install):
+        """The epoch starts at 0 and a token minted before the column existed
+        carries none, which reads as 0. An install that has never been claimed
+        therefore keeps its sessions across the upgrade; only a claim ends
+        them."""
+        token = create_session_token(_SECRET, install.owner_id)  # no epoch claim
+        async with _client(install.app, token=token) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+
+    async def test_a_restart_does_not_end_a_session(self, claimed):
+        """The epoch lives on the account row, not in the process: the wizard
+        ends in a restart and the browser has to come back signed in."""
+        async with _http(claimed) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+        claimed.restarted()
+        async with _http(claimed) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+
+    async def test_the_epoch_moves_once_and_only_on_a_claim(self, install):
+        async def epoch() -> int:
+            account = await install.db.get_account(install.owner_id)
+            return int(account["session_epoch"])
+
+        assert await epoch() == 0
+        assert (await _claim(install)).status_code == 200
+        assert await epoch() == 1
+
+        # A refused second claim does not move it, and neither does an
+        # ordinary login or a password change.
+        assert (await _claim(install, body={"username": "bob"})).status_code == 409
+        async with _client(install.app, token=install.session_token()) as http:
+            await http.put("/api/accounts/me/password", json={
+                "current_password": _PASSWORD, "new_password": "a-third-one",
+            })
+        assert await epoch() == 1
+
+    async def test_a_session_for_another_account_is_unaffected(self, claimed):
+        """The epoch is per account. Claiming one instance's account must not
+        reach into anybody else's session — there is only one account here, so
+        this pins the column rather than a global."""
+        second = await claimed.db.create_managed_account(
+            username="bob", credential=hash_password(_PASSWORD),
+        )
+        token = create_session_token(
+            _SECRET, second["id"],
+            session_epoch=int(second["session_epoch"] or 0),
+        )
+        async with _client(claimed.app, token=token) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
 
 
 # --------------------------------------------------------------------------- #
