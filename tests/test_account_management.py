@@ -764,21 +764,29 @@ class TestPasswordLength:
         (_MULTIBYTE_OVER, 400),
     ])
     async def test_changing_your_own_password(self, install: _Install, password, status):
+        # Claimed first: this endpoint refuses on an unclaimed instance (PR 6),
+        # where the *first* password goes through the guarded claim instead.
+        # The limit is the same on both doors; this one is about the limit.
+        await install.secure_the_owner()
         async with _client(install.app) as client:
             response = await client.put(
-                "/api/accounts/me/password", json={"new_password": password},
+                "/api/accounts/me/password",
+                json={"current_password": _PASSWORD, "new_password": password},
                 headers=install.headers(),
             )
         assert response.status_code == status, response.text
 
     async def test_a_password_at_the_limit_still_logs_in(self, install: _Install):
+        await install.secure_the_owner()
         async with _client(install.app) as client:
             assert (await client.put(
-                "/api/accounts/me/password", json={"new_password": _AT_THE_LIMIT},
+                "/api/accounts/me/password",
+                json={"current_password": _PASSWORD, "new_password": _AT_THE_LIMIT},
                 headers=install.headers(),
             )).status_code == 200
             assert (await client.post(
-                "/api/auth/login", json={"password": _AT_THE_LIMIT},
+                "/api/auth/login",
+                json={"username": "alice", "password": _AT_THE_LIMIT},
             )).status_code == 200
 
     async def test_an_over_long_guess_is_refused_rather_than_crashing(

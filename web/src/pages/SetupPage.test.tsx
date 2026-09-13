@@ -15,10 +15,10 @@ vi.mock('../api/client', () => ({
     setupSkip: vi.fn(),
     restartSystem: vi.fn(),
     me: vi.fn(),
-    listActors: vi.fn().mockResolvedValue({ actors: [] }),
+    listActors: vi.fn(),
     authStatus: vi.fn(),
     login: vi.fn(),
-    checkAuth: vi.fn().mockResolvedValue({ authenticated: true }),
+    getOwnAccount: vi.fn(),
     listAccounts: vi.fn().mockResolvedValue({ accounts: [] }),
   },
   setToken: vi.fn(),
@@ -34,6 +34,7 @@ const client = await import('../api/client');
 const { SetupPage, SetupReminder } = await import('./SetupPage');
 const { useSetupStore } = await import('../stores/setupStore');
 const { useAuthStore } = await import('../stores/authStore');
+const { useActorStore } = await import('../stores/actorStore');
 
 const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 
@@ -87,7 +88,10 @@ beforeEach(() => {
   useSetupStore.setState({
     state: null, loading: true, busy: null, error: null, reconnecting: false,
   });
-  useAuthStore.setState({ authenticated: true, setupPending: false });
+  useAuthStore.setState({
+    authenticated: true, setupPending: false,
+    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
+  });
   api.setupState.mockResolvedValue(state());
   api.me.mockResolvedValue({
     actor_id: 'actor-1', account_id: 'acc-1', username: 'alice',
@@ -97,7 +101,20 @@ beforeEach(() => {
     auth_required: true, mode: 'local', login: 'password',
     setup_pending: false, multiple_accounts: false,
   });
-  api.checkAuth.mockResolvedValue({ authenticated: true });
+  // The name on the page comes from the actor map, like every other name in
+  // the app — the account row carries the login, the actor carries the name.
+  useActorStore.getState().reset();
+  api.listActors.mockResolvedValue({
+    actors: [{
+      id: 'actor-1', kind: 'human', display_name: 'Alice Example',
+      profile_version: 1,
+    }],
+  });
+  api.getOwnAccount.mockResolvedValue({
+    id: 'acc-1', actor_id: 'actor-1', username: 'alice',
+    display_name: 'Alice Example', enabled: true, has_password: true,
+    created_at: '', updated_at: '', disabled_at: null, is_self: true,
+  });
   (client.getToken as unknown as ReturnType<typeof vi.fn>)
     .mockReturnValue('a-synthetic-session-token');
 });
@@ -147,7 +164,7 @@ describe('claiming an unclaimed instance', () => {
     // own startup path so this tab is signed in rather than sent back to a
     // form for the password it just set.
     expect(client.setToken).toHaveBeenCalledWith('a-synthetic-session-token');
-    await waitFor(() => expect(api.checkAuth).toHaveBeenCalled());
+    await waitFor(() => expect(api.getOwnAccount).toHaveBeenCalled());
     expect(api.authStatus).toHaveBeenCalled();
     expect(api.listActors).toHaveBeenCalled();
     expect(useAuthStore.getState().authenticated).toBe(true);
