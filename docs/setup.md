@@ -321,11 +321,22 @@ What it deliberately does not do:
   host decisions — `nerve init` on the machine.
 - **Replace the settings screens.** First-run decisions only.
 
+Every step is a *patch*: a field you do not touch is left exactly as it is, so
+re-entering a step to change one thing changes one thing. The forms open on
+what the instance already says rather than on defaults, and a credential is
+shown as configured rather than read back out.
+
 It ends in a restart, because `timezone`, the Telegram token and the gateway
 socket are read at startup (see [Config](config.md#what-still-needs-a-restart)).
-The page waits for the new process and comes back **signed in**: the signing
-secret is pinned and persisted and nothing in the wizard rotates it, so the
-session outlives the process that issued it.
+The page waits for the **new** process — `/health` publishes a generation that
+changes on every start, and the daemon being replaced answers until the moment
+it stops — and comes back **signed in**: the signing secret is pinned and
+persisted, the session epoch lives on the account rather than in the process,
+and nothing in the wizard rotates either.
+
+Claiming the account ends the sessions that existed before it, including any
+an earlier visitor was holding; see
+[Accounts and identity](accounts.md#passwordless).
 
 **Under `lockdown` the checklist is read-only.** Configuration there is
 fleet-managed and machine-local values are environment references, so every

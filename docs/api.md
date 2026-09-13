@@ -173,6 +173,12 @@ itself — a loopback socket peer needs none, unless
 session token for the account just claimed, so the browser is signed in with
 the password it set.
 
+**Every session issued before the claim stops working.** The claim bumps the
+account's session epoch, so the tokens a passwordless install handed out are
+one epoch behind and are refused at their next request, HTTP and WebSocket
+alike; the token returned here is minted at the new epoch. See
+[Accounts and identity](accounts.md#passwordless).
+
 One transaction does the whole claim, so a half-claimed account — named but
 still open, or secured but unreachable — never exists, and of two callers
 racing to claim a fresh install exactly one wins.
@@ -206,18 +212,32 @@ configuration wherever it can be — so an install set up at the terminal shows
 the same list. `restart_pending_paths` compares what the wizard wrote against
 what this process is running, so it clears itself at the restart.
 
+`values` carries what the forms open on — the configured timezone, your display
+name, which sources sync — and reports a **secret as present or not, never as
+itself**: the wizard writes credentials and does not read them back.
+`restart_pending_reasons` holds what is waiting on a restart but is not a
+configuration key, already in words (a cron file the running scheduler has not
+picked up).
+
 | Endpoint | Does |
 |---|---|
 | `PUT /api/setup/provider` | `{anthropic_api_key?, openai_api_key?}` → `config.local.yaml` |
 | `PUT /api/setup/profile` | `{timezone?, display_name?}` — the zone to the tracked settings, the name onto your actor |
 | `PUT /api/setup/channels` | `{telegram_bot_token, telegram_allowed_users?}` |
-| `PUT /api/setup/automation` | `{crons[], github?, gmail?, gmail_accounts[], telegram?, telegram_api_id?, telegram_api_hash?}` |
+| `PUT /api/setup/automation` | `{crons?, github?, gmail?, gmail_accounts?, telegram?, telegram_api_id?, telegram_api_hash?}` |
 | `POST /api/setup/steps/{id}/skip` | remember that a step was declined |
 | `POST /api/setup/steps/{id}/unskip` | put it back on the list |
 
 Each returns the whole checklist, so one round trip both writes and refreshes.
 Every one is idempotent and re-enterable, and writes only the keys its step
 owns — merged into what is on disk, never regenerating the file.
+
+**These are PATCH semantics**, and the `?` above is load-bearing: an omitted
+field is left exactly as it is. A step is entered again to change one thing,
+and a body that defaulted the rest would turn "enable this cron" into "and
+switch off the sync sources configured elsewhere". One mutation is served at a
+time, and a step is recorded as done only after every write it makes has
+landed.
 
 | Response | When |
 |---|---|
@@ -230,13 +250,25 @@ Restart the daemon: what `nerve restart` does, asked for over HTTP. Requires a
 session. Allowed under lockdown, because a restart writes no configuration.
 
 ```json
-Response: { "restarting": true, "method": "helper", "message": "…" }
+Response: { "restarting": true, "method": "helper", "message": "…",
+            "boot": "3f7c…" }
 ```
 
-The work happens after the response is sent, so the answer is on the wire
-before the process is signalled. Sessions survive it — the signing secret is
-pinned and persisted, and nothing in the wizard rotates it — so a browser that
-polls `/api/auth/status` until it answers comes back already signed in.
+`boot` is the generation of the process that accepted the request. **Poll
+`/health` until it reports a different one** — the daemon being replaced
+answers perfectly well while it shuts down, so waiting for any answer at all
+accepts the process you asked to replace, with the restart-only settings still
+unapplied.
+
+| Response | When |
+|---|---|
+| `409` | a restart is already under way; a second helper would race the first over the same PID |
+| `500` | the helper could not be started — the instance is still running, and the reason is in the message |
+
+The helper holds a short delay before it signals anything, so this response is
+on the wire first. Sessions survive the restart: the signing secret is pinned
+and persisted, the session epoch lives on the account rather than in the
+process, and nothing in the wizard rotates either.
 
 ### Actors
 
@@ -805,6 +837,13 @@ Response: {
 ```
 
 ### Health
+
+`GET /health` — unauthenticated liveness, plus `boot`: a random value, new on
+every start. It is the only thing that distinguishes the new process from the
+old one still answering as it shuts down, which is what makes
+`POST /api/system/restart` observable. Deliberately opaque: an uptime or a
+counter would tell an anonymous caller how long the box has been up, or how
+often it falls over.
 
 #### `GET /health`
 No auth required.
