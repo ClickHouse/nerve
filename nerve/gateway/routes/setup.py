@@ -239,7 +239,10 @@ class SetupValuesOut(BaseModel):
     sync_github: bool
     sync_gmail: bool
     sync_telegram: bool
-    gmail_accounts: list[str]
+    # Deliberately not here: which mailboxes sync. Every account may read this
+    # endpoint (0.4), the wizard has no field for them, and a list of somebody's
+    # email addresses is not something to publish for a screen that does not
+    # use it. An omitted `gmail_accounts` in a step leaves them untouched.
 
 
 class SetupStateOut(BaseModel):
@@ -594,7 +597,6 @@ def _render(context: _Context) -> SetupStateOut:
         sync_github=bool(sync.github.enabled),
         sync_gmail=bool(sync.gmail.enabled),
         sync_telegram=bool(sync.telegram.enabled),
-        gmail_accounts=list(sync.gmail.accounts or []),
     )
 
     return SetupStateOut(

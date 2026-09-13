@@ -158,7 +158,7 @@ describe('an unclaimed instance', () => {
       values: {
         timezone: 'UTC', display_name: null, has_anthropic_key: false,
         has_openai_key: false, has_telegram_token: false, sync_github: false,
-        sync_gmail: false, sync_telegram: false, gmail_accounts: [],
+        sync_gmail: false, sync_telegram: false,
       },
     });
     (getToken as unknown as ReturnType<typeof vi.fn>).mockReturnValue(null);
