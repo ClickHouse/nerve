@@ -1117,21 +1117,14 @@ class TestMutationsAreActuallySerialised:
         async with _http(claimed) as http:
             await http.post("/api/setup/steps/channels/skip")
 
-        release, started = asyncio.Event(), asyncio.Event()
-        original = setup_routes.set_optional_crons
+        release = asyncio.Event()
 
-        def _slow(*args, **kwargs):
-            started.set()
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(setup_routes, "set_optional_crons", _slow)
-
-        async def _blocked_reload():
+        async def _blocked_publish(plan):
+            # Held open between the step's read of the checklist and its save.
             await release.wait()
             return ()
 
-        monkeypatch.setattr(setup_routes, "_apply_cron_toggles",
-                            lambda *a, **k: _blocked_reload())
+        monkeypatch.setattr(setup_routes, "_publish_cron_plan", _blocked_publish)
 
         async with _http(claimed) as http:
             automation = asyncio.create_task(http.put(
@@ -1293,6 +1286,75 @@ class TestNothingHalfLands:
         assert all(
             not job["enabled"] for job in jobs if job["id"] == "inbox-processor"
         ), "the cron file was published for a step that failed"
+
+
+@pytest.mark.asyncio
+class TestAFailureSaysWhatLanded:
+    """Where two resources cannot be written as one, the answer has to say
+    which of them changed. "Nothing was changed" is only allowed when it is
+    true."""
+
+    async def test_an_unreadable_cron_file_stops_before_the_sync_write(
+        self, claimed,
+    ):
+        """The cron file is parsed before anything is published, so a step
+        that cannot finish has not started."""
+        before = claimed.tracked()
+        claimed.system_crons.write_text("jobs: [this is not a list of jobs\n", encoding="utf-8")
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/automation", json={
+                "github": True, "crons": ["inbox-processor"],
+            })
+        assert response.status_code == 409
+        assert "nothing was changed" in response.json()["detail"].lower()
+        assert claimed.tracked() == before, (
+            "the sync settings were written by a step that reported failure"
+        )
+        assert "automation" not in setup_state.load_state().done
+
+    async def test_a_database_failure_after_the_timezone_says_the_timezone_landed(
+        self, claimed, monkeypatch,
+    ):
+        async def _broken(*args, **kwargs):
+            raise RuntimeError("disk is on fire")
+
+        monkeypatch.setattr(claimed.db, "update_actor_profile", _broken)
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/profile", json={
+                "timezone": "Europe/Berlin", "display_name": "Alice Example",
+            })
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert "time zone was saved" in detail
+        assert "display name could not be saved" in detail
+        # And it is true: the file changed, and the checklist knows it owes a
+        # restart for it rather than having lost that with the failure.
+        assert claimed.tracked()["timezone"] == "Europe/Berlin"
+        state = setup_state.load_state()
+        assert state.applied.get("timezone") == "Europe/Berlin"
+
+    async def test_a_name_only_failure_says_nothing_was_written(
+        self, claimed, monkeypatch,
+    ):
+        async def _broken(*args, **kwargs):
+            raise RuntimeError("disk is on fire")
+
+        monkeypatch.setattr(claimed.db, "update_actor_profile", _broken)
+        async with _http(claimed) as http:
+            response = await http.put(
+                "/api/setup/profile", json={"display_name": "Alice Example"},
+            )
+        assert response.status_code == 500
+        assert "Nothing was written" in response.json()["detail"]
+
+    async def test_the_cron_file_is_published_atomically(self, claimed):
+        async with _http(claimed) as http:
+            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
+        assert not claimed.system_crons.with_name("system.yaml.tmp").exists()
+        jobs = yaml.safe_load(claimed.system_crons.read_text(encoding="utf-8"))["jobs"]
+        assert any(j["id"] == "memory-maintenance" for j in jobs), (
+            "the rest of the file survived the rewrite"
+        )
 
 
 @pytest.mark.asyncio
