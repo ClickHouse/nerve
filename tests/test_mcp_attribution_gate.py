@@ -91,8 +91,7 @@ class TestAToolCallNeedsAnAttributableSession:
         session_id = mcp.invoked[0]["session_id"]
         session = await mcp.db.get_session(session_id)
         assert session is not None, "the handler ran without a session row"
-        identity = await mcp.db.get_local_identity()
-        assert session["created_by_actor_id"] == identity.system_actor_id
+        assert session["created_by_actor_id"] == mcp.db.system_actor_id
 
     async def test_database_create_failure_refuses_the_tool(self, mcp):
         await mcp.db.db.execute(
@@ -117,8 +116,7 @@ class TestAToolCallNeedsAnAttributableSession:
         assert retry.is_error is False
         assert len(mcp.invoked) == 1
         session = await mcp.db.get_session(mcp.invoked[0]["session_id"])
-        identity = await mcp.db.get_local_identity()
-        assert session["created_by_actor_id"] == identity.system_actor_id
+        assert session["created_by_actor_id"] == mcp.db.system_actor_id
 
 
 @pytest.mark.asyncio
@@ -129,7 +127,6 @@ class TestOnlyALostRaceIsSurvivable:
         exists, so the call proceeds."""
         resolver = SatelliteSessionResolver(mcp.db)
         sid = resolver.build_session_id("claude-code", "race-1")
-        identity = await mcp.db.get_local_identity()
 
         real_create = mcp.db.create_session
 
@@ -151,7 +148,7 @@ class TestOnlyALostRaceIsSurvivable:
 
         session = await mcp.db.get_session(sid)
         assert session is not None
-        assert session["created_by_actor_id"] == identity.system_actor_id
+        assert session["created_by_actor_id"] == mcp.db.system_actor_id
 
 
 async def _system(db):
