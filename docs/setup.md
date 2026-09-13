@@ -316,8 +316,11 @@ so: the checklist derives what it can from the instance itself — a provider
 credential is configured or it is not — so an install set up at the terminal
 shows the same list. Only what nothing else records is remembered: that a step
 was skipped, which automation an operator chose, and — until the next restart —
-that a step's value is on disk but not yet live. Those notes live in
-`setup-state.json` in the machine-local state directory beside the database.
+that a step's value is on disk but not yet live. Each account has its own
+skipped/done/answered decisions, so Alice's abandoned or skipped checklist does
+not finish Bob's. Applied configuration and restart debt remain instance-wide,
+because every account is looking at the same daemon. Those notes live together
+in `setup-state.json` in the machine-local state directory beside the database.
 They hold no credential (a secret is recorded as present or absent, never as
 itself), and a missing or unreadable file reads as empty state rather than
 stopping setup.

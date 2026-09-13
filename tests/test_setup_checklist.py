@@ -11,6 +11,7 @@ checklist ends in a restart and the browser has to come back signed in.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import stat
 from pathlib import Path
@@ -866,12 +867,12 @@ class TestTheChecklistIsReadAsTheCaller:
     Alice's — and the first thing he saved would be her name back onto himself.
     """
 
-    async def _add_bob(self, claimed) -> str:
+    async def _add_bob(self, claimed, *, display_name="Bob Example") -> str:
         async with _http(claimed) as http:
             created = await http.post("/api/accounts", json={
                 "username": "bob",
                 "password": "another-passphrase",
-                "display_name": "Bob Example",
+                "display_name": display_name,
             })
         assert created.status_code == 201, created.text
         return created.json()["id"]
@@ -904,6 +905,73 @@ class TestTheChecklistIsReadAsTheCaller:
         async with _client(claimed.app, token=claimed.session_token(bob)) as http:
             after = (await http.get("/api/setup")).json()["values"]["display_name"]
         assert before == after == "Bob Example"
+
+    async def test_alices_progress_and_skips_do_not_answer_bobs_checklist(
+        self, claimed,
+    ):
+        bob = await self._add_bob(claimed, display_name=None)
+        async with _http(claimed) as http:
+            profile = await http.put(
+                "/api/setup/profile", json={"display_name": "Alice Example"},
+            )
+            skipped = await http.post("/api/setup/steps/channels/skip")
+        assert profile.status_code == 200, profile.text
+        assert skipped.status_code == 200, skipped.text
+        assert _status_of(skipped.json(), "profile") == "done"
+        assert _status_of(skipped.json(), "channels") == "skipped"
+
+        async with _client(claimed.app, token=claimed.session_token(bob)) as http:
+            state = (await http.get("/api/setup")).json()
+        assert state["values"]["display_name"] is None
+        assert _status_of(state, "profile") == "pending"
+        assert _status_of(state, "channels") == "pending"
+
+    async def test_concurrent_accounts_keep_both_sets_of_decisions(self, claimed):
+        bob = await self._add_bob(claimed, display_name=None)
+        async with (
+            _http(claimed) as alice_http,
+            _client(claimed.app, token=claimed.session_token(bob)) as bob_http,
+        ):
+            alice_skip, bob_skip = await asyncio.gather(
+                alice_http.post("/api/setup/steps/channels/skip"),
+                bob_http.post("/api/setup/steps/provider/skip"),
+            )
+        assert alice_skip.status_code == 200, alice_skip.text
+        assert bob_skip.status_code == 200, bob_skip.text
+
+        async with _http(claimed) as http:
+            alice = (await http.get("/api/setup")).json()
+        async with _client(claimed.app, token=claimed.session_token(bob)) as http:
+            bob_state = (await http.get("/api/setup")).json()
+        assert _status_of(alice, "channels") == "skipped"
+        assert _status_of(alice, "provider") == "pending"
+        assert _status_of(bob_state, "provider") == "skipped"
+        assert _status_of(bob_state, "channels") == "pending"
+
+    async def test_ambiguous_legacy_decisions_are_not_given_to_bob(self, claimed):
+        bob = await self._add_bob(claimed, display_name=None)
+        state_path = setup_state.state_file()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({
+            "version": 2,
+            "skipped": ["channels"],
+            "done": ["profile"],
+            "answered": ["profile"],
+            "applied": {},
+            "debts": [],
+            "boot": boot.boot_id(),
+        }), encoding="utf-8")
+
+        async with _client(claimed.app, token=claimed.session_token(bob)) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "profile") == "pending"
+        assert _status_of(state, "channels") == "pending"
+
+        migrated = json.loads(
+            state_path.read_text(encoding="utf-8"),
+        )
+        assert migrated["version"] == 3
+        assert migrated["accounts"][bob]["skipped"] == []
 
 
 @pytest.mark.asyncio

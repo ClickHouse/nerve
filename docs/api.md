@@ -213,11 +213,15 @@ restart.
 
 A step's `status` is `done`, `skipped` or `pending`, and is *derived* from the
 instance wherever it can be — so an install set up at the terminal shows the
-same list. `values` carries what the forms open on — the configured timezone,
-your display name, which sources sync — and reports a **secret as present or
-not, never as itself**: the checklist writes credentials and does not read them
-back. `warning` is set when a request's configuration landed but its
-bookkeeping did not, which is neither success nor failure.
+same list. Decisions that cannot be derived (`skipped`, transitional `done`,
+and an answer that chose the existing default) are kept per account; one
+account's checklist response cannot answer another's. Applied configuration
+and restart debt are shared because they describe the running instance.
+`values` carries what the forms open on — the configured timezone, your display
+name, which sources sync — and reports a **secret as present or not, never as
+itself**: the checklist writes credentials and does not read them back.
+`warning` is set when a request's configuration landed but its bookkeeping did
+not, which is neither success nor failure.
 
 `restart_pending_paths` compares what the checklist wrote against what this
 process is running, so it clears itself at the restart.

@@ -405,7 +405,17 @@ async def _context(actor: Actor) -> _Context:
     """
     config = get_config()
     unclaimed = await instance_is_unclaimed(get_deps().db, config)
-    state = setup_state.load_state()
+    # require_account guarantees this. Passing it explicitly is the server-side
+    # half of the account boundary: Alice's skip/done/answered decisions must
+    # never become Bob's checklist merely because they share one instance.
+    assert actor.account_id is not None  # noqa: S101
+    state = setup_state.load_state(
+        actor.account_id,
+        # A v1/v2 setup-state file has no author. The sole account can inherit
+        # it; once there are two, assigning it to whichever account reads first
+        # would itself be the cross-account leak this boundary prevents.
+        adopt_legacy_decisions=await get_deps().db.count_accounts() == 1,
+    )
     setup_state.retire_transitional(state, _TRANSITIONAL_STEPS)
     return _Context(
         config=config,

@@ -6,7 +6,9 @@ not because a flag says so, so an install set up at the terminal shows the
 same checklist as one set up in a browser, and a step re-entered after a
 change still reads correctly.
 
-Two things cannot be derived, and only those are stored:
+Two things cannot be derived, and only those are stored. Decisions are scoped
+to the account that made them; restart bookkeeping is shared because it
+describes the one running daemon:
 
 * **skipped** — "I do not want Telegram" is indistinguishable from "I have not
   got to Telegram yet" unless somebody writes it down, and a checklist that
@@ -46,7 +48,8 @@ from nerve import boot, paths
 
 logger = logging.getLogger(__name__)
 
-_VERSION = 2
+_VERSION = 3
+_UNSCOPED_ACCOUNT = "_unscoped"
 
 # Paths whose *value* must not be written here. Recorded as a boolean instead:
 # enough to answer "is the running process using what the wizard wrote", which
@@ -70,7 +73,9 @@ def state_file() -> Path:
 
 
 @dataclass
-class SetupState:
+class AccountSetupState:
+    """The checklist decisions made by one signed-in account."""
+
     #: Steps declined on purpose. A decision, so it outlives every restart.
     skipped: set[str] = field(default_factory=set)
     #: Steps recorded as answered. Transitional for every step whose
@@ -82,6 +87,22 @@ class SetupState:
     #: *decision*, so it is kept across restarts like a skip, and it is the
     #: only thing that tells "set the timezone back to UTC" from "nobody ever
     #: touched the timezone".
+    answered: set[str] = field(default_factory=set)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "skipped": sorted(self.skipped),
+            "done": sorted(self.done),
+            "answered": sorted(self.answered),
+        }
+
+
+@dataclass
+class SetupState:
+    #: The selected account's decisions. These remain direct attributes so the
+    #: route code cannot accidentally mutate a detached copy.
+    skipped: set[str] = field(default_factory=set)
+    done: set[str] = field(default_factory=set)
     answered: set[str] = field(default_factory=set)
     #: dotted config path -> the value written (or True/False for a secret).
     #: Only ever this process's writes: an entry that outlived its writer says
@@ -97,13 +118,30 @@ class SetupState:
     #: Whether :func:`retire_transitional` dropped anything from this object
     #: since it was loaded, so the caller knows there is something to persist.
     retired: bool = False
+    #: Which account the three decision sets above belong to. Product callers
+    #: always provide a real account id; the sentinel only supports direct
+    #: state-file callers and old tests that have no account context.
+    account_id: str | None = None
+    #: Every other account's decisions, retained during this read/modify/write
+    #: so saving Alice cannot erase Bob.
+    accounts: dict[str, AccountSetupState] = field(default_factory=dict, repr=False)
+
+    def _sync_account(self) -> None:
+        scope = self.account_id or _UNSCOPED_ACCOUNT
+        self.accounts[scope] = AccountSetupState(
+            skipped=self.skipped,
+            done=self.done,
+            answered=self.answered,
+        )
 
     def as_dict(self) -> dict[str, Any]:
+        self._sync_account()
         return {
             "version": _VERSION,
-            "skipped": sorted(self.skipped),
-            "done": sorted(self.done),
-            "answered": sorted(self.answered),
+            "accounts": {
+                account_id: decisions.as_dict()
+                for account_id, decisions in sorted(self.accounts.items())
+            },
             "applied": dict(self.applied),
             "debts": sorted(self.debts),
             "boot": boot.boot_id(),
@@ -127,7 +165,26 @@ def _string_map(value: Any, *, coerce: bool = False) -> dict[str, Any]:
     return {k: v for k, v in value.items() if isinstance(k, str)}
 
 
-def load_state() -> SetupState:
+def _account_states(value: Any) -> dict[str, AccountSetupState]:
+    """Valid account decision objects in a v3 state file."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        account_id: AccountSetupState(
+            skipped=_string_set(raw.get("skipped")),
+            done=_string_set(raw.get("done")),
+            answered=_string_set(raw.get("answered")),
+        )
+        for account_id, raw in value.items()
+        if isinstance(account_id, str) and isinstance(raw, dict)
+    }
+
+
+def load_state(
+    account_id: str | None = None,
+    *,
+    adopt_legacy_decisions: bool = True,
+) -> SetupState:
     """Read the checklist's notes. **Never raises** — every field is checked.
 
     This file is the wizard's own scratch pad, written by the wizard and read
@@ -145,13 +202,13 @@ def load_state() -> SetupState:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return SetupState()
+        return SetupState(account_id=account_id)
     except (OSError, ValueError) as e:
         logger.warning("Setup state at %s is unreadable (%s); starting empty", path, e)
-        return SetupState()
+        return SetupState(account_id=account_id)
     if not isinstance(raw, dict):
         logger.warning("Setup state at %s is not an object; starting empty", path)
-        return SetupState()
+        return SetupState(account_id=account_id)
 
     version = raw.get("version")
     if not isinstance(version, int) or version > _VERSION:
@@ -161,16 +218,53 @@ def load_state() -> SetupState:
             "Setup state at %s has version %r (this build writes %d); "
             "starting empty", path, version, _VERSION,
         )
-        return SetupState()
+        return SetupState(account_id=account_id)
 
     written_by = raw.get("boot")
+    migrated = version < 3
+    if migrated:
+        # Versions 1 and 2 predate multi-account checklist state. A sole
+        # account can safely inherit those decisions. With multiple accounts
+        # authorship is unknowable: re-prompting is safer than assigning one
+        # person's skip or completion to somebody else. Shared restart facts
+        # below survive either way.
+        scope = account_id or _UNSCOPED_ACCOUNT
+        selected = AccountSetupState()
+        if adopt_legacy_decisions:
+            selected = AccountSetupState(
+                skipped=_string_set(raw.get("skipped")),
+                done=_string_set(raw.get("done")),
+                answered=_string_set(raw.get("answered")),
+            )
+        elif any(raw.get(field) for field in ("skipped", "done", "answered")):
+            logger.warning(
+                "Setup state at %s predates account scoping and this instance "
+                "has multiple accounts; discarding ambiguous checklist decisions",
+                path,
+            )
+        accounts = {scope: selected}
+    else:
+        accounts = _account_states(raw.get("accounts"))
+        if account_id is not None:
+            scope = account_id
+        elif len(accounts) == 1:
+            # A convenience for direct state-file diagnostics. Routes always
+            # pass an account id, so product behavior never guesses.
+            scope = next(iter(accounts))
+        else:
+            scope = _UNSCOPED_ACCOUNT
+        selected = accounts.setdefault(scope, AccountSetupState())
+
     return SetupState(
-        skipped=_string_set(raw.get("skipped")),
-        done=_string_set(raw.get("done")),
-        answered=_string_set(raw.get("answered")),
+        skipped=selected.skipped,
+        done=selected.done,
+        answered=selected.answered,
         applied=_string_map(raw.get("applied")),
         debts=_string_set(raw.get("debts")),
         boot=written_by if isinstance(written_by, str) else "",
+        retired=migrated,
+        account_id=scope,
+        accounts=accounts,
     )
 
 
@@ -194,13 +288,18 @@ def retire_transitional(state: SetupState, transitional_done: set[str]) -> bool:
     """
     if state.boot == boot.boot_id():
         return False
+    state._sync_account()
     dropped = (
         bool(state.applied) or bool(state.debts)
-        or bool(state.done & transitional_done)
+        or any(
+            bool(decisions.done & transitional_done)
+            for decisions in state.accounts.values()
+        )
     )
     state.applied = {}
     state.debts = set()
-    state.done -= transitional_done
+    for decisions in state.accounts.values():
+        decisions.done -= transitional_done
     state.boot = boot.boot_id()
     state.retired = state.retired or dropped
     return dropped
