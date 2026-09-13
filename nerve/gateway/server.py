@@ -309,6 +309,33 @@ async def lifespan(app: FastAPI):
         for action in identity_report.identity_actions:
             logger.info("Identity bootstrap: %s", action)
 
+        # The setup token, for as long as this install is unclaimed. One
+        # account with no password admits every caller who can reach the
+        # gateway, and this is what somebody who is *not* on the machine must
+        # present to end that state (see nerve.setup_token). Generated here
+        # because the log this writes it to is how a headless install delivers
+        # it; dropped again the moment the account has a password.
+        #
+        # It starts nothing, so there is nothing to register in
+        # startup_cleanups — and a failure must not stop the gateway, because
+        # the guard fails closed without a token: with none stored, no token
+        # is ever accepted and only a loopback caller can claim.
+        try:
+            from nerve import setup_token
+
+            unclaimed = await setup_token.instance_is_unclaimed(db, config)
+            setup_token.announce(
+                await setup_token.ensure_setup_token(db, unclaimed=unclaimed),
+                host=config.gateway.host,
+                port=config.gateway.port,
+            )
+        except Exception as e:  # noqa: BLE001 - never block startup on this
+            logger.warning(
+                "Could not prepare the setup token (%s). An unclaimed instance "
+                "can still be claimed from this machine, but not from another.",
+                e,
+            )
+
         # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
         proxy_service = None
         if config.proxy.enabled:
