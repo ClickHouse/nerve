@@ -337,6 +337,12 @@ class TestAConcurrentPasswordChange:
         row = await db.get_account(account["id"])
         assert row["credential"] == "$2b$12$their-own"
         assert row["credential_source"] == "local"
+        # ...and the report says what happened rather than what it set out to
+        # do. Claiming the configured hash was copied onto an account it was
+        # not is worse than saying nothing.
+        assert not report.migrated_config_credential
+        assert not any("copied auth.password_hash" in a for a in report.identity_actions)
+        assert any("newer one" in a for a in report.identity_actions)
 
     async def test_the_mirror_does_not_clear_a_password_set_meanwhile(
         self, db: Database, tmp_path,
