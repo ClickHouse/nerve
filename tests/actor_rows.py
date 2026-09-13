@@ -6,6 +6,7 @@ These helpers are deliberately not autouse: some tests count actor rows, and
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 from nerve.identity import Actor
@@ -26,19 +27,21 @@ async def ensure_actor_row(db, *actors: Actor) -> None:
     """
     for actor in actors:
         if await db.get_actor_ref(actor.actor_id) is None:
-            await db.create_actor_ref(
-                kind=actor.kind,
-                display_name=actor.display_name,
-                actor_id=actor.actor_id,
+            await db._write(
+                """INSERT INTO actor_refs (id, kind, display_name, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    actor.actor_id,
+                    actor.kind,
+                    actor.display_name,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
 
 
 async def ensure_system_principal(db) -> str:
-    """Bootstrap the identity that production guarantees; return its actor id."""
-    identity = await db.get_local_identity()
-    if identity is None:
-        identity = await db.bootstrap_local_identity(credential_source="none")
-    return identity.system_actor_id
+    """Return the migration-guaranteed system actor id."""
+    return db.system_actor_id
 
 
 def mock_system_principal(db) -> str:
