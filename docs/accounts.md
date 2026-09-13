@@ -65,9 +65,8 @@ require the setup token printed by the server. Loopback requests are exempt
 unless `auth.setup_token_required` is enabled.
 
 Claiming increments the account's session epoch. Sessions issued while the
-installation was passwordless stop working on their next request; the claim
-response contains the replacement token. An existing WebSocket remains valid
-until it reconnects.
+installation was passwordless are invalidated, and their open WebSockets are
+closed. The claim response contains the replacement token.
 
 While the installation is unclaimed, the normal password-change endpoint
 returns `409`; use the claim endpoint instead. See
@@ -94,9 +93,9 @@ installation's system actor.
 | Backend and external MCP token | The system actor |
 
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
-connection. An existing WebSocket keeps the identity it received when it
-connected. Autonomous work, including cron jobs and background agents, uses the
-system actor rather than a human account.
+connection. Open WebSockets re-check the account on each frame and close when
+the account is no longer authorized. Autonomous work, including cron jobs and
+background agents, uses the system actor rather than a human account.
 
 ## Attribution
 

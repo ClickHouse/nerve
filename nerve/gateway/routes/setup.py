@@ -404,6 +404,20 @@ async def claim(req: ClaimRequest, request: Request):
     # credential left behind in a log file is one somebody eventually uses.
     await invalidate_setup_token(store)
 
+    # And the sockets. Every HTTP token from before the claim is already
+    # refused by the epoch, but a socket accepted before it is *open*: it would
+    # go on receiving this session's broadcasts — the transcript of whatever
+    # the owner does next — until it happened to send something. Closing is
+    # best-effort by design: the per-frame check has already made those
+    # connections unable to *act*, so a failure here costs visibility, not
+    # authority, and must not fail a claim that has committed.
+    try:
+        from nerve.gateway.server import close_revoked_sockets
+
+        await close_revoked_sockets()
+    except Exception as e:  # noqa: BLE001 - the claim is done; this is cleanup
+        logger.warning("Claim: open sockets could not be closed: %s", e)
+
     try:
         actor: Actor = await actor_for_account(store, account["id"])
     except ActorResolutionError as e:  # pragma: no cover - just claimed it

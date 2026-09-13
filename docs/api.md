@@ -108,8 +108,11 @@ the password it set.
 
 **Every session issued before the claim stops working.** The claim bumps the
 account's session epoch, so the tokens a passwordless install handed out are
-one epoch behind and are refused at their next request, HTTP and WebSocket
-alike; the token returned here is minted at the new epoch. See
+one epoch behind: refused at their next HTTP request, refused at a WebSocket
+handshake, and — for sockets that are *already open* — closed outright with
+`1008`, with every inbound frame re-checked against the account row in case a
+close was missed. The token returned here is minted at the new epoch, so the
+browser doing the claiming is the one session that survives. See
 [Accounts and identity](accounts.md#passwordless).
 
 One transaction does the whole claim, so a half-claimed account — named but
@@ -281,8 +284,8 @@ Failures:
 | `404` | Account not found |
 | `409` | Username or account-state conflict; the response explains the conflict |
 
-Disabling an account affects its next request. An existing WebSocket keeps its
-accepted identity until it reconnects.
+Disabling an account affects its next request or WebSocket frame. The server
+closes an open connection instead of changing its actor.
 
 ### Sessions
 
