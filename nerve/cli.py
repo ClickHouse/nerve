@@ -533,6 +533,34 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     click.echo(outcome.message)
 
 
+def _echo_setup_token(config) -> None:
+    """Print the first-run setup token, while there is one.
+
+    ``nerve status`` is a terminal command on the machine itself, which is
+    exactly who the token is for. It is deliberately **not** printed by
+    ``nerve doctor``: that report is also produced for the Telegram ``/doctor``
+    command, and a live credential should not be relayed into a chat.
+    """
+    from nerve.db.accounts import read_instance_secret
+    from nerve.setup_token import SETUP_TOKEN_NAME
+
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    if not token:
+        return
+    host = config.gateway.host if config is not None else "localhost"
+    port = config.gateway.port if config is not None else 8900
+    if host in {"0.0.0.0", "::", "[::]", ""}:
+        host = "localhost"
+    click.echo()
+    click.secho(
+        "  This instance has not been claimed: it has no password, so anyone "
+        "who can reach it is signed in as the owner.",
+        fg="yellow",
+    )
+    click.echo(f"  Finish setup at http://{host}:{port}/setup")
+    click.echo(f"  Setup token (only needed from another machine): {token}")
+
+
 @main.command()
 @click.option("--follow", "-f", is_flag=True, help="Follow log output (like tail -f)")
 @click.pass_context
@@ -589,6 +617,8 @@ def status(ctx: click.Context, follow: bool) -> None:
         click.echo(f"  Logs: {paths.log_file()}")
     else:
         click.echo("Nerve is not running")
+
+    _echo_setup_token(config)
 
     if follow and paths.log_file().exists():
         click.echo(f"\n--- Tailing {paths.log_file()} ---")
@@ -1140,7 +1170,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     elif not usable:
         warnings.append(
             "[WARN] No password set — passwordless: anyone who can reach "
-            "the gateway acts as the owner"
+            "the gateway acts as the owner. Claim it at /setup; a browser on "
+            "this machine needs nothing, one elsewhere needs the setup token "
+            "from `nerve status` or the startup log (this report is also sent "
+            "to Telegram, so it does not print the token)"
         )
     else:
         lines.append(
