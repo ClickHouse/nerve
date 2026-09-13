@@ -55,8 +55,10 @@ vi.mock('../../api/client', () => ({
     getModels: vi.fn(async () => ({ models: [], default: null })),
     uploadFiles: vi.fn(),
     rewritePrompt: vi.fn(),
+    listAccounts: vi.fn(async () => ({ accounts: [] })),
   },
   getToken: vi.fn(() => 'tok'),
+  setUnauthorizedHandler: vi.fn(),
 }));
 vi.mock('../../api/websocket', () => ({
   ws: { switchSession: vi.fn(), send: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onMessage: vi.fn(() => () => {}) },
@@ -268,6 +270,26 @@ describe('the chat header', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(container).toBeEmptyDOMElement();
     expect(listActors).not.toHaveBeenCalled();
+  });
+
+  it('keeps its name reachable when the text is only for screen readers', async () => {
+    // Below `md` the chip sheds its text rather than itself, so a phone can
+    // still learn who a shared session belongs to — the session list marks a
+    // person only once two of them exist, and there it is behind a drawer.
+    // The breakpoint itself is a Tailwind class and not assertable here (the
+    // stylesheet is not processed and `matchMedia` reports desktop); what is
+    // assertable, and what the mobile state depends on, is that the sentence
+    // is always in the DOM rather than conditionally rendered, and that the
+    // glyph beside it never claims a name of its own.
+    const { container } = render(<SessionCreator actorId={ALICE} />);
+
+    expect(await screen.findByText('Started by Alice')).toBeInTheDocument();
+    const chip = container.querySelector('[data-attribution="session-header"]')!;
+    expect(chip).toHaveAttribute('title', 'Started by Alice');
+    expect(chip.querySelector('svg')).toHaveAttribute('aria-hidden', 'true');
+    const text = chip.querySelector('span')!;
+    expect(text.className).toContain('sr-only');
+    expect(text.className).toContain('md:not-sr-only');
   });
 
   it('falls back to the neutral label rather than the id', async () => {
