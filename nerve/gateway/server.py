@@ -23,7 +23,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from nerve import paths
+from nerve import boot, paths
 from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
@@ -1145,7 +1145,13 @@ def create_app() -> FastAPI:
     # Health check (no auth required) — must be before static mount
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.1.0"}
+        # `boot` changes on every start, and that is the only honest answer to
+        # "has it restarted yet?" — the old process answers this endpoint
+        # perfectly well while it is shutting down, so a client that polls for
+        # *any* answer accepts the process it asked to replace. Opaque and
+        # random: an uptime or a counter would tell an anonymous caller how
+        # long this box has been up or how often it falls over.
+        return {"status": "ok", "version": "0.1.0", "boot": boot.boot_id()}
 
     # Favicon from the tracked config subtree (see config.workspace_favicon).
     # No auth: a browser asks for this before anyone has logged in, so requiring

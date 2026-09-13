@@ -504,11 +504,27 @@ export const api = {
     ),
 
   /** Restart the daemon — what `nerve restart` does. The browser reconnects
-   *  and stays signed in: the signing secret is pinned and persisted, and
-   *  nothing in the wizard rotates it. */
-  restartSystem: () => request<{ restarting: boolean; method: string; message: string }>(
-    '/system/restart', { method: 'POST' },
-  ),
+   *  and stays signed in: the signing secret is pinned and persisted, the
+   *  session epoch is per account rather than per process, and nothing in the
+   *  wizard rotates either. `boot` names the process that accepted the
+   *  request; wait for `health()` to report a different one. */
+  restartSystem: () => request<{
+    restarting: boolean; method: string; message: string; boot: string;
+  }>('/system/restart', { method: 'POST' }),
+
+  /**
+   * Liveness, and which run of the daemon is answering.
+   *
+   * Outside `/api` and outside the session: it has to be readable while the
+   * instance is coming back up. `boot` is a new random value on every start,
+   * which is the only thing that distinguishes the new process from the old
+   * one still serving as it shuts down.
+   */
+  health: async (): Promise<{ status: string; boot?: string }> => {
+    const res = await fetch('/health');
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json();
+  },
 
   /** Who this request is. Carries no credential and no token. */
   me: () => request<Me>('/auth/me'),

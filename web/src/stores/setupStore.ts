@@ -130,37 +130,55 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
 
   restart: async () => {
     set({ busy: 'restart', error: null });
+    let before: string;
     try {
-      await api.restartSystem();
+      // Not a background task on the server: whether a restart was *begun* is
+      // knowable there, so a failure to start one arrives here as an error
+      // rather than as a page waiting for a process that is never coming.
+      before = (await api.restartSystem()).boot;
     } catch (e) {
       set({ busy: null, error: errorDetail(e, 'Could not restart the instance') });
       return false;
     }
     set({ busy: null, reconnecting: true });
 
-    // Wait for the new process rather than for a timer: the daemon we were
-    // talking to is going away, so every request until the new one is
-    // listening fails, and only a successful answer means it is back. The
-    // session token is untouched throughout — the signing secret is pinned
-    // and persisted, and nothing in the wizard rotates it, so the tab comes
-    // back already signed in.
+    // Wait for a *different* process, not for any answer at all. The daemon
+    // that accepted the request keeps serving while it shuts down, so "is
+    // anybody there" is satisfied by the very process being replaced — and
+    // the restart-only settings the wizard just wrote would still not be in
+    // force. `boot` is a fresh random value on every start, so a changed one
+    // is proof and nothing else is.
+    //
+    // The session token is untouched throughout — the signing secret is
+    // pinned and persisted, the session epoch lives on the account rather
+    // than in the process, and nothing in the wizard rotates either — so the
+    // tab comes back already signed in.
     const deadline = Date.now() + RECONNECT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, RECONNECT_INTERVAL_MS));
+      let boot: string | undefined;
       try {
-        await api.authStatus();
+        boot = (await api.health()).boot;
+      } catch {
+        continue;  // still down, or half up
+      }
+      // An instance that publishes no generation at all is one this client is
+      // newer than; falling back to "it answered" is the old behaviour, and
+      // better than waiting forever for a field that will never arrive.
+      if (boot === before) continue;
+      try {
         await useAuthStore.getState().refreshStatus();
         await get().load();
-        set({ reconnecting: false });
-        return true;
       } catch {
-        // Still down — or half up. Ask again.
+        // The new process is up; a failed first read is not a failed restart.
       }
+      set({ reconnecting: false });
+      return true;
     }
     set({
       reconnecting: false,
-      error: 'The instance did not answer after the restart. Check the server '
-        + 'log (`nerve logs`), then reload this page.',
+      error: 'The instance did not come back after the restart. Check the '
+        + 'server log (`nerve logs`), then reload this page.',
     });
     return false;
   },
