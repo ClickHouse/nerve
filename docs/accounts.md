@@ -59,19 +59,53 @@ removing the configured value later generates a fresh key instead of reviving
 the retired one. If a database file was readable by other users, a stored key
 is treated as compromised, deleted, and unpinned before replacement.
 
-With no password anywhere — none on the account row and no `auth.password_hash`
-— every caller who can reach the gateway logs in with any password and acts as
-the owner. That is the intended behaviour for a private, loopback-bound install
-and a real exposure on anything else: Nerve does **not** change the bind address
-or refuse to start over it. Set a password before exposing the gateway beyond
-the machine; the accounts screen is where.
+With no password on the account row or in `auth.password_hash`, every caller
+who reaches the gateway logs in with any password and acts as the owner. Nerve
+keeps this upgrade-compatible state usable, but it must be claimed before the
+gateway is exposed.
+
+Open `/setup` and supply the mandatory setup token shown by `nerve status`.
+The claim names and secures the existing account in one transaction and may set
+its display name. The token is persisted across restarts, compared in constant
+time, and invalidated on success. It is never written to a URL, response,
+server log, or browser storage. Remote claims require HTTPS or a protected
+tunnel.
+
+`PUT /api/accounts/me/password` refuses while unclaimed, so the passwordless
+session issued to any visitor is not a second path around the setup token.
+
+### The claim cutover
+
+The database claim uses `BEGIN IMMEDIATE` and checks its precondition inside
+the transaction. Two callers may both reach it, but exactly one can change the
+sole account from passwordless to local credentials.
+
+The same transaction increments `accounts.session_epoch`. Session tokens
+record the epoch at minting, and request identity compares it with the account
+row. A missing epoch reads as 0, preserving sessions across an upgrade until a
+claim advances the account to 1. The successful claim response carries a
+client session token minted at the new epoch; every earlier HTTP session is
+stale.
+
+Account mutations carry the epoch stated by their credential into the write
+transaction. This closes the interval where a password change, account create,
+disable, or rename was authorized just before the claim but would otherwise
+land after it.
+
+Open WebSockets record the credential's epoch at admission. They are registered
+before handshake work, rechecked immediately after registration and before
+every inbound frame, and best-effort closed when the claim commits. Thus a
+stale socket cannot act, and proactive closure stops it receiving the new
+owner's transcript. A disabled account is likewise closed on its next frame.
+The connection actor is never rewritten, so previously stored attribution does
+not change.
+
+The epoch is per account: it revokes every session for that account, not one
+device.
 
 **Passwordless is bounded to one account.** With two accounts it is not a weaker
-login, it is an unanswerable question: nothing distinguishes the callers, so
-every one of them would be whoever the code picked. So a second account cannot
-be created while the instance is passwordless — the create is refused with a
-`409` saying to set a password first, rather than startup being refused, which
-would break the upgrade promise in an unrelated way.
+login but an unanswerable identity choice. Creating a second account therefore
+returns `409` until the first account has both a password and username.
 
 ## Account management
 
@@ -98,8 +132,8 @@ both reported as `409` with what to do first:
 
 Setting a password is own-account only. Nobody can set anyone else's — and an
 account that already has one must supply it, so a stolen session token is not on
-its own enough to take the account over. The account that has *no* password yet
-is the single exception, which is also the state the whole screen exists to end.
+its own enough to take the account over. An unclaimed account must use the
+setup-token-protected claim endpoint instead.
 
 ### Usernames
 

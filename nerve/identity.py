@@ -48,6 +48,12 @@ class Actor:
     account_id: str | None = None
     # Presentation snapshot, never an identity or authorization key.
     display_name: str | None = None
+    # The account's session epoch **as the credential stated it** — not as the
+    # row says now. It is what makes "admitted before the claim" answerable
+    # after the claim: a mutation carries this into its transaction and the row
+    # refuses it if the two have diverged (v049). ``None`` for a credential
+    # with no account behind it, which has no epoch to be stale against.
+    session_epoch: int | None = None
 
     def __post_init__(self) -> None:
         if not self.actor_id:
@@ -66,10 +72,29 @@ class Actor:
         return self.kind == ACTOR_KIND_HUMAN
 
 
-def _actor_for_account_row(account: dict) -> Actor:
-    """Resolve an account row, checking disablement on every request."""
+def _actor_for_account_row(
+    account: dict, *, session_epoch: int | None = None,
+) -> Actor:
+    """Resolve a joined account identity row, refusing a stale one.
+
+    Disablement is checked **here**, on the way to every actor, rather than at
+    each ingress: a token minted before the account was disabled keeps
+    verifying (it is signed and unexpired), so the account row is the only
+    thing that can stop it, and it takes effect on the next request.
+
+    The session epoch is checked in the same place and for the same reason. A
+    session minted while the instance was passwordless names this account, is
+    signed and has thirty days left; the row is the only thing that can end it,
+    and claiming the account bumps the row (v049). ``session_epoch`` is what
+    the credential carried — ``None`` for credentials that are not sessions
+    (the system principal, MCP), which have no account and no epoch to check.
+    """
     if not account.get("enabled"):
         raise ActorResolutionError("This account is disabled")
+    if session_epoch is not None and session_epoch != int(account.get("session_epoch") or 0):
+        raise ActorResolutionError(
+            "This session is no longer current for this account; sign in again"
+        )
     if account["actor_id"] is None:
         # The schema's foreign key makes this unreachable; fail closed rather
         # than invent an identity if it ever is reached.
@@ -79,21 +104,40 @@ def _actor_for_account_row(account: dict) -> Actor:
         kind=account["actor_kind"],
         account_id=account["account_id"],
         display_name=account["display_name"],
+        # The credential's own epoch where there is one. Reading it back off
+        # the row here instead would hand every request the *current* value —
+        # which is the promotion bug: a session admitted before a claim would
+        # carry the epoch the claim had just written, and every later check
+        # against it would pass.
+        session_epoch=(
+            session_epoch if session_epoch is not None
+            else int(account.get("session_epoch") or 0)
+        ),
     )
 
 
-async def actor_for_account(store: "AccountStore", account_id: str) -> Actor:
-    """Resolve an account id without caching."""
+async def actor_for_account(
+    store: "AccountStore", account_id: str, *, session_epoch: int | None = None,
+) -> Actor:
+    """The actor of the account with this id.
+
+    Looked up on every call. Nothing is cached: an account disabled a second
+    ago must not keep being served from a previous lookup — and neither must a
+    session the claim ended a second ago, which is why the epoch the credential
+    carried is checked against the same row rather than in a query of its own.
+    """
     if not isinstance(account_id, str) or not account_id:
         raise ActorResolutionError("This credential names no account")
     account = await store._account_identity(account_id)
     if account is None:
         raise ActorResolutionError("This credential names an account that no longer exists")
-    return _actor_for_account_row(account)
+    return _actor_for_account_row(account, session_epoch=session_epoch)
 
 
-async def actor_for_sole_account(store: "AccountStore") -> Actor:
-    """Resolve the sole account.
+async def actor_for_sole_account(
+    store: "AccountStore", *, session_epoch: int | None = None,
+) -> Actor:
+    """Resolve the actor of the single local account, when exactly one exists.
 
     A legacy credential names no person, so zero or multiple accounts are
     ambiguous and must fail rather than select a row.
@@ -104,7 +148,7 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
             "This credential predates per-account logins and no longer resolves "
             "to a single account; sign in again"
         )
-    return _actor_for_account_row(account)
+    return _actor_for_account_row(account, session_epoch=session_epoch)
 
 
 async def system_actor(store: "AccountStore") -> Actor:

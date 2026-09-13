@@ -72,10 +72,10 @@ Response: {
 | `login` | what the form must collect: `none` (passwordless — send any password), `password` (one account, no username), `username_password` (two or more) |
 | `auth_required` | kept for older clients; equals `login != "none"` |
 
-Standalone passwordless installs auto-login and open Accounts; other signed-in
-sessions open the app, and signed-out sessions open the login page. **Auto-login
-with an empty password is correct for `none` and for nothing else** — with two
-accounts it names nobody and the server refuses it.
+Standalone passwordless installs auto-login and open the setup claim page;
+other signed-in sessions open the app, and signed-out sessions open the login
+page. **Auto-login with an empty password is correct for `none` and for nothing
+else** — with two accounts it names nobody and the server refuses it.
 
 Nothing here identifies anybody: no username, and not the number of accounts.
 Before the gateway has finished starting the answer is the fail-closed one
@@ -129,8 +129,50 @@ would otherwise break them, so two concurrent calls cannot both win — there is
 no window in which two callers each disable the other's account and leave
 nobody.
 
-Disabling takes effect at the account's **next** request, not retroactively, and
-an open WebSocket keeps the identity it was accepted with until it reconnects.
+Disabling takes effect at the account's **next** request, not retroactively —
+and at an open WebSocket's next *frame*, which is re-checked against the
+account row before anything is done with it. The connection is closed rather
+than re-pointed: what it already sent stays attributed to the actor it was
+accepted with.
+
+### Setup claim
+
+#### `POST /api/setup/claim`
+
+Name and secure the one account on an unclaimed install. This is the only
+unauthenticated account write; every request must include the persisted setup
+token.
+
+```json
+Request: {
+  "username": "alice",
+  "password": "…",
+  "setup_token": "…",
+  "display_name": "Alice"
+}
+Response: { "token": "eyJ…" }
+```
+
+`display_name` is optional. The response token is the client session minted
+after the claim; account identity is read through the canonical
+`GET /api/accounts/me` endpoint and names through the actor directory.
+
+The setup token is read locally with `nerve status`, sent only in the JSON
+body, and invalidated after success. It never appears in a URL, response,
+server log, or browser storage. Use HTTPS or a protected tunnel when claiming
+remotely.
+
+The claim and session-epoch bump are one database transaction. Of concurrent
+claimants exactly one can win. Every session minted while the instance was
+passwordless becomes stale; open WebSockets are rechecked and closed.
+
+| Response | When |
+|---|---|
+| `400` | the username is malformed/reserved, or the password exceeds bcrypt's 72-byte limit |
+| `403` | the setup token is wrong or no stored token can match it; a concurrent loser may see this after the winner retires the token |
+| `409` | the account is no longer claimable, including a request that passed token validation before a concurrent winner, or a configured password |
+| `422` | the setup token, username, or password is missing/empty |
+| `503` | no signing secret, or identity startup is incomplete |
 
 ### Actors
 
@@ -710,9 +752,11 @@ Response: { "status": "ok", "version": "0.1.0" }
 ## WebSocket Protocol
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
-too). The token is resolved to an actor at admission. A credential that names
-nobody is refused with close code `4001`; a stale admitted socket is closed on
-its next frame after an account is disabled or setup is claimed.
+too). The token is resolved to an actor at accept and rechecked before each
+inbound frame. A credential refused at admission closes with code `4001`; a
+stale session epoch or an account disabled after admission closes with policy
+code `1008`. Reconnect after logging in again. The actor is never
+rewritten, so stored attribution remains with the identity that sent it.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token

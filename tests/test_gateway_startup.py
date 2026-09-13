@@ -79,7 +79,13 @@ def harness(tmp_path, monkeypatch):
 
     async def _init_db(*a, **k):
         opened.append("db")
-        return MagicMock(cleanup_expired_messages=AsyncMock(return_value=0))
+        return MagicMock(
+            cleanup_expired_messages=AsyncMock(return_value=0),
+            login_state=AsyncMock(
+                return_value=MagicMock(passwordless=False),
+            ),
+            _delete_instance_secret=AsyncMock(return_value=False),
+        )
 
     async def _close_db():
         closed.append("db")

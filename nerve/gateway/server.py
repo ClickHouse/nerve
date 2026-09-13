@@ -28,8 +28,12 @@ from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
-from nerve.gateway.auth import SESSION_TOKEN_HEADER, authenticate_websocket
-from nerve.identity import Actor
+from nerve.gateway.auth import (
+    SESSION_TOKEN_HEADER,
+    authenticate_websocket,
+    identity_store,
+)
+from nerve.identity import Actor, ActorResolutionError, actor_for_account
 from nerve.gateway.routes import (
     init_deps,
     register_all_routes,
@@ -98,8 +102,21 @@ class WebSocketConnection:
     Frozen on purpose. A socket stays open for hours, so anything mutable here
     is an identity that can change halfway through a conversation: the actor
     resolved at accept is the actor every message on this connection is
-    attributed to. Account admission state may close a stale socket, but never
-    rewrites the actor stored here; a new connection resolves from scratch.
+    attributed to, and a later rename leaves it exactly as it was.
+
+    That is not the same as the connection remaining *valid*. Authority is
+    re-checked before every inbound frame (:func:`_connection_still_authorised`)
+    and the account row is what answers: an account disabled a minute ago, or
+    one whose session epoch has moved because the instance was claimed, ends
+    the connection rather than changing who it acts as. The actor is never
+    rewritten — a socket that may no longer act is closed, not re-pointed,
+    because re-pointing it would attribute the next message to somebody who
+    did not send it.
+
+    ``session_epoch`` is the credential epoch verified at accept. Comparing it
+    with the account row on every frame revokes credentials minted before a
+    claim or later session reset. ``None`` marks a credential with no account
+    behind it (the agent's own system principal), which has nothing to revoke.
 
     Session selection is deliberately *not* here — the client switches sessions
     over the same socket, so that one is a local variable in the handler.
@@ -107,6 +124,24 @@ class WebSocketConnection:
 
     client_id: str
     actor: Actor
+    session_epoch: int | None = None
+
+
+# Every socket this process has open, by client id. Written here rather than
+# inferred from the broadcaster, which holds *callbacks* for a session and
+# cannot say which account is behind one.
+#
+# It exists so authority can be withdrawn without waiting for the connection to
+# say something: claiming an instance has to end the sockets a passwordless
+# install handed out, and a socket that is only checked when it *sends* keeps
+# receiving broadcasts in the meantime.
+_live_sockets: dict[str, tuple["WebSocketConnection", WebSocket]] = {}
+
+# What a socket is told when its authority ends underneath it. 1008 is the
+# WebSocket protocol's "policy violation", which is what this is: the
+# credential was fine when it was accepted and is not any more.
+WS_REVOKED_CODE = 1008
+WS_REVOKED_REASON = "Session ended; sign in again"
 
 
 async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
@@ -114,15 +149,81 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
 
     The one place a WebSocket's identity is decided. Returns ``None`` after
     closing the socket when the credential is missing, invalid, or names no
-    account this instance can act for (a disabled account, or a pre-account
-    token on an install that now has two).
+    account this instance can act for (a disabled account, a pre-account token
+    on an install that now has two, or a session the claim has ended).
+
+    The epoch recorded here is **the credential's own**, carried on the actor
+    that authenticating it produced. Reading it back off the account row here
+    would be a second read, and a claim committing between the two would hand
+    this connection the epoch the claim had just written — promoting exactly
+    the session the claim exists to end, and making every later check pass.
     """
     await websocket.accept()
     actor = await authenticate_websocket(websocket)
     if actor is None:
         await websocket.close(code=4001, reason="Unauthorized")
         return None
-    return WebSocketConnection(client_id=str(uuid.uuid4())[:8], actor=actor)
+    return WebSocketConnection(
+        client_id=str(uuid.uuid4())[:8],
+        actor=actor,
+        session_epoch=actor.session_epoch,
+    )
+
+
+async def _connection_still_authorised(connection: WebSocketConnection) -> bool:
+    """Whether this socket may still act, asked before every inbound frame.
+
+    One indexed read of the account row, through the same resolution every
+    HTTP request uses — so a disabled account and a claimed instance are the
+    same check here as they are there, rather than a second implementation of
+    the rule that could drift from it.
+
+    A credential with no account behind it (the system principal) has nothing
+    to re-check and stays valid.
+    """
+    if not connection.actor.account_id:
+        return True
+    store = identity_store()
+    if store is None:  # pragma: no cover - fail closed; startup is long done
+        return False
+    try:
+        await actor_for_account(
+            store, connection.actor.account_id,
+            session_epoch=connection.session_epoch,
+        )
+    except ActorResolutionError as e:
+        logger.info(
+            "WebSocket %s is no longer authorised: %s", connection.client_id, e,
+        )
+        return False
+    return True
+
+
+async def close_revoked_sockets() -> int:
+    """Close every open socket whose account has moved on. Returns how many.
+
+    Called when a claim commits: the point of claiming is to end the authority
+    a passwordless install handed out, and a socket that is only re-checked
+    when it *sends* would go on receiving broadcasts — the transcript of
+    whatever the owner does next — until it did.
+
+    The connection's actor is never rewritten. A socket that may no longer act
+    is closed, because re-pointing it at somebody else would attribute the next
+    message on it to a person who did not send it.
+    """
+    closed = 0
+    for client_id, (connection, websocket) in list(_live_sockets.items()):
+        if await _connection_still_authorised(connection):
+            continue
+        try:
+            await websocket.close(code=WS_REVOKED_CODE, reason=WS_REVOKED_REASON)
+        except Exception as e:  # noqa: BLE001 - already gone is also closed
+            logger.debug("WebSocket %s could not be closed: %s", client_id, e)
+        _live_sockets.pop(client_id, None)
+        closed += 1
+    if closed:
+        logger.info("Closed %d WebSocket(s) whose session had ended", closed)
+    return closed
 
 
 async def _send_session_status(
@@ -319,6 +420,16 @@ async def lifespan(app: FastAPI):
         identity_report = await bootstrap_identity(db, config)
         for action in identity_report.identity_actions:
             logger.info("Identity bootstrap: %s", action)
+
+        # Claiming is impossible without the persisted setup token. Prepare
+        # it before serving, and never print its value: the local `status`
+        # command reads it directly from the database when the operator asks.
+        from nerve import setup_token
+
+        await setup_token.ensure_setup_token(
+            db,
+            unclaimed=await setup_token.instance_is_unclaimed(db, config),
+        )
 
         # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
         proxy_service = None
@@ -927,59 +1038,91 @@ def create_app() -> FastAPI:
     # WebSocket endpoint
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
-        # Accept, authenticate and resolve the actor — once, here. Nothing
-        # below re-reads identity: this connection acts as `connection.actor`
-        # until it closes.
+        # Accept, authenticate and resolve the actor — once, here. The actor is
+        # immutable for attribution; authority is re-checked below before each
+        # frame, and a stale connection is closed rather than re-pointed.
         connection = await _accept_websocket(websocket)
         if connection is None:
             return
 
         client_id = connection.client_id
-        router = _engine.router
-        # Reuse the last session for this channel (no sticky period).
-        # Only create a brand-new session if none exist at all.
-        active_session = await router.get_last_session("web:default")
-        if not active_session:
-            # Not through the router: this ingress knows *who* connected, so
-            # the session it mints belongs to that person rather than to the
-            # web channel in general.
-            active_session = await _engine.sessions.get_active_session(
-                "web:default", source="web", actor=connection.actor,
-            )
-        logger.info("WebSocket connected: %s (session: %s)", client_id, active_session)
-
-        # Register as broadcast listener for the active session
-        async def ws_broadcast(session_id: str, message: dict):
-            try:
-                await websocket.send_json(message)
-            except Exception:
-                pass
-
-        await broadcaster.register(active_session, client_id, ws_broadcast)
-        # Also register on __global__ channel for cross-session notifications
-        await broadcaster.register("__global__", f"global:{client_id}", ws_broadcast)
-
-        # Inform the client which session they're connected to
-        await websocket.send_json({
-            "type": "session_switched",
-            "session_id": active_session,
-        })
-
-        # If a turn is mid-flight (page reload, transient WS drop, sticky
-        # reconnect after a network blip), replay the broadcaster buffer so
-        # the freshly-bound listener can rebuild the in-flight stream
-        # without waiting for new events. Idle sessions get nothing here;
-        # they hydrate via REST + the existing ``session_switched`` event.
-        if broadcaster.is_buffering(active_session):
-            is_running = _engine.is_session_running(active_session)
-            session_record = await _engine.db.get_session(active_session)
-            await _send_session_status(
-                websocket, active_session, is_running, session_record,
-            )
-
+        # Registered before anything can fail, and removed in the `finally`
+        # that covers everything after it: a handshake that dies half way — a
+        # client that closes the tab while the session is being resolved —
+        # would otherwise leave an entry naming a socket nobody will ever
+        # close.
+        _live_sockets[client_id] = (connection, websocket)
+        active_session: str | None = None
         try:
+            # Registered, *then* re-checked. A claim that committed between
+            # verifying the credential and getting here would otherwise have
+            # walked the registry before this entry existed and left the
+            # connection open; asking again once it is findable closes that
+            # window from the other side. Cheap — one indexed read — and it
+            # runs before the connection is given a session or a listener.
+            if not await _connection_still_authorised(connection):
+                await websocket.close(
+                    code=WS_REVOKED_CODE, reason=WS_REVOKED_REASON,
+                )
+                return
+
+            router = _engine.router
+            # Reuse the last session for this channel (no sticky period).
+            # Only create a brand-new session if none exist at all.
+            active_session = await router.get_last_session("web:default")
+            if not active_session:
+                # Not through the router: this ingress knows *who* connected,
+                # so the session it mints belongs to that person rather than
+                # to the web channel in general.
+                active_session = await _engine.sessions.get_active_session(
+                    "web:default", source="web", actor=connection.actor,
+                )
+            logger.info(
+                "WebSocket connected: %s (session: %s)", client_id, active_session,
+            )
+
+            # Register as broadcast listener for the active session
+            async def ws_broadcast(session_id: str, message: dict):
+                try:
+                    await websocket.send_json(message)
+                except Exception:
+                    pass
+
+            await broadcaster.register(active_session, client_id, ws_broadcast)
+            # Also register on __global__ channel for cross-session notifications
+            await broadcaster.register("__global__", f"global:{client_id}", ws_broadcast)
+
+            # Inform the client which session they're connected to
+            await websocket.send_json({
+                "type": "session_switched",
+                "session_id": active_session,
+            })
+
+            # If a turn is mid-flight (page reload, transient WS drop, sticky
+            # reconnect after a network blip), replay the broadcaster buffer so
+            # the freshly-bound listener can rebuild the in-flight stream
+            # without waiting for new events. Idle sessions get nothing here;
+            # they hydrate via REST + the existing ``session_switched`` event.
+            if broadcaster.is_buffering(active_session):
+                is_running = _engine.is_session_running(active_session)
+                session_record = await _engine.db.get_session(active_session)
+                await _send_session_status(
+                    websocket, active_session, is_running, session_record,
+                )
+
             while True:
                 data = await websocket.receive_json()
+                # Before anything is *done* with the frame. The credential was
+                # checked at accept, hours ago on a long-lived socket, and the
+                # account row is the only thing that can say it has since
+                # stopped being good — a disabled account, or an instance that
+                # has been claimed out from under a session a passwordless
+                # install handed out.
+                if not await _connection_still_authorised(connection):
+                    await websocket.close(
+                        code=WS_REVOKED_CODE, reason=WS_REVOKED_REASON,
+                    )
+                    break
                 msg_type = data.get("type", "")
 
                 if msg_type == "message":
@@ -1129,7 +1272,9 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.warning("WebSocket error for %s: %s", client_id, e)
         finally:
-            await broadcaster.unregister(active_session, client_id)
+            _live_sockets.pop(client_id, None)
+            if active_session is not None:
+                await broadcaster.unregister(active_session, client_id)
             await broadcaster.unregister("__global__", f"global:{client_id}")
 
     # Health check (no auth required) — must be before static mount

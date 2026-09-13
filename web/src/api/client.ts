@@ -17,6 +17,12 @@ export interface AuthStatus {
   login: LoginKind;
 }
 
+/** What `POST /api/setup/claim` hands back: a session for the account it just
+ *  secured, so the browser never has to re-type the password it set. */
+export interface SetupClaim {
+  token: string;
+}
+
 /** One local account, as `/api/accounts` returns it. Never carries a credential. */
 export interface Account {
   id: string;
@@ -389,6 +395,15 @@ export const api = {
   checkAuth: () => request<{ authenticated: boolean }>('/auth/check'),
 
   authStatus: () => request<AuthStatus>('/auth/status'),
+
+  // The one unauthenticated write. The mandatory setup token is sent only
+  // in this JSON body and is never retained by the API client.
+  setupClaim: (body: {
+    username: string; password: string;
+    setup_token: string; display_name?: string;
+  }) => request<SetupClaim>('/setup/claim', {
+    method: 'POST', body: JSON.stringify(body),
+  }),
 
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),

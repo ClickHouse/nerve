@@ -600,6 +600,28 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         click.echo("Starting Nerve... new instance will start shortly.")
 
 
+def _echo_setup_token(config) -> None:
+    """Print the unclaimed instance's token only to this local terminal."""
+    from nerve.db.accounts import read_instance_secret
+    from nerve.setup_token import SETUP_TOKEN_NAME
+
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    if not token:
+        return
+    host = config.gateway.host if config is not None else "localhost"
+    port = config.gateway.port if config is not None else 8900
+    if host in {"0.0.0.0", "::", "[::]", ""}:
+        host = "localhost"
+    click.echo()
+    click.secho(
+        "  This instance has not been claimed. Every browser claim requires "
+        "the setup token below.",
+        fg="yellow",
+    )
+    click.echo(f"  Setup page: http://{host}:{port}/setup")
+    click.echo(f"  Setup token: {token}")
+
+
 @main.command()
 @click.option("--follow", "-f", is_flag=True, help="Follow log output (like tail -f)")
 @click.pass_context
@@ -611,6 +633,7 @@ def status(ctx: click.Context, follow: bool) -> None:
     # Docker mode: proxy to docker compose ps
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
+        _echo_setup_token(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         ctx.exit(rc)
@@ -656,6 +679,8 @@ def status(ctx: click.Context, follow: bool) -> None:
         click.echo(f"  Logs: {paths.log_file()}")
     else:
         click.echo("Nerve is not running")
+
+    _echo_setup_token(config)
 
     if follow and paths.log_file().exists():
         click.echo(f"\n--- Tailing {paths.log_file()} ---")
@@ -1207,7 +1232,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     elif not usable:
         warnings.append(
             "[WARN] No password set — passwordless: anyone who can reach "
-            "the gateway acts as the owner"
+            "the gateway acts as the owner. Claim it at /setup with the "
+            "setup token shown by `nerve status` on the host"
         )
     else:
         lines.append(

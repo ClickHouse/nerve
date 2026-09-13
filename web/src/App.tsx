@@ -29,11 +29,14 @@ import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
+import { SetupPage } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
-  const { authenticated, ready, checkAuth, sessionExpired } = useAuthStore();
+  const {
+    authenticated, ready, checkAuth, sessionExpired, loginMode,
+  } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
@@ -52,6 +55,13 @@ function App() {
   // token is not that decision: the instance may still be unset-up, and
   // rendering on the token alone landed on /chat before the answer arrived.
   if (!ready) return null;
+  // An instance nobody has claimed yet gets the claim page instead of the login
+  // page, even with no session: the claim endpoint is unauthenticated (the
+  // state it ends admits everybody anyway), and the tab that arrives with a
+  // dead token in storage would otherwise be asked for a password that does
+  // not exist yet. Decided after `ready`, so it is the descriptor's answer
+  // rather than the absence of one.
+  if (!authenticated && loginMode === 'none') return <SetupPage />;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
   // overlay, so nothing you had typed is thrown away to ask for it.
@@ -89,6 +99,7 @@ function App() {
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
           <Route path="/accounts" element={<AccountsPage />} />
+          <Route path="/setup" element={<SetupPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -108,12 +119,17 @@ function App() {
 /**
  * Where the app opens.
  *
- * Passwordless standalone installs open Accounts so the owner can name and
- * secure the account. The setup claim page arrives in the later claim PR.
+ * Chat, unless the instance has never been secured — its one account has no
+ * password, so everyone who can reach it is signed in as it — in which case the
+ * setup page, so the state gets noticed rather than silently persisting.
+ * Naming the account does not settle it; only a password does.
+ * Only the *root* redirect moves: a deep link, refresh or bookmark still lands
+ * where it says. The passwordless state already admits that browser; the setup
+ * token protects the ownership cutover rather than acting as route authority.
  */
 function Home() {
   const loginMode = useAuthStore((s) => s.loginMode);
-  return <Navigate to={loginMode === 'none' ? '/accounts' : '/chat'} replace />;
+  return <Navigate to={loginMode === 'none' ? '/setup' : '/chat'} replace />;
 }
 
 /**

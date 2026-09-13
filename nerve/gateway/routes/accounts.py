@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from nerve.config import get_config
 from nerve.db.accounts import (
     AccountError,
+    StaleSessionError,
     LastAccountError,
     PasswordlessInstanceError,
     UnnamedAccountError,
@@ -54,7 +55,7 @@ router = APIRouter()
 # "conflict" means and what tells a UI to re-read and explain rather than to
 # re-validate the form.
 _CONFLICT = (PasswordlessInstanceError, UnnamedAccountError, UsernameTakenError,
-             LastAccountError)
+             LastAccountError, StaleSessionError)
 
 
 class AccountOut(BaseModel):
@@ -209,6 +210,12 @@ async def create_account(req: AccountCreateRequest, actor: Actor = Depends(requi
             username=req.username,
             credential=_hashed(req.password),
             display_name=(req.display_name or None),
+            # The epoch this request was *authorised* under, checked inside the
+            # transaction: a create admitted while the instance was
+            # passwordless must not leave an account behind if a claim landed
+            # while it was in flight (PR 6's claim cutover).
+            acting_account_id=actor.account_id,
+            acting_session_epoch=actor.session_epoch,
         )
     except _CONFLICT as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -236,15 +243,35 @@ async def update_account(
 
     This is also how the account an upgrade created — which has no username —
     gets one, which it must before a second account can exist.
+
+    **Refused while the instance is unclaimed** (PR 6's claim cutover): a
+    passwordless install mints a session for anybody, so this is the one
+    account mutation a stranger could otherwise reach — the others are already
+    refused by the passwordless guard, the last-account guard or the
+    first-password rule. The claim sets the first username and password
+    together, which is what makes it the one door.
     """
     db = get_deps().db
+    config = get_config()
+    if instance_is_passwordless(await db.login_state(), config):
+        raise HTTPException(
+            status_code=409,
+            detail="This instance has not been claimed yet. Give the account "
+                   "its username and password together through "
+                   "POST /api/setup/claim with the mandatory setup token.",
+        )
     account = await db.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
 
     if req.username is not None:
         try:
-            account = await db.update_account_login(account_id, username=req.username)
+            account = await db.update_account_login(
+                account_id, username=req.username,
+                expected_session_epoch=(
+                    actor.session_epoch if account_id == actor.account_id else None
+                ),
+            )
         except _CONFLICT as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
         except AccountError as e:
@@ -253,9 +280,18 @@ async def update_account(
             raise HTTPException(status_code=404, detail="Account not found")
 
     if req.display_name is not None:
-        await db.update_actor_profile(
-            account["actor_id"], display_name=(req.display_name.strip() or None),
-        )
+        try:
+            await db.update_actor_profile(
+                account["actor_id"],
+                display_name=(req.display_name.strip() or None),
+                # Checked inside the write's own transaction, like every other
+                # account mutation: a rename authorised before a claim must not
+                # land after it, least of all over the claimer's own name.
+                acting_account_id=actor.account_id,
+                acting_session_epoch=actor.session_epoch,
+            )
+        except StaleSessionError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
     return await _render(db, account)
 
 
@@ -265,13 +301,20 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 
     Takes effect at the account's *next* request, not retroactively: a token
     issued before this is still signed and unexpired, and the account row is
-    what stops it — at every door. An open WebSocket keeps the identity it was
-    accepted with until it reconnects.
+    what stops it — at every door. An open WebSocket is checked the same way
+    before each inbound frame and closed when the row says no, so it ends at
+    the next thing it says rather than at the next time it reconnects. What it
+    already sent keeps the actor it was accepted with; a connection that may no
+    longer act is closed, never re-pointed at somebody else.
     """
     db = get_deps().db
     try:
-        account = await db.disable_account(account_id)
-    except LastAccountError as e:
+        account = await db.disable_account(
+            account_id,
+            acting_account_id=actor.account_id,
+            acting_session_epoch=actor.session_epoch,
+        )
+    except (LastAccountError, StaleSessionError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -283,7 +326,14 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 async def enable_account(account_id: str, actor: Actor = Depends(require_account)):
     """Re-enable an account. Idempotent."""
     db = get_deps().db
-    account = await db.enable_account(account_id)
+    try:
+        account = await db.enable_account(
+            account_id,
+            acting_account_id=actor.account_id,
+            acting_session_epoch=actor.session_epoch,
+        )
+    except StaleSessionError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s enabled by account %s", account_id, actor.account_id)
@@ -298,10 +348,8 @@ async def change_own_password(
 
     ``current_password`` is required whenever the account already has one —
     from its own row or from ``auth.password_hash`` — so a stolen session token
-    is not on its own enough to take the account over. The account that has
-    none (a passwordless install, before anyone has set one) is the one case
-    that may set a first password without proving anything beyond being signed
-    in, which is also what it has to do before a second account can exist.
+    is not on its own enough to take the account over. A passwordless install
+    must instead use the setup-token-protected claim endpoint.
 
     An **omitted** current password and an **empty** one are different things.
     The first is "I am not claiming to know it"; the second is a claim that the
@@ -311,13 +359,29 @@ async def change_own_password(
 
     Setting a password moves the account to its own credential, after which
     ``auth.password_hash`` no longer applies to it.
+
+    **While the instance is unclaimed this endpoint refuses.** The one case
+    that needs no current password is exactly the state a passwordless install
+    is in, and a passwordless install hands a session to anybody who asks — so
+    leaving this open would be a second, unguarded way to take the instance
+    over, beside the one the setup token protects. There is one door, and it
+    is ``POST /api/setup/claim``.
     """
     db = get_deps().db
+    config = get_config()
     account = await db.get_account(actor.account_id)
     if account is None:  # pragma: no cover - resolved a moment ago
         raise HTTPException(status_code=404, detail="Account not found")
 
-    existing = account_credential(account, get_config())
+    if instance_is_passwordless(await db.login_state(), config):
+        raise HTTPException(
+            status_code=409,
+            detail="This instance has not been claimed yet. Set the first "
+                   "password through POST /api/setup/claim with the mandatory "
+                   "setup token.",
+        )
+
+    existing = account_credential(account, config)
     if existing:
         supplied = req.current_password
         if supplied is None or not verify_password(supplied, existing):
@@ -326,7 +390,17 @@ async def change_own_password(
     try:
         updated = await db.update_account_login(
             account["id"], credential=_hashed(req.new_password),
+            # Conditional on the account still being at the epoch this request
+            # was authorised under. The passwordless branch above read a
+            # snapshot; if a claim committed between that read and this write,
+            # the snapshot says "no password to prove" about an account that
+            # now has one, and the write would hand the instance back.
+            expected_session_epoch=actor.session_epoch,
         )
+    except _CONFLICT as e:
+        # A stale session is a fact about the *instance* (it was claimed under
+        # this request), not about the password in the body.
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if updated is None:  # pragma: no cover - removed between two reads
