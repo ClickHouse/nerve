@@ -265,8 +265,11 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 
     Takes effect at the account's *next* request, not retroactively: a token
     issued before this is still signed and unexpired, and the account row is
-    what stops it — at every door. An open WebSocket keeps the identity it was
-    accepted with until it reconnects.
+    what stops it — at every door. An open WebSocket is checked the same way
+    before each inbound frame and closed when the row says no, so it ends at
+    the next thing it says rather than at the next time it reconnects. What it
+    already sent keeps the actor it was accepted with; a connection that may no
+    longer act is closed, never re-pointed at somebody else.
     """
     db = get_deps().db
     try:

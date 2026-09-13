@@ -99,13 +99,26 @@ else moves it: a password change does not, because that endpoint hands back no
 token and would sign the person changing their password out of the tab they
 changed it in.
 
-Two limits worth knowing. The epoch is per *account*, so it is the right shape
-for "end every session on this account" and no shape at all for "sign out this
-one device", which nothing here offers. And an **already-open WebSocket keeps
-the identity it was accepted with** until it reconnects — the same rule
-disablement follows, for the same reason (a socket is open for hours and
-re-reading identity mid-stream would attribute one message differently from the
-one before it).
+**Open WebSockets end too.** A socket authenticates once, at accept, and is
+then held for hours — so the claim closes every open connection whose account
+has moved on (policy code `1008`), and every inbound frame is re-checked
+against the account row before anything is done with it. Both halves are
+needed: closing is what stops a stale socket *receiving* the owner's
+transcript without ever speaking, and the per-frame check is what stops it
+*acting* if the close never reached it.
+
+The connection's **actor is never rewritten** — a socket that may no longer act
+is closed, not re-pointed, because re-pointing it would attribute the next
+message on it to somebody who did not send it. Messages already attributed to
+the earlier actor stay as they are.
+
+Disablement gets the same treatment for free: it used to take effect at the
+account's next *request* and never on an open socket, and now the socket ends
+at its next frame as well.
+
+One limit worth knowing: the epoch is per *account*. It is the right shape for
+"end every session on this account" and no shape at all for "sign out this one
+device", which nothing here offers.
 
 **Passwordless is bounded to one account.** With two accounts it is not a weaker
 login, it is an unanswerable question: nothing distinguishes the callers, so
