@@ -131,11 +131,17 @@ Routes are split into domain-specific modules under `nerve/gateway/routes/`. Eac
 ```python
 from nerve.gateway.routes._deps import get_deps
 
+router = APIRouter(dependencies=[Depends(require_auth)])
+
 @router.get("/api/example")
-async def example(user: dict = Depends(require_auth)):
+async def example():
     deps = get_deps()
     # Use deps.engine, deps.db, deps.notification_service
 ```
+
+Use `actor: Actor = Depends(require_auth)` on handlers that consume identity for
+attribution, account authority, or session-epoch checks; otherwise gate the
+module through the router dependency.
 
 ## Development Workflow
 

@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ import pytest_asyncio
 import nerve.config  # noqa: F401  — imported so its constants can be re-pointed
 from nerve import paths
 from nerve.db import Database
+from nerve.identity import Actor
 
 # Machine-local paths that are already materialized by the time a fixture runs,
 # keyed by attribute name -> location under the state dir.
@@ -113,6 +115,19 @@ def _deterministic_umask():
     os.umask(old)
 
 
+# The actor a test that is not about authentication runs as. Obviously
+# synthetic ids, UUID-shaped like the real ones, and NOT rows in ``actor_refs``
+# — nothing in this version stores an actor, so nothing checks. See the PR 2
+# handoff: the day an actor id becomes a foreign key, tests using this have to
+# create the row.
+TEST_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
+
+
 @pytest.fixture
 def bypass_auth():
     """Install a stand-in for ``require_auth`` on a test app.
@@ -123,19 +138,83 @@ def bypass_auth():
     relying on an empty ``auth.jwt_secret``. Yields a function taking the app
     (returns it, for chaining). Auth tests must not use it — they exercise the
     real dependency with real tokens.
+
+    The override returns a real :class:`~nerve.identity.Actor`, not a stub
+    dict: a route that starts reading the actor must see the same type in tests
+    that it sees in production.
     """
     from nerve.gateway.auth import require_auth
 
     apps = []
 
     def _bypass(app):
-        app.dependency_overrides[require_auth] = lambda: {"sub": "user"}
+        app.dependency_overrides[require_auth] = lambda: TEST_ACTOR
         apps.append(app)
         return app
 
     yield _bypass
     for app in apps:
         app.dependency_overrides.pop(require_auth, None)
+
+
+@dataclass(frozen=True)
+class _TestIdentity:
+    owner_account_id: str
+    owner_actor_id: str
+    system_actor_id: str
+
+
+@pytest.fixture
+def open_identity_db():
+    """Factory: a connected ``Database`` with one test account.
+
+    Returns ``(db, identity)`` with the account, human actor, and the
+    migration-created system actor ids. This intentionally uses the narrow
+    internal bootstrap primitive: tests create exceptional account states
+    directly instead of expanding the production Database API for fixtures.
+    Await it **in the event loop that will use the database**: a sync
+    ``TestClient`` test should call it through ``client.portal`` so the
+    connection's write lock belongs to the loop the app runs in.
+
+    The caller closes the database.
+    """
+
+    async def _open(db_path, *, credential_source: str = "none", display_name=None):
+        database = Database(Path(db_path))
+        await database.connect()
+        account = await database._bootstrap_first_account(
+            credential_source=credential_source, display_name=display_name,
+        )
+        assert account.created and account.account_id and account.actor_id
+        identity = _TestIdentity(
+            owner_account_id=account.account_id,
+            owner_actor_id=account.actor_id,
+            system_actor_id=database.system_actor_id,
+        )
+        return database, identity
+
+    return _open
+
+
+@pytest.fixture
+def wire_identity_store(monkeypatch):
+    """Point the request path's actor resolution at a database.
+
+    ``require_auth`` resolves the actor against ``get_deps().db``, which the
+    gateway lifespan wires before it serves. A test that builds its own app
+    wires it here instead; ``monkeypatch`` puts the previous container back
+    afterwards, so one test's (closed) database can never be resolved against
+    by the next.
+    """
+    from nerve.gateway.routes import _deps as deps_module
+
+    def _wire(database):
+        monkeypatch.setattr(
+            deps_module, "_deps", deps_module.RouteDeps(engine=None, db=database),
+        )
+        return database
+
+    return _wire
 
 
 @pytest.fixture

@@ -17,6 +17,7 @@ from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,7 @@ def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> 
 
 
 @router.get("/api/sessions")
-async def list_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+async def list_sessions(offset: int = 0, actor: Actor = Depends(require_auth)):
     """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
     deps = get_deps()
     limit = _page_size()
@@ -216,7 +217,7 @@ async def list_sessions(offset: int = 0, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/sessions/search")
-async def search_sessions(q: str, user: dict = Depends(require_auth)):
+async def search_sessions(q: str, actor: Actor = Depends(require_auth)):
     """Search sessions by title across all non-archived sessions."""
     if not q or not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
@@ -227,7 +228,7 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/sessions/archived")
-async def list_archived_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+async def list_archived_sessions(offset: int = 0, actor: Actor = Depends(require_auth)):
     """One page of archived sessions — fetched only when the group is expanded."""
     deps = get_deps()
     limit = _page_size()
@@ -238,7 +239,7 @@ async def list_archived_sessions(offset: int = 0, user: dict = Depends(require_a
 
 
 @router.get("/api/sessions/system")
-async def list_system_sessions(offset: int = 0, user: dict = Depends(require_auth)):
+async def list_system_sessions(offset: int = 0, actor: Actor = Depends(require_auth)):
     """One page of system (cron/hook) sessions — fetched only when expanded."""
     deps = get_deps()
     limit = _page_size()
@@ -249,7 +250,7 @@ async def list_system_sessions(offset: int = 0, user: dict = Depends(require_aut
 
 
 @router.post("/api/sessions")
-async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
+async def create_session(req: SessionCreateRequest, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     metadata = None
     if req.backend:
@@ -359,7 +360,7 @@ async def _attach_review_loop(deps, session: dict, session_id: str, cwd: str, re
 
 
 @router.get("/api/sessions/{session_id}")
-async def get_session(session_id: str, user: dict = Depends(require_auth)):
+async def get_session(session_id: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     session = await deps.db.get_session(session_id)
     if not session:
@@ -368,7 +369,7 @@ async def get_session(session_id: str, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/sessions/{session_id}/messages")
-async def get_messages(session_id: str, limit: int = 500, user: dict = Depends(require_auth)):
+async def get_messages(session_id: str, limit: int = 500, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     messages = await deps.db.get_messages(session_id, limit=limit)
     session = await deps.db.get_session(session_id)
@@ -403,7 +404,7 @@ async def _would_create_cycle(db, child_id: str, new_parent_id: str) -> bool:
 
 
 @router.patch("/api/sessions/{session_id}")
-async def update_session(session_id: str, req: dict, user: dict = Depends(require_auth)):
+async def update_session(session_id: str, req: dict, actor: Actor = Depends(require_auth)):
     """Update session fields (title, starred, model, parent_session_id).
 
     ``parent_session_id`` is the sidebar drag-to-nest relationship (null clears
@@ -517,7 +518,7 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
 
 
 @router.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str, user: dict = Depends(require_auth)):
+async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     engine = deps.engine
     db = deps.db
@@ -563,7 +564,7 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/sessions/{session_id}/status")
-async def session_status(session_id: str, user: dict = Depends(require_auth)):
+async def session_status(session_id: str, actor: Actor = Depends(require_auth)):
     """Enhanced session status with lifecycle info."""
     deps = get_deps()
     session = await deps.db.get_session(session_id)
@@ -584,7 +585,7 @@ async def session_status(session_id: str, user: dict = Depends(require_auth)):
 
 
 @router.post("/api/sessions/fork")
-async def fork_session(req: ForkRequest, user: dict = Depends(require_auth)):
+async def fork_session(req: ForkRequest, actor: Actor = Depends(require_auth)):
     """Fork a session, optionally from a specific message.
 
     The fork branches the source's native conversation on its first turn
@@ -615,7 +616,7 @@ _RUN_LATER_MANUAL_ACK = "Acknowledged — saved to run manually later."
 
 
 @router.post("/api/sessions/run-later")
-async def run_later(req: RunLaterRequest, user: dict = Depends(require_auth)):
+async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
     """Defer a composed prompt: persist it as the session's pending user
     message plus a synthetic assistant acknowledgment (written directly, with
     no LLM call and zero token spend), and — for the three timed options —
@@ -715,7 +716,7 @@ async def run_later(req: RunLaterRequest, user: dict = Depends(require_auth)):
 
 
 @router.post("/api/sessions/{session_id}/resume")
-async def resume_session(session_id: str, user: dict = Depends(require_auth)):
+async def resume_session(session_id: str, actor: Actor = Depends(require_auth)):
     """Resume a stopped or idle session."""
     deps = get_deps()
     try:
@@ -726,7 +727,7 @@ async def resume_session(session_id: str, user: dict = Depends(require_auth)):
 
 
 @router.post("/api/sessions/{session_id}/archive")
-async def archive_session(session_id: str, user: dict = Depends(require_auth)):
+async def archive_session(session_id: str, actor: Actor = Depends(require_auth)):
     """Archive a session and its entire descendant subtree (soft delete).
 
     Cascade is the default: children, grandchildren and deeper are archived
@@ -744,7 +745,7 @@ async def archive_session(session_id: str, user: dict = Depends(require_auth)):
 
 
 @router.post("/api/sessions/{session_id}/unarchive")
-async def unarchive_session(session_id: str, user: dict = Depends(require_auth)):
+async def unarchive_session(session_id: str, actor: Actor = Depends(require_auth)):
     """Restore an archived session (Archived group → Unarchive / Star)."""
     deps = get_deps()
     try:
@@ -756,7 +757,7 @@ async def unarchive_session(session_id: str, user: dict = Depends(require_auth))
 
 @router.get("/api/sessions/{session_id}/events")
 async def get_session_events(
-    session_id: str, limit: int = 50, user: dict = Depends(require_auth),
+    session_id: str, limit: int = 50, actor: Actor = Depends(require_auth),
 ):
     """Get the lifecycle event log for a session."""
     deps = get_deps()
@@ -767,7 +768,7 @@ async def get_session_events(
 # --- Modified files ---
 
 @router.get("/api/sessions/{session_id}/modified-files")
-async def get_modified_files(session_id: str, user: dict = Depends(require_auth)):
+async def get_modified_files(session_id: str, actor: Actor = Depends(require_auth)):
     """List files modified during a session with +/- stats."""
     deps = get_deps()
     session = await deps.db.get_session(session_id)
@@ -840,7 +841,7 @@ async def get_file_diff(
     session_id: str,
     path: str,
     context: int = 4,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     """Compute a unified diff for a single file against its session baseline snapshot."""
     deps = get_deps()
@@ -880,7 +881,7 @@ async def get_file_diff(
 # --- Chat ---
 
 @router.post("/api/chat", response_model=MessageResponse)
-async def chat(req: MessageRequest, user: dict = Depends(require_auth)):
+async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
     """Send a message and get a response (non-streaming). Use WebSocket for streaming."""
     deps = get_deps()
     session_id = req.session_id
