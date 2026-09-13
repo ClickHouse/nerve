@@ -59,95 +59,53 @@ removing the configured value later generates a fresh key instead of reviving
 the retired one. If a database file was readable by other users, a stored key
 is treated as compromised, deleted, and unpinned before replacement.
 
-With no password anywhere — none on the account row and no `auth.password_hash`
-— every caller who can reach the gateway logs in with any password and acts as
-the owner. That is the intended behaviour for a private, loopback-bound install
-and a real exposure on anything else: Nerve does **not** change the bind address
-or refuse to start over it. Set a password before exposing the gateway beyond
-the machine.
+With no password on the account row or in `auth.password_hash`, every caller
+who reaches the gateway logs in with any password and acts as the owner. Nerve
+keeps this upgrade-compatible state usable, but it must be claimed before the
+gateway is exposed.
 
-**How that first password is set: the setup wizard, and only there.** An
-install with one account and no password is *unclaimed*, and the wizard at
-`/setup` is what ends that state — it names and secures the account the install
-already has, in one transaction, and signs the browser in with the password it
-set. It is guarded by a **setup token** printed in the server log, which a
-caller whose socket peer is loopback does not need, because being on the machine
-is proof enough. See [Setup](setup.md#claiming-an-instance-from-a-browser).
+Open `/setup` and supply the mandatory setup token shown by `nerve status`.
+The claim names and secures the existing account in one transaction and may set
+its display name. The token is persisted across restarts, compared in constant
+time, and invalidated on success. It is never written to a URL, response,
+server log, or browser storage. Remote claims require HTTPS or a protected
+tunnel.
 
-`PUT /api/accounts/me/password` needs no current password on an account that
-has none — which is exactly this state — so while the instance is unclaimed it
-refuses with a `409` pointing at the claim endpoint. There is one door, and it
-is the guarded one. Once the instance has been claimed, the accounts screen is
-where passwords are changed as usual.
+`PUT /api/accounts/me/password` refuses while unclaimed, so the passwordless
+session issued to any visitor is not a second path around the setup token.
 
 ### The claim cutover
 
-Claiming is a **cutover**, not a door that swings shut behind the last caller
-through it. Three rules, and the wizard, the account routes and the WebSocket
-endpoint all follow them:
+The database claim uses `BEGIN IMMEDIATE` and checks its precondition inside
+the transaction. Two callers may both reach it, but exactly one can change the
+sole account from passwordless to local credentials.
 
-1. **While unclaimed, the only write anybody may perform is the claim.** A
-   passwordless install mints a real session for any password, so "is there a
-   session?" is not a boundary: every setup write, the restart endpoint and
-   every account mutation refuse with a `409` naming
-   `POST /api/setup/claim`. (The rest of the product stays usable — a
-   passwordless install is meant to work until somebody secures it.)
-2. **At the claim, the epoch bump is the cutover.** Anything admitted under
-   the old epoch is stale from that instant: HTTP mutations carry the epoch
-   their credential stated into their own write transaction and the row
-   refuses them if the two have diverged; WebSocket connections record the
-   epoch from the verified token — never a later read of the row — and are
-   re-checked once they enter the registry and before every frame.
-3. **Locality is not the identity of the code in the browser.** A tokenless
-   claim must also be same-origin; see
-   [Setup](setup.md#claiming-an-instance-from-a-browser).
+The same transaction increments `accounts.session_epoch`. Session tokens
+record the epoch at minting, and request identity compares it with the account
+row. A missing epoch reads as 0, preserving sessions across an upgrade until a
+claim advances the account to 1. The successful claim response carries a
+client session token minted at the new epoch; every earlier HTTP session is
+stale.
 
-**Claiming also ends every session that came before it.** A passwordless
-install hands an ordinary account session to everybody who reaches it, and
-those tokens name the same account and have thirty days left — so securing the
-account would otherwise secure only the *next* caller. Each account carries a
-**session epoch** (`accounts.session_epoch`, added by `v049`): every session
-token records the epoch it was minted under, the account row is compared
-against it on the same read that already checks whether the account is
-disabled, and the claim bumps the row inside the transaction that sets the
-password. The token the claim returns is minted at the new epoch, so the
-browser doing the claiming is the one session that survives.
+Account mutations carry the epoch stated by their credential into the write
+transaction. This closes the interval where a password change, account create,
+disable, or rename was authorized just before the claim but would otherwise
+land after it.
 
-A token with no epoch at all reads as 0 — that is what a token minted before
-the column existed carries, and what a grandfathered `sub: "user"` session
-carries. An account that has never been claimed is also at 0, so an upgrade
-logs nobody out; a claim moves the account to 1 and all of them stop. Nothing
-else moves it: a password change does not, because that endpoint hands back no
-token and would sign the person changing their password out of the tab they
-changed it in.
+Open WebSockets record the credential's epoch at admission. They are registered
+before handshake work, rechecked immediately after registration and before
+every inbound frame, and best-effort closed when the claim commits. Thus a
+stale socket cannot act, and proactive closure stops it receiving the new
+owner's transcript. A disabled account is likewise closed on its next frame.
+The connection actor is never rewritten, so previously stored attribution does
+not change.
 
-**Open WebSockets end too.** A socket authenticates once, at accept, and is
-then held for hours — so the claim closes every open connection whose account
-has moved on (policy code `1008`), and every inbound frame is re-checked
-against the account row before anything is done with it. Both halves are
-needed: closing is what stops a stale socket *receiving* the owner's
-transcript without ever speaking, and the per-frame check is what stops it
-*acting* if the close never reached it.
-
-The connection's **actor is never rewritten** — a socket that may no longer act
-is closed, not re-pointed, because re-pointing it would attribute the next
-message on it to somebody who did not send it. Messages already attributed to
-the earlier actor stay as they are.
-
-Disablement gets the same treatment for free: it used to take effect at the
-account's next *request* and never on an open socket, and now the socket ends
-at its next frame as well.
-
-One limit worth knowing: the epoch is per *account*. It is the right shape for
-"end every session on this account" and no shape at all for "sign out this one
-device", which nothing here offers.
+The epoch is per account: it revokes every session for that account, not one
+device.
 
 **Passwordless is bounded to one account.** With two accounts it is not a weaker
-login, it is an unanswerable question: nothing distinguishes the callers, so
-every one of them would be whoever the code picked. So a second account cannot
-be created while the instance is passwordless — the create is refused with a
-`409` saying to set a password first, rather than startup being refused, which
-would break the upgrade promise in an unrelated way.
+login but an unanswerable identity choice. Creating a second account therefore
+returns `409` until the first account has both a password and username.
 
 ## Account management
 
@@ -174,8 +132,8 @@ both reported as `409` with what to do first:
 
 Setting a password is own-account only. Nobody can set anyone else's — and an
 account that already has one must supply it, so a stolen session token is not on
-its own enough to take the account over. The account that has *no* password yet
-is the single exception, which is also the state the whole screen exists to end.
+its own enough to take the account over. An unclaimed account must use the
+setup-token-protected claim endpoint instead.
 
 ### Usernames
 

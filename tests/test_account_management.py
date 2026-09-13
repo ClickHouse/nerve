@@ -485,7 +485,7 @@ class TestOwnPassword:
         which is exactly the state a passwordless install is in, and a
         passwordless install hands a session to anybody who asks. So while the
         instance is unclaimed it refuses and points at the claim endpoint,
-        which requires a loopback caller or the setup token.
+        which requires the mandatory setup token.
         """
         async with _client(install.app) as client:
             response = await client.put(
@@ -689,8 +689,8 @@ class TestTheRouteSurface:
 
         The fourth is PR 6's claim: the state it ends — one account with no
         password — already admits every caller, so requiring a session would
-        protect nothing. What protects it is its own guard (a loopback socket
-        peer, or the setup token), which this scan cannot see; the tests in
+        protect nothing. What protects it is the mandatory setup token, which
+        this scan cannot see; the tests in
         ``test_setup_wizard.py`` are what pin it."""
         open_endpoints = {
             (tuple(methods), path)

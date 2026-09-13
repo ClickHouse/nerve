@@ -1,23 +1,9 @@
-"""The first-run wizard: who may claim an instance, and what the checklist writes.
-
-The security-relevant half is the claim guard, so most of this file is about
-the ways a caller might try to get past it: a forged header, an IPv6 spelling
-of loopback that a string comparison would miss, a second claim racing the
-first, and the password endpoint that needs no current password on exactly the
-account this exists to secure.
-
-The rest is the checklist: every step idempotent, skippable and re-enterable,
-nothing written under lockdown, and nothing anywhere that rotates the signing
-secret — because the wizard ends in a restart and the browser has to come back
-still signed in.
-"""
+"""Mandatory-token first-account claim and session cutover."""
 
 from __future__ import annotations
 
 import asyncio
-import os
-import stat
-import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,14 +11,15 @@ import httpx
 import jwt
 import pytest
 import pytest_asyncio
-import yaml
 from fastapi import FastAPI
 
-from nerve import boot, setup_state, setup_token
-from nerve.config import AuthConfig, GatewayConfig, NerveConfig, set_config
+from nerve import setup_token
+from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.db.accounts import JWT_SECRET_NAME
 from nerve.gateway.auth import (
     JWT_ALGORITHM,
+    TOKEN_TYPE_CLAIM,
+    TOKEN_TYPE_SESSION,
     create_session_token,
     hash_password,
     pin_jwt_secret,
@@ -40,37 +27,39 @@ from nerve.gateway.auth import (
 )
 from nerve.gateway.routes import accounts as accounts_routes
 from nerve.gateway.routes import auth as auth_routes
-from nerve import setup_writer as setup_writer_module
 from nerve.gateway.routes import setup as setup_routes
-from nerve.setup_writer import (
-    SetupChoices,
-    write_config_local_yaml,
-    write_config_yaml,
-    write_cron_jobs,
-    write_workspace_settings,
-)
 
-_SECRET = "test-secret-for-the-setup-wizard-padded-32b"
+_SECRET = "test-secret-for-the-setup-claim-padded-32b"
 _PASSWORD = "correct-horse-battery-staple"
-_LOOPBACK = ("127.0.0.1", 41000)
-_REMOTE = ("203.0.113.7", 41000)     # TEST-NET-3, never routable
-_ANTHROPIC_KEY = "anthropic-key-placeholder"
-_TELEGRAM_TOKEN = "0000000000:telegram-bot-token-placeholder"
-_TELEGRAM_API_HASH = "telegram-api-hash-placeholder"
+_LOCAL = ("127.0.0.1", 41000)
+_REMOTE = ("203.0.113.7", 41000)
 
 
 def _legacy_token(secret: str = _SECRET) -> str:
-    """What a browser that logged in before per-account sessions is holding."""
     now = datetime.now(timezone.utc)
     return jwt.encode(
         {"iat": now, "exp": now + timedelta(hours=720), "sub": "user"},
-        secret, algorithm=JWT_ALGORITHM,
+        secret,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def _pre_epoch_session_token(account_id: str, secret: str = _SECRET) -> str:
+    """A typed per-account token minted before the ``sep`` claim existed."""
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "iat": now,
+            "exp": now + timedelta(hours=720),
+            "sub": account_id,
+            TOKEN_TYPE_CLAIM: TOKEN_TYPE_SESSION,
+        },
+        secret,
+        algorithm=JWT_ALGORITHM,
     )
 
 
 class _FakeSocket:
-    """Enough of a WebSocket for ``authenticate_websocket``: a token and no cookies."""
-
     def __init__(self, token: str):
         self.query_params = {"token": token}
         self.cookies: dict[str, str] = {}
@@ -84,133 +73,43 @@ def _app() -> FastAPI:
     return app
 
 
-# What a browser on the machine actually addresses. Not a made-up name: the
-# claim's tokenless path checks the Host header against the addresses this
-# instance answers on (DNS rebinding), so a synthetic host would be testing a
-# request no browser makes.
-_BASE_URL = "http://127.0.0.1:8900"
-
-
 def _client(
-    app: FastAPI, *, client=_LOOPBACK, token: str = "", base_url: str = _BASE_URL,
+    app: FastAPI, *, token: str = "", client=_LOCAL,
 ) -> httpx.AsyncClient:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, client=client),
-        base_url=base_url,
+        base_url="http://nerve-test",
         headers=headers,
     )
 
 
 class _Install:
-    """A fresh install: real files from the installer's own writers, a real db."""
-
-    def __init__(self, db, identity, app, config_dir: Path, workspace: Path):
+    def __init__(self, db, identity, token: str):
         self.db = db
         self.identity = identity
-        self.app = app
-        self.config_dir = config_dir
-        self.workspace = workspace
         self.owner_id = identity.owner_account_id
-
-    @property
-    def config_local(self) -> Path:
-        return self.config_dir / "config.local.yaml"
-
-    @property
-    def config_yaml(self) -> Path:
-        return self.config_dir / "config.yaml"
-
-    @property
-    def settings(self) -> Path:
-        return self.workspace / "config" / "settings.yaml"
-
-    @property
-    def system_crons(self) -> Path:
-        return self.workspace / "config" / "cron" / "system.yaml"
-
-    def secrets(self) -> dict:
-        return yaml.safe_load(self.config_local.read_text(encoding="utf-8")) or {}
-
-    def tracked(self) -> dict:
-        return yaml.safe_load(self.settings.read_text(encoding="utf-8")) or {}
-
-    def machine(self) -> dict:
-        return yaml.safe_load(self.config_yaml.read_text(encoding="utf-8")) or {}
-
-    async def token(self) -> str:
-        """The setup token, as first start would have generated it."""
-        return await setup_token.ensure_setup_token(self.db, unclaimed=True)
+        self.setup_token = token
+        self.app = _app()
 
     async def owner_actor_id(self) -> str:
         account = await self.db.get_account(self.owner_id)
         return account["actor_id"]
 
-    def session_token(self, account_id: str | None = None) -> str:
-        return create_session_token(_SECRET, account_id or self.owner_id)
-
-    def restarted(self, **kwargs) -> NerveConfig:
-        """Model what a restart does: a new process, with a new config.
-
-        The generation matters as much as the config does. Everything the
-        checklist notes down about work in flight is scoped to the process
-        that noted it — a secret is recorded as "present" rather than as
-        itself, so nothing else can tell a key that is in force from one
-        pasted over it — and a new generation is what retires those notes.
-        """
-        boot.BOOT_ID = secrets.token_hex(8)
-        return self.reconfigure(**kwargs)
-
-    def reconfigure(self, **kwargs) -> NerveConfig:
-        config = NerveConfig(
-            auth=AuthConfig(jwt_secret=_SECRET, **kwargs.pop("auth", {})),
-            config_dir=self.config_dir,
-            workspace=self.workspace,
-            **kwargs,
+    def session_token(self, account_id: str | None = None, epoch: int = 0) -> str:
+        return create_session_token(
+            _SECRET,
+            account_id or self.owner_id,
+            session_epoch=epoch,
         )
-        set_config(config)
-        return config
-
-
-@pytest.fixture(autouse=True)
-def no_ambient_credential(monkeypatch):
-    """Answer the provider step from the instance, not from this shell.
-
-    A Docker install is handed its credential in the environment, so the step
-    reads it — which means a developer who exports `ANTHROPIC_API_KEY` gets a
-    different checklist from one who does not. The tests say which world they
-    are in.
-    """
-    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
-        monkeypatch.delenv(name, raising=False)
-
-
-@pytest.fixture(autouse=True)
-def process_generation(monkeypatch):
-    """One generation per test, restored afterwards.
-
-    ``boot.BOOT_ID`` is a module global set at import, which in production is
-    the daemon starting. ``_Install.restarted()`` moves it; this puts it back.
-    """
-    monkeypatch.setattr(boot, "BOOT_ID", secrets.token_hex(8))
 
 
 @pytest_asyncio.fixture
 async def install(tmp_path, open_identity_db, wire_identity_store):
-    """An unclaimed install with real configuration files on disk.
-
-    The files come from :mod:`nerve.setup_writer`, so what the wizard merges
-    into is exactly what `nerve init` would have left behind.
-    """
     config_dir = tmp_path / "config"
     workspace = tmp_path / "workspace"
-    config_dir.mkdir(parents=True)
-    choices = SetupChoices(workspace_path=workspace, timezone="UTC")
-    write_config_yaml(choices, config_dir)
-    write_workspace_settings(choices)
-    write_config_local_yaml(choices, config_dir)
-    write_cron_jobs(choices)
-
+    config_dir.mkdir()
+    workspace.mkdir()
     set_config(NerveConfig(
         auth=AuthConfig(jwt_secret=_SECRET),
         config_dir=config_dir,
@@ -219,2146 +118,390 @@ async def install(tmp_path, open_identity_db, wire_identity_store):
     pin_jwt_secret(_SECRET)
     database, identity = await open_identity_db(tmp_path / "nerve.db")
     wire_identity_store(database)
+    token = await setup_token.ensure_setup_token(database, unclaimed=True)
+    assert token
     try:
-        yield _Install(database, identity, _app(), config_dir, workspace)
+        yield _Install(database, identity, token)
     finally:
         await database.close()
         set_config(NerveConfig())
 
 
+_UNSET = object()
+
+
 async def _claim(
-    install: _Install, *, client=_LOOPBACK, body: dict | None = None,
-    headers: dict | None = None,
+    install: _Install,
+    *,
+    username: str = "alice",
+    password: str = _PASSWORD,
+    display_name: str | None = None,
+    token: str | None | object = _UNSET,
+    client=_LOCAL,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    payload = {"username": "alice", "password": _PASSWORD}
-    payload.update(body or {})
+    body = {"username": username, "password": password}
+    supplied = install.setup_token if token is _UNSET else token
+    if supplied is not None:
+        body["setup_token"] = supplied
+    if display_name is not None:
+        body["display_name"] = display_name
     async with _client(install.app, client=client) as http:
-        return await http.post("/api/setup/claim", json=payload, headers=headers or {})
-
-
-# --------------------------------------------------------------------------- #
-#  Claiming                                                                    #
-# --------------------------------------------------------------------------- #
+        return await http.post(
+            "/api/setup/claim",
+            json=body,
+            headers=headers or {},
+        )
 
 
 @pytest.mark.asyncio
-class TestClaimingFromThisMachine:
-    async def test_a_loopback_caller_claims_without_a_token(self, install):
-        response = await _claim(install)
+class TestClaim:
+    async def test_every_request_requires_a_nonempty_token(self, install):
+        missing = await _claim(install, token=None)
+        empty = await _claim(install, token="")
+        wrong = await _claim(install, token="not-the-token")
+        non_ascii = await _claim(install, token="é")
+        assert missing.status_code == empty.status_code == 422
+        assert wrong.status_code == non_ascii.status_code == 403
+        account = await install.db.get_account(install.owner_id)
+        assert account["credential_source"] == "none"
+
+    async def test_valid_token_claims_from_any_peer_or_page(self, install):
+        response = await _claim(
+            install,
+            client=_REMOTE,
+            headers={
+                "Origin": "https://elsewhere.invalid",
+                "Host": "rebound.invalid",
+                "Sec-Fetch-Site": "cross-site",
+                "X-Forwarded-For": "127.0.0.1",
+            },
+        )
         assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["username"] == "alice"
+        assert set(response.json()) == {"token"}
         account = await install.db.get_account(install.owner_id)
         assert account["username"] == "alice"
         assert verify_password(_PASSWORD, account["credential"])
 
-    async def test_the_session_it_returns_works(self, install):
+    async def test_the_returned_client_session_uses_canonical_me(self, install):
         token = (await _claim(install)).json()["token"]
         async with _client(install.app, token=token) as http:
             checked = await http.get("/api/auth/check")
-            me = await http.get("/api/auth/me")
+            me = await http.get("/api/accounts/me")
         assert checked.status_code == 200
         assert me.status_code == 200
         assert me.json()["username"] == "alice"
 
-    async def test_it_names_the_account_that_was_already_there(self, install):
-        """Not "create": the actor every earlier row points at must not move."""
-        before = await install.owner_actor_id()
-        response = await _claim(install, body={"display_name": "Alice Example"})
+    async def test_optional_display_name_keeps_the_existing_identity(self, install):
+        actor_id = await install.owner_actor_id()
+        response = await _claim(install, display_name="  Alice Example  ")
         assert response.status_code == 200
-        after = await install.owner_actor_id()
-        assert after == before
-        assert response.json()["actor_id"] == before
-        ref = await install.db.get_actor_ref(before)
-        assert ref["display_name"] == "Alice Example"
+        account = await install.db.get_account(install.owner_id)
+        actor = await install.db.get_actor_ref(actor_id)
+        assert account["actor_id"] == actor_id
+        assert actor["display_name"] == "Alice Example"
         assert await install.db.count_accounts() == 1
 
-    async def test_the_token_is_invalidated(self, install):
-        await install.token()
-        assert (await _claim(install)).status_code == 200
+    async def test_token_is_invalidated_and_never_returned_or_logged(
+        self, install, caplog,
+    ):
+        token = install.setup_token
+        with caplog.at_level("INFO"):
+            response = await _claim(install)
+        assert response.status_code == 200
         assert await setup_token.stored_setup_token(install.db) == ""
+        assert token not in response.text
+        assert token not in caplog.text
 
-    async def test_a_second_claim_is_refused(self, install):
+    async def test_token_invalidation_rolls_the_claim_back(self, install):
+        """Account and bearer retirement are one transaction, not two promises."""
+        await install.db.db.execute(
+            """CREATE TRIGGER refuse_setup_token_delete
+                 BEFORE DELETE ON instance_secrets
+                   WHEN OLD.name = 'setup_token'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected setup-token delete failure');
+                 END"""
+        )
+        await install.db.db.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected setup-token"):
+            await install.db.claim_sole_account(
+                username="alice",
+                credential=hash_password(_PASSWORD),
+                invalidate_secret_name=setup_token.SETUP_TOKEN_NAME,
+            )
+
+        account = await install.db.get_account(install.owner_id)
+        assert account["credential_source"] == "none"
+        assert account["username"] is None
+        assert await setup_token.stored_setup_token(install.db) == install.setup_token
+
+    async def test_second_claim_is_refused_without_changing_the_owner(self, install):
         assert (await _claim(install)).status_code == 200
-        second = await _claim(install, body={"username": "bob"})
-        assert second.status_code == 409
+        second = await _claim(install, username="bob")
+        # The invalidated credential is checked before claimability.
+        assert second.status_code == 403
         account = await install.db.get_account(install.owner_id)
         assert account["username"] == "alice"
         assert verify_password(_PASSWORD, account["credential"])
 
-    async def test_two_claims_at_once_leave_exactly_one_winner(self, install):
+    async def test_two_claims_have_exactly_one_winner(self, install):
+        body = {
+            "username": "alice",
+            "password": _PASSWORD,
+            "setup_token": install.setup_token,
+        }
+        other = {
+            "username": "bob",
+            "password": "a-different-passphrase",
+            "setup_token": install.setup_token,
+        }
         async with _client(install.app) as http:
             first, second = await asyncio.gather(
-                http.post("/api/setup/claim", json={
-                    "username": "alice", "password": _PASSWORD,
-                }),
-                http.post("/api/setup/claim", json={
-                    "username": "bob", "password": "a-different-passphrase",
-                }),
+                http.post("/api/setup/claim", json=body),
+                http.post("/api/setup/claim", json=other),
             )
-        codes = sorted([first.status_code, second.status_code])
-        assert codes == [200, 409], (first.text, second.text)
+        statuses = [first.status_code, second.status_code]
+        assert statuses.count(200) == 1
+        # The loser either saw the claimed row inside the CAS transaction, or
+        # arrived after that transaction atomically retired the bearer.
+        assert next(code for code in statuses if code != 200) in {403, 409}
         account = await install.db.get_account(install.owner_id)
         winner = "alice" if first.status_code == 200 else "bob"
         assert account["username"] == winner
 
-    async def test_a_password_bcrypt_cannot_hold_is_a_400(self, install):
-        response = await _claim(install, body={"password": "x" * 200})
-        assert response.status_code == 400
-        # Said in bytes, like the accounts routes say it: "too long" is not
-        # actionable on a password whose length the person can see.
-        assert "72" in response.json()["detail"]
-        assert "bytes" in response.json()["detail"]
+    async def test_password_and_username_validation_leave_it_unclaimed(self, install):
+        too_long = await _claim(install, password="x" * 200)
+        bad_name = await _claim(install, username="admin")
+        assert too_long.status_code == 400
+        assert "72" in too_long.json()["detail"]
+        assert "bytes" in too_long.json()["detail"]
+        assert bad_name.status_code == 400
         assert await setup_token.instance_is_unclaimed(
-            install.db, install.reconfigure(),
-        ) is True
-
-    @pytest.mark.parametrize("username", ["user", "A B", "x", "admin"])
-    async def test_a_username_the_rules_refuse_is_a_400(self, install, username):
-        response = await _claim(install, body={"username": username})
-        assert response.status_code == 400
-
-    async def test_the_response_never_carries_the_setup_token(self, install):
-        token = await install.token()
-        response = await _claim(install)
-        assert token not in response.text
-
-    async def test_a_configured_password_means_the_instance_is_not_unclaimed(
-        self, install,
-    ):
-        """PR 3's D3 window: the row says ``none``, configuration says
-        otherwise, and configuration is what authenticates until the next
-        restart re-derives the row.
-
-        The claim reads the shared predicate rather than the row, so it cannot
-        be used to take over an install whose password arrived by a config
-        reload — which the row-only precondition inside ``claim_sole_account``
-        would happily allow.
-        """
-        install.reconfigure(auth={"password_hash": hash_password(_PASSWORD)})
-        response = await _claim(install)
-        assert response.status_code == 409, response.text
-        account = await install.db.get_account(install.owner_id)
-        assert account["username"] is None
-        assert not account["credential"]
-
-    async def test_the_password_endpoint_is_closed_in_that_window_too(self, install):
-        """...and the side door stays shut for the same reason: with a
-        configured password the account is not credential-less, so changing it
-        needs the current one."""
-        install.reconfigure(auth={"password_hash": hash_password(_PASSWORD)})
-        async with _client(install.app, token=install.session_token()) as http:
-            response = await http.put(
-                "/api/accounts/me/password", json={"new_password": "taken-over"},
-            )
-        assert response.status_code == 403
-        assert not (await install.db.get_account(install.owner_id))["credential"]
-
-
-@pytest.mark.asyncio
-class TestClaimingFromSomewhereElse:
-    async def test_a_remote_caller_without_a_token_is_refused(self, install):
-        await install.token()
-        response = await _claim(install, client=_REMOTE)
-        assert response.status_code == 403
-        assert await setup_token.instance_is_unclaimed(
-            install.db, install.reconfigure(),
-        ) is True
-
-    async def test_a_wrong_token_is_refused_in_the_same_words(self, install):
-        await install.token()
-        missing = await _claim(install, client=_REMOTE)
-        wrong = await _claim(
-            install, client=_REMOTE, body={"setup_token": "not-the-token"},
+            install.db,
+            NerveConfig(auth=AuthConfig(jwt_secret=_SECRET)),
         )
-        assert missing.status_code == wrong.status_code == 403
-        assert missing.json() == wrong.json()
 
-    async def test_the_right_token_lets_a_remote_caller_in(self, install):
-        token = await install.token()
-        response = await _claim(
-            install, client=_REMOTE, body={"setup_token": token},
-        )
-        assert response.status_code == 200, response.text
+    async def test_configured_password_cannot_be_claimed(self, install):
+        set_config(NerveConfig(
+            auth=AuthConfig(
+                jwt_secret=_SECRET,
+                password_hash=hash_password(_PASSWORD),
+            ),
+        ))
+        response = await _claim(install)
+        assert response.status_code == 409
         account = await install.db.get_account(install.owner_id)
-        assert account["username"] == "alice"
+        assert account["credential_source"] == "none"
 
-    @pytest.mark.parametrize("headers", [
-        {"X-Forwarded-For": "127.0.0.1"},
-        {"X-Forwarded-For": "127.0.0.1, 203.0.113.7"},
-        {"Forwarded": "for=127.0.0.1;proto=http"},
-        {"X-Real-IP": "::1"},
-        {"Host": "localhost"},
-    ])
-    async def test_a_forwarded_header_cannot_make_a_caller_local(
-        self, install, headers,
-    ):
-        await install.token()
-        response = await _claim(install, client=_REMOTE, headers=headers)
-        assert response.status_code == 403, headers
+    async def test_missing_stored_token_fails_closed(self, install):
+        # Exceptional raw state: production only deletes through claim or the
+        # startup lifecycle, both of which are covered separately.
+        await install.db.delete_instance_secret(setup_token.SETUP_TOKEN_NAME)
+        response = await _claim(install)
+        assert response.status_code == 403
 
-    async def test_uvicorn_own_proxy_header_handling_cannot_relax_the_guard(
-        self, install,
-    ):
-        """The one place a header *can* reach the peer address, checked.
+    async def test_socket_cleanup_is_best_effort(self, install, monkeypatch):
+        import nerve.gateway.server as server
 
-        Nerve's listener disables that middleware (see
-        ``test_setup_token.py``), so in production it is not in the path at
-        all. Driven through it here anyway, because "we turned it off" and
-        "it could not hurt us if it were on" are different claims and the
-        second one is the one that survives somebody turning it back on.
-        """
-        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+        async def explode():
+            raise RuntimeError("already gone")
 
-        await install.token()
-        fronted = ProxyHeadersMiddleware(install.app)
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=fronted, client=_REMOTE),
-            base_url="http://nerve-test",
-        ) as http:
-            response = await http.post(
-                "/api/setup/claim",
-                json={"username": "alice", "password": _PASSWORD},
-                headers={"X-Forwarded-For": "127.0.0.1"},
-            )
-        assert response.status_code == 403, response.text
-
-    async def test_a_proxy_that_forwards_the_real_client_makes_it_stricter(
-        self, install,
-    ):
-        """And the same middleware in the deployment the switch exists for.
-
-        With a reverse proxy on this host the peer is loopback and the guard
-        would let the claim through — the documented limitation, and why
-        ``auth.setup_token_required`` exists. *If* that middleware were in the
-        path and the proxy forwarded the real client, the token would be
-        demanded after all. Nerve's own listener does not run it, so this is
-        the behaviour of the guard rather than a property anybody should
-        depend on.
-        """
-        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
-
-        token = await install.token()
-        fronted = ProxyHeadersMiddleware(install.app)
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=fronted, client=_LOOPBACK),
-            base_url="http://nerve-test",
-        ) as http:
-            refused = await http.post(
-                "/api/setup/claim",
-                json={"username": "alice", "password": _PASSWORD},
-                headers={"X-Forwarded-For": "203.0.113.7"},
-            )
-            accepted = await http.post(
-                "/api/setup/claim",
-                json={
-                    "username": "alice", "password": _PASSWORD,
-                    "setup_token": token,
-                },
-                headers={"X-Forwarded-For": "203.0.113.7"},
-            )
-        assert refused.status_code == 403, refused.text
-        assert accepted.status_code == 200, accepted.text
-
-    async def test_with_no_token_stored_a_remote_caller_can_never_claim(self, install):
-        """The guard fails closed: nothing to match means nothing matches."""
+        monkeypatch.setattr(server, "close_revoked_sockets", explode)
+        response = await _claim(install)
+        assert response.status_code == 200
         assert await setup_token.stored_setup_token(install.db) == ""
-        for supplied in ("", "guess"):
-            response = await _claim(
-                install, client=_REMOTE, body={"setup_token": supplied},
-            )
-            assert response.status_code == 403
-
-    async def test_the_switch_forces_a_token_from_a_local_caller_too(self, install):
-        install.reconfigure(auth={"setup_token_required": True})
-        token = await install.token()
-        refused = await _claim(install)
-        assert refused.status_code == 403
-        accepted = await _claim(install, body={"setup_token": token})
-        assert accepted.status_code == 200
-
-    async def test_the_guard_is_judged_before_the_instance_state(self, install):
-        """A refused caller learns nothing about the instance here.
-
-        After a claim, a remote caller with no token still gets the guard's
-        403 rather than "already claimed" — which is public anyway, but the
-        ordering is what keeps the endpoint from answering questions for
-        callers who have not passed the door.
-        """
-        await install.token()
-        assert (await _claim(install)).status_code == 200
-        response = await _claim(install, client=_REMOTE, body={"username": "bob"})
-        assert response.status_code == 403
-
-
-# --------------------------------------------------------------------------- #
-#  What the claim does to the sessions that came before it                     #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-class TestClaimingEndsTheSessionsBeforeIt:
-    """The point of step one, and the thing it did not do in round 1.
-
-    A passwordless install hands a session to everybody who reaches it. Those
-    tokens name the account the claim secures, are signed with the same secret
-    and have thirty days left, so unless the claim ends them it secures the
-    *next* caller and leaves every previous one with owner authority — which is
-    the window the claim exists to close.
-    """
-
-    async def test_a_session_from_before_the_claim_is_refused_after_it(
+class TestSessionEpoch:
+    async def test_preclaim_http_and_new_websocket_sessions_are_revoked(
         self, install,
     ):
-        # What any visitor gets on a passwordless install: an ordinary login.
         async with _client(install.app) as http:
             before = (await http.post(
-                "/api/auth/login", json={"password": "anything at all"},
+                "/api/auth/login",
+                json={"password": "anything"},
             )).json()["token"]
-        async with _client(install.app, token=before) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-
-        assert (await _claim(install)).status_code == 200
-
-        async with _client(install.app, token=before) as http:
-            after = await http.get("/api/auth/check")
-        assert after.status_code == 401, after.text
-
-    async def test_the_claimer_keeps_working(self, install):
-        claimed = (await _claim(install)).json()["token"]
-        async with _client(install.app, token=claimed) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-            assert (await http.get("/api/setup")).status_code == 200
-
-    async def test_a_websocket_holding_one_is_refused_too(self, install):
-        """The other door into the same identity."""
         from nerve.gateway.auth import authenticate_websocket
 
-        async with _client(install.app) as http:
-            before = (await http.post(
-                "/api/auth/login", json={"password": "anything at all"},
-            )).json()["token"]
+        assert await authenticate_websocket(_FakeSocket(before)) is not None
+        claimed = (await _claim(install)).json()["token"]
 
-        socket = _FakeSocket(before)
-        assert await authenticate_websocket(socket) is not None
-
-        assert (await _claim(install)).status_code == 200
+        async with _client(install.app, token=before) as http:
+            assert (await http.get("/api/auth/check")).status_code == 401
         assert await authenticate_websocket(_FakeSocket(before)) is None
+        async with _client(install.app, token=claimed) as http:
+            assert (await http.get("/api/accounts/me")).status_code == 200
 
-    async def test_a_legacy_token_dies_with_them(self, install):
-        """A tab from before per-account sessions carries no epoch at all, so
-        it reads as 0 and stops the moment the account is claimed — which is
-        right: it was minted while the instance admitted everybody."""
-        async with _client(install.app, token=_legacy_token()) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-        assert (await _claim(install)).status_code == 200
-        async with _client(install.app, token=_legacy_token()) as http:
+    async def test_a_token_from_any_other_epoch_is_refused(self, install):
+        # Equality is deliberate: a restored or rolled-back database must not
+        # accept a token minted against a future copy of the account either.
+        future = install.session_token(epoch=1)
+        async with _client(install.app, token=future) as http:
             assert (await http.get("/api/auth/check")).status_code == 401
 
-    async def test_an_upgrade_logs_nobody_out(self, install):
-        """The epoch starts at 0 and a token minted before the column existed
-        carries none, which reads as 0. An install that has never been claimed
-        therefore keeps its sessions across the upgrade; only a claim ends
-        them."""
-        token = create_session_token(_SECRET, install.owner_id)  # no epoch claim
+    async def test_legacy_tokens_survive_upgrade_then_die_at_claim(self, install):
+        legacy = _legacy_token()
+        async with _client(install.app, token=legacy) as http:
+            assert (await http.get("/api/auth/check")).status_code == 200
+        await _claim(install)
+        async with _client(install.app, token=legacy) as http:
+            assert (await http.get("/api/auth/check")).status_code == 401
+
+    async def test_pre_epoch_account_tokens_survive_upgrade_then_die_at_claim(
+        self, install,
+    ):
+        token = _pre_epoch_session_token(install.owner_id)
         async with _client(install.app, token=token) as http:
             assert (await http.get("/api/auth/check")).status_code == 200
+        await _claim(install)
+        async with _client(install.app, token=token) as http:
+            assert (await http.get("/api/auth/check")).status_code == 401
 
-    async def test_a_restart_does_not_end_a_session(self, claimed):
-        """The epoch lives on the account row, not in the process: the wizard
-        ends in a restart and the browser has to come back signed in."""
-        async with _http(claimed) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-        claimed.restarted()
-        async with _http(claimed) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-
-    async def test_the_epoch_moves_once_and_only_on_a_claim(self, install):
+    async def test_epoch_moves_once_and_only_on_claim(self, install):
         async def epoch() -> int:
             account = await install.db.get_account(install.owner_id)
             return int(account["session_epoch"])
 
         assert await epoch() == 0
-        assert (await _claim(install)).status_code == 200
+        claimed = await _claim(install)
+        assert claimed.status_code == 200
         assert await epoch() == 1
 
-        # A refused second claim does not move it, and neither does an
-        # ordinary login or a password change.
-        assert (await _claim(install, body={"username": "bob"})).status_code == 409
-        async with _client(install.app, token=install.session_token()) as http:
-            await http.put("/api/accounts/me/password", json={
-                "current_password": _PASSWORD, "new_password": "a-third-one",
-            })
-        assert await epoch() == 1
-
-    async def test_a_session_for_another_account_is_unaffected(self, claimed):
-        """The epoch is per account. Claiming one instance's account must not
-        reach into anybody else's session — there is only one account here, so
-        this pins the column rather than a global."""
-        second = await claimed.db.create_managed_account(
-            username="bob", credential=hash_password(_PASSWORD),
-        )
-        token = create_session_token(
-            _SECRET, second["id"],
-            session_epoch=int(second["session_epoch"] or 0),
-        )
-        async with _client(claimed.app, token=token) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-
-
-# --------------------------------------------------------------------------- #
-#  Whose page is asking                                                        #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestALocalBrowserIsNotAnyLocalPage:
-    """Rule three of the cutover.
-
-    Loopback says the caller is on this machine. It does not say who wrote the
-    page: a browser here runs whatever site its owner visited, and Nerve's CORS
-    policy is `allow_origins=["*"]`, so `https://evil.example` can post to
-    `http://127.0.0.1:8900` and pick the password for an unclaimed instance.
-
-    So a *tokenless* claim must also come from a page this instance served. The
-    token remains the way through from anywhere else — whoever holds it read it
-    off this machine's own log.
-    """
-
-    async def test_a_hostile_origin_cannot_claim_without_the_token(self, install):
-        await install.token()
-        response = await _claim(
-            install, headers={"Origin": "https://evil.example"},
-        )
-        assert response.status_code == 403, response.text
-        assert await setup_token.instance_is_unclaimed(
-            install.db, install.reconfigure(),
-        ) is True
-
-    async def test_a_hostile_origin_with_the_token_is_fine(self, install):
-        """The token is proof of access to the machine's own log, which is a
-        stronger statement than any header makes."""
-        token = await install.token()
-        response = await _claim(
-            install,
-            body={"setup_token": token},
-            headers={"Origin": "https://evil.example"},
-        )
-        assert response.status_code == 200, response.text
-
-    async def test_a_cross_site_fetch_cannot_claim_without_the_token(self, install):
-        """Browsers that send `Sec-Fetch-Site` say it outright, including the
-        ones that omit `Origin`."""
-        await install.token()
-        response = await _claim(install, headers={"Sec-Fetch-Site": "cross-site"})
-        assert response.status_code == 403, response.text
-
-    async def test_the_instances_own_page_claims_with_nothing(self, install):
-        response = await _claim(install, headers={
-            "Origin": "http://127.0.0.1:8900", "Sec-Fetch-Site": "same-origin",
-        })
-        assert response.status_code == 200, response.text
-
-    async def test_a_request_with_no_origin_at_all_still_claims(self, install):
-        """curl on the machine sends no Origin and no Sec-Fetch-Site. It is
-        not a page, and the peer address is the whole story for it."""
-        response = await _claim(install)
-        assert response.status_code == 200, response.text
-
-    async def test_a_rebound_name_cannot_claim_without_the_token(self, install):
-        """DNS rebinding: a name the attacker controls resolves to loopback,
-        so the peer is local and the page is same-origin *with itself*. The
-        Host header is the only thing that gives it away."""
-        await install.token()
-        async with _client(install.app, base_url="http://evil.example:8900") as http:
-            response = await http.post("/api/setup/claim", json={
-                "username": "mallory", "password": "a-password-of-their-own",
-            })
-        assert response.status_code == 403, response.text
-        assert await setup_token.instance_is_unclaimed(
-            install.db, install.reconfigure(),
-        ) is True
-
-    async def test_a_configured_hostname_is_this_instance(self, install):
-        """An operator who bound the gateway to a name reaches it by that
-        name, and their own page is not cross-origin."""
-        install.reconfigure(gateway=GatewayConfig(host="nerve.internal", port=8900))
-        async with _client(install.app, base_url="http://nerve.internal:8900") as http:
-            response = await http.post("/api/setup/claim", json={
-                "username": "alice", "password": _PASSWORD,
-            })
-        assert response.status_code == 200, response.text
-
-    @pytest.mark.parametrize("origin,why", [
-        ("http://127.0.0.1:3000", "another port on this machine is another author"),
-        ("https://127.0.0.1:8900", "another scheme is another origin"),
-        ("null", "an opaque origin names nobody, so it cannot name this instance"),
-    ])
-    async def test_a_near_miss_origin_still_needs_the_token(
-        self, install, origin, why,
-    ):
-        """Host alone would make every port and both schemes on this machine
-        one origin. They are not, and the browser's own rules say so."""
-        await install.token()
-        response = await _claim(install, headers={"Origin": origin})
-        assert response.status_code == 403, why
-
-    async def test_an_https_instance_accepts_its_own_page(self, install):
-        """An instance behind TLS sees `https://host` in Origin and nothing in
-        Host to say so; guessing http would refuse its own page."""
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=install.app, client=_LOOPBACK),
-            base_url="https://127.0.0.1:8900",
+        async with _client(
+            install.app,
+            token=claimed.json()["token"],
         ) as http:
-            response = await http.post("/api/setup/claim", json={
-                "username": "alice", "password": _PASSWORD,
-            }, headers={"Origin": "https://127.0.0.1:8900"})
-        assert response.status_code == 200, response.text
-
-    async def test_the_origin_check_cannot_make_a_remote_caller_local(self, install):
-        """It only ever *removes* the exemption. A claim from another machine
-        needs the token however friendly its headers are."""
-        await install.token()
-        response = await _claim(
-            install, client=_REMOTE,
-            headers={"Origin": "http://127.0.0.1:8900", "Sec-Fetch-Site": "same-origin"},
-        )
-        assert response.status_code == 403, response.text
-
-
-# --------------------------------------------------------------------------- #
-#  Nothing but the claim, while nobody has claimed it                          #
-# --------------------------------------------------------------------------- #
+            changed = await http.put("/api/accounts/me/password", json={
+                "current_password": _PASSWORD,
+                "new_password": "a-third-passphrase",
+            })
+        assert changed.status_code == 200
+        assert await epoch() == 1
 
 
 @pytest.mark.asyncio
-class TestAVisitorCanOnlyClaim:
-    """Rule one of the cutover.
-
-    A passwordless install mints a real session for any password, so
-    `require_account` admits the very visitor the setup token exists to keep
-    out. Every write except the claim therefore has to refuse until the
-    instance has been claimed — otherwise "account first" means only that the
-    account is first among the things a stranger may do.
-    """
-
-    MUTATIONS = [
-        ("put", "/api/setup/provider", {"anthropic_api_key": _ANTHROPIC_KEY}),
-        ("put", "/api/setup/profile", {"timezone": "Europe/Berlin"}),
-        ("put", "/api/setup/profile", {"display_name": "Mallory"}),
-        ("put", "/api/setup/channels", {"telegram_bot_token": _TELEGRAM_TOKEN}),
-        ("put", "/api/setup/automation", {"crons": ["inbox-processor"]}),
-        ("post", "/api/setup/steps/channels/skip", None),
-        ("post", "/api/setup/steps/channels/unskip", None),
-        ("post", "/api/system/restart", None),
-    ]
-
-    @pytest.mark.parametrize("method,path,body", MUTATIONS)
-    async def test_a_visitor_session_writes_nothing(
-        self, install, method, path, body,
-    ):
-        before = {
-            p: p.read_text(encoding="utf-8")
-            for p in (
-                install.config_local, install.config_yaml,
-                install.settings, install.system_crons,
-            )
-        }
-        async with _client(install.app, token=install.session_token()) as http:
-            call = getattr(http, method)
-            response = await (call(path, json=body) if body is not None else call(path))
-
-        assert response.status_code == 409, (path, response.text)
-        assert "/api/setup/claim" in response.json()["detail"]
-        for path_on_disk, text in before.items():
-            assert path_on_disk.read_text(encoding="utf-8") == text, path_on_disk
-        assert setup_state.load_state().done == set()
-        assert setup_state.load_state().skipped == set()
-
-    ACCOUNT_MUTATIONS = [
-        ("put", "/api/accounts/me/password", {"new_password": "taken-over"}),
-        ("post", "/api/accounts", {"username": "mallory", "password": "in-i-go"}),
-    ]
-
-    @pytest.mark.parametrize("method,path,body", ACCOUNT_MUTATIONS)
-    async def test_the_account_routes_refuse_too(
-        self, install, method, path, body,
-    ):
-        """The sweep: every account mutation a pre-claim visitor can reach.
-
-        Creating is already refused by the passwordless guard and disabling by
-        the last-account guard; the first password is refused by the claim's
-        own rule. This pins all of them as one property rather than three
-        coincidences.
-        """
-        async with _client(install.app, token=install.session_token()) as http:
-            response = await getattr(http, method)(path, json=body)
-        assert response.status_code == 409, (path, response.text)
-        assert await install.db.count_accounts() == 1
-
-    async def test_renaming_the_unclaimed_account_is_refused(self, install):
-        """The one that was still reachable: a stranger could give the
-        instance's account a username before anybody claimed it."""
-        async with _client(install.app, token=install.session_token()) as http:
-            response = await http.patch(
-                f"/api/accounts/{install.owner_id}",
-                json={"username": "mallory", "display_name": "Mallory"},
-            )
-        assert response.status_code == 409
-        assert "/api/setup/claim" in response.json()["detail"]
-        account = await install.db.get_account(install.owner_id)
-        assert account["username"] is None
-
-    async def test_disabling_the_only_account_stays_refused(self, install):
-        async with _client(install.app, token=install.session_token()) as http:
-            response = await http.post(f"/api/accounts/{install.owner_id}/disable")
-        assert response.status_code == 409
-        assert (await install.db.get_account(install.owner_id))["enabled"] is True
-
-    async def test_reading_the_checklist_is_still_allowed(self, install):
-        """The wizard has to render for the person about to claim it."""
-        async with _client(install.app, token=install.session_token()) as http:
-            response = await http.get("/api/setup")
-        assert response.status_code == 200
-        assert response.json()["setup_pending"] is True
-
-    async def test_the_restart_a_visitor_asked_for_never_started(
-        self, install, monkeypatch,
-    ):
-        calls = []
-        monkeypatch.setattr(
-            setup_routes.daemon, "restart_daemon",
-            lambda *a, **k: calls.append(k),
-        )
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        async with _client(install.app, token=install.session_token()) as http:
-            response = await http.post("/api/system/restart")
-        assert response.status_code == 409
-        assert calls == []
-
-    async def test_everything_works_once_it_has_been_claimed(self, claimed):
-        """The refusal is about the instance's state, not about the endpoints:
-        every one of them works the moment step one is done."""
-        async with _http(claimed) as http:
-            for method, path, body in self.MUTATIONS[:-1]:
-                call = getattr(http, method)
-                response = await (
-                    call(path, json=body) if body is not None else call(path)
-                )
-                assert response.status_code == 200, (path, response.text)
-
-
-# --------------------------------------------------------------------------- #
-#  Requests already in flight when the claim commits                           #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestAnInFlightRequestCannotOutliveTheClaim:
-    """The claim is a cutover, not a door that swings shut behind the last
-    caller through it.
-
-    A passwordless install admits everybody, so a visitor's request can be
-    *authorised* a moment before the claim and land a moment after it. Refusing
-    at the door is not enough: the check and the write have to be one act, so
-    the write carries the epoch its credential named and the row refuses it if
-    the two have diverged.
-    """
-
-    async def _claim_between_read_and_write(self, install, monkeypatch, seam):
-        """Make ``seam`` commit the claim the first time it is touched."""
-        claimed: list[str] = []
+class TestStaleHttpWrites:
+    async def _claim_at(self, install, monkeypatch, seam: str):
         fired: list[bool] = []
         original = getattr(install.db, seam)
 
-        async def _claim_then(*args, **kwargs):
-            # Guarded *before* awaiting: the claim goes through this same
-            # seam, so a flag set afterwards would recurse into a second
-            # claim instead of arming the window once.
+        async def claim_then(*args, **kwargs):
             if not fired:
                 fired.append(True)
                 response = await _claim(install)
                 assert response.status_code == 200, response.text
-                claimed.append(response.json()["token"])
             return await original(*args, **kwargs)
 
-        monkeypatch.setattr(install.db, seam, _claim_then)
-        return claimed
+        monkeypatch.setattr(install.db, seam, claim_then)
+        return fired
 
-    async def test_a_password_change_admitted_before_the_claim_is_refused(
+    async def test_password_change_cannot_outlive_claim(
         self, install, monkeypatch,
     ):
-        """The takeover the reviewer reproduced: the route read a passwordless
-        snapshot, the claim committed, and the write then set the attacker's
-        password on a claimed account."""
         visitor = install.session_token()
-        claimed = await self._claim_between_read_and_write(
-            install, monkeypatch, "get_account",
-        )
-
+        fired = await self._claim_at(install, monkeypatch, "get_account")
         async with _client(install.app, token=visitor) as http:
             response = await http.put(
-                "/api/accounts/me/password", json={"new_password": "taken-over"},
+                "/api/accounts/me/password",
+                json={"new_password": "taken-over"},
             )
-        assert claimed, "the claim never ran"
-        assert response.status_code in (401, 409), response.text
-
+        assert fired
+        assert response.status_code in (401, 409)
         account = await install.db.get_account(install.owner_id)
-        assert verify_password(_PASSWORD, account["credential"]), (
-            "an in-flight request replaced the password the claim just set"
-        )
+        assert verify_password(_PASSWORD, account["credential"])
         assert not verify_password("taken-over", account["credential"])
 
-    async def test_an_account_creation_admitted_before_the_claim_is_refused(
+    async def test_account_creation_cannot_outlive_claim(
         self, install, monkeypatch,
     ):
-        """...and cannot leave a durable second account behind."""
         visitor = install.session_token()
-        claimed = await self._claim_between_read_and_write(
-            install, monkeypatch, "get_actor_ref",
-        )
-
+        fired = await self._claim_at(install, monkeypatch, "get_actor_ref")
         async with _client(install.app, token=visitor) as http:
             response = await http.post("/api/accounts", json={
-                "username": "mallory", "password": "a-second-way-in",
+                "username": "mallory",
+                "password": "a-second-way-in",
             })
-        assert claimed, "the claim never ran"
-        assert response.status_code in (401, 409), response.text
+        assert fired
+        assert response.status_code in (401, 409)
         assert await install.db.get_account_by_username("mallory") is None
 
-    async def test_a_disable_admitted_before_the_claim_is_refused(
-        self, install, monkeypatch,
-    ):
-        """Locking the new owner out is the other way to keep control."""
+    async def test_disable_cannot_outlive_claim(self, install, monkeypatch):
         visitor = install.session_token()
-        await self._claim_between_read_and_write(
-            install, monkeypatch, "get_account",
-        )
-
+        fired = await self._claim_at(install, monkeypatch, "get_account")
         async with _client(install.app, token=visitor) as http:
             response = await http.post(
                 f"/api/accounts/{install.owner_id}/disable",
             )
-        assert response.status_code in (401, 409), response.text
-        account = await install.db.get_account(install.owner_id)
-        assert account["enabled"] is True
+        assert fired
+        assert response.status_code in (401, 409)
+        assert (await install.db.get_account(install.owner_id))["enabled"] is True
 
-    SETUP_MUTATIONS = [
-        ("put", "/api/setup/provider", {"anthropic_api_key": _ANTHROPIC_KEY}),
-        ("put", "/api/setup/profile", {"timezone": "Europe/Berlin"}),
-        ("put", "/api/setup/profile", {"display_name": "Mallory"}),
-        ("put", "/api/setup/channels", {"telegram_bot_token": _TELEGRAM_TOKEN}),
-        ("put", "/api/setup/automation", {"crons": ["inbox-processor"]}),
-        ("post", "/api/setup/steps/channels/skip", None),
-        ("post", "/api/setup/steps/channels/unskip", None),
-        ("post", "/api/system/restart", None),
-    ]
-
-    @pytest.mark.parametrize("method,path,body", SETUP_MUTATIONS)
-    async def test_a_setup_write_admitted_before_the_claim_is_refused(
-        self, install, monkeypatch, method, path, body,
-    ):
-        """"The instance is claimed now" is not the same question as "you were
-        allowed to ask".
-
-        The claim commits *after* this request's credential was accepted and
-        before its write — the only window that matters, since a request that
-        starts later is refused at the door by the epoch on its token. Without
-        the revalidation the handler sees a claimed instance, decides the
-        caller is signed in, and writes as the person it just locked out.
-        """
-        visitor = install.session_token()
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        monkeypatch.setattr(
-            setup_routes.daemon, "restart_daemon",
-            lambda *a, **k: pytest.fail("a stale session restarted the daemon"),
-        )
-        before = {
-            p: p.read_text(encoding="utf-8")
-            for p in (
-                install.config_local, install.config_yaml,
-                install.settings, install.system_crons,
-            )
-        }
-
-        fired: list[bool] = []
-        original = install.db.login_state
-
-        async def _claim_in_the_window(*args, **kwargs):
-            # Guarded before awaiting: the claim reads this too.
-            if not fired:
-                fired.append(True)
-                response = await _claim(install)
-                assert response.status_code == 200, response.text
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(install.db, "login_state", _claim_in_the_window)
-
-        async with _client(install.app, token=visitor) as http:
-            call = getattr(http, method)
-            answered = await (
-                call(path, json=body) if body is not None else call(path)
-            )
-        assert fired, "the claim never ran inside the window"
-        assert answered.status_code in (401, 409), (path, answered.text)
-        for path_on_disk, text in before.items():
-            assert path_on_disk.read_text(encoding="utf-8") == text, path_on_disk
-
-    async def test_a_display_name_patch_admitted_before_the_claim_is_refused(
+    async def test_display_name_patch_cannot_outlive_claim(
         self, install, monkeypatch,
     ):
-        """The rename that would overwrite the claimer's own name."""
         visitor = install.session_token()
         fired: list[bool] = []
         original = install.db.login_state
 
-        async def _claim_in_the_window(*args, **kwargs):
+        async def claim_then(*args, **kwargs):
             if not fired:
                 fired.append(True)
-                response = await _claim(install, body={"display_name": "Alice Example"})
-                assert response.status_code == 200, response.text
+                response = await _claim(
+                    install,
+                    display_name="Alice Example",
+                )
+                assert response.status_code == 200
             return await original(*args, **kwargs)
 
-        monkeypatch.setattr(install.db, "login_state", _claim_in_the_window)
-
+        monkeypatch.setattr(install.db, "login_state", claim_then)
         async with _client(install.app, token=visitor) as http:
-            answered = await http.patch(
+            response = await http.patch(
                 f"/api/accounts/{install.owner_id}",
                 json={"display_name": "Mallory"},
             )
-        assert fired, "the claim never ran inside the window"
-        assert answered.status_code in (401, 409), answered.text
-        ref = await install.db.get_actor_ref(await install.owner_actor_id())
-        assert ref["display_name"] == "Alice Example"
-
-    async def test_the_claimer_can_do_all_of_it(self, claimed):
-        """The cutover refuses *stale* sessions, not every session: the person
-        who claimed the instance is at the current epoch and unaffected."""
-        async with _http(claimed) as http:
-            changed = await http.put("/api/accounts/me/password", json={
-                "current_password": _PASSWORD, "new_password": "a-newer-one",
-            })
-            created = await http.post("/api/accounts", json={
-                "username": "bob", "password": "another-passphrase",
-            })
-        assert changed.status_code == 200, changed.text
-        assert created.status_code == 201, created.text
-
-
-# --------------------------------------------------------------------------- #
-#  The side door                                                               #
-# --------------------------------------------------------------------------- #
+        assert fired
+        assert response.status_code in (401, 409)
+        actor = await install.db.get_actor_ref(await install.owner_actor_id())
+        assert actor["display_name"] == "Alice Example"
 
 
 @pytest.mark.asyncio
-class TestThePasswordEndpointIsNotASecondDoor:
-    async def test_it_refuses_while_the_instance_is_unclaimed(self, install):
-        """The one endpoint that needs no current password is the one an
-        unclaimed install would hand to anybody."""
-        async with _client(install.app, token=install.session_token()) as http:
+class TestOnlyClaimSetsTheFirstPassword:
+    async def test_password_endpoint_refuses_while_unclaimed(self, install):
+        async with _client(
+            install.app,
+            token=install.session_token(),
+        ) as http:
             response = await http.put(
-                "/api/accounts/me/password", json={"new_password": "taken-over"},
+                "/api/accounts/me/password",
+                json={"new_password": "taken-over"},
             )
         assert response.status_code == 409
         assert "/api/setup/claim" in response.json()["detail"]
-        account = await install.db.get_account(install.owner_id)
-        assert not account["credential"]
+        assert not (await install.db.get_account(install.owner_id))["credential"]
 
-    async def test_it_works_again_once_the_account_is_claimed(self, install):
-        token = (await _claim(install)).json()["token"]
-        async with _client(install.app, token=token) as http:
-            without = await http.put(
-                "/api/accounts/me/password", json={"new_password": "next-one"},
+    async def test_it_requires_the_current_password_after_claim(self, install):
+        claimed = (await _claim(install)).json()["token"]
+        async with _client(install.app, token=claimed) as http:
+            refused = await http.put(
+                "/api/accounts/me/password",
+                json={"new_password": "next-one"},
             )
-            with_current = await http.put("/api/accounts/me/password", json={
-                "current_password": _PASSWORD, "new_password": "next-one-please",
+            accepted = await http.put("/api/accounts/me/password", json={
+                "current_password": _PASSWORD,
+                "new_password": "next-one-please",
             })
-        assert without.status_code == 403      # the current password is required
-        assert with_current.status_code == 200
+        assert refused.status_code == 403
+        assert accepted.status_code == 200
         account = await install.db.get_account(install.owner_id)
         assert verify_password("next-one-please", account["credential"])
 
-    async def test_the_claim_is_the_only_unauthenticated_write(self, install):
-        """Every other setup endpoint needs a session."""
-        async with _client(install.app) as http:
-            for method, path in (
-                ("get", "/api/setup"),
-                ("put", "/api/setup/provider"),
-                ("put", "/api/setup/profile"),
-                ("put", "/api/setup/channels"),
-                ("put", "/api/setup/automation"),
-                ("post", "/api/setup/steps/provider/skip"),
-                ("post", "/api/system/restart"),
-                ("get", "/api/auth/me"),
-            ):
-                call = getattr(http, method)
-                response = await call(path, json={}) if method != "get" else await call(path)
-                assert response.status_code == 401, (path, response.status_code)
-
-
-# --------------------------------------------------------------------------- #
-#  The checklist                                                               #
-# --------------------------------------------------------------------------- #
-
-
-@pytest_asyncio.fixture
-async def claimed(install):
-    """An install past step one, with a session token for its owner."""
-    response = await _claim(install)
-    assert response.status_code == 200
-    install.token_for_owner = response.json()["token"]
-    return install
-
-
-def _http(install, **kwargs) -> httpx.AsyncClient:
-    return _client(install.app, token=install.token_for_owner, **kwargs)
-
-
-@pytest.mark.asyncio
-class TestTheChecklist:
-    async def test_the_account_step_is_the_only_required_one(self, claimed):
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        required = [s["id"] for s in state["steps"] if s["required"]]
-        assert required == ["account"]
-        assert state["setup_pending"] is False
-        account = next(s for s in state["steps"] if s["id"] == "account")
-        assert account["status"] == "done"
-        assert account["can_skip"] is False
-
-    async def test_an_unclaimed_instance_says_so(self, install):
-        async with _client(install.app, token=install.session_token()) as http:
-            state = (await http.get("/api/setup")).json()
-        assert state["setup_pending"] is True
-        account = next(s for s in state["steps"] if s["id"] == "account")
-        assert account["status"] == "pending"
-        assert state["finished"] is False
-
-    async def test_a_provider_key_is_written_privately_and_only_there(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )
-        assert response.status_code == 200, response.text
-        assert claimed.secrets()["anthropic_api_key"] == _ANTHROPIC_KEY
-        assert _ANTHROPIC_KEY not in claimed.settings.read_text(encoding="utf-8")
-        assert _ANTHROPIC_KEY not in claimed.config_yaml.read_text(encoding="utf-8")
-        mode = stat.S_IMODE(claimed.config_local.stat().st_mode)
-        assert mode == 0o600, f"{mode:04o}"
-
-    async def test_writing_a_step_twice_changes_nothing_the_second_time(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})
-            once = claimed.config_local.read_text(encoding="utf-8")
-            second = await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )
-        assert second.status_code == 200
-        assert claimed.config_local.read_text(encoding="utf-8") == once
-
-    async def test_an_empty_provider_step_is_refused_rather_than_written(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/provider", json={})
-        assert response.status_code == 400
-        assert "anthropic_api_key" not in claimed.secrets()
-
-    async def test_the_profile_step_writes_the_timezone_to_the_tracked_layer(
-        self, claimed,
-    ):
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/profile", json={"timezone": "Europe/Berlin"},
-            )
-        assert response.status_code == 200, response.text
-        assert claimed.tracked()["timezone"] == "Europe/Berlin"
-        # The wizard writes a portable value to exactly one layer.
-        assert "timezone" not in claimed.machine()
-
-    async def test_the_profile_step_renames_the_existing_actor(self, claimed):
-        before = await claimed.owner_actor_id()
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/profile", json={"display_name": "Alice Example"},
-            )
-        assert response.status_code == 200
-        assert await claimed.owner_actor_id() == before
-        ref = await claimed.db.get_actor_ref(before)
-        assert ref["display_name"] == "Alice Example"
-        assert len(await claimed.db.list_actor_refs(kind="human")) == 1
-
-    async def test_a_time_zone_this_machine_does_not_know_is_refused(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/profile", json={"timezone": "Mars/Olympus_Mons"},
-            )
-        assert response.status_code == 400
-        assert claimed.tracked()["timezone"] == "UTC"
-
-    async def test_the_channel_step_splits_the_token_from_the_switch(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-                "telegram_allowed_users": [4242],
-            })
-        assert response.status_code == 200, response.text
-        assert claimed.secrets()["telegram"]["bot_token"] == _TELEGRAM_TOKEN
-        assert claimed.secrets()["telegram"]["allowed_users"] == [4242]
-        assert claimed.machine()["telegram"]["enabled"] is True
-        assert _TELEGRAM_TOKEN not in claimed.settings.read_text(encoding="utf-8")
-
-    async def test_the_machine_file_keeps_its_mode_and_owner(self, claimed):
-        """`config.yaml` carries no secret and an operator edits it by hand.
-
-        In Docker the container is root over a bind-mounted checkout, so a
-        wizard write that published a fresh root-owned 0600 inode would leave
-        the host's own non-root CLI unable to read the file it needs to
-        recognise a Docker install at all. The private writer is for the file
-        that holds credentials.
-        """
-        claimed.config_yaml.chmod(0o644)
-        before = claimed.config_yaml.stat()
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-            })
-        assert response.status_code == 200, response.text
-        after = claimed.config_yaml.stat()
-        assert stat.S_IMODE(after.st_mode) == 0o644
-        assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
-        assert claimed.machine()["telegram"]["enabled"] is True
-        # ...while the file that does hold a credential stays owner-only.
-        assert stat.S_IMODE(claimed.config_local.stat().st_mode) == 0o600
-
-    async def test_a_machine_write_is_atomic_and_leaves_no_temporary(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-            })
-        assert not (claimed.config_dir / "config.yaml.tmp").exists()
-        assert claimed.machine()["workspace"], "the rest of the file survived"
-
-    async def test_the_automation_step_toggles_the_crons_the_installer_wrote(
-        self, claimed,
-    ):
-        before = claimed.tracked()["sync"]["gmail"]
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/automation", json={
-                "crons": ["inbox-processor"], "github": True,
-            })
-        assert response.status_code == 200, response.text
-        jobs = {
-            job["id"]: job["enabled"]
-            for job in yaml.safe_load(
-                claimed.system_crons.read_text(encoding="utf-8"),
-            )["jobs"]
-        }
-        assert jobs["inbox-processor"] is True
-        assert jobs["task-planner"] is False
-        assert jobs["memory-maintenance"] is True, "a core cron is never touched"
-        assert claimed.tracked()["sync"]["github"]["enabled"] is True
-        # Gmail was not mentioned, so it is exactly what the installer left.
-        assert claimed.tracked()["sync"]["gmail"] == before
-
-    async def test_re_entering_it_changes_only_what_was_asked_for(self, claimed):
-        """The blocker: a step entered again to turn one cron on used to
-        switch off every sync source configured anywhere else, and clear the
-        Gmail addresses with them. Omitted means untouched."""
-        async with _http(claimed) as http:
-            await http.put("/api/setup/automation", json={
-                "github": True, "gmail": True,
-                "gmail_accounts": ["alice@example.invalid"],
-                "crons": [],
-            })
-            settled = claimed.tracked()
-            machine = claimed.machine()
-
-            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
-
-        assert claimed.tracked() == settled, "a cron change rewrote the sync settings"
-        assert claimed.machine() == machine, "a cron change cleared the mailboxes"
-        jobs = {
-            job["id"]: job["enabled"]
-            for job in yaml.safe_load(
-                claimed.system_crons.read_text(encoding="utf-8"),
-            )["jobs"]
-        }
-        assert jobs["inbox-processor"] is True
-
-    async def test_telegram_sync_and_its_credentials(self, claimed):
-        """The source the wizard accepts and the UI now offers.
-
-        Its credentials are not the bot token: the bot is how Nerve talks *as*
-        you, these are how it reads your own messages.
-        """
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/automation", json={
-                "telegram": True,
-                "telegram_api_id": 1234567,
-                "telegram_api_hash": _TELEGRAM_API_HASH,
-            })
-        assert response.status_code == 200, response.text
-        assert claimed.tracked()["sync"]["telegram"]["enabled"] is True
-        stored = claimed.secrets()["sync"]["telegram"]
-        assert stored["api_id"] == 1234567
-        assert stored["api_hash"] == _TELEGRAM_API_HASH
-        # ...and it is a secret, so it is in the private file only.
-        assert _TELEGRAM_API_HASH not in claimed.settings.read_text(encoding="utf-8")
-
-    async def test_credentials_supplied_before_the_source_is_on_are_kept(
-        self, claimed,
-    ):
-        """They used to be dropped on the floor: the builder keyed them off
-        the switch, so somebody who pasted credentials with the source still
-        off was told it saved and found nothing there."""
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/automation", json={
-                "telegram_api_id": 7654321,
-                "telegram_api_hash": _TELEGRAM_API_HASH,
-            })
-        assert response.status_code == 200, response.text
-        assert claimed.secrets()["sync"]["telegram"]["api_id"] == 7654321
-
-    async def test_one_credential_does_not_erase_the_other(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/automation", json={
-                "telegram_api_id": 1234567,
-                "telegram_api_hash": _TELEGRAM_API_HASH,
-            })
-            await http.put("/api/setup/automation", json={
-                "telegram_api_id": 7654321,
-            })
-        stored = claimed.secrets()["sync"]["telegram"]
-        assert stored["api_id"] == 7654321
-        assert stored["api_hash"] == _TELEGRAM_API_HASH, (
-            "supplying one credential erased the other"
-        )
-
-    async def test_the_automation_step_is_re_enterable(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
-            response = await http.put(
-                "/api/setup/automation", json={"crons": ["task-planner"]},
-            )
-        assert response.status_code == 200
-        jobs = {
-            job["id"]: job["enabled"]
-            for job in yaml.safe_load(
-                claimed.system_crons.read_text(encoding="utf-8"),
-            )["jobs"]
-        }
-        assert jobs["inbox-processor"] is False
-        assert jobs["task-planner"] is True
-
-    async def test_the_crons_on_offer_come_from_the_file(self, claimed):
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        offered = {c["id"] for c in state["crons"]}
-        assert offered == {
-            "inbox-processor", "task-planner", "skill-extractor", "skill-reviser",
-        }
-        assert all(c["description"] for c in state["crons"])
-
-    async def test_it_carries_the_values_a_form_has_to_open_on(self, claimed):
-        """A form that opens on defaults submits defaults."""
-        claimed.reconfigure(timezone="Europe/Berlin", anthropic_api_key=_ANTHROPIC_KEY)
-        async with _http(claimed) as http:
-            values = (await http.get("/api/setup")).json()["values"]
-        assert values["timezone"] == "Europe/Berlin"
-        assert values["has_anthropic_key"] is True
-        assert values["has_openai_key"] is False
-        # Whatever the live config says, not a default this screen invented.
-        assert values["sync_github"] is claimed.reconfigure(
-            timezone="Europe/Berlin", anthropic_api_key=_ANTHROPIC_KEY,
-        ).sync.github.enabled
-
-    async def test_it_reports_a_secret_as_present_and_never_repeats_it(
-        self, claimed,
-    ):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-            })
-            body = (await http.get("/api/setup")).text
-        assert _TELEGRAM_TOKEN not in body
-        assert _ANTHROPIC_KEY not in body
-
-    async def test_a_step_can_be_skipped_and_re_entered(self, claimed):
-        async with _http(claimed) as http:
-            skipped = (await http.post("/api/setup/steps/channels/skip")).json()
-            assert _status_of(skipped, "channels") == "skipped"
-
-            unskipped = (await http.post("/api/setup/steps/channels/unskip")).json()
-            assert _status_of(unskipped, "channels") == "pending"
-
-            await http.post("/api/setup/steps/channels/skip")
-            written = (await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-            })).json()
-        assert _status_of(written, "channels") == "done"
-
-    async def test_the_required_step_cannot_be_skipped(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.post("/api/setup/steps/account/skip")
-        assert response.status_code == 400
-
-    async def test_an_unknown_step_is_a_400(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.post("/api/setup/steps/nonsense/skip")
-        assert response.status_code == 400
-
-    async def test_skipping_survives_a_restart(self, claimed):
-        """The one thing that cannot be derived is the one thing that is stored."""
-        async with _http(claimed) as http:
-            await http.post("/api/setup/steps/channels/skip")
-        assert setup_state.load_state().skipped == {"channels"}
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "channels") == "skipped"
-
-    async def test_a_restart_is_reported_as_pending_until_it_happens(self, claimed):
-        async with _http(claimed) as http:
-            state = (await http.put(
-                "/api/setup/profile", json={"timezone": "Europe/Berlin"},
-            )).json()
-        assert state["restart_pending"] is True
-        assert state["restart_pending_paths"] == ["timezone"]
-        assert state["finished"] is False
-
-        # What a restart does: the process comes back with the written value.
-        claimed.restarted(timezone="Europe/Berlin")
-        async with _http(claimed) as http:
-            after = (await http.get("/api/setup")).json()
-        assert after["restart_pending"] is False
-        assert after["restart_pending_paths"] == []
-
-    async def test_replacing_a_credential_that_is_already_live_is_pending_too(
-        self, claimed,
-    ):
-        """The case the value comparison alone cannot see.
-
-        A secret is recorded as "present", never as itself, so a key pasted
-        over an existing one reads as present either way while only the old one
-        is in force. Without this the checklist would say nothing is waiting on
-        a restart and the new key would sit on disk unused.
-        """
-        claimed.reconfigure(anthropic_api_key="the-key-this-process-started-with")
-        async with _http(claimed) as http:
-            state = (await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )).json()
-        assert state["restart_pending"] is True
-        assert state["restart_pending_paths"] == ["anthropic_api_key"]
-        assert claimed.secrets()["anthropic_api_key"] == _ANTHROPIC_KEY
-
-    async def test_a_credential_written_by_an_earlier_process_is_not_pending(
-        self, claimed,
-    ):
-        """...and it clears itself at the restart, rather than nagging forever."""
-        async with _http(claimed) as http:
-            await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )
-        claimed.restarted(anthropic_api_key=_ANTHROPIC_KEY)
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert state["restart_pending"] is False
-
-    async def test_a_step_stops_being_done_when_its_reason_stops_being_true(
-        self, claimed,
-    ):
-        """A note the wizard left is not evidence forever.
-
-        The provider step is "done" because a credential is configured. Once a
-        later process has started, the instance is the witness — so a
-        credential removed by hand afterwards leaves the step to do again,
-        rather than green because of something the wizard wrote down months
-        ago.
-        """
-        async with _http(claimed) as http:
-            saved = (await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )).json()
-        assert _status_of(saved, "provider") == "done"
-
-        # A restart, and the operator has since taken the key back out.
-        claimed.restarted()
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "provider") == "pending"
-        assert state["restart_pending"] is False, (
-            "a restart that has happened must stop being reported as pending"
-        )
-
-    async def test_a_skip_is_a_decision_and_survives(self, claimed):
-        """What is retired is what the instance can answer for itself. "I do
-        not want Telegram" is not one of those."""
-        async with _http(claimed) as http:
-            await http.post("/api/setup/steps/channels/skip")
-        claimed.restarted()
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "channels") == "skipped"
-
-    async def test_the_automation_answer_survives_too(self, claimed):
-        """Which crons an operator wanted is a decision nothing else records,
-        so it is not transitional."""
-        async with _http(claimed) as http:
-            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
-        claimed.restarted()
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "automation") == "done"
-
-    async def test_an_openai_only_answer_survives_the_restart(self, claimed):
-        """The step accepts an OpenAI key on its own, so the instance has to
-        recognise one on its own — otherwise a valid answer goes back to "to
-        do" at exactly the restart the wizard tells you to perform."""
-        async with _http(claimed) as http:
-            saved = (await http.put(
-                "/api/setup/provider", json={"openai_api_key": "openai-key-placeholder"},
-            )).json()
-        assert _status_of(saved, "provider") == "done"
-
-        claimed.restarted(openai_api_key="openai-key-placeholder")
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "provider") == "done"
-        assert "OpenAI" in next(
-            s["detail"] for s in state["steps"] if s["id"] == "provider"
-        )
-
-    async def test_a_timezone_only_answer_survives_the_restart(self, claimed):
-        """Nothing else records that somebody answered the profile step: no
-        display name was set, and the marker is retired with the process that
-        wrote it. A timezone that is not the installer's default is the
-        answer, and it is on disk."""
-        async with _http(claimed) as http:
-            saved = (await http.put(
-                "/api/setup/profile", json={"timezone": "Europe/Berlin"},
-            )).json()
-        assert _status_of(saved, "profile") == "done"
-
-        claimed.restarted(timezone="Europe/Berlin")
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "profile") == "done"
-        assert state["restart_pending"] is False
-
-    async def test_the_installers_own_default_is_not_an_answer(self, claimed):
-        """...and the other direction: an install nobody has touched must not
-        report the profile step as done because the default exists."""
-        claimed.restarted(timezone=setup_routes.DEFAULT_TIMEZONE)
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "profile") == "pending"
-
-    async def test_an_answered_checklist_stays_finished_across_a_restart(
-        self, claimed,
-    ):
-        """The whole point of the two above, end to end: the wizard tells you
-        to restart, so the restart must not undo the wizard."""
-        async with _http(claimed) as http:
-            await http.put(
-                "/api/setup/provider", json={"openai_api_key": "openai-key-placeholder"},
-            )
-            await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})
-            await http.post("/api/setup/steps/channels/skip")
-            await http.post("/api/setup/steps/automation/skip")
-
-        claimed.restarted(
-            openai_api_key="openai-key-placeholder", timezone="Europe/Berlin",
-        )
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert state["restart_pending"] is False
-        assert state["finished"] is True, [
-            (s["id"], s["status"]) for s in state["steps"]
-        ]
-
-    async def test_finished_once_everything_is_answered(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})
-            await http.put("/api/setup/profile", json={"display_name": "Alice Example"})
-            await http.post("/api/setup/steps/channels/skip")
-            state = (await http.post("/api/setup/steps/automation/skip")).json()
-        # The provider key is the one path still waiting for a restart.
-        assert state["restart_pending"] is True
-        claimed.restarted(anthropic_api_key=_ANTHROPIC_KEY)
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert state["restart_pending"] is False
-        assert state["finished"] is True
-
-
-@pytest.mark.asyncio
-class TestOneMutationAtATime:
-    """Two tabs, or one tab's form and another's skip.
-
-    Every step reads the checklist's notes, changes them and writes them back,
-    so without a lock each request saves over a snapshot taken before the
-    other — and a skip disappears because a provider save that started first
-    finished last.
-    """
-
-    async def test_concurrent_steps_all_survive(self, claimed):
-        async with _http(claimed) as http:
-            responses = await asyncio.gather(
-                http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY}),
-                http.post("/api/setup/steps/channels/skip"),
-                http.put("/api/setup/profile", json={"display_name": "Alice Example"}),
-                http.put("/api/setup/automation", json={"crons": []}),
-            )
-        assert [r.status_code for r in responses] == [200, 200, 200, 200]
-
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "provider") == "done"
-        assert _status_of(state, "channels") == "skipped"
-        assert _status_of(state, "profile") == "done"
-        assert _status_of(state, "automation") == "done"
-
-    async def test_the_notes_on_disk_agree_with_the_answer(self, claimed):
-        async with _http(claimed) as http:
-            await asyncio.gather(*[
-                http.post(f"/api/setup/steps/{step}/skip")
-                for step in ("provider", "channels", "automation")
-            ])
-        assert setup_state.load_state().skipped == {
-            "provider", "channels", "automation",
-        }
-
-
-@pytest.mark.asyncio
-class TestMutationsAreActuallySerialised:
-    """`asyncio.gather` proves nothing on its own — the requests may simply not
-    overlap. These force the interleaving: one handler is held open *after* it
-    has read the checklist, and another runs to completion inside that window.
-    """
-
-    async def _blocked_at(self, claimed, monkeypatch, release: asyncio.Event,
-                          started: asyncio.Event):
-        """Hold the profile step between its read of the state and its save."""
-        db = claimed.db
-        original = db.update_actor_profile
-
-        async def _slow(*args, **kwargs):
-            started.set()
-            await release.wait()
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(db, "update_actor_profile", _slow)
-
-    async def test_a_skip_during_a_profile_write_is_not_overwritten(
-        self, claimed, monkeypatch,
-    ):
-        release, started = asyncio.Event(), asyncio.Event()
-        await self._blocked_at(claimed, monkeypatch, release, started)
-
-        async with _http(claimed) as http:
-            profile = asyncio.create_task(http.put(
-                "/api/setup/profile", json={"display_name": "Alice Example"},
-            ))
-            await asyncio.wait_for(started.wait(), timeout=5)
-
-            # Inside the window: the profile handler has read the checklist and
-            # not yet written it back.
-            skip = asyncio.create_task(http.post("/api/setup/steps/channels/skip"))
-            await asyncio.sleep(0.05)
-            release.set()
-            profile_response, skip_response = await asyncio.gather(profile, skip)
-
-        assert profile_response.status_code == 200, profile_response.text
-        assert skip_response.status_code == 200, skip_response.text
-        assert setup_state.load_state().skipped == {"channels"}, (
-            "the profile step saved a snapshot taken before the skip"
-        )
-        assert _status_of(skip_response.json(), "profile") == "done"
-
-    async def test_an_unskip_during_an_automation_write_is_not_overwritten(
-        self, claimed, monkeypatch,
-    ):
-        async with _http(claimed) as http:
-            await http.post("/api/setup/steps/channels/skip")
-
-        release = asyncio.Event()
-
-        async def _blocked_publish(plan):
-            # Held open between the step's read of the checklist and its save.
-            await release.wait()
-            return ()
-
-        monkeypatch.setattr(setup_routes, "_publish_cron_plan", _blocked_publish)
-
-        async with _http(claimed) as http:
-            automation = asyncio.create_task(http.put(
-                "/api/setup/automation", json={"crons": ["inbox-processor"]},
-            ))
-            await asyncio.sleep(0.05)
-            unskip = asyncio.create_task(
-                http.post("/api/setup/steps/channels/unskip"),
-            )
-            await asyncio.sleep(0.05)
-            release.set()
-            automation_response, unskip_response = await asyncio.gather(
-                automation, unskip,
-            )
-
-        assert automation_response.status_code == 200, automation_response.text
-        assert unskip_response.status_code == 200, unskip_response.text
-        assert setup_state.load_state().skipped == set(), (
-            "the automation step saved a snapshot taken before the unskip"
-        )
-        assert "automation" in setup_state.load_state().done
-
-    async def test_every_mutating_handler_holds_the_lock(self):
-        """Structural: the lock is only a rule if every handler follows it.
-
-        Checked against the source because the failure it prevents — one
-        handler quietly written without it, as skip and unskip were — is
-        invisible in any test that does not force an interleaving.
-        """
-        import inspect
-
-        source = inspect.getsource(setup_routes)
-        handlers = [
-            "set_provider", "set_profile", "set_channels", "set_automation",
-            "skip_step", "unskip_step", "get_setup",
-        ]
-        for name in handlers:
-            body = inspect.getsource(getattr(setup_routes, name))
-            assert '_loop_lock("state")' in body, name
-        # ...and nothing mutates the notes outside one.
-        assert source.count("setup_state.save_state(") == 4, (
-            "a new call site for save_state: check it runs under the lock"
-        )
-
-
-@pytest.mark.asyncio
-class TestAChoiceThatWasNotSavedIsNotReportedAsSaved:
-    """`save_state` can fail — a state directory that cannot be written
-    owner-only, a full disk — and it returned False into a caller that ignored
-    it, so a skip that reached no disk answered 200 and came back at the next
-    read."""
-
-    @staticmethod
-    def _failing_save(monkeypatch):
-        monkeypatch.setattr(setup_state, "save_state", lambda state: False)
-
-    async def test_a_skip_that_could_not_be_saved_is_an_error(
-        self, claimed, monkeypatch,
-    ):
-        self._failing_save(monkeypatch)
-        async with _http(claimed) as http:
-            response = await http.post("/api/setup/steps/channels/skip")
-        assert response.status_code == 500
-        assert "not remembered" in response.json()["detail"]
-        assert "Nothing else changed" in response.json()["detail"]
-
-    async def test_an_unskip_that_could_not_be_saved_is_an_error(
-        self, claimed, monkeypatch,
-    ):
-        self._failing_save(monkeypatch)
-        async with _http(claimed) as http:
-            response = await http.post("/api/setup/steps/channels/unskip")
-        assert response.status_code == 500
-
-    async def test_a_step_whose_configuration_landed_says_what_landed(
-        self, claimed, monkeypatch,
-    ):
-        """The other case, and it is not a failure: the credential *is* on
-        disk. Answering 500 would invite a retry of a write that already
-        happened; answering a plain 200 would hide that the checklist has
-        forgotten it."""
-        self._failing_save(monkeypatch)
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["warning"]
-        assert "configuration was written" in body["warning"]
-        assert "provider" in body["warning"]
-        # And it really did land.
-        assert claimed.secrets()["anthropic_api_key"] == _ANTHROPIC_KEY
-
-    async def test_nothing_is_warned_about_when_the_save_works(self, claimed):
-        async with _http(claimed) as http:
-            body = (await http.put(
-                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
-            )).json()
-        assert body["warning"] is None
-
-
-@pytest.mark.asyncio
-class TestReadingAndWritingDoNotRaceEachOther:
-    """Reading the checklist can write: the first read after a restart retires
-    what the previous process left behind. That write has to be inside the same
-    lock the steps take, or it lands on top of one."""
-
-    async def test_a_read_racing_every_step_loses_nothing(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})
-        claimed.restarted(anthropic_api_key=_ANTHROPIC_KEY)
-
-        async with _http(claimed) as http:
-            results = await asyncio.gather(
-                http.get("/api/setup"),
-                http.post("/api/setup/steps/channels/skip"),
-                http.get("/api/setup"),
-                http.put("/api/setup/automation", json={"crons": []}),
-                http.get("/api/setup"),
-            )
-        assert {r.status_code for r in results} == {200}
-
-        async with _http(claimed) as http:
-            final = (await http.get("/api/setup")).json()
-        assert _status_of(final, "channels") == "skipped"
-        assert _status_of(final, "automation") == "done"
-        on_disk = setup_state.load_state()
-        assert on_disk.skipped == {"channels"}
-        assert "automation" in on_disk.done
-
-
-@pytest.mark.asyncio
-class TestNothingHalfLands:
-    """A step that writes to more than one place either does all of it or
-    answers with an error for work it has not done."""
-
-    async def test_an_unusable_settings_file_stops_the_step_before_the_rename(
-        self, claimed,
-    ):
-        claimed.settings.write_text("- this is a list\n", encoding="utf-8")
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/profile", json={
-                "timezone": "Europe/Berlin", "display_name": "Alice Example",
-            })
-        assert response.status_code == 409
-        assert "settings" in response.json()["detail"]
-        ref = await claimed.db.get_actor_ref(await claimed.owner_actor_id())
-        assert ref["display_name"] is None, "the rename landed anyway"
-
-    async def test_a_refused_step_is_not_recorded_as_done(self, claimed):
-        claimed.settings.write_text("- this is a list\n", encoding="utf-8")
-        async with _http(claimed) as http:
-            assert (await http.put(
-                "/api/setup/automation", json={"github": True, "crons": ["inbox-processor"]},
-            )).status_code == 409
-        assert "automation" not in setup_state.load_state().done
-        jobs = yaml.safe_load(claimed.system_crons.read_text(encoding="utf-8"))["jobs"]
-        assert all(
-            not job["enabled"] for job in jobs if job["id"] == "inbox-processor"
-        ), "the cron file was published for a step that failed"
-
-
-@pytest.mark.asyncio
-class TestAFailureSaysWhatLanded:
-    """Where two resources cannot be written as one, the answer has to say
-    which of them changed. "Nothing was changed" is only allowed when it is
-    true."""
-
-    async def test_an_unreadable_cron_file_stops_before_the_sync_write(
-        self, claimed,
-    ):
-        """The cron file is parsed before anything is published, so a step
-        that cannot finish has not started."""
-        before = claimed.tracked()
-        claimed.system_crons.write_text("jobs: [this is not a list of jobs\n", encoding="utf-8")
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/automation", json={
-                "github": True, "crons": ["inbox-processor"],
-            })
-        assert response.status_code == 409
-        assert "nothing was changed" in response.json()["detail"].lower()
-        assert claimed.tracked() == before, (
-            "the sync settings were written by a step that reported failure"
-        )
-        assert "automation" not in setup_state.load_state().done
-
-    async def test_a_database_failure_after_the_timezone_says_the_timezone_landed(
-        self, claimed, monkeypatch,
-    ):
-        async def _broken(*args, **kwargs):
-            raise RuntimeError("disk is on fire")
-
-        monkeypatch.setattr(claimed.db, "update_actor_profile", _broken)
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/profile", json={
-                "timezone": "Europe/Berlin", "display_name": "Alice Example",
-            })
-        assert response.status_code == 500
-        detail = response.json()["detail"]
-        assert "time zone was saved" in detail
-        assert "display name could not be saved" in detail
-        # And it is true: the file changed, and the checklist knows it owes a
-        # restart for it rather than having lost that with the failure.
-        assert claimed.tracked()["timezone"] == "Europe/Berlin"
-        state = setup_state.load_state()
-        assert state.applied.get("timezone") == "Europe/Berlin"
-
-    async def test_a_name_only_failure_says_nothing_was_written(
-        self, claimed, monkeypatch,
-    ):
-        async def _broken(*args, **kwargs):
-            raise RuntimeError("disk is on fire")
-
-        monkeypatch.setattr(claimed.db, "update_actor_profile", _broken)
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/profile", json={"display_name": "Alice Example"},
-            )
-        assert response.status_code == 500
-        assert "Nothing was written" in response.json()["detail"]
-
-    async def test_a_publication_failure_after_the_sync_write_says_so(
-        self, claimed, monkeypatch,
-    ):
-        """Parsing failures were fixed last round; this is the rename itself
-        failing after the sync settings have already landed."""
-        real = setup_writer_module.publish_text
-
-        def _explode_on_the_cron_file(path, text):
-            # Only the last target fails, which is the case: the sync settings
-            # have already been published by the time the cron file is renamed.
-            if path.name == "system.yaml":
-                raise OSError("read-only file system")
-            return real(path, text)
-
-        monkeypatch.setattr(
-            setup_writer_module, "publish_text", _explode_on_the_cron_file,
-        )
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/automation", json={
-                "github": True, "crons": ["inbox-processor"],
-            })
-        assert response.status_code == 500
-        detail = response.json()["detail"]
-        assert "sync settings were saved" in detail
-        assert "crons are unchanged" in detail
-
-        # What landed is on disk and the checklist knows it owes a restart for
-        # it — but the step is *not* done, and there is no cron debt for a file
-        # that was never written.
-        assert claimed.tracked()["sync"]["github"]["enabled"] is True
-        state = setup_state.load_state()
-        assert state.applied.get("sync.github.enabled") is True
-        assert "automation" not in state.done
-        assert state.debts == set(), (
-            "a debt was recorded for a cron file that was never published"
-        )
-
-        async with _http(claimed) as http:
-            after = (await http.get("/api/setup")).json()
-        assert _status_of(after, "automation") == "pending"
-        assert after["finished"] is False
-
-        # And the restart does not launder it: automation's completion is a
-        # durable note, so a step marked done here would have stayed done
-        # while the cron file never changed.
-        claimed.restarted()
-        async with _http(claimed) as http:
-            restarted = (await http.get("/api/setup")).json()
-        assert _status_of(restarted, "automation") == "pending"
-        assert restarted["finished"] is False
-
-    async def test_a_failed_name_only_profile_leaves_no_marker(
-        self, claimed, monkeypatch,
-    ):
-        """It used to record the step as done *before* the write it depends
-        on, so a failed rename counted towards `finished`."""
-        async def _broken(*args, **kwargs):
-            raise RuntimeError("disk is on fire")
-
-        monkeypatch.setattr(claimed.db, "update_actor_profile", _broken)
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/profile", json={"display_name": "Alice Example"},
-            )
-        assert response.status_code == 500
-        state = setup_state.load_state()
-        assert "profile" not in state.done
-        assert "profile" not in state.answered
-
-    async def test_a_successful_rename_comes_back_renamed(self, claimed):
-        """The actor this request resolved with is immutable and carries the
-        old name; rendering from it makes a saved rename look unsaved, and
-        leaves the form's Save button lit over a change that landed."""
-        async with _http(claimed) as http:
-            body = (await http.put(
-                "/api/setup/profile", json={"display_name": "Alice Example"},
-            )).json()
-        assert body["values"]["display_name"] == "Alice Example"
-        assert "Alice Example" in next(
-            s["detail"] for s in body["steps"] if s["id"] == "profile"
-        )
-
-    async def test_choosing_the_default_timezone_is_still_an_answer(self, claimed):
-        """Setting a non-default zone back to UTC is a decision, and nothing
-        on disk can tell it from never having been asked — so it is written
-        down, and it survives the restart."""
-        async with _http(claimed) as http:
-            await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})
-            saved = (await http.put(
-                "/api/setup/profile",
-                json={"timezone": setup_routes.DEFAULT_TIMEZONE},
-            )).json()
-        assert _status_of(saved, "profile") == "done"
-
-        claimed.restarted(timezone=setup_routes.DEFAULT_TIMEZONE)
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert _status_of(state, "profile") == "done"
-        assert state["restart_pending"] is False
-
-    async def test_the_cron_file_is_published_atomically(self, claimed):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
-        assert not claimed.system_crons.with_name("system.yaml.tmp").exists()
-        jobs = yaml.safe_load(claimed.system_crons.read_text(encoding="utf-8"))["jobs"]
-        assert any(j["id"] == "memory-maintenance" for j in jobs), (
-            "the rest of the file survived the rewrite"
-        )
-
-
-@pytest.mark.asyncio
-class TestCronChangesAreAppliedOrOwned:
-    """A rewritten cron file the scheduler has not re-read is a change that
-    has not happened — and a checklist saying "nothing is waiting" over it is
-    the one wrong answer that matters, because then nobody restarts."""
-
-    async def test_an_unreachable_scheduler_becomes_restart_debt(self, claimed):
-        async with _http(claimed) as http:
-            state = (await http.put(
-                "/api/setup/automation", json={"crons": ["inbox-processor"]},
-            )).json()
-        assert state["restart_pending"] is True
-        assert any("scheduler" in reason for reason in state["restart_pending_reasons"])
-        assert state["finished"] is False
-
-    async def test_a_live_scheduler_is_reloaded_and_owes_nothing(
-        self, claimed, monkeypatch,
-    ):
-        reloads = []
-
-        class _Cron:
-            async def reload(self):
-                reloads.append(True)
-                return {"jobs": 1}
-
-        import nerve.gateway.server as server_module
-
-        monkeypatch.setattr(server_module, "_cron_service", _Cron(), raising=False)
-        async with _http(claimed) as http:
-            state = (await http.put(
-                "/api/setup/automation", json={"crons": ["inbox-processor"]},
-            )).json()
-        assert reloads, "the scheduler was never told"
-        assert state["restart_pending_reasons"] == []
-
-    async def test_a_reload_that_fails_is_debt_rather_than_an_error(
-        self, claimed, monkeypatch,
-    ):
-        class _Cron:
-            async def reload(self):
-                raise RuntimeError("no scheduler today")
-
-        import nerve.gateway.server as server_module
-
-        monkeypatch.setattr(server_module, "_cron_service", _Cron(), raising=False)
-        async with _http(claimed) as http:
-            state = (await http.put(
-                "/api/setup/automation", json={"crons": ["inbox-processor"]},
-            )).json()
-        # The file was written; only the applying failed, and the checklist
-        # says so rather than pretending either way.
-        assert state["restart_pending"] is True
-        assert state["restart_pending_reasons"]
-
-    async def test_a_selection_that_changes_nothing_owes_nothing(
-        self, claimed, monkeypatch,
-    ):
-        async with _http(claimed) as http:
-            state = (await http.put(
-                "/api/setup/automation", json={"crons": []},
-            )).json()
-        assert state["restart_pending_reasons"] == []
-
-
-@pytest.mark.asyncio
-class TestAWhitespaceTokenIsNoToken:
-    async def test_it_is_refused_rather_than_marked_done(self, claimed):
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/channels", json={"telegram_bot_token": "   "},
-            )
-        assert response.status_code == 400
-        assert "channels" not in setup_state.load_state().done
-        assert "telegram" not in claimed.secrets()
-
-    async def test_the_allow_list_is_left_alone_when_it_is_not_given(self, claimed):
-        """Pairing is how people are added to it; a setup step must not clear
-        what pairing built."""
-        async with _http(claimed) as http:
-            await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-                "telegram_allowed_users": [4242],
-            })
-            await http.put("/api/setup/channels", json={
-                "telegram_bot_token": "0000000000:a-replacement-placeholder",
-            })
-        assert claimed.secrets()["telegram"]["allowed_users"] == [4242]
-
-
-def _status_of(state: dict, step: str) -> str:
-    return next(s["status"] for s in state["steps"] if s["id"] == step)
-
-
-# --------------------------------------------------------------------------- #
-#  Lockdown                                                                    #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestLockdown:
-    async def test_the_checklist_says_it_is_read_only(self, claimed):
-        claimed.reconfigure(lockdown=True)
-        async with _http(claimed) as http:
-            state = (await http.get("/api/setup")).json()
-        assert state["lockdown"] is True
-        assert state["writable"] is False
-        assert "lockdown" in state["read_only_reason"].lower()
-
-    async def test_no_step_writes_anything(self, claimed):
-        before = {
-            path: path.read_text(encoding="utf-8")
-            for path in (
-                claimed.config_local, claimed.config_yaml,
-                claimed.settings, claimed.system_crons,
-            )
-        }
-        claimed.reconfigure(lockdown=True)
-        async with _http(claimed) as http:
-            for path, body in (
-                ("/api/setup/provider", {"anthropic_api_key": _ANTHROPIC_KEY}),
-                ("/api/setup/profile", {"timezone": "Europe/Berlin"}),
-                ("/api/setup/channels", {"telegram_bot_token": _TELEGRAM_TOKEN}),
-                ("/api/setup/automation", {"crons": ["inbox-processor"]}),
-            ):
-                response = await http.put(path, json=body)
-                assert response.status_code == 409, (path, response.text)
-        for path, text in before.items():
-            assert path.read_text(encoding="utf-8") == text, path
-
-    async def test_the_account_can_still_be_claimed(self, install):
-        """Deliberate: the claim writes to nerve.db, not to configuration.
-
-        A fleet-managed install that could never be claimed would stay open to
-        everyone who can reach it, forever.
-        """
-        install.reconfigure(lockdown=True)
+    async def test_claim_does_not_rotate_the_signing_secret(self, install):
+        before = await install.db.get_instance_secret(JWT_SECRET_NAME)
         response = await _claim(install)
-        assert response.status_code == 200, response.text
-
-    async def test_a_request_for_both_halves_lands_neither(self, claimed):
-        """The name is a database write and the zone is a file write.
-
-        A request that asked for both must not land the name and then answer
-        with the failure of the other — that is a committed write reported as
-        a failure, and the form it leaves behind primes a retry that can only
-        conflict with what already happened.
-        """
-        claimed.reconfigure(lockdown=True)
-        async with _http(claimed) as http:
-            response = await http.put("/api/setup/profile", json={
-                "timezone": "Europe/Berlin", "display_name": "Alice Example",
-            })
-        assert response.status_code == 409
-        ref = await claimed.db.get_actor_ref(await claimed.owner_actor_id())
-        assert ref["display_name"] is None
-        assert claimed.tracked()["timezone"] == "UTC"
-
-    async def test_a_display_name_is_still_allowed(self, claimed):
-        """It is a database write too — and the one thing the wizard can
-        usefully do on a fleet-managed box."""
-        claimed.reconfigure(lockdown=True)
-        async with _http(claimed) as http:
-            response = await http.put(
-                "/api/setup/profile", json={"display_name": "Alice Example"},
-            )
-        assert response.status_code == 200, response.text
-        ref = await claimed.db.get_actor_ref(await claimed.owner_actor_id())
-        assert ref["display_name"] == "Alice Example"
-
-
-# --------------------------------------------------------------------------- #
-#  The signing secret, and the restart the wizard ends with                    #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestTheSigningSecretIsNeverRotated:
-    async def test_no_step_touches_the_auth_section(self, claimed):
-        before = claimed.secrets()["auth"]
-        async with _http(claimed) as http:
-            await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})
-            await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})
-            await http.put("/api/setup/channels", json={
-                "telegram_bot_token": _TELEGRAM_TOKEN,
-            })
-            await http.put("/api/setup/automation", json={"crons": []})
-        assert claimed.secrets()["auth"] == before
-        assert claimed.secrets()["auth"]["jwt_secret"]
-
-    async def test_the_claim_leaves_a_stored_secret_alone(self, install):
-        """The reconnect after the restart depends on this: the token in
-        localStorage has to still verify."""
-        await install.db.ensure_instance_secret(JWT_SECRET_NAME, "a-stored-signing-secret-32-bytes!!")
-        stored = await install.db.get_instance_secret(JWT_SECRET_NAME)
-        token = (await _claim(install)).json()["token"]
-        assert await install.db.get_instance_secret(JWT_SECRET_NAME) == stored
-        async with _client(install.app, token=token) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-
-    async def test_a_session_issued_before_the_steps_still_works_after_them(
-        self, claimed,
-    ):
-        async with _http(claimed) as http:
-            await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})
-            # Same token, after every write: nothing re-keyed the instance.
-            assert (await http.get("/api/auth/check")).status_code == 200
-
-
-@pytest.mark.asyncio
-class TestTheRestartStep:
-    async def test_it_needs_a_session(self, install):
-        async with _client(install.app) as http:
-            assert (await http.post("/api/system/restart")).status_code == 401
-
-    async def test_it_uses_the_same_mechanism_the_cli_does(self, claimed, monkeypatch):
-        calls = []
-
-        def _fake_restart(config_dir, **kwargs):
-            calls.append((Path(config_dir), kwargs))
-            return setup_routes.daemon.RestartOutcome(
-                method="helper", message="ok", old_pid=kwargs.get("old_pid"),
-            )
-
-        monkeypatch.setattr(setup_routes.daemon, "restart_daemon", _fake_restart)
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        async with _http(claimed) as http:
-            response = await http.post("/api/system/restart")
-        assert response.status_code == 200, response.text
-        assert response.json()["restarting"] is True
-        assert calls, "the helper was not started"
-        config_dir, kwargs = calls[0]
-        assert config_dir == claimed.config_dir
-        assert kwargs["old_pid"] == os.getpid(), "this process is the daemon"
-        assert kwargs["delay_seconds"] > 0, (
-            "the helper must hold off until this response is on the wire"
-        )
-
-    async def test_it_says_which_process_answered(self, claimed, monkeypatch):
-        """The client waits for a *different* generation. The old process
-        answers /health perfectly well while it shuts down, so 'anybody home?'
-        accepts the process being replaced."""
-        monkeypatch.setattr(
-            setup_routes.daemon, "restart_daemon",
-            lambda config_dir, **kwargs: setup_routes.daemon.RestartOutcome(
-                method="helper", message="ok", old_pid=1,
-            ),
-        )
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        async with _http(claimed) as http:
-            body = (await http.post("/api/system/restart")).json()
-        assert body["boot"] == setup_routes.boot.boot_id()
-        assert body["boot"]
-
-    async def test_a_restart_that_cannot_start_is_reported_as_a_failure(
-        self, claimed, monkeypatch,
-    ):
-        """Whether one was *begun* is knowable here, and a page told
-        'restarting' for a helper that never existed waits for a process that
-        is never coming."""
-        def _boom(config_dir, **kwargs):
-            raise OSError("no such directory")
-
-        monkeypatch.setattr(setup_routes.daemon, "restart_daemon", _boom)
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        async with _http(claimed) as http:
-            response = await http.post("/api/system/restart")
-        assert response.status_code == 500
-        assert "no such directory" in response.json()["detail"]
-        assert "still running" in response.json()["detail"]
-
-    async def test_a_second_restart_is_refused_rather_than_spawning_another(
-        self, claimed, monkeypatch,
-    ):
-        """Two helpers race over the same pid and the same pid file."""
-        calls = []
-        monkeypatch.setattr(
-            setup_routes.daemon, "restart_daemon",
-            lambda config_dir, **kwargs: (
-                calls.append(kwargs),
-                setup_routes.daemon.RestartOutcome(
-                    method="helper", message="ok", old_pid=1,
-                ),
-            )[1],
-        )
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        async with _http(claimed) as http:
-            first = await http.post("/api/system/restart")
-            second = await http.post("/api/system/restart")
-        assert first.status_code == 200
-        assert second.status_code == 409
-        assert len(calls) == 1
-
-    async def test_concurrent_restarts_start_exactly_one_helper(
-        self, claimed, monkeypatch,
-    ):
-        calls = []
-        monkeypatch.setattr(
-            setup_routes.daemon, "restart_daemon",
-            lambda config_dir, **kwargs: (
-                calls.append(kwargs),
-                setup_routes.daemon.RestartOutcome(
-                    method="helper", message="ok", old_pid=1,
-                ),
-            )[1],
-        )
-        monkeypatch.setattr(setup_routes, "_restart_requested", False)
-        async with _http(claimed) as http:
-            responses = await asyncio.gather(*[
-                http.post("/api/system/restart") for _ in range(4)
-            ])
-        assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
-        assert len(calls) == 1
-
-
-# --------------------------------------------------------------------------- #
-#  /api/auth/me                                                                #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestWhoAmI:
-    async def test_it_says_who_the_caller_is(self, claimed):
-        async with _http(claimed) as http:
-            body = (await http.get("/api/auth/me")).json()
-        assert body["username"] == "alice"
-        assert body["kind"] == "human"
-        assert body["account_id"] == claimed.owner_id
-        assert body["actor_id"] == await claimed.owner_actor_id()
-
-    async def test_it_carries_no_credential(self, claimed):
-        await claimed.db.update_account_login(
-            claimed.owner_id, credential=hash_password(_PASSWORD),
-        )
-        async with _http(claimed) as http:
-            response = await http.get("/api/auth/me")
-        assert set(response.json()) == {
-            "actor_id", "account_id", "username", "display_name", "kind",
-        }
-        assert "$2b$" not in response.text
-        assert "credential" not in response.text
+        after = await install.db.get_instance_secret(JWT_SECRET_NAME)
+        assert response.status_code == 200
+        assert after == before
