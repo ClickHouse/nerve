@@ -142,6 +142,15 @@ _STEPS = (
 
 _SKIPPABLE = {step for step, _title, required in _STEPS if not required}
 
+# Steps whose completion the *instance* can state on its own: a provider
+# credential is configured or it is not, a bot token is there or it is not, a
+# person has a display name or has not. Their recorded "done" is transitional —
+# it answers "written, not live yet" for the process that wrote it, and a later
+# process reads the instance instead (see setup_state.retire_transitional).
+# `automation` is deliberately absent: which crons an operator wanted is a
+# decision nothing else records.
+_TRANSITIONAL_STEPS = {STEP_PROVIDER, STEP_PROFILE, STEP_CHANNELS}
+
 
 # --------------------------------------------------------------------------- #
 #  Models                                                                      #
@@ -375,9 +384,17 @@ class _Context:
 async def _context(actor: Actor) -> _Context:
     config = get_config()
     unclaimed = await instance_is_unclaimed(get_deps().db, config)
+    state = setup_state.load_state()
+    # Anything an earlier process left behind describes a write that has since
+    # been picked up — or undone by hand — and the instance is the better
+    # witness either way. Persisted so it happens once rather than on every
+    # read, and best-effort: a state file that cannot be rewritten must not
+    # stop the checklist from being read.
+    if setup_state.retire_transitional(state, _TRANSITIONAL_STEPS):
+        setup_state.save_state(state)
     return _Context(
         config=config,
-        state=setup_state.load_state(),
+        state=state,
         unclaimed=unclaimed,
         display_name=actor.display_name,
     )
