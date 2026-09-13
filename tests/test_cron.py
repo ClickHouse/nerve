@@ -19,6 +19,7 @@ from nerve.cron.service import (
     _parse_interval,
     _parse_timestamp,
 )
+from nerve.identity import ActorResolutionError
 from tests.actor_rows import mock_system_principal
 
 
@@ -972,6 +973,66 @@ class TestRotation:
         cron_service.db.set_channel_session.assert_awaited_once_with(
             "cron:pers", result["new_session_id"],
         )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_retires_nothing(self, cron_service):
+        """Retiring the old generation cancels its wakeups and stamps it
+        rotated; the replacement is what the run then uses. So the principal
+        is resolved first — a failure here must leave the job exactly as it
+        was, not with a retired chat and nothing in its place."""
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(30),
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
+        })
+        job = _pers_job(context_rotate_hours=24)
+        cron_service.db.get_system_principal = AsyncMock(return_value=None)
+
+        with pytest.raises(ActorResolutionError):
+            await cron_service._resolve_persistent_session(job)
+
+        cron_service.db.update_session_metadata.assert_not_awaited()
+        cron_service.db.cancel_wakeups_for_session.assert_not_awaited()
+        cron_service.db.set_channel_session.assert_not_awaited()
+        cron_service.engine.sessions.get_or_create.assert_not_awaited()
+
+        # The next run rotates as it would have.
+        mock_system_principal(cron_service.db)
+        session_id, rotated = await cron_service._resolve_persistent_session(job)
+        assert rotated is True
+        assert session_id.startswith("cron:pers:")
+        cron_service.db.set_channel_session.assert_awaited_once_with(
+            "cron:pers", session_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_retires_nothing_manually_either(
+        self, cron_service,
+    ):
+        """The manual path has the same ordering, and the same guarantee."""
+        cron_service._jobs = [_pers_job(context_rotate_hours=0)]
+        _map_current(cron_service, "cron:pers", {
+            "connected_at": _hours_ago(1),
+            "sdk_session_id": "sdk-123",
+            "status": "idle",
+            "title": "Cron: pers",
+            "metadata": "{}",
+        })
+        cron_service.db.get_system_principal = AsyncMock(return_value=None)
+
+        with pytest.raises(ActorResolutionError):
+            await cron_service.rotate_session("pers")
+
+        cron_service.engine.schedule_memorize.assert_not_awaited()
+        cron_service.db.update_session_metadata.assert_not_awaited()
+        cron_service.db.cancel_wakeups_for_session.assert_not_awaited()
+        cron_service.db.set_channel_session.assert_not_awaited()
+
+        mock_system_principal(cron_service.db)
+        result = await cron_service.rotate_session("pers")
+        assert result["rotated"] is True
+        assert result["new_session_id"].startswith("cron:pers:")
 
     @pytest.mark.asyncio
     async def test_manual_rotation_without_session_is_noop(self, cron_service):
