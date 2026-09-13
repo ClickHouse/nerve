@@ -288,6 +288,30 @@ describe('who the session belongs to', () => {
       expect(clearToken).toHaveBeenCalled();
     });
 
+  it('stays locked when the account cannot be confirmed', async () => {
+    // A confirmed *match* is what unlocks a mounted app, not the absence of a
+    // mismatch: usernames are mutable and reusable, so the one the overlay
+    // submitted can have come to name somebody else since it was read. With no
+    // answer, the token is discarded and the overlay stays up.
+    useAuthStore.setState({
+      account: { id: 'acc-1', username: 'alice' },
+      sessionExpired: true,
+      authenticated: false,
+    });
+    api.login.mockResolvedValue({ token: 'a-fresh-token' });
+    api.getOwnAccount.mockRejectedValue(new Error('network'));
+
+    await useAuthStore.getState().login('a-passphrase', 'alice');
+
+    expect(useAuthStore.getState().authenticated).toBe(false);
+    expect(useAuthStore.getState().sessionExpired).toBe(true);
+    expect(useAuthStore.getState().error).toMatch(/Could not confirm/);
+    expect(clearToken).toHaveBeenCalled();
+    // Nothing was purged either — this is "try again", not "you are somebody
+    // else".
+    expect(clearAllDrafts).not.toHaveBeenCalled();
+  });
+
   it('keeps the app when the same account unlocks it', async () => {
     useAuthStore.setState({
       account: { id: 'acc-1', username: 'alice' },

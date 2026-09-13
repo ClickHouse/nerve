@@ -379,6 +379,14 @@ def _scrub_account_credentials(snapshot: Path) -> None:
     ``nerve.db`` carries the password hashes with it. ``--no-secrets`` promises
     it does not.
 
+    **Every** account, not only the ones holding a hash. A row still on the
+    transitional ``config`` source carries no credential of its own — it reads
+    ``auth.password_hash`` — and ``config.local.yaml`` is omitted from this
+    bundle, so leaving it on ``config`` restores an account that can neither
+    authenticate nor be recognised as passwordless: the one state with no way
+    out. Reachable by taking a ``--no-secrets`` backup between an upgrade and
+    the first start that migrates, which is not an exotic moment.
+
     The row's ``credential_source`` moves to ``none`` in the same statement,
     because the schema refuses a ``local`` account with no credential — and
     because it is the truth about the scrubbed row. The restored instance is
@@ -403,17 +411,17 @@ def _scrub_account_credentials(snapshot: Path) -> None:
             return
         conn.execute("PRAGMA secure_delete=ON")
         conn.execute(
-            "UPDATE accounts SET credential = NULL, credential_source = 'none' "
-            "WHERE credential IS NOT NULL"
+            "UPDATE accounts SET credential = NULL, credential_source = 'none'"
         )
         conn.commit()
         left = conn.execute(
-            "SELECT COUNT(*) FROM accounts WHERE credential IS NOT NULL"
+            "SELECT COUNT(*) FROM accounts "
+            "WHERE credential IS NOT NULL OR credential_source != 'none'"
         ).fetchone()[0]
         if left:  # pragma: no cover - an UPDATE that reported success and did not
             raise BackupError(
                 f"could not scrub account credentials from {snapshot}: "
-                f"{left} row(s) still carry one"
+                f"{left} row(s) still carry one, or still read the configured one"
             )
     finally:
         conn.close()
@@ -431,8 +439,11 @@ def _is_sanitisable_config(arcname: str) -> bool:
 def _sanitised_config(src: Path) -> str | None:
     """``src`` with every secret leaf replaced by a ``${VAR}`` placeholder.
 
-    ``None`` when there is nothing to rewrite — not a mapping, unreadable, or no
-    secret in it — in which case the caller copies the file as it stands.
+    ``None`` when it parsed and there was nothing to rewrite, in which case the
+    caller copies the file as it stands. :class:`BackupError` when it could not
+    be *inspected* — the two used to be the same answer, so a file that would
+    not parse was copied into a bundle documented as carrying no credential,
+    which is the one thing a parse failure cannot rule out.
 
     The tracked workspace configuration is *supposed* to hold references rather
     than values, and mostly does. But the startup migration deliberately leaves
@@ -446,12 +457,18 @@ def _sanitised_config(src: Path) -> str | None:
 
     try:
         raw = yaml.safe_load(src.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
-        # Unparseable: there is nothing to rewrite *safely*. The caller copies
-        # it, which is what happened to every such file before this existed.
-        return None
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        raise BackupError(
+            f"Backup: {src} could not be parsed, so a --no-secrets bundle cannot "
+            f"promise it carries no credential ({e}). Fix the file, or take the "
+            f"backup with secrets and keep it as private as the instance."
+        ) from e
     if not isinstance(raw, dict):
-        return None
+        raise BackupError(
+            f"Backup: {src} is not a configuration mapping, so a --no-secrets "
+            f"bundle cannot promise it carries no credential. Fix the file, or "
+            f"take the backup with secrets and keep it as private as the instance."
+        )
     tracked, _secrets, moved = _scrub_secrets(raw)
     if not moved:
         return None

@@ -160,21 +160,36 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     setToken(token);
     const identity = await loadIdentity();
 
-    if (wasExpired && previous && identity && identity.id !== previous.id) {
-      // A different person, in front of an application that is still mounted
-      // and still holding the last one's drafts and loaded state. The overlay
-      // binds re-authentication to one account so this should be unreachable;
-      // if it is ever reached, nothing of the previous account may survive, so
-      // this is a sign-out rather than a sign-in.
-      clearToken();
-      purgeAccountScopedState();
-      sessionEstablished = false;
-      set({
-        authenticated: false, loading: false, sessionExpired: false,
-        account: null,
-        error: 'That is a different account. Sign in again to use it.',
-      });
-      return;
+    if (wasExpired) {
+      // Unlocking a *mounted* application — one still holding the previous
+      // person's drafts, read state and loaded sessions. That needs a
+      // positively confirmed match, not the absence of a mismatch: a username
+      // is mutable and reusable, so the one this overlay submitted can have
+      // come to name a different account since it was read.
+      if (!identity) {
+        // Cannot confirm. Keep the door shut rather than open it on a maybe —
+        // the token is discarded, so nothing was gained by the attempt.
+        clearToken();
+        set({
+          loading: false,
+          error: 'Could not confirm this account just now. Try again, or log out.',
+        });
+        return;
+      }
+      if (!previous || identity.id !== previous.id) {
+        // A different person, in front of somebody else's mounted application.
+        // Nothing of the previous account may survive, so this is a sign-out
+        // rather than a sign-in.
+        clearToken();
+        purgeAccountScopedState();
+        sessionEstablished = false;
+        set({
+          authenticated: false, loading: false, sessionExpired: false,
+          account: null,
+          error: 'That is a different account. Sign in again to use it.',
+        });
+        return;
+      }
     }
 
     sessionEstablished = true;
