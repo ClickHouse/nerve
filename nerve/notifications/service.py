@@ -1191,12 +1191,19 @@ class NotificationService:
         a ``notification_expired`` broadcast, and the Telegram card is
         edited to show it expired. ``notify``-kind expiry stays silent.
         """
+        # Resolved before the flip. Expiring is one-way, and the note that
+        # tells an asking session its question died can only be produced from
+        # the rows that flip — so a lookup failure here costs one tick, and
+        # the next sweep expires them and reports them together.
+        actor = await system_actor(self.db)
         rows = await self.db.expire_due_notifications()
         if rows:
-            await self._report_expired(rows)
+            await self._report_expired(rows, actor)
         return len(rows)
 
-    async def _report_expired(self, rows: list[dict[str, Any]]) -> None:
+    async def _report_expired(
+        self, rows: list[dict[str, Any]], actor: "Actor | None" = None,
+    ) -> None:
         """Report expired questions/approvals to every interested party.
 
         Silent-by-construction expiry was the bug: the asking session
@@ -1250,10 +1257,13 @@ class NotificationService:
         for notif in questions:
             by_session.setdefault(notif["session_id"], []).append(notif)
         for session_id, session_rows in by_session.items():
-            await self._inject_expiry_note(session_id, session_rows)
+            await self._inject_expiry_note(session_id, session_rows, actor)
 
     async def _inject_expiry_note(
-        self, session_id: str, rows: list[dict[str, Any]],
+        self,
+        session_id: str,
+        rows: list[dict[str, Any]],
+        actor: "Actor | None" = None,
     ) -> None:
         """Inject an expired-unanswered note into the asking session.
 
@@ -1307,6 +1317,7 @@ class NotificationService:
             message,
             source="notification:expiry",
             internal=True,
+            actor=actor,
         )
 
     async def _edit_telegram_expired(self, notif: dict[str, Any]) -> None:
