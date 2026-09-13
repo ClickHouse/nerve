@@ -91,9 +91,9 @@ def _actor_for_account_row(
     """
     if not account.get("enabled"):
         raise ActorResolutionError("This account is disabled")
-    if session_epoch is not None and session_epoch < int(account.get("session_epoch") or 0):
+    if session_epoch is not None and session_epoch != int(account.get("session_epoch") or 0):
         raise ActorResolutionError(
-            "This session predates the password on this account; sign in again"
+            "This session is no longer current for this account; sign in again"
         )
     if account["actor_id"] is None:
         # The schema's foreign key makes this unreachable; fail closed rather
