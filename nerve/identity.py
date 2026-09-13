@@ -54,20 +54,19 @@ class Actor:
         return self.kind == ACTOR_KIND_HUMAN
 
 
-async def _actor_for_account_row(store: "AccountStore", account: dict) -> Actor:
+def _actor_for_account_row(account: dict) -> Actor:
     """Resolve an account row, checking disablement on every request."""
     if not account.get("enabled"):
         raise ActorResolutionError("This account is disabled")
-    actor = await store.get_actor_ref(account["actor_id"])
-    if actor is None:
+    if account["actor_id"] is None:
         # The schema's foreign key makes this unreachable; fail closed rather
         # than invent an identity if it ever is reached.
         raise ActorResolutionError("This account has no actor identity")
     return Actor(
-        actor_id=actor["id"],
-        kind=actor["kind"],
-        account_id=account["id"],
-        display_name=actor["display_name"],
+        actor_id=account["actor_id"],
+        kind=account["actor_kind"],
+        account_id=account["account_id"],
+        display_name=account["display_name"],
     )
 
 
@@ -75,10 +74,10 @@ async def actor_for_account(store: "AccountStore", account_id: str) -> Actor:
     """Resolve an account id without caching."""
     if not isinstance(account_id, str) or not account_id:
         raise ActorResolutionError("This credential names no account")
-    account = await store.get_account(account_id)
+    account = await store._account_identity(account_id)
     if account is None:
         raise ActorResolutionError("This credential names an account that no longer exists")
-    return await _actor_for_account_row(store, account)
+    return _actor_for_account_row(account)
 
 
 async def actor_for_sole_account(store: "AccountStore") -> Actor:
@@ -87,13 +86,13 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
     A legacy credential names no person, so zero or multiple accounts are
     ambiguous and must fail rather than select a row.
     """
-    account = await store.get_sole_account()
+    account = await store._sole_account_identity()
     if account is None:
         raise ActorResolutionError(
             "This credential predates per-account logins and no longer resolves "
             "to a single account; sign in again"
         )
-    return await _actor_for_account_row(store, account)
+    return _actor_for_account_row(account)
 
 
 async def system_actor(store: "AccountStore") -> Actor:
