@@ -38,8 +38,10 @@ Two entry shapes:
 from __future__ import annotations
 
 import copy
+import os
 import secrets
 import shutil
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -735,6 +737,96 @@ def leading_comment(text: str) -> str:
     return "".join(kept)
 
 
+def _merged_yaml(path: Path, updates: dict[str, Any], header: str) -> str:
+    """The text a merge produces: what is on disk, with these paths set.
+
+    Shared by both writers below, so "what the merge means" is decided once
+    and only "how privately it is published" differs between them.
+    """
+    original = path.read_text(encoding="utf-8") if path.exists() else ""
+    data: dict[str, Any] = {}
+    if original.strip():
+        loaded = yaml.safe_load(original)
+        if loaded is not None and not isinstance(loaded, dict):
+            raise ValueError(f"{path} is not a mapping; refusing to rewrite it")
+        data = loaded or {}
+
+    for dotted, value in updates.items():
+        if value is None:
+            del_leaf(data, dotted)
+        else:
+            set_leaf(data, dotted, value)
+
+    opening = leading_comment(original) if original else header
+    return opening + yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+
+
+def merge_machine_paths(
+    path: Path, updates: dict[str, Any], *, header: str = "",
+) -> None:
+    """Merge dotted paths into a machine-local file that carries no secret.
+
+    ``config.yaml`` holds this box's workspace path, its deployment style and
+    which features are on — nothing anyone must not read, and the file an
+    operator edits by hand. So it is republished **at the mode and ownership it
+    already had**, not forced to ``0600``.
+
+    That distinction is not cosmetic. In the Docker deployment the container
+    runs as root over a bind-mounted checkout, so a wizard write that published
+    a fresh root-owned ``0600`` inode would leave the host's own non-root
+    ``nerve`` unable to read the file it needs to recognise a Docker install at
+    all. Forced ``0600`` is for the file that holds credentials, and
+    :func:`merge_private_paths` is where that lives.
+
+    Atomic all the same: written to a temporary beside the destination and
+    renamed over it, so a reader never sees half a file, and the destination's
+    mode and owner are carried onto the temporary before the rename rather than
+    applied to the published name afterwards.
+    """
+    text = _merged_yaml(path, updates, header or CONFIG_YAML_HEADER)
+
+    existing_stat = path.stat() if path.exists() else None
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        # Created narrow and widened to the destination's own mode below, so
+        # the window in between is never *wider* than what the file ends at.
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if existing_stat is not None:
+            os.fchmod(fd, stat.S_IMODE(existing_stat.st_mode))
+            if hasattr(os, "fchown") and os.getuid() == 0:
+                # Only root can give a file away, and only root is in the
+                # position that needs to: the container writing a file the
+                # host's non-root user owns.
+                try:
+                    os.fchown(fd, existing_stat.st_uid, existing_stat.st_gid)
+                except OSError:  # pragma: no cover - best effort
+                    pass
+        else:
+            os.fchmod(fd, 0o644 & ~_current_umask())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+
+
+def _current_umask() -> int:
+    """The process umask, read without leaving it changed."""
+    current = os.umask(0o022)
+    os.umask(current)
+    return current
+
+
 def merge_private_paths(
     path: Path, updates: dict[str, Any], *, header: str = "",
 ) -> None:
@@ -756,24 +848,8 @@ def merge_private_paths(
     ``header`` is used only when the file does not exist yet, so a file
     created here opens with the same explanation the installer's would.
     """
-    original = path.read_text(encoding="utf-8") if path.exists() else ""
-    data: dict[str, Any] = {}
-    if original.strip():
-        loaded = yaml.safe_load(original)
-        if loaded is not None and not isinstance(loaded, dict):
-            raise ValueError(f"{path} is not a mapping; refusing to rewrite it")
-        data = loaded or {}
-
-    for dotted, value in updates.items():
-        if value is None:
-            del_leaf(data, dotted)
-        else:
-            set_leaf(data, dotted, value)
-
-    opening = leading_comment(original) if original else (header or _CONFIG_LOCAL_HEADER)
     paths.write_private_text(
-        path,
-        opening + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+        path, _merged_yaml(path, updates, header or _CONFIG_LOCAL_HEADER),
     )
 
 

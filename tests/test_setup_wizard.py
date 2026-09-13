@@ -746,6 +746,37 @@ class TestTheChecklist:
         assert claimed.machine()["telegram"]["enabled"] is True
         assert _TELEGRAM_TOKEN not in claimed.settings.read_text(encoding="utf-8")
 
+    async def test_the_machine_file_keeps_its_mode_and_owner(self, claimed):
+        """`config.yaml` carries no secret and an operator edits it by hand.
+
+        In Docker the container is root over a bind-mounted checkout, so a
+        wizard write that published a fresh root-owned 0600 inode would leave
+        the host's own non-root CLI unable to read the file it needs to
+        recognise a Docker install at all. The private writer is for the file
+        that holds credentials.
+        """
+        claimed.config_yaml.chmod(0o644)
+        before = claimed.config_yaml.stat()
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/channels", json={
+                "telegram_bot_token": _TELEGRAM_TOKEN,
+            })
+        assert response.status_code == 200, response.text
+        after = claimed.config_yaml.stat()
+        assert stat.S_IMODE(after.st_mode) == 0o644
+        assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+        assert claimed.machine()["telegram"]["enabled"] is True
+        # ...while the file that does hold a credential stays owner-only.
+        assert stat.S_IMODE(claimed.config_local.stat().st_mode) == 0o600
+
+    async def test_a_machine_write_is_atomic_and_leaves_no_temporary(self, claimed):
+        async with _http(claimed) as http:
+            await http.put("/api/setup/channels", json={
+                "telegram_bot_token": _TELEGRAM_TOKEN,
+            })
+        assert not (claimed.config_dir / "config.yaml.tmp").exists()
+        assert claimed.machine()["workspace"], "the rest of the file survived"
+
     async def test_the_automation_step_toggles_the_crons_the_installer_wrote(
         self, claimed,
     ):
