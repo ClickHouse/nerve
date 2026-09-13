@@ -263,6 +263,10 @@ class TestClaimingFromThisMachine:
     async def test_a_password_bcrypt_cannot_hold_is_a_400(self, install):
         response = await _claim(install, body={"password": "x" * 200})
         assert response.status_code == 400
+        # Said in bytes, like the accounts routes say it: "too long" is not
+        # actionable on a password whose length the person can see.
+        assert "72" in response.json()["detail"]
+        assert "bytes" in response.json()["detail"]
         assert await setup_token.instance_is_unclaimed(
             install.db, install.reconfigure(),
         ) is True

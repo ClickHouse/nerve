@@ -22,7 +22,7 @@ vi.mock('../api/client', async () => {
     api: {
       authStatus: vi.fn(),
       login: vi.fn(),
-      checkAuth: vi.fn(),
+      getOwnAccount: vi.fn(),
       setupState: vi.fn(),
       setupClaim: vi.fn(),
       me: vi.fn(),
@@ -67,7 +67,7 @@ const { useAuthStore } = await import('../stores/authStore');
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const apiLogin = api.login as unknown as ReturnType<typeof vi.fn>;
-const checkAuth = api.checkAuth as unknown as ReturnType<typeof vi.fn>;
+const getOwnAccount = api.getOwnAccount as unknown as ReturnType<typeof vi.fn>;
 const setupState = api.setupState as unknown as ReturnType<typeof vi.fn>;
 const setupClaim = api.setupClaim as unknown as ReturnType<typeof vi.fn>;
 const me = api.me as unknown as ReturnType<typeof vi.fn>;
@@ -90,9 +90,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   (getToken as unknown as ReturnType<typeof vi.fn>).mockReturnValue(null);
   useAuthStore.setState({
-    authenticated: false, checking: true, sessionExpired: false,
+    authenticated: false, ready: false, sessionExpired: false,
     loginMode: 'password', setupPending: false, error: null, loading: false,
+    account: null,
   });
+  getOwnAccount.mockRejectedValue(new Error('401: Unauthorized'));
   setupState.mockResolvedValue({
     setup_pending: true, lockdown: false, writable: true,
     read_only_reason: null, restart_pending: false, restart_pending_paths: [],
@@ -135,7 +137,11 @@ describe('an unclaimed instance', () => {
     const userEvent = (await import('@testing-library/user-event')).default;
     authStatus.mockResolvedValueOnce(UNCLAIMED).mockResolvedValue(CLAIMED);
     apiLogin.mockRejectedValue(new Error('401: Unauthorized'));
-    checkAuth.mockResolvedValue({ authenticated: true });
+    getOwnAccount.mockResolvedValue({
+      id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: null,
+      enabled: true, has_password: true, created_at: '', updated_at: '',
+      disabled_at: null, is_self: true,
+    });
     listActors.mockResolvedValue({ actors: [] });
     me.mockResolvedValue({
       actor_id: 'actor-1', account_id: 'acc-1', username: 'alice',
@@ -170,7 +176,11 @@ describe('a claimed instance', () => {
   it('opens the app, not the wizard', async () => {
     authStatus.mockResolvedValue(CLAIMED);
     (getToken as unknown as ReturnType<typeof vi.fn>).mockReturnValue('a-session');
-    checkAuth.mockResolvedValue({ authenticated: true });
+    getOwnAccount.mockResolvedValue({
+      id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: null,
+      enabled: true, has_password: true, created_at: '', updated_at: '',
+      disabled_at: null, is_self: true,
+    });
 
     renderApp('/');
 
@@ -183,7 +193,7 @@ describe('a claimed instance', () => {
 
     renderApp('/');
 
-    await waitFor(() => expect(useAuthStore.getState().checking).toBe(false));
+    await waitFor(() => expect(useAuthStore.getState().ready).toBe(true));
     expect(screen.queryByRole('form', { name: 'Claim this instance' })).toBeNull();
     expect(screen.queryByText('the chat page')).toBeNull();
   });

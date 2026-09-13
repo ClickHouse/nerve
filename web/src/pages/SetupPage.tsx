@@ -5,6 +5,7 @@ import {
 } from '../components/ui/icons';
 import { Badge, Button, Checkbox, TextField } from '../components/ui';
 import { api, type SetupCron, type SetupStep } from '../api/client';
+import { actorName, useActorRef } from '../stores/actorStore';
 import { useAuthStore } from '../stores/authStore';
 import { useSetupStore, type SetupStoreState } from '../stores/setupStore';
 
@@ -295,22 +296,25 @@ function Checklist() {
   );
 }
 
-/** Who you are signed in as, from `/api/auth/me`. */
+/**
+ * Who you are signed in as.
+ *
+ * From the identity the auth store already confirmed and the actor map that
+ * already knows every name — not from a second request of its own. The store's
+ * binding is the security-relevant one (a session is only bound to an account
+ * the server confirmed it belongs to), and re-deriving "who am I" beside it is
+ * how the two would disagree. `GET /api/auth/me` answers the same question in
+ * one call for a caller that has neither; see the handoff.
+ */
 function SignedInAs() {
-  const [who, setWho] = useState<string | null>(null);
+  const username = useAuthStore((s) => s.account?.username ?? null);
+  const actorId = useAuthStore((s) => s.account?.actor_id ?? null);
+  const actor = useActorRef(actorId);
 
-  useEffect(() => {
-    let live = true;
-    api.me()
-      .then((me) => {
-        if (live) setWho(me.display_name || me.username || null);
-      })
-      .catch(() => { /* a name is a nicety; never an error message */ });
-    return () => { live = false; };
-  }, []);
-
-  if (!who) return null;
-  return <p className="text-2xs text-text-dim">Signed in as {who}.</p>;
+  if (!actorId && !username) return null;
+  const name = actor ? actorName(actor) : (username ?? '');
+  if (!name) return null;
+  return <p className="text-2xs text-text-dim">Signed in as {name}.</p>;
 }
 
 function ProviderForm() {
