@@ -261,3 +261,50 @@ class TestWhereTheTokenIsPrinted:
 
         _echo_setup_token(NerveConfig())
         assert capsys.readouterr().out == ""
+
+
+class TestTheListenerDoesNotTrustForwardingHeaders:
+    """The one place a header could reach the peer address is the server's own.
+
+    uvicorn enables ``ProxyHeadersMiddleware`` by default and
+    ``FORWARDED_ALLOW_IPS`` in the environment can widen its trust to ``*``,
+    at which point a remote caller names its own address and the locality guard
+    is answering a question the caller asked. Nerve reads no forwarding header
+    anywhere, so the listener says so explicitly — and this pins that it keeps
+    saying so, because the default is the dangerous direction.
+    """
+
+    def test_run_server_disables_proxy_headers(self, monkeypatch):
+        from nerve.config import NerveConfig
+        from nerve.gateway import server
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            server, "create_app", lambda: object(),
+        )
+
+        def _fake_run(app, **kwargs):
+            captured.update(kwargs)
+
+        import uvicorn
+
+        monkeypatch.setattr(uvicorn, "run", _fake_run)
+        server.run_server(NerveConfig())
+
+        assert captured["proxy_headers"] is False
+        assert captured["forwarded_allow_ips"] is None
+
+    def test_uvicorn_still_defaults_the_other_way(self):
+        """If this ever changes, the explicit argument stops being load-bearing
+        and the comment beside it stops being true."""
+        import inspect
+
+        import uvicorn
+
+        default = inspect.signature(uvicorn.Config.__init__).parameters[
+            "proxy_headers"
+        ].default
+        assert default is True, (
+            "uvicorn no longer trusts proxy headers by default; revisit "
+            "run_server's explicit argument and the comment on it"
+        )

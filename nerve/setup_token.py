@@ -35,15 +35,15 @@ One honest limitation, documented in ``docs/setup.md``: a reverse proxy on the
 same host makes every request's peer loopback, which silently makes the token
 optional. ``auth.setup_token_required: true`` forces it for those deployments.
 
-**The one place a header can reach the peer address, and why it is still
-safe.** uvicorn runs ``ProxyHeadersMiddleware`` by default, which rewrites
-``scope["client"]`` from ``X-Forwarded-For`` — but only when the immediate peer
-is already trusted (``127.0.0.1``). A remote caller's header is ignored
-outright, so the rewrite can never turn a remote request into a local one; and
-where it does fire, the peer was loopback anyway. In the deployment this module
-cannot otherwise see through — a proxy on this host — a proxy that forwards the
-real client address makes the guard *stricter* rather than weaker, because the
-peer becomes that remote address. Both directions are pinned by tests.
+**The one place a header could reach the peer address, and what closes it.**
+uvicorn runs ``ProxyHeadersMiddleware`` by default, which rewrites
+``scope["client"]`` from ``X-Forwarded-For`` when it trusts the immediate peer
+— and ``FORWARDED_ALLOW_IPS=*`` in the environment widens that to everybody, at
+which point a remote caller names its own address and this guard is answering a
+question the caller asked. So ``run_server`` passes ``proxy_headers=False``
+explicitly: the peer is the socket's, always. A proxy in front of Nerve is
+therefore invisible here, which is the documented limitation and what
+``auth.setup_token_required`` is for.
 """
 
 from __future__ import annotations
