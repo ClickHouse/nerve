@@ -11,16 +11,7 @@ import { clearAllReads } from './helpers/readStorage';
 export interface SignedInAccount {
   id: string;
   username: string | null;
-  /**
-   * The permanent identity behind the login — what this person's sessions and
-   * messages are stored under, and so what a message sent from this tab has to
-   * be stamped with before anyone else can see who sent it.
-   *
-   * A different column from `id`: that one is the login and can be renamed
-   * away, this one outlives every rename. Carried here rather than read
-   * separately so there is exactly one answer to "who is signed in", confirmed
-   * at the same moment and discarded at the same moment as the rest of it.
-   */
+  /** Stable author identity; account id and display names may change. */
   actor_id: string;
 }
 
@@ -32,10 +23,7 @@ export interface SignedInAccount {
 function purgeAccountScopedState(): void {
   clearAllDrafts();
   clearAllReads();
-  // Display names are read fresh per app session, and both occasions this runs
-  // on end one. Not a secrecy measure — whoever signs in next can read
-  // /api/actors too — but a map that outlives the session that fetched it is a
-  // cache, and the whole point of this one is that it is not.
+  // Do not let a name snapshot outlive the session that read it.
   useActorStore.getState().reset();
 }
 
@@ -124,55 +112,23 @@ let sessionEstablished = false;
  */
 let statusGeneration = 0;
 
-/**
- * Which authentication session the app is in.
- *
- * Every sign-in and every startup check decides an outcome across several
- * awaits, and the decision is committed at the end. If the session it was
- * deciding for has ended by then, the commit has to be dropped rather than
- * applied: the overlay's log-out button stays live while an unlock is in
- * flight, so "sign in, then sign out" can otherwise finish by signing you back
- * in — after the sign-out already purged the drafts and read state that made
- * staying signed in worth anything.
- *
- * This never changes *what* is decided, only whether a decision that has been
- * superseded is allowed to land. The confirmed-match rule below is untouched.
- */
+/** Drops login/startup decisions superseded by logout or another auth session. */
 let authGeneration = 0;
 
-/** Start a new authentication session, abandoning whatever the last one was
- *  still deciding. */
 function beginAuthSession(): number {
   return ++authGeneration;
 }
 
-/** Whether `generation` is still the session the app is in. */
 function isCurrentAuthSession(generation: number): boolean {
   return generation === authGeneration;
 }
 
-/**
- * Drop a token this attempt installed — but only if it is still the one in
- * storage.
- *
- * `clearToken()` is global and has no idea whose token it is clearing. A stale
- * attempt calling it unconditionally can wipe the credential a *newer* sign-in
- * has already installed, signing out somebody who is legitimately signed in.
- */
+/** A stale attempt must not clear a newer session's token. */
 function discardOwnToken(token: string): void {
   if (getToken() === token) clearToken();
 }
 
-/**
- * Bind the signed-in actor to an operation that will commit later.
- *
- * For anything that stamps a row after an await: the actor has to be the one
- * who *asked*, not whoever happens to be signed in when the request comes back.
- * The server records the former, so the optimistic row must say the same thing
- * or a reload would change the answer — which is the one thing attribution may
- * never do. `stillCurrent()` says whether committing is still that person's to
- * do at all.
- */
+/** Bind delayed optimistic work to the actor and auth session that requested it. */
 export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
   const generation = authGeneration;
   const actorId = useAuthStore.getState().account?.actor_id ?? null;
@@ -210,8 +166,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       ({ token } = await api.login(password, username));
     } catch (e: any) {
-      // A refusal for a session that has ended says nothing about the one the
-      // app is in now; reporting it would overwrite a newer attempt's state.
       if (!isCurrentAuthSession(generation)) return;
       set({ error: e.message || 'Login failed', loading: false });
       // A refused sign-in is a good moment to find out the form was asking for
@@ -219,17 +173,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       void get().refreshStatus();
       return;
     }
-    // Before installing it, not after. A credential belonging to a session that
-    // has already ended must never reach storage at all — installing it and
-    // taking it back again is a window in which a logged-out tab holds a
-    // working token, and the taking-back is what could clear somebody else's.
+    // Never install a credential for a session logout already ended.
     if (!isCurrentAuthSession(generation)) return;
 
     setToken(token);
     const identity = await loadIdentity();
-    // Signed out while the identity read was in flight. Take back only what
-    // this attempt installed, and leave `loading` to whoever owns it now —
-    // `logout` clears it, and a newer sign-in sets and clears its own.
+    // Take back only this attempt's token; a newer login may own storage now.
     if (!isCurrentAuthSession(generation)) {
       discardOwnToken(token);
       return;
@@ -275,8 +224,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: () => {
-    // Whatever a sign-in or a startup check was still deciding is about a
-    // session that no longer exists; it must not be allowed to commit.
     beginAuthSession();
     clearToken();
     // Purge unsent drafts so nothing leaks to the next user on a shared
@@ -284,8 +231,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // take your unsent work with it.
     purgeAccountScopedState();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
-    // `loading` too: an attempt abandoned by the line above will not clear it,
-    // and a login form left spinning cannot be submitted again.
     set({
       authenticated: false, loading: false, sessionExpired: false,
       error: null, account: null,
@@ -347,9 +292,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         const { token: fresh } = await api.login('');
         if (!isCurrentAuthSession(authSession)) return;
         setToken(fresh);
-        // The identity read needs the token, so it has to follow it; the guard
-        // then has a token to take back if this session ended meanwhile — and
-        // only if nothing newer has replaced it.
         const identity = await loadIdentity();
         if (!isCurrentAuthSession(authSession)) {
           discardOwnToken(fresh);
@@ -415,24 +357,7 @@ setUnauthorizedHandler(() => {
   void useAuthStore.getState().refreshStatus();
 });
 
-/**
- * The actor id to stamp on a row this tab is about to show before the server's
- * copy of it exists — a message you have just sent, which the gateway excludes
- * you from its own echo of.
- *
- * Derived from {@link AuthState.account} rather than held separately, so there
- * is nothing to keep in step and nothing that can disagree with it. That also
- * makes it safe by construction across an authentication boundary: `account` is
- * resolved *before* a session is announced as authenticated, cleared whenever
- * one ends, and — on the session-expired overlay — only ever replaced by a
- * positively confirmed match for the same account. There is therefore no window
- * in which this returns the previous person, and none in which a message can be
- * sent while it is still unknown.
- *
- * `null` when identity could not be read at all (a caller with no account row:
- * the instance's own credential, an MCP token). That is the ordinary
- * unattributed path and renders exactly as history does.
- */
+/** Stable actor for optimistic rows; null for callers without an account row. */
 export function selfActorId(): string | null {
   return useAuthStore.getState().account?.actor_id ?? null;
 }
