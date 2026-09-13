@@ -80,6 +80,33 @@ refuses with a `409` pointing at the claim endpoint. There is one door, and it
 is the guarded one. Once the instance has been claimed, the accounts screen is
 where passwords are changed as usual.
 
+**Claiming also ends every session that came before it.** A passwordless
+install hands an ordinary account session to everybody who reaches it, and
+those tokens name the same account and have thirty days left — so securing the
+account would otherwise secure only the *next* caller. Each account carries a
+**session epoch** (`accounts.session_epoch`, added by `v049`): every session
+token records the epoch it was minted under, the account row is compared
+against it on the same read that already checks whether the account is
+disabled, and the claim bumps the row inside the transaction that sets the
+password. The token the claim returns is minted at the new epoch, so the
+browser doing the claiming is the one session that survives.
+
+A token with no epoch at all reads as 0 — that is what a token minted before
+the column existed carries, and what a grandfathered `sub: "user"` session
+carries. An account that has never been claimed is also at 0, so an upgrade
+logs nobody out; a claim moves the account to 1 and all of them stop. Nothing
+else moves it: a password change does not, because that endpoint hands back no
+token and would sign the person changing their password out of the tab they
+changed it in.
+
+Two limits worth knowing. The epoch is per *account*, so it is the right shape
+for "end every session on this account" and no shape at all for "sign out this
+one device", which nothing here offers. And an **already-open WebSocket keeps
+the identity it was accepted with** until it reconnects — the same rule
+disablement follows, for the same reason (a socket is open for hours and
+re-reading identity mid-stream would attribute one message differently from the
+one before it).
+
 **Passwordless is bounded to one account.** With two accounts it is not a weaker
 login, it is an unanswerable question: nothing distinguishes the callers, so
 every one of them would be whoever the code picked. So a second account cannot
