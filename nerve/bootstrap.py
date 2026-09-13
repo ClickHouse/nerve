@@ -3,11 +3,14 @@
 Each step explains what the component does before asking for configuration.
 All choices are collected in memory; nothing is written until the final apply step.
 Ctrl+C at any point leaves the system untouched.
+
+What the wizard *asks* lives here. What setup *writes* lives in
+:mod:`nerve.setup_writer`, because the web setup wizard has to produce the
+same configuration this does, and two implementations of setup drift.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import stat
@@ -15,7 +18,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,207 +25,44 @@ import click
 import yaml
 
 from nerve import paths
-from nerve.config import _expand_path, _interpolate_str, workspace_settings_file
+from nerve.config import workspace_settings_file
+from nerve.setup_writer import (
+    CORE_CRONS,
+    PRODUCTIVITY_CRONS,
+    SetupChoices,
+    bedrock_geo_prefix,
+    build_config_layers,
+    # Re-exported under its old private name: this module has been its import
+    # site since the wizard was written, and `nerve init` is not the only
+    # caller that expands a workspace path the way the loader does.
+    expand_workspace as _expand_workspace,
+    leaf_paths,
+    write_config_local_yaml,
+    write_config_yaml,
+    write_cron_jobs,
+    workspace_dir,
+    write_workspace_settings,
+)
 from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
     install_config_scaffold,
 )
 
-
-# --- Cron definitions for the wizard ---
-
-# Core crons are always enabled and not presented for selection.
-CORE_CRONS = [
-    {
-        "id": "memory-maintenance",
-        "schedule": "0 5 * * *",
-        "description": "Daily memory cleanup — dedup, prune stale entries, improve wording",
-        "session_mode": "isolated",
-        "model": "",
-        "prompt": (
-            "You are running a daily memory maintenance job. Work completely silently — do not output any text, only think.\n\n"
-            "Do the following:\n\n"
-            "## Phase 1: Gather Yesterday's Data\n\n"
-            "1. Use memory_records_by_date(date=yesterday, updated=true, limit=200) to get ALL records created or updated yesterday.\n"
-            "2. Optionally: use conversation_history(date=yesterday) for additional event context.\n\n"
-            "## Phase 2: Evaluate Each Record\n\n"
-            "For each record from yesterday, evaluate and act:\n"
-            "- **Exact duplicates**: Same fact already stored elsewhere → delete the worse copy\n"
-            "- **Category-redundant**: Adds nothing beyond category summary → delete\n"
-            "- **Stale/completed**: No longer true → delete\n"
-            "- **Generic knowledge**: Textbook facts not personal to the user → delete\n"
-            "- **Meta-noise**: Observations about the memory system itself → delete\n"
-            "- **Improvable**: Poorly worded or could be more useful → update via memory_update\n\n"
-            "## Phase 3: Category Review\n\n"
-            "If yesterday's memories revealed new important context, check whether category summaries need updating.\n\n"
-            "Rules:\n"
-            "- Never delete entries about people, relationships, or preferences unless exact duplicates\n"
-            "- Never delete actionable/pending items\n"
-            "- Updating is better than deleting\n"
-            "- When in doubt, keep the memory\n"
-            "- Do NOT log or memorize anything about this maintenance run\n"
-        ),
-    },
+# The wizard's answers, the layering rules and the four writers live in
+# nerve.setup_writer, so the web setup wizard writes configuration through
+# exactly the code `nerve init` does rather than through a second
+# implementation that drifts. Re-exported here because this module has been
+# their import site since the wizard was written.
+__all__ = [
+    "CORE_CRONS",
+    "PRODUCTIVITY_CRONS",
+    "SetupChoices",
+    "SetupWizard",
+    "bedrock_geo_prefix",
+    "is_fresh_install",
+    "run_non_interactive",
 ]
-
-# Productivity crons the user can enable/disable.
-PRODUCTIVITY_CRONS = [
-    {
-        "id": "inbox-processor",
-        "name": "Inbox Processor",
-        "schedule": "*/30 * * * *",
-        "description": "Polls your connected sources (email, GitHub, Telegram) every 30 minutes. Creates tasks for actionable items, memorizes important facts, and sends you notifications for urgent things.",
-        "requires": "At least one sync source connected",
-        "session_mode": "persistent",
-        "context_rotate_hours": 24,
-        "reminder_mode": True,
-        # Skip idle polls: only wake when the inbox actually has new messages.
-        # No "sources" list → any source the "inbox" consumer tracks.
-        "run_if": [{"type": "messages", "consumer": "inbox"}],
-        "prompt": (
-            "Process the sync inbox by calling poll_all_sources(consumer=\"inbox\").\n\n"
-            "If there are new messages, review them and take appropriate action:\n"
-            "- **Create tasks** (via task_create) for items requiring follow-up\n"
-            "- **Memorize** important facts (via memorize) worth remembering\n"
-            "- **Ignore** routine notifications, spam, or low-signal items\n\n"
-            "Cross-source deduplication: if multiple sources report the same event, treat as ONE.\n\n"
-            "**Notifications — use them!**\n"
-            "- Use `notify` for urgent/high-priority items\n"
-            "- Use `ask_user` when unsure\n"
-            "- Do NOT notify for routine items\n\n"
-            "Be selective. If no new messages, reply \"No new messages.\"\n"
-        ),
-    },
-    {
-        "id": "task-planner",
-        "name": "Task Planner",
-        "schedule": "0 */4 * * *",
-        "description": "Every 4 hours, reviews your open tasks and proposes implementation plans. Plans go through an approval flow — nothing is executed without your OK.",
-        "requires": None,
-        "session_mode": "persistent",
-        "context_rotate_hours": 168,
-        "reminder_mode": False,
-        # Only fire when there is actually something to plan.
-        "run_if": [{"type": "tasks", "status": "pending"}],
-        "prompt": (
-            "You are a proactive planning agent. Your job is to find a task worth working on and produce an implementation plan.\n\n"
-            "1. Use task_list to browse open tasks\n"
-            "2. Use plan_list to see which tasks already have plans — skip those\n"
-            "3. Pick ONE task and explore the relevant codebase\n"
-            "4. Call plan_propose(task_id, content) with your plan\n\n"
-            "If all tasks have plans or none are actionable, say so and stop.\n\n"
-            "After proposing a plan, use `notify` to alert the user.\n"
-        ),
-    },
-    {
-        "id": "skill-extractor",
-        "name": "Skill Extractor",
-        "schedule": "0 */12 * * *",
-        "description": "Every 12 hours, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
-        "requires": None,
-        "session_mode": "persistent",
-        "context_rotate_hours": 168,
-        "reminder_mode": False,
-        "prompt": (
-            "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
-            "1. Recall recent behavior patterns and events\n"
-            "2. Check existing skills to avoid duplicates\n"
-            "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
-            "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
-            "If no candidates found, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
-        ),
-    },
-    {
-        "id": "skill-reviser",
-        "name": "Skill Reviser",
-        "schedule": "0 3 * * 0",
-        "description": "Weekly review of existing skills — checks if instructions are still accurate, complete, and well-written. Proposes fixes through the approval flow.",
-        "requires": None,
-        "session_mode": "persistent",
-        "context_rotate_hours": 168,
-        "reminder_mode": False,
-        "prompt": (
-            "You are a skill revision agent. Review existing skills and propose improvements.\n\n"
-            "1. Load all skills and their content\n"
-            "2. Check accuracy (outdated paths, commands, URLs)\n"
-            "3. Check completeness (missing steps, known gotchas)\n"
-            "4. Check quality (clear descriptions, good trigger phrases)\n"
-            "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
-            "If all skills look good, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
-        ),
-    },
-]
-
-# Default memory categories for a fresh install.
-# Generic enough for any user — they can customize in config.yaml later.
-_PERSONAL_MEMORY_CATEGORIES = [
-    {"name": "personal_info", "description": "Identity, contact details, timezone, background"},
-    {"name": "preferences", "description": "Communication style, tool preferences, how things should be done"},
-    {"name": "relationships", "description": "People, dynamics, contact context"},
-    {"name": "work", "description": "Job, projects, PRs, code reviews, meetings"},
-    {"name": "infrastructure", "description": "Servers, deployments, CI/CD, system ops"},
-    {"name": "finances", "description": "Accounts, payments, subscriptions, budgets"},
-    {"name": "tasks_deadlines", "description": "Active tasks, deadlines, pending follow-ups"},
-    {"name": "conversations", "description": "Key things said, promises, follow-ups"},
-    {"name": "agent_ops", "description": "Operational lessons, memory design, prompt tuning"},
-    {"name": "people", "description": "Information and facts about people"},
-]
-
-_WORKER_MEMORY_CATEGORIES = [
-    {"name": "task_domain", "description": "Domain-specific knowledge: CI systems, APIs, database schemas, repo structure"},
-    {"name": "patterns", "description": "Recurring patterns: common failure modes, root causes, known flaky tests, seasonal issues"},
-    {"name": "procedures", "description": "How to do things: reproduction steps, debug workflows, fix templates that worked"},
-    {"name": "decisions", "description": "Past decisions and outcomes: what was tried, what worked, why approach X over Y"},
-    {"name": "approvals", "description": "What got approved/rejected, approval preferences, risk thresholds"},
-    {"name": "contacts", "description": "People involved: who owns what, who to notify, escalation paths"},
-    {"name": "infrastructure", "description": "Systems, endpoints, service dependencies, deployment details"},
-    {"name": "agent_ops", "description": "Operational lessons about the worker itself: tool gotchas, performance observations"},
-]
-
-
-@dataclass
-class SetupChoices:
-    """Collected user choices — nothing is written until apply()."""
-
-    deployment: str = "server"  # "server" or "docker"
-    mode: str = "personal"
-    anthropic_api_key: str = ""
-    openai_api_key: str = ""
-    use_proxy: bool = False  # Use CLIProxyAPI instead of direct API key
-    # Provider
-    provider_type: str = "anthropic"  # "anthropic" | "bedrock"
-    aws_region: str = ""
-    aws_profile: str = ""
-    workspace_path: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
-    timezone: str = "America/New_York"
-    user_name: str = ""
-    telegram_bot_token: str = ""
-    # Telegram user IDs authorized to DM the bot. Empty = pair after setup
-    # via `nerve pair` + /pair <code>.
-    telegram_allowed_users: list[int] = field(default_factory=list)
-    password: str = ""  # plaintext during wizard, hashed at write time
-    enabled_crons: list[str] = field(default_factory=list)
-    # sync sources
-    github_sync: bool = False
-    gmail_sync: bool = False
-    gmail_accounts: list[str] = field(default_factory=list)
-    telegram_sync: bool = False
-    telegram_api_id: int = 0
-    telegram_api_hash: str = ""
-    # docker credential forwarding
-    claude_oauth_token: str = ""  # OAuth token (from keychain/credentials.json/manual)
-    github_token: str = ""  # GitHub PAT (from gh auth token/env)
-    # worker-specific
-    task_description: str = ""
-    # external agents (Codex, Claude Code, ...)
-    external_agents: list[str] = field(default_factory=list)
-    external_agents_conflict_policy: str = "backup"   # "backup" | "skip" | "merge"
-    external_agents_mcp_url: str = ""                  # e.g. "https://localhost:8900/mcp/v1/"
-    external_agents_token: str = ""                    # bearer JWT (one-shot at bootstrap)
-
 
 # --- Credential resolution (priority waterfall) ---
 
@@ -365,22 +204,6 @@ def _resolve_gh_token() -> tuple[str, str]:
 
 
 # --- Bedrock helpers ---
-
-
-def bedrock_geo_prefix(region: str) -> str:
-    """Map an AWS region to its Bedrock cross-region inference-profile prefix.
-
-    Bedrock inference profiles are geography-scoped: ``us.``, ``eu.`` and
-    ``apac.``. Writing a ``us.`` model ID for an ``eu-*`` region yields an
-    instant 400 ("The provided model identifier is invalid").
-    """
-    region = (region or "").lower()
-    if region.startswith("eu-"):
-        return "eu"
-    if region.startswith(("ap-", "au-")):
-        return "apac"
-    # us-*, ca-*, sa-*, mx-* and unknown regions route via the US profile
-    return "us"
 
 
 # --- Credential validators (used by the wizard and preflight) ---
@@ -1991,459 +1814,89 @@ class SetupWizard:
             )
 
     def _workspace_dir(self) -> Path:
-        """The workspace path, expanded the same way the config loader does.
-
-        nerve/config.py resolves `workspace` with ${VAR} interpolation *and*
-        expandvars/expanduser. Expanding differently here would put
-        settings.yaml somewhere the loader never looks — the wizard would
-        report success and every portable setting would be silently lost.
-        """
-        return _expand_workspace(str(self.choices.workspace_path))
+        """The workspace path, expanded the same way the config loader does."""
+        return workspace_dir(self.choices)
 
     @staticmethod
     def _leaf_paths(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         """Flatten a nested dict to ``{"a.b": value}``. Lists are leaves."""
-        out: dict[str, Any] = {}
-        for key, value in d.items():
-            path = f"{prefix}{key}"
-            if isinstance(value, dict):
-                out.update(SetupWizard._leaf_paths(value, f"{path}."))
-            else:
-                out[path] = value
-        return out
-
-    @staticmethod
-    def _set_leaf(d: dict[str, Any], path: str, value: Any) -> None:
-        *parents, last = path.split(".")
-        node = d
-        for part in parents:
-            child = node.get(part)
-            if not isinstance(child, dict):
-                child = {}
-                node[part] = child
-            node = child
-        node[last] = value
-
-    @staticmethod
-    def _del_leaf(d: dict[str, Any], path: str) -> bool:
-        """Remove ``path``, pruning any dict it leaves empty. True if removed."""
-        *parents, last = path.split(".")
-        chain: list[tuple[dict[str, Any], str]] = []
-        node = d
-        for part in parents:
-            child = node.get(part)
-            if not isinstance(child, dict):
-                return False
-            chain.append((node, part))
-            node = child
-        if last not in node:
-            return False
-        del node[last]
-        for parent, key in reversed(chain):
-            if not parent[key]:
-                del parent[key]
-        return True
-
-    # Keys that describe *this box* and must never travel with the workspace
-    # repo. Everything else the wizard decides is shared behaviour and belongs
-    # in the tracked settings layer, so `nerve config sync` and lockdown mean
-    # something on a default install instead of being no-ops.
-    #
-    # A key must appear in exactly one of the two dicts below. config.yaml
-    # shadows settings.yaml, so writing a portable value to both would make
-    # the tracked copy dead weight -- edit it and nothing happens.
+        return leaf_paths(d, prefix)
 
     def _build_config_layers(
         self,
     ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-        """Split the wizard's answers into (machine-local, portable, shadowed).
-
-        ``shadowed`` lists dotted paths this run must *delete* from a
-        pre-existing settings.yaml rather than merely omit. The tracked file is
-        merge-preserving, so a key the wizard stops emitting would otherwise
-        remain at its old value. The case this covers is switching an install
-        away from Bedrock: ``provider.aws_region`` has to be removed, or the
-        tracked file keeps naming a region the box no longer uses.
-        """
-        machine: dict[str, Any] = {
-            "workspace": str(self.choices.workspace_path),
-            "deployment": self.choices.deployment,
-        }
-        shadowed: list[str] = []
-        portable: dict[str, Any] = {
-            "timezone": self.choices.timezone,
-            # Shared, not machine-local: these describe the deployment, and a
-            # fleet needs one place to set them. The wizard only ever wrote the
-            # declared defaults here, so while they lived in config.yaml the
-            # tracked layer could not state them at all. A box needing a
-            # different port still overrides in config.yaml.
-            #
-            # host/port only. gateway.ssl.cert and .key are local filesystem
-            # paths and stay machine-local.
-            "gateway": {
-                "host": "0.0.0.0",
-                "port": 8900,
-            },
-            "agent": {
-                "model": "claude-opus-5",
-                "cron_model": "claude-sonnet-4-6",
-                "max_turns": 50,
-                "max_concurrent": 32,
-                "thinking": "max",
-                "effort": "max",
-                "context_1m": True,
-            },
-            "quiet_start": "02:00",
-            "quiet_end": "08:00",
-            "memory": {
-                "recall_model": "claude-sonnet-4-6",
-                "memorize_model": "claude-sonnet-4-6",
-                "fast_model": "claude-haiku-4-5-20251001",
-                "embed_model": "text-embedding-3-small",
-                "categories": (
-                    _PERSONAL_MEMORY_CATEGORIES if self.choices.mode == "personal"
-                    else _WORKER_MEMORY_CATEGORIES
-                ),
-            },
-            # Cron config lives in workspace/config/cron (git-syncable); the
-            # loader resolves it from the workspace automatically, so no explicit
-            # cron paths are written here.
-            "sessions": {
-                "sticky_period_minutes": 120,
-                "archive_after_days": 30,
-                "max_sessions": 500,
-                "memorize_interval_minutes": 30,
-            },
-        }
-
-        if self.choices.mode == "personal":
-            # dm_policy/stream_mode are shared behaviour; `enabled` is not --
-            # it is derived from whether *this* machine was given a bot token,
-            # and the token itself lives in config.local.yaml.
-            machine["telegram"] = {"enabled": bool(self.choices.telegram_bot_token)}
-            portable["telegram"] = {
-                "dm_policy": "pairing",
-                "stream_mode": "partial",
-            }
-            portable["sync"] = {
-                "telegram": {"enabled": self.choices.telegram_sync},
-                "gmail": {"enabled": self.choices.gmail_sync},
-                "github": {"enabled": self.choices.github_sync},
-                "github_events": {"enabled": self.choices.github_sync},
-                # Disabled by default — requires an explicit list of repos to watch.
-                "github_repos": {"enabled": False, "repos": []},
-            }
-            # Which sources to sync is shared policy; *whose* mailboxes is
-            # not. These are personal addresses in a file the docs tell you to
-            # commit, and they are per-person rather than per-team.
-            machine.setdefault("sync", {})["gmail"] = {
-                "accounts": self.choices.gmail_accounts
-            }
-
-        # Provider and region are shared; only the AWS profile is a local
-        # credential handle. While the whole block was machine-local, a locked
-        # box never read it and fell back to the declared default, becoming an
-        # `anthropic` instance and then failing for a missing API key that lived
-        # in config.local.yaml, which lockdown also ignores.
-        portable["provider"] = {"type": self.choices.provider_type}
-        if self.choices.aws_profile:
-            machine["provider"] = {"aws_profile": self.choices.aws_profile}
-        if self.choices.provider_type == "bedrock":
-            portable["provider"]["aws_region"] = self.choices.aws_region
-            # The prefix is geography-scoped (us./eu./apac.) and must match the
-            # configured region or every call 400s. Since the region is now in
-            # the tracked layer, these belong there too.
-            geo = bedrock_geo_prefix(self.choices.aws_region)
-            for section, key, value in (
-                ("agent", "model", f"{geo}.anthropic.claude-opus-5"),
-                ("agent", "cron_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-                ("agent", "title_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
-                ("memory", "recall_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-                ("memory", "memorize_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-                ("memory", "fast_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
-            ):
-                portable[section][key] = value
-        else:
-            # Switching away from Bedrock. The non-prefixed model names in the
-            # base dict above already overwrite the geo-prefixed ones, so only
-            # the region needs deleting.
-            shadowed.append("provider.aws_region")
-
-        if self.choices.use_proxy:
-            # A local helper process on a local port.
-            machine["proxy"] = {"enabled": True, "port": 8317}
-
-        if self.choices.deployment == "docker":
-            machine["docker"] = {
-                "extra_mounts": [],  # e.g. ["~/code:/code", "~/projects:/projects"]
-            }
-
-        return machine, portable, shadowed
+        """Split the wizard's answers into (machine-local, portable, shadowed)."""
+        return build_config_layers(self.choices)
 
     def _write_config_yaml(self) -> None:
         """Write the machine-local base config.yaml."""
-        machine, _portable, _shadowed = self._build_config_layers()
-        config_path = self.config_dir / "config.yaml"
-        # encoding is pinned on every config read and write in this module, to
-        # match nerve.config, which pins it on the way in. Under an ASCII default
-        # encoding an unpinned open() raises on the em-dash in these headers, at
-        # the first write, before any user value is involved. A user value cannot
-        # trigger it: safe_dump escapes non-ASCII to \xNN, so the dumped body is
-        # always ASCII.
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.write("# Nerve — Machine-local configuration\n")
-            f.write("# Settings specific to this box: workspace location,\n")
-            f.write("# bind address, deployment style, local credentials handles.\n")
-            f.write("# Shared behaviour lives in <workspace>/config/settings.yaml,\n")
-            f.write("# which this file overrides. Secrets go in config.local.yaml.\n\n")
-            yaml.safe_dump(machine, f, default_flow_style=False, sort_keys=False)
+        write_config_yaml(self.choices, self.config_dir)
 
     def _write_workspace_settings(self) -> None:
         """Write the portable half into ``<workspace>/config/settings.yaml``.
 
-        Ownership model: the wizard owns the keys it generates and rewrites
-        them from this run's answers, exactly as it does for config.yaml.
-        Anything else in the file -- a team policy key, a hand-tuned setting
-        the wizard never emits -- is preserved untouched.
-
-        The alternative ("existing always wins") sounds safer for a file that
-        may be shared through git, but it means re-running init after changing
-        an answer silently does nothing: the wizard prompts for a timezone,
-        prints a tick, and discards the answer because the key already exists.
-        Overwriting is recoverable -- there is a .bak, and the file is in a
-        repo where the diff is visible before anyone commits it.
+        The writer decides what to merge and reports what it did; the words
+        below are this wizard's, because it is the half that talks to a
+        terminal. A file that is not YAML, or not a mapping, is left exactly
+        as it was — the operator is told rather than having a hand-written
+        settings file replaced by generated one.
         """
-        _machine, portable, shadowed = self._build_config_layers()
-        settings_path = workspace_settings_file(self._workspace_dir())
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-        raw = ""
-        existing: dict[str, Any] = {}
-        if settings_path.exists():
-            raw = settings_path.read_text(encoding="utf-8")
-            try:
-                loaded = yaml.safe_load(raw)
-            except yaml.YAMLError as e:
-                click.secho(
-                    f"\n    Warning: {settings_path} is not valid YAML ({e}) —"
-                    " leaving it alone.",
-                    fg="yellow",
-                )
-                return
-            if loaded is not None and not isinstance(loaded, dict):
-                click.secho(
-                    f"\n    Warning: {settings_path} is not a mapping —"
-                    " leaving it alone.",
-                    fg="yellow",
-                )
-                return
-            existing = loaded or {}
-
-        merged = copy.deepcopy(existing)
-        # Diff against the file as it was on disk, not against `merged` while
-        # it is being mutated. The two are equivalent -- no portable leaf path
-        # is a prefix of another, so a _set_leaf can only touch descendants of
-        # its own path -- but flattening once says what is meant and drops the
-        # per-key re-walk.
-        before_paths = self._leaf_paths(existing)
-        added, changed, removed = [], [], []
-        for path, value in self._leaf_paths(portable).items():
-            before = before_paths.get(path, _MISSING)
-            if before is _MISSING:
-                added.append(path)
-            elif before != value:
-                changed.append(f"{path}: {before!r} → {value!r}")
-            self._set_leaf(merged, path, value)
-        for path in shadowed:
-            if self._del_leaf(merged, path):
-                removed.append(path)
-
-        if merged == existing:
+        outcome = write_workspace_settings(self.choices)
+        if outcome.status == "invalid_yaml":
+            click.secho(
+                f"\n    Warning: {outcome.path} is not valid YAML"
+                f" ({outcome.detail}) — leaving it alone.",
+                fg="yellow",
+            )
+            return
+        if outcome.status == "not_a_mapping":
+            click.secho(
+                f"\n    Warning: {outcome.path} is not a mapping —"
+                " leaving it alone.",
+                fg="yellow",
+            )
+            return
+        if not outcome.wrote:
             return
 
         # safe_dump cannot round-trip comments, and this file is meant to be
         # read by other people in a PR. Say so rather than quietly deleting
         # someone's rationale.
-        if existing and any(
-            line.lstrip().startswith("#")
-            for line in raw.splitlines()[_SETTINGS_HEADER_LINES:]
-        ):
+        if outcome.comments_lost:
             click.secho(
-                f"\n    Note: comments in {settings_path.name} are not preserved"
+                f"\n    Note: comments in {outcome.path.name} are not preserved"
                 " when it is regenerated (the previous file is in"
-                f" {settings_path.name}.bak).",
+                f" {outcome.path.name}.bak).",
                 fg="yellow",
             )
 
-        with open(settings_path, "w", encoding="utf-8") as f:
-            f.write(_SETTINGS_HEADER)
-            yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=False)
-
-        for label, items in (("added", added), ("updated", changed),
-                             ("removed", removed)):
+        for label, items in (("added", outcome.added), ("updated", outcome.changed),
+                             ("removed", outcome.removed)):
             if items:
                 click.secho(f"\n    {label}: {', '.join(items)}", dim=True)
 
     def _write_config_local_yaml(self) -> None:
-        """Write config.local.yaml with secrets."""
-        local: dict[str, Any] = {}
+        """Write config.local.yaml with secrets.
 
-        if self.choices.anthropic_api_key:
-            local["anthropic_api_key"] = self.choices.anthropic_api_key
-
-        if self.choices.claude_oauth_token:
-            local["claude_oauth_token"] = self.choices.claude_oauth_token
-
-        if self.choices.github_token:
-            local["github_token"] = self.choices.github_token
-
-        if self.choices.openai_api_key:
-            local["openai_api_key"] = self.choices.openai_api_key
-
-        if self.choices.telegram_bot_token:
-            local["telegram"] = {
-                "bot_token": self.choices.telegram_bot_token,
-            }
-            if self.choices.telegram_allowed_users:
-                local["telegram"]["allowed_users"] = list(
-                    self.choices.telegram_allowed_users
-                )
-
-        # Sync credentials (secrets — go in local config)
-        if self.choices.telegram_sync and self.choices.telegram_api_id:
-            local.setdefault("sync", {})["telegram"] = {
-                "api_id": self.choices.telegram_api_id,
-                "api_hash": self.choices.telegram_api_hash,
-            }
-
-        # Auth: JWT secret + optional password hash
-        auth: dict[str, str] = {
-            "jwt_secret": secrets.token_hex(32),
-        }
-        if self.choices.password:
-            import bcrypt
-            hashed = bcrypt.hashpw(
-                self.choices.password.encode("utf-8"),
-                bcrypt.gensalt(),
-            ).decode("utf-8")
-            auth["password_hash"] = hashed
-        local["auth"] = auth
-
-        # The file holds the signing secret, the password hash and the API keys,
-        # so it is created owner-only. If the filesystem cannot keep it private,
-        # nothing is written and setup stops.
-        local_path = self.config_dir / "config.local.yaml"
+        If the file cannot be made owner-only, nothing is written and setup
+        stops.
+        """
         try:
-            paths.write_private_text(
-                local_path,
-                "# Nerve — Secrets (gitignored)\n"
-                "# API keys, tokens, and other sensitive configuration.\n\n"
-                + yaml.safe_dump(local, default_flow_style=False, sort_keys=False),
-            )
+            write_config_local_yaml(self.choices, self.config_dir)
         except paths.InsecureFileError as e:
             raise click.ClickException(
-                f"Setup stopped: {e} Nothing was written to {local_path}."
+                f"Setup stopped: {e} Nothing was written to "
+                f"{self.config_dir / 'config.local.yaml'}."
             ) from e
 
     def _write_cron_jobs(self) -> None:
         """Write system crons to system.yaml and scaffold jobs.yaml for user crons."""
-        jobs: list[dict[str, Any]] = []
-
-        # Core crons (always enabled)
-        for cron in CORE_CRONS:
-            jobs.append({
-                "id": cron["id"],
-                "schedule": cron["schedule"],
-                "prompt": cron["prompt"],
-                "description": cron["description"],
-                "model": cron.get("model", ""),
-                "session_mode": cron.get("session_mode", "isolated"),
-                "enabled": True,
-            })
-
-        if self.choices.mode == "personal":
-            # Productivity crons (personal mode)
-            for cron in PRODUCTIVITY_CRONS:
-                enabled = cron["id"] in self.choices.enabled_crons
-                job: dict[str, Any] = {
-                    "id": cron["id"],
-                    "schedule": cron["schedule"],
-                    "prompt": cron["prompt"],
-                    "description": cron["description"],
-                    "model": cron.get("model", ""),
-                    "session_mode": cron.get("session_mode", "isolated"),
-                    "enabled": enabled,
-                }
-                if cron.get("context_rotate_hours"):
-                    job["context_rotate_hours"] = cron["context_rotate_hours"]
-                if cron.get("reminder_mode"):
-                    job["reminder_mode"] = cron["reminder_mode"]
-                if cron.get("run_if"):
-                    job["run_if"] = cron["run_if"]
-                jobs.append(job)
-        elif self.choices.mode == "worker":
-            # Workers get skill crons — they create skills during onboarding
-            # and those skills should be maintained automatically.
-            # Other crons (task-planner, etc.) can be added during onboarding.
-            _WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner")
-            for cron in PRODUCTIVITY_CRONS:
-                if cron["id"] not in _WORKER_CRONS:
-                    continue
-                enabled = cron["id"] in self.choices.enabled_crons
-                job = {
-                    "id": cron["id"],
-                    "schedule": cron["schedule"],
-                    "prompt": cron["prompt"],
-                    "description": cron["description"],
-                    "model": cron.get("model", ""),
-                    "session_mode": cron.get("session_mode", "isolated"),
-                    "enabled": enabled,
-                }
-                if cron.get("context_rotate_hours"):
-                    job["context_rotate_hours"] = cron["context_rotate_hours"]
-                if cron.get("reminder_mode"):
-                    job["reminder_mode"] = cron["reminder_mode"]
-                if cron.get("run_if"):
-                    job["run_if"] = cron["run_if"]
-                jobs.append(job)
-
-        # Cron config lives in the git-syncable workspace/config/cron subtree.
-        # Via _workspace_dir for the reason spelled out there: expanding only
-        # `~` here sent a `workspace: ${VAR}` install's jobs to a literal
-        # "./${VAR}/config/cron" beside the process CWD, where nothing loads
-        # them, while settings.yaml landed correctly and the wizard reported
-        # success.
-        cron_dir = self._workspace_dir() / "config" / "cron"
-        cron_dir.mkdir(parents=True, exist_ok=True)
-        (cron_dir / "gates").mkdir(parents=True, exist_ok=True)
-
-        # Write system crons (managed by nerve init, safe to regenerate)
-        system_file = cron_dir / "system.yaml"
-
-        with open(system_file, "w", encoding="utf-8") as f:
-            f.write("# Nerve — System Cron Jobs\n")
-            f.write("# Managed by 'nerve init'. Safe to re-generate.\n")
-            f.write("# To add custom crons, use jobs.yaml instead.\n\n")
-            yaml.safe_dump({"jobs": jobs}, f, default_flow_style=False, sort_keys=False)
-
-        # Create jobs.yaml scaffold if it doesn't exist. If this is an upgrade
-        # from a legacy install, preserve the user's existing custom crons by
-        # copying the legacy jobs.yaml rather than writing a blank placeholder
-        # (a blank one here would shadow the legacy jobs — see _resolve_cron_dir).
-        jobs_file = cron_dir / "jobs.yaml"
-        if not jobs_file.exists():
-            legacy_jobs = paths.cron_dir() / "jobs.yaml"
-            if legacy_jobs.exists():
-                shutil.copy2(legacy_jobs, jobs_file)
-                click.echo(
-                    f"\n    Migrated custom crons from {legacy_jobs} to {jobs_file}",
-                )
-            else:
-                with open(jobs_file, "w", encoding="utf-8") as f:
-                    f.write("# Nerve — Custom Cron Jobs\n")
-                    f.write("# Add your own cron jobs here. Nerve will never overwrite this file.\n")
-                    f.write("# Format is the same as system.yaml — see it for examples.\n\n")
-                    f.write("jobs: []\n")
+        outcome = write_cron_jobs(self.choices)
+        if outcome.migrated_from is not None:
+            click.echo(
+                f"\n    Migrated custom crons from {outcome.migrated_from} to"
+                f" {outcome.jobs_file}",
+            )
 
     # --- Preflight ---
 
@@ -2724,42 +2177,6 @@ def _has_config_content(path: Path) -> bool:
     except (OSError, yaml.YAMLError):
         return True  # can't tell — err towards keeping a backup
     return bool(data)
-
-
-def _expand_workspace(raw: str) -> Path:
-    """Expand a workspace path exactly as nerve.config resolves it.
-
-    Delegates to ``_expand_path`` rather than repeating it. The previous
-    implementation reversed the order (``expanduser`` before ``expandvars``) and
-    did not strip, and both mattered: ``expanduser`` only expands a *leading*
-    ``~``, so a value carrying leading whitespace — a ``NERVE_WORKSPACE`` with a
-    trailing newline, say — was not expanded at all, and the wizard wrote
-    settings.yaml to a directory the loader never reads.
-
-    Blank means unset, as it does for every other path setting, so it falls back
-    to the same default the loader uses.
-    """
-    if "${" in raw:
-        raw = _interpolate_str(raw, [])
-    return _expand_path(raw) or paths.default_workspace()
-
-
-_MISSING = object()
-
-# Regenerated verbatim on every write; anything below it is user content, so
-# the comment-loss warning only fires for comments the operator added.
-_SETTINGS_HEADER = """\
-# Nerve — Shared configuration
-# Git-tracked and portable: this is the layer that syncs between machines and
-# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
-# which overrides this file. Secrets belong in config.local.yaml or behind an
-# ${ENV_VAR} reference — never here.
-#
-# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
-# does not generate are left alone.
-
-"""
-_SETTINGS_HEADER_LINES = _SETTINGS_HEADER.count("\n")
 
 
 # --- Docker file templates ---
