@@ -691,9 +691,15 @@ def _merge_settings(
         for line in raw.splitlines()[_SETTINGS_HEADER_LINES:]
     )
 
-    with open(settings_path, "w", encoding="utf-8") as f:
-        f.write(_SETTINGS_HEADER)
-        yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=False)
+    # Rendered in full, then published by rename. Dumping straight into the
+    # destination truncates it first, so a failure part way through — a dump
+    # that raises on an unserialisable value, a full disk — leaves the tracked
+    # settings of a working install as however much of the new file got
+    # written. That file is the one an operator shares through git and the one
+    # the mandatory restart reads.
+    publish_text(settings_path, _SETTINGS_HEADER + yaml.safe_dump(
+        merged, default_flow_style=False, sort_keys=False,
+    ))
 
     return SettingsOutcome(
         status="written",
