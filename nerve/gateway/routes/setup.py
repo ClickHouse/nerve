@@ -610,12 +610,18 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
                 status_code=400,
                 detail=f"{timezone!r} is not a time zone this machine knows.",
             ) from e
+        # Both halves or neither. The name goes into the database and the zone
+        # into a file, and a request that asked for both must not land the name
+        # and then answer with the failure of the other — a committed write
+        # reported as a failure is a form that primes a retry which can only
+        # conflict with what already happened.
+        _require_writable(context.config)
 
     db = get_deps().db
     if req.display_name is not None:
-        # Written before the configuration, because it is the half that cannot
-        # fail on a read-only instance — and under lockdown it is the only half
-        # that runs at all.
+        # Written first because it is the half that works on a read-only
+        # instance: under lockdown, naming yourself is the one thing the
+        # checklist can still do.
         if not actor.account_id:  # pragma: no cover - require_account checked
             raise HTTPException(status_code=403, detail="No account to rename")
         account = await db.get_account(actor.account_id)

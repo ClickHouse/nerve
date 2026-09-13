@@ -69,6 +69,9 @@ const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const apiLogin = api.login as unknown as ReturnType<typeof vi.fn>;
 const checkAuth = api.checkAuth as unknown as ReturnType<typeof vi.fn>;
 const setupState = api.setupState as unknown as ReturnType<typeof vi.fn>;
+const setupClaim = api.setupClaim as unknown as ReturnType<typeof vi.fn>;
+const me = api.me as unknown as ReturnType<typeof vi.fn>;
+const listActors = api.listActors as unknown as ReturnType<typeof vi.fn>;
 
 const UNCLAIMED = {
   auth_required: false, mode: 'local', login: 'none',
@@ -126,6 +129,40 @@ describe('an unclaimed instance', () => {
     // optional setup token.
     expect(screen.getByLabelText('Setup token')).toBeTruthy();
     expect(screen.getByRole('button', { name: /claim and sign in/i })).toBeTruthy();
+  });
+
+  it('claiming from that tab leaves it signed in, not back at a form', async () => {
+    const userEvent = (await import('@testing-library/user-event')).default;
+    authStatus.mockResolvedValueOnce(UNCLAIMED).mockResolvedValue(CLAIMED);
+    apiLogin.mockRejectedValue(new Error('401: Unauthorized'));
+    checkAuth.mockResolvedValue({ authenticated: true });
+    listActors.mockResolvedValue({ actors: [] });
+    me.mockResolvedValue({
+      actor_id: 'actor-1', account_id: 'acc-1', username: 'alice',
+      display_name: null, kind: 'human',
+    });
+    setupClaim.mockResolvedValue({
+      token: 'a-fresh-session', account_id: 'acc-1', actor_id: 'actor-1',
+      username: 'alice', display_name: null,
+    });
+    setupState.mockResolvedValue({
+      setup_pending: false, lockdown: false, writable: true,
+      read_only_reason: null, restart_pending: false, restart_pending_paths: [],
+      finished: true, steps: [], crons: [],
+    });
+    (getToken as unknown as ReturnType<typeof vi.fn>).mockReturnValue(null);
+
+    renderApp('/');
+    await screen.findByRole('form', { name: 'Claim this instance' });
+    await userEvent.type(screen.getByLabelText('Username'), 'alice');
+    await userEvent.type(screen.getByLabelText('Password'), 'a-real-password');
+    // From here the stored token is what a signed-in tab would have.
+    (getToken as unknown as ReturnType<typeof vi.fn>).mockReturnValue('a-fresh-session');
+    await userEvent.click(screen.getByRole('button', { name: /claim and sign in/i }));
+
+    await waitFor(() => expect(useAuthStore.getState().authenticated).toBe(true));
+    // Not the login page: the password it just set is not something to retype.
+    expect(screen.queryByRole('form', { name: 'Claim this instance' })).toBeNull();
   });
 });
 

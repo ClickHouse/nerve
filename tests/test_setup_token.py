@@ -187,3 +187,59 @@ class TestTheTokenLifecycle:
         with caplog.at_level("WARNING"):
             setup_token.announce(None, host="127.0.0.1", port=8900)
         assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+class TestWhereTheTokenIsPrinted:
+    """It is a credential: the channels it appears on are chosen, not incidental."""
+
+    async def test_doctor_names_the_state_but_never_the_token(
+        self, open_identity_db, tmp_path, monkeypatch,
+    ):
+        """`nerve doctor` is also produced for the Telegram ``/doctor``
+        command, so a live credential in it would be a credential in a chat
+        log. It says where to find the token instead."""
+        from nerve.cli import doctor_report
+
+        db, _identity = await open_identity_db(tmp_path / "nerve.db")
+        try:
+            token = await setup_token.ensure_setup_token(db, unclaimed=True)
+        finally:
+            await db.close()
+        monkeypatch.setattr("nerve.paths.db_path", lambda: tmp_path / "nerve.db")
+
+        report = doctor_report(NerveConfig(workspace=tmp_path / "workspace"))
+        assert token not in report
+        assert "passwordless" in report
+        assert "/setup" in report
+
+    async def test_status_prints_it_on_the_machine(
+        self, open_identity_db, tmp_path, monkeypatch, capsys,
+    ):
+        """`nerve status` is a terminal command on the box, which is exactly
+        who the token is for."""
+        from nerve.cli import _echo_setup_token
+
+        db, _identity = await open_identity_db(tmp_path / "nerve.db")
+        try:
+            token = await setup_token.ensure_setup_token(db, unclaimed=True)
+        finally:
+            await db.close()
+        monkeypatch.setattr("nerve.paths.db_path", lambda: tmp_path / "nerve.db")
+
+        _echo_setup_token(NerveConfig())
+        printed = capsys.readouterr().out
+        assert token in printed
+        assert "/setup" in printed
+
+    async def test_status_says_nothing_once_the_instance_is_claimed(
+        self, open_identity_db, tmp_path, monkeypatch, capsys,
+    ):
+        from nerve.cli import _echo_setup_token
+
+        db, _identity = await open_identity_db(tmp_path / "nerve.db")
+        await db.close()
+        monkeypatch.setattr("nerve.paths.db_path", lambda: tmp_path / "nerve.db")
+
+        _echo_setup_token(NerveConfig())
+        assert capsys.readouterr().out == ""
