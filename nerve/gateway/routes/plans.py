@@ -146,6 +146,17 @@ async def approve_plan(
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
 
+    # The prompt is assembled by Nerve from the task file and the approved
+    # plan — nobody typed it — so the turn is the instance's own work even
+    # though a person's approval started it. The session below carries who
+    # approved.
+    #
+    # Resolved here, before anything is written: the next statement moves the
+    # plan to 'implementing', which the guard above then refuses to approve
+    # again. Failing after that would strand the plan with no implementation
+    # and no way to retry it.
+    impl_actor = await system_actor(deps.db)
+
     # Mark plan as implementing immediately (prevents double-approve)
     await deps.db.update_plan(plan_id, status="implementing", reviewed_at=now)
 
@@ -224,12 +235,6 @@ async def approve_plan(
     # session (without registration, the asyncio.Task is invisible to
     # `engine.stop_session` and the only way to recover is a daemon
     # restart).
-    # The prompt is assembled by Nerve from the task file and the approved
-    # plan — nobody typed it — so the turn is the instance's own work even
-    # though a person's approval started it. The session above carries who
-    # approved.
-    impl_actor = await system_actor(deps.db)
-
     async def _run_impl():
         try:
             await deps.engine.run(
