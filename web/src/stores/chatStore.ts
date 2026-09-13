@@ -1092,13 +1092,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
     //
-    // The sender is stamped here because nobody else can: the gateway excludes
-    // this tab from the `user_message` echo, so this row is the only copy that
-    // exists until the transcript is re-read. Without it a two-person session
-    // holds one attributed message and one unattributed one in each tab, which
-    // the visibility rule reads as a single person — and neither side sees a
-    // label until a reload. Null when identity could not be read at all,
-    // which is the ordinary unattributed path.
+    // The gateway excludes this tab from its own `user_message` echo, so stamp
+    // the optimistic row with the same stable author id the stored row gets.
+    // Null identity follows the ordinary unattributed-history path.
     const sender = selfActorId();
     set((state) => ({
       messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString(), actor_id: sender }],

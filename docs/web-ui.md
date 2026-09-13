@@ -142,84 +142,25 @@ out", which is what discards all of that first.
 
 ### Attribution
 
-Who sent a message and who started a session, for installs where more than one
-person shares the agent.
+Messages and sessions store stable actor ids, never names. The UI resolves their
+current names from `GET /api/actors`: Nerve is always labelled, while a human is
+labelled only when their actor id differs from the signed-in viewer. Thus Alice
+does not see repeated labels on her own history, but Bob sees Alice throughout
+an Alice-only transcript and sidebar. The same rule applies to the open-session
+header; on phones it keeps the name visible and hides only the "Started by"
+verb visually.
 
-Sessions and messages store an *actor id* and never a name. The UI turns the id
-into a name at render time from `GET /api/actors`, so renaming somebody changes
-every label and rewrites no stored row. Nothing caches a name: the map is held
-in memory by `actorStore`, never in `localStorage`, and never written onto a
-message or session object.
+Null ids in legacy or unidentified-human history render no attribution element.
+Names are held only in memory. Equal rendered names get collision-safe id
+suffixes in visible text, and a missing display name uses `Unnamed account`.
+The system principal uses `Nerve` and a bot glyph.
 
-**Where labels appear.** A label has to earn its space by telling two things
-apart, so it is not shown everywhere an id exists:
-
-- **A message** is labelled with its sender's name when the sender is the
-  agent's own principal, or when two or more distinct people have spoken in
-  that session. One person talking to themselves — every conversation on a
-  single-account install — shows no labels at all. The first message from a
-  second person labels the earlier ones too, because that is the moment they
-  became ambiguous.
-- **A session list row** is marked under the same rule: a glyph for sessions the
-  agent started itself, a truncated name for a person once a second person has
-  started something. The System group is not marked; its rows already carry the
-  agent glyph.
-- **The chat header** names the creator of the open session whenever there is
-  one, without waiting for a second person: it describes one session, so it is
-  an answer rather than a repetition. Below the `md` breakpoint it sheds the
-  *verb*, not the name — it reads `Alice` on a phone and `Started by Alice`
-  above that, with the verb kept in the DOM for screen readers — because on a
-  phone this is the only place a shared session's owner can be read, the list
-  being behind a drawer, and a glyph alone looks the same for everybody.
-
-**Your own messages.** A message you have just sent exists in your transcript
-before it exists anywhere else, and the server excludes you from its own echo,
-so the app stamps it with your actor id as it is created. Without that, a fresh
-two-tab exchange leaves each tab holding one attributed message and one
-unattributed one, which reads as a single person and suppresses every label on
-both sides. The id is the `actor_id` of the account this session was confirmed
-as — the same `/api/accounts/me` read that binds the session-expired overlay to
-one person, not a second lookup of its own, so there is one answer to "who is
-signed in" and nothing that can disagree with it. A caller with no account row
-gets no id, which is the ordinary unattributed path.
-
-**Identity is per authentication session.** It is resolved *before* a session is
-announced as authenticated and committed in the same update, so there is no
-window in which the app is usable and who you are is unknown — nothing to race,
-and no message that can go out unstamped. It is dropped whenever a session ends,
-and on the expired-session overlay it can only be replaced by a positively
-confirmed match for the same account; a different person there is a sign-out.
-A sign-in or startup check whose session ends while it is still deciding is
-discarded rather than committed. Otherwise a slow answer from one session could
-label the next person's messages with the previous person's actor — worse than
-no attribution, because it is a false statement rather than a missing one.
-
-**The null rule.** `actor_id` and `created_by_actor_id` are frequently `null`,
-and `null` renders *exactly* as the UI did before attribution existed: no chip,
-no placeholder, no "unknown user". That covers every assistant and tool row
-(their authorship is their role), everything recorded before the columns
-existed, and any message sent while the signed-in actor could not be read.
-
-**Names are snapshots.** An actor with no display name, and an id this instance
-does not know, both read `Unnamed account`; the raw id is in the tooltip, never
-in the label. The agent's own principal reads `Nerve` with a bot glyph and a
-tooltip saying it is scheduled or autonomous work. Display names are not
-identity and two people can share one, so when two actors would render the same
-label both get a suffix of their own id appended — `Alex (a0000ab)` — in the
-label itself rather than only the tooltip, since a phone has no hover. The
-suffix is as long as it has to be to be unique within that group of names,
-growing past its six-character floor and as far as the whole id if two ids
-share a tail.
-
-The map is re-read once per app session, again when an id it has not seen
-appears (somebody added in another tab, including one that appears *while* a
-lookup is in flight — the read keeps following up until nothing is queued), and
-again after every mutation on `/accounts`, which is what makes a rename show up
-in the chat without a reload. An id that a completed read did not know is never
-requested again, so history pointing at an actor this instance has never had
-costs one request rather than one per render. Responses commit only if they are
-still current, so a lookup already on the wire cannot repopulate the map after a
-logout, and two overlapping re-reads cannot land the older snapshot last.
+Optimistic and live messages carry actor ids so labels are correct before a
+reload. The actor directory coalesces concurrent reads and performs one
+follow-up for ids arriving while a read is in flight. Account mutations force a
+refresh, so same-tab renames update immediately without rewriting messages;
+renames in another tab converge on reload. Request generations prevent a stale
+lookup from repopulating the map after logout or overwriting a newer refresh.
 
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
@@ -266,8 +207,8 @@ cd web && npx vite build
 Uses Zustand for lightweight state management:
 - `authStore` — Login/logout, token management
 - `actorStore` — The actor id → display name map behind attribution labels. In
-  memory only and re-read rather than remembered, so a rename is visible without
-  a reload and no stale name can outlive it
+  memory only; same-tab account mutations refresh it, while cross-tab renames
+  converge on reload
 - `chatStore` — Sessions, messages, streaming state, agent status, side panel state (tabs, visibility, width), pending interactions (mid-turn user input), sidebar collapsed state, text selection quotes, modified files tracking. WebSocket message handling is dispatched to domain-specific handler modules under `handlers/`, with stateless helpers under `helpers/`.
 - `taskStore` — Task list, search, filters, detail view with content editing
 - `skillsStore` — Skills list with usage stats, detail view with SKILL.md editor, create/update/delete/toggle, filesystem sync
