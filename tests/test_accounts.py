@@ -81,7 +81,7 @@ def _corrupt_system_actor(path, shape: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v047_has_only_the_launch_identity_model(db: Database):
+async def test_schema_has_only_the_launch_identity_model(db: Database):
     from nerve.db.migrations import v047_accounts
 
     number = int(v047_accounts.__name__.rsplit(".", 1)[1].split("_", 1)[0][1:])
@@ -97,7 +97,7 @@ async def test_v047_has_only_the_launch_identity_model(db: Database):
     }
     assert await _columns(db, "accounts") == {
         "id", "actor_id", "username", "credential_source", "credential",
-        "enabled", "created_at",
+        "enabled", "created_at", "session_epoch",
     }
     assert await _columns(db, "instance_secrets") == {"name", "value"}
 

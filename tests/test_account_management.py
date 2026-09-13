@@ -71,12 +71,16 @@ class _Install:
         )
 
     async def set_credential(
-        self, *, credential_source: str, credential: str | None = None,
+        self,
+        *,
+        credential_source: str,
+        credential: str | None = None,
+        account_id: str | None = None,
     ) -> None:
         """Seed a credential shape without a fixture-only production method."""
         await self.db._write(
             "UPDATE accounts SET credential_source = ?, credential = ? WHERE id = ?",
-            (credential_source, credential, self.owner_id),
+            (credential_source, credential, account_id or self.owner_id),
         )
 
 
@@ -555,8 +559,8 @@ class TestOwnPassword:
         second = await install.db.create_managed_account(
             username="bob", credential=hash_password(_PASSWORD),
         )
-        await install.db.set_account_credential(
-            second["id"], credential_source="none", credential=None,
+        await install.set_credential(
+            account_id=second["id"], credential_source="none",
         )
         async with _client(install.app) as client:
             response = await client.put(
@@ -720,6 +724,9 @@ class TestTheRouteSurface:
                 if endpoint is None:
                     continue
                 gates = [
+                    dependency.dependency.__name__
+                    for dependency in route.dependencies
+                ] + [
                     p.default.dependency.__name__
                     for p in inspect.signature(endpoint).parameters.values()
                     if getattr(p.default, "dependency", None) is not None

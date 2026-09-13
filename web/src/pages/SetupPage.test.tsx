@@ -32,10 +32,7 @@ const listActors = api.listActors as unknown as ReturnType<typeof vi.fn>;
 
 const CLAIMED = {
   auth_required: true,
-  mode: 'local',
   login: 'password',
-  setup_pending: false,
-  multiple_accounts: false,
 };
 const ACCOUNT = {
   id: 'account-1',
@@ -45,9 +42,6 @@ const ACCOUNT = {
   enabled: true,
   has_password: true,
   created_at: 't',
-  updated_at: 't',
-  disabled_at: null,
-  is_self: true,
 };
 
 function renderPage() {
@@ -73,8 +67,6 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: 'none',
-    statusLoading: false,
-    setupPending: true,
     account: null,
   });
   setupClaim.mockResolvedValue({ token: 'client-session-token' });
@@ -84,7 +76,6 @@ beforeEach(() => {
     id: 'actor-1',
     kind: 'human',
     display_name: 'Alice',
-    profile_version: 1,
   }] });
 });
 
@@ -155,7 +146,7 @@ describe('first-account claim', () => {
   });
 
   it('routes a claimed instance to accounts', async () => {
-    useAuthStore.setState({ setupPending: false });
+    useAuthStore.setState({ loginMode: 'password' });
     renderPage();
     expect(await screen.findByText('accounts destination')).toBeInTheDocument();
   });
