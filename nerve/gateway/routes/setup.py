@@ -265,6 +265,9 @@ class SetupStateOut(BaseModel):
     steps: list[SetupStepOut]
     crons: list[CronToggleOut]
     values: SetupValuesOut
+    # Set when a request's configuration landed but its bookkeeping did not,
+    # which is neither success nor failure and has to be said as itself.
+    warning: str | None = None
 
 
 class ProviderRequest(BaseModel):
@@ -574,7 +577,7 @@ def _step_status(
     raise HTTPException(status_code=404, detail=f"Unknown setup step: {step}")
 
 
-def _render(context: _Context) -> SetupStateOut:
+def _render(context: _Context, *, warning: str | None = None) -> SetupStateOut:
     config = context.config
     problem = _writable_problem(config)
     pending = setup_state.pending_paths(context.state, config)
@@ -630,6 +633,7 @@ def _render(context: _Context) -> SetupStateOut:
             for c in crons
         ],
         values=values,
+        warning=warning,
     )
 
 
@@ -752,12 +756,18 @@ def _record(
     step: str,
     applied: dict[str, Any] | None = None,
     debts: tuple[str, ...] = (),
-) -> None:
+) -> str | None:
     """Note that a step was answered, after every write it makes has landed.
 
     Separate from :func:`_write` so a failure in a later target cannot leave a
     step recorded as done — the checklist would then say "provider: done" for
     a request the caller was told had failed.
+
+    Returns a warning when the note itself could not be saved. The
+    configuration has landed by then, so this is neither success to report
+    silently nor a failure to raise: the instance *is* configured and the
+    checklist has lost its memory of it, which is partial success and has to be
+    said as one.
     """
     if applied:
         setup_state.record_applied(context.state, applied)
@@ -765,7 +775,32 @@ def _record(
         context.state.debts.add(debt)
     context.state.done.add(step)
     context.state.skipped.discard(step)
-    setup_state.save_state(context.state)
+    if setup_state.save_state(context.state):
+        return None
+    return (
+        f"The configuration was written, but the checklist could not record "
+        f"the {step} step at {setup_state.state_file()} — it may ask for this "
+        "again. The instance itself is configured."
+    )
+
+
+def _save_or_refuse(context: _Context) -> None:
+    """Persist the checklist's notes, or refuse the request.
+
+    For a request whose *only* effect is the note — skipping a step, putting
+    one back — a save that did not happen is a request that did nothing, and
+    answering 200 to it means the choice quietly reappears at the next read.
+    Steps that write configuration first are the other case; see
+    :func:`_record`.
+    """
+    if not setup_state.save_state(context.state):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"The checklist could not be saved to {setup_state.state_file()}, "
+                "so that choice was not remembered. Nothing else changed."
+            ),
+        )
 
 
 async def _apply_cron_toggles(context: _Context, wanted: set[str]) -> tuple[str, ...]:
@@ -828,11 +863,11 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_acco
             choices=SetupChoices(anthropic_api_key=anthropic, openai_api_key=openai),
             secret_paths=("anthropic_api_key", "openai_api_key"),
         )
-        _record(context, step=STEP_PROVIDER, applied=applied)
+        warning = _record(context, step=STEP_PROVIDER, applied=applied)
         logger.info(
             "Setup: a provider credential was stored by account %s", actor.account_id,
         )
-        return _render(await _context(actor))
+        return _render(await _context(actor), warning=warning)
 
 
 @router.put("/api/setup/profile", response_model=SetupStateOut)
@@ -887,8 +922,8 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
                 account["actor_id"], display_name=(display_name.strip() or None),
             )
 
-        _record(context, step=STEP_PROFILE, applied=applied)
-        return _render(await _context(actor))
+        warning = _record(context, step=STEP_PROFILE, applied=applied)
+        return _render(await _context(actor), warning=warning)
 
 
 @router.put("/api/setup/channels", response_model=SetupStateOut)
@@ -925,11 +960,11 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_acco
             machine_paths=("telegram.enabled",),
             secret_paths=secret_paths,
         )
-        _record(context, step=STEP_CHANNELS, applied=applied)
+        warning = _record(context, step=STEP_CHANNELS, applied=applied)
         logger.info(
             "Setup: a Telegram bot token was stored by account %s", actor.account_id,
         )
-        return _render(await _context(actor))
+        return _render(await _context(actor), warning=warning)
 
 
 @router.put("/api/setup/automation", response_model=SetupStateOut)
@@ -1008,8 +1043,8 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
                 actor.account_id, ", ".join(sorted(wanted)) or "none",
             )
 
-        _record(context, step=STEP_AUTOMATION, applied=applied, debts=debts)
-        return _render(await _context(actor))
+        warning = _record(context, step=STEP_AUTOMATION, applied=applied, debts=debts)
+        return _render(await _context(actor), warning=warning)
 
 
 @router.post("/api/setup/steps/{step_id}/skip", response_model=SetupStateOut)
@@ -1028,11 +1063,12 @@ async def skip_step(step_id: str, actor: Actor = Depends(require_account)):
             if step_id in {s for s, _t, _r in _STEPS}
             else f"Unknown setup step: {step_id}",
         )
-    context = await _context(actor)
-    context.state.skipped.add(step_id)
-    context.state.done.discard(step_id)
-    setup_state.save_state(context.state)
-    return _render(await _context(actor))
+    async with _loop_lock("state"):
+        context = await _context(actor)
+        context.state.skipped.add(step_id)
+        context.state.done.discard(step_id)
+        _save_or_refuse(context)
+        return _render(await _context(actor))
 
 
 @router.post("/api/setup/steps/{step_id}/unskip", response_model=SetupStateOut)
@@ -1040,10 +1076,11 @@ async def unskip_step(step_id: str, actor: Actor = Depends(require_account)):
     """Put a skipped step back on the list."""
     if step_id not in _SKIPPABLE:
         raise HTTPException(status_code=400, detail=f"Unknown setup step: {step_id}")
-    context = await _context(actor)
-    context.state.skipped.discard(step_id)
-    setup_state.save_state(context.state)
-    return _render(await _context(actor))
+    async with _loop_lock("state"):
+        context = await _context(actor)
+        context.state.skipped.discard(step_id)
+        _save_or_refuse(context)
+        return _render(await _context(actor))
 
 
 # --------------------------------------------------------------------------- #
