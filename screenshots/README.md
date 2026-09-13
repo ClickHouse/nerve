@@ -6,10 +6,12 @@ URL of a commit**, never of a branch, so a description keeps showing what it
 showed when it was written.
 
 Every image below was captured against a **throwaway instance** — its own
-`NERVE_HOME`, config directory and workspace, on a loopback port, with two
-synthetic accounts, **alice** ("Alice") and **bob** ("Bob"), and fabricated
-transcripts. No setup token, API key, real name or internal address appears in
-any of them. Chromium via Playwright, `fullPage: false`.
+`NERVE_HOME`, config directory and workspace, on a loopback port — using only
+synthetic data. The multi-account/chat captures use **alice** ("Alice") and
+**bob** ("Bob") plus fabricated transcripts; the first-run captures use a
+synthetic unclaimed installation. No setup token, API key, real name or
+internal address appears in any of them. Chromium via Playwright,
+`fullPage: false`.
 
 | File | PR | Captured from | What it shows |
 |---|---|---|---|
