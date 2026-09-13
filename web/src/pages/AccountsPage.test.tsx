@@ -11,9 +11,9 @@ vi.mock('../api/client', () => ({
     updateAccount: vi.fn(),
     setAccountEnabled: vi.fn(),
     changeOwnPassword: vi.fn(),
+    getOwnAccount: vi.fn(),
     authStatus: vi.fn().mockResolvedValue({
-      auth_required: true, mode: 'local', login: 'password',
-      setup_pending: false, multiple_accounts: false,
+      auth_required: true, login: 'password',
     }),
     login: vi.fn(),
     checkAuth: vi.fn(),
@@ -33,6 +33,7 @@ const { useAccountStore, errorDetail, blockedReason } = await import('../stores/
 const { useAuthStore } = await import('../stores/authStore');
 
 const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
+const getToken = client.getToken as unknown as ReturnType<typeof vi.fn>;
 
 function account(overrides: Partial<Account> = {}): Account {
   return {
@@ -43,9 +44,6 @@ function account(overrides: Partial<Account> = {}): Account {
     enabled: true,
     has_password: true,
     created_at: '2026-08-05T00:00:00Z',
-    updated_at: '2026-08-05T00:00:00Z',
-    disabled_at: null,
-    is_self: true,
     ...overrides,
   };
 }
@@ -60,13 +58,17 @@ beforeEach(() => {
   api.createAccount.mockReset();
   api.setAccountEnabled.mockReset();
   api.changeOwnPassword.mockReset();
+  api.getOwnAccount.mockReset();
   api.updateAccount.mockReset();
   api.authStatus.mockResolvedValue({
-    auth_required: true, mode: 'local', login: 'password',
-    setup_pending: false, multiple_accounts: false,
+    auth_required: true, login: 'password',
   });
+  getToken.mockReturnValue('session-token');
   useAccountStore.setState({ accounts: [], loading: true, busyId: null, error: null });
-  useAuthStore.setState({ loginMode: null, setupPending: true, statusLoading: false });
+  useAuthStore.setState({
+    loginMode: null,
+    account: { id: 'acc-1', username: 'alice' },
+  });
 });
 
 describe('the list', () => {
@@ -76,7 +78,7 @@ describe('the list', () => {
         account(),
         account({
           id: 'acc-2', username: 'bob', display_name: 'Bob',
-          enabled: false, disabled_at: '2026-08-06T00:00:00Z', is_self: false,
+          enabled: false,
         }),
       ],
     });
@@ -101,6 +103,39 @@ describe('the list', () => {
     api.listAccounts.mockRejectedValue(new Error('500: {"detail": "nope"}'));
     renderPage();
     expect(await screen.findByRole('alert')).toHaveTextContent('nope');
+  });
+
+  it('recovers the signed-in identity after its startup read failed', async () => {
+    useAuthStore.setState({ authenticated: true, account: null });
+    api.listAccounts.mockResolvedValue({ accounts: [account()] });
+    api.getOwnAccount
+      .mockRejectedValueOnce(new Error('network'))
+      .mockResolvedValue(account());
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('network');
+    expect(screen.queryByText('you')).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Your password' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('you')).toBeInTheDocument();
+    expect(screen.getByRole('form', { name: 'Your password' })).toBeInTheDocument();
+  });
+
+  it('does not restore an identity from a session that has been replaced', async () => {
+    useAuthStore.setState({ authenticated: true, account: null });
+    api.listAccounts.mockResolvedValue({ accounts: [account()] });
+    let finishIdentity!: (value: Account) => void;
+    api.getOwnAccount.mockReturnValue(new Promise<Account>((resolve) => {
+      finishIdentity = resolve;
+    }));
+
+    const loading = useAccountStore.getState().load();
+    getToken.mockReturnValue('replacement-session-token');
+    finishIdentity(account());
+    await loading;
+
+    expect(useAuthStore.getState().account).toBeNull();
   });
 });
 
@@ -155,7 +190,7 @@ describe('disabling and enabling', () => {
     api.listAccounts.mockResolvedValue({
       accounts: [
         account(),
-        account({ id: 'acc-2', username: 'bob', is_self: false }),
+        account({ id: 'acc-2', username: 'bob' }),
       ],
     });
     api.setAccountEnabled.mockResolvedValue(account());
@@ -173,7 +208,7 @@ describe('disabling and enabling', () => {
 
   it('lets the question be answered no', async () => {
     api.listAccounts.mockResolvedValue({
-      accounts: [account(), account({ id: 'acc-2', username: 'bob', is_self: false })],
+      accounts: [account(), account({ id: 'acc-2', username: 'bob' })],
     });
     renderPage();
     await screen.findByText('bob');
@@ -187,7 +222,7 @@ describe('disabling and enabling', () => {
 
   it('warns harder about disabling yourself, and says what it costs', async () => {
     api.listAccounts.mockResolvedValue({
-      accounts: [account(), account({ id: 'acc-2', username: 'bob', is_self: false })],
+      accounts: [account(), account({ id: 'acc-2', username: 'bob' })],
     });
     api.setAccountEnabled.mockResolvedValue(account());
     renderPage();
@@ -208,8 +243,7 @@ describe('disabling and enabling', () => {
     api.listAccounts.mockResolvedValue({
       accounts: [
         account(),
-        account({ id: 'acc-2', username: 'bob', enabled: false, is_self: false,
-                  disabled_at: '2026-08-06T00:00:00Z' }),
+        account({ id: 'acc-2', username: 'bob', enabled: false }),
       ],
     });
     api.setAccountEnabled.mockResolvedValue(account());
@@ -335,7 +369,7 @@ describe('a committed write is not a failed one', () => {
     api.listAccounts.mockResolvedValueOnce({ accounts: [account()] });
     await useAccountStore.getState().load();
 
-    const created = account({ id: 'acc-2', username: 'bob', is_self: false });
+    const created = account({ id: 'acc-2', username: 'bob' });
     api.createAccount.mockResolvedValue(created);
     api.listAccounts.mockRejectedValue(new Error('500: {"detail": "gone"}'));
 
@@ -363,13 +397,11 @@ describe('a committed write is not a failed one', () => {
     expect(useAccountStore.getState().error).toMatch(/already taken/);
   });
 
-  it('applies an updated row from the response, not only from the refresh', async () => {
+  it('replaces an updated row even when the follow-up refresh fails', async () => {
     api.listAccounts.mockResolvedValueOnce({ accounts: [account()] });
     await useAccountStore.getState().load();
 
-    api.setAccountEnabled.mockResolvedValue(
-      account({ enabled: false, disabled_at: '2026-08-06T00:00:00Z' }),
-    );
+    api.setAccountEnabled.mockResolvedValue(account({ enabled: false }));
     api.listAccounts.mockRejectedValue(new Error('network'));
 
     expect(await useAccountStore.getState().setEnabled('acc-1', false)).toBe(true);
@@ -385,8 +417,7 @@ describe('a committed write is not a failed one', () => {
     api.changeOwnPassword.mockResolvedValue(account({ has_password: true }));
     api.listAccounts.mockRejectedValue(new Error('network'));
     api.authStatus.mockResolvedValue({
-      auth_required: true, mode: 'local', login: 'password',
-      setup_pending: false, multiple_accounts: false,
+      auth_required: true, login: 'password',
     });
 
     expect(await useAccountStore.getState().changeOwnPassword({
@@ -394,11 +425,10 @@ describe('a committed write is not a failed one', () => {
     })).toBe(true);
 
     expect(api.authStatus).toHaveBeenCalled();
-    expect(useAuthStore.getState().setupPending).toBe(false);
     expect(useAuthStore.getState().loginMode).toBe('password');
   });
 
-  it('lets the refresh be retried on its own', async () => {
+  it('clears the stale-list warning when the refresh is retried', async () => {
     api.changeOwnPassword.mockResolvedValue(account());
     api.listAccounts.mockRejectedValueOnce(new Error('network'));
     expect(await useAccountStore.getState().changeOwnPassword({
@@ -411,11 +441,9 @@ describe('a committed write is not a failed one', () => {
     expect(useAccountStore.getState().error).toBeNull();
   });
 
-  it('keeps the add form open only when the write failed', async () => {
+  it('closes the add form after a committed create whose redraw fails', async () => {
     api.listAccounts.mockResolvedValue({ accounts: [account()] });
-    api.createAccount.mockResolvedValue(
-      account({ id: 'acc-2', username: 'bob', is_self: false }),
-    );
+    api.createAccount.mockResolvedValue(account({ id: 'acc-2', username: 'bob' }));
     renderPage();
     await screen.findByText('alice');
 
@@ -423,11 +451,11 @@ describe('a committed write is not a failed one', () => {
     const form = screen.getByRole('form', { name: 'Add account' });
     await userEvent.type(within(form).getByLabelText('New account username'), 'bob');
     await userEvent.type(within(form).getByLabelText('New account password'), 'a-passphrase');
-    // The list refresh fails *after* the create commits.
     api.listAccounts.mockRejectedValue(new Error('network'));
     await userEvent.click(within(form).getByRole('button', { name: 'Create' }));
 
     await waitFor(() =>
       expect(screen.queryByRole('form', { name: 'Add account' })).not.toBeInTheDocument());
   });
+
 });

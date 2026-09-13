@@ -29,7 +29,6 @@ import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
-import { SetupPage } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
@@ -90,7 +89,6 @@ function App() {
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
           <Route path="/accounts" element={<AccountsPage />} />
-          <Route path="/setup" element={<SetupPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -110,18 +108,12 @@ function App() {
 /**
  * Where the app opens.
  *
- * Chat, unless the instance has never been secured — its one account has no
- * password, so everyone who can reach it is signed in as it — in which case the
- * setup page, so the state gets noticed rather than silently persisting.
- * Naming the account does not settle it; only a password does.
- * Only the *root* redirect
- * moves: a deep link, a refresh or a bookmark still lands where it says, and
- * the setup page is skippable, so an abandoned setup leaves a working
- * instance.
+ * Passwordless standalone installs open Accounts so the owner can name and
+ * secure the account. The setup claim page arrives in the later claim PR.
  */
 function Home() {
-  const setupPending = useAuthStore((s) => s.setupPending);
-  return <Navigate to={setupPending ? '/setup' : '/chat'} replace />;
+  const loginMode = useAuthStore((s) => s.loginMode);
+  return <Navigate to={loginMode === 'none' ? '/accounts' : '/chat'} replace />;
 }
 
 /**

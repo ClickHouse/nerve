@@ -39,12 +39,8 @@ interface AuthState {
    * Startup has finished deciding where this tab belongs.
    *
    * Nothing renders before it, including for a tab that arrives holding a
-   * token: a token says the tab may come in, not *where* it should land. The
-   * instance may still be unset-up, and that is decided from the status
-   * descriptor, which arrives a moment after a token can be read out of
-   * storage. The app used to render on the token alone and navigate to /chat
-   * before the answer came back — by which time the component that would have
-   * redirected was already unmounted.
+   * token: a token says the tab may come in, not where the root route should
+   * land. That comes from the status descriptor.
    */
   ready: boolean;
   error: string | null;
@@ -68,14 +64,6 @@ interface AuthState {
    * log itself in without asking.
    */
   loginMode: LoginKind | null;
-  /** A descriptor read is in flight. */
-  statusLoading: boolean;
-  /**
-   * The sole account has no password, so everyone who can reach this instance
-   * is signed in as it. Routed to `/setup`. Giving the account a username does
-   * not change it; only a password does.
-   */
-  setupPending: boolean;
   /**
    * The account this session belongs to, once it is known.
    *
@@ -139,8 +127,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   error: null,
   sessionExpired: false,
   loginMode: null,
-  statusLoading: false,
-  setupPending: false,
   account: null,
 
   login: async (password: string, username?: string) => {
@@ -212,7 +198,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   refreshStatus: async () => {
     const generation = ++statusGeneration;
-    set({ statusLoading: true });
     try {
       applyStatus(generation, await api.authStatus());
     } catch {
@@ -223,7 +208,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   checkAuth: async () => {
     const token = getToken();
     const generation = ++statusGeneration;
-    set({ statusLoading: true });
     // Both at once. Nothing renders until both have answered — that is what
     // `ready` means — so asking in sequence would double the blank screen.
     // `/api/accounts/me` *is* the session check: it needs a valid token and it
@@ -296,14 +280,11 @@ function applyStatus(generation: number, status: Awaited<ReturnType<typeof api.a
   if (status) {
     useAuthStore.setState({
       loginMode: status.login,
-      setupPending: status.setup_pending,
-      statusLoading: false,
     });
     return;
   }
   useAuthStore.setState((state) => ({
     loginMode: state.loginMode ?? FAIL_CLOSED_LOGIN,
-    statusLoading: false,
   }));
 }
 

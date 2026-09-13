@@ -1136,7 +1136,6 @@ def _dead_password_warning(remaining: list[Path], *, locked: bool) -> str:
 async def _migrate_config_credentials(
     db: "Database", config: NerveConfig, report: MigrationReport, *,
     dry_run: bool, pending_config_rows: int = 0,
-    stragglers: list[dict] | None = None,
 ) -> None:
     """Move every account off ``credential_source = 'config'`` (3.5).
 
@@ -1149,11 +1148,10 @@ async def _migrate_config_credentials(
         # Nothing to copy. A row still on `config` with no configured hash is
         # brought back to `none` by the mirror, which has already run.
         return
-    if stragglers is None:
-        stragglers = [
-            account for account in await db.list_accounts()
-            if account["credential_source"] == "config"
-        ]
+    stragglers = [
+        account for account in await db.list_accounts()
+        if account["credential_source"] == "config"
+    ]
     if stragglers or pending_config_rows:
         if dry_run:
             report.migrated_config_credential = True

@@ -37,11 +37,6 @@ router = APIRouter()
 # would turn this endpoint into a list of who works here.
 _INVALID = "Invalid username or password"
 
-# The identity mode this build implements. Reported so a client can tell a local
-# install from a later externally-authenticated one without guessing from which
-# fields happen to be present.
-AUTH_MODE = "local"
-
 # What the login form must collect.
 LOGIN_NONE = "none"                        # passwordless: any password, one account
 LOGIN_PASSWORD = "password"                # one account: password only, no username
@@ -51,10 +46,7 @@ LOGIN_USERNAME_PASSWORD = "username_password"   # two or more: a username is req
 # pinned a signing secret — never a shape that tells a browser to log itself in.
 _UNKNOWN_STATUS = {
     "auth_required": True,
-    "mode": AUTH_MODE,
     "login": LOGIN_USERNAME_PASSWORD,
-    "setup_pending": False,
-    "multiple_accounts": False,
 }
 
 # The hash compared against when the username names no account.
@@ -146,18 +138,8 @@ _calibrated_budget: float | None = None
 # introduces a slower hash, and stays stale until a *known-user* probe raises
 # the reactive mark. Which is one probe too late, again.
 _policy_comparison_seconds: float | None = None
-# A value tests pin in place of calibrating. Production never sets it: a real
-# budget is always derived from this machine and these accounts.
-_pinned_budget: float | None = None
-
-
 def _slowest_stored_cost(accounts: list[dict], configured_password: str) -> int:
-    """The highest bcrypt work factor this install can be asked to verify.
-
-    Every account's own hash, plus the configured one that ``config`` and
-    ``none`` rows read. Never below the policy cost, which is what the decoy —
-    and therefore every unknown-username comparison — costs.
-    """
+    """Highest active bcrypt cost, never below the decoy's policy cost."""
     candidates = [
         bcrypt_cost(account["credential"] or "")
         for account in accounts
@@ -168,31 +150,12 @@ def _slowest_stored_cost(accounts: list[dict], configured_password: str) -> int:
 
 
 def prepare_login_timing(config, accounts: list[dict]) -> float:
-    """Calibrate the failure budget for the accounts as they stand now.
+    """Set a common failure budget before the request clock starts.
 
-    Called at the top of :func:`login`, **before** that request takes its own
-    start time: the measurement costs a comparison, and paying for it inside a
-    request's timed window is what made the first failure of a process stand out
-    from every later one.
-
-    Run on **every** login, not once, because what it depends on changes under a
-    running gateway: a `config` or `none` row verifies against
-    `auth.password_hash`, which a configuration reload can replace with a hash
-    at any work factor. Only the per-comparison measurement is cached — that is
-    the hardware — and the slowest cost in use is recomputed from rows the
-    caller has already fetched, so the recalibration costs an exponent and no
-    query at all.
-
-    It therefore comes *down* as well as up: when the last odd work factor is
-    re-hashed at the policy cost, the next login stops paying for it. The
-    reactive mark can still raise it within the request (see
-    :func:`_observe_comparison`) for anything this could not know.
+    The machine's policy-cost measurement is cached, while active costs are
+    reread every login so configuration reloads and rehashes take effect.
     """
     global _failure_budget, _calibrated_budget, _policy_comparison_seconds
-
-    if _pinned_budget is not None:
-        _failure_budget = _calibrated_budget = _pinned_budget
-        return _pinned_budget
 
     if _policy_comparison_seconds is None:
         started = time.monotonic()
@@ -225,32 +188,8 @@ def _reactive_ceiling() -> float:
     return max(_REACTIVE_BUDGET_CEILING_SECONDS, base * 2)
 
 
-def _set_failure_budget(seconds: float | None) -> None:
-    """Pin (or clear) the budget. For tests, which cannot afford a quarter of a
-    second per failed login and need a known value to measure against.
-
-    A pinned value survives recalibration — the budget is recomputed on every
-    login now, so a value merely assigned would be gone by the next one.
-    ``None`` unpins and clears the cached measurement, so the next login
-    calibrates from scratch.
-    """
-    global _failure_budget, _calibrated_budget, _policy_comparison_seconds
-    global _pinned_budget
-    _pinned_budget = seconds
-    _failure_budget = seconds
-    _calibrated_budget = seconds
-    if seconds is None:
-        _policy_comparison_seconds = None
-
-
 def _observe_comparison(seconds: float) -> None:
-    """Raise the budget to cover a comparison that took longer than it.
-
-    The backstop behind calibration: a credential stored at a higher cost after
-    startup, or a machine that has become slower, would otherwise make its own
-    failures stand out. Bounded, so one bad moment cannot make every later
-    refusal crawl.
-    """
+    """Boundedly raise the budget when reality exceeds calibration."""
     global _failure_budget
     if _failure_budget is not None and seconds > _failure_budget:
         _failure_budget = min(
@@ -282,28 +221,10 @@ async def _refuse(started_at: float, detail: str) -> HTTPException:
 
 
 async def _maybe_upgrade_hash(store, account: dict, password: str) -> None:
-    """Re-hash a just-verified password at the policy cost, if it is not already.
+    """Silently converge a verified local hash with compare-and-swap.
 
-    Opportunistic and silent: it happens on a login that has already succeeded,
-    it writes through the ordinary credential path, and nothing about it reaches
-    the client. This is what drains an install of the assorted work factors a
-    migrated configuration hash can bring with it — which is what makes the
-    response budget a transitional measure rather than a permanent one.
-
-    Skipped for an account whose credential lives in configuration (moving it
-    onto the row is the startup migration's job, not a side effect of somebody
-    logging in) and for a password too long to hash, which
-    :func:`verify_password` accepted by truncating: re-hashing it would refuse,
-    and hashing the truncation would store a different password from the one its
-    owner types.
-
-    **Compare-and-swap.** The credential was read, compared against and is now
-    being replaced — three steps, with room between them for the account's owner
-    to change their password from another tab. Writing unconditionally would put
-    the *old* password back and leave whoever knew it still able to log in, so
-    the write is conditioned on the hash still being the one this request
-    verified against. Losing that race is a no-op: what the other writer stored
-    is newer than anything this could produce.
+    Configuration-owned and overlong legacy passwords are left for their
+    dedicated migration/compatibility paths.
     """
     if account["credential_source"] != "local":
         return
@@ -442,41 +363,10 @@ async def login(req: LoginRequest):
 
 @router.get("/api/auth/status")
 async def auth_status():
-    """How to log in, and whether this install still needs setting up.
+    """Describe the login form without identifying accounts.
 
-    Unauthenticated, so it publishes only what a login form has to know:
-
-    | Field | Meaning |
-    |---|---|
-    | ``mode`` | the identity mode — ``local`` in this build |
-    | ``login`` | ``none`` (passwordless), ``password`` (one account, no username needed) or ``username_password`` |
-    | ``setup_pending`` | nothing has been secured yet: the one account has no password, so every caller is admitted as it |
-    | ``multiple_accounts`` | more than one account exists |
-    | ``auth_required`` | kept for older clients; ``login != "none"`` |
-
-    ``setup_pending`` equals ``login == "none"`` today, and is a separate field
-    on purpose: it is the *question* "is this instance still unsecured", which
-    PR 6's wizard owns and may widen (a missing provider credential, say)
-    without changing what the login form collects. It deliberately does **not**
-    also require the account to be unnamed. The accounts screen can set a
-    username on its own, and an install that did that first would otherwise
-    stop reporting as pending — losing the warning and the route to the wizard
-    — while still admitting every caller, which is the exact state the wizard
-    exists to end.
-
-    Deliberately **not** here: how many accounts there are, and any username.
-    The spec sketched an account *count*; the boolean says everything a client
-    needs (and is already implied by ``login``), while a count tells an
-    anonymous caller how many people work here.
-
-    ``auth_required`` used to be read from ``auth.password_hash``. It cannot be
-    any more: after the startup migration the credential lives on the account
-    row and the configuration key is gone, and a stale ``false`` computed from
-    configuration would tell the browser to log itself in with an empty
-    password. It is derived from the accounts now, like everything else here.
-
-    Fails closed: before the gateway has finished starting, the answer is the
-    one that makes a client ask for a username and a password.
+    ``auth_required`` is the legacy spelling of ``login != 'none'``. Missing
+    startup state fails closed to username and password.
     """
     config = get_config()
     store = identity_store()
@@ -493,10 +383,7 @@ async def auth_status():
 
     return {
         "auth_required": login_kind != LOGIN_NONE,
-        "mode": AUTH_MODE,
         "login": login_kind,
-        "setup_pending": login_kind == LOGIN_NONE,
-        "multiple_accounts": state.accounts > 1,
     }
 
 
