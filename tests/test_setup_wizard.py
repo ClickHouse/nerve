@@ -1066,6 +1066,175 @@ class TestOneMutationAtATime:
 
 
 @pytest.mark.asyncio
+class TestMutationsAreActuallySerialised:
+    """`asyncio.gather` proves nothing on its own — the requests may simply not
+    overlap. These force the interleaving: one handler is held open *after* it
+    has read the checklist, and another runs to completion inside that window.
+    """
+
+    async def _blocked_at(self, claimed, monkeypatch, release: asyncio.Event,
+                          started: asyncio.Event):
+        """Hold the profile step between its read of the state and its save."""
+        db = claimed.db
+        original = db.update_actor_profile
+
+        async def _slow(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(db, "update_actor_profile", _slow)
+
+    async def test_a_skip_during_a_profile_write_is_not_overwritten(
+        self, claimed, monkeypatch,
+    ):
+        release, started = asyncio.Event(), asyncio.Event()
+        await self._blocked_at(claimed, monkeypatch, release, started)
+
+        async with _http(claimed) as http:
+            profile = asyncio.create_task(http.put(
+                "/api/setup/profile", json={"display_name": "Alice Example"},
+            ))
+            await asyncio.wait_for(started.wait(), timeout=5)
+
+            # Inside the window: the profile handler has read the checklist and
+            # not yet written it back.
+            skip = asyncio.create_task(http.post("/api/setup/steps/channels/skip"))
+            await asyncio.sleep(0.05)
+            release.set()
+            profile_response, skip_response = await asyncio.gather(profile, skip)
+
+        assert profile_response.status_code == 200, profile_response.text
+        assert skip_response.status_code == 200, skip_response.text
+        assert setup_state.load_state().skipped == {"channels"}, (
+            "the profile step saved a snapshot taken before the skip"
+        )
+        assert _status_of(skip_response.json(), "profile") == "done"
+
+    async def test_an_unskip_during_an_automation_write_is_not_overwritten(
+        self, claimed, monkeypatch,
+    ):
+        async with _http(claimed) as http:
+            await http.post("/api/setup/steps/channels/skip")
+
+        release, started = asyncio.Event(), asyncio.Event()
+        original = setup_routes.set_optional_crons
+
+        def _slow(*args, **kwargs):
+            started.set()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(setup_routes, "set_optional_crons", _slow)
+
+        async def _blocked_reload():
+            await release.wait()
+            return ()
+
+        monkeypatch.setattr(setup_routes, "_apply_cron_toggles",
+                            lambda *a, **k: _blocked_reload())
+
+        async with _http(claimed) as http:
+            automation = asyncio.create_task(http.put(
+                "/api/setup/automation", json={"crons": ["inbox-processor"]},
+            ))
+            await asyncio.sleep(0.05)
+            unskip = asyncio.create_task(
+                http.post("/api/setup/steps/channels/unskip"),
+            )
+            await asyncio.sleep(0.05)
+            release.set()
+            automation_response, unskip_response = await asyncio.gather(
+                automation, unskip,
+            )
+
+        assert automation_response.status_code == 200, automation_response.text
+        assert unskip_response.status_code == 200, unskip_response.text
+        assert setup_state.load_state().skipped == set(), (
+            "the automation step saved a snapshot taken before the unskip"
+        )
+        assert "automation" in setup_state.load_state().done
+
+    async def test_every_mutating_handler_holds_the_lock(self):
+        """Structural: the lock is only a rule if every handler follows it.
+
+        Checked against the source because the failure it prevents — one
+        handler quietly written without it, as skip and unskip were — is
+        invisible in any test that does not force an interleaving.
+        """
+        import inspect
+
+        source = inspect.getsource(setup_routes)
+        handlers = [
+            "set_provider", "set_profile", "set_channels", "set_automation",
+            "skip_step", "unskip_step", "get_setup",
+        ]
+        for name in handlers:
+            body = inspect.getsource(getattr(setup_routes, name))
+            assert '_loop_lock("state")' in body, name
+        # ...and nothing mutates the notes outside one.
+        assert source.count("setup_state.save_state(") == 3, (
+            "a new call site for save_state: check it runs under the lock"
+        )
+
+
+@pytest.mark.asyncio
+class TestAChoiceThatWasNotSavedIsNotReportedAsSaved:
+    """`save_state` can fail — a state directory that cannot be written
+    owner-only, a full disk — and it returned False into a caller that ignored
+    it, so a skip that reached no disk answered 200 and came back at the next
+    read."""
+
+    @staticmethod
+    def _failing_save(monkeypatch):
+        monkeypatch.setattr(setup_state, "save_state", lambda state: False)
+
+    async def test_a_skip_that_could_not_be_saved_is_an_error(
+        self, claimed, monkeypatch,
+    ):
+        self._failing_save(monkeypatch)
+        async with _http(claimed) as http:
+            response = await http.post("/api/setup/steps/channels/skip")
+        assert response.status_code == 500
+        assert "not remembered" in response.json()["detail"]
+        assert "Nothing else changed" in response.json()["detail"]
+
+    async def test_an_unskip_that_could_not_be_saved_is_an_error(
+        self, claimed, monkeypatch,
+    ):
+        self._failing_save(monkeypatch)
+        async with _http(claimed) as http:
+            response = await http.post("/api/setup/steps/channels/unskip")
+        assert response.status_code == 500
+
+    async def test_a_step_whose_configuration_landed_says_what_landed(
+        self, claimed, monkeypatch,
+    ):
+        """The other case, and it is not a failure: the credential *is* on
+        disk. Answering 500 would invite a retry of a write that already
+        happened; answering a plain 200 would hide that the checklist has
+        forgotten it."""
+        self._failing_save(monkeypatch)
+        async with _http(claimed) as http:
+            response = await http.put(
+                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["warning"]
+        assert "configuration was written" in body["warning"]
+        assert "provider" in body["warning"]
+        # And it really did land.
+        assert claimed.secrets()["anthropic_api_key"] == _ANTHROPIC_KEY
+
+    async def test_nothing_is_warned_about_when_the_save_works(self, claimed):
+        async with _http(claimed) as http:
+            body = (await http.put(
+                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
+            )).json()
+        assert body["warning"] is None
+
+
+@pytest.mark.asyncio
 class TestReadingAndWritingDoNotRaceEachOther:
     """Reading the checklist can write: the first read after a restart retires
     what the previous process left behind. That write has to be inside the same

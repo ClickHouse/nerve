@@ -154,7 +154,8 @@ describe('an unclaimed instance', () => {
     setupState.mockResolvedValue({
       setup_pending: false, lockdown: false, writable: true,
       read_only_reason: null, restart_pending: false, restart_pending_paths: [],
-      restart_pending_reasons: [], finished: true, steps: [], crons: [],
+      restart_pending_reasons: [], warning: null, finished: true,
+      steps: [], crons: [],
       values: {
         timezone: 'UTC', display_name: null, has_anthropic_key: false,
         has_openai_key: false, has_telegram_token: false, sync_github: false,
