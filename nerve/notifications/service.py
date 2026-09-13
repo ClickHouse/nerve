@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nerve.identity import system_actor
+from nerve.identity import Actor, system_actor
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
 
@@ -442,12 +442,6 @@ class NotificationService:
                 notif, answer, answered_by,
             )
 
-        success = await self.db.answer_notification(
-            notification_id, answer, answered_by,
-        )
-        if not success:
-            return False
-
         session_id = notif["session_id"]
 
         from nerve.agent.streaming import broadcaster
@@ -461,6 +455,22 @@ class NotificationService:
         is_external = bool(
             session_record and session_record.get("source") == "external"
         )
+
+        # Resolve before answering, for a session we are going to inject into.
+        # ``answer_notification`` moves the row out of ``pending``, and this
+        # method refuses a row that is not pending — so once it has run, an
+        # answer that never reached the agent cannot be given again. The UI
+        # would report success on a question the agent is still waiting for.
+        # An external session injects nothing, so it needs no actor.
+        actor = None
+        if not is_external:
+            actor = await system_actor(self.db)
+
+        success = await self.db.answer_notification(
+            notification_id, answer, answered_by,
+        )
+        if not success:
+            return False
 
         if is_external:
             await broadcaster.broadcast("__global__", {
@@ -497,6 +507,7 @@ class NotificationService:
                 injected_message,
                 source=f"notification:{answered_by}",
                 channel=answered_by,
+                actor=actor,
             )
         except Exception as e:
             logger.error(
@@ -689,6 +700,7 @@ class NotificationService:
         source: str,
         channel: str | None = None,
         internal: bool = False,
+        actor: "Actor | None" = None,
     ) -> None:
         """Fire-and-forget ``engine.run()`` into a session.
 
@@ -703,13 +715,18 @@ class NotificationService:
         lock acquisition, and two answers dispatched in quick succession
         could then reach the session in the other order — the exact FIFO
         property this method exists to provide.
+
+        ``actor`` may be passed in by a caller that had to resolve it earlier
+        still — before it consumed something the answer cannot be given
+        again — and is resolved here otherwise.
         """
         # The text is this service's — an answer relayed into the session, or
         # a redelivery notice. The person who answered is recorded on the
         # notification itself; putting them on the agent's prompt would be the
         # wrong claim, and 0.7 defers notification-answer attribution past
         # this gate anyway.
-        actor = await system_actor(self.db)
+        if actor is None:
+            actor = await system_actor(self.db)
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
