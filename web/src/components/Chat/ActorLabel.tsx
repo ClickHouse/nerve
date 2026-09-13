@@ -1,5 +1,5 @@
 import {
-  actorDiscriminator, actorName, ambiguousActorIds, isSystemActor, useActorStore,
+  actorDiscriminators, actorName, isSystemActor, useActorStore,
 } from '../../stores/actorStore';
 import { useEffect } from 'react';
 import { Badge } from '../ui';
@@ -52,14 +52,15 @@ function useAttribution(actorId: string | null | undefined): Attribution {
   const system = isSystemActor(actor);
   // Display names are not identity and two of them can be equal, so a label
   // that is only a name can name two different people. When that happens both
-  // get a stable slice of their own id appended — in the label, not just the
-  // tooltip, because the tooltip is not there on a phone.
-  const ambiguous = !!actorId && ambiguousActorIds(actors).has(actorId);
+  // get a suffix off their own id — in the label, not just the tooltip,
+  // because the tooltip is not there on a phone. The suffix is as long as it
+  // has to be to be unique within the group; see `actorDiscriminators`.
+  const discriminator = actorId ? actorDiscriminators(actors).get(actorId) : undefined;
   return {
-    name: ambiguous ? `${base} (${actorDiscriminator(actorId!)})` : base,
+    name: discriminator ? `${base} (${discriminator})` : base,
     system,
     anonymous: !actor?.display_name?.trim() && !system,
-    ambiguous,
+    ambiguous: !!discriminator,
   };
 }
 
@@ -107,14 +108,22 @@ export function ActorLabel({ actorId }: { actorId: string | null | undefined }) 
  * header describes one session, so this is an answer rather than a repetition,
  * and it is the only place the full answer exists.
  *
- * **It does not disappear on a phone.** It did, matching the backend and model
- * chips beside it, and that was wrong: those two are conveniences, this is the
- * only place a phone can learn who a shared session belongs to — the session
- * list marks a person only once two of them have started something, and on a
- * phone that list is a drawer you have to open. So the chip stays at every
- * width and sheds its *text* instead: below `md` the glyph carries it and the
- * name is `sr-only`, which keeps the full sentence for a screen reader and the
- * `title` for a long press, while costing the title bar about 22px.
+ * **It does not disappear on a phone, and it shows a name there.** Two earlier
+ * versions of this were wrong in opposite ways. Hiding the chip below `md`, to
+ * match the backend and model chips beside it, left a phone with nowhere to
+ * learn who a shared session belongs to: those two are conveniences, this is
+ * the answer, and a *person* is marked in the session list only once two of
+ * them have started something — behind a drawer at that width. Keeping the
+ * chip but making the name `sr-only` was no better: the only thing left on
+ * screen was a generic glyph identical for everybody, and `title` is not a
+ * touch affordance, so a sighted phone user still could not tell Alice's
+ * session from Bob's.
+ *
+ * So what it sheds on a phone is the *verb*, not the name. Below `md` the chip
+ * reads `Alice`, truncated to 5rem; at `md` and up it reads `Started by Alice`
+ * in full. The verb stays in the DOM as `sr-only` throughout, so assistive
+ * technology always gets the whole sentence regardless of width, and the glyph
+ * never has to carry an accessible name of its own.
  */
 export function SessionCreator({ actorId }: { actorId: string | null | undefined }) {
   const attribution = useAttribution(actorId);
@@ -128,13 +137,16 @@ export function SessionCreator({ actorId }: { actorId: string | null | undefined
       title={label}
       className="shrink-0 max-w-[12rem] overflow-hidden"
     >
-      {/* Decorative at `md` and up, where the text says the same thing; below
-          it the text is still in the DOM for assistive technology, so the
-          glyph never has to carry an accessible name of its own. */}
+      {/* Decorative: the name is beside it at every width. */}
       {attribution.system
         ? <Bot size={11} className="shrink-0" aria-hidden="true" />
         : <User size={11} className="shrink-0" aria-hidden="true" />}
-      <span className="sr-only md:not-sr-only md:truncate">Started by {attribution.name}</span>
+      <span className="truncate max-w-[5rem] md:max-w-none">
+        {/* Out of flow below `md` (sr-only is absolutely positioned), so the
+            chip shows the name alone without the width the verb would cost. */}
+        <span className="sr-only md:not-sr-only">Started by </span>
+        {attribution.name}
+      </span>
     </Badge>
   );
 }

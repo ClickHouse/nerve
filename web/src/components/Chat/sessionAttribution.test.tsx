@@ -110,6 +110,11 @@ function renderSidebar(sessions: Session[]) {
   );
 }
 
+/** The header chip, whose text is split across two elements by design. */
+function headerChip(): HTMLElement | null {
+  return document.querySelector('[data-attribution="session-header"]');
+}
+
 /** Every creator marker on screen, by its accessible/hover text. */
 function markers(): string[] {
   return [...document.querySelectorAll('[data-attribution="session-row"]')]
@@ -231,13 +236,13 @@ describe('the chat page', () => {
   it('names the creator of the open session in its header', async () => {
     await renderChatPage(chat('s1', BOB));
 
-    expect(await screen.findByText('Started by Bob')).toBeInTheDocument();
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Bob'));
   });
 
   it('says so when the agent started it', async () => {
     await renderChatPage(chat('s1', SYSTEM));
 
-    expect(await screen.findByText('Started by Nerve')).toBeInTheDocument();
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Nerve'));
   });
 
   it('puts nothing in the header for a session with no recorded creator', async () => {
@@ -252,13 +257,13 @@ describe('the chat header', () => {
   it('names the creator without waiting for a second person', async () => {
     render(<SessionCreator actorId={ALICE} />);
 
-    expect(await screen.findByText('Started by Alice')).toBeInTheDocument();
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Alice'));
   });
 
   it('says the agent started it, and why that is different', async () => {
     render(<SessionCreator actorId={SYSTEM} />);
 
-    expect(await screen.findByText('Started by Nerve')).toBeInTheDocument();
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Nerve'));
     expect(
       screen.getByTitle('Started by Nerve itself — scheduled or autonomous work'),
     ).toBeInTheDocument();
@@ -272,37 +277,64 @@ describe('the chat header', () => {
     expect(listActors).not.toHaveBeenCalled();
   });
 
-  it('keeps its name reachable when the text is only for screen readers', async () => {
-    // Below `md` the chip sheds its text rather than itself, so a phone can
-    // still learn who a shared session belongs to — the session list marks a
-    // person only once two of them exist, and there it is behind a drawer.
-    // The breakpoint itself is a Tailwind class and not assertable here (the
-    // stylesheet is not processed and `matchMedia` reports desktop); what is
-    // assertable, and what the mobile state depends on, is that the sentence
-    // is always in the DOM rather than conditionally rendered, and that the
-    // glyph beside it never claims a name of its own.
-    const { container } = render(<SessionCreator actorId={ALICE} />);
+  /**
+   * The chip has two shapes, and which one is showing is a Tailwind breakpoint
+   * — not assertable here, since the stylesheet is not processed and
+   * `matchMedia` reports desktop. What *is* assertable is the structure both
+   * shapes depend on, and it is the structure that was wrong twice: the name
+   * must be a plain text node (so a phone shows it), the verb must be a
+   * separate `sr-only` element (so the phone does not pay for it but a screen
+   * reader still hears the whole sentence), and the glyph must claim no
+   * accessible name of its own. The rendered result at 375px is checked in a
+   * browser; see the handoff.
+   */
+  it('shows the name itself, with only the verb reserved for screen readers', async () => {
+    render(<SessionCreator actorId={ALICE} />);
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Alice'));
+    const chip = headerChip()!;
 
-    expect(await screen.findByText('Started by Alice')).toBeInTheDocument();
-    const chip = container.querySelector('[data-attribution="session-header"]')!;
+    // The name is the chip's own text, not inside the sr-only element — this
+    // is what a sighted phone user sees.
+    const verb = chip.querySelector('.sr-only')!;
+    expect(verb).toHaveTextContent('Started by');
+    expect(verb.textContent).not.toContain('Alice');
+    expect(chip.textContent).toContain('Alice');
+
+    expect(verb.className).toContain('md:not-sr-only');
     expect(chip).toHaveAttribute('title', 'Started by Alice');
     expect(chip.querySelector('svg')).toHaveAttribute('aria-hidden', 'true');
-    const text = chip.querySelector('span')!;
-    expect(text.className).toContain('sr-only');
-    expect(text.className).toContain('md:not-sr-only');
+  });
+
+  it('carries the discriminator into the name, so a phone can tell two Alexes apart', async () => {
+    const ALEX_1 = '0199aaaa-1111-7000-8000-0000000000ab';
+    const ALEX_2 = '0199aaaa-1111-7000-8000-0000000000cd';
+    listActors.mockResolvedValue({
+      actors: [
+        actorRef(ALEX_1, { display_name: 'Alex' }),
+        actorRef(ALEX_2, { display_name: 'Alex' }),
+      ],
+    });
+    render(<SessionCreator actorId={ALEX_1} />);
+
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Alex (0000ab)'));
+    // Visible text, not just the tooltip: the part that disambiguates is
+    // outside the sr-only verb.
+    const chip = headerChip()!;
+    expect(chip.querySelector('.sr-only')!.textContent).not.toContain('0000ab');
+    expect(chip.textContent).toContain('Alex (0000ab)');
   });
 
   it('falls back to the neutral label rather than the id', async () => {
     listActors.mockResolvedValue({ actors: [alice(null)] });
     render(<SessionCreator actorId={ALICE} />);
 
-    expect(await screen.findByText('Started by Unnamed account')).toBeInTheDocument();
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Unnamed account'));
     expect(screen.queryByText(new RegExp(ALICE))).toBeNull();
   });
 
   it('does not crash on an id the server has never heard of', async () => {
     render(<SessionCreator actorId="actor-elsewhere" />);
 
-    expect(await screen.findByText('Started by Unnamed account')).toBeInTheDocument();
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Unnamed account'));
   });
 });
