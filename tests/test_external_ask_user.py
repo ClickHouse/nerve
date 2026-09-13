@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 
 from nerve.config import NerveConfig
+from nerve.identity import ActorResolutionError
 from nerve.notifications.service import NotificationService
 
 from tests.actor_rows import ensure_system_principal
@@ -101,6 +102,53 @@ async def test_native_session_answer_still_injects(db):
     engine.run.assert_called_once()
     _args, kwargs = engine.run.call_args
     assert kwargs["session_id"] == "native-session-1"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_leaves_the_answer_givable_again(db):
+    """Answering is one-way: the row leaves ``pending`` and ``handle_answer``
+    refuses a row that is not pending. So an answer that never reached the
+    agent must not consume the question — otherwise the UI reports success on
+    something the agent is still waiting for, and nobody can answer it again.
+    """
+    await db.create_session(session_id="native-session-2", source="web", actor=None)
+    await db.create_notification(
+        notification_id="ask-native-2",
+        session_id="native-session-2",
+        type="question",
+        title="Continue?",
+    )
+
+    engine = MagicMock()
+    engine.sessions = MagicMock()
+    engine.sessions.is_running = MagicMock(return_value=False)
+    engine.run = AsyncMock()
+    service = _make_service(db, engine)
+
+    real = db.get_system_principal
+
+    async def _no_principal():
+        return None
+
+    db.get_system_principal = _no_principal
+    with patch("nerve.agent.streaming.broadcaster.broadcast", new=AsyncMock()):
+        with pytest.raises(ActorResolutionError):
+            await service.handle_answer("ask-native-2", "go", "web")
+    db.get_system_principal = real
+
+    engine.run.assert_not_called()
+    still = await db.get_notification("ask-native-2")
+    assert still["status"] == "pending", "the question was consumed by a failure"
+    assert not still["answer"]
+
+    # ...and the next attempt delivers it.
+    with patch("nerve.agent.streaming.broadcaster.broadcast", new=AsyncMock()):
+        assert await service.handle_answer("ask-native-2", "go", "web") is True
+    import asyncio
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    engine.run.assert_called_once()
+    assert (await db.get_notification("ask-native-2"))["status"] == "answered"
 
 
 @pytest.mark.asyncio
