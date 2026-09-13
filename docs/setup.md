@@ -286,12 +286,12 @@ auth:
 It is read at startup and pinned for the life of the process, like `auth.mode`
 and for the same reason, so set it **before** the instance is reachable.
 
-One refinement, in Nerve's favour: uvicorn rewrites the peer address from
-`X-Forwarded-For` when the immediate peer is `127.0.0.1`, so a same-host proxy
-that forwards the real client address makes the guard demand the token after
-all. A remote caller's own `X-Forwarded-For` is ignored — the rewrite only
-happens for a peer that was already loopback — so the header cannot be used to
-look local. Do not rely on either: set the switch.
+Nerve's listener reads **no** forwarding header: `nerve start` passes
+`proxy_headers=False` to uvicorn explicitly, because uvicorn's default is to
+rewrite the peer address from `X-Forwarded-For` when it trusts the immediate
+peer — and `FORWARDED_ALLOW_IPS=*` in the environment would then let any caller
+name its own address. So the peer is the socket's, always; a proxy in front of
+Nerve is invisible to the guard, which is why the switch above exists.
 
 ### What the wizard can and cannot decide
 

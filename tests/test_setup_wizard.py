@@ -379,16 +379,11 @@ class TestClaimingFromSomewhereElse:
     ):
         """The one place a header *can* reach the peer address, checked.
 
-        Nerve's guard reads ``scope["client"]`` and no header — but uvicorn
-        runs ``ProxyHeadersMiddleware`` by default, which rewrites that value
-        from ``X-Forwarded-For`` when the immediate peer is trusted
-        (``127.0.0.1``). So the real question is whether that rewrite can ever
-        turn a remote caller into a local one, and the answer has to be no:
-        the rewrite only happens for a peer that was *already* loopback, and
-        for a remote peer the header is ignored outright.
-
-        This drives the endpoint through the real middleware rather than
-        reasoning about it.
+        Nerve's listener disables that middleware (see
+        ``test_setup_token.py``), so in production it is not in the path at
+        all. Driven through it here anyway, because "we turned it off" and
+        "it could not hurt us if it were on" are different claims and the
+        second one is the one that survives somebody turning it back on.
         """
         from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -411,11 +406,13 @@ class TestClaimingFromSomewhereElse:
     ):
         """And the same middleware in the deployment the switch exists for.
 
-        With a reverse proxy on this host, the peer is loopback and the guard
-        would let the claim through — that is the documented limitation. When
-        the proxy passes the real client on, uvicorn replaces the peer with it
-        and the token is demanded after all. Worth pinning, because it is the
-        direction that could otherwise regress silently.
+        With a reverse proxy on this host the peer is loopback and the guard
+        would let the claim through — the documented limitation, and why
+        ``auth.setup_token_required`` exists. *If* that middleware were in the
+        path and the proxy forwarded the real client, the token would be
+        demanded after all. Nerve's own listener does not run it, so this is
+        the behaviour of the guard rather than a property anybody should
+        depend on.
         """
         from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 

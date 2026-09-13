@@ -1296,5 +1296,17 @@ def run_server(config: NerveConfig | None = None) -> None:
         host=config.gateway.host,
         port=config.gateway.port,
         log_level="info",
+        # Forwarding headers are **not** read, and saying so here is the point.
+        # uvicorn enables ProxyHeadersMiddleware by default, which rewrites
+        # scope["client"] from X-Forwarded-For whenever the immediate peer is
+        # trusted — and FORWARDED_ALLOW_IPS in the environment can widen that
+        # to `*`, at which point any caller can name its own address. Nerve
+        # decides one thing from the peer address, and it is whether a
+        # first-run claim may skip the setup token (0.7, 6.1); a caller-supplied
+        # header that can answer that question defeats the guard. A proxy on
+        # the same host therefore makes every request look local, which is
+        # documented, and `auth.setup_token_required` is the answer to it.
+        proxy_headers=False,
+        forwarded_allow_ips=None,
         **ssl_config,
     )
