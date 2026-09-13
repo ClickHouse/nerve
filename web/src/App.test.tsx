@@ -20,6 +20,7 @@ vi.mock('./api/client', async () => {
     api: {
       authStatus: vi.fn(), getOwnAccount: vi.fn(), login: vi.fn(),
       listActors: vi.fn().mockResolvedValue({ actors: [] }),
+      setupState: vi.fn(),
     },
     setToken: vi.fn(),
     clearToken: vi.fn(),
@@ -60,11 +61,13 @@ vi.mock('./components/Notifications/NotificationToast', () => ({
 import { api, getToken } from './api/client';
 import App from './App';
 import { useAuthStore } from './stores/authStore';
+import { useSetupStore } from './stores/setupStore';
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const getOwnAccount = api.getOwnAccount as unknown as ReturnType<typeof vi.fn>;
 const apiLogin = api.login as unknown as ReturnType<typeof vi.fn>;
 const tokenInStorage = getToken as unknown as ReturnType<typeof vi.fn>;
+const setupState = api.setupState as unknown as ReturnType<typeof vi.fn>;
 
 function me() {
   return {
@@ -89,6 +92,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   tokenInStorage.mockReturnValue(null);
   getOwnAccount.mockResolvedValue(me());
+  setupState.mockRejectedValue(new Error('not part of this test'));
+  useSetupStore.setState({ state: null, loading: true, busy: null, error: null });
   useAuthStore.setState({
     authenticated: false,
     loading: false,
@@ -243,5 +248,54 @@ describe('startup with no token', () => {
     await waitFor(() =>
       expect(useAuthStore.getState().loginMode).toBe('username_password'));
     expect(apiLogin).not.toHaveBeenCalled();
+  });
+});
+
+describe('the finish-setup affordance in the app', () => {
+  it('appears once the checklist says there is something left', async () => {
+    tokenInStorage.mockReturnValue('a-stored-token');
+    authStatus.mockResolvedValue(status());
+    setupState.mockResolvedValue({
+      setup_pending: false, lockdown: false, writable: true,
+      read_only_reason: null, restart_pending: false, restart_pending_paths: [],
+      restart_pending_reasons: [], restart_command: 'nerve restart',
+      warning: null, finished: false, steps: [], crons: [],
+      values: {
+        timezone: 'UTC', display_name: null, has_anthropic_key: false,
+        has_openai_key: false, has_telegram_token: false, sync_github: false,
+        sync_gmail: false, sync_telegram: false,
+      },
+    });
+
+    renderApp();
+
+    // An abandoned post-claim checklist is invisible without this; the app
+    // reads it once per load precisely so every page can point back at it.
+    expect(
+      await screen.findByRole('link', { name: /finish setup/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('stays away when the checklist is finished', async () => {
+    tokenInStorage.mockReturnValue('a-stored-token');
+    authStatus.mockResolvedValue(status());
+    setupState.mockResolvedValue({
+      setup_pending: false, lockdown: false, writable: true,
+      read_only_reason: null, restart_pending: false, restart_pending_paths: [],
+      restart_pending_reasons: [], restart_command: 'nerve restart',
+      warning: null, finished: true, steps: [], crons: [],
+      values: {
+        timezone: 'UTC', display_name: null, has_anthropic_key: false,
+        has_openai_key: false, has_telegram_token: false, sync_github: false,
+        sync_gmail: false, sync_telegram: false,
+      },
+    });
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(useSetupStore.getState().state?.finished).toBe(true));
+    expect(screen.queryByRole('link', { name: /finish setup/i })).toBeNull();
   });
 });

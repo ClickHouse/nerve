@@ -1,6 +1,7 @@
 import {
   MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, Clock,
-  Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket, Users, type Icon,
+  Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket, Users, ShieldQuestion,
+  type Icon,
 } from '../ui/icons';
 
 export type NavItem = {
@@ -11,6 +12,11 @@ export type NavItem = {
   label: string;
   /** Hidden unless the named feature is enabled. */
   feature?: 'ultracode';
+  /** Shown only while the first-run checklist has something left to answer.
+   *  A destination you visit once and never again does not deserve a
+   *  permanent slot — and a checklist nobody can find is a checklist people
+   *  abandon, which is the state this entry exists to make visible. */
+  whileUnfinished?: true;
 };
 
 export const NAV_ITEMS: NavItem[] = [
@@ -27,6 +33,7 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/cron', icon: Clock, label: 'Cron' },
   { path: '/memory', icon: Brain, label: 'Memory' },
   { path: '/accounts', icon: Users, label: 'Accounts' },
+  { path: '/setup', icon: ShieldQuestion, label: 'Setup', whileUnfinished: true },
   { path: '/diagnostics', icon: Activity, label: 'Diag' },
 ];
 

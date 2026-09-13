@@ -2,6 +2,7 @@ import { useEffect, useMemo } from 'react';
 import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import type { Location } from 'react-router-dom';
 import { useAuthStore } from './stores/authStore';
+import { useSetupStore } from './stores/setupStore';
 import { ws } from './api/websocket';
 import { useChatStore } from './stores/chatStore';
 import { useUIStore } from './stores/uiStore';
@@ -29,7 +30,7 @@ import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
-import { SetupPage } from './pages/SetupPage';
+import { SetupPage, SetupReminder } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
@@ -48,6 +49,12 @@ function App() {
     ws.connect();
     const unsub = ws.onMessage(handleWSMessage);
     loadSessions();
+    // The checklist, once per app load. It decides whether the "finish setup"
+    // affordance and its nav entry are shown at all, and that question has to
+    // be answerable from every page rather than only from the setup page —
+    // an abandoned checklist that is invisible everywhere else is an
+    // abandoned checklist nobody finishes.
+    void useSetupStore.getState().load();
     return () => { unsub(); ws.disconnect(); };
   }, [authenticated]);
 
@@ -111,6 +118,7 @@ function App() {
       )}
 
       <NotificationToast />
+      <SetupReminder />
       <ShortcutsModal />
     </>
   );

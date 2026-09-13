@@ -8,11 +8,15 @@ import { IconButton } from '../ui';
 import { LogOut } from '../ui/icons';
 import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS } from './navItems';
+import { setupIsUnfinished, useSetupStore } from '../../stores/setupStore';
 
 export function NavRail() {
   const location = useLocation();
   const navigate = useNavigate();
   const { logout } = useAuthStore();
+  // Beside Accounts while the checklist has something left, and gone once it
+  // has not. The store is loaded once by the app, so this costs no request.
+  const setupUnfinished = useSetupStore(setupIsUnfinished);
   const pendingCount = useNotificationStore(s => s.pendingCount);
   const loadNotifications = useNotificationStore(s => s.loadNotifications);
   const [ultracodeEnabled, setUltracodeEnabled] = useState(false);
@@ -27,6 +31,7 @@ export function NavRail() {
 
   const visibleItems = NAV_ITEMS.filter(item => {
     if (item.feature === 'ultracode' && !ultracodeEnabled) return false;
+    if (item.whileUnfinished && !setupUnfinished) return false;
     return true;
   });
 

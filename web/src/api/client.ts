@@ -23,6 +23,67 @@ export interface SetupClaim {
   token: string;
 }
 
+/** One step of the post-claim checklist, as `GET /api/setup` reports it. */
+export interface SetupStep {
+  id: string;
+  title: string;
+  /** `done` because the thing it does is true, not because a flag says so. */
+  status: 'done' | 'skipped' | 'pending';
+  required: boolean;
+  can_skip: boolean;
+  detail: string;
+}
+
+/** An optional cron the checklist can switch on, read from the install's own
+ *  `system.yaml` — the checklist toggles what is there and adds nothing. */
+export interface SetupCron {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+}
+
+/** What the checklist's forms open on: the instance's current answers.
+ *  Secrets are reported as present or not — the checklist writes credentials
+ *  and never reads them back. */
+export interface SetupValues {
+  timezone: string;
+  display_name: string | null;
+  has_anthropic_key: boolean;
+  has_openai_key: boolean;
+  has_telegram_token: boolean;
+  sync_github: boolean;
+  sync_gmail: boolean;
+  sync_telegram: boolean;
+}
+
+/** `GET /api/setup` — the whole checklist screen in one read. */
+export interface SetupState {
+  /** The one account still has no password: anybody who can reach the
+   *  instance is signed in as the owner. */
+  setup_pending: boolean;
+  lockdown: boolean;
+  writable: boolean;
+  /** Why the checklist cannot write, when it cannot. */
+  read_only_reason: string | null;
+  restart_pending: boolean;
+  restart_pending_paths: string[];
+  /** Waiting on a restart but not a configuration key — a cron file the
+   *  running scheduler has not picked up. Already in words. */
+  restart_pending_reasons: string[];
+  /** What an operator runs on the server to pick the above up. There is no
+   *  endpoint that does it: the browser never restarts the daemon. */
+  restart_command: string;
+  finished: boolean;
+  steps: SetupStep[];
+  crons: SetupCron[];
+  values: SetupValues;
+  /** Set when a step's configuration landed but the checklist could not
+   *  record it — partial success, which is neither an error to retry nor a
+   *  success to say nothing about. */
+  warning: string | null;
+}
+
 /** One local account, as `/api/accounts` returns it. Never carries a credential. */
 export interface Account {
   id: string;
@@ -404,6 +465,43 @@ export const api = {
   }) => request<SetupClaim>('/setup/claim', {
     method: 'POST', body: JSON.stringify(body),
   }),
+
+  // The post-claim checklist. Every one of these is an ordinary authenticated
+  // request: the setup token guards the claim above and nothing else.
+  setupState: () => request<SetupState>('/setup'),
+
+  setupProvider: (body: { anthropic_api_key?: string; openai_api_key?: string }) =>
+    request<SetupState>('/setup/provider', {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
+
+  setupProfile: (body: { timezone?: string; display_name?: string }) =>
+    request<SetupState>('/setup/profile', {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
+
+  setupChannels: (body: {
+    telegram_bot_token: string; telegram_allowed_users?: number[];
+  }) => request<SetupState>('/setup/channels', {
+    method: 'PUT', body: JSON.stringify(body),
+  }),
+
+  /** Every field optional: an omitted one is left untouched. Sending a value
+   *  the user did not change is how re-entering a step to turn one cron on
+   *  used to switch off the sync sources configured elsewhere. */
+  setupAutomation: (body: {
+    crons?: string[]; github?: boolean; gmail?: boolean;
+    gmail_accounts?: string[]; telegram?: boolean;
+    telegram_api_id?: number; telegram_api_hash?: string;
+  }) => request<SetupState>('/setup/automation', {
+    method: 'PUT', body: JSON.stringify(body),
+  }),
+
+  setupSkip: (step: string, skipped: boolean) =>
+    request<SetupState>(
+      `/setup/steps/${encodeURIComponent(step)}/${skipped ? 'skip' : 'unskip'}`,
+      { method: 'POST' },
+    ),
 
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
