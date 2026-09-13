@@ -530,6 +530,7 @@ class AccountStore:
         username: str,
         credential: str,
         display_name: str | None = None,
+        invalidate_secret_name: str | None = None,
     ) -> dict:
         """Atomically name and secure exactly one unclaimed account.
 
@@ -549,7 +550,10 @@ class AccountStore:
         Raises :class:`NotClaimableError` unless exactly one account exists and
         it has no credential, and the username errors of
         :func:`normalise_username`. ``display_name`` also renames the account's
-        actor, in the same transaction.
+        actor, in the same transaction. When ``invalidate_secret_name`` is
+        supplied, that instance secret is securely deleted in the transaction
+        too: the account cannot become claimed while its bearer claim token
+        remains live after a cancellation or database error.
 
         **It also ends every session that existed before it**, by bumping
         ``session_epoch`` in the same statement that sets the password. A
@@ -561,8 +565,7 @@ class AccountStore:
 
         Note what this does **not** do: decide who may call it. A passwordless
         install admits everybody, so the caller is responsible for the guard
-        that makes claiming meaningful (a setup token, or proof that the request
-        came from the machine itself).
+        that makes claiming meaningful (the persisted setup token).
         """
         username = normalise_username(username)
         if not credential:
@@ -604,6 +607,15 @@ class AccountStore:
                     "UPDATE actor_refs SET display_name = ? WHERE id = ?",
                     (display_name or None, account["actor_id"]),
                 )
+            if invalidate_secret_name is not None:
+                await self.db.execute("PRAGMA secure_delete=ON")
+                try:
+                    await self.db.execute(
+                        "DELETE FROM instance_secrets WHERE name = ?",
+                        (invalidate_secret_name,),
+                    )
+                finally:
+                    await self.db.execute("PRAGMA secure_delete=OFF")
         return await self.get_account(account["id"])  # type: ignore[return-value]
 
     async def disable_account(

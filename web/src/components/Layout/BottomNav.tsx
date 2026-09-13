@@ -7,7 +7,6 @@ import { api } from '../../api/client';
 import { Drawer, IconButton } from '../ui';
 import { MoreHorizontal, LogOut, X } from '../ui/icons';
 import { ThemeToggle } from './ThemeToggle';
-import { setupIsUnfinished, useSetupStore } from '../../stores/setupStore';
 import { NAV_ITEMS, PRIMARY_PATHS, type NavItem } from './navItems';
 
 /**
@@ -37,15 +36,7 @@ export function BottomNav() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const setupUnfinished = useSetupStore(setupIsUnfinished);
-  const available = NAV_ITEMS.filter(i => {
-    if (i.feature === 'ultracode' && !ultracodeEnabled) return false;
-    // Behind "More" while the checklist has something left to answer, and
-    // gone once it has not: a destination you visit once does not earn a
-    // permanent slot, and one nobody can find is one people abandon.
-    if (i.whileUnfinished && !setupUnfinished) return false;
-    return true;
-  });
+  const available = NAV_ITEMS.filter(i => !(i.feature === 'ultracode' && !ultracodeEnabled));
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));

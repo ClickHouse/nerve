@@ -222,153 +222,40 @@ nerve start              # Start the server
 
 ## Claiming an instance from a browser
 
-`nerve init` asks for a password. The headless path does not: it reads
-`NERVE_PASSWORD` from the environment and defaults it to empty, so a Docker
-install that omits it starts with **one account and no password**. Until
-somebody claims it, everyone who can reach the gateway is signed in as the
-owner and no activity can be told apart.
+A headless install with no `NERVE_PASSWORD` starts with one passwordless
+account. Until it is claimed, every caller who reaches the gateway is admitted
+as that account. Open `/setup` to name it, set its password, and optionally
+set its display name in one atomic operation.
 
-The web setup wizard at `/setup` is how that ends. Its first step names and
-secures the account the install already has — it does not create a second one,
-so nothing recorded up to that point changes hands — and it signs the browser
-in with the password it just set. Every later step is an ordinary authenticated
-request.
+Every claim requires the setup token. Read it locally with:
 
-### Who may claim
-
-Two ways to prove you are allowed to:
-
-- **You are on the machine.** The request's *socket peer address* is loopback
-  (`127.0.0.0/8`, `::1`, or the IPv4-mapped `::ffff:127.0.0.1` a dual-stack
-  listener reports). That is at least as strong as reading a token out of the
-  machine's own log, so no token is asked for.
-- **You hold the setup token.** Generated on first start while the instance is
-  unclaimed, and printed:
-
-  ```bash
-  nerve logs          # the startup line, on the machine
-  docker logs nerve   # the same line, for a container
-  nerve status        # prints it again while the instance is unclaimed
-  ```
-
-  It is kept in `nerve.db`, so a restart does not invalidate it, and it is
-  deleted the moment the account has a password. `nerve doctor` deliberately
-  does **not** print it: that report is also relayed by the Telegram `/doctor`
-  command, and a live credential does not belong in a chat log.
-
-Nothing else counts *for locality*. The peer address comes from the socket, and
-**no header is ever read** to decide it — not `X-Forwarded-For`, not
-`Forwarded`. A caller-supplied header that can turn a remote request into a
-local one defeats the whole guard, and Nerve has no forwarding-header handling
-anywhere.
-
-**A tokenless claim must also be same-origin.** Loopback says the caller is on
-this machine; it does not say who wrote the page doing the asking. A browser
-there runs whatever site its owner visited, and Nerve answers
-`Access-Control-Allow-Origin: *`, so without this a page on
-`https://evil.example` could post to `http://127.0.0.1:8900` and choose the
-username and password of an unclaimed instance — locking its owner out of their
-own machine. So the exemption also requires:
-
-- `Origin`, when the browser sends one, to be this instance;
-- `Sec-Fetch-Site` to be `same-origin` or `none`;
-- `Host` to name an address this instance answers on, which is what stops DNS
-  rebinding: a name the attacker controls that resolves to loopback is
-  same-origin with *itself*, and only the `Host` header gives it away.
-
-Anything else — a hostile origin, a rebound name, a header that cannot be read
-— simply requires the setup token, which is a stronger statement than any
-header makes: whoever holds it read it off this machine's own log. A request
-with no `Origin` and no `Sec-Fetch-Site` at all is not a page (`curl` on the
-machine), and the peer address is the whole story for it.
-
-The wildcard CORS policy is fine for the rest of the API, which authenticates
-on a bearer token that a cross-origin page can neither obtain nor attach. The
-claim is the one endpoint that deliberately accepts no credential, which is
-exactly why it needs this instead.
-
-Claiming is also the only way to set that first password. `PUT
-/api/accounts/me/password` needs no current password on an account that has
-none, which is exactly the state this exists to end, so while the instance is
-unclaimed it refuses and points here. There is one door.
-
-### Docker, and the reverse-proxy limitation
-
-A request from the host into a container arrives over the bridge network, so
-its peer is the bridge gateway rather than loopback: the container case needs
-the token, which is what `docker logs` is for.
-
-The honest limitation is the other way round. **Running Nerve behind a reverse
-proxy on the same host makes every request look local**, because the proxy is
-the peer — so the token requirement switches itself off with nothing to say so.
-For those deployments, force it:
-
-```yaml
-# config.yaml (machine-local) or the tracked settings.yaml
-auth:
-  setup_token_required: true
+```bash
+nerve status
 ```
 
-It is read at startup and pinned for the life of the process, like `auth.mode`
-and for the same reason, so set it **before** the instance is reachable.
+The token is generated once, persisted in `nerve.db` across restarts, and
+invalidated when the claim succeeds. It is sent only in the claim request body:
+Nerve never places it in a URL, response, server log, or browser storage.
 
-Nerve's listener reads **no** forwarding header: `nerve start` passes
-`proxy_headers=False` to uvicorn explicitly, because uvicorn's default is to
-rewrite the peer address from `X-Forwarded-For` when it trusts the immediate
-peer — and `FORWARDED_ALLOW_IPS=*` in the environment would then let any caller
-name its own address. So the peer is the socket's, always; a proxy in front of
-Nerve is invisible to the guard, which is why the switch above exists.
+The setup token is a bearer credential. For remote setup, protect it and the
+new password in transit by serving Nerve over HTTPS or reaching it through a
+trusted encrypted tunnel. Do not expose a plaintext remote setup page.
 
-### What the wizard can and cannot decide
+The claim updates the existing account rather than creating another, so earlier
+attribution keeps its identity. Exactly one concurrent claimant can win. It
+also advances the account's session epoch: pre-claim HTTP sessions become
+unauthorized, open WebSockets are rechecked and closed, and the successful
+response carries the one new client session token. The browser refreshes
+`/api/auth/status`, `/api/accounts/me`, and the actor directory before
+routing to chat.
 
-It is a checklist, not a gate: after the account, every step can be skipped,
-re-entered and done in any order, and an abandoned wizard leaves a working
-instance running on defaults with a reminder in the app.
+Browser setup ends there. Provider credentials, profile configuration,
+channels, automation, and daemon lifecycle remain in `nerve init`, the CLI,
+configuration files, and their dedicated product surfaces.
 
-| Step | Writes |
-|---|---|
-| Claim the account | username, password and display name, in `nerve.db` |
-| Provider credential | `anthropic_api_key` / `openai_api_key` → `config.local.yaml` (0600) |
-| Timezone and name | `timezone` → the tracked `settings.yaml`; the display name → your actor |
-| Telegram | `telegram.bot_token` → `config.local.yaml`; `telegram.enabled` → `config.yaml` |
-| Automation | enables the optional crons the installer wrote, and which sources sync |
-
-Every one of those writes through the same code `nerve init` writes with
-(`nerve/setup_writer.py`), so the two cannot drift about which layer a value
-belongs in. Each step writes only the keys it owns, and merges them into what
-is already on disk rather than regenerating the file.
-
-What it deliberately does not do:
-
-- **Find a credential on your laptop.** `nerve init` reads the macOS keychain
-  and `~/.claude/.credentials.json`; a process inside the VM cannot see either,
-  so the wizard asks for a key instead of pretending to.
-- **Decide the install's shape.** Deployment style and the workspace path are
-  host decisions — `nerve init` on the machine.
-- **Replace the settings screens.** First-run decisions only.
-
-Every step is a *patch*: a field you do not touch is left exactly as it is, so
-re-entering a step to change one thing changes one thing. The forms open on
-what the instance already says rather than on defaults, and a credential is
-shown as configured rather than read back out.
-
-It ends in a restart, because `timezone`, the Telegram token and the gateway
-socket are read at startup (see [Config](config.md#what-still-needs-a-restart)).
-The page waits for the **new** process — `/health` publishes a generation that
-changes on every start, and the daemon being replaced answers until the moment
-it stops — and comes back **signed in**: the signing secret is pinned and
-persisted, the session epoch lives on the account rather than in the process,
-and nothing in the wizard rotates either.
-
-Claiming the account ends the sessions that existed before it, including any
-an earlier visitor was holding; see
-[Accounts and identity](accounts.md#passwordless).
-
-**Under `lockdown` the checklist is read-only.** Configuration there is
-fleet-managed and machine-local values are environment references, so every
-write refuses with the reason. Claiming the account still works, on purpose: it
-writes to `nerve.db` rather than to configuration, and a fleet-managed install
-that could never be claimed would stay open to everyone who can reach it.
+Claiming is the only way to set the first password.
+`PUT /api/accounts/me/password` refuses while the instance is unclaimed, so a
+passwordless session cannot bypass the setup token.
 
 ## HTTPS Setup
 

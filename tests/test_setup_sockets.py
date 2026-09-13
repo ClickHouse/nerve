@@ -157,9 +157,7 @@ def _passwordless_session(instance) -> str:
 
 
 def _claim(instance) -> str:
-    """Claim over HTTP, from a peer TestClient reports as ``testclient`` —
-    which is not loopback, so this goes through the setup token, exactly as a
-    claim from another machine does."""
+    """Claim over HTTP with the token every peer must present."""
     response = instance.client.post("/api/setup/claim", json={
         "username": "alice",
         "password": _PASSWORD,

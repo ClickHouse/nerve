@@ -30,7 +30,7 @@ from pathlib import Path
 
 import click
 
-from nerve import daemon, paths
+from nerve import paths
 from nerve.config import (
     RESUME_QUEUE_FILE,
     load_config,
@@ -509,31 +509,92 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         ctx.exit(rc)
         return
 
-    systemd = _is_systemd_managed()
+    # Systemd mode (Restart=always): just kill the process — systemd
+    # will bring it back automatically.
+    if _is_systemd_managed():
+        running, old_pid = _get_daemon_status()
+        if running:
+            click.echo(f"Restarting Nerve (PID {old_pid})... systemd will respawn.")
+            os.kill(old_pid, signal.SIGTERM)
+        else:
+            click.echo("Nerve is not running — systemd will start it shortly.")
+        return
+
+    # Build the command that `start` would use to launch the daemon.
+    # Always use ``-m nerve`` so the restart works regardless of how *this*
+    # process was invoked (console-script, ``python -m nerve``, etc.).
+    verbose = ctx.obj["verbose"]
+    start_cmd_parts = [sys.executable, "-m", "nerve", "-c", str(config_dir)]
+    if verbose:
+        start_cmd_parts.append("-v")
+    start_cmd_parts.extend(["start", "--foreground"])
+
     running, old_pid = _get_daemon_status()
 
-    # Everything below — the systemd path and the detached helper — is in
-    # nerve.daemon, because the web setup wizard's last step has to do exactly
-    # this and a second implementation of "restart the daemon" would drift from
-    # this one. The facts it needs are passed in rather than discovered there,
-    # so this command's own helpers stay the ones in force.
-    outcome = daemon.restart_daemon(
-        config_dir,
-        verbose=ctx.obj["verbose"],
-        old_pid=old_pid if running else None,
-        systemd=systemd,
+    # Spawn a detached helper that: waits for old PID to exit, then starts
+    # a new daemon.  Written as an inline Python script so we don't need an
+    # external shell script on disk.
+    helper_script = (
+        "import os, signal, subprocess, sys, time\n"
+        f"old_pid = {old_pid if running else 'None'}\n"
+        f"pid_file = {str(paths.pid_file())!r}\n"
+        f"log_file = {str(paths.log_file())!r}\n"
+        f"start_cmd = {start_cmd_parts!r}\n"
+        "if old_pid is not None:\n"
+        "    try:\n"
+        "        os.kill(old_pid, signal.SIGTERM)\n"
+        "    except ProcessLookupError:\n"
+        "        pass\n"
+        "    for _ in range(30):\n"
+        "        time.sleep(0.5)\n"
+        "        try:\n"
+        "            os.kill(old_pid, 0)\n"
+        "        except ProcessLookupError:\n"
+        "            break\n"
+        "    else:\n"
+        "        try:\n"
+        "            os.kill(old_pid, signal.SIGKILL)\n"
+        "            time.sleep(0.5)\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "    # Remove stale PID file\n"
+        "    try:\n"
+        "        os.unlink(pid_file)\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n"
+        "time.sleep(0.5)\n"
+        "log_fd = open(log_file, 'a')\n"
+        "proc = subprocess.Popen(\n"
+        "    start_cmd,\n"
+        "    stdout=log_fd,\n"
+        "    stderr=log_fd,\n"
+        "    stdin=subprocess.DEVNULL,\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "log_fd.close()\n"
+        "time.sleep(1)\n"
+        "if proc.poll() is not None:\n"
+        "    sys.exit(1)\n"
     )
-    click.echo(outcome.message)
+
+    log_fd = open(paths.log_file(), "a")
+    subprocess.Popen(
+        [sys.executable, "-c", helper_script],
+        stdout=log_fd,
+        stderr=log_fd,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    log_fd.close()
+
+    if running:
+        click.echo(f"Restarting Nerve (PID {old_pid})... new instance will start shortly.")
+    else:
+        click.echo("Starting Nerve... new instance will start shortly.")
 
 
 def _echo_setup_token(config) -> None:
-    """Print the first-run setup token, while there is one.
-
-    ``nerve status`` is a terminal command on the machine itself, which is
-    exactly who the token is for. It is deliberately **not** printed by
-    ``nerve doctor``: that report is also produced for the Telegram ``/doctor``
-    command, and a live credential should not be relayed into a chat.
-    """
+    """Print the unclaimed instance's token only to this local terminal."""
     from nerve.db.accounts import read_instance_secret
     from nerve.setup_token import SETUP_TOKEN_NAME
 
@@ -546,12 +607,12 @@ def _echo_setup_token(config) -> None:
         host = "localhost"
     click.echo()
     click.secho(
-        "  This instance has not been claimed: it has no password, so anyone "
-        "who can reach it is signed in as the owner.",
+        "  This instance has not been claimed. Every browser claim requires "
+        "the setup token below.",
         fg="yellow",
     )
-    click.echo(f"  Finish setup at http://{host}:{port}/setup")
-    click.echo(f"  Setup token (only needed from another machine): {token}")
+    click.echo(f"  Setup page: http://{host}:{port}/setup")
+    click.echo(f"  Setup token: {token}")
 
 
 @main.command()
@@ -565,10 +626,6 @@ def status(ctx: click.Context, follow: bool) -> None:
     # Docker mode: proxy to docker compose ps
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
-        # Before the exit, and before `logs -f` replaces this process: a Docker
-        # install is precisely the one that *needs* the token — its callers
-        # arrive over the bridge network, so their peer is never loopback —
-        # and the operator reading this is on the machine.
         _echo_setup_token(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
@@ -1168,10 +1225,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     elif not usable:
         warnings.append(
             "[WARN] No password set — passwordless: anyone who can reach "
-            "the gateway acts as the owner. Claim it at /setup; a browser on "
-            "this machine needs nothing, one elsewhere needs the setup token "
-            "from `nerve status` or the startup log (this report is also sent "
-            "to Telegram, so it does not print the token)"
+            "the gateway acts as the owner. Claim it at /setup with the "
+            "setup token shown by `nerve status` on the host"
         )
     else:
         lines.append(

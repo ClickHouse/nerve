@@ -253,8 +253,8 @@ async def update_account(
         raise HTTPException(
             status_code=409,
             detail="This instance has not been claimed yet. Give the account "
-                   "its username and password together through the setup "
-                   "wizard (POST /api/setup/claim).",
+                   "its username and password together through "
+                   "POST /api/setup/claim with the mandatory setup token.",
         )
     account = await db.get_account(account_id)
     if account is None:
@@ -344,10 +344,8 @@ async def change_own_password(
 
     ``current_password`` is required whenever the account already has one —
     from its own row or from ``auth.password_hash`` — so a stolen session token
-    is not on its own enough to take the account over. The account that has
-    none (a passwordless install, before anyone has set one) is the one case
-    that may set a first password without proving anything beyond being signed
-    in, which is also what it has to do before a second account can exist.
+    is not on its own enough to take the account over. A passwordless install
+    must instead use the setup-token-protected claim endpoint.
 
     An **omitted** current password and an **empty** one are different things.
     The first is "I am not claiming to know it"; the second is a claim that the
@@ -375,9 +373,8 @@ async def change_own_password(
         raise HTTPException(
             status_code=409,
             detail="This instance has not been claimed yet. Set the first "
-                   "password through the setup wizard (POST /api/setup/claim), "
-                   "which proves the request comes from the machine itself or "
-                   "carries the setup token.",
+                   "password through POST /api/setup/claim with the mandatory "
+                   "setup token.",
         )
 
     existing = account_credential(account, config)

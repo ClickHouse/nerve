@@ -54,23 +54,20 @@ empty.
 | `username_password` | Two or more accounts | Username and password |
 
 A passwordless installation is safe only when access to the gateway is already
-restricted, such as by binding it to loopback. Set a password before exposing
-the gateway to other users or networks.
+restricted. Claim it before exposing the gateway to other users or networks.
 
 ### Claiming the first account
 
-A new passwordless installation is unclaimed. Use `/setup` to set the first
-account's username, display name, and password in one operation. Until then,
-`POST /api/setup/claim` is the only permitted write; other setup, account, and
-restart mutations return `409`.
+A new passwordless installation is unclaimed. Open `/setup` and enter the setup
+token shown by `nerve status` to set the first account's username, password, and
+optional display name. Send the token only in the JSON request body. For a remote
+claim, use HTTPS or a protected tunnel.
 
-Remote claims require the setup token printed by the server. Loopback requests
-are exempt unless `auth.setup_token_required` is enabled, but a tokenless claim
-must still come from a page served by the same Nerve instance.
-
-Claiming increments the account's session epoch. Sessions issued while the
-installation was passwordless are invalidated, and their open WebSockets are
-closed. The claim response contains the replacement token.
+Until the claim succeeds, `POST /api/setup/claim` is the only permitted account
+write. The claim updates the account and increments its session epoch in one
+transaction. Sessions issued while the installation was passwordless are
+invalidated, their open WebSockets are closed, and the response returns the
+replacement token. The setup token is then invalidated.
 
 See [Setup](setup.md#claiming-an-instance-from-a-browser).
 

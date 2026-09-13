@@ -17,81 +17,10 @@ export interface AuthStatus {
   login: LoginKind;
 }
 
-/** One step of the first-run checklist, as `GET /api/setup` reports it. */
-export interface SetupStep {
-  id: string;
-  title: string;
-  /** `done` because the thing it does is true, not because a flag says so. */
-  status: 'done' | 'skipped' | 'pending';
-  required: boolean;
-  can_skip: boolean;
-  detail: string;
-}
-
-/** An optional cron the checklist can switch on, read from the install's own
- *  `system.yaml` — the wizard toggles what is there and adds nothing. */
-export interface SetupCron {
-  id: string;
-  name: string;
-  description: string;
-  enabled: boolean;
-}
-
-/** What the checklist's forms open on: the instance's current answers.
- *  Secrets are reported as present or not — the wizard writes credentials
- *  and never reads them back. */
-export interface SetupValues {
-  timezone: string;
-  display_name: string | null;
-  has_anthropic_key: boolean;
-  has_openai_key: boolean;
-  has_telegram_token: boolean;
-  sync_github: boolean;
-  sync_gmail: boolean;
-  sync_telegram: boolean;
-}
-
-/** `GET /api/setup` — the whole checklist screen in one read. */
-export interface SetupState {
-  /** The one account still has no password: anybody who can reach the
-   *  instance is signed in as the owner. */
-  setup_pending: boolean;
-  lockdown: boolean;
-  writable: boolean;
-  /** Why the checklist cannot write, when it cannot. */
-  read_only_reason: string | null;
-  restart_pending: boolean;
-  restart_pending_paths: string[];
-  /** Waiting on a restart but not a configuration key — a cron file the
-   *  running scheduler has not picked up. Already in words. */
-  restart_pending_reasons: string[];
-  finished: boolean;
-  steps: SetupStep[];
-  crons: SetupCron[];
-  values: SetupValues;
-  /** Set when a step's configuration landed but the checklist could not
-   *  record it — partial success, which is neither an error to retry nor a
-   *  success to say nothing about. */
-  warning: string | null;
-}
-
 /** What `POST /api/setup/claim` hands back: a session for the account it just
  *  secured, so the browser never has to re-type the password it set. */
 export interface SetupClaim {
   token: string;
-  account_id: string;
-  actor_id: string;
-  username: string | null;
-  display_name: string | null;
-}
-
-/** `GET /api/auth/me` — who this request is. Never a credential. */
-export interface Me {
-  actor_id: string;
-  account_id: string | null;
-  username: string | null;
-  display_name: string | null;
-  kind: 'human' | 'system';
 }
 
 /** One local account, as `/api/accounts` returns it. Never carries a credential. */
@@ -482,77 +411,14 @@ export const api = {
    */
   getViewer: () => request<Viewer>('/auth/me'),
 
-  // Setup wizard. `setupClaim` is the one unauthenticated write in the
-  // product: the state it ends (one account, no password) already admits
-  // everybody, so a session would protect nothing — the setup token, or a
-  // request from the machine itself, is what guards it.
+  // The one unauthenticated write. The mandatory setup token is sent only
+  // in this JSON body and is never retained by the API client.
   setupClaim: (body: {
     username: string; password: string;
-    display_name?: string; setup_token?: string;
+    setup_token: string; display_name?: string;
   }) => request<SetupClaim>('/setup/claim', {
     method: 'POST', body: JSON.stringify(body),
   }),
-
-  setupState: () => request<SetupState>('/setup'),
-
-  setupProvider: (body: { anthropic_api_key?: string; openai_api_key?: string }) =>
-    request<SetupState>('/setup/provider', {
-      method: 'PUT', body: JSON.stringify(body),
-    }),
-
-  setupProfile: (body: { timezone?: string; display_name?: string }) =>
-    request<SetupState>('/setup/profile', {
-      method: 'PUT', body: JSON.stringify(body),
-    }),
-
-  setupChannels: (body: {
-    telegram_bot_token: string; telegram_allowed_users?: number[];
-  }) => request<SetupState>('/setup/channels', {
-    method: 'PUT', body: JSON.stringify(body),
-  }),
-
-  /** Every field optional: an omitted one is left untouched. Sending a value
-   *  the user did not change is how re-entering a step to turn one cron on
-   *  used to switch off the sync sources configured elsewhere. */
-  setupAutomation: (body: {
-    crons?: string[]; github?: boolean; gmail?: boolean;
-    gmail_accounts?: string[]; telegram?: boolean;
-    telegram_api_id?: number; telegram_api_hash?: string;
-  }) => request<SetupState>('/setup/automation', {
-    method: 'PUT', body: JSON.stringify(body),
-  }),
-
-  setupSkip: (step: string, skipped: boolean) =>
-    request<SetupState>(
-      `/setup/steps/${encodeURIComponent(step)}/${skipped ? 'skip' : 'unskip'}`,
-      { method: 'POST' },
-    ),
-
-  /** Restart the daemon — what `nerve restart` does. The browser reconnects
-   *  and stays signed in: the signing secret is pinned and persisted, the
-   *  session epoch is per account rather than per process, and nothing in the
-   *  wizard rotates either. `boot` names the process that accepted the
-   *  request; wait for `health()` to report a different one. */
-  restartSystem: () => request<{
-    restarting: boolean; method: string; message: string; boot: string;
-  }>('/system/restart', { method: 'POST' }),
-
-  /**
-   * Liveness, and which run of the daemon is answering.
-   *
-   * Outside `/api` and outside the session: it has to be readable while the
-   * instance is coming back up. `boot` is a new random value on every start,
-   * which is the only thing that distinguishes the new process from the old
-   * one still serving as it shuts down.
-   */
-  health: async (): Promise<{ status: string; boot?: string }> => {
-    const res = await fetch('/health');
-    if (!res.ok) throw new Error(`${res.status}`);
-    return res.json();
-  },
-
-  /** Who this request is. Carries no credential and no token. */
-  me: () => request<Me>('/auth/me'),
 
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),

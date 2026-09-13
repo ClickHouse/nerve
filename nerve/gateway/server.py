@@ -23,7 +23,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from nerve import boot, paths
+from nerve import paths
 from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
@@ -410,32 +410,15 @@ async def lifespan(app: FastAPI):
         for action in identity_report.identity_actions:
             logger.info("Identity bootstrap: %s", action)
 
-        # The setup token, for as long as this install is unclaimed. One
-        # account with no password admits every caller who can reach the
-        # gateway, and this is what somebody who is *not* on the machine must
-        # present to end that state (see nerve.setup_token). Generated here
-        # because the log this writes it to is how a headless install delivers
-        # it; dropped again the moment the account has a password.
-        #
-        # It starts nothing, so there is nothing to register in
-        # startup_cleanups — and a failure must not stop the gateway, because
-        # the guard fails closed without a token: with none stored, no token
-        # is ever accepted and only a loopback caller can claim.
-        try:
-            from nerve import setup_token
+        # Claiming is impossible without the persisted setup token. Prepare
+        # it before serving, and never print its value: the local `status`
+        # command reads it directly from the database when the operator asks.
+        from nerve import setup_token
 
-            unclaimed = await setup_token.instance_is_unclaimed(db, config)
-            setup_token.announce(
-                await setup_token.ensure_setup_token(db, unclaimed=unclaimed),
-                host=config.gateway.host,
-                port=config.gateway.port,
-            )
-        except Exception as e:  # noqa: BLE001 - never block startup on this
-            logger.warning(
-                "Could not prepare the setup token (%s). An unclaimed instance "
-                "can still be claimed from this machine, but not from another.",
-                e,
-            )
+        await setup_token.ensure_setup_token(
+            db,
+            unclaimed=await setup_token.instance_is_unclaimed(db, config),
+        )
 
         # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
         proxy_service = None
@@ -1280,13 +1263,7 @@ def create_app() -> FastAPI:
     # Health check (no auth required) — must be before static mount
     @app.get("/health")
     async def health():
-        # `boot` changes on every start, and that is the only honest answer to
-        # "has it restarted yet?" — the old process answers this endpoint
-        # perfectly well while it is shutting down, so a client that polls for
-        # *any* answer accepts the process it asked to replace. Opaque and
-        # random: an uptime or a counter would tell an anonymous caller how
-        # long this box has been up or how often it falls over.
-        return {"status": "ok", "version": "0.1.0", "boot": boot.boot_id()}
+        return {"status": "ok", "version": "0.1.0"}
 
     # Favicon from the tracked config subtree (see config.workspace_favicon).
     # No auth: a browser asks for this before anyone has logged in, so requiring
@@ -1420,17 +1397,5 @@ def run_server(config: NerveConfig | None = None) -> None:
         host=config.gateway.host,
         port=config.gateway.port,
         log_level="info",
-        # Forwarding headers are **not** read, and saying so here is the point.
-        # uvicorn enables ProxyHeadersMiddleware by default, which rewrites
-        # scope["client"] from X-Forwarded-For whenever the immediate peer is
-        # trusted — and FORWARDED_ALLOW_IPS in the environment can widen that
-        # to `*`, at which point any caller can name its own address. Nerve
-        # decides one thing from the peer address, and it is whether a
-        # first-run claim may skip the setup token (0.7, 6.1); a caller-supplied
-        # header that can answer that question defeats the guard. A proxy on
-        # the same host therefore makes every request look local, which is
-        # documented, and `auth.setup_token_required` is the answer to it.
-        proxy_headers=False,
-        forwarded_allow_ips=None,
         **ssl_config,
     )

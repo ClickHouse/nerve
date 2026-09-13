@@ -19,10 +19,6 @@ vi.mock('./api/client', async () => {
     ...actual,
     api: {
       authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(),
-      // The setup page is the wizard now (PR 6), and it reads its checklist
-      // once it has a session. These tests are about *where a tab lands*, so
-      // the checklist is stubbed rather than exercised.
-      setupState: vi.fn().mockRejectedValue(new Error('not part of this test')),
       listActors: vi.fn().mockResolvedValue({ actors: [] }),
     },
     setToken: vi.fn(),

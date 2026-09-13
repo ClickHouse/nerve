@@ -579,35 +579,6 @@ def _as_lockdown(value: Any) -> bool:
     )
 
 
-def _as_bool_flag(value: Any, *, where: str = "flag") -> bool:
-    """Parse a boolean whose default is the *weaker* position, refusing garbage.
-
-    The same trade as :func:`_as_lockdown`, for the same reason and with much
-    less blast radius: ``auth.setup_token_required`` defaults to off, so a
-    value nobody can parse must not be read as off. An operator who turned a
-    guard on and mistyped it should be told, not quietly left unguarded.
-
-    ``None`` — the key absent, or a bare ``setup_token_required:`` — is the
-    file declining to set it, which is what the default is for.
-    """
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, str):
-        resolved = value.strip().lower()
-        if resolved in TRUTHY:
-            return True
-        if resolved in FALSY:
-            return False
-    raise ConfigError(
-        f"{where} must be true or false, got {value!r}. Accepted spellings are "
-        f"true/false, 1/0, yes/no, on/off (case-insensitive). Refused rather "
-        f"than assumed, because assuming would mean assuming the weaker of the "
-        f"two settings."
-    )
-
-
 def _resolved(path: Path) -> Path:
     """``path`` with symlinks followed; the path itself if it cannot be resolved."""
     try:
@@ -1998,14 +1969,6 @@ class AuthConfig:
     # logged out mid-work. Only a tab left untouched for the whole window
     # comes back to a password prompt.
     jwt_expiry_hours: int = 720  # 30 days
-    # Require the first-run setup token from *every* caller, including one
-    # whose socket peer is loopback (see nerve/setup_token.py). Off by default,
-    # because a loopback peer has already proved the caller is on the machine.
-    # Turn it on where that stops being true — a reverse proxy on the same host
-    # makes every request look local. Startup-only, like `mode` and for the
-    # same reason: a guard a configuration push can relax is a guard a
-    # configuration delivery bug can relax.
-    setup_token_required: bool = False
 
     @classmethod
     @_coerced
@@ -2014,13 +1977,6 @@ class AuthConfig:
             password_hash=d.get("password_hash", ""),
             jwt_secret=d.get("jwt_secret", ""),
             jwt_expiry_hours=max(1, _lenient_int(d.get("jwt_expiry_hours"), 720)),
-            # Only an explicit, unambiguous yes turns it on; anything else
-            # leaves the default. A guard must not be *enabled* by a typo any
-            # more than it may be disabled by one, and the operator sees the
-            # effective value in `nerve doctor`.
-            setup_token_required=_as_bool_flag(
-                d.get("setup_token_required"), where="auth.setup_token_required",
-            ),
         )
 
 

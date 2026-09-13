@@ -59,22 +59,6 @@ Response: {
 The response does not expose usernames or the account count. Before
 authentication is ready, it returns the fail-closed `username_password` state.
 
-#### `GET /api/auth/me`
-Return the current actor. Requires authentication.
-
-```json
-Response: {
-  "actor_id": "…",
-  "account_id": "…",
-  "username": "alice",
-  "display_name": "Alice",
-  "kind": "human"
-}
-```
-
-The response does not include credentials or tokens. System actors have
-`kind: "system"` and no account ID or username.
-
 #### `GET /api/auth/check`
 Verify current authentication.
 
@@ -82,138 +66,88 @@ Verify current authentication.
 Response: { "authenticated": true }
 ```
 
-### Setup
+### Accounts
 
-The first-run wizard. `GET /api/setup` and every write below need a session
-like any other endpoint; **`POST /api/setup/claim` does not**, and is the only
-unauthenticated write in the product. See
-[Setup](setup.md#claiming-an-instance-from-a-browser) for why, and for where
-the setup token comes from.
+Every signed-in account can manage accounts. System credentials cannot. Account
+responses never include password hashes or their storage location.
 
-#### `POST /api/setup/claim`
-Name and secure the account an unclaimed install already has.
+An account is:
 
 ```json
-Request:  { "username": "alice", "password": "…",
-            "display_name": "Alice", "setup_token": "…" }
-Response: { "token": "eyJ…", "account_id": "…", "actor_id": "…",
-            "username": "alice", "display_name": "Alice" }
-```
-
-`setup_token` is required only when the request did not come from the machine
-itself — a loopback socket peer needs none, unless
-`auth.setup_token_required` is on. The response's `token` is an ordinary
-session token for the account just claimed, so the browser is signed in with
-the password it set.
-
-**Every session issued before the claim stops working.** The claim bumps the
-account's session epoch, so the tokens a passwordless install handed out are
-one epoch behind: refused at their next HTTP request, refused at a WebSocket
-handshake, and — for sockets that are *already open* — closed outright with
-`1008`, with every inbound frame re-checked against the account row in case a
-close was missed. The token returned here is minted at the new epoch, so the
-browser doing the claiming is the one session that survives. See
-[Accounts and identity](accounts.md#passwordless).
-
-One transaction does the whole claim, so a half-claimed account — named but
-still open, or secured but unreachable — never exists, and of two callers
-racing to claim a fresh install exactly one wins.
-
-A tokenless claim must also come from a page this instance served
-(`Origin` / `Sec-Fetch-Site` / `Host`); a cross-origin one needs the token.
-See [Setup](setup.md#claiming-an-instance-from-a-browser).
-
-| Response | When |
-|---|---|
-| `400` | the username is malformed or reserved, or the password is longer than bcrypt's 72 bytes |
-| `403` | the token is required and was missing or wrong — identical in both cases, and judged before anything about the instance is read. A cross-origin or rebound-host request from a loopback peer lands here too, because it needs the token |
-| `409` | the instance is not claimable: it has been claimed already, or a configured `auth.password_hash` is authenticating it |
-| `503` | no signing secret, or the gateway has not finished starting |
-
-#### `GET /api/setup`
-The checklist, in one read.
-
-```json
-Response: {
-  "setup_pending": false, "lockdown": false, "writable": true,
-  "read_only_reason": null,
-  "restart_pending": true, "restart_pending_paths": ["timezone"],
-  "finished": false,
-  "steps": [{ "id": "account", "title": "Claim this instance",
-              "status": "done", "required": true, "can_skip": false,
-              "detail": "The account has a password." }],
-  "crons": [{ "id": "inbox-processor", "name": "Inbox Processor",
-              "description": "…", "enabled": false }]
+{
+  "id": "…",
+  "actor_id": "…",
+  "username": "alice",
+  "display_name": "Alice",
+  "enabled": true,
+  "has_password": true,
+  "created_at": "…"
 }
 ```
 
-A step's `status` is `done`, `skipped` or `pending`, and is *derived* from
-configuration wherever it can be — so an install set up at the terminal shows
-the same list. `restart_pending_paths` compares what the wizard wrote against
-what this process is running, so it clears itself at the restart.
-
-`values` carries what the forms open on — the configured timezone, your display
-name, which sources sync — and reports a **secret as present or not, never as
-itself**: the wizard writes credentials and does not read them back.
-`restart_pending_reasons` holds what is waiting on a restart but is not a
-configuration key, already in words (a cron file the running scheduler has not
-picked up).
+`id` identifies the account. `actor_id` is the stable attribution ID and does
+not change when the username changes.
 
 | Endpoint | Does |
 |---|---|
-| `PUT /api/setup/provider` | `{anthropic_api_key?, openai_api_key?}` → `config.local.yaml` |
-| `PUT /api/setup/profile` | `{timezone?, display_name?}` — the zone to the tracked settings, the name onto your actor |
-| `PUT /api/setup/channels` | `{telegram_bot_token, telegram_allowed_users?}` |
-| `PUT /api/setup/automation` | `{crons?, github?, gmail?, gmail_accounts?, telegram?, telegram_api_id?, telegram_api_hash?}` |
-| `POST /api/setup/steps/{id}/skip` | remember that a step was declined |
-| `POST /api/setup/steps/{id}/unskip` | put it back on the list |
+| `GET /api/accounts` | List accounts, oldest first; includes disabled accounts |
+| `GET /api/accounts/me` | Return the signed-in account |
+| `POST /api/accounts` | Create an account from `{username, password, display_name?}` |
+| `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
+| `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
+| `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
+| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
 
-Each returns the whole checklist, so one round trip both writes and refreshes.
-Every one is idempotent and re-enterable, and writes only the keys its step
-owns — merged into what is on disk, never regenerating the file.
-
-**While the instance is unclaimed every one of these refuses with `409`**, as
-do `POST /api/system/restart` and the account mutations: a passwordless install
-mints a session for anybody, so the claim is the only write that crosses that
-boundary. See [Accounts and identity](accounts.md#the-claim-cutover).
-
-**These are PATCH semantics**, and the `?` above is load-bearing: an omitted
-field is left exactly as it is. A step is entered again to change one thing,
-and a body that defaulted the rest would turn "enable this cron" into "and
-switch off the sync sources configured elsewhere". One mutation is served at a
-time, and a step is recorded as done only after every write it makes has
-landed.
+Failures:
 
 | Response | When |
 |---|---|
-| `400` | nothing to set, a time zone this machine does not know, or an unknown/unskippable step |
-| `409` | the instance is in lockdown, has no machine-local configuration directory, or its tracked settings file is not usable |
-| `500` | the file could not be written owner-only — nothing was written |
+| `400` | Invalid username or password longer than 72 UTF-8 bytes |
+| `403` | System credential, or current password not supplied or incorrect |
+| `404` | Account not found |
+| `409` | Username or account-state conflict; the response explains the conflict |
 
-#### `POST /api/system/restart`
-Restart the daemon: what `nerve restart` does, asked for over HTTP. Requires a
-session. Allowed under lockdown, because a restart writes no configuration.
+Disabling an account affects its next request or WebSocket frame. The server
+closes an open connection instead of changing its actor.
+
+### Setup claim
+
+#### `POST /api/setup/claim`
+
+Name and secure the one account on an unclaimed install. This is the only
+unauthenticated account write; every request must include the persisted setup
+token.
 
 ```json
-Response: { "restarting": true, "method": "helper", "message": "…",
-            "boot": "3f7c…" }
+Request: {
+  "username": "alice",
+  "password": "…",
+  "setup_token": "…",
+  "display_name": "Alice"
+}
+Response: { "token": "eyJ…" }
 ```
 
-`boot` is the generation of the process that accepted the request. **Poll
-`/health` until it reports a different one** — the daemon being replaced
-answers perfectly well while it shuts down, so waiting for any answer at all
-accepts the process you asked to replace, with the restart-only settings still
-unapplied.
+`display_name` is optional. The response token is the client session minted
+after the claim; account identity is read through the canonical
+`GET /api/accounts/me` endpoint and names through the actor directory.
+
+The setup token is read locally with `nerve status`, sent only in the JSON
+body, and invalidated after success. It never appears in a URL, response,
+server log, or browser storage. Use HTTPS or a protected tunnel when claiming
+remotely.
+
+The claim and session-epoch bump are one database transaction. Of concurrent
+claimants exactly one can win. Every session minted while the instance was
+passwordless becomes stale; open WebSockets are rechecked and closed.
 
 | Response | When |
 |---|---|
-| `409` | a restart is already under way; a second helper would race the first over the same PID |
-| `500` | the helper could not be started — the instance is still running, and the reason is in the message |
-
-The helper holds a short delay before it signals anything, so this response is
-on the wire first. Sessions survive the restart: the signing secret is pinned
-and persisted, the session epoch lives on the account rather than in the
-process, and nothing in the wizard rotates either.
+| `400` | the username is malformed/reserved, or the password exceeds bcrypt's 72-byte limit |
+| `403` | the setup token is wrong or no stored token can match it; a concurrent loser may see this after the winner retires the token |
+| `409` | the account is no longer claimable, including a request that passed token validation before a concurrent winner, or a configured password |
+| `422` | the setup token, username, or password is missing/empty |
+| `503` | no signing secret, or identity startup is incomplete |
 
 ### Actors
 
@@ -835,13 +769,6 @@ Response: {
 
 ### Health
 
-`GET /health` — unauthenticated liveness, plus `boot`: a random value, new on
-every start. It is the only thing that distinguishes the new process from the
-old one still answering as it shuts down, which is what makes
-`POST /api/system/restart` observable. Deliberately opaque: an uptime or a
-counter would tell an anonymous caller how long the box has been up, or how
-often it falls over.
-
 #### `GET /health`
 No auth required.
 
@@ -852,10 +779,11 @@ Response: { "status": "ok", "version": "0.1.0" }
 ## WebSocket Protocol
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
-too). The token is resolved to an actor at admission. A credential that names
-nobody is refused with close code `4001`. Once admitted, both identity and
-authority remain fixed until the socket reconnects; account changes are checked
-at the next connection.
+too). The token is resolved to an actor at accept and rechecked before each
+inbound frame. A credential refused at admission closes with code `4001`; a
+stale session epoch or an account disabled after admission closes with policy
+code `1008`. Reconnect after logging in again. The actor is never
+rewritten, so stored attribution remains with the identity that sent it.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token
