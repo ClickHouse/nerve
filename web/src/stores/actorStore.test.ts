@@ -43,7 +43,7 @@ vi.mock('./helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 const { api } = await import('../api/client');
 const {
   useActorStore, actorName, isSystemActor, visibleActorIds,
-  actorDiscriminator, ambiguousActorIds,
+  actorDiscriminators,
   UNNAMED_ACTOR, SYSTEM_ACTOR_NAME,
 } = await import('./actorStore');
 const { useAccountStore } = await import('./accountStore');
@@ -211,6 +211,48 @@ describe('while a lookup is still open', () => {
     await settled(2);
     expect(useActorStore.getState().actors[BOB].display_name).toBe('Bob');
     expect(useActorStore.getState().unresolved).not.toContain(BOB);
+  });
+
+  it('keeps following up however many waves arrive', async () => {
+    // A new person per response window, for longer than any fixed number of
+    // follow-ups. The earlier version stopped after four and left the fifth
+    // arrival queued with `inFlight` cleared and no hook dependency changed to
+    // restart it — the original bug, one wave further out.
+    const WAVES = 8;
+    const ids = Array.from({ length: WAVES }, (_, i) => `actor-wave-${i}`);
+    const known: ActorRef[] = [];
+
+    // Every request is deferred, so the test controls exactly when each answer
+    // lands and can queue the next id while the previous one is open.
+    const gates: Array<{ promise: Promise<{ actors: ActorRef[] }>; resolve: (v: { actors: ActorRef[] }) => void }> = [];
+    listActors.mockImplementation(() => {
+      const gate = deferred<{ actors: ActorRef[] }>();
+      gates.push(gate);
+      return gate.promise;
+    });
+
+    useActorStore.getState().resolve([ids[0]]);
+    known.push(actor(ids[0], { display_name: 'Wave 0' }));
+
+    for (let wave = 1; wave < WAVES; wave++) {
+      await vi.waitFor(() => expect(gates.length).toBe(wave));
+      // Queued while request `wave` is still open — the stranding window.
+      useActorStore.getState().resolve([ids[wave]]);
+      // The answer was composed before that person existed, so it cannot
+      // resolve them. Only the follow-up can, which is the whole point.
+      gates[wave - 1].resolve({ actors: [...known] });
+      known.push(actor(ids[wave], { display_name: `Wave ${wave}` }));
+    }
+    await vi.waitFor(() => expect(gates.length).toBe(WAVES));
+    gates[WAVES - 1].resolve({ actors: [...known] });
+
+    await vi.waitFor(() => expect(useActorStore.getState().loading).toBe(false));
+    await vi.waitFor(() =>
+      expect(Object.keys(useActorStore.getState().actors).length).toBe(WAVES));
+
+    // Every wave has a name, and nothing was written off as unknown.
+    for (const id of ids) expect(useActorStore.getState().actors[id]).toBeDefined();
+    expect(useActorStore.getState().unresolved).toEqual([]);
   });
 
   it('stops following up once the id is known to be nobody', async () => {
@@ -391,13 +433,14 @@ describe('two actors with the same name', () => {
     [BOB]: bob(),
   };
 
-  it('are both marked ambiguous', () => {
-    expect(ambiguousActorIds(twoAlexes)).toEqual(new Set(['actor-alex-1', 'actor-alex-2']));
+  it('both get a discriminator', () => {
+    const byId = actorDiscriminators(twoAlexes);
+    expect([...byId.keys()].sort()).toEqual(['actor-alex-1', 'actor-alex-2']);
   });
 
   it('leaves a unique name alone', () => {
-    expect(ambiguousActorIds(twoAlexes).has(BOB)).toBe(false);
-    expect(ambiguousActorIds({ [ALICE]: alice(), [BOB]: bob() })).toEqual(new Set());
+    expect(actorDiscriminators(twoAlexes).has(BOB)).toBe(false);
+    expect(actorDiscriminators({ [ALICE]: alice(), [BOB]: bob() }).size).toBe(0);
   });
 
   it('counts the label, so two accounts with no name collide too', () => {
@@ -405,7 +448,7 @@ describe('two actors with the same name', () => {
       'actor-x': actor('actor-x'),
       'actor-y': actor('actor-y'),
     };
-    expect(ambiguousActorIds(nameless)).toEqual(new Set(['actor-x', 'actor-y']));
+    expect([...actorDiscriminators(nameless).keys()].sort()).toEqual(['actor-x', 'actor-y']);
   });
 
   it('trims before comparing, so "Alex" and "Alex " are the same name', () => {
@@ -413,24 +456,86 @@ describe('two actors with the same name', () => {
       'actor-alex-1': actor('actor-alex-1', { display_name: 'Alex' }),
       'actor-alex-2': actor('actor-alex-2', { display_name: 'Alex ' }),
     };
-    expect(ambiguousActorIds(padded).size).toBe(2);
+    expect(actorDiscriminators(padded).size).toBe(2);
   });
 
   it('memoises on the map it was given', () => {
-    const first = ambiguousActorIds(twoAlexes);
-    expect(ambiguousActorIds(twoAlexes)).toBe(first);
-    expect(ambiguousActorIds({ ...twoAlexes })).not.toBe(first);
+    const first = actorDiscriminators(twoAlexes);
+    expect(actorDiscriminators(twoAlexes)).toBe(first);
+    expect(actorDiscriminators({ ...twoAlexes })).not.toBe(first);
   });
 
-  it('discriminates from the id, stably and from the end', () => {
-    // Two UUIDs sharing a prefix — a timestamp-prefixed generator makes this
-    // the normal case, not the pathological one.
+  it('takes the suffix from the end, where two UUIDs are likeliest to differ', () => {
+    // A timestamp-prefixed generator makes a shared prefix the normal case,
+    // not the pathological one.
     const a = '0199aaaa-1111-7000-8000-0000000000ab';
     const b = '0199aaaa-1111-7000-8000-0000000000cd';
-    expect(actorDiscriminator(a)).not.toBe(actorDiscriminator(b));
-    expect(actorDiscriminator(a)).toBe(actorDiscriminator(a));   // stable
-    expect(a).toContain(actorDiscriminator(a));
-    expect(actorDiscriminator('short')).toBe('short');
+    const byId = actorDiscriminators({
+      [a]: actor(a, { display_name: 'Alex' }),
+      [b]: actor(b, { display_name: 'Alex' }),
+    });
+    expect(byId.get(a)).toBe('0000ab');
+    expect(byId.get(b)).toBe('0000cd');
+    expect(a.endsWith(byId.get(a)!)).toBe(true);
+  });
+
+  /**
+   * The reason a fixed-length tail is not good enough. Two ids from the same
+   * generator can agree on their last six characters, and then the thing whose
+   * entire job is to tell them apart renders identically for both.
+   */
+  it('grows until the suffixes are actually distinct', () => {
+    const a = '0199aaaa-1111-7000-8000-00000a0000ab';
+    const b = '0199aaaa-1111-7000-8000-00000b0000ab';   // same last 10 characters
+    const byId = actorDiscriminators({
+      [a]: actor(a, { display_name: 'Alex' }),
+      [b]: actor(b, { display_name: 'Alex' }),
+    });
+
+    expect(byId.get(a)).not.toBe(byId.get(b));
+    expect(a.endsWith(byId.get(a)!)).toBe(true);
+    expect(b.endsWith(byId.get(b)!)).toBe(true);
+    // Grown past six to reach the character that differs, and no further.
+    expect(byId.get(a)).toBe('a0000ab');
+    expect(byId.get(b)).toBe('b0000ab');
+  });
+
+  it('extends to the whole id when only the first character differs', () => {
+    // Same length, identical everywhere but the first character, so nothing
+    // shorter than the entire id separates them.
+    const a = 'aa0000ab';
+    const b = 'ba0000ab';
+    const byId = actorDiscriminators({
+      [a]: actor(a, { display_name: 'Alex' }),
+      [b]: actor(b, { display_name: 'Alex' }),
+    });
+
+    expect(byId.get(a)).toBe(a);
+    expect(byId.get(b)).toBe(b);
+  });
+
+  it('handles a group whose ids are shorter than the floor', () => {
+    const short = '0000ab';
+    const long = 'cafe0000ab';
+    const byId = actorDiscriminators({
+      [short]: actor(short, { display_name: 'Alex' }),
+      [long]: actor(long, { display_name: 'Alex' }),
+    });
+
+    // The short one cannot yield six *distinct* characters of its own, so the
+    // group grows one further; slicing past an id's length is not an error, it
+    // just yields the whole id.
+    expect(byId.get(short)).not.toBe(byId.get(long));
+    expect(byId.get(short)).toBe(short);
+    expect(long.endsWith(byId.get(long)!)).toBe(true);
+  });
+
+  it('keeps a group of three apart from each other', () => {
+    const ids = ['aaa111', 'bbb111', 'ccc111'];
+    const map = Object.fromEntries(ids.map((id) => [id, actor(id, { display_name: 'Alex' })]));
+    const byId = actorDiscriminators(map);
+
+    expect(new Set(ids.map((id) => byId.get(id))).size).toBe(3);
   });
 });
 
