@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChatMessage, MessageBlock } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
+import { useAuthStore } from '../../stores/authStore';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
@@ -29,12 +30,10 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
 
-  // Which senders this transcript names. A name earns its place only when it
-  // tells two messages apart: the agent's own principal always does, and a
-  // person does once a second person has spoken here. One person talking to
-  // themselves — which is every conversation on a one-account install — gets no
-  // labels at all, so nothing about that transcript changes.
-  const namedSenders = useVisibleActorIds(messages.map(m => m.actor_id));
+  const viewerActorId = useAuthStore((s) => s.account?.actor_id ?? null);
+  const namedSenders = useVisibleActorIds(
+    messages.map(m => m.actor_id), viewerActorId,
+  );
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;

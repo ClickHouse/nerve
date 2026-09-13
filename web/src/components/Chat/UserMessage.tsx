@@ -15,10 +15,7 @@ export function UserMessage({ message, actions, showActor = false }: {
   message: ChatMessage;
   /** Hover toolbar (MessageActions) — anchored to the reading column. */
   actions?: ReactNode;
-  /** Name the sender above the text. Off by default, and ignored entirely when
-      the message carries no actor, so an unattributed transcript — which is
-      every transcript on a one-person install, and all history everywhere —
-      renders exactly as it did before attribution existed. */
+  /** Name a non-viewer sender above the text. Null legacy rows stay unchanged. */
   showActor?: boolean;
 }) {
   const text = message.blocks.find(b => b.type === 'text')?.content || '';
