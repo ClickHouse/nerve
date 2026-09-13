@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -117,6 +118,17 @@ class _Install:
     def session_token(self, account_id: str | None = None) -> str:
         return create_session_token(_SECRET, account_id or self.owner_id)
 
+    def restarted(self, **kwargs) -> NerveConfig:
+        """Model what a restart does: a new process, with a new config.
+
+        The process clock matters because a *secret* is recorded as "present"
+        rather than as itself, so "was this written after the daemon started"
+        is the only way to tell a key that is in force from one that replaced
+        it and is waiting.
+        """
+        setup_state.PROCESS_STARTED = datetime.now(timezone.utc)
+        return self.reconfigure(**kwargs)
+
     def reconfigure(self, **kwargs) -> NerveConfig:
         config = NerveConfig(
             auth=AuthConfig(jwt_secret=_SECRET, **kwargs.pop("auth", {})),
@@ -126,6 +138,19 @@ class _Install:
         )
         set_config(config)
         return config
+
+
+@pytest.fixture(autouse=True)
+def process_clock(monkeypatch):
+    """Start each test with a process older than every write it makes.
+
+    ``setup_state.PROCESS_STARTED`` is a module global set at import, which in
+    production is the daemon starting. ``_Install.restarted()`` moves it; this
+    puts it back.
+    """
+    monkeypatch.setattr(
+        setup_state, "PROCESS_STARTED", datetime.now(timezone.utc),
+    )
 
 
 @pytest_asyncio.fixture
@@ -674,11 +699,43 @@ class TestTheChecklist:
         assert state["finished"] is False
 
         # What a restart does: the process comes back with the written value.
-        claimed.reconfigure(timezone="Europe/Berlin")
+        claimed.restarted(timezone="Europe/Berlin")
         async with _http(claimed) as http:
             after = (await http.get("/api/setup")).json()
         assert after["restart_pending"] is False
         assert after["restart_pending_paths"] == []
+
+    async def test_replacing_a_credential_that_is_already_live_is_pending_too(
+        self, claimed,
+    ):
+        """The case the value comparison alone cannot see.
+
+        A secret is recorded as "present", never as itself, so a key pasted
+        over an existing one reads as present either way while only the old one
+        is in force. Without this the checklist would say nothing is waiting on
+        a restart and the new key would sit on disk unused.
+        """
+        claimed.reconfigure(anthropic_api_key="the-key-this-process-started-with")
+        async with _http(claimed) as http:
+            state = (await http.put(
+                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
+            )).json()
+        assert state["restart_pending"] is True
+        assert state["restart_pending_paths"] == ["anthropic_api_key"]
+        assert claimed.secrets()["anthropic_api_key"] == _ANTHROPIC_KEY
+
+    async def test_a_credential_written_by_an_earlier_process_is_not_pending(
+        self, claimed,
+    ):
+        """...and it clears itself at the restart, rather than nagging forever."""
+        async with _http(claimed) as http:
+            await http.put(
+                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
+            )
+        claimed.restarted(anthropic_api_key=_ANTHROPIC_KEY)
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert state["restart_pending"] is False
 
     async def test_finished_once_everything_is_answered(self, claimed):
         async with _http(claimed) as http:
@@ -688,7 +745,7 @@ class TestTheChecklist:
             state = (await http.post("/api/setup/steps/automation/skip")).json()
         # The provider key is the one path still waiting for a restart.
         assert state["restart_pending"] is True
-        claimed.reconfigure(anthropic_api_key=_ANTHROPIC_KEY)
+        claimed.restarted(anthropic_api_key=_ANTHROPIC_KEY)
         async with _http(claimed) as http:
             state = (await http.get("/api/setup")).json()
         assert state["restart_pending"] is False
