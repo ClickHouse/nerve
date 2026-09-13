@@ -43,6 +43,7 @@ vi.mock('./helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 const { api } = await import('../api/client');
 const {
   useActorStore, actorName, isSystemActor, visibleActorIds,
+  actorDiscriminator, ambiguousActorIds,
   UNNAMED_ACTOR, SYSTEM_ACTOR_NAME,
 } = await import('./actorStore');
 const { useAccountStore } = await import('./accountStore');
@@ -69,6 +70,16 @@ const system = (name: string | null = 'Nerve') =>
 async function settled(calls = 1): Promise<void> {
   await vi.waitFor(() => expect(listActors).toHaveBeenCalledTimes(calls));
   await vi.waitFor(() => expect(useActorStore.getState().loading).toBe(false));
+}
+
+/**
+ * A response this test decides when to deliver, so it can make something else
+ * happen while the request is still open.
+ */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let release!: (value: T) => void;
+  const promise = new Promise<T>((r) => { release = r; });
+  return { promise, resolve: release };
 }
 
 beforeEach(() => {
@@ -170,6 +181,95 @@ describe('an id the server does not know', () => {
     await settled();
 
     expect(actorName(useActorStore.getState().actors['actor-ghost'])).toBe(UNNAMED_ACTOR);
+  });
+});
+
+/**
+ * Everything here is about a response that is *slow*. The store coalesces, so
+ * anything that happens between a request going out and coming back has no
+ * request of its own to ride on — and that window is exactly when a second
+ * person's first live message arrives, when somebody logs out, and when a
+ * rename is saved.
+ */
+describe('while a lookup is still open', () => {
+  it('follows up on an id that arrived after the request went out', async () => {
+    // Bob does not exist yet when the map is fetched; his first live message
+    // lands while it is in flight. Without a follow-up his id sits in the
+    // queue with nothing to drain it and reads `Unnamed account` until the
+    // next navigation.
+    const first = deferred<{ actors: ActorRef[] }>();
+    listActors.mockReturnValueOnce(first.promise);
+    useActorStore.getState().resolve([ALICE]);
+    await vi.waitFor(() => expect(listActors).toHaveBeenCalledTimes(1));
+
+    useActorStore.getState().resolve([BOB]);
+    expect(listActors).toHaveBeenCalledTimes(1);   // coalesced, as intended
+
+    listActors.mockResolvedValue({ actors: [alice(), bob()] });
+    first.resolve({ actors: [alice()] });
+
+    await settled(2);
+    expect(useActorStore.getState().actors[BOB].display_name).toBe('Bob');
+    expect(useActorStore.getState().unresolved).not.toContain(BOB);
+  });
+
+  it('stops following up once the id is known to be nobody', async () => {
+    const first = deferred<{ actors: ActorRef[] }>();
+    listActors.mockReturnValueOnce(first.promise);
+    useActorStore.getState().resolve([ALICE]);
+    await vi.waitFor(() => expect(listActors).toHaveBeenCalledTimes(1));
+
+    useActorStore.getState().resolve(['actor-ghost']);
+    listActors.mockResolvedValue({ actors: [alice()] });
+    first.resolve({ actors: [alice()] });
+
+    // One follow-up, which settles the question, and then it stops: two
+    // requests total and the id recorded so nothing asks a third time.
+    await settled(2);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(listActors).toHaveBeenCalledTimes(2);
+    expect(useActorStore.getState().unresolved).toContain('actor-ghost');
+  });
+
+  it('does not let a logout be undone by the response that was already sent', async () => {
+    const slow = deferred<{ actors: ActorRef[] }>();
+    listActors.mockReturnValueOnce(slow.promise);
+    useActorStore.getState().resolve([ALICE]);
+    await vi.waitFor(() => expect(listActors).toHaveBeenCalledTimes(1));
+
+    useAuthStore.getState().logout();
+    expect(useActorStore.getState().actors).toEqual({});
+
+    slow.resolve({ actors: [alice(), bob(), system()] });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The map stays empty. Repopulating it here would put the previous
+    // session's names back on screen after somebody deliberately ended it.
+    expect(useActorStore.getState().actors).toEqual({});
+    expect(useActorStore.getState().loaded).toBe(false);
+  });
+
+  it('keeps the newest snapshot when two forced re-reads land out of order', async () => {
+    useActorStore.getState().resolve([ALICE]);
+    await settled();
+
+    // Two renames in quick succession. The first request is answered last.
+    const stale = deferred<{ actors: ActorRef[] }>();
+    const fresh = deferred<{ actors: ActorRef[] }>();
+    listActors.mockReturnValueOnce(stale.promise).mockReturnValueOnce(fresh.promise);
+
+    const firstRefresh = useActorStore.getState().refresh();
+    await vi.waitFor(() => expect(listActors).toHaveBeenCalledTimes(2));
+    const secondRefresh = useActorStore.getState().refresh();
+    await vi.waitFor(() => expect(listActors).toHaveBeenCalledTimes(3));
+
+    fresh.resolve({ actors: [alice('Alice Two'), bob(), system()] });
+    stale.resolve({ actors: [alice('Alice One'), bob(), system()] });
+    await Promise.all([firstRefresh, secondRefresh]);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The older answer arriving last must not roll the name backwards.
+    expect(useActorStore.getState().actors[ALICE].display_name).toBe('Alice Two');
   });
 });
 
@@ -277,6 +377,60 @@ describe('actorName', () => {
     expect(isSystemActor(system())).toBe(true);
     expect(isSystemActor(alice())).toBe(false);
     expect(isSystemActor(undefined)).toBe(false);
+  });
+});
+
+/**
+ * Display names are not identity (0.7) and nothing stops two of them being
+ * equal, so a label that is only a name can name two different people.
+ */
+describe('two actors with the same name', () => {
+  const twoAlexes = {
+    'actor-alex-1': actor('actor-alex-1', { display_name: 'Alex' }),
+    'actor-alex-2': actor('actor-alex-2', { display_name: 'Alex' }),
+    [BOB]: bob(),
+  };
+
+  it('are both marked ambiguous', () => {
+    expect(ambiguousActorIds(twoAlexes)).toEqual(new Set(['actor-alex-1', 'actor-alex-2']));
+  });
+
+  it('leaves a unique name alone', () => {
+    expect(ambiguousActorIds(twoAlexes).has(BOB)).toBe(false);
+    expect(ambiguousActorIds({ [ALICE]: alice(), [BOB]: bob() })).toEqual(new Set());
+  });
+
+  it('counts the label, so two accounts with no name collide too', () => {
+    const nameless = {
+      'actor-x': actor('actor-x'),
+      'actor-y': actor('actor-y'),
+    };
+    expect(ambiguousActorIds(nameless)).toEqual(new Set(['actor-x', 'actor-y']));
+  });
+
+  it('trims before comparing, so "Alex" and "Alex " are the same name', () => {
+    const padded = {
+      'actor-alex-1': actor('actor-alex-1', { display_name: 'Alex' }),
+      'actor-alex-2': actor('actor-alex-2', { display_name: 'Alex ' }),
+    };
+    expect(ambiguousActorIds(padded).size).toBe(2);
+  });
+
+  it('memoises on the map it was given', () => {
+    const first = ambiguousActorIds(twoAlexes);
+    expect(ambiguousActorIds(twoAlexes)).toBe(first);
+    expect(ambiguousActorIds({ ...twoAlexes })).not.toBe(first);
+  });
+
+  it('discriminates from the id, stably and from the end', () => {
+    // Two UUIDs sharing a prefix — a timestamp-prefixed generator makes this
+    // the normal case, not the pathological one.
+    const a = '0199aaaa-1111-7000-8000-0000000000ab';
+    const b = '0199aaaa-1111-7000-8000-0000000000cd';
+    expect(actorDiscriminator(a)).not.toBe(actorDiscriminator(b));
+    expect(actorDiscriminator(a)).toBe(actorDiscriminator(a));   // stable
+    expect(a).toContain(actorDiscriminator(a));
+    expect(actorDiscriminator('short')).toBe('short');
   });
 });
 
