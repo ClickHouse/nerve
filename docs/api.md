@@ -72,7 +72,8 @@ Response: {
 | `login` | what the form must collect: `none` (passwordless — send any password), `password` (one account, no username), `username_password` (two or more) |
 | `auth_required` | kept for older clients; equals `login != "none"` |
 
-Standalone passwordless installs auto-login and open the setup claim page;
+Standalone passwordless installs auto-login and open the setup checklist at its
+claim step;
 other signed-in sessions open the app, and signed-out sessions open the login
 page. **Auto-login with an empty password is correct for `none` and for nothing
 else** — with two accounts it names nobody and the server refuses it.
@@ -135,44 +136,134 @@ account row before anything is done with it. The connection is closed rather
 than re-pointed: what it already sent stays attributed to the actor it was
 accepted with.
 
-### Setup claim
+### Setup
+
+The first-run checklist. `GET /api/setup` and every write below need a session
+like any other endpoint; **`POST /api/setup/claim` does not**, and is the only
+unauthenticated write in the product. See
+[Setup](setup.md#claiming-an-instance-from-a-browser) for why, and for where
+the setup token comes from.
 
 #### `POST /api/setup/claim`
-
-Name and secure the one account on an unclaimed install. This is the only
-unauthenticated account write; every request must include the persisted setup
-token.
+Name and secure the account an unclaimed install already has.
 
 ```json
-Request: {
-  "username": "alice",
-  "password": "…",
-  "setup_token": "…",
-  "display_name": "Alice"
-}
+Request:  { "username": "alice", "password": "…",
+            "setup_token": "…", "display_name": "Alice" }
 Response: { "token": "eyJ…" }
 ```
 
-`display_name` is optional. The response token is the client session minted
-after the claim; account identity is read through the canonical
-`GET /api/accounts/me` endpoint and names through the actor directory.
+`setup_token` is **required on every call, from every address** — a browser on
+the machine itself included. There is no locality exemption, no origin policy,
+and no setting that relaxes it. Read it on the machine with `nerve status`; it
+travels only in this JSON body and is deleted in the transaction that commits
+the claim, and it never appears in a URL, a response, a server log, or browser
+storage. Use HTTPS or a protected tunnel when claiming remotely.
 
-The setup token is read locally with `nerve status`, sent only in the JSON
-body, and invalidated after success. It never appears in a URL, response,
-server log, or browser storage. Use HTTPS or a protected tunnel when claiming
-remotely.
+`display_name` is optional. The response is the whole body: `token` is an
+ordinary session token for the account just claimed, so the browser is signed
+in with the password it set. Identity is read afterwards from
+`GET /api/accounts/me` and names from the actor directory.
 
-The claim and session-epoch bump are one database transaction. Of concurrent
-claimants exactly one can win. Every session minted while the instance was
-passwordless becomes stale; open WebSockets are rechecked and closed.
+**Every session issued before the claim stops working.** The claim bumps the
+account's session epoch, so the tokens a passwordless install handed out are
+one epoch behind: refused at their next HTTP request, refused at a WebSocket
+handshake, and — for sockets that are *already open* — closed outright with
+`1008`, with every inbound frame re-checked against the account row in case a
+close was missed. The token returned here is minted at the new epoch, so the
+browser doing the claiming is the one session that survives. See
+[Accounts and identity](accounts.md#the-claim-cutover).
+
+One transaction does the whole claim, so a half-claimed account — named but
+still open, or secured but unreachable — never exists, and of two callers
+racing to claim a fresh install exactly one wins.
 
 | Response | When |
 |---|---|
-| `400` | the username is malformed/reserved, or the password exceeds bcrypt's 72-byte limit |
-| `403` | the setup token is wrong or no stored token can match it; a concurrent loser may see this after the winner retires the token |
-| `409` | the account is no longer claimable, including a request that passed token validation before a concurrent winner, or a configured password |
-| `422` | the setup token, username, or password is missing/empty |
-| `503` | no signing secret, or identity startup is incomplete |
+| `400` | the username is empty, malformed or reserved, or the password is longer than bcrypt's 72 bytes |
+| `403` | the token was wrong, or none is stored — identical in both cases, compared in constant time, and judged before anything about the instance is read. A concurrent loser lands here once the winner has retired the token |
+| `409` | the instance is not claimable: it has been claimed already, a concurrent caller won the race, or a configured `auth.password_hash` is authenticating it |
+| `422` | `setup_token` or `password` is missing or empty, or `username` is absent |
+| `503` | no signing secret, or the gateway has not finished starting |
+
+#### `GET /api/setup`
+The checklist, in one read.
+
+```json
+Response: {
+  "setup_pending": false, "lockdown": false, "writable": true,
+  "read_only_reason": null,
+  "restart_pending": true, "restart_pending_paths": ["timezone"],
+  "restart_pending_reasons": [], "restart_command": "nerve restart",
+  "finished": false,
+  "steps": [{ "id": "account", "title": "Claim this instance",
+              "status": "done", "required": true, "can_skip": false,
+              "detail": "The account has a password." }],
+  "crons": [{ "id": "inbox-processor", "name": "Inbox Processor",
+              "description": "…", "enabled": false }],
+  "values": { "timezone": "UTC", "display_name": "Alice",
+              "has_anthropic_key": true, "sync_github": false },
+  "warning": null
+}
+```
+
+`setup_pending` is the one fact about step one: the account is still unclaimed.
+`finished` means every step is done or skipped *and* nothing is waiting on a
+restart.
+
+A step's `status` is `done`, `skipped` or `pending`, and is *derived* from the
+instance wherever it can be — so an install set up at the terminal shows the
+same list. `values` carries what the forms open on — the configured timezone,
+your display name, which sources sync — and reports a **secret as present or
+not, never as itself**: the checklist writes credentials and does not read them
+back. `warning` is set when a request's configuration landed but its
+bookkeeping did not, which is neither success nor failure.
+
+`restart_pending_paths` compares what the checklist wrote against what this
+process is running, so it clears itself at the restart.
+`restart_pending_reasons` holds what is waiting on a restart but is not a
+configuration key, already in words (a cron file the running scheduler has not
+picked up). **No endpoint performs the restart**: `restart_command` carries
+what an operator runs on the server instead (`nerve restart`), and the next
+read of this endpoint reports the result. See
+[Setup](setup.md#applying-what-it-wrote).
+
+| Endpoint | Does |
+|---|---|
+| `PUT /api/setup/provider` | `{anthropic_api_key?, openai_api_key?}` → `config.local.yaml` |
+| `PUT /api/setup/profile` | `{timezone?, display_name?}` — the zone to the tracked settings, the name onto your actor |
+| `PUT /api/setup/channels` | `{telegram_bot_token, telegram_allowed_users?}` |
+| `PUT /api/setup/automation` | `{crons?, github?, gmail?, gmail_accounts?, telegram?, telegram_api_id?, telegram_api_hash?}` |
+| `POST /api/setup/steps/{id}/skip` | remember that a step was declined |
+| `POST /api/setup/steps/{id}/unskip` | put it back on the list |
+
+Each returns the whole checklist, so one round trip both writes and refreshes.
+Every one is idempotent and re-enterable, and writes only the keys its step
+owns — merged into what is on disk, never regenerating the file.
+
+**While the instance is unclaimed every one of these writes refuses with
+`409`**, as do the account mutations: a passwordless install mints a session
+for anybody, so the claim is the only write that crosses that boundary. Reading
+the checklist still works — it is the screen the claim is on. See
+[Accounts and identity](accounts.md#the-claim-cutover).
+
+**These are PATCH semantics**, and the `?` above is load-bearing: an omitted
+field is left exactly as it is. A step is entered again to change one thing,
+and a body that defaulted the rest would turn "enable this cron" into "and
+switch off the sync sources configured elsewhere". One mutation is served at a
+time, and a step is recorded as done only after every write it makes has
+landed.
+
+Under `lockdown` the checklist writes no configuration: every step that would
+write a file refuses with the reason, and `writable`/`read_only_reason` report
+it before a form is shown. What lives in `nerve.db` — the claim, and your own
+display name — still works.
+
+| Response | When |
+|---|---|
+| `400` | nothing to set, a time zone this machine does not know, or an unknown/unskippable step |
+| `409` | the instance is unclaimed, the session predates a claim, or a file cannot be written: lockdown, no machine-local configuration directory, an unusable tracked settings file, or an unreadable cron file |
+| `500` | a write failed; the message names what landed and what did not |
 
 ### Actors
 

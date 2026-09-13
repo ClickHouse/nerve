@@ -222,40 +222,139 @@ nerve start              # Start the server
 
 ## Claiming an instance from a browser
 
-A headless install with no `NERVE_PASSWORD` starts with one passwordless
-account. Until it is claimed, every caller who reaches the gateway is admitted
-as that account. Open `/setup` to name it, set its password, and optionally
-set its display name in one atomic operation.
+`nerve init` asks for a password. The headless path does not: it reads
+`NERVE_PASSWORD` from the environment and defaults it to empty, so a Docker
+install that omits it starts with **one account and no password**. Until
+somebody claims it, everyone who can reach the gateway is signed in as the
+owner and no activity can be told apart.
 
-Every claim requires the setup token. Read it locally with:
+The checklist at `/setup` is how that ends. Its first step names and secures
+the account the install already has — it does not create a second one, so
+nothing recorded up to that point changes hands — and it signs the browser in
+with the password it just set. Every later step is an ordinary authenticated
+request.
+
+### Who may claim
+
+Whoever holds the **setup token**. Read it on the machine with:
 
 ```bash
 nerve status
 ```
 
-The token is generated once, persisted in `nerve.db` across restarts, and
-invalidated when the claim succeeds. It is sent only in the claim request body:
-Nerve never places it in a URL, response, server log, or browser storage.
+It is generated once while the instance is unclaimed, kept in `nerve.db` so a
+restart does not invalidate it, and deleted in the same transaction that
+commits the claim. It travels only in the claim request body: Nerve never
+places it in a URL, a response, a log line, or browser storage. `nerve doctor`
+deliberately does **not** print it — that report is also relayed by the
+Telegram `/doctor` command, and a live credential does not belong in a chat
+log.
+
+**Every claim needs it, from every address** — a browser running on the machine
+itself included. There is no locality exemption and no origin policy, which is
+the point: nothing about where a request appears to come from is consulted, so
+a forwarding header, a rebound DNS name or a page on some other site posting to
+`127.0.0.1` has nothing to lie about, and there is no setting to remember to
+switch on for the deployments where "the caller is local" stops meaning what it
+looks like — a reverse proxy on the same host, a container reached from its
+host.
 
 The setup token is a bearer credential. For remote setup, protect it and the
 new password in transit by serving Nerve over HTTPS or reaching it through a
 trusted encrypted tunnel. Do not expose a plaintext remote setup page.
 
 The claim updates the existing account rather than creating another, so earlier
-attribution keeps its identity. Exactly one concurrent claimant can win. It
-also advances the account's session epoch: pre-claim HTTP sessions become
-unauthorized, open WebSockets are rechecked and closed, and the successful
-response carries the one new client session token. The browser refreshes
-`/api/auth/status`, `/api/accounts/me`, and the actor directory before
-routing to chat.
+attribution keeps its identity, and of two callers racing to claim a fresh
+install exactly one wins. It also ends every session that came before it,
+including any an earlier visitor was holding: the account's session epoch
+advances, pre-claim HTTP sessions become unauthorized, open WebSockets are
+rechecked and closed, and the successful response carries the one new client
+session token. See
+[Accounts and identity](accounts.md#the-claim-cutover).
 
-Browser setup ends there. Provider credentials, profile configuration,
-channels, automation, and daemon lifecycle remain in `nerve init`, the CLI,
-configuration files, and their dedicated product surfaces.
+Claiming is also the only way to set that first password. `PUT
+/api/accounts/me/password` needs no current password on an account that has
+none, which is exactly the state this exists to end, so while the instance is
+unclaimed it refuses and points here. There is one door.
 
-Claiming is the only way to set the first password.
-`PUT /api/accounts/me/password` refuses while the instance is unclaimed, so a
-passwordless session cannot bypass the setup token.
+### What the checklist can and cannot decide
+
+It is a checklist, not a gate: after the account, every step can be skipped,
+re-entered and done in any order, and an abandoned checklist leaves a working
+instance running on defaults with a reminder in the app.
+
+| Step | Writes |
+|---|---|
+| Claim this instance | username, password and display name, in `nerve.db` |
+| Provider credential | `anthropic_api_key` / `openai_api_key` → `config.local.yaml` (0600) |
+| Timezone and name | `timezone` → the tracked `settings.yaml`; the display name → your actor |
+| Telegram | `telegram.bot_token` → `config.local.yaml`; `telegram.enabled` → `config.yaml` |
+| Automation | enables the optional crons the installer wrote, and which sources sync |
+
+Every one of those writes through the same code `nerve init` writes with
+(`nerve/setup_writer.py`), so the two cannot drift about which layer a value
+belongs in. Each step writes only the keys it owns, and merges them into what
+is already on disk rather than regenerating the file.
+
+What it deliberately does not do:
+
+- **Find a credential on your laptop.** `nerve init` reads the macOS keychain
+  and `~/.claude/.credentials.json`; a process inside the VM cannot see either,
+  so the checklist asks for a key instead of pretending to.
+- **Decide the install's shape.** Deployment style and the workspace path are
+  host decisions — `nerve init` on the machine.
+- **Replace the settings screens.** First-run decisions only.
+- **Restart the daemon.** See [Applying what it wrote](#applying-what-it-wrote).
+
+Every step is a *patch*: a field you do not touch is left exactly as it is, so
+re-entering a step to change one thing changes one thing. The forms open on
+what the instance already says rather than on defaults, and a credential is
+shown as configured rather than read back out.
+
+A step is **done because the thing it does is true**, not because a flag says
+so: the checklist derives what it can from the instance itself — a provider
+credential is configured or it is not — so an install set up at the terminal
+shows the same list. Only what nothing else records is remembered: that a step
+was skipped, which automation an operator chose, and — until the next restart —
+that a step's value is on disk but not yet live. Those notes live in
+`setup-state.json` in the machine-local state directory beside the database.
+They hold no credential (a secret is recorded as present or absent, never as
+itself), and a missing or unreadable file reads as empty state rather than
+stopping setup.
+
+### Applying what it wrote
+
+`timezone` and the Telegram token are read at startup (see
+[Config](config.md#what-still-needs-a-restart)), so a step that writes one of
+them is saved but not yet in force. The checklist says which ones are waiting —
+`restart_pending`, with `restart_pending_paths` for configuration keys and
+`restart_pending_reasons` for what has no key to name, such as a cron file the
+running scheduler has not re-read — and names the command to run in
+`restart_command`:
+
+```bash
+nerve restart
+```
+
+Run it on the server, then reload the page. **There is no button and no
+endpoint for this, on purpose:** a browser that can restart the daemon holds
+process control over the box, which is a great deal to hand out for a
+convenience. The page picks the result up on its next read, because "pending"
+is a comparison between what is on disk and what this process is running rather
+than a flag anybody has to clear. You stay signed in across the restart — the
+signing secret is pinned and persisted, the session epoch lives on the account
+rather than in the process, and nothing in the checklist rotates either.
+
+### Under lockdown
+
+**The checklist writes no configuration.** Configuration there is fleet-managed
+and machine-local values are environment references, so every step that would
+write a file refuses with the reason, and `GET /api/setup` says so before a
+form is shown with `writable: false` and a `read_only_reason`.
+
+What lives in `nerve.db` still works, on purpose: claiming the account, and
+your own display name. A fleet-managed install that could never be claimed
+would stay open to everyone who can reach it.
 
 ## HTTPS Setup
 
