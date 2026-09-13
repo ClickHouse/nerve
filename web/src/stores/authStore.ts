@@ -151,6 +151,34 @@ function isCurrentAuthSession(generation: number): boolean {
   return generation === authGeneration;
 }
 
+/**
+ * Drop a token this attempt installed — but only if it is still the one in
+ * storage.
+ *
+ * `clearToken()` is global and has no idea whose token it is clearing. A stale
+ * attempt calling it unconditionally can wipe the credential a *newer* sign-in
+ * has already installed, signing out somebody who is legitimately signed in.
+ */
+function discardOwnToken(token: string): void {
+  if (getToken() === token) clearToken();
+}
+
+/**
+ * Bind the signed-in actor to an operation that will commit later.
+ *
+ * For anything that stamps a row after an await: the actor has to be the one
+ * who *asked*, not whoever happens to be signed in when the request comes back.
+ * The server records the former, so the optimistic row must say the same thing
+ * or a reload would change the answer — which is the one thing attribution may
+ * never do. `stillCurrent()` says whether committing is still that person's to
+ * do at all.
+ */
+export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
+  const generation = authGeneration;
+  const actorId = useAuthStore.getState().account?.actor_id ?? null;
+  return { actorId, stillCurrent: () => isCurrentAuthSession(generation) };
+}
+
 function identityOf(account: Account): SignedInAccount {
   return { id: account.id, username: account.username, actor_id: account.actor_id };
 }
@@ -182,18 +210,28 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       ({ token } = await api.login(password, username));
     } catch (e: any) {
+      // A refusal for a session that has ended says nothing about the one the
+      // app is in now; reporting it would overwrite a newer attempt's state.
+      if (!isCurrentAuthSession(generation)) return;
       set({ error: e.message || 'Login failed', loading: false });
       // A refused sign-in is a good moment to find out the form was asking for
       // the wrong thing, which is what a stale descriptor looks like from here.
       void get().refreshStatus();
       return;
     }
+    // Before installing it, not after. A credential belonging to a session that
+    // has already ended must never reach storage at all — installing it and
+    // taking it back again is a window in which a logged-out tab holds a
+    // working token, and the taking-back is what could clear somebody else's.
+    if (!isCurrentAuthSession(generation)) return;
+
     setToken(token);
     const identity = await loadIdentity();
-    // Signed out while this was in flight. The token is discarded rather than
-    // installed, so the attempt leaves nothing behind.
+    // Signed out while the identity read was in flight. Take back only what
+    // this attempt installed, and leave `loading` to whoever owns it now —
+    // `logout` clears it, and a newer sign-in sets and clears its own.
     if (!isCurrentAuthSession(generation)) {
-      clearToken();
+      discardOwnToken(token);
       return;
     }
 
@@ -246,7 +284,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // take your unsent work with it.
     purgeAccountScopedState();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
-    set({ authenticated: false, sessionExpired: false, error: null, account: null });
+    // `loading` too: an attempt abandoned by the line above will not clear it,
+    // and a login form left spinning cannot be submitted again.
+    set({
+      authenticated: false, loading: false, sessionExpired: false,
+      error: null, account: null,
+    });
     void get().refreshStatus();
   },
 
@@ -303,12 +346,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (status?.login === 'none') {
       try {
         const { token: fresh } = await api.login('');
+        if (!isCurrentAuthSession(authSession)) return;
         setToken(fresh);
         // The identity read needs the token, so it has to follow it; the guard
-        // then has a token to discard if this session ended meanwhile.
+        // then has a token to take back if this session ended meanwhile — and
+        // only if nothing newer has replaced it.
         const identity = await loadIdentity();
         if (!isCurrentAuthSession(authSession)) {
-          clearToken();
+          discardOwnToken(fresh);
           return;
         }
         sessionEstablished = true;
