@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -146,12 +147,21 @@ def bypass_auth():
         app.dependency_overrides.pop(require_auth, None)
 
 
+@dataclass(frozen=True)
+class _TestIdentity:
+    owner_account_id: str
+    owner_actor_id: str
+    system_actor_id: str
+
+
 @pytest.fixture
 def open_identity_db():
-    """Factory: a connected ``Database`` with the local identity bootstrapped.
+    """Factory: a connected ``Database`` with one test account.
 
-    Returns ``(db, LocalIdentity)`` — the tenant, the agent and its system
-    principal, and one owner account, exactly as first start creates them.
+    Returns ``(db, identity)`` with the account, human actor, and the
+    migration-created system actor ids. This intentionally uses the narrow
+    internal bootstrap primitive: tests create exceptional account states
+    directly instead of expanding the production Database API for fixtures.
     Await it **in the event loop that will use the database**: a sync
     ``TestClient`` test should call it through ``client.portal`` so the
     connection's write lock belongs to the loop the app runs in.
@@ -162,8 +172,14 @@ def open_identity_db():
     async def _open(db_path, *, credential_source: str = "none", display_name=None):
         database = Database(Path(db_path))
         await database.connect()
-        identity = await database.bootstrap_local_identity(
+        account = await database._bootstrap_first_account(
             credential_source=credential_source, display_name=display_name,
+        )
+        assert account.created and account.account_id and account.actor_id
+        identity = _TestIdentity(
+            owner_account_id=account.account_id,
+            owner_actor_id=account.actor_id,
+            system_actor_id=database.system_actor_id,
         )
         return database, identity
 

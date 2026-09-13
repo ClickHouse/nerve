@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from datetime import datetime, timezone
+from uuid import uuid4
 
 import httpx
 import jwt
@@ -67,12 +69,41 @@ class _Install:
         self.actor_id = identity.owner_actor_id
 
     async def add_account(self, display_name: str) -> tuple[str, str]:
-        """A second person. Returns ``(account_id, actor_id)``."""
-        actor = await self.db.create_actor_ref(kind="human", display_name=display_name)
-        account = await self.db.create_account(
-            actor_id=actor["id"], credential_source="none",
+        """Insert exceptional multi-account state without a production API."""
+        account_id, actor_id = str(uuid4()), str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.db._atomic():
+            await self.db.db.execute(
+                """INSERT INTO actor_refs (id, kind, display_name, created_at)
+                   VALUES (?, 'human', ?, ?)""",
+                (actor_id, display_name, now),
+            )
+            await self.db.db.execute(
+                """INSERT INTO accounts
+                       (id, actor_id, username, credential_source, credential,
+                        enabled, created_at)
+                   VALUES (?, ?, NULL, 'none', NULL, 1, ?)""",
+                (account_id, actor_id, now),
+            )
+        return account_id, actor_id
+
+    async def rename_actor(self, actor_id: str, display_name: str) -> None:
+        await self.db._write(
+            "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+            (display_name, actor_id),
         )
-        return account["id"], actor["id"]
+
+    async def set_enabled(self, enabled: bool) -> None:
+        await self.db._write(
+            "UPDATE accounts SET enabled = ? WHERE id = ?",
+            (int(enabled), self.account_id),
+        )
+
+    async def has_account_for_actor(self, actor_id: str) -> bool:
+        async with self.db.db.execute(
+            "SELECT 1 FROM accounts WHERE actor_id = ?", (actor_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     def session_token(self, account_id: str | None = None, secret: str = _SECRET) -> str:
         return create_session_token(secret, account_id or self.account_id)
@@ -193,7 +224,7 @@ class _Socket:
 @pytest.mark.asyncio
 class TestSessionTokens:
     async def test_a_session_resolves_to_its_account(self, install):
-        await install.db.update_actor_profile(install.actor_id, display_name="Alice")
+        await install.rename_actor(install.actor_id, "Alice")
         async with _client(_app()) as client:
             res = await client.get(
                 "/api/whoami", headers=_bearer(install.session_token()),
@@ -214,12 +245,12 @@ class TestSessionTokens:
         app = _app()
         async with _client(app) as client:
             assert (await client.get("/api/whoami", headers=_bearer(token))).status_code == 200
-            await install.db.set_account_enabled(install.account_id, False)
+            await install.set_enabled(False)
             refused = await client.get("/api/whoami", headers=_bearer(token))
             assert refused.status_code == 401
             assert "disabled" in refused.json()["detail"]
             # ...and re-enabling lets the same token back in.
-            await install.db.set_account_enabled(install.account_id, True)
+            await install.set_enabled(True)
             assert (await client.get("/api/whoami", headers=_bearer(token))).status_code == 200
 
     async def test_an_unknown_account_is_refused(self, install):
@@ -235,11 +266,11 @@ class TestSessionTokens:
     async def test_the_display_name_is_a_snapshot_taken_per_request(self, install):
         """Renaming changes what later requests carry and nothing else: the
         actor id — what attribution stores — is untouched."""
-        await install.db.update_actor_profile(install.actor_id, display_name="Alice")
+        await install.rename_actor(install.actor_id, "Alice")
         app, token = _app(), install.session_token()
         async with _client(app) as client:
             first = (await client.get("/api/whoami", headers=_bearer(token))).json()
-            await install.db.update_actor_profile(install.actor_id, display_name="Alice B")
+            await install.rename_actor(install.actor_id, "Alice B")
             second = (await client.get("/api/whoami", headers=_bearer(token))).json()
         assert first["display_name"] == "Alice"
         assert second["display_name"] == "Alice B"
@@ -263,7 +294,7 @@ class TestSystemPrincipal:
         assert body["account_id"] is None
         assert body["actor_id"] == install.identity.system_actor_id
         # And it is not a person: no account row points at it.
-        assert await install.db.get_account_by_actor(body["actor_id"]) is None
+        assert not await install.has_account_for_actor(body["actor_id"])
 
     async def test_mcp_and_worker_credentials_resolve_to_the_system_principal(
         self, install,
@@ -296,16 +327,15 @@ class TestSystemPrincipal:
             )
         assert res.status_code == 401
 
-    async def test_system_resolution_needs_a_bootstrapped_instance(self, db):
-        """Before bootstrap there is no principal to act as — refuse rather
-        than invent one."""
-        with pytest.raises(ActorResolutionError, match="system principal"):
-            await resolve_actor_from_claims(
-                db, jwt.decode(
-                    create_system_token(_SECRET), _SECRET,
-                    algorithms=[JWT_ALGORITHM],
-                ),
-            )
+    async def test_system_resolution_uses_the_migration_principal(self, db):
+        actor = await resolve_actor_from_claims(
+            db, jwt.decode(
+                create_system_token(_SECRET), _SECRET,
+                algorithms=[JWT_ALGORITHM],
+            ),
+        )
+        assert actor.actor_id == db.system_actor_id
+        assert actor.is_system and actor.account_id is None
 
 
 # --------------------------------------------------------------------------- #
@@ -373,7 +403,7 @@ class TestMcpEndpointAdmission:
             assert (
                 await client.post("/mcp/v1/", headers=_bearer(token), content=b"{}")
             ).status_code == 200
-            await install.db.set_account_enabled(install.account_id, False)
+            await install.set_enabled(False)
             refused = await client.post(
                 "/mcp/v1/", headers=_bearer(token), content=b"{}",
             )
@@ -443,7 +473,7 @@ class TestWorkerTokenExchange:
         """The actor is resolved before the token's shape is judged, so a
         credential whose account is gone is refused as unauthenticated rather
         than as the wrong kind of token."""
-        await install.db.set_account_enabled(install.account_id, False)
+        await install.set_enabled(False)
         async with _client(self._app(install, monkeypatch)) as client:
             res = await client.post(
                 "/api/codex/worker-token",
@@ -501,7 +531,7 @@ class TestGrandfatheredSessions:
             assert ok.status_code == 200
 
     async def test_a_disabled_sole_account_is_still_refused(self, install):
-        await install.db.set_account_enabled(install.account_id, False)
+        await install.set_enabled(False)
         async with _client(_app()) as client:
             res = await client.get("/api/whoami", headers=_bearer(install.legacy_token()))
         assert res.status_code == 401
@@ -530,7 +560,7 @@ class TestLoginAdmission:
         return app
 
     async def test_a_disabled_sole_account_cannot_log_in(self, install):
-        await install.db.set_account_enabled(install.account_id, False)
+        await install.set_enabled(False)
         async with _client(self._login_app()) as client:
             res = await client.post("/api/auth/login", json={"password": ""})
         assert res.status_code == 401
@@ -552,17 +582,17 @@ class TestNoProcessGlobalActor:
         answer where there should be two.
         """
         bob_account, bob_actor = await install.add_account("Bob")
-        await install.db.update_actor_profile(install.actor_id, display_name="Alice")
+        await install.rename_actor(install.actor_id, "Alice")
 
         barrier = asyncio.Barrier(2)
-        original = install.db.get_actor_ref
+        original = install.db._account_identity
 
-        async def _rendezvous(actor_id: str):
-            row = await original(actor_id)
+        async def _rendezvous(account_id: str):
+            row = await original(account_id)
             await barrier.wait()   # nobody leaves until both are here
-            return await original(actor_id)
+            return await original(account_id)
 
-        install.db.get_actor_ref = _rendezvous
+        install.db._account_identity = _rendezvous
         try:
             app = _app()
             async with _client(app) as client:
@@ -571,7 +601,7 @@ class TestNoProcessGlobalActor:
                     client.get("/api/whoami", headers=_bearer(install.session_token(bob_account))),
                 )
         finally:
-            install.db.get_actor_ref = original
+            install.db._account_identity = original
 
         assert alice.status_code == bob.status_code == 200
         assert alice.json() == {
@@ -656,7 +686,7 @@ class TestWebSocketActorIsFixedAtAccept:
         assert connection.client_id
 
     async def test_a_refused_socket_is_closed_and_yields_nothing(self, install):
-        await install.db.set_account_enabled(install.account_id, False)
+        await install.set_enabled(False)
         socket = _Socket(token=install.session_token())
         assert await _accept_websocket(socket) is None
         assert socket.closed == (4001, "Unauthorized")
@@ -671,9 +701,9 @@ class TestWebSocketActorIsFixedAtAccept:
         connection = await _accept_websocket(_Socket(token=install.session_token()))
         before = connection.actor
 
-        await install.db.update_actor_profile(install.actor_id, display_name="Renamed")
+        await install.rename_actor(install.actor_id, "Renamed")
         await install.add_account("Bob")
-        await install.db.set_account_enabled(install.account_id, False)
+        await install.set_enabled(False)
 
         assert connection.actor == before
         assert connection.actor.display_name == before.display_name
