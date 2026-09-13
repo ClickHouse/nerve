@@ -861,6 +861,30 @@ class TestTheChecklist:
         }
         assert all(c["description"] for c in state["crons"])
 
+    async def test_it_carries_the_values_a_form_has_to_open_on(self, claimed):
+        """A form that opens on defaults submits defaults."""
+        claimed.reconfigure(timezone="Europe/Berlin", anthropic_api_key=_ANTHROPIC_KEY)
+        async with _http(claimed) as http:
+            values = (await http.get("/api/setup")).json()["values"]
+        assert values["timezone"] == "Europe/Berlin"
+        assert values["has_anthropic_key"] is True
+        assert values["has_openai_key"] is False
+        # Whatever the live config says, not a default this screen invented.
+        assert values["sync_github"] is claimed.reconfigure(
+            timezone="Europe/Berlin", anthropic_api_key=_ANTHROPIC_KEY,
+        ).sync.github.enabled
+
+    async def test_it_reports_a_secret_as_present_and_never_repeats_it(
+        self, claimed,
+    ):
+        async with _http(claimed) as http:
+            await http.put("/api/setup/channels", json={
+                "telegram_bot_token": _TELEGRAM_TOKEN,
+            })
+            body = (await http.get("/api/setup")).text
+        assert _TELEGRAM_TOKEN not in body
+        assert _ANTHROPIC_KEY not in body
+
     async def test_a_step_can_be_skipped_and_re_entered(self, claimed):
         async with _http(claimed) as http:
             skipped = (await http.post("/api/setup/steps/channels/skip")).json()

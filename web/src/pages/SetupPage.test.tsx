@@ -47,6 +47,7 @@ function state(overrides: Partial<SetupState> = {}): SetupState {
     read_only_reason: null,
     restart_pending: false,
     restart_pending_paths: [],
+    restart_pending_reasons: [],
     finished: false,
     steps: [
       {
@@ -76,6 +77,17 @@ function state(overrides: Partial<SetupState> = {}): SetupState {
         description: 'Polls your sources.', enabled: false,
       },
     ],
+    values: {
+      timezone: 'UTC',
+      display_name: 'Alice Example',
+      has_anthropic_key: false,
+      has_openai_key: false,
+      has_telegram_token: false,
+      sync_github: true,
+      sync_gmail: false,
+      sync_telegram: false,
+      gmail_accounts: [],
+    },
     ...overrides,
   };
 }
@@ -365,8 +377,28 @@ describe('the finish-setup affordance', () => {
     expect(screen.getByRole('link', { name: /finish setup/i })).toBeTruthy();
   });
 
-  it('is not shown once it has been claimed', () => {
+  it('stays after the claim while the checklist is unfinished', () => {
+    // The state the affordance is actually for: an unclaimed instance already
+    // redirects here by itself, and an abandoned *post-claim* checklist used
+    // to have nothing pointing at it anywhere in the app.
     useAuthStore.setState({ setupPending: false });
+    useSetupStore.setState({ state: state({ finished: false }) });
+    renderReminder();
+    expect(screen.getByRole('link', { name: /finish setup/i })).toBeTruthy();
+    expect(screen.getByText(/Setup is not finished/)).toBeTruthy();
+  });
+
+  it('goes away once the server says the list is finished', () => {
+    useAuthStore.setState({ setupPending: false });
+    useSetupStore.setState({ state: state({ finished: true }) });
+    renderReminder();
+    expect(screen.queryByRole('link', { name: /finish setup/i })).toBeNull();
+  });
+
+  it('says nothing while the checklist has not been read', () => {
+    // A failed or pending read must not grow a permanent nag.
+    useAuthStore.setState({ setupPending: false });
+    useSetupStore.setState({ state: null });
     renderReminder();
     expect(screen.queryByRole('link', { name: /finish setup/i })).toBeNull();
   });
@@ -375,5 +407,83 @@ describe('the finish-setup affordance', () => {
     useAuthStore.setState({ setupPending: true });
     renderReminder('/setup');
     expect(screen.queryByRole('link', { name: /finish setup/i })).toBeNull();
+  });
+});
+
+describe('hydration', () => {
+  it('opens the profile form on the instance\'s timezone, not the browser\'s', async () => {
+    api.setupState.mockResolvedValue(state({
+      values: { ...state().values, timezone: 'Pacific/Auckland' },
+    }));
+    renderPage();
+    const profile = await screen.findByRole('region', { name: 'Timezone and name' });
+    expect(
+      (within(profile).getByLabelText('Time zone') as HTMLInputElement).value,
+    ).toBe('Pacific/Auckland');
+  });
+
+  it('sends only the field that changed', async () => {
+    api.setupProfile.mockResolvedValue(state());
+    renderPage();
+    const profile = await screen.findByRole('region', { name: 'Timezone and name' });
+    const name = within(profile).getByLabelText('Your display name');
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Alice Second');
+    await userEvent.click(within(profile).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.setupProfile).toHaveBeenCalled());
+    // The timezone is shared configuration; editing a name must not move it.
+    expect(api.setupProfile.mock.calls[0][0]).toEqual({
+      display_name: 'Alice Second',
+    });
+  });
+
+  it('hydrates the sync toggles and submits only what moved', async () => {
+    api.setupAutomation.mockResolvedValue(state());
+    renderPage();
+    const automation = await screen.findByRole('region', { name: 'Automation' });
+    expect(
+      (within(automation).getByLabelText('GitHub') as HTMLInputElement).checked,
+    ).toBe(true);
+
+    await userEvent.click(within(automation).getByLabelText('Inbox Processor'));
+    await userEvent.click(within(automation).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.setupAutomation).toHaveBeenCalled());
+    expect(api.setupAutomation.mock.calls[0][0]).toEqual({
+      crons: ['inbox-processor'],
+    });
+  });
+
+  it('refreshes the names in the app after a rename', async () => {
+    api.setupProfile.mockResolvedValue(state());
+    renderPage();
+    const profile = await screen.findByRole('region', { name: 'Timezone and name' });
+    const name = within(profile).getByLabelText('Your display name');
+    await userEvent.clear(name);
+    await userEvent.type(name, 'Alice Renamed');
+    await userEvent.click(within(profile).getByRole('button', { name: 'Save' }));
+    // Nothing stores the name it changed, so every label reads it again.
+    await waitFor(() => expect(api.listActors).toHaveBeenCalled());
+  });
+});
+
+describe('one mutation at a time', () => {
+  it('disables every other control while a save is in flight', async () => {
+    let release: (v: unknown) => void = () => {};
+    api.setupProvider.mockReturnValue(new Promise((r) => { release = r; }));
+    renderPage();
+    const provider = await screen.findByRole('region', { name: 'Provider credential' });
+    await userEvent.type(
+      within(provider).getByLabelText('Anthropic API key'), 'a-key',
+    );
+    await userEvent.click(within(provider).getByRole('button', { name: 'Save' }));
+
+    const automation = screen.getByRole('region', { name: 'Automation' });
+    await waitFor(() => expect(
+      (within(automation).getByRole('button', { name: 'Skip' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true));
+    release(state());
   });
 });
