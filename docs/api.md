@@ -31,17 +31,10 @@ cannot log in (`401`).
 Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
 or as `?token=` (for `<img src>` and downloads, which cannot set headers).
 
-Every request resolves its token to an **actor** — the account behind it, or
-the agent's system principal for credentials the instance minted for itself.
-A `401` on a token that was working means it no longer names anybody this
-instance can act for:
-
-| Situation | Response |
-|---|---|
-| account disabled since the token was issued | `401` at the next request (disabling is not retroactive) |
-| account no longer exists | `401` |
-| session predating per-account logins, on an install that now has two or more accounts | `401` — log in again |
-| no signing secret, or the gateway has not finished starting | `503` |
+Every request resolves its token to an account actor or the system principal.
+Unknown and disabled accounts fail with `401`; unavailable startup identity
+state fails with `503`. See [Accounts and identity](accounts.md) for token
+types and legacy-session compatibility.
 
 **`X-Nerve-Token` on the response.** Once a session token is past half its
 life, the reply carries a fresh one under this header; swap it in and a tab in
@@ -602,11 +595,9 @@ Response: { "status": "ok", "version": "0.1.0" }
 ## WebSocket Protocol
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
-too). The token is resolved to an actor **once, at accept**, and that actor is
-what the connection acts as until it closes: an account disabled, renamed, or
-joined by a second one mid-stream leaves the open socket alone and takes effect
-on the next connection. A credential that names nobody is refused with close
-code `4001`; reconnect after logging in again.
+too). The token is resolved to an actor at admission. A credential that names
+nobody is refused with close code `4001`; a stale admitted socket is closed on
+its next frame after an account is disabled or setup is claimed.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token

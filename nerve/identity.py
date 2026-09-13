@@ -1,23 +1,9 @@
-"""Who a piece of work is attributed to.
+"""Request and autonomous-work identity.
 
-An :class:`Actor` is the identity carried through an operation: the person who
-made the request, or the agent's system principal when the work is autonomous
-(cron, channel traffic, background agents). It is resolved **per request** from
-the database and passed down the call chain. There is deliberately no
-process-global "current actor" and no cache: a shared agent serves two people
-at once, and a module-level actor is how one of them ends up attributed to the
-other.
-
-This module sits at the top level, outside both :mod:`nerve.db` and
-:mod:`nerve.gateway`, because both ends need it: the gateway resolves an actor
-on the request, and the data-access layer stores its id. It therefore imports
-neither at runtime — the database handle arrives as an argument and is typed
-only for the checker — so ``nerve.db`` can import this module without a cycle.
-
-Identity vs presentation (RFC 3.3): ``actor_id`` is the identity and is
-permanent. ``display_name`` is a *snapshot* taken when the actor was resolved;
-renaming an account changes what later requests carry and rewrites nothing that
-was stored before. Names are never identity or authorization keys.
+This top-level module imports neither the database nor gateway at runtime, so
+both may use :class:`Actor`. Actors are resolved per request and passed down;
+there is no process-global current actor. ``actor_id`` is permanent identity,
+while ``display_name`` is only a presentation snapshot.
 """
 
 from __future__ import annotations
@@ -36,23 +22,12 @@ ACTOR_KINDS = (ACTOR_KIND_HUMAN, ACTOR_KIND_SYSTEM)
 
 
 class ActorResolutionError(Exception):
-    """A verified credential names no actor this instance can act for.
-
-    Raised, never returned, so a caller cannot forget to check: the token's
-    signature was good but the account behind it is gone, disabled, or
-    ambiguous. Ingress code turns it into a 401 (the credential is no longer
-    usable, so re-authenticating is the remedy).
-    """
+    """A verified credential names no actor this instance can act for."""
 
 
 @dataclass(frozen=True, slots=True)
 class Actor:
-    """The identity an authenticated request or an autonomous run acts as.
-
-    Frozen: once resolved, an actor cannot be edited. A long-lived WebSocket
-    fixes one at accept and carries that exact value for its whole life, so
-    nothing can swap an identity under an open connection.
-    """
+    """The immutable identity an authenticated request or autonomous run uses."""
 
     actor_id: str
     kind: str
@@ -80,13 +55,7 @@ class Actor:
 
 
 async def _actor_for_account_row(store: "AccountStore", account: dict) -> Actor:
-    """Turn an ``accounts`` row into an :class:`Actor`, refusing a disabled one.
-
-    Disablement is checked **here**, on the way to every actor, rather than at
-    each ingress: a token minted before the account was disabled keeps
-    verifying (it is signed and unexpired), so the account row is the only
-    thing that can stop it, and it takes effect on the next request.
-    """
+    """Resolve an account row, checking disablement on every request."""
     if not account.get("enabled"):
         raise ActorResolutionError("This account is disabled")
     actor = await store.get_actor_ref(account["actor_id"])
@@ -103,11 +72,7 @@ async def _actor_for_account_row(store: "AccountStore", account: dict) -> Actor:
 
 
 async def actor_for_account(store: "AccountStore", account_id: str) -> Actor:
-    """The actor of the account with this id.
-
-    Looked up on every call. Nothing is cached: an account disabled a second
-    ago must not keep being served from a previous lookup.
-    """
+    """Resolve an account id without caching."""
     if not isinstance(account_id, str) or not account_id:
         raise ActorResolutionError("This credential names no account")
     account = await store.get_account(account_id)
@@ -117,13 +82,10 @@ async def actor_for_account(store: "AccountStore", account_id: str) -> Actor:
 
 
 async def actor_for_sole_account(store: "AccountStore") -> Actor:
-    """The actor of the single local account, when exactly one exists.
+    """Resolve the sole account.
 
-    The bound that 0.5 puts on passwordless access and PR 2 puts on
-    grandfathered session tokens: a credential that names no particular person
-    is only meaningful while there is only one person it could mean. With two
-    accounts it names nobody, and resolving it to whichever row sorts first
-    would attribute one person's work to another.
+    A legacy credential names no person, so zero or multiple accounts are
+    ambiguous and must fail rather than select a row.
     """
     account = await store.get_sole_account()
     if account is None:
@@ -135,12 +97,7 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
 
 
 async def system_actor(store: "AccountStore") -> Actor:
-    """The agent's system principal — the identity autonomous work acts as.
-
-    Scheduled runs, channel traffic, background agents and the agent's own
-    calls into its API are attributed to this actor rather than to a person
-    (0.6). It has no account and never logs in.
-    """
+    """Resolve the account-less principal used for autonomous work."""
     row = await store.get_system_principal()
     if row is None:
         raise ActorResolutionError(

@@ -14,11 +14,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
-from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 class ReviewLoopKillRequest(BaseModel):
@@ -43,7 +42,6 @@ def _service():
 async def list_review_loops(
     status: str = "",
     limit: int = 50,
-    actor: Actor = Depends(require_auth),
 ):
     """List loops (newest first). ``status``: 'open', an exact status, or empty."""
     service = _service()
@@ -52,7 +50,7 @@ async def list_review_loops(
 
 
 @router.get("/api/review-loops/{loop_id}")
-async def get_review_loop(loop_id: str, actor: Actor = Depends(require_auth)):
+async def get_review_loop(loop_id: str):
     """Full loop detail: state, criteria, and the attempt ledger with
     verdicts — everything the loop card renders."""
     service = _service()
@@ -67,7 +65,7 @@ _STATE_MAX_BYTES = 256 * 1024
 
 
 @router.get("/api/review-loops/{loop_id}/state")
-async def get_review_loop_state(loop_id: str, actor: Actor = Depends(require_auth)):
+async def get_review_loop_state(loop_id: str):
     """The implementer's handoff file (STATE.md) — the loop's primary
     artifact. Path is derived server-side from the loop row (never from
     the client), read bounded (tail)."""
@@ -103,7 +101,6 @@ async def get_review_loop_state(loop_id: str, actor: Actor = Depends(require_aut
 async def kill_review_loop(
     loop_id: str,
     req: ReviewLoopKillRequest = ReviewLoopKillRequest(),
-    actor: Actor = Depends(require_auth),
 ):
     service = _service()
     from nerve.workflows.review_loop import ReviewLoopError
@@ -119,7 +116,6 @@ async def kill_review_loop(
 async def decide_review_loop(
     loop_id: str,
     req: ReviewLoopDecisionRequest,
-    actor: Actor = Depends(require_auth),
 ):
     """Apply a decision to a parked loop — the same handler the approval
     card's dispatcher awaits, so the card is never the only path."""

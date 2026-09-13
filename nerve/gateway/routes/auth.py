@@ -78,6 +78,6 @@ async def auth_status():
     }
 
 
-@router.get("/api/auth/check")
-async def check_auth(actor: Actor = Depends(require_auth)):
+@router.get("/api/auth/check", dependencies=[Depends(require_auth)])
+async def check_auth():
     return {"authenticated": True}

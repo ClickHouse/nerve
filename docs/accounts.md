@@ -89,11 +89,8 @@ Two consequences worth knowing:
   A token issued before the change is still signed and unexpired, so the
   account row is the only thing that can stop it — and it does, at every door:
   HTTP, a new WebSocket, and the MCP endpoint.
-- **A WebSocket's identity is fixed when it connects.** A socket stays open for
-  hours, and re-reading identity mid-stream would attribute a message sent now
-  differently from one sent a minute ago. Disabling, renaming or adding an
-  account leaves open sockets exactly as they were and applies to the next
-  connection.
+- **A WebSocket's identity is fixed when it connects.** Renaming does not
+  rewrite it; disabling the account closes the stale socket on its next frame.
 
 Autonomous work — cron jobs, channel traffic, background agents, and the
 instance talking to itself — acts as the **system principal** rather than as
@@ -103,18 +100,14 @@ removed.
 
 ### Sessions that predate this version
 
-Browsers hold 30-day session tokens issued before accounts existed. They name
-no account, so they cannot say who they are — but they still verify, and
-logging every open tab out on upgrade would be a poor trade. So:
+Browsers may hold 30-day session tokens issued before accounts existed. They
+name no account, so they are handled narrowly:
 
 - with **exactly one account**, such a token resolves to that account, and the
   reply carries a proper per-account token in the `X-Nerve-Token` header, which
   the browser stores. One request per tab and the old shape is gone;
 - with **two or more accounts** it is refused (`401`) rather than resolved to
-  whichever account sorts first: it names nobody in particular, and a guess
-  would file one person's work under another's name. In practice the install
-  that creates its second account makes its old tabs log in again at that
-  moment, which is correct and explainable.
+  whichever account sorts first; those tabs must log in again.
 
 The acceptance is temporary and is removed in a later release. Nothing mints
 that shape any more.

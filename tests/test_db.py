@@ -6,17 +6,6 @@ import pytest
 import pytest_asyncio
 
 from nerve.db import Database
-from nerve.identity import Actor
-
-# `require_auth` hands a route the actor the request resolved to. These tests
-# call the route functions directly, so they supply one; no route here reads
-# it, so any well-formed actor does.
-_ACTOR = Actor(
-    actor_id="00000000-0000-4000-8000-00000000ac70",
-    kind="human",
-    account_id="00000000-0000-4000-8000-00000000acc7",
-    display_name="Test Account",
-)
 
 
 @pytest.mark.asyncio
@@ -916,7 +905,7 @@ class TestPatchRouteTagCanonicalization:
         )
         monkeypatch.setattr(tasks_route, "get_deps", lambda: type("D", (), {"db": db})())
         await tasks_route.update_task(
-            "t1", tasks_route.TaskUpdateRequest(content=content), actor=_ACTOR,
+            "t1", tasks_route.TaskUpdateRequest(content=content),
         )
         return await db.get_task("t1")
 
