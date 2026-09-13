@@ -242,6 +242,13 @@ async def claim(req: ClaimRequest, request: Request):
     username and a credential on the existing one and names its existing
     actor. Nothing that was ever attributed to this install moves.
 
+    **It also ends every session that existed before it.** A passwordless
+    install hands a session to anybody who asks, and those tokens name this
+    same account — so the claim bumps the account's session epoch inside its
+    transaction and every one of them is refused at its next request. The
+    token returned here is minted at the new epoch, so the browser doing the
+    claiming is the one session that survives.
+
     The guard is evaluated *before* the instance state, so a caller who fails
     it learns nothing here that ``/api/auth/status`` does not already say.
     """
@@ -311,10 +318,19 @@ async def claim(req: ClaimRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     logger.info(
-        "Instance claimed: account %s is now named and has a password", account["id"],
+        "Instance claimed: account %s is now named and has a password; every "
+        "session issued while it was passwordless is now refused",
+        account["id"],
     )
     return ClaimResponse(
-        token=create_session_token(secret, account["id"]),
+        # At the epoch the claim just bumped to, so this token is the only one
+        # that still works: every session handed out while the instance
+        # admitted everybody is an epoch behind and is refused at its next
+        # request (v049).
+        token=create_session_token(
+            secret, account["id"],
+            session_epoch=account.get("session_epoch") or 0,
+        ),
         account_id=account["id"],
         actor_id=actor.actor_id,
         username=account["username"],
