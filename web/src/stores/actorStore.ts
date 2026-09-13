@@ -136,7 +136,7 @@ export const useActorStore = create<ActorState>((set, get) => {
   }
 
   /**
-   * Request, then follow up on anything that arrived while it was open.
+   * Request, then keep following up until nothing is queued.
    *
    * The follow-up is the point. `resolve` cannot start a second request while
    * one is in flight — that is the coalescing forty mounting bubbles depend on
@@ -144,12 +144,31 @@ export const useActorStore = create<ActorState>((set, get) => {
    * message, arriving between the map being fetched and it landing) would sit
    * in the queue with nothing to drain it, and read `Unnamed account` until the
    * next navigation.
+   *
+   * **The exit condition is an empty queue, not a round count.** An earlier
+   * version stopped after a fixed number of follow-ups, which recreated the
+   * very bug it was written for one wave further out: a fifth arrival, queued
+   * during the fifth response, was left with `inFlight` cleared and no hook
+   * dependency changed to restart it.
+   *
+   * It terminates because every round settles everything it claims — into the
+   * map or into `unresolved`, and `resolve` skips both — so the queue can only
+   * refill from *new* arrivals, and each of those costs exactly one request.
+   * `pending` never holds an id that is already known, because `fetchOnce`
+   * prunes the ones its own answer settled. The inner bound is a tripwire, not
+   * a limit: it breaks the work into finite chains so this reads as bounded
+   * segments rather than an open `while (true)`, and re-entering is what keeps
+   * arrivals from being stranded.
    */
   async function drain(): Promise<void> {
-    for (let round = 0; round <= MAX_FOLLOW_UPS; round++) {
-      if (!(await fetchOnce())) return;
-      if (pending.size === 0) return;
-    }
+    // `do`, not `while`: the first request has to happen even with an empty
+    // queue, because that is what a forced re-read after a rename is.
+    do {
+      for (let round = 0; round <= MAX_FOLLOW_UPS; round++) {
+        if (!(await fetchOnce())) return;
+        if (pending.size === 0) return;
+      }
+    } while (pending.size > 0);
   }
 
   /** Start a request chain and publish it as the one to coalesce onto. */
@@ -218,27 +237,42 @@ export function isSystemActor(actor: ActorRef | undefined): boolean {
 }
 
 /**
- * A stable, short tail of an actor id, for telling two identical names apart.
+ * How short a discriminator is allowed to be.
  *
- * Six characters off the end rather than the front: these are UUIDs, and two of
- * them are far likelier to share a prefix — some generators put a timestamp
- * there — than a tail. It is only ever a hint; the full id stays in the
- * tooltip, and the id itself is what the label is derived from, so the same
- * actor gets the same suffix on every surface and across reloads.
+ * A floor rather than the length: the suffix grows until it is unique within
+ * its group (see `actorDiscriminators`), and this only stops it being *shorter*
+ * than six characters when two characters would already do. A one-character
+ * discriminator is technically the shortest unique one and reads like a typo;
+ * six is short enough to sit in a label and long enough to look deliberate, and
+ * holding it constant means adding a third person with the same name does not
+ * silently restyle the other two.
  */
-export function actorDiscriminator(id: string): string {
-  return id.length > 6 ? id.slice(-6) : id;
-}
+const MIN_DISCRIMINATOR = 6;
 
-let ambiguousCache: { actors: Record<string, ActorRef>; ids: Set<string> } | null = null;
+let discriminatorCache:
+  { actors: Record<string, ActorRef>; byId: Map<string, string> } | null = null;
 
 /**
- * Actors whose label is not unique — two people called Alex, or two accounts
- * with no display name at all.
+ * The suffix each actor needs in order to be told apart from another actor that
+ * renders the same label — two people called Alex, or two accounts with no
+ * display name at all. Ids that need nothing are absent.
  *
  * Display names are not identity and nothing stops two of them being equal
  * (0.7: names are never identity keys), so a label that is only a name can name
- * two different people. These ids get a discriminator appended.
+ * two different people.
+ *
+ * **The suffix is computed per colliding group and is unique by construction,
+ * not by luck.** A fixed-length tail is not good enough: two ids can share
+ * their last six characters — more easily than it sounds, since these are
+ * UUIDs and a group is usually two rows from the same generator — and then the
+ * disambiguator does not disambiguate. The length grows a character at a time
+ * until every id in the group has a distinct tail, extending to the whole id if
+ * that is what it takes. That terminates because ids are the map's own keys and
+ * are therefore already distinct.
+ *
+ * Taken from the *end* of the id rather than the front: two UUIDs are far
+ * likelier to share a prefix — some generators put a timestamp there — than a
+ * tail, so a front slice would need to grow much further much more often.
  *
  * Collisions are computed over **the whole map, not the list being rendered**.
  * Per-list would be narrower and would show the suffix less often, but the same
@@ -248,25 +282,35 @@ let ambiguousCache: { actors: Record<string, ActorRef>; ids: Set<string> } | nul
  * be. The map is a handful of rows, and the result is memoised on its identity,
  * so every label on a page shares one computation.
  *
- * Ids the map does not know are absent from this set and keep the plain
- * fallback: there is nothing to compare them against, and their tooltip already
- * carries the id.
+ * Ids the map does not know are absent and keep the plain fallback: there is
+ * nothing to compare them against, and their tooltip already carries the id.
  */
-export function ambiguousActorIds(actors: Record<string, ActorRef>): Set<string> {
-  if (ambiguousCache?.actors === actors) return ambiguousCache.ids;
+export function actorDiscriminators(actors: Record<string, ActorRef>): Map<string, string> {
+  if (discriminatorCache?.actors === actors) return discriminatorCache.byId;
+
   const byLabel = new Map<string, string[]>();
   for (const actor of Object.values(actors)) {
     const label = actorName(actor);
-    const seen = byLabel.get(label);
-    if (seen) seen.push(actor.id);
+    const sharing = byLabel.get(label);
+    if (sharing) sharing.push(actor.id);
     else byLabel.set(label, [actor.id]);
   }
-  const ids = new Set<string>();
+
+  const byId = new Map<string, string>();
   for (const sharing of byLabel.values()) {
-    if (sharing.length > 1) for (const id of sharing) ids.add(id);
+    if (sharing.length < 2) continue;
+    const longest = Math.max(...sharing.map((id) => id.length));
+    let length = Math.min(MIN_DISCRIMINATOR, longest);
+    // Grow until the tails are distinct. The last candidate is the whole id,
+    // which always is — these are the map's keys.
+    for (; length < longest; length++) {
+      if (new Set(sharing.map((id) => id.slice(-length))).size === sharing.length) break;
+    }
+    for (const id of sharing) byId.set(id, id.slice(-length));
   }
-  ambiguousCache = { actors, ids };
-  return ids;
+
+  discriminatorCache = { actors, byId };
+  return byId;
 }
 
 /**
