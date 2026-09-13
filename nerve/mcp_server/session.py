@@ -128,6 +128,14 @@ class SatelliteSessionResolver:
             client_session_id: Optional stable id supplied by the client
                 (e.g. a Codex thread id). When provided, the satellite
                 session id is stable across reconnects.
+
+        Raises whatever stopped the row being created — including an
+        unresolvable system principal. The returned id becomes the
+        ``ToolContext.session_id`` a tool handler runs under and the key its
+        audit row is written against, so an id with no row behind it would let
+        a tool with real side effects run with neither a session nor an audit
+        trail. Failing here refuses the call instead: the dispatcher catches
+        it and answers with a context error before the handler is reached.
         """
         safe_client = _sanitize_client_name(client_name)
 
@@ -152,6 +160,10 @@ class SatelliteSessionResolver:
                 "origin_ids": ["nerve-mcp-detected"],
             }
             title = f"Codex/mcp ({client_session_id[:8]})"
+            # Outside the catch below, and before the insert: see resolve()'s
+            # docstring. A satellite id whose row does not exist is worse than
+            # a refused call.
+            actor = await self._satellite_actor()
             try:
                 await self.db.create_session(
                     session_id=sid,
@@ -159,14 +171,14 @@ class SatelliteSessionResolver:
                     source="external",
                     metadata=metadata,
                     status="active",
-                    actor=await self._satellite_actor(),
+                    actor=actor,
                 )
                 logger.info(
                     "Created Codex satellite session %s via MCP (mcp=%s)",
                     sid, mcp_session_id,
                 )
             except Exception:
-                logger.exception("Failed to create Codex satellite %s", sid)
+                await self._survivable_or_raise(sid)
             return sid
 
         identifier = client_session_id or mcp_session_id
@@ -183,6 +195,7 @@ class SatelliteSessionResolver:
             "runtime": f"{safe_client}-external",
         }
         title = f"{safe_client} ({mcp_session_id[:8]})"
+        actor = await self._satellite_actor()
         try:
             await self.db.create_session(
                 session_id=sid,
@@ -190,17 +203,37 @@ class SatelliteSessionResolver:
                 source="external",
                 metadata=metadata,
                 status="active",
-                actor=await self._satellite_actor(),
+                actor=actor,
             )
             logger.info(
                 "Created satellite session %s (client=%s, mcp=%s)",
                 sid, safe_client, mcp_session_id,
             )
         except Exception:
-            # Race: another concurrent request created the row between
-            # get_session() and create_session(). create_session() is
-            # INSERT OR IGNORE so this is normally swallowed; the
-            # broader except is belt-and-braces.
-            logger.exception("Failed to create satellite session %s", sid)
+            await self._survivable_or_raise(sid)
 
         return sid
+
+    async def _survivable_or_raise(self, sid: str) -> None:
+        """Swallow a lost create race; re-raise anything else.
+
+        The only failure this method may absorb is another request having
+        created the row between ``get_session()`` and ``create_session()`` —
+        harmless, because the row the caller needs now exists. (The insert is
+        ``INSERT OR IGNORE``, so that race normally raises nothing at all;
+        this is the belt-and-braces path.)
+
+        Anything else — a database error, a constraint violation — leaves no
+        row, and returning the id anyway would hand a tool call a session that
+        exists nowhere. So it propagates: :func:`build_ctx_resolver` fails,
+        and the MCP dispatcher turns that into a context error *before* the
+        handler runs.
+        """
+        if await self.db.get_session(sid) is None:
+            logger.exception(
+                "Failed to create satellite session %s — refusing the call", sid,
+            )
+            raise
+        logger.info(
+            "Satellite session %s was created concurrently; continuing", sid,
+        )
