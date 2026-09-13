@@ -14,7 +14,12 @@ vi.mock('../../api/client', () => ({
     getModels: vi.fn(async () => ({ models: [], default: null })),
     rewritePrompt: vi.fn(),
     uploadFiles: vi.fn(),
+    getOwnAccount: vi.fn(async () => { throw new Error("403"); }),
   },
+  // The chat store stamps an optimistic message with the signed-in actor, so it
+  // now reaches authStore, which reads these two at module load.
+  getToken: vi.fn(),
+  setUnauthorizedHandler: vi.fn(),
 }));
 
 /**
