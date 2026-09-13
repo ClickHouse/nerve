@@ -30,7 +30,7 @@ from pathlib import Path
 
 import click
 
-from nerve import paths
+from nerve import daemon, paths
 from nerve.config import (
     RESUME_QUEUE_FILE,
     load_config,
@@ -516,88 +516,21 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         ctx.exit(rc)
         return
 
-    # Systemd mode (Restart=always): just kill the process — systemd
-    # will bring it back automatically.
-    if _is_systemd_managed():
-        running, old_pid = _get_daemon_status()
-        if running:
-            click.echo(f"Restarting Nerve (PID {old_pid})... systemd will respawn.")
-            os.kill(old_pid, signal.SIGTERM)
-        else:
-            click.echo("Nerve is not running — systemd will start it shortly.")
-        return
-
-    # Build the command that `start` would use to launch the daemon.
-    # Always use ``-m nerve`` so the restart works regardless of how *this*
-    # process was invoked (console-script, ``python -m nerve``, etc.).
-    verbose = ctx.obj["verbose"]
-    start_cmd_parts = [sys.executable, "-m", "nerve", "-c", str(config_dir)]
-    if verbose:
-        start_cmd_parts.append("-v")
-    start_cmd_parts.extend(["start", "--foreground"])
-
+    systemd = _is_systemd_managed()
     running, old_pid = _get_daemon_status()
 
-    # Spawn a detached helper that: waits for old PID to exit, then starts
-    # a new daemon.  Written as an inline Python script so we don't need an
-    # external shell script on disk.
-    helper_script = (
-        "import os, signal, subprocess, sys, time\n"
-        f"old_pid = {old_pid if running else 'None'}\n"
-        f"pid_file = {str(paths.pid_file())!r}\n"
-        f"log_file = {str(paths.log_file())!r}\n"
-        f"start_cmd = {start_cmd_parts!r}\n"
-        "if old_pid is not None:\n"
-        "    try:\n"
-        "        os.kill(old_pid, signal.SIGTERM)\n"
-        "    except ProcessLookupError:\n"
-        "        pass\n"
-        "    for _ in range(30):\n"
-        "        time.sleep(0.5)\n"
-        "        try:\n"
-        "            os.kill(old_pid, 0)\n"
-        "        except ProcessLookupError:\n"
-        "            break\n"
-        "    else:\n"
-        "        try:\n"
-        "            os.kill(old_pid, signal.SIGKILL)\n"
-        "            time.sleep(0.5)\n"
-        "        except ProcessLookupError:\n"
-        "            pass\n"
-        "    # Remove stale PID file\n"
-        "    try:\n"
-        "        os.unlink(pid_file)\n"
-        "    except FileNotFoundError:\n"
-        "        pass\n"
-        "time.sleep(0.5)\n"
-        "log_fd = open(log_file, 'a')\n"
-        "proc = subprocess.Popen(\n"
-        "    start_cmd,\n"
-        "    stdout=log_fd,\n"
-        "    stderr=log_fd,\n"
-        "    stdin=subprocess.DEVNULL,\n"
-        "    start_new_session=True,\n"
-        ")\n"
-        "log_fd.close()\n"
-        "time.sleep(1)\n"
-        "if proc.poll() is not None:\n"
-        "    sys.exit(1)\n"
+    # Everything below — the systemd path and the detached helper — is in
+    # nerve.daemon, because the web setup wizard's last step has to do exactly
+    # this and a second implementation of "restart the daemon" would drift from
+    # this one. The facts it needs are passed in rather than discovered there,
+    # so this command's own helpers stay the ones in force.
+    outcome = daemon.restart_daemon(
+        config_dir,
+        verbose=ctx.obj["verbose"],
+        old_pid=old_pid if running else None,
+        systemd=systemd,
     )
-
-    log_fd = open(paths.log_file(), "a")
-    subprocess.Popen(
-        [sys.executable, "-c", helper_script],
-        stdout=log_fd,
-        stderr=log_fd,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    log_fd.close()
-
-    if running:
-        click.echo(f"Restarting Nerve (PID {old_pid})... new instance will start shortly.")
-    else:
-        click.echo("Starting Nerve... new instance will start shortly.")
+    click.echo(outcome.message)
 
 
 @main.command()
