@@ -626,6 +626,25 @@ def merge_settings_paths(
     )
 
 
+def settings_problem(workspace: Path) -> str:
+    """Why the tracked settings file could not be merged into, or ``""``.
+
+    Asked *before* a step writes anything, so a request that touches more than
+    one file does not publish the first and then discover the second is
+    unusable — which answers with an error for work that half happened.
+    """
+    path = workspace_settings_file(workspace)
+    if not path.exists():
+        return ""
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as e:
+        return f"it is not valid YAML: {e}"
+    if loaded is not None and not isinstance(loaded, dict):
+        return "it is not a mapping"
+    return ""
+
+
 def _merge_settings(
     settings_path: Path, updates: dict[str, Any], shadowed: list[str],
 ) -> SettingsOutcome:
