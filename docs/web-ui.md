@@ -153,25 +153,43 @@ apart, so it is not shown everywhere an id exists:
   agent glyph.
 - **The chat header** names the creator of the open session whenever there is
   one, without waiting for a second person: it describes one session, so it is
-  an answer rather than a repetition. It hides below the `md` breakpoint, like
-  the backend and model chips beside it.
+  an answer rather than a repetition. Below the `md` breakpoint it sheds its
+  *text* rather than itself — a glyph carries it, and the name stays in the
+  accessibility tree and in the tooltip — because on a phone this is the only
+  place a shared session's owner can be read, the list being behind a drawer.
+
+**Your own messages.** A message you have just sent exists in your transcript
+before it exists anywhere else, and the server excludes you from its own echo,
+so the app stamps it with your actor id as it is created. Without that, a fresh
+two-tab exchange leaves each tab holding one attributed message and one
+unattributed one, which reads as a single person and suppresses every label on
+both sides. The id comes from `/api/accounts` (`is_self` → `actor_id`), read
+once per session and cleared on logout. A caller with no account row gets no
+id, which is the ordinary unattributed path.
 
 **The null rule.** `actor_id` and `created_by_actor_id` are frequently `null`,
 and `null` renders *exactly* as the UI did before attribution existed: no chip,
 no placeholder, no "unknown user". That covers every assistant and tool row
 (their authorship is their role), everything recorded before the columns
-existed, and the optimistic bubble of a message you have just sent, which has no
-id until the server's copy comes back.
+existed, and any message sent while the signed-in actor could not be read.
 
 **Names are snapshots.** An actor with no display name, and an id this instance
 does not know, both read `Unnamed account`; the raw id is in the tooltip, never
 in the label. The agent's own principal reads `Nerve` with a bot glyph and a
-tooltip saying it is scheduled or autonomous work. The map is re-read once per
-app session, again when an id it has not seen appears (somebody added in another
-tab), and again after every mutation on `/accounts` — which is what makes a
-rename show up in the chat without a reload. An id that a completed read did not
-know is never requested again, so history pointing at an actor this instance has
-never had costs one request rather than one per render.
+tooltip saying it is scheduled or autonomous work. Display names are not
+identity and two people can share one, so when two actors would render the same
+label both get a short, stable slice of their own id appended — `Alex (0000ab)`
+— in the label itself rather than only the tooltip, since a phone has no hover.
+
+The map is re-read once per app session, again when an id it has not seen
+appears (somebody added in another tab, including one that appears *while* a
+lookup is in flight), and again after every mutation on `/accounts` — which is
+what makes a rename show up in the chat without a reload. An id that a completed
+read did not know is never requested again, so history pointing at an actor this
+instance has never had costs one request rather than one per render. Responses
+commit only if they are still current, so a lookup that was already on the wire
+cannot repopulate the map after a logout, and two overlapping re-reads cannot
+land the older snapshot last.
 
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
