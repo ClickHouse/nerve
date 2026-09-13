@@ -56,20 +56,30 @@ class TestLocality:
 
         A caller-supplied header that can turn a remote request into a local
         one defeats the whole thing, so the absence is worth pinning rather
-        than assuming. Comments and every string literal are removed first —
-        the module explains at length *why* it ignores ``X-Forwarded-For``,
-        and a check that could not tell prose from code would either fail on
-        the explanation or have to stop looking for the word.
+        than assuming. Docstrings are blanked first and comments are dropped by
+        the parse — the module explains at length *why* it ignores
+        ``X-Forwarded-For``, and a check that could not tell prose from code
+        would fail on the explanation. String literals in *code* are kept,
+        because ``scope.get("headers")`` is exactly the shape being refused.
         """
         import ast
 
         tree = ast.parse(Path(setup_token.__file__).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                node.value = ""
-        code = ast.unparse(tree)
-        assert "headers" not in code
-        assert "request" not in code, "the guard reads a scope, never a Request"
+            if not isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                continue
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                first.value.value = ""
+        code = ast.unparse(tree).lower()
+        for forbidden in ("header", "forwarded", "real-ip", "request."):
+            assert forbidden not in code, forbidden
 
     def test_a_local_peer_needs_no_token_unless_configuration_says_so(self):
         relaxed = NerveConfig(auth=AuthConfig())
@@ -95,6 +105,14 @@ class TestComparison:
         assert setup_token.token_accepted("", "") is False
         assert setup_token.token_accepted(None, "") is False
         assert setup_token.token_accepted("anything", "") is False
+
+    def test_not_even_the_decoy_it_compares_against(self, monkeypatch):
+        """The comparison still happens when nothing is stored, so a refusal
+        costs the same either way — and the decoy it compares against must not
+        become a password. Unguessable in practice (it is random per process);
+        checked anyway, because "unguessable" is not "cannot match"."""
+        monkeypatch.setattr(setup_token, "_DECOY_TOKEN", "a-synthetic-decoy")
+        assert setup_token.token_accepted("a-synthetic-decoy", "") is False
 
     def test_only_the_exact_token_matches(self):
         assert setup_token.token_accepted("abc", "abc") is True
