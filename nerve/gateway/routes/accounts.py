@@ -239,8 +239,23 @@ async def update_account(
 
     This is also how the account an upgrade created — which has no username —
     gets one, which it must before a second account can exist.
+
+    **Refused while the instance is unclaimed** (PR 6's claim cutover): a
+    passwordless install mints a session for anybody, so this is the one
+    account mutation a stranger could otherwise reach — the others are already
+    refused by the passwordless guard, the last-account guard or the
+    first-password rule. The claim sets the first username and password
+    together, which is what makes it the one door.
     """
     db = get_deps().db
+    config = get_config()
+    if instance_is_passwordless(await db.login_state(), config):
+        raise HTTPException(
+            status_code=409,
+            detail="This instance has not been claimed yet. Give the account "
+                   "its username and password together through the setup "
+                   "wizard (POST /api/setup/claim).",
+        )
     account = await db.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
