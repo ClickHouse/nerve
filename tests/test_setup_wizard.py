@@ -919,6 +919,94 @@ class TestAnInFlightRequestCannotOutliveTheClaim:
         account = await install.db.get_account(install.owner_id)
         assert account["enabled"] is True
 
+    SETUP_MUTATIONS = [
+        ("put", "/api/setup/provider", {"anthropic_api_key": _ANTHROPIC_KEY}),
+        ("put", "/api/setup/profile", {"timezone": "Europe/Berlin"}),
+        ("put", "/api/setup/profile", {"display_name": "Mallory"}),
+        ("put", "/api/setup/channels", {"telegram_bot_token": _TELEGRAM_TOKEN}),
+        ("put", "/api/setup/automation", {"crons": ["inbox-processor"]}),
+        ("post", "/api/setup/steps/channels/skip", None),
+        ("post", "/api/setup/steps/channels/unskip", None),
+        ("post", "/api/system/restart", None),
+    ]
+
+    @pytest.mark.parametrize("method,path,body", SETUP_MUTATIONS)
+    async def test_a_setup_write_admitted_before_the_claim_is_refused(
+        self, install, monkeypatch, method, path, body,
+    ):
+        """"The instance is claimed now" is not the same question as "you were
+        allowed to ask".
+
+        The claim commits *after* this request's credential was accepted and
+        before its write — the only window that matters, since a request that
+        starts later is refused at the door by the epoch on its token. Without
+        the revalidation the handler sees a claimed instance, decides the
+        caller is signed in, and writes as the person it just locked out.
+        """
+        visitor = install.session_token()
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
+        monkeypatch.setattr(
+            setup_routes.daemon, "restart_daemon",
+            lambda *a, **k: pytest.fail("a stale session restarted the daemon"),
+        )
+        before = {
+            p: p.read_text(encoding="utf-8")
+            for p in (
+                install.config_local, install.config_yaml,
+                install.settings, install.system_crons,
+            )
+        }
+
+        fired: list[bool] = []
+        original = install.db.login_state
+
+        async def _claim_in_the_window(*args, **kwargs):
+            # Guarded before awaiting: the claim reads this too.
+            if not fired:
+                fired.append(True)
+                response = await _claim(install)
+                assert response.status_code == 200, response.text
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(install.db, "login_state", _claim_in_the_window)
+
+        async with _client(install.app, token=visitor) as http:
+            call = getattr(http, method)
+            answered = await (
+                call(path, json=body) if body is not None else call(path)
+            )
+        assert fired, "the claim never ran inside the window"
+        assert answered.status_code in (401, 409), (path, answered.text)
+        for path_on_disk, text in before.items():
+            assert path_on_disk.read_text(encoding="utf-8") == text, path_on_disk
+
+    async def test_a_display_name_patch_admitted_before_the_claim_is_refused(
+        self, install, monkeypatch,
+    ):
+        """The rename that would overwrite the claimer's own name."""
+        visitor = install.session_token()
+        fired: list[bool] = []
+        original = install.db.login_state
+
+        async def _claim_in_the_window(*args, **kwargs):
+            if not fired:
+                fired.append(True)
+                response = await _claim(install, body={"display_name": "Alice Example"})
+                assert response.status_code == 200, response.text
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(install.db, "login_state", _claim_in_the_window)
+
+        async with _client(install.app, token=visitor) as http:
+            answered = await http.patch(
+                f"/api/accounts/{install.owner_id}",
+                json={"display_name": "Mallory"},
+            )
+        assert fired, "the claim never ran inside the window"
+        assert answered.status_code in (401, 409), answered.text
+        ref = await install.db.get_actor_ref(await install.owner_actor_id())
+        assert ref["display_name"] == "Alice Example"
+
     async def test_the_claimer_can_do_all_of_it(self, claimed):
         """The cutover refuses *stale* sessions, not every session: the person
         who claimed the instance is at the current epoch and unaffected."""

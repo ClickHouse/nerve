@@ -276,9 +276,18 @@ async def update_account(
             raise HTTPException(status_code=404, detail="Account not found")
 
     if req.display_name is not None:
-        await db.update_actor_profile(
-            account["actor_id"], display_name=(req.display_name.strip() or None),
-        )
+        try:
+            await db.update_actor_profile(
+                account["actor_id"],
+                display_name=(req.display_name.strip() or None),
+                # Checked inside the write's own transaction, like every other
+                # account mutation: a rename authorised before a claim must not
+                # land after it, least of all over the claimer's own name.
+                acting_account_id=actor.account_id,
+                acting_session_epoch=actor.session_epoch,
+            )
+        except StaleSessionError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
     return await _render(db, account)
 
 
@@ -301,7 +310,7 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
             acting_account_id=actor.account_id,
             acting_session_epoch=actor.session_epoch,
         )
-    except LastAccountError as e:
+    except (LastAccountError, StaleSessionError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -313,11 +322,14 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 async def enable_account(account_id: str, actor: Actor = Depends(require_account)):
     """Re-enable an account. Idempotent."""
     db = get_deps().db
-    account = await db.enable_account(
-        account_id,
-        acting_account_id=actor.account_id,
-        acting_session_epoch=actor.session_epoch,
-    )
+    try:
+        account = await db.enable_account(
+            account_id,
+            acting_account_id=actor.account_id,
+            acting_session_epoch=actor.session_epoch,
+        )
+    except StaleSessionError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s enabled by account %s", account_id, actor.account_id)
@@ -384,6 +396,10 @@ async def change_own_password(
             # now has one, and the write would hand the instance back.
             expected_session_epoch=actor.session_epoch,
         )
+    except _CONFLICT as e:
+        # A stale session is a fact about the *instance* (it was claimed under
+        # this request), not about the password in the body.
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if updated is None:  # pragma: no cover - removed between two reads
