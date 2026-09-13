@@ -1,6 +1,7 @@
 """Shared test fixtures for Nerve tests."""
 
 import asyncio
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -76,6 +77,65 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
     _repoint_import_time_state_paths(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _unpin_jwt_secret():
+    """Forget the signing secret pinned to this process.
+
+    Startup pins the effective secret once for the life of the daemon; in the
+    suite each test is its own "process", so a test that bootstraps an
+    identity (or pins a secret directly) must not leave it pinned for the
+    tests after it.
+    """
+    from nerve.gateway.auth import unpin_jwt_secret
+
+    unpin_jwt_secret()
+    yield
+    unpin_jwt_secret()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _deterministic_umask():
+    """Run the suite under umask 022, whatever the developer's shell has.
+
+    ``Database.connect`` refuses — unrepaired — to open a state directory that
+    other users can write to. A umask of 002 (Ubuntu's default with
+    user-private groups) makes every plain ``mkdir()`` in a test fixture a
+    0775, group-writable directory: a hazard the policy is right to refuse,
+    but not what those fixtures are about. Production never depends on the
+    umask (Nerve creates its state directory 0700 explicitly, see
+    ``paths.ensure_nerve_home``); the tests that *are* about the umask set
+    their own inside the test.
+    """
+    old = os.umask(0o022)
+    yield
+    os.umask(old)
+
+
+@pytest.fixture
+def bypass_auth():
+    """Install a stand-in for ``require_auth`` on a test app.
+
+    There is no unauthenticated mode: with no signing secret in force every
+    auth check fails closed. Route tests that are not about authentication
+    therefore override the dependency on the app they build instead of
+    relying on an empty ``auth.jwt_secret``. Yields a function taking the app
+    (returns it, for chaining). Auth tests must not use it — they exercise the
+    real dependency with real tokens.
+    """
+    from nerve.gateway.auth import require_auth
+
+    apps = []
+
+    def _bypass(app):
+        app.dependency_overrides[require_auth] = lambda: {"sub": "user"}
+        apps.append(app)
+        return app
+
+    yield _bypass
+    for app in apps:
+        app.dependency_overrides.pop(require_auth, None)
 
 
 @pytest.fixture

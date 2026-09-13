@@ -413,6 +413,51 @@ _UNRESOLVED_REF = "${"
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
 
+def _require_auth_mapping(value: Any, where: str) -> None:
+    """Refuse an ``auth`` section that is present but not a mapping.
+
+    A malformed ``auth:`` (a string, a list, a number) must never be read as
+    "no auth" — replacing it with an empty mapping would turn a broken or
+    tampered configuration push into a passwordless instance, the exact
+    downgrade 0.1 forbids. It is a hard error, at load and in validation.
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigError(
+            f"auth in {where} must be a mapping of settings, got "
+            f"{type(value).__name__} {value!r}. A malformed auth section is refused "
+            f"rather than read as 'no authentication'."
+        )
+
+
+def _normalise_layer_auth(layer: dict[str, Any], where: str) -> dict[str, Any]:
+    """Validate and normalise one layer's ``auth`` section *before* any merge.
+
+    Two things, in the only place where the second one is safe:
+
+    * a present, non-mapping ``auth`` is refused (:func:`_require_auth_mapping`);
+    * a present **null** ``auth:`` becomes the empty mapping.
+
+    The second is what keeps a bare ``auth:`` line a no-op overlay. Left as
+    ``None`` it is not a mapping, so :func:`_deep_merge` *replaces* the section
+    below it rather than merging into it: an ``auth:`` typed into
+    ``config.local.yaml`` (or left behind by hand-editing or by scrubbing
+    secrets out of a file) would erase a tracked ``password_hash`` and
+    ``jwt_secret`` and leave a passwordless instance — the silent downgrade 0.1
+    forbids. Normalised per layer, an empty section overlays nothing and every
+    key underneath survives.
+
+    Only ``auth`` is treated this way. Every other section keeps the merge
+    semantics it has always had, where a null overlay clears what is below it;
+    ``auth`` is singled out because it is the one section whose disappearance
+    *weakens* the instance instead of resetting it to a default.
+
+    Mutates and returns ``layer``.
+    """
+    _require_auth_mapping(layer.get("auth"), where)
+    if "auth" in layer and layer["auth"] is None:
+        layer["auth"] = {}
+    return layer
+
 
 def lockdown_anchor() -> bool:
     """Whether the environment forces this instance into lockdown.
@@ -625,6 +670,12 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     """
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
+    # Each layer's ``auth`` is judged and normalised *before* merging: a deep
+    # merge would otherwise let a well-formed machine section silently replace a
+    # broken tracked one (and the tracked layer is exactly what a push
+    # delivers), or let a bare ``auth:`` replace the credentials underneath it.
+    _normalise_layer_auth(base, "config.yaml")
+    _normalise_layer_auth(local, "config.local.yaml")
 
     machine = _deep_merge(base, local)
     # An env-anchored instance takes its workspace from the environment too, so
@@ -648,6 +699,7 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
+    _normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
 
     # Lockdown is owned by the *tracked* settings file only, so a local edit to
     # config.yaml/config.local.yaml can't unlock (or fake-lock) an instance — the
@@ -1923,6 +1975,11 @@ class RetentionConfig:
 @dataclass
 class AuthConfig:
     password_hash: str = ""
+    # Signing secret for session tokens. Optional: when unset, one is generated
+    # on first start and kept in nerve.db (see nerve.migrate.ensure_jwt_secret);
+    # a configured value always wins over the stored one. Consumers read the
+    # resolved value through nerve.gateway.auth.effective_jwt_secret(), never
+    # this field directly.
     jwt_secret: str = ""
     # Web-session lifetime. This is an *idle* timeout, not a cap on a working
     # session: the gateway slides the token forward on every authenticated
@@ -2960,7 +3017,7 @@ def write_config_pointer(config_dir: Path) -> None:
     """
     pointer = paths.config_pointer_file()
     try:
-        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # the state dir, owner-only
         pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
     except OSError as e:
         logger.warning("Could not write config pointer %s: %s", pointer, e)
@@ -3352,14 +3409,20 @@ def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
         return False
     users.append(user_id)
 
-    with open(local_path, "w", encoding="utf-8") as f:
-        f.write("# Nerve — Secrets (gitignored)\n")
-        f.write("# API keys, tokens, and other sensitive configuration.\n\n")
-        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-    try:
-        os.chmod(local_path, 0o600)
-    except OSError:
-        pass
+    # Rewritten through the owner-only writer: the file it is rewriting holds
+    # the signing secret and the password hash, and a plain write followed by a
+    # chmod would republish both at the umask's mode in between. A filesystem
+    # that will not keep it private gets nothing written, and
+    # ``paths.InsecureFileError`` **propagates**: this function's ``False``
+    # already means "the id was already there", and folding a failure into it
+    # is how a caller ends up telling someone they are paired when nothing was
+    # saved. An exception is the one result a caller cannot ignore by accident.
+    paths.write_private_text(
+        local_path,
+        "# Nerve — Secrets (gitignored)\n"
+        "# API keys, tokens, and other sensitive configuration.\n\n"
+        + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+    )
     logger.info("Persisted Telegram user %d to %s", user_id, local_path)
     return True
 

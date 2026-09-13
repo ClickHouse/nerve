@@ -236,6 +236,29 @@ class TestAppendTelegramAllowedUser:
         mode = stat.S_IMODE(os.stat(tmp_path / "config.local.yaml").st_mode)
         assert mode == 0o600
 
+    def test_it_raises_rather_than_rewrite_the_secrets_file_wide(
+        self, tmp_path, monkeypatch,
+    ):
+        """F25/F29: the file it rewrites holds the password hash and the
+        signing secret. On a filesystem that will not keep it owner-only
+        nothing is written — and the failure *raises* rather than becoming the
+        ``False`` that means "this id was already there", which a caller can
+        (and did) mistake for success."""
+        from nerve import paths as paths_mod
+
+        (tmp_path / "config.local.yaml").write_text(
+            "auth:\n  password_hash: keep-me\ntelegram:\n  bot_token: '1:x'\n"
+        )
+        os.chmod(tmp_path / "config.local.yaml", 0o600)
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+
+        with pytest.raises(paths_mod.InsecureFileError):
+            append_telegram_allowed_user(tmp_path, 42)
+        data = yaml.safe_load((tmp_path / "config.local.yaml").read_text())
+        assert data["auth"]["password_hash"] == "keep-me"  # untouched
+        assert "allowed_users" not in data.get("telegram", {})
+        assert not (tmp_path / "config.local.yaml.tmp").exists()
+
 
 class TestModelDefaultsAndAliases:
     def test_default_model_is_opus_5(self):

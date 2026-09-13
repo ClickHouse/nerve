@@ -14,9 +14,9 @@ Nothing reloads on its own. A reload happens when an operator asks for one
 change. Editing a config file on the box does not apply itself.
 
 Restart-only (NOT reloaded here): the gateway socket (host/port/SSL), the
-Telegram bot's token and allow-list, the MCP endpoint (including the
-``auth.jwt_secret`` it checks ``/mcp/v1`` against, which the web gateway reads
-per request), Langfuse, the memory bridges, the Codex thread-sync service
+Telegram bot's token and allow-list, the MCP endpoint, the signing secret
+(``auth.jwt_secret`` is pinned at startup for every consumer, web gateway and
+MCP endpoint alike — see :mod:`nerve.gateway.auth`), Langfuse, the memory bridges, the Codex thread-sync service
 (``sync.codex.*`` — a different service from the cron sources under ``sync.*``,
 and the one place those two names diverge), anything a service derived from
 config at construction, and a background loop that was never started because its

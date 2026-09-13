@@ -305,10 +305,11 @@ class TestHttpReviseRoute:
     to the right status codes and dispatches the same plan_update prompt."""
 
     @pytest_asyncio.fixture
-    async def app_setup(self, db: Database, tmp_path):
+    async def app_setup(self, db: Database, tmp_path, bypass_auth):
         """Build a minimal FastAPI app wired to a fake engine + this DB.
 
-        We bypass auth (no jwt_secret) and use TestClient for sync HTTP.
+        Auth is overridden on the app (these routes are not about it) and
+        TestClient gives sync HTTP.
         """
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -317,12 +318,9 @@ class TestHttpReviseRoute:
         from nerve.gateway.routes._deps import init_deps
         from nerve.gateway.routes.plans import router as plans_router
 
-        # Auth dependency reads get_config().auth.jwt_secret — set up a
-        # config with no secret so require_auth is a no-op.
         import nerve.config as cfg_mod
         cfg = NerveConfig()
         cfg.workspace = tmp_path
-        cfg.auth.jwt_secret = ""
         cfg_mod._config = cfg
 
         engine, task_id = await _setup(db, tmp_path)
@@ -330,6 +328,7 @@ class TestHttpReviseRoute:
 
         app = FastAPI()
         app.include_router(plans_router)
+        bypass_auth(app)
         client = TestClient(app)
 
         yield SimpleNamespace(client=client, engine=engine, db=db, task_id=task_id)

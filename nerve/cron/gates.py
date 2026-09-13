@@ -526,6 +526,7 @@ class GitHubPrActivityGate(CronGate):
     def _state_path(self, job_id: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in job_id)
         d = paths.cache_dir()
+        paths.ensure_nerve_home()  # cache_dir is under the state dir; never create it wide
         d.mkdir(parents=True, exist_ok=True)
         return d / f"pr_activity_{safe}.json"
 

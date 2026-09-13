@@ -1672,6 +1672,7 @@ class MemUBridge:
                 }
 
             resources_dir = paths.nerve_path("memu-resources")
+            paths.ensure_nerve_home()  # never create the state dir with a default mode
             resources_dir.mkdir(parents=True, exist_ok=True)
 
             # Fast model for category summaries and date resolution (Haiku).
@@ -2621,6 +2622,7 @@ class MemUBridge:
         def _write_conversation() -> int:
             """JSON-encode and write the conversation (off the event loop —
             10K messages serialize to multiple MB)."""
+            paths.ensure_nerve_home()
             conv_dir.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(entries, ensure_ascii=False)
             conv_path.write_text(payload, encoding="utf-8")

@@ -25,6 +25,7 @@ Keep this module dependency-free (only ``os``/``pathlib``) so that
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 # Environment override for the machine-local state directory.
@@ -169,3 +170,109 @@ def default_workspace() -> Path:
     workspace is configurable via ``config.workspace``.
     """
     return Path.home() / "nerve-workspace"
+
+
+def ensure_nerve_home() -> Path:
+    """Create the state directory if it does not exist, owner-only, and return it.
+
+    ``nerve.db`` lives here with the accounts and possibly the signing secret,
+    and :meth:`nerve.db.Database.connect` refuses to open a state directory
+    other users can write to. Creating it ``0700`` — the mode is applied by
+    ``mkdir`` itself, so there is no wider window and the umask can only
+    remove bits — means a directory Nerve created never trips that refusal
+    (a umask of ``002``, common on Ubuntu, would otherwise leave it ``0775``).
+    An existing directory is left as found: judging it is ``connect()``'s job.
+    """
+    home = nerve_home()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return home
+
+
+# Mode for a file that carries a credential: owner read/write, nothing else.
+SECRET_FILE_MODE = 0o600
+
+
+class InsecureFileError(RuntimeError):
+    """A credential-bearing file could not be created owner-only.
+
+    Raised by :func:`write_private_text` *before* any content is written, so
+    nothing secret reaches a file other users could read. Not an ``OSError``
+    subclass on purpose: the generic ``except OSError`` a writer wraps its I/O
+    in must not be able to swallow this one.
+    """
+
+
+def _mode_is_private(st_mode: int) -> bool:
+    """True when a stat mode carries no group/world permission bit."""
+    return (stat.S_IMODE(st_mode) & 0o077) == 0
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` as a file only its owner can read.
+
+    ``config.local.yaml`` carries the signing secret, the password hash and
+    every API key the wizard collected, so it must not exist at a wider mode —
+    not even for the moment between a plain write and a ``chmod``, which is how
+    it used to be produced.
+
+    The order is the one the state-file policy requires everywhere:
+
+    1. create a temporary with ``O_CREAT|O_EXCL`` at ``0600``;
+    2. ``fstat`` **that descriptor** — before a single byte is written. A
+       filesystem that accepted the mode and ignored it is caught while the
+       file is still empty, and :class:`InsecureFileError` is raised with
+       nothing written and nothing left behind;
+    3. write through the descriptor, flush, fsync;
+    4. confirm the path still names the file just written — comparing device
+       and inode against the descriptor, so a temporary swapped for a symlink
+       cannot be what gets published — then rename it into place.
+
+    The destination is therefore owner-only from its first byte, readers never
+    see a half-written file, and a caller that cannot write privately learns it
+    by exception rather than by a flag it might ignore. ``OSError`` from the
+    write itself propagates, exactly as the plain write this replaced did.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    # O_EXCL already refuses a name that exists; O_NOFOLLOW says the same about
+    # a symlink out loud, so the create can never be redirected.
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        SECRET_FILE_MODE,
+    )
+    try:
+        st = os.fstat(fd)
+        if not _mode_is_private(st.st_mode):
+            raise InsecureFileError(
+                f"{path} cannot be created owner-only ({SECRET_FILE_MODE:04o}): the "
+                f"filesystem reports mode {stat.S_IMODE(st.st_mode):04o} on a file "
+                f"just created with it. Nothing was written. It holds credentials, so "
+                f"it is not written at a mode other users can read — put the "
+                f"configuration on a filesystem with Unix permissions, or keep the "
+                f"secrets in the environment and reference them as ${{VAR}}."
+            )
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # Publication is by name, so prove the name still refers to what was
+        # written: another user who replaced the temporary with a symlink
+        # between the create and the rename would otherwise have that symlink
+        # renamed into place.
+        current = os.stat(tmp, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino):
+            raise InsecureFileError(
+                f"{tmp} was replaced while it was being written; refusing to install "
+                f"it as {path}. Nothing was published."
+            )
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # never mask the failure being raised
+        raise
+    finally:
+        os.close(fd)

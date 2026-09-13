@@ -2,8 +2,8 @@
 
 Exercises :func:`nerve.mcp_server.auth.authenticate_mcp` directly: it
 should pass valid bearer tokens, reject missing/invalid ones, accept
-the ``?token=`` query-param form, and bypass entirely when no
-``jwt_secret`` is configured (dev mode).
+the ``?token=`` query-param form, and refuse everything when no signing
+secret is in force (there is no dev mode).
 """
 
 from __future__ import annotations
@@ -36,14 +36,21 @@ def auth_config() -> NerveConfig:
 
 
 @pytest.fixture
-def dev_config() -> NerveConfig:
+def no_secret_config() -> NerveConfig:
     return NerveConfig(auth=AuthConfig(jwt_secret=""))
 
 
-def test_dev_mode_bypasses_auth(dev_config):
-    # No headers, no query — dev mode should still pass.
-    result = authenticate_mcp(_scope(), dev_config)
-    assert result is None
+def test_no_secret_in_force_fails_closed(no_secret_config):
+    """There is no dev mode: with nothing configured and nothing pinned the
+    endpoint refuses, token or no token."""
+    with pytest.raises(McpAuthError, match="No signing secret"):
+        authenticate_mcp(_scope(), no_secret_config)
+    # Padded so PyJWT's short-key warning stays out of the run; the token is
+    # only there to be refused.
+    token = create_token("a-secret-nothing-is-pinned-to-padded-to-32b")
+    headers = [(b"authorization", f"Bearer {token}".encode())]
+    with pytest.raises(McpAuthError, match="No signing secret"):
+        authenticate_mcp(_scope(headers=headers), no_secret_config)
 
 
 def test_missing_token_raises(auth_config):

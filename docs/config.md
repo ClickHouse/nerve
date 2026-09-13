@@ -238,7 +238,7 @@ A reload is always explicit. Two things cause one:
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | ✅ read per request. Only the gateway's own auth: the MCP endpoint checks `/mcp/v1` against the `auth.jwt_secret` it was mounted with, so rotating that secret is half-hot (see the restart table). `auth.jwt_expiry_hours` governs tokens minted *after* the reload; already-issued tokens keep the window they were signed with until they next slide |
+| Web gateway auth (`auth.*`) | partly. `auth.password_hash` and `auth.jwt_expiry_hours` are read per login/request and follow a reload (`jwt_expiry_hours` governs tokens minted *after* it; already-issued tokens keep the window they were signed with until they next slide). `auth.jwt_secret` is pinned at startup for the web gateway and MCP endpoint (see the restart table) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -280,7 +280,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
-| `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
+| `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
@@ -303,20 +303,22 @@ as a warning: nothing failed, but the new value is not live yet.
 With no daemon running there is nothing to reload and the command says so. Config
 is read fresh at startup, so `nerve start` already picks the edit up.
 
-It authenticates the way the gateway asks to be authenticated, which depends on
-`auth.jwt_secret` in the config it just read:
+It authenticates with the same signing secret the daemon pinned at startup (see
+[Accounts and identity](accounts.md)):
 
-- **Set** → it signs a token with it. If that is not the secret the running daemon
-  started with, the gateway rejects the request and only a restart resolves it.
-- **Empty, unlocked** → the gateway is in dev mode and does not ask for a token
-  (`require_auth` runs open), so the call goes unauthenticated.
-- **Empty, locked** → refused before anything is sent. A locked gateway never takes
-  the open path, so no request from that shell can be authenticated. If the secret
-  comes from `${ENV_VAR}`, export it in that shell too.
+- **`auth.jwt_secret` set** → it signs a token with it. If that is not the secret
+  the running daemon started with — the key was changed in config without a
+  restart — the gateway rejects the request and only a restart resolves it.
+- **Unset** → it signs with the secret the daemon generated into `nerve.db` on its
+  first start; this shell is on the same box, so it reads it from there. With no
+  secret anywhere the daemon has never started, and the command refuses before
+  sending anything: the gateway takes no unauthenticated request, locked or not.
+  If the secret is meant to come from `${ENV_VAR}`, export it in that shell too.
 
-`auth.password_hash` is not an alternative here. It gates the browser login, which
-is what mints a token from it; `require_auth` reads `auth.jwt_secret` alone, so a
-password neither makes the endpoint ask for a token nor gives the CLI one to sign.
+`auth.password_hash` is not an alternative here. It gates the browser login,
+which is what mints a token from it; request authentication uses the effective
+startup-pinned signing secret, so a password neither replaces the token nor
+gives the CLI one to sign.
 
 `POST /api/config/sync` runs the same reload but scores it differently, because it
 answers a different question. Its `ok` is about the *merge*: true once the merged
@@ -609,10 +611,12 @@ referenced from `settings.yaml` before you lock the box. The usual ones:
 `auth.jwt_secret`, `auth.password_hash`, `telegram.bot_token`,
 `anthropic_api_key`/`openai_api_key`, `xmemory.api_key`.
 
-`auth.jwt_secret` is the one to get right. A locked instance that ends up without
-it does not fall back to the unauthenticated dev mode an unlocked box would — the
-gateway refuses every request with a 503 and websockets are declined — so the box
-comes up unusable rather than open. Note also that a `${VAR}` left unresolved
+`auth.jwt_secret` is worth getting right even though it is no longer required. A
+locked instance that ends up without it neither runs open nor refuses every
+request: it generates a signing secret on its first start and keeps it in
+`nerve.db` — machine-local state, not configuration (see
+[Accounts and identity](accounts.md)). Supplying it from the fleet lets you rotate
+it centrally; leaving it out gives each box its own. Note also that a `${VAR}` left unresolved
 survives as its literal text, which is a perfectly usable signing key and one
 published in the config repo, so check that the variable is actually set on the box.
 
@@ -1230,8 +1234,8 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auth.password_hash` | string | - | bcrypt hash for login |
-| `auth.jwt_secret` | string | - | JWT signing secret |
+| `auth.password_hash` | string | - | bcrypt hash for login. Unset means passwordless: every caller who can reach the gateway acts as the owner, which is only sensible on a loopback or otherwise private bind |
+| `auth.jwt_secret` | string | - | JWT signing secret. Optional: when unset, one is generated on first start and kept in `nerve.db` (never written into a config file). A configured value wins at startup and **retires** any stored one, so setting it later rotates the secret at the next restart (every tab logs in once) and the old stored key can never come back into force. Pinned for the life of the process — a reload cannot change or remove it (see the restart table). A generated secret is only ever kept in a database readable by this user alone: if `nerve.db` cannot be made `0600` (a filesystem without modes), startup refuses to generate one, and setting `auth.jwt_secret` here or in the environment is the way through — nothing secret is then stored in the database. See [Accounts and identity](accounts.md) |
 
 ## API Keys (config.local.yaml)
 

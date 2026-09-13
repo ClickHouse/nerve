@@ -64,7 +64,7 @@ class FakeSessionManager:
 
 
 @pytest_asyncio.fixture
-async def setup(db: Database, tmp_path):
+async def setup(db: Database, tmp_path, bypass_auth):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -75,7 +75,6 @@ async def setup(db: Database, tmp_path):
 
     cfg = NerveConfig()
     cfg.workspace = tmp_path
-    cfg.auth.jwt_secret = ""  # require_auth becomes a no-op
     cfg_mod._config = cfg
 
     engine = SimpleNamespace(
@@ -90,6 +89,7 @@ async def setup(db: Database, tmp_path):
 
     app = FastAPI()
     app.include_router(sessions_router)
+    bypass_auth(app)  # these routes are not about auth
     yield SimpleNamespace(client=TestClient(app), db=db)
 
     cfg_mod._config = None

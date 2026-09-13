@@ -96,9 +96,14 @@ class TestAuthenticateMcp:
         with pytest.raises(McpAuthError):
             authenticate_mcp(_scope("garbage"), cfg)
 
-    def test_dev_mode_bypass(self, tmp_path):
+    def test_no_secret_in_force_fails_closed(self, tmp_path):
+        """There is no dev mode: nothing configured and nothing pinned means
+        the endpoint refuses, with or without a token."""
         cfg = self._config(tmp_path, "")
-        assert authenticate_mcp(_scope(None), cfg) is None
+        with pytest.raises(McpAuthError, match="No signing secret"):
+            authenticate_mcp(_scope(None), cfg)
+        with pytest.raises(McpAuthError, match="No signing secret"):
+            authenticate_mcp(_scope("garbage"), cfg)
 
 
 class TestCtxBinding:
