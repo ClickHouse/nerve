@@ -20,34 +20,14 @@ JWT_SECRET_NAME = "jwt_secret"
 _UNSET = object()
 
 
-# --------------------------------------------------------------------------- #
-#  Usernames                                                                   #
-# --------------------------------------------------------------------------- #
-#
-# A username is a *lookup key*, never an identity (0.7): ``actor_refs.id`` is
-# the identity, and renaming an account changes what it logs in as and what is
-# displayed without moving one byte of stored authorship.
-
-# Two to thirty-two characters, starting with a letter or a digit, then letters,
-# digits, dot, underscore or hyphen. ASCII only and stored lower-cased, which is
-# what makes the case-insensitive uniqueness complete: SQLite's NOCASE collation
-# folds ASCII and nothing else, so a charset with no non-ASCII letters in it
-# leaves no room for a unicode look-alike to sit beside an existing name.
+# Usernames are mutable lookup keys, never actor identities. ASCII-only storage
+# makes SQLite's NOCASE uniqueness complete.
 USERNAME_PATTERN = r"^[a-z0-9][a-z0-9._-]{1,31}$"
 _USERNAME_RE = re.compile(USERNAME_PATTERN)
 USERNAME_MIN_LENGTH = 2
 USERNAME_MAX_LENGTH = 32
 
-# Names that must never become a login.
-#
-# ``user`` is the load-bearing one: PR 2 grandfathers web sessions minted before
-# per-account logins, whose subject is the literal string ``user``
-# (``nerve.gateway.auth.LEGACY_SUBJECT``), so allowing it as a username would
-# let a person's name collide with a token subject while that clause lives.
-# ``agent-system``/``backend-agent``/``external-agent-mcp`` are the other token
-# subjects, reserved for the same reason. ``me`` is a path segment
-# (``/api/accounts/me``). The rest read as an authority this model does not have
-# (0.4: every account has full permissions) and would mislead.
+# Token subjects and authority-like/path names must not become logins.
 RESERVED_USERNAMES = frozenset({
     "user",
     "admin",
@@ -78,50 +58,23 @@ class UsernameTakenError(AccountError):
 
 
 class PasswordlessInstanceError(AccountError):
-    """A second account cannot exist while the first one has no password (0.5).
-
-    Passwordless admits every caller as the one account. With two accounts that
-    is not a weaker login, it is an unanswerable question: nothing distinguishes
-    the callers, so every one of them would be whoever the code picked.
-    """
+    """A second account cannot exist while the first has no password."""
 
 
 class UnnamedAccountError(AccountError):
-    """An existing account has no username, so a second one cannot be told apart.
-
-    The account an upgrade creates has ``username IS NULL`` on purpose — nothing
-    needed one while password-only login was unambiguous. The moment a second
-    account exists it does, and an account with no username cannot be logged
-    into at all.
-    """
+    """An existing account needs a username before a second can exist."""
 
 
 class NotClaimableError(AccountError):
-    """The sole-account claim found something other than one unsecured account.
-
-    Either more than one account exists, or none does, or the one that does
-    already has a password — in which case somebody has already claimed it and
-    a second claim would be taking it from them.
-    """
+    """The claim target is not exactly one unsecured account."""
 
 
 class LastAccountError(AccountError):
-    """The last enabled account cannot be disabled — that is a locked-out install.
-
-    The only guard in the model (0.4). Everything else any account may do to any
-    other account, including this, right up to the point where nobody is left.
-    """
+    """The last enabled account cannot be disabled."""
 
 
 def normalise_username(raw: str | None) -> str:
-    """Canonicalise and validate a username, or raise.
-
-    Surrounding whitespace is stripped and the result lower-cased, so
-    ``" Alice "`` and ``"alice"`` are one name rather than two that happen to
-    collide in the index. Raises :class:`InvalidUsernameError` for anything
-    outside :data:`USERNAME_PATTERN` and :class:`ReservedUsernameError` for
-    :data:`RESERVED_USERNAMES`.
-    """
+    """Strip, lower-case and validate a username, or raise."""
     if raw is None:
         raise InvalidUsernameError("A username is required")
     candidate = str(raw).strip().lower()
@@ -140,43 +93,20 @@ def normalise_username(raw: str | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class LoginState:
-    """What the instance's accounts say about how a caller may log in.
+    """Non-identifying facts shared by login and legacy-token resolution."""
 
-    The "exactly one account" predicate, stated once so the three rules bounded
-    by it cannot drift apart: grandfathered ``sub: "user"`` tokens (PR 2),
-    password-only login, and passwordless access (0.5).
-
-    Deliberately carries **no username and no credential** — it is what the
-    unauthenticated ``/api/auth/status`` descriptor is built from, so there is
-    nothing on it that must not be published.
-    """
-
-    accounts: int
     single_account: bool
-    # Exactly one account and it has no credential at all: any password is
-    # accepted and resolves to it. This is also the first-run state PR 6's
-    # wizard claims — deliberately *not* a second field, because a second field
-    # is a second thing to keep in step, and the one that existed keyed off the
-    # username as well and therefore went false when a passwordless account was
-    # merely named. A named account with no password is still an open one.
+    # A named account without a credential is still passwordless.
     passwordless: bool
     sole_account_id: str | None = None
 
 
 def login_state_from(accounts: list[dict]) -> LoginState:
-    """The login predicate over an already-fetched list of accounts.
-
-    Split out so a caller that needs the rows for something else — the login
-    route reads their work factors to calibrate its response budget — can get
-    both from one query instead of two.
-    """
+    """Build login state from rows a caller may already need for timing."""
     if len(accounts) != 1:
-        return LoginState(
-            accounts=len(accounts), single_account=False, passwordless=False,
-        )
+        return LoginState(single_account=False, passwordless=False)
     sole = accounts[0]
     return LoginState(
-        accounts=1,
         single_account=True,
         passwordless=sole["credential_source"] == "none",
         sole_account_id=sole["id"],
@@ -481,20 +411,9 @@ class AccountStore:
             raise UsernameTakenError(f"The username '{username}' is already taken") from e
         return await self.get_account(account_id)
 
-    # -- account management (PR 3) -------------------------------------------
-    #
-    # Every guard below is evaluated *inside* the transaction that acts on it,
-    # under BEGIN IMMEDIATE. A count read before a write is not a guard: two
-    # callers can both read "two enabled accounts" and both disable one.
-    #
-    # Note what is deliberately absent: there is no way to delete an account.
-    # Removal is disablement, and the row stays forever. That keeps the account
-    # count monotone, which is what stops an install that briefly had two
-    # accounts from falling back into the single-account relaxations — a
-    # grandfathered ``sub: "user"`` token would otherwise start resolving again,
-    # to whichever account happened to remain. The row is the tombstone.
-    # ``actor_refs`` rows are never deleted either (0.9): attribution written by
-    # PR 4 references them permanently.
+    # -- account management --------------------------------------------------
+    # Guards share their BEGIN IMMEDIATE transaction with the mutation. Accounts
+    # are disabled, never deleted, so single-account relaxations cannot return.
 
     async def login_state(self) -> LoginState:
         """The account-shaped facts that decide how a caller may log in.
@@ -515,26 +434,7 @@ class AccountStore:
         credential: str,
         display_name: str | None = None,
     ) -> dict:
-        """Add a person: one ``actor_refs`` row and one ``accounts`` row, atomically.
-
-        The actor and the account are created in the same transaction. Two DAL
-        calls would leave an orphaned actor behind whenever the second failed —
-        and an orphaned *human* actor is not inert: it is a row a later bug
-        could attach a login to.
-
-        Refuses, inside that transaction:
-
-        * :class:`PasswordlessInstanceError` — the instance is passwordless
-          (0.5). Set a password on the existing account first.
-        * :class:`UnnamedAccountError` — an existing account has no username,
-          so it could not be logged into once this one exists.
-        * :class:`UsernameTakenError` / :class:`InvalidUsernameError` /
-          :class:`ReservedUsernameError` — see :func:`normalise_username`.
-
-        The new account always carries its own credential (``local``): an
-        account with no password is either an open door or unreachable,
-        depending on how many accounts there are, and neither is worth creating.
-        """
+        """Atomically create a human actor and its password-bearing account."""
         username = normalise_username(username)
         if not credential:
             raise AccountError("A new account needs a password")
@@ -605,20 +505,7 @@ class AccountStore:
         username: str | object = _UNSET,
         credential: str | object = _UNSET,
     ) -> dict | None:
-        """Change what an account logs in *as* and *with*, in one transaction.
-
-        Either or both. Setting a credential moves the row to
-        ``credential_source = 'local'``, so a password set here supersedes
-        ``auth.password_hash`` for this account and the configuration value
-        stops applying to it.
-
-        Both at once is PR 6's "claim and secure" step: the sole passwordless,
-        unnamed account gets a username and a password together, so a
-        half-claimed account — named but still open, or secured but unreachable
-        — never exists, not even between two requests.
-
-        Returns the updated row, or ``None`` if there is no such account.
-        """
+        """Change a username and/or move its password to the account row."""
         sets: list[str] = []
         params: list = []
         if username is not _UNSET:
@@ -654,22 +541,7 @@ class AccountStore:
     async def replace_credential_if_unchanged(
         self, account_id: str, *, expected: str, credential: str,
     ) -> bool:
-        """Swap one stored hash for another, only if it is still the one seen.
-
-        A compare-and-swap, and the comparison is the point. The one caller is
-        the opportunistic re-hash on the login path, whichreads a credential,
-        verifies a password against it, and then writes a replacement — three
-        steps with room between them for the account's owner to change their
-        password from another tab. An unconditional write would put the *old*
-        password back, silently, and leave whoever knew it still able to log in.
-
-        Conditioned on ``credential_source`` too, so a row that has moved off
-        its own credential in the meantime (back to the configured one, say) is
-        left alone rather than dragged back to ``local``.
-
-        Returns whether a row changed. ``False`` is a benign no-op: something
-        else got there first, and what it wrote is newer than what this had.
-        """
+        """Replace a local hash only if its source and value are unchanged."""
         if not expected or not credential:
             raise AccountError("both the expected and the new credential are required")
         result = await self._write(
@@ -688,20 +560,7 @@ class AccountStore:
         credential_source: str,
         credential: str | None = None,
     ) -> bool:
-        """Move an account's credential, only if it is still where it was seen.
-
-        The startup migration's version of the compare-and-swap that guards the
-        login path's re-hash, and it exists for the same reason. ``nerve sync``
-        and friends run the identity bootstrap against a *live* daemon, so the
-        migration's "read every account, then write the ones that need it" has a
-        window in it: an account whose owner changes their password in that
-        window would have the configured hash written over their new one, or
-        have it cleared entirely by the mirror. Conditioning the write on the
-        source the caller read makes the loser of that race a no-op, and the
-        newer of the two writes is always the deliberate one.
-
-        Returns whether a row changed.
-        """
+        """Move a credential only while its source is still the one observed."""
         for source in (expected_source, credential_source):
             if source not in CREDENTIAL_SOURCES:
                 raise ValueError(
@@ -730,30 +589,10 @@ class AccountStore:
         credential: str,
         display_name: str | None = None,
     ) -> dict:
-        """Name and secure the one unclaimed account, in a single transaction.
+        """Atomically name and secure exactly one unclaimed account.
 
-        First-run "claim and secure": the account an install is created with has
-        no password and no username, and this is what gives it both. One
-        transaction, so a half-claimed account — named but still open, or
-        secured but unreachable — never exists, not even between two requests.
-
-        The *precondition* is checked inside the transaction as well, which is
-        the difference between this and ``get_sole_account()`` followed by
-        ``update_account_login()``: those are two transactions, so two callers
-        racing to claim a fresh install can both read "one account, no
-        password" and the second one silently overwrites the first's password
-        with its own. Under ``BEGIN IMMEDIATE`` the loser reads the winner's
-        committed row and raises :class:`NotClaimableError`.
-
-        Raises :class:`NotClaimableError` unless exactly one account exists and
-        it has no credential, and the username errors of
-        :func:`normalise_username`. ``display_name`` also renames the account's
-        actor, in the same transaction.
-
-        Note what this does **not** do: decide who may call it. A passwordless
-        install admits everybody, so the caller is responsible for the guard
-        that makes claiming meaningful (a setup token, or proof that the request
-        came from the machine itself).
+        The caller must separately authorize the claim; this DAL method only
+        makes its precondition and writes indivisible.
         """
         username = normalise_username(username)
         if not credential:
@@ -802,21 +641,7 @@ class AccountStore:
         return await self.get_account(account["id"])  # type: ignore[return-value]
 
     async def disable_account(self, account_id: str) -> dict | None:
-        """Disable an account unless it is the last enabled one.
-
-        The lockout guard (0.4), enforced by the statement itself as well as by
-        the surrounding transaction: the ``UPDATE`` carries the "more than one
-        enabled account" condition in its ``WHERE``, so even a caller that
-        somehow reached it with a stale count cannot make it fire. Raises
-        :class:`LastAccountError` rather than reporting a count, so no caller
-        can forget to look.
-
-        Idempotent: disabling an already-disabled account returns it unchanged
-        (and is never the lockout case — nothing changes).
-
-        Returns ``None`` if there is no such account. The row is *never*
-        removed; see the note at the top of this section.
-        """
+        """Idempotently disable an account unless it is the last enabled one."""
         async with self._atomic():
             await self.db.execute("BEGIN IMMEDIATE")
             account = await self.get_account(account_id)

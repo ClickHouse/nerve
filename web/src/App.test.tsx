@@ -8,7 +8,7 @@ import type { AuthStatus } from './api/client';
  *
  * The one that matters is the tab that arrives *holding a token*. A token says
  * it may come in; it does not say where. An instance whose sole account has no
- * password belongs on the setup page however the tab arrived, and the app used
+ * password belongs on the accounts page however the tab arrived, and the app used
  * to render on the token alone — reaching `/chat` before the status descriptor
  * answered, by which time the component that would have redirected was gone.
  */
@@ -47,6 +47,9 @@ vi.mock('./stores/chatStore', () => {
 // shell is replaced by its outlet so routing still resolves through it.
 vi.mock('./components/Layout/AppShell', () => ({ AppShell: () => <Outlet /> }));
 vi.mock('./pages/ChatPage', () => ({ ChatPage: () => <div>the chat page</div> }));
+vi.mock('./pages/AccountsPage', () => ({
+  AccountsPage: () => <div>the accounts page</div>,
+}));
 vi.mock('./components/Notifications/NotificationToast', () => ({
   NotificationToast: () => null,
 }));
@@ -63,18 +66,14 @@ const tokenInStorage = getToken as unknown as ReturnType<typeof vi.fn>;
 function me() {
   return {
     id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't', updated_at: 't',
-    disabled_at: null, is_self: true,
+    enabled: true, has_password: true, created_at: 't',
   };
 }
 
 function status(overrides: Partial<AuthStatus> = {}): AuthStatus {
   return {
     auth_required: true,
-    mode: 'local',
     login: 'password',
-    setup_pending: false,
-    multiple_accounts: false,
     ...overrides,
   };
 }
@@ -94,8 +93,6 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: null,
-    statusLoading: false,
-    setupPending: false,
     account: null,
   });
 });
@@ -106,14 +103,14 @@ describe('startup with a token already in storage', () => {
     getOwnAccount.mockResolvedValue(me());
   });
 
-  it('lands on the setup page when the instance has no password', async () => {
+  it('lands on the accounts page when the instance has no password', async () => {
     authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false, setup_pending: true }),
+      status({ login: 'none', auth_required: false }),
     );
 
     renderApp();
 
-    expect(await screen.findByText(/Setup is not finished/)).toBeInTheDocument();
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -144,23 +141,23 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
 
-    answer(status({ login: 'none', auth_required: false, setup_pending: true }));
-    expect(await screen.findByText(/Setup is not finished/)).toBeInTheDocument();
+    answer(status({ login: 'none', auth_required: false }));
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
   });
 
-  it('reaches setup on a real reload, not just with a reset store', async () => {
+  it('reaches accounts on a real reload, not just with a reset store', async () => {
     // The same fresh-module path, followed all the way through: a grandfathered
     // token on a passwordless install is precisely the upgrading install PR 3
-    // has to route to setup, and it is the one shape a reset store hides.
+    // has to route to Accounts, and it is the one shape a reset store hides.
     vi.resetModules();
     authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false, setup_pending: true }),
+      status({ login: 'none', auth_required: false }),
     );
     const { default: FreshApp } = await import('./App');
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
 
-    expect(await screen.findByText(/Setup is not finished/)).toBeInTheDocument();
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -179,28 +176,27 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
-  it('a dead token on a passwordless install still reaches setup', async () => {
+  it('a dead token on a passwordless install still reaches accounts', async () => {
     // The token is useless, which puts this tab exactly where a tab with no
     // token at all stands — so it takes the same path, rather than stopping at
     // a login form a passwordless install has no answer for.
     authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false, setup_pending: true }),
+      status({ login: 'none', auth_required: false }),
     );
     getOwnAccount.mockRejectedValueOnce(new Error('401'));
     apiLogin.mockResolvedValue({ token: 'a-fresh-token' });
 
     renderApp();
 
-    expect(await screen.findByText(/Setup is not finished/)).toBeInTheDocument();
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
     expect(apiLogin).toHaveBeenCalledWith('');
   });
 
   it('opens the app when the descriptor cannot be read but the token is good',
     async () => {
       // The token answers "may this tab come in"; only the descriptor answers
-      // "where". With no answer, the app is the safe place to be — it is the
-      // setup *page* that is the claim, and claiming without evidence would
-      // put every working install in front of a setup notice.
+      // "where". With no answer, the app is the safe place to be; routing every
+      // working install to Accounts would pretend they were passwordless.
       authStatus.mockRejectedValue(new Error('network'));
 
       renderApp();
@@ -208,32 +204,19 @@ describe('startup with a token already in storage', () => {
       expect(await screen.findByText('the chat page')).toBeInTheDocument();
       await waitFor(() =>
         expect(useAuthStore.getState().loginMode).toBe('username_password'));
-      expect(useAuthStore.getState().setupPending).toBe(false);
-    });
-
-  it('a dead token on a passwordless install signs in rather than asking',
-    async () => {
-      authStatus.mockResolvedValue(status({ login: 'none', auth_required: false }));
-      getOwnAccount.mockRejectedValueOnce(new Error('401'));
-      apiLogin.mockResolvedValue({ token: 'a-fresh-token' });
-
-      renderApp();
-
-      expect(await screen.findByText('the chat page')).toBeInTheDocument();
-      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
     });
 });
 
 describe('startup with no token', () => {
-  it('auto-logs-in a passwordless install and still lands on setup', async () => {
+  it('auto-logs-in a passwordless install and lands on accounts', async () => {
     authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false, setup_pending: true }),
+      status({ login: 'none', auth_required: false }),
     );
     apiLogin.mockResolvedValue({ token: 'a-fresh-token' });
 
     renderApp();
 
-    expect(await screen.findByText(/Setup is not finished/)).toBeInTheDocument();
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
     expect(apiLogin).toHaveBeenCalledWith('');
   });
 

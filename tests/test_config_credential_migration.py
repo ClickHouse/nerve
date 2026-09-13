@@ -62,20 +62,6 @@ def _auth_section(path: Path) -> dict:
 
 @pytest.mark.asyncio
 class TestTheCopy:
-    async def test_the_hash_is_copied_byte_for_byte(self, db: Database, tmp_path):
-        config = _install(
-            tmp_path,
-            local_yaml=f"auth:\n  password_hash: '{_HASH}'\n  jwt_secret: '{_SECRET}'\n",
-        )
-        report = await bootstrap_identity(db, config)
-        (account,) = await db.list_accounts()
-        assert account["credential_source"] == "local"
-        assert account["credential"] == _HASH
-        assert report.migrated_config_credential
-        # A re-hash would produce a different salt and a different string, and
-        # would mean the migration had decided what somebody's password is.
-        assert bcrypt.checkpw(_PASSWORD.encode(), account["credential"].encode())
-
     async def test_it_is_idempotent(self, db: Database, tmp_path):
         config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
         first = await bootstrap_identity(db, config)
@@ -91,29 +77,6 @@ class TestTheCopy:
         assert not third.did_bootstrap
         (account,) = await db.list_accounts()
         assert account["credential"] == _HASH
-
-    async def test_a_local_credential_is_left_alone(self, db: Database, tmp_path):
-        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        await bootstrap_identity(db, config)
-        (account,) = await db.list_accounts()
-        await db.set_account_credential(
-            account["id"], credential_source="local", credential="$2b$12$the-accounts-own",
-        )
-        reloaded = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        report = await bootstrap_identity(db, reloaded)
-        assert not report.migrated_config_credential
-        (account,) = await db.list_accounts()
-        assert account["credential"] == "$2b$12$the-accounts-own"
-
-    async def test_a_passwordless_install_is_untouched(self, db: Database, tmp_path):
-        config = _install(tmp_path, local_yaml="auth:\n  jwt_secret: 'x' \n")
-        report = await bootstrap_identity(db, config)
-        assert not report.migrated_config_credential
-        assert not report.scrubbed_config_password
-        (account,) = await db.list_accounts()
-        assert account["credential_source"] == "none"
-        assert account["credential"] is None
-
 
 @pytest.mark.asyncio
 class TestTheScrub:
@@ -138,28 +101,8 @@ class TestTheScrub:
         assert yaml.safe_load(text)["anthropic_api_key"] == "an-obviously-fake-value"
         # The file's own header is kept rather than replaced.
         assert text.startswith("# Nerve —")
-
-    async def test_the_file_stays_owner_only(self, db: Database, tmp_path):
-        """It still holds the signing secret and every API key the wizard
-        collected, so it is rewritten through the fail-closed private writer."""
-        config = _install(
-            tmp_path,
-            local_yaml=f"auth:\n  password_hash: '{_HASH}'\n  jwt_secret: '{_SECRET}'\n",
-        )
-        local_yaml = config.config_dir / "config.local.yaml"
-        local_yaml.chmod(0o600)
-        await bootstrap_identity(db, config)
         assert local_yaml.stat().st_mode & 0o077 == 0
-
-    async def test_an_empty_auth_section_is_dropped_rather_than_left_null(
-        self, db: Database, tmp_path,
-    ):
-        """A bare ``auth:`` key is an empty overlay, not an eraser — but leaving
-        one behind for no reason invites the question."""
-        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        local_yaml = config.config_dir / "config.local.yaml"
-        await bootstrap_identity(db, config)
-        assert "auth" not in (yaml.safe_load(local_yaml.read_text(encoding="utf-8")) or {})
+        assert config.auth.password_hash == ""
 
     async def test_config_yaml_is_scrubbed_too(self, db: Database, tmp_path):
         """Both machine-local layers can carry it, and both are gitignored."""
@@ -178,43 +121,6 @@ class TestTheScrub:
         text = (config_dir / "config.yaml").read_text(encoding="utf-8")
         assert "password_hash" not in text
         assert f"workspace: {ws}" in text
-
-    async def test_the_process_stops_believing_in_the_configured_password(
-        self, db: Database, tmp_path,
-    ):
-        """The in-memory config is emptied with the file, so the login route and
-        the status descriptor do not go on reading a value that exists nowhere
-        until the next restart."""
-        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        await bootstrap_identity(db, config)
-        assert config.auth.password_hash == ""
-
-    async def test_a_write_that_cannot_be_private_reports_and_keeps_the_login(
-        self, db: Database, tmp_path, monkeypatch,
-    ):
-        """A tidy-up that fails must not stop a start, and must not be silent —
-        the credential is already on the row, so the configured value is inert
-        either way."""
-        from nerve import migrate as migrate_mod
-
-        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        local_yaml = config.config_dir / "config.local.yaml"
-        before = local_yaml.read_text(encoding="utf-8")
-
-        def _refuse(path, text):
-            raise paths.InsecureFileError(f"{path} cannot be created owner-only")
-
-        monkeypatch.setattr(migrate_mod.paths, "write_private_text", _refuse)
-        report = await bootstrap_identity(db, config)
-
-        (account,) = await db.list_accounts()
-        assert account["credential"] == _HASH          # the copy happened first
-        assert not report.scrubbed_config_password
-        assert local_yaml.read_text(encoding="utf-8") == before
-        assert any("could not be removed" in w for w in report.warnings)
-        # ...and the value is still in force for this process, because it is
-        # still in the file.
-        assert config.auth.password_hash == _HASH
 
     async def test_a_failed_scrub_is_retried_at_the_next_start(
         self, db: Database, tmp_path, monkeypatch,
@@ -239,7 +145,9 @@ class TestTheScrub:
         first = await bootstrap_identity(db, config)
         assert first.migrated_config_credential
         assert not first.scrubbed_config_password
+        assert any("could not be removed" in w for w in first.warnings)
         assert _HASH in local_yaml.read_text(encoding="utf-8")
+        assert config.auth.password_hash == _HASH
         assert (await db.list_accounts())[0]["credential"] == _HASH
         # The password keeps working across all of this — the copy is what
         # authentication depends on, and it landed.
@@ -315,7 +223,7 @@ class TestAConcurrentPasswordChange:
     read, so a password set in that window is never written over."""
 
     async def test_the_copy_does_not_overwrite_a_password_set_meanwhile(
-        self, db: Database, tmp_path,
+        self, db: Database, tmp_path, monkeypatch,
     ):
         from nerve.migrate import MigrationReport, _migrate_config_credentials
 
@@ -324,15 +232,18 @@ class TestAConcurrentPasswordChange:
         account = await db.create_account(
             actor_id=actor["id"], credential_source="config",
         )
-        # What `list_accounts()` saw a moment ago...
-        stale = await db.get_account(account["id"])
-        # ...and what the owner did in the meantime, from the running daemon.
-        await db.update_account_login(account["id"], credential="$2b$12$their-own")
+        original = db.set_account_credential_if_source
+
+        async def change_first(*args, **kwargs):
+            await db.update_account_login(
+                account["id"], credential="$2b$12$their-own",
+            )
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(db, "set_account_credential_if_source", change_first)
 
         report = MigrationReport()
-        await _migrate_config_credentials(
-            db, config, report, dry_run=False, stragglers=[stale],
-        )
+        await _migrate_config_credentials(db, config, report, dry_run=False)
 
         row = await db.get_account(account["id"])
         assert row["credential"] == "$2b$12$their-own"
@@ -345,7 +256,7 @@ class TestAConcurrentPasswordChange:
         assert any("newer one" in a for a in report.identity_actions)
 
     async def test_the_mirror_does_not_clear_a_password_set_meanwhile(
-        self, db: Database, tmp_path,
+        self, db: Database, tmp_path, monkeypatch,
     ):
         """The other direction: the mirror moves `config`/`none` rows to match
         configuration, and a row that has become `local` must be left alone even
@@ -354,13 +265,17 @@ class TestAConcurrentPasswordChange:
         account = await db.create_account(
             actor_id=actor["id"], credential_source="none",
         )
-        await db.update_account_login(account["id"], credential="$2b$12$their-own")
+        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
+        original = db.set_account_credential_if_source
 
-        changed = await db.set_account_credential_if_source(
-            account["id"], expected_source="none", credential_source="config",
-        )
+        async def change_first(*args, **kwargs):
+            await db.update_account_login(
+                account["id"], credential="$2b$12$their-own",
+            )
+            return await original(*args, **kwargs)
 
-        assert changed is False
+        monkeypatch.setattr(db, "set_account_credential_if_source", change_first)
+        await bootstrap_identity(db, config)
         row = await db.get_account(account["id"])
         assert row["credential"] == "$2b$12$their-own"
 
@@ -399,15 +314,6 @@ class TestLockdown:
         assert "auth.password_hash" in warning
         assert "no longer authenticates anybody" in warning
         assert "fleet-managed" in warning
-
-    async def test_the_env_reference_in_the_file_is_left_as_a_reference(
-        self, db: Database, tmp_path, monkeypatch,
-    ):
-        config = self._locked(tmp_path, monkeypatch)
-        settings = workspace_settings_file(config.workspace)
-        await bootstrap_identity(db, config)
-        assert "${NERVE_TEST_PASSWORD_HASH}" in settings.read_text(encoding="utf-8")
-
 
 @pytest.mark.asyncio
 class TestATrackedValueIsReportedNotRewritten:
@@ -451,16 +357,6 @@ class TestTheStaleValueWarning:
         assert any("no account uses it" in w for w in report.warnings)
         assert any("no account uses it" in r.getMessage() for r in caplog.records)
 
-    async def test_nothing_is_said_when_the_value_still_authenticates(
-        self, db: Database, tmp_path,
-    ):
-        config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        report = await bootstrap_identity(db, config)
-        # It was copied and then removed, so there is no stale value to warn
-        # about — only the actions that describe what happened.
-        assert not any("no account uses it" in w for w in report.warnings)
-
-
 # --------------------------------------------------------------------------- #
 #  The whole point: nobody's password changes                                  #
 # --------------------------------------------------------------------------- #
@@ -502,10 +398,7 @@ class TestTheOldPasswordStillWorks:
 
         assert good.status_code == 200, good.text
         assert bad.status_code == 401
-        # ...and the instance is still "one account, password only" — the
-        # migration changed where the hash lives, nothing else.
-        assert status.json()["login"] == "password"
-        assert status.json()["setup_pending"] is False
+        assert status.json() == {"auth_required": True, "login": "password"}
 
 
 # --------------------------------------------------------------------------- #

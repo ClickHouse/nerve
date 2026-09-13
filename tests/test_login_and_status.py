@@ -76,14 +76,31 @@ class _Install:
 
 
 @pytest.fixture(autouse=True)
-def _fast_failures():
-    """Failed logins are padded to a response budget of about a quarter of a
-    second on real hardware (see ``_failure_budget_seconds``). Pin it to nothing
-    for the tests that are not about the padding, and let the ones that are set
-    their own."""
-    auth_routes._set_failure_budget(0.0)
+def _fast_failures(monkeypatch):
+    """Skip timing padding except in tests that explicitly reset it."""
+    monkeypatch.setattr(auth_routes, "_FAILURE_BUDGET_FLOOR_SECONDS", 0.0)
+    auth_routes._failure_budget = 0.0
+    auth_routes._calibrated_budget = 0.0
+    auth_routes._policy_comparison_seconds = 0.0
     yield
-    auth_routes._set_failure_budget(None)
+    auth_routes._failure_budget = None
+    auth_routes._calibrated_budget = None
+    auth_routes._policy_comparison_seconds = None
+
+
+def _reset_timing() -> None:
+    auth_routes._failure_budget = None
+    auth_routes._calibrated_budget = None
+    auth_routes._policy_comparison_seconds = None
+
+
+def _fixed_timing(monkeypatch, budget: float) -> None:
+    def prepare(_config, _accounts):
+        auth_routes._failure_budget = budget
+        auth_routes._calibrated_budget = budget
+        return budget
+
+    monkeypatch.setattr(auth_routes, "prepare_login_timing", prepare)
 
 
 @pytest_asyncio.fixture
@@ -320,7 +337,6 @@ class TestTheSecondAccountIsTheTurningPoint:
             )).status_code == 200
             before = (await client.get("/api/auth/status")).json()
             assert before["login"] == "password"
-            assert before["multiple_accounts"] is False
 
             await install.add_account("bob")
 
@@ -333,7 +349,6 @@ class TestTheSecondAccountIsTheTurningPoint:
             )).status_code == 401
             after = (await client.get("/api/auth/status")).json()
             assert after["login"] == "username_password"
-            assert after["multiple_accounts"] is True
 
     async def test_disabling_the_second_account_does_not_bring_them_back(self, install):
         """The row is the tombstone: the relaxations are keyed on how many
@@ -361,54 +376,41 @@ class TestTheSecondAccountIsTheTurningPoint:
 
 @pytest.mark.asyncio
 class TestStatusDescriptor:
-    async def test_setup_pending(self, install):
-        """One account, no password, no username: what a fresh headless install
-        looks like, and the state PR 6's wizard claims."""
+    async def test_passwordless(self, install):
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {
-            "auth_required": False, "mode": "local", "login": "none",
-            "setup_pending": True, "multiple_accounts": False,
-        }
+        assert body == {"auth_required": False, "login": "none"}
 
-    async def test_naming_the_account_does_not_end_setup(self, install):
+    async def test_naming_the_account_stays_passwordless(self, install):
         """The accounts screen can set a username on its own. Doing that first
         must not stop the instance reporting as unsecured — it still admits
         every caller, which is the state the wizard exists to end."""
         await install.db.set_account_username(install.owner_id, "alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body["login"] == "none"
-        assert body["setup_pending"] is True
+        assert body == {"auth_required": False, "login": "none"}
 
-    async def test_only_a_password_ends_setup(self, install):
+    async def test_only_a_password_ends_passwordless_login(self, install):
         await install.db.set_account_username(install.owner_id, "alice")
         await install.db.update_account_login(
             install.owner_id, credential=hash_password(_PASSWORD),
         )
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body["login"] == "password"
-        assert body["setup_pending"] is False
+        assert body == {"auth_required": True, "login": "password"}
 
     async def test_password_only(self, install):
         await install.secure_the_owner("alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {
-            "auth_required": True, "mode": "local", "login": "password",
-            "setup_pending": False, "multiple_accounts": False,
-        }
+        assert body == {"auth_required": True, "login": "password"}
 
     async def test_username_and_password(self, install):
         await install.secure_the_owner("alice")
         await install.add_account("bob")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {
-            "auth_required": True, "mode": "local", "login": "username_password",
-            "setup_pending": False, "multiple_accounts": True,
-        }
+        assert body == {"auth_required": True, "login": "username_password"}
 
     async def test_a_configured_password_is_not_passwordless(self, install):
         """The row still says `none` — a reload added the hash and no restart
@@ -420,7 +422,6 @@ class TestStatusDescriptor:
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
             assert body["login"] == "password"
-            assert body["setup_pending"] is False
             # ...and the two agree: the empty password a `none` descriptor
             # would have invited is refused.
             assert (await client.post(
@@ -452,7 +453,6 @@ class TestStatusDescriptor:
             body = (await client.get("/api/auth/status")).json()
         assert body["login"] == "username_password"
         assert body["auth_required"] is True
-        assert body["setup_pending"] is False
 
     async def test_fails_closed_with_no_identity_store(self, install, monkeypatch):
         from nerve.gateway.routes import _deps as deps_module
@@ -547,7 +547,7 @@ class TestFailedLoginsCostTheSame:
 
     @pytest.mark.parametrize("rounds", [4, 12])
     async def test_failures_take_the_budget_whatever_the_stored_cost(
-        self, install, rounds,
+        self, install, rounds, monkeypatch,
     ):
         """The decoy equalises *whether* a comparison happens. The budget
         equalises how long one takes — otherwise a cost-4 account fails in a
@@ -559,7 +559,7 @@ class TestFailedLoginsCostTheSame:
             credential=_cheap_hash(_PASSWORD, rounds),
         )
         budget = 0.4
-        auth_routes._set_failure_budget(budget)
+        _fixed_timing(monkeypatch, budget)
 
         async def elapsed(body) -> float:
             async with _client(install.app) as client:
@@ -579,10 +579,12 @@ class TestFailedLoginsCostTheSame:
         assert known < budget + 1.5, known
         assert unknown < budget + 1.5, unknown
 
-    async def test_the_budget_covers_a_slower_hash_than_the_policy(self, install):
+    async def test_the_budget_covers_a_slower_hash_than_the_policy(
+        self, install, monkeypatch,
+    ):
         """From the other direction: a hash *more* expensive than the budget
         would stand out by being slower. One observation raises the floor."""
-        auth_routes._set_failure_budget(0.01)
+        _fixed_timing(monkeypatch, 0.01)
         await install.db.update_account_login(install.owner_id, username="alice")
         await install.db.set_account_credential(
             install.owner_id, credential_source="local",
@@ -611,7 +613,7 @@ class TestFailedLoginsCostTheSame:
         had a chance to observe the slow hash."""
         from nerve.config import get_config
 
-        auth_routes._set_failure_budget(None)
+        _reset_timing()
         await install.db.update_account_login(install.owner_id, username="alice")
         slow = _cheap_hash(_PASSWORD, rounds=13)
         await install.db.set_account_credential(
@@ -653,7 +655,7 @@ class TestFailedLoginsCostTheSame:
         that happens, and stays stale until some known-user probe raises the
         reactive mark — which is the same one-probe-too-late this is supposed to
         have ended. So it is recomputed every login."""
-        auth_routes._set_failure_budget(None)
+        _reset_timing()
         await install.db.set_account_username(install.owner_id, "alice")
 
         async def probe(body) -> float:
@@ -685,7 +687,7 @@ class TestFailedLoginsCostTheSame:
     async def test_the_budget_comes_back_down_when_the_slow_hash_goes(self, install):
         """It is recomputed, not ratcheted: an install that converges on the
         policy cost stops paying for the one account that had not."""
-        auth_routes._set_failure_budget(None)
+        _reset_timing()
         set_config(NerveConfig(auth=AuthConfig(
             jwt_secret=_SECRET, password_hash=_cheap_hash(_PASSWORD, rounds=14),
         )))
@@ -726,7 +728,7 @@ class TestFailedLoginsCostTheSame:
         """The measurement costs a comparison. Paid inside a request's own timed
         window, it would make the first failure of a process stand out from
         every later one — the same leak, moved."""
-        auth_routes._set_failure_budget(None)
+        _reset_timing()
         async with _client(install.app) as client:
             await install.secure_the_owner("alice")
             first = time.monotonic()

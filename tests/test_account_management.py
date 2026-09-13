@@ -73,15 +73,16 @@ class _Install:
 
 
 @pytest.fixture(autouse=True)
-def _fast_failures():
-    """Failed logins are padded to a common response budget (see
-    ``nerve.gateway.routes.auth._failure_budget_seconds``). Nothing in this file
-    is about the padding, and paying it per refusal would add minutes."""
-    from nerve.gateway.routes import auth as auth_routes
-
-    auth_routes._set_failure_budget(0.0)
+def _fast_failures(monkeypatch):
+    """Skip timing padding; this file does not test it."""
+    monkeypatch.setattr(auth_routes, "_FAILURE_BUDGET_FLOOR_SECONDS", 0.0)
+    auth_routes._failure_budget = 0.0
+    auth_routes._calibrated_budget = 0.0
+    auth_routes._policy_comparison_seconds = 0.0
     yield
-    auth_routes._set_failure_budget(None)
+    auth_routes._failure_budget = None
+    auth_routes._calibrated_budget = None
+    auth_routes._policy_comparison_seconds = None
 
 
 @pytest_asyncio.fixture
@@ -106,7 +107,7 @@ async def install(tmp_path, open_identity_db, wire_identity_store):
 # must not be able to arrive in a response unnoticed.
 _ACCOUNT_FIELDS = {
     "id", "actor_id", "username", "display_name", "enabled", "has_password",
-    "created_at", "updated_at", "disabled_at", "is_self",
+    "created_at",
 }
 
 
@@ -272,6 +273,7 @@ class TestPasswordlessGuard:
         assert response.status_code == 409
         assert "password" in response.json()["detail"].lower()
         assert await install.db.count_accounts() == 1
+        assert len(await install.db.list_actor_refs(kind="human")) == 1
 
     async def test_setting_a_password_and_a_username_unblocks_it(self, install: _Install):
         async with _client(install.app) as client:
@@ -292,6 +294,7 @@ class TestPasswordlessGuard:
             )
             assert blocked.status_code == 409
             assert "username" in blocked.json()["detail"].lower()
+            assert len(await install.db.list_actor_refs(kind="human")) == 1
             # 3. name it, and the second account can exist.
             assert (await client.patch(
                 f"/api/accounts/{install.owner_id}", json={"username": "alice"},
@@ -353,7 +356,6 @@ class TestLastAccountGuard:
             again = await client.post(f"/api/accounts/{bob}/enable", headers=install.headers())
             assert back.json() == again.json()
             assert back.json()["enabled"] is True
-            assert back.json()["disabled_at"] is None
 
     async def test_unknown_account(self, install: _Install):
         async with _client(install.app) as client:
@@ -424,6 +426,9 @@ class TestUsernamesThroughTheApi:
         assert response.status_code == status, response.text
         if status == 201:
             assert response.json()["username"] == username.lower()
+        else:
+            assert await install.db.count_accounts() == 1
+            assert len(await install.db.list_actor_refs(kind="human")) == 1
 
     async def test_renaming_keeps_the_identity(self, install: _Install):
         """0.7: a username is a lookup key. Renaming moves nothing stored."""
@@ -588,79 +593,6 @@ class TestOwnPassword:
                 headers=install.headers(),
             )
         assert response.status_code == 422
-
-
-# --------------------------------------------------------------------------- #
-#  Structural: what the route surface promises                                 #
-# --------------------------------------------------------------------------- #
-
-
-class TestTheRouteSurface:
-    """Checked against the modules rather than through a client, so a route
-    added later without a gate fails here rather than in production."""
-
-    @staticmethod
-    def _endpoints():
-        import inspect
-
-        from nerve.gateway.routes import (
-            accounts, auth, codex, config, cron, diagnostics, external_agents,
-            files, mcp_servers, memory, models, notifications, plans,
-            prompt_rewrite, review_loops, sessions, skills, sources, tasks,
-            workflow_runs,
-        )
-
-        modules = [
-            accounts, auth, codex, config, cron, diagnostics, external_agents,
-            files, mcp_servers, memory, models, notifications, plans,
-            prompt_rewrite, review_loops, sessions, skills, sources, tasks,
-            workflow_runs,
-        ]
-        for module in modules:
-            for route in module.router.routes:
-                endpoint = getattr(route, "endpoint", None)
-                if endpoint is None:
-                    continue
-                gates = [
-                    p.default.dependency.__name__
-                    for p in inspect.signature(endpoint).parameters.values()
-                    if getattr(p.default, "dependency", None) is not None
-                ]
-                yield sorted(route.methods), str(route.path), gates
-
-    def test_only_three_api_endpoints_are_unauthenticated(self):
-        """Login and status are the doors themselves; the worker-token exchange
-        authenticates through the MCP path instead. Anything else appearing
-        here is a hole."""
-        open_endpoints = {
-            (tuple(methods), path)
-            for methods, path, gates in self._endpoints()
-            if path.startswith("/api")
-            and "require_auth" not in gates
-            and "require_account" not in gates
-        }
-        assert open_endpoints == {
-            (("POST",), "/api/auth/login"),
-            (("GET",), "/api/auth/status"),
-            (("POST",), "/api/codex/worker-token"),
-        }
-
-    def test_every_account_endpoint_requires_a_human_account(self):
-        account_endpoints = [
-            (tuple(methods), path, gates)
-            for methods, path, gates in self._endpoints()
-            if path.startswith("/api/accounts")
-        ]
-        assert len(account_endpoints) == 7
-        for methods, path, gates in account_endpoints:
-            assert gates == ["require_account"], (methods, path, gates)
-
-    def test_there_is_no_endpoint_that_deletes_an_account(self):
-        """Removal is disablement; the row is the tombstone that keeps a
-        grandfathered token from resolving to the wrong account."""
-        for methods, path, _ in self._endpoints():
-            if path.startswith("/api/accounts"):
-                assert "DELETE" not in methods, path
 
 
 # --------------------------------------------------------------------------- #

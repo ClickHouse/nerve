@@ -184,8 +184,7 @@ class TestLoginRoute:
         assert claims["sub"] == client.account_id
         assert claims[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SESSION
         assert client.get("/api/auth/status").json() == {
-            "auth_required": True, "mode": "local", "login": "password",
-            "setup_pending": False, "multiple_accounts": False,
+            "auth_required": True, "login": "password",
         }
 
     def test_password_checked_and_token_signed_with_the_generated_secret(self, client, config):
@@ -207,19 +206,15 @@ class TestLoginRoute:
             with pytest.raises(jwt.InvalidSignatureError):
                 _claims(token, "dev-secret")
         assert client.get("/api/auth/status").json() == {
-            "auth_required": True, "mode": "local", "login": "password",
-            "setup_pending": False, "multiple_accounts": False,
+            "auth_required": True, "login": "password",
         }
 
     def test_passwordless_admits_any_password_with_a_real_secret(self, client, config):
         """0.5 / 0.7: a passwordless install stays passwordless; every admitted
         caller resolves to the single account. The token is a real one."""
         pin_jwt_secret(_GENERATED)
-        # The descriptor's passwordless shape: no credential anywhere, one
-        # account, and it has no username either — so setup is still pending.
         assert client.get("/api/auth/status").json() == {
-            "auth_required": False, "mode": "local", "login": "none",
-            "setup_pending": True, "multiple_accounts": False,
+            "auth_required": False, "login": "none",
         }
         res = client.post("/api/auth/login", json={"password": "anything at all"})
         assert res.status_code == 200
