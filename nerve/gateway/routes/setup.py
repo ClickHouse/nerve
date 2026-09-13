@@ -554,10 +554,40 @@ _UNCLAIMED_REFUSED = (
 )
 
 
+_STALE_REFUSED = (
+    "This instance was claimed after your session started, so that request was "
+    "refused. Sign in again."
+)
+
+
 def _require_claimed(context: _Context) -> None:
     """Refuse every mutation but the claim while the instance is unclaimed."""
     if context.unclaimed:
         raise HTTPException(status_code=409, detail=_UNCLAIMED_REFUSED)
+
+
+async def _require_current_session(actor: Actor, db) -> None:
+    """Rule two, for the writes that have no transaction to join.
+
+    "Not unclaimed any more" and "you were allowed to ask" are different
+    questions, and only the second one is about the caller: a session admitted
+    while the instance was passwordless can resume *after* the claim, find the
+    instance claimed, and write a provider key or restart the daemon as the
+    person it locked out.
+
+    The account writes carry their epoch into their own transaction, which is
+    stronger. A file write has no transaction, so this is read as late as it
+    can be — inside the mutation lock, immediately before the write — and the
+    claim's own bump is atomic, so what remains is a window measured in the
+    time between this read and the next statement.
+    """
+    if actor.account_id is None or actor.session_epoch is None:
+        return
+    account = await db.get_account(actor.account_id)
+    if account is None or int(account.get("session_epoch") or 0) != int(
+        actor.session_epoch
+    ):
+        raise HTTPException(status_code=409, detail=_STALE_REFUSED)
 
 
 def _provider_detail(config) -> str:
@@ -932,6 +962,7 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_acco
     async with _loop_lock("state"):
         context = await _context(actor)
         _require_claimed(context)
+        await _require_current_session(actor, get_deps().db)
         applied = _write(
             context,
             choices=SetupChoices(anthropic_api_key=anthropic, openai_api_key=openai),
@@ -973,6 +1004,7 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
     async with _loop_lock("state"):
         context = await _context(actor)
         _require_claimed(context)
+        await _require_current_session(actor, get_deps().db)
         db = get_deps().db
 
         # Everything that can be discovered before writing, first: whether the
@@ -1004,6 +1036,8 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
             try:
                 await db.update_actor_profile(
                     account["actor_id"], display_name=(display_name.strip() or None),
+                    acting_account_id=actor.account_id,
+                    acting_session_epoch=actor.session_epoch,
                 )
                 renamed = display_name.strip() or None
             except Exception as e:  # noqa: BLE001 - said, not swallowed
@@ -1059,6 +1093,7 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_acco
     async with _loop_lock("state"):
         context = await _context(actor)
         _require_claimed(context)
+        await _require_current_session(actor, get_deps().db)
         allowed = req.telegram_allowed_users
         choices = SetupChoices(
             telegram_bot_token=token,
@@ -1095,6 +1130,7 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
     async with _loop_lock("state"):
         context = await _context(actor)
         _require_claimed(context)
+        await _require_current_session(actor, get_deps().db)
         _require_writable(context.config)
         live = context.config.sync
 
@@ -1217,6 +1253,7 @@ async def skip_step(step_id: str, actor: Actor = Depends(require_account)):
     async with _loop_lock("state"):
         context = await _context(actor)
         _require_claimed(context)
+        await _require_current_session(actor, get_deps().db)
         context.state.skipped.add(step_id)
         context.state.done.discard(step_id)
         _save_or_refuse(context)
@@ -1231,6 +1268,7 @@ async def unskip_step(step_id: str, actor: Actor = Depends(require_account)):
     async with _loop_lock("state"):
         context = await _context(actor)
         _require_claimed(context)
+        await _require_current_session(actor, get_deps().db)
         context.state.skipped.discard(step_id)
         _save_or_refuse(context)
         return _render(await _context(actor))
@@ -1273,6 +1311,10 @@ async def restart_system(actor: Actor = Depends(require_account)):
         # while the instance admits everybody it is an action anybody can take
         # — including over and over. Step one first.
         raise HTTPException(status_code=409, detail=_UNCLAIMED_REFUSED)
+    # As late as it can be read, and after the question above: the claim may
+    # commit at any point in this request, and the check is only worth what
+    # happens between it and the action.
+    await _require_current_session(actor, get_deps().db)
     config_dir = Path(config.config_dir) if config.config_dir else paths.nerve_home()
     # This process *is* the daemon being replaced. Reading the pid file would
     # be answering the same question less reliably.
