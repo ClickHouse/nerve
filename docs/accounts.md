@@ -57,6 +57,17 @@ A passwordless installation is safe only when access to the gateway is already
 restricted, such as by binding it to loopback. Set a password before exposing
 the gateway to other users or networks.
 
+### Claiming the first account
+
+A new passwordless installation is unclaimed. Use `/setup` to set the first
+account's username, display name, and password in one operation. Remote claims
+require the setup token printed by the server. Loopback requests are exempt
+unless `auth.setup_token_required` is enabled.
+
+While the installation is unclaimed, the normal password-change endpoint
+returns `409`; use the claim endpoint instead. See
+[Setup](setup.md#claiming-an-instance-from-a-browser).
+
 Passwords must be non-empty and no longer than 72 UTF-8 bytes. Nerve stores
 passwords as bcrypt hashes. Unknown usernames and incorrect passwords return the
 same response and use the same timing protections.

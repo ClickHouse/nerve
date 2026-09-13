@@ -1268,6 +1268,7 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 |-----|------|---------|-------------|
 | `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
 | `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
+| `auth.setup_token_required` | bool | `false` | Require a setup token for loopback claims as well as remote claims. Enable this before startup when a same-host reverse proxy makes remote requests appear local. Used only while the installation is unclaimed. See [Setup](setup.md#claiming-an-instance-from-a-browser) |
 
 ## API Keys (config.local.yaml)
 
