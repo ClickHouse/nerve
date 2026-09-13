@@ -572,6 +572,11 @@ def status(ctx: click.Context, follow: bool) -> None:
     # Docker mode: proxy to docker compose ps
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
+        # Before the exit, and before `logs -f` replaces this process: a Docker
+        # install is precisely the one that *needs* the token — its callers
+        # arrive over the bridge network, so their peer is never loopback —
+        # and the operator reading this is on the machine.
+        _echo_setup_token(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         ctx.exit(rc)
