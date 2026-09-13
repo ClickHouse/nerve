@@ -69,6 +69,10 @@ export interface SetupState {
   steps: SetupStep[];
   crons: SetupCron[];
   values: SetupValues;
+  /** Set when a step's configuration landed but the checklist could not
+   *  record it — partial success, which is neither an error to retry nor a
+   *  success to say nothing about. */
+  warning: string | null;
 }
 
 /** What `POST /api/setup/claim` hands back: a session for the account it just

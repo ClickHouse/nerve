@@ -48,6 +48,7 @@ function state(overrides: Partial<SetupState> = {}): SetupState {
     restart_pending: false,
     restart_pending_paths: [],
     restart_pending_reasons: [],
+    warning: null,
     finished: false,
     steps: [
       {
@@ -298,6 +299,25 @@ describe('the checklist', () => {
     renderPage();
     const automation = await screen.findByRole('region', { name: 'Automation' });
     expect(within(automation).getByLabelText('Inbox Processor')).toBeTruthy();
+  });
+});
+
+describe('a step that saved its configuration but not its note', () => {
+  it('says so rather than reporting a plain success', async () => {
+    api.setupProvider.mockResolvedValue(state({
+      warning: 'The configuration was written, but the checklist could not '
+        + 'record the provider step.',
+    }));
+    renderPage();
+    const provider = await screen.findByRole('region', { name: 'Provider credential' });
+    await userEvent.type(
+      within(provider).getByLabelText('Anthropic API key'), 'a-key',
+    );
+    await userEvent.click(within(provider).getByRole('button', { name: 'Save' }));
+
+    expect(
+      await screen.findByText(/could not record the provider step/),
+    ).toBeTruthy();
   });
 });
 

@@ -73,6 +73,12 @@ export function SetupPage() {
           <p role="alert" className="text-error text-sm mb-4">{error}</p>
         )}
 
+        {state?.warning && (
+          <Notice tone="warning" icon={<AlertTriangle size={14} />}>
+            {state.warning}
+          </Notice>
+        )}
+
         {state?.lockdown && (
           <Notice tone="warning" icon={<Lock size={14} />}>
             {state.read_only_reason
