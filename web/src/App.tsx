@@ -29,11 +29,14 @@ import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
+import { SetupPage, SetupReminder } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
-  const { authenticated, ready, checkAuth, sessionExpired } = useAuthStore();
+  const {
+    authenticated, ready, checkAuth, sessionExpired, setupPending,
+  } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
@@ -52,6 +55,13 @@ function App() {
   // token is not that decision: the instance may still be unset-up, and
   // rendering on the token alone landed on /chat before the answer arrived.
   if (!ready) return null;
+  // An instance nobody has claimed yet gets the wizard instead of the login
+  // page, even with no session: the claim endpoint is unauthenticated (the
+  // state it ends admits everybody anyway), and the tab that arrives with a
+  // dead token in storage would otherwise be asked for a password that does
+  // not exist yet. Decided after `ready`, so it is the descriptor's answer
+  // rather than the absence of one.
+  if (!authenticated && setupPending) return <SetupPage />;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
   // overlay, so nothing you had typed is thrown away to ask for it.
@@ -100,6 +110,7 @@ function App() {
       )}
 
       <NotificationToast />
+      <SetupReminder />
       <ShortcutsModal />
     </>
   );
