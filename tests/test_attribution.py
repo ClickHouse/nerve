@@ -483,7 +483,7 @@ class TestAutonomousWorkIsTheSystemPrincipal:
         ]
 
     async def test_an_unresolvable_principal_writes_nothing_and_says_so(
-        self, install, monkeypatch, caplog,
+        self, install, monkeypatch,
     ):
         """Unreachable in production — every opener bootstraps the identity
         before it can serve — so what matters is *which way* it fails if it
@@ -543,14 +543,15 @@ class TestAutonomousWorkIsTheSystemPrincipal:
             for event in _codex_thread("thread-orphan", workspace):
                 await ingester.ingest(event)
 
-        # The MCP resolver already swallows a failed satellite create into its
-        # log rather than failing the connection — so there it is reported, and
-        # what matters is the same: no row.
-        with caplog.at_level("ERROR"):
+        # The satellite resolver refuses too. Its return value becomes the
+        # session a tool handler runs under and the key its audit row is
+        # written against, so handing back an id with no row behind it would
+        # let a tool with real side effects run unattributed and unaudited —
+        # see test_mcp_attribution_gate.py for the end-to-end proof.
+        with pytest.raises(ActorResolutionError):
             await SatelliteSessionResolver(install.db).resolve(
                 client_name="claude-code", mcp_session_id="mcp-orphan",
             )
-        assert any(r.levelname == "ERROR" for r in caplog.records)
 
         # Not one row anywhere. The fixture creates no sessions, so an empty
         # list is the whole claim: nothing was written unattributed, and
