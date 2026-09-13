@@ -123,11 +123,6 @@ function isCurrentAuthSession(generation: number): boolean {
   return generation === authGeneration;
 }
 
-/** A stale attempt must not clear a newer session's token. */
-function discardOwnToken(token: string): void {
-  if (getToken() === token) clearToken();
-}
-
 /** Bind delayed optimistic work to the actor and auth session that requested it. */
 export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
   const generation = authGeneration;
@@ -176,11 +171,13 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // Never install a credential for a session logout already ended.
     if (!isCurrentAuthSession(generation)) return;
 
-    setToken(token);
+    const tokenRevision = setToken(token);
     const identity = await loadIdentity();
-    // Take back only this attempt's token; a newer login may own storage now.
+    // Take back only this attempt's token revision. JWTs minted for the same
+    // account in one second can be byte-identical, so string equality cannot
+    // distinguish this stale attempt from a newer login.
     if (!isCurrentAuthSession(generation)) {
-      discardOwnToken(token);
+      clearToken(tokenRevision);
       return;
     }
 
@@ -292,10 +289,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       try {
         const { token: fresh } = await api.login('');
         if (!isCurrentAuthSession(authSession)) return;
-        setToken(fresh);
+        const tokenRevision = setToken(fresh);
         const identity = await loadIdentity();
         if (!isCurrentAuthSession(authSession)) {
-          discardOwnToken(fresh);
+          clearToken(tokenRevision);
           return;
         }
         sessionEstablished = true;
