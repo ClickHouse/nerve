@@ -144,17 +144,6 @@ WS_REVOKED_CODE = 1008
 WS_REVOKED_REASON = "Session ended; sign in again"
 
 
-async def _account_session_epoch(account_id: str | None) -> int | None:
-    """The account's current session epoch, or ``None`` when there is no account."""
-    if not account_id:
-        return None
-    store = identity_store()
-    if store is None:  # pragma: no cover - the socket authenticated a moment ago
-        return None
-    account = await store.get_account(account_id)
-    return int((account or {}).get("session_epoch") or 0)
-
-
 async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
     """Accept a socket, authenticate it, and fix its actor for good.
 
@@ -163,10 +152,11 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
     account this instance can act for (a disabled account, a pre-account token
     on an install that now has two, or a session the claim has ended).
 
-    The epoch recorded here is the **account row's**, not the token's. They are
-    equal at this point — the handshake refused anything older — and the row is
-    the value the per-frame check compares against, so reading it once here is
-    what makes "has this moved since we let them in" a single comparison later.
+    The epoch recorded here is **the credential's own**, carried on the actor
+    that authenticating it produced. Reading it back off the account row here
+    would be a second read, and a claim committing between the two would hand
+    this connection the epoch the claim had just written — promoting exactly
+    the session the claim exists to end, and making every later check pass.
     """
     await websocket.accept()
     actor = await authenticate_websocket(websocket)
@@ -176,7 +166,7 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
     return WebSocketConnection(
         client_id=str(uuid.uuid4())[:8],
         actor=actor,
-        session_epoch=await _account_session_epoch(actor.account_id),
+        session_epoch=actor.session_epoch,
     )
 
 
@@ -1081,6 +1071,18 @@ def create_app() -> FastAPI:
         _live_sockets[client_id] = (connection, websocket)
         active_session: str | None = None
         try:
+            # Registered, *then* re-checked. A claim that committed between
+            # verifying the credential and getting here would otherwise have
+            # walked the registry before this entry existed and left the
+            # connection open; asking again once it is findable closes that
+            # window from the other side. Cheap — one indexed read — and it
+            # runs before the connection is given a session or a listener.
+            if not await _connection_still_authorised(connection):
+                await websocket.close(
+                    code=WS_REVOKED_CODE, reason=WS_REVOKED_REASON,
+                )
+                return
+
             router = _engine.router
             # Reuse the last session for this channel (no sticky period).
             # Only create a brand-new session if none exist at all.
