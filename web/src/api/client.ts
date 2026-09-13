@@ -868,8 +868,10 @@ export const api = {
     formData.append('session_id', sessionId);
     files.forEach(f => formData.append('files', f));
 
+    const requestToken = authToken;
+    const requestRevision = tokenRevision;
     const headers: Record<string, string> = {};
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    if (requestToken) headers['Authorization'] = `Bearer ${requestToken}`;
 
     const res = await fetch(`${API_BASE}/files/upload`, {
       method: 'POST',
@@ -877,11 +879,12 @@ export const api = {
       body: formData,
     });
 
-    absorbRefreshedToken(res);
-
     if (res.status === 401) {
-      throw handleUnauthorized();
+      throw handleUnauthorized(requestRevision);
     }
+
+    absorbRefreshedToken(res, requestRevision);
+
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`${res.status}: ${body}`);
