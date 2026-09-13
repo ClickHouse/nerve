@@ -1057,50 +1057,58 @@ def create_app() -> FastAPI:
             return
 
         client_id = connection.client_id
+        # Registered before anything can fail, and removed in the `finally`
+        # that covers everything after it: a handshake that dies half way — a
+        # client that closes the tab while the session is being resolved —
+        # would otherwise leave an entry naming a socket nobody will ever
+        # close.
         _live_sockets[client_id] = (connection, websocket)
-        router = _engine.router
-        # Reuse the last session for this channel (no sticky period).
-        # Only create a brand-new session if none exist at all.
-        active_session = await router.get_last_session("web:default")
-        if not active_session:
-            # Not through the router: this ingress knows *who* connected, so
-            # the session it mints belongs to that person rather than to the
-            # web channel in general.
-            active_session = await _engine.sessions.get_active_session(
-                "web:default", source="web", actor=connection.actor,
-            )
-        logger.info("WebSocket connected: %s (session: %s)", client_id, active_session)
-
-        # Register as broadcast listener for the active session
-        async def ws_broadcast(session_id: str, message: dict):
-            try:
-                await websocket.send_json(message)
-            except Exception:
-                pass
-
-        await broadcaster.register(active_session, client_id, ws_broadcast)
-        # Also register on __global__ channel for cross-session notifications
-        await broadcaster.register("__global__", f"global:{client_id}", ws_broadcast)
-
-        # Inform the client which session they're connected to
-        await websocket.send_json({
-            "type": "session_switched",
-            "session_id": active_session,
-        })
-
-        # If a turn is mid-flight (page reload, transient WS drop, sticky
-        # reconnect after a network blip), replay the broadcaster buffer so
-        # the freshly-bound listener can rebuild the in-flight stream
-        # without waiting for new events. Idle sessions get nothing here;
-        # they hydrate via REST + the existing ``session_switched`` event.
-        if broadcaster.is_buffering(active_session):
-            is_running = _engine.is_session_running(active_session)
-            session_record = await _engine.db.get_session(active_session)
-            await _send_session_status(
-                websocket, active_session, is_running, session_record,
-            )
-
+        active_session: str | None = None
         try:
+            router = _engine.router
+            # Reuse the last session for this channel (no sticky period).
+            # Only create a brand-new session if none exist at all.
+            active_session = await router.get_last_session("web:default")
+            if not active_session:
+                # Not through the router: this ingress knows *who* connected,
+                # so the session it mints belongs to that person rather than
+                # to the web channel in general.
+                active_session = await _engine.sessions.get_active_session(
+                    "web:default", source="web", actor=connection.actor,
+                )
+            logger.info(
+                "WebSocket connected: %s (session: %s)", client_id, active_session,
+            )
+
+            # Register as broadcast listener for the active session
+            async def ws_broadcast(session_id: str, message: dict):
+                try:
+                    await websocket.send_json(message)
+                except Exception:
+                    pass
+
+            await broadcaster.register(active_session, client_id, ws_broadcast)
+            # Also register on __global__ channel for cross-session notifications
+            await broadcaster.register("__global__", f"global:{client_id}", ws_broadcast)
+
+            # Inform the client which session they're connected to
+            await websocket.send_json({
+                "type": "session_switched",
+                "session_id": active_session,
+            })
+
+            # If a turn is mid-flight (page reload, transient WS drop, sticky
+            # reconnect after a network blip), replay the broadcaster buffer so
+            # the freshly-bound listener can rebuild the in-flight stream
+            # without waiting for new events. Idle sessions get nothing here;
+            # they hydrate via REST + the existing ``session_switched`` event.
+            if broadcaster.is_buffering(active_session):
+                is_running = _engine.is_session_running(active_session)
+                session_record = await _engine.db.get_session(active_session)
+                await _send_session_status(
+                    websocket, active_session, is_running, session_record,
+                )
+
             while True:
                 data = await websocket.receive_json()
                 # Before anything is *done* with the frame. The credential was
@@ -1263,7 +1271,8 @@ def create_app() -> FastAPI:
             logger.warning("WebSocket error for %s: %s", client_id, e)
         finally:
             _live_sockets.pop(client_id, None)
-            await broadcaster.unregister(active_session, client_id)
+            if active_session is not None:
+                await broadcaster.unregister(active_session, client_id)
             await broadcaster.unregister("__global__", f"global:{client_id}")
 
     # Health check (no auth required) — must be before static mount
