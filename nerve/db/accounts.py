@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -9,7 +10,105 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BOOTSTRAP_CREDENTIAL_SOURCES = ("config", "none")
+CREDENTIAL_SOURCES = ("config", "local", "none")
 JWT_SECRET_NAME = "jwt_secret"
+
+# Sentinel for "leave this field alone" in partial updates, distinct from None
+# (which clears a nullable field).
+_UNSET = object()
+
+
+# Usernames are mutable lookup keys, never actor identities. ASCII-only storage
+# makes SQLite's NOCASE uniqueness complete.
+USERNAME_PATTERN = r"^[a-z0-9][a-z0-9._-]{1,31}$"
+_USERNAME_RE = re.compile(USERNAME_PATTERN)
+USERNAME_MIN_LENGTH = 2
+USERNAME_MAX_LENGTH = 32
+
+# Token subjects and authority-like/path names must not become logins.
+RESERVED_USERNAMES = frozenset({
+    "user",
+    "admin",
+    "system",
+    "nerve",
+    "agent-system",
+    "backend-agent",
+    "external-agent-mcp",
+    "root",
+    "me",
+})
+
+
+class AccountError(ValueError):
+    """A rule about accounts was broken. Ingress turns these into 4xx."""
+
+
+class InvalidUsernameError(AccountError):
+    """The username is empty, too short or long, or outside the character set."""
+
+
+class ReservedUsernameError(AccountError):
+    """The username is one this instance keeps for itself."""
+
+
+class UsernameTakenError(AccountError):
+    """Another account already has this username (compared case-insensitively)."""
+
+
+class PasswordlessInstanceError(AccountError):
+    """A second account cannot exist while the first has no password."""
+
+
+class UnnamedAccountError(AccountError):
+    """An existing account needs a username before a second can exist."""
+
+
+class NotClaimableError(AccountError):
+    """The claim target is not exactly one unsecured account."""
+
+
+class LastAccountError(AccountError):
+    """The last enabled account cannot be disabled."""
+
+
+def normalise_username(raw: str | None) -> str:
+    """Strip, lower-case and validate a username, or raise."""
+    if raw is None:
+        raise InvalidUsernameError("A username is required")
+    candidate = str(raw).strip().lower()
+    if not candidate:
+        raise InvalidUsernameError("A username is required")
+    if not _USERNAME_RE.match(candidate):
+        raise InvalidUsernameError(
+            f"Usernames are {USERNAME_MIN_LENGTH}–{USERNAME_MAX_LENGTH} characters, "
+            "start with a letter or digit, and may otherwise contain letters, "
+            "digits, '.', '_' and '-'."
+        )
+    if candidate in RESERVED_USERNAMES:
+        raise ReservedUsernameError(f"'{candidate}' is reserved; choose another username")
+    return candidate
+
+
+@dataclass(frozen=True, slots=True)
+class LoginState:
+    """Non-identifying facts shared by login and legacy-token resolution."""
+
+    single_account: bool
+    # A named account without a credential is still passwordless.
+    passwordless: bool
+    sole_account_id: str | None = None
+
+
+def login_state_from(accounts: list[dict]) -> LoginState:
+    """Build login state from rows a caller may already need for timing."""
+    if len(accounts) != 1:
+        return LoginState(single_account=False, passwordless=False)
+    sole = accounts[0]
+    return LoginState(
+        single_account=True,
+        passwordless=sole["credential_source"] == "none",
+        sole_account_id=sole["id"],
+    )
 
 
 def _now() -> str:
@@ -35,6 +134,78 @@ class BootstrapAccount:
 
 class AccountStore:
     """Database mixin; callers use higher-level account and identity services."""
+
+    # -- actor_refs ----------------------------------------------------------
+
+    async def get_actor_ref(self, actor_id: str) -> dict | None:
+        async with self.db.execute(
+            "SELECT * FROM actor_refs WHERE id = ?", (actor_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def list_actor_refs(self, *, kind: str | None = None) -> list[dict]:
+        if kind is None:
+            sql, params = "SELECT * FROM actor_refs ORDER BY created_at, id", ()
+        else:
+            sql = "SELECT * FROM actor_refs WHERE kind = ? ORDER BY created_at, id"
+            params = (kind,)
+        async with self.db.execute(sql, params) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def update_actor_profile(
+        self,
+        actor_id: str,
+        *,
+        display_name: str | None | object = _UNSET,
+    ) -> dict | None:
+        """Rename an actor without rewriting authorship references."""
+        if display_name is _UNSET:
+            return await self.get_actor_ref(actor_id)
+        await self._write(
+            "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+            (display_name, actor_id),
+        )
+        return await self.get_actor_ref(actor_id)
+
+    # -- accounts ------------------------------------------------------------
+
+    async def get_account(self, account_id: str) -> dict | None:
+        async with self.db.execute(
+            "SELECT * FROM accounts WHERE id = ?", (account_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _account(row) if row else None
+
+    async def get_account_by_actor(self, actor_id: str) -> dict | None:
+        async with self.db.execute(
+            "SELECT * FROM accounts WHERE actor_id = ?", (actor_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _account(row) if row else None
+
+    async def get_account_by_username(self, username: str) -> dict | None:
+        """Case-insensitive lookup, matching the unique index."""
+        async with self.db.execute(
+            "SELECT * FROM accounts WHERE username = ? COLLATE NOCASE", (username,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _account(row) if row else None
+
+    async def list_accounts(self, *, include_disabled: bool = True) -> list[dict]:
+        sql = "SELECT * FROM accounts"
+        if not include_disabled:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY created_at, id"
+        async with self.db.execute(sql) as cursor:
+            return [_account(row) async for row in cursor]
+
+    async def count_accounts(self, *, enabled_only: bool = False) -> int:
+        sql = "SELECT COUNT(*) FROM accounts"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        async with self.db.execute(sql) as cursor:
+            return (await cursor.fetchone())[0]
 
     async def _count_accounts(self) -> int:
         async with self.db.execute("SELECT COUNT(*) FROM accounts") as cursor:
@@ -120,6 +291,268 @@ class AccountStore:
             "UPDATE accounts SET credential_source = ?, credential = NULL WHERE id = ?",
             (credential_source, account_id),
         )
+
+    # -- account management --------------------------------------------------
+    # Guards share their BEGIN IMMEDIATE transaction with the mutation. Accounts
+    # are disabled, never deleted, so single-account relaxations cannot return.
+
+    async def login_state(self) -> LoginState:
+        """The account-shaped facts that decide how a caller may log in.
+
+        One read, one predicate — see :class:`LoginState`. ``passwordless``
+        keys off ``credential_source = 'none'``; a ``config`` row counts as
+        having a credential because the startup mirror keeps that value in step
+        with ``auth.password_hash`` (a row is only left on ``config`` while one
+        is configured), and PR 3's startup migration moves every such row to
+        ``local`` anyway.
+        """
+        return login_state_from(await self.list_accounts())
+
+    async def create_managed_account(
+        self,
+        *,
+        username: str,
+        credential: str,
+        display_name: str | None = None,
+    ) -> dict:
+        """Atomically create a human actor and its password-bearing account."""
+        username = normalise_username(username)
+        if not credential:
+            raise AccountError("A new account needs a password")
+
+        actor_id, account_id = _new_id(), _new_id()
+        async with self._atomic():
+            # The write lock up front: the guards below are read-then-write, and
+            # a deferred transaction would let two callers both read a state
+            # that permits the insert and then both perform it.
+            await self.db.execute("BEGIN IMMEDIATE")
+
+            async with self.db.execute(
+                "SELECT username, credential_source FROM accounts"
+            ) as cursor:
+                existing = [dict(row) async for row in cursor]
+
+            if len(existing) == 1 and existing[0]["credential_source"] == "none":
+                raise PasswordlessInstanceError(
+                    "This instance is passwordless, so a second account could not "
+                    "be told apart from the first. Set a password on the existing "
+                    "account before adding anyone."
+                )
+            if existing and any(not row["username"] for row in existing):
+                raise UnnamedAccountError(
+                    "An existing account has no username, and an account without "
+                    "one cannot be logged into once a second account exists. Give "
+                    "the existing account a username first."
+                )
+
+            async with self.db.execute(
+                "SELECT 1 FROM accounts WHERE username = ? COLLATE NOCASE", (username,)
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise UsernameTakenError(
+                        f"The username '{username}' is already taken"
+                    )
+
+            now = _now()
+            await self.db.execute(
+                """INSERT INTO actor_refs (id, kind, display_name, created_at)
+                   VALUES (?, 'human', ?, ?)""",
+                (actor_id, display_name, now),
+            )
+            try:
+                await self.db.execute(
+                    """INSERT INTO accounts
+                           (id, actor_id, username, credential_source, credential,
+                            enabled, created_at)
+                       VALUES (?, ?, ?, 'local', ?, 1, ?)""",
+                    (account_id, actor_id, username, credential, now),
+                )
+            except sqlite3.IntegrityError as e:
+                # The unique index is the real arbiter of the check above: two
+                # processes racing on the same name are serialised by it, not by
+                # the SELECT. The actor insert rolls back with this.
+                raise UsernameTakenError(
+                    f"The username '{username}' is already taken"
+                ) from e
+
+        return await self.get_account(account_id)  # type: ignore[return-value]
+
+    async def update_account_login(
+        self,
+        account_id: str,
+        *,
+        username: str | object = _UNSET,
+        credential: str | object = _UNSET,
+    ) -> dict | None:
+        """Change a username and/or move its password to the account row."""
+        sets: list[str] = []
+        params: list = []
+        if username is not _UNSET:
+            normalised = normalise_username(username)  # type: ignore[arg-type]
+            sets.append("username = ?")
+            params.append(normalised)
+        if credential is not _UNSET:
+            if not credential:
+                raise AccountError("A password is required")
+            sets.append("credential_source = 'local'")
+            sets.append("credential = ?")
+            params.append(credential)
+        if not sets:
+            return await self.get_account(account_id)
+
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            async with self.db.execute(
+                "SELECT 1 FROM accounts WHERE id = ?", (account_id,)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            params.append(account_id)
+            try:
+                await self.db.execute(
+                    f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", tuple(params),
+                )
+            except sqlite3.IntegrityError as e:
+                raise UsernameTakenError("That username is already taken") from e
+        return await self.get_account(account_id)
+
+    async def replace_credential_if_unchanged(
+        self, account_id: str, *, expected: str, credential: str,
+    ) -> bool:
+        """Replace a local hash only if its source and value are unchanged."""
+        if not expected or not credential:
+            raise AccountError("both the expected and the new credential are required")
+        result = await self._write(
+            """UPDATE accounts
+                  SET credential = ?
+                WHERE id = ? AND credential = ? AND credential_source = 'local'""",
+            (credential, account_id, expected),
+        )
+        return result.rowcount > 0
+
+    async def set_account_credential_if_source(
+        self,
+        account_id: str,
+        *,
+        expected_source: str,
+        credential_source: str,
+        credential: str | None = None,
+    ) -> bool:
+        """Move a credential only while its source is still the one observed."""
+        for source in (expected_source, credential_source):
+            if source not in CREDENTIAL_SOURCES:
+                raise ValueError(
+                    f"credential_source must be one of {CREDENTIAL_SOURCES}, "
+                    f"got {source!r}"
+                )
+        if credential_source == "local":
+            if not credential:
+                raise ValueError(
+                    "credential is required when moving to credential_source='local'"
+                )
+        else:
+            credential = None
+        result = await self._write(
+            """UPDATE accounts
+                  SET credential_source = ?, credential = ?
+                WHERE id = ? AND credential_source = ?""",
+            (credential_source, credential, account_id, expected_source),
+        )
+        return result.rowcount > 0
+
+    async def claim_sole_account(
+        self,
+        *,
+        username: str,
+        credential: str,
+        display_name: str | None = None,
+    ) -> dict:
+        """Atomically name and secure exactly one unclaimed account.
+
+        The caller must separately authorize the claim; this DAL method only
+        makes its precondition and writes indivisible.
+        """
+        username = normalise_username(username)
+        if not credential:
+            raise AccountError("A password is required")
+
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            async with self.db.execute(
+                "SELECT id, actor_id, credential_source FROM accounts"
+            ) as cursor:
+                rows = [dict(row) async for row in cursor]
+            if len(rows) != 1:
+                raise NotClaimableError(
+                    "Claiming is for an install with exactly one account; this "
+                    f"one has {len(rows)}."
+                )
+            account = rows[0]
+            if account["credential_source"] != "none":
+                raise NotClaimableError(
+                    "This account already has a password, so it has been claimed "
+                    "already. Sign in instead."
+                )
+
+            try:
+                await self.db.execute(
+                    """UPDATE accounts
+                          SET username = ?, credential_source = 'local',
+                              credential = ?
+                        WHERE id = ?""",
+                    (username, credential, account["id"]),
+                )
+            except sqlite3.IntegrityError as e:  # pragma: no cover - one account
+                raise UsernameTakenError(
+                    f"The username '{username}' is already taken"
+                ) from e
+            if display_name is not None:
+                await self.db.execute(
+                    "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+                    (display_name or None, account["actor_id"]),
+                )
+        return await self.get_account(account["id"])  # type: ignore[return-value]
+
+    async def disable_account(self, account_id: str) -> dict | None:
+        """Idempotently disable an account unless it is the last enabled one."""
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            account = await self.get_account(account_id)
+            if account is None:
+                return None
+            if not account["enabled"]:
+                return account
+            cursor = await self.db.execute(
+                """UPDATE accounts
+                      SET enabled = 0
+                    WHERE id = ? AND enabled = 1
+                      AND (SELECT COUNT(*) FROM accounts WHERE enabled = 1) > 1""",
+                (account_id,),
+            )
+            changed = cursor.rowcount
+            await cursor.close()
+            if not changed:
+                raise LastAccountError(
+                    "This is the last enabled account. Disabling it would lock "
+                    "everybody out, so it is refused — add another account first, "
+                    "or disable a different one."
+                )
+        return await self.get_account(account_id)
+
+    async def enable_account(self, account_id: str) -> dict | None:
+        """Re-enable an account. Idempotent; ``None`` if there is no such account."""
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            account = await self.get_account(account_id)
+            if account is None:
+                return None
+            if account["enabled"]:
+                return account
+            await self.db.execute(
+                "UPDATE accounts SET enabled = 1 WHERE id = ?",
+                (account_id,),
+            )
+        return await self.get_account(account_id)
 
     async def get_system_principal(self) -> dict:
         """Compatibility accessor for the migration-guaranteed system actor."""

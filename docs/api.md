@@ -7,24 +7,38 @@ All endpoints require JWT authentication via `Authorization: Bearer <token>` hea
 ### Auth
 
 #### `POST /api/auth/login`
-Login with password, receive JWT.
+Log in, receive a JWT.
 
 ```json
-Request:  { "password": "..." }
+Request:  { "password": "...", "username": "alice" }
 Response: { "token": "eyJ..." }
 ```
 
-With no `auth.password_hash` configured the install is passwordless: any
-password is accepted and the token resolves to the single local account.
+`username` is **optional while exactly one account exists and required once
+there are two or more.** The account an upgrade created has none, so requiring
+one would lock that install out; supplying a username that does resolve is
+accepted at any time, so a client that always sends one keeps working the moment
+the account is named. Ask `GET /api/auth/status` which shape to collect rather
+than guessing.
+
+With no password anywhere — none on the account row and no `auth.password_hash`
+— the install is passwordless: any password is accepted and the token resolves
+to the single local account. That state exists only while there is exactly one
+account.
+
 Tokens are signed with `auth.jwt_secret`, or with the secret the gateway
 generated on first start when that is unset (see
 [Accounts and identity](accounts.md)); `503` means no signing secret exists
 yet, which only happens before the gateway has completed its first start.
 
 The result is a **session token**: `sub` is the account's id and `typ` is
-`session`. Treat it as opaque — the claims are the server's business. Password-
-only login is valid while exactly one account exists, and a disabled account
-cannot log in (`401`).
+`session`. Treat it as opaque — the claims are the server's business.
+
+| Outcome | Response |
+|---|---|
+| wrong password, unknown username, or no username where one is required | `401` `Invalid username or password` — identical in all three cases, and identical in how long it takes: a username that names nobody still costs a password comparison, an empty password is compared rather than refused early, and every refusal waits out a response budget calibrated from the slowest hash the install stores, so that no account's work factor is visible in the timing |
+| correct password, account disabled | `401` naming the reason, and only after the password checked out |
+| no signing secret, or identity storage not wired yet | `503` |
 
 #### Authenticated requests
 
@@ -44,11 +58,79 @@ per-account logins existed — those are upgraded on their first request rather
 than slid. The header is CORS-exposed, so a browser can read it cross-origin.
 
 #### `GET /api/auth/status`
-Whether a password is required to log in. No auth required.
+How to log in. No auth required.
 
 ```json
-Response: { "auth_required": true }
+Response: {
+  "auth_required": true,
+  "login": "password"
+}
 ```
+
+| Field | Meaning |
+|---|---|
+| `login` | what the form must collect: `none` (passwordless — send any password), `password` (one account, no username), `username_password` (two or more) |
+| `auth_required` | kept for older clients; equals `login != "none"` |
+
+Standalone passwordless installs auto-login and open Accounts; other signed-in
+sessions open the app, and signed-out sessions open the login page. **Auto-login
+with an empty password is correct for `none` and for nothing else** — with two
+accounts it names nobody and the server refuses it.
+
+Nothing here identifies anybody: no username, and not the number of accounts.
+Before the gateway has finished starting the answer is the fail-closed one
+(`login: "username_password"`, `auth_required: true`), which asks rather than
+assumes.
+
+### Accounts
+
+Every account may manage accounts — there are no roles — so these need only a
+valid session; an account is a person, so the credentials the instance mints for
+itself (`typ: system`) are refused with `403`. **No response ever carries a
+credential**, or says where one is stored.
+
+An account is:
+
+```json
+{
+  "id": "…", "actor_id": "…", "username": "alice", "display_name": "Alice",
+  "enabled": true, "has_password": true,
+  "created_at": "…"
+}
+```
+
+`id` is the login; `actor_id` is the person. They are different columns on the
+same row, and only `actor_id` is permanent — it is what attribution is recorded
+against and what survives a rename, so it is the id to resolve a displayed
+author through. `has_password` is the only thing published about the credential;
+where the hash lives is not.
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/accounts` | `{ "accounts": [...] }`, oldest first, disabled ones included |
+| `GET /api/accounts/me` | the signed-in account |
+| `POST /api/accounts` | `{username, password, display_name?}` → `201` and the new account |
+| `PATCH /api/accounts/{id}` | `{username?, display_name?}`. A rename moves no stored attribution |
+| `POST /api/accounts/{id}/disable` | idempotent |
+| `POST /api/accounts/{id}/enable` | idempotent |
+| `PUT /api/accounts/me/password` | `{current_password?, new_password}`. Own account only |
+
+Failures:
+
+| Response | When |
+|---|---|
+| `400` | the username is malformed or reserved, or the password is longer than bcrypt's 72 **bytes** (accented letters and emoji cost two to four each) — all facts about the request |
+| `403` | the system principal; or a password change without the current password |
+| `404` | no such account |
+| `409` | the username is taken; the instance is passwordless; an existing account has no username; this is the last enabled account. All four describe the *instance*, and the message says what to do first |
+
+The guards behind the `409`s are enforced inside the database transaction that
+would otherwise break them, so two concurrent calls cannot both win — there is
+no window in which two callers each disable the other's account and leave
+nobody.
+
+Disabling takes effect at the account's **next** request, not retroactively, and
+an open WebSocket keeps the identity it was accepted with until it reconnects.
 
 #### `GET /api/auth/check`
 Verify current authentication.

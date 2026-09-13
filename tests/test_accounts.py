@@ -9,6 +9,15 @@ import pytest
 
 from nerve.db import SCHEMA_VERSION, Database
 from nerve.db.base import IdentityInvariantError
+from nerve.db.accounts import (
+    RESERVED_USERNAMES,
+    InvalidUsernameError,
+    LastAccountError,
+    NotClaimableError,
+    ReservedUsernameError,
+    UsernameTakenError,
+    normalise_username,
+)
 
 
 async def _columns(db: Database, table: str) -> set[str]:
@@ -24,6 +33,28 @@ async def _insert_human(db: Database, *, name: str | None = None) -> str:
         (actor_id, name),
     )
     return actor_id
+
+
+async def _insert_account(
+    db: Database,
+    *,
+    actor_id: str | None = None,
+    display_name: str | None = None,
+    username: str | None = None,
+    source: str = "none",
+    credential: str | None = None,
+) -> dict:
+    """Seed account state explicitly without a fixture-only production DAL."""
+    actor_id = actor_id or await _insert_human(db, name=display_name)
+    account_id = str(uuid.uuid4())
+    await db._write(
+        """INSERT INTO accounts
+               (id, actor_id, username, credential_source, credential,
+                enabled, created_at)
+           VALUES (?, ?, ?, ?, ?, 1, 't')""",
+        (account_id, actor_id, username, source, credential),
+    )
+    return await db.get_account(account_id)
 
 
 def _corrupt_system_actor(path, shape: str) -> None:
@@ -130,7 +161,6 @@ async def test_system_actor_cannot_be_duplicated_deleted_or_reclassified(db: Dat
             (db.system_actor_id, human),
         )
     assert (await db.get_system_principal())["id"] == db.system_actor_id
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["zero", "multiple", "wrong-kind"])
@@ -243,3 +273,182 @@ async def test_account_actor_ids_are_distinct_and_usernames_casefold(db: Databas
         await db._write(
             "UPDATE actor_refs SET kind = 'system' WHERE id = ?", (first,)
         )
+class TestUsernameNormalisation:
+    """Character set, case folding and the reserved list (PR 3). Pure
+    function — no database, so no asyncio mark."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("alice", "alice"),
+        ("Alice", "alice"),
+        ("  Alice  ", "alice"),
+        ("ALICE", "alice"),
+        ("a1", "a1"),
+        ("0bob", "0bob"),
+        ("alice.b", "alice.b"),
+        ("alice_b", "alice_b"),
+        ("alice-b", "alice-b"),
+        ("a" * 32, "a" * 32),
+        # Surrounding whitespace, including a stray newline from a paste, is
+        # stripped rather than refused.
+        ("alice\n", "alice"),
+    ])
+    def test_accepted_and_lower_cased(self, raw, expected):
+        assert normalise_username(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        None, "", "   ", "a", ".alice", "-alice", "_alice", "al ice", "alice!",
+        "alice@example", "a" * 33, "álice", "ALİCE", "ali\nce", "alice/../bob",
+    ])
+    def test_refused(self, raw):
+        with pytest.raises(InvalidUsernameError):
+            normalise_username(raw)
+
+    def test_the_legacy_token_subject_is_reserved(self):
+        """PR 2's grandfather clause gives the literal string a meaning in
+        tokens, so it must never also be somebody's login."""
+        from nerve.gateway.auth import LEGACY_SUBJECT
+
+        assert LEGACY_SUBJECT in RESERVED_USERNAMES
+        with pytest.raises(ReservedUsernameError):
+            normalise_username(LEGACY_SUBJECT)
+
+    @pytest.mark.parametrize("raw", sorted(RESERVED_USERNAMES))
+    def test_every_reserved_name_is_refused_in_any_case(self, raw):
+        with pytest.raises(ReservedUsernameError):
+            normalise_username(raw.upper())
+
+    def test_the_other_token_subjects_are_reserved(self):
+        from nerve.gateway import auth as gw_auth
+
+        assert gw_auth.SYSTEM_SUBJECT in RESERVED_USERNAMES
+        for subject in ("backend-agent", "external-agent-mcp"):
+            assert subject in RESERVED_USERNAMES
+
+
+@pytest.mark.asyncio
+class TestManagedAccountCreation:
+    async def _owner(self, db: Database):
+        return await _insert_account(
+            db, display_name="Alice", source="local",
+            credential="$2b$12$synthetic", username="alice",
+        )
+
+    async def test_two_connections_create_one_account_and_no_orphan_actor(
+        self, db: Database,
+    ):
+        import asyncio
+
+        await self._owner(db)
+        other = Database(db.db_path)
+        await other.connect()
+        try:
+            results = await asyncio.gather(
+                db.create_managed_account(username="bob", credential="$2b$12$x"),
+                other.create_managed_account(username="BOB", credential="$2b$12$y"),
+                return_exceptions=True,
+            )
+        finally:
+            await other.close()
+        taken = [r for r in results if isinstance(r, UsernameTakenError)]
+        made = [r for r in results if isinstance(r, dict)]
+        assert len(taken) == 1 and len(made) == 1
+        assert await db.count_accounts() == 2
+        assert len(await db.list_actor_refs(kind="human")) == 2
+
+
+@pytest.mark.asyncio
+class TestLastAccountGuard:
+    async def _two(self, db: Database):
+        ids = []
+        for name in ("alice", "bob"):
+            ids.append((await _insert_account(
+                db, source="local", credential="$2b$12$synthetic", username=name,
+            ))["id"])
+        return ids
+
+    async def test_two_connections_cannot_both_disable(self, db: Database, tmp_path):
+        """The guard has to hold across *processes* too — a `nerve` CLI beside
+        the daemon — which is what BEGIN IMMEDIATE inside the transaction buys:
+        the in-process write lock is not in play on a second connection."""
+        import asyncio
+
+        first, second = await self._two(db)
+        other = Database(db.db_path)
+        await other.connect()
+        try:
+            results = await asyncio.gather(
+                db.disable_account(first),
+                other.disable_account(second),
+                return_exceptions=True,
+            )
+        finally:
+            await other.close()
+        refused = [r for r in results if isinstance(r, LastAccountError)]
+        assert len(refused) == 1, results
+        assert await db.count_accounts(enabled_only=True) == 1
+
+
+@pytest.mark.asyncio
+class TestClaimingTheSoleAccount:
+    """The first-run "claim and secure" step, for the setup wizard. One
+    transaction, and the precondition checked inside it."""
+
+    async def _unclaimed(self, db: Database) -> dict:
+        return await _insert_account(db)
+
+    async def test_names_and_secures_in_one_step(self, db: Database):
+        account = await self._unclaimed(db)
+        claimed = await db.claim_sole_account(
+            username="Alice", credential="$2b$12$claimed", display_name="Alice A",
+        )
+        assert claimed["id"] == account["id"]
+        assert claimed["username"] == "alice"          # normalised on the way in
+        assert claimed["credential_source"] == "local"
+        assert claimed["credential"] == "$2b$12$claimed"
+        actor = await db.get_actor_ref(account["actor_id"])
+        assert actor["display_name"] == "Alice A"
+        assert not (await db.login_state()).passwordless
+
+    async def test_an_already_claimed_account_is_refused(self, db: Database):
+        await self._unclaimed(db)
+        await db.claim_sole_account(username="alice", credential="$2b$12$first")
+        with pytest.raises(NotClaimableError):
+            await db.claim_sole_account(username="bob", credential="$2b$12$second")
+        (account,) = await db.list_accounts()
+        assert account["username"] == "alice"
+        assert account["credential"] == "$2b$12$first"
+
+    async def test_an_install_without_one_account_is_refused(self, db: Database):
+        with pytest.raises(NotClaimableError):
+            await db.claim_sole_account(username="alice", credential="$2b$12$x")
+        await self._unclaimed(db)
+        await self._unclaimed(db)
+        with pytest.raises(NotClaimableError):
+            await db.claim_sole_account(username="alice", credential="$2b$12$x")
+
+    async def test_two_connections_racing_to_claim_leave_one_winner(
+        self, db: Database, tmp_path,
+    ):
+        """The reason this exists rather than get_sole_account() +
+        update_account_login(): those are two transactions, so the second caller
+        reads "one account, no password" before the first commits and quietly
+        replaces its password with its own."""
+        import asyncio
+
+        await self._unclaimed(db)
+        other = Database(db.db_path)
+        await other.connect()
+        try:
+            results = await asyncio.gather(
+                db.claim_sole_account(username="alice", credential="$2b$12$alice"),
+                other.claim_sole_account(username="bob", credential="$2b$12$bob"),
+                return_exceptions=True,
+            )
+        finally:
+            await other.close()
+        refused = [r for r in results if isinstance(r, NotClaimableError)]
+        won = [r for r in results if isinstance(r, dict)]
+        assert len(refused) == 1 and len(won) == 1, results
+        (account,) = await db.list_accounts()
+        assert account["username"] == won[0]["username"]
+        assert account["credential"] == won[0]["credential"]

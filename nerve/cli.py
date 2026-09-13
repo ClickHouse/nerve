@@ -1178,14 +1178,53 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] SSL not configured")
 
-    # Check auth
-    if config.auth.password_hash:
-        lines.append("[OK] Auth password hash configured")
-    else:
+    # Check auth. The credential lives on the account row, not in configuration:
+    # the startup migration copied auth.password_hash across and removed the key,
+    # so reading that key here would call a perfectly well-secured install
+    # "passwordless". Read-only, and tolerant of a database that does not exist
+    # yet (None) — that is a fresh install, which the wizard is about to shape.
+    #
+    # Which rows count as having a password is asked of the same function the
+    # login route asks, not restated: a `none` row reads auth.password_hash too
+    # (a reload that adds one takes effect before the next restart re-derives
+    # the row), so judging by the row alone told operators that an *active*
+    # password did nothing — and removing it on that advice would have opened
+    # the instance.
+    from nerve.db.accounts import inspect_bootstrap_state
+    from nerve.gateway.auth import source_authenticates
+
+    configured = bool(config.auth.password_hash)
+    identity_state = inspect_bootstrap_state(paths.db_path())
+    sources = identity_state[0] if identity_state is not None else None
+    usable = [
+        source for source in (sources or [])
+        if source_authenticates(source, configured_password=configured)
+    ]
+    if sources is None:
+        lines.append("[--] Accounts: nerve.db not created yet (first start will)")
+    elif not sources:
+        warnings.append("[WARN] No local account yet — the next start creates one")
+    elif not usable:
         warnings.append(
-            "[WARN] Auth password not set — passwordless: anyone who can reach "
+            "[WARN] No password set — passwordless: anyone who can reach "
             "the gateway acts as the owner"
         )
+    else:
+        lines.append(
+            f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
+        )
+    if configured and sources is not None:
+        reading = [source for source in sources if source != "local"]
+        if reading:
+            lines.append(
+                f"[OK] auth.password_hash is in use by {len(reading)} account(s) "
+                "— the next start copies it onto them and removes the key"
+            )
+        else:
+            warnings.append(
+                "[WARN] auth.password_hash is set but no account uses it — every "
+                "account has its own password now; the configured value does nothing"
+            )
 
     if config.auth.jwt_secret:
         lines.append("[OK] JWT secret configured")
