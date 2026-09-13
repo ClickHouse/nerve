@@ -68,6 +68,29 @@ def _hostname_of(value: str) -> str:
     return host.lower()
 
 
+def _origin_tuple(value: str, *, default_scheme: str = "") -> tuple[str, str, int]:
+    """``(scheme, host, effective port)`` — a whole origin, not just its host.
+
+    Comparing hostnames alone makes every port and both schemes on this
+    machine one origin, which they are not: a page served by something else on
+    ``127.0.0.1:3000`` is a different author from the instance on
+    ``127.0.0.1:8900``, and the browser's own rules say so.
+    """
+    if not value:
+        return ("", "", 0)
+    candidate = value if "//" in value else f"//{value}"
+    parts = urlsplit(candidate)
+    scheme = (parts.scheme or default_scheme).lower()
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return (scheme, host, -1)   # an unparseable port matches nothing
+    if port is None:
+        port = {"https": 443, "wss": 443, "http": 80, "ws": 80}.get(scheme, 0)
+    return (scheme, host, port)
+
+
 def host_is_this_instance(host_header: str, config) -> bool:
     """Whether ``Host`` names an address this instance actually answers on.
 
@@ -97,8 +120,13 @@ def host_is_this_instance(host_header: str, config) -> bool:
     return False
 
 
-def same_origin(headers, config) -> tuple[bool, str]:
+def same_origin(headers, config, *, scheme: str = "http") -> tuple[bool, str]:
     """``(ok, why_not)`` for "this request came from a page this instance served".
+
+    ``scheme`` is the request's own — an instance behind TLS sees
+    ``https://host`` in ``Origin`` and nothing in ``Host`` to say so, and
+    guessing ``http`` there would refuse the exemption to the instance's own
+    page.
 
     Conservative by construction: anything that says it came from somewhere
     else, and anything that cannot be read as having come from here, refuses
@@ -117,7 +145,22 @@ def same_origin(headers, config) -> tuple[bool, str]:
         return False, f"the browser reported it as a {fetch_site} request"
 
     origin = _header(headers, "origin")
-    if origin and origin.lower() != "null":
-        if _hostname_of(origin) != _hostname_of(host_header):
-            return False, f"it came from {origin}"
+    if not origin:
+        # No Origin at all: not a page (curl, a script on the machine). The
+        # peer address is the whole story for those, and Sec-Fetch-Site above
+        # has already refused any browser that said otherwise.
+        return True, ""
+    if origin.strip().lower() == "null":
+        # An opaque origin — a sandboxed frame, a `data:` document, some
+        # redirects. It names nobody, so it cannot be shown to be this
+        # instance, and "cannot be shown" is what the token is for.
+        return False, "it came from an opaque origin"
+
+    # The whole tuple. Host alone would make every port and both schemes on
+    # this machine one origin, and a page served by something else on
+    # 127.0.0.1:3000 is a different author from the instance on :8900.
+    target = _origin_tuple(host_header, default_scheme=(scheme or "http").lower())
+    source = _origin_tuple(origin, default_scheme=(scheme or "http").lower())
+    if source != target:
+        return False, f"it came from {origin}"
     return True, ""

@@ -122,9 +122,16 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   save: async (step, run) => {
+    // Stamped like `load()`. Alice starts a save, signs out, Bob signs in —
+    // and her answer, arriving afterwards, would install her instance state
+    // over his and clear the busy and error state of whatever *he* is doing.
+    // Every path after the await asks whether it is still hers to commit.
+    const asked = bindSender().stillCurrent;
     set({ busy: step, error: null });
     try {
-      set({ state: await run() });
+      const state = await run();
+      if (!asked()) return false;
+      set({ state });
       if (step === 'profile') {
         // A display name is a label everywhere else in the app and is stored
         // nowhere else — nothing carries the name it changed, so without this
@@ -135,23 +142,28 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       }
       return true;
     } catch (e) {
+      if (!asked()) return false;
       set({ error: errorDetail(e, 'Could not save that') });
       return false;
     } finally {
-      set({ busy: null });
+      if (asked()) set({ busy: null });
     }
   },
 
   skip: async (step, skipped) => {
+    const asked = bindSender().stillCurrent;
     set({ busy: step, error: null });
     try {
-      set({ state: await api.setupSkip(step, skipped) });
+      const state = await api.setupSkip(step, skipped);
+      if (!asked()) return false;
+      set({ state });
       return true;
     } catch (e) {
+      if (!asked()) return false;
       set({ error: errorDetail(e, 'Could not update the checklist') });
       return false;
     } finally {
-      set({ busy: null });
+      if (asked()) set({ busy: null });
     }
   },
 

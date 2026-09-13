@@ -691,6 +691,32 @@ class TestALocalBrowserIsNotAnyLocalPage:
             })
         assert response.status_code == 200, response.text
 
+    @pytest.mark.parametrize("origin,why", [
+        ("http://127.0.0.1:3000", "another port on this machine is another author"),
+        ("https://127.0.0.1:8900", "another scheme is another origin"),
+        ("null", "an opaque origin names nobody, so it cannot name this instance"),
+    ])
+    async def test_a_near_miss_origin_still_needs_the_token(
+        self, install, origin, why,
+    ):
+        """Host alone would make every port and both schemes on this machine
+        one origin. They are not, and the browser's own rules say so."""
+        await install.token()
+        response = await _claim(install, headers={"Origin": origin})
+        assert response.status_code == 403, why
+
+    async def test_an_https_instance_accepts_its_own_page(self, install):
+        """An instance behind TLS sees `https://host` in Origin and nothing in
+        Host to say so; guessing http would refuse its own page."""
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=install.app, client=_LOOPBACK),
+            base_url="https://127.0.0.1:8900",
+        ) as http:
+            response = await http.post("/api/setup/claim", json={
+                "username": "alice", "password": _PASSWORD,
+            }, headers={"Origin": "https://127.0.0.1:8900"})
+        assert response.status_code == 200, response.text
+
     async def test_the_origin_check_cannot_make_a_remote_caller_local(self, install):
         """It only ever *removes* the exemption. A claim from another machine
         needs the token however friendly its headers are."""
