@@ -1576,11 +1576,6 @@ class AgentEngine:
             )
             return 0
 
-        # Drain the queue up front so a resumed turn that triggers another
-        # restart re-enrolls into a clean file and ids are never double-run.
-        with contextlib.suppress(FileNotFoundError):
-            RESUME_QUEUE_FILE.unlink()
-
         seen: set[str] = set()
         ids: list[str] = []
         for line in raw.splitlines():
@@ -1590,6 +1585,17 @@ class AgentEngine:
                 ids.append(sid)
         if not ids:
             return 0
+
+        # Resolve before the queue file is deleted. Unlinking is what consumes
+        # the enrolment — nothing re-enrols an id afterwards — so a lookup that
+        # failed after it would forget every continuation the operator asked
+        # for, silently, with the sessions still sitting there resumable.
+        actor = await system_actor(self.db)
+
+        # Drain the queue up front so a resumed turn that triggers another
+        # restart re-enrolls into a clean file and ids are never double-run.
+        with contextlib.suppress(FileNotFoundError):
+            RESUME_QUEUE_FILE.unlink()
 
         resumed = 0
         for sid in ids:
@@ -1626,7 +1632,7 @@ class AgentEngine:
                     # it out of the transcript anyway. Whoever was talking to
                     # the session keeps their messages; the continuation is
                     # the assistant's.
-                    actor=await system_actor(self.db),
+                    actor=actor,
                 )
                 resumed += 1
             except Exception as e:

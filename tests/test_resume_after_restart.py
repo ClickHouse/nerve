@@ -14,6 +14,7 @@ import pytest
 from nerve import cli, paths
 from nerve.agent.engine import AgentEngine, _RESUME_AFTER_RESTART_PROMPT
 from nerve.agent.sessions import SessionStatus
+from nerve.identity import ActorResolutionError
 from tests.actor_rows import FAKE_SYSTEM_PRINCIPAL
 
 
@@ -54,6 +55,34 @@ async def test_no_queue_file_is_noop(tmp_path):
     with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
         assert await engine.resume_enrolled_sessions() == 0
     engine.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_leaves_the_queue_for_the_next_start(tmp_path):
+    """Unlinking the queue is what consumes the enrolment — nothing re-enrols
+    an id afterwards. So a failure before anything is resumed must leave the
+    file alone, or every continuation the operator asked for is forgotten
+    silently while the sessions sit there still resumable."""
+    qf = tmp_path / "resume-after-restart"
+    qf.write_text("S1\nS2\n")
+    engine = _engine_with({"S1": _session("S1"), "S2": _session("S2")})
+    engine.db.get_system_principal = AsyncMock(return_value=None)
+
+    with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
+        with pytest.raises(ActorResolutionError):
+            await engine.resume_enrolled_sessions()
+
+    assert qf.exists(), "the enrolment was consumed by a failure"
+    assert qf.read_text().split() == ["S1", "S2"]
+    engine.run.assert_not_awaited()
+
+    # The next start resumes them.
+    engine.db.get_system_principal = AsyncMock(
+        return_value=dict(FAKE_SYSTEM_PRINCIPAL),
+    )
+    with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
+        assert await engine.resume_enrolled_sessions() == 2
+    assert not qf.exists()
 
 
 @pytest.mark.asyncio
