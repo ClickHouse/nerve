@@ -250,6 +250,36 @@ class TestWhereTheTokenIsPrinted:
         assert token in printed
         assert "/setup" in printed
 
+    @pytest.mark.parametrize("deployment", ["server", "docker"])
+    async def test_the_real_command_prints_it_in_both_deployments(
+        self, open_identity_db, tmp_path, monkeypatch, deployment,
+    ):
+        """Through `nerve status` itself, not the helper it calls.
+
+        Docker is the deployment that *needs* the token — its callers arrive
+        over the bridge network, so their peer is never loopback — and its
+        branch of this command returned before ever reaching the helper.
+        """
+        from click.testing import CliRunner
+
+        from nerve import cli
+
+        db, _identity = await open_identity_db(tmp_path / "nerve.db")
+        try:
+            token = await setup_token.ensure_setup_token(db, unclaimed=True)
+        finally:
+            await db.close()
+        monkeypatch.setattr("nerve.paths.db_path", lambda: tmp_path / "nerve.db")
+        monkeypatch.setattr(cli, "_get_daemon_status", lambda: (False, None))
+        monkeypatch.setattr(cli, "_docker_compose", lambda *a, **k: 0)
+        monkeypatch.setattr(cli, "_is_docker_mode", lambda config: deployment == "docker")
+
+        result = CliRunner().invoke(
+            cli.main, ["-c", str(tmp_path), "status"], obj=None,
+        )
+        assert token in result.output, (deployment, result.output)
+        assert "/setup" in result.output
+
     async def test_status_says_nothing_once_the_instance_is_claimed(
         self, open_identity_db, tmp_path, monkeypatch, capsys,
     ):
