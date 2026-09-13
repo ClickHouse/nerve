@@ -858,6 +858,7 @@ def _record(
     applied: dict[str, Any] | None = None,
     debts: tuple[str, ...] = (),
     answered: bool = False,
+    done: bool = True,
 ) -> str | None:
     """Note that a step was answered, after every write it makes has landed.
 
@@ -875,6 +876,12 @@ def _record(
         setup_state.record_applied(context.state, applied)
     for debt in debts:
         context.state.debts.add(debt)
+    if not done:
+        # What landed, and nothing about the step being answered: a request
+        # that failed part way has configuration on disk to account for and no
+        # business reporting itself as done.
+        setup_state.save_state(context.state)
+        return None
     if answered:
         # A decision the instance cannot state for itself — somebody chose the
         # value that was already there — so it outlives the process that heard
@@ -1213,9 +1220,14 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
                 # and answering with a bare 500 would lose both the record of
                 # what *did* land and the restart it needs.
                 logger.exception("Setup: the cron file could not be published")
+                # Only what landed. Marking the step done here left a wizard
+                # that could report `finished` for a cron selection it never
+                # applied — automation's completion is a durable note, so
+                # nothing later would have taken it back — and the debt would
+                # have been retired at the restart as though the file had been
+                # written and merely not reloaded.
                 _record(
-                    context, step=STEP_AUTOMATION, applied=applied,
-                    debts=(_CRON_DEBT,),
+                    context, step=STEP_AUTOMATION, applied=applied, done=False,
                 )
                 raise HTTPException(
                     status_code=500,
