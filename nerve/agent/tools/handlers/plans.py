@@ -227,13 +227,17 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
 
+    # The agent approved this plan through its own tool, so both the session
+    # and the run it dispatches are the instance's own work. Resolved before
+    # the status flip below, which is one-way: the guard above refuses a plan
+    # that is already 'implementing', so a failure after it would strand the
+    # plan with no implementation and no way to retry.
+    impl_actor = await system_actor(ctx.db)
+
     # Mark as implementing (prevents double-approve)
     await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
 
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
-    impl_actor = await system_actor(ctx.db)
-    # The agent approved this plan through its own tool, so both the session
-    # and the run it dispatches are the instance's own work.
     await ctx.engine.sessions.get_or_create(
         impl_session_id, title=f"Implement: {task['title']}", source="web",
         actor=impl_actor,
