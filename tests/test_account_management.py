@@ -370,6 +370,10 @@ class TestLastAccountGuard:
             assert back.json()["enabled"] is True
 
     async def test_unknown_account(self, install: _Install):
+        # Claimed first: an unclaimed instance refuses every account mutation
+        # before it looks anything up (PR 6's claim cutover), and this is
+        # about what happens to a name that does not exist.
+        await install.secure_the_owner()
         async with _client(install.app) as client:
             for path in ("/api/accounts/nope/disable", "/api/accounts/nope/enable"):
                 assert (await client.post(path, headers=install.headers())).status_code == 404

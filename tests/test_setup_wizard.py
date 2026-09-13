@@ -751,6 +751,46 @@ class TestAVisitorCanOnlyClaim:
         assert setup_state.load_state().done == set()
         assert setup_state.load_state().skipped == set()
 
+    ACCOUNT_MUTATIONS = [
+        ("put", "/api/accounts/me/password", {"new_password": "taken-over"}),
+        ("post", "/api/accounts", {"username": "mallory", "password": "in-i-go"}),
+    ]
+
+    @pytest.mark.parametrize("method,path,body", ACCOUNT_MUTATIONS)
+    async def test_the_account_routes_refuse_too(
+        self, install, method, path, body,
+    ):
+        """The sweep: every account mutation a pre-claim visitor can reach.
+
+        Creating is already refused by the passwordless guard and disabling by
+        the last-account guard; the first password is refused by the claim's
+        own rule. This pins all of them as one property rather than three
+        coincidences.
+        """
+        async with _client(install.app, token=install.session_token()) as http:
+            response = await getattr(http, method)(path, json=body)
+        assert response.status_code == 409, (path, response.text)
+        assert await install.db.count_accounts() == 1
+
+    async def test_renaming_the_unclaimed_account_is_refused(self, install):
+        """The one that was still reachable: a stranger could give the
+        instance's account a username before anybody claimed it."""
+        async with _client(install.app, token=install.session_token()) as http:
+            response = await http.patch(
+                f"/api/accounts/{install.owner_id}",
+                json={"username": "mallory", "display_name": "Mallory"},
+            )
+        assert response.status_code == 409
+        assert "/api/setup/claim" in response.json()["detail"]
+        account = await install.db.get_account(install.owner_id)
+        assert account["username"] is None
+
+    async def test_disabling_the_only_account_stays_refused(self, install):
+        async with _client(install.app, token=install.session_token()) as http:
+            response = await http.post(f"/api/accounts/{install.owner_id}/disable")
+        assert response.status_code == 409
+        assert (await install.db.get_account(install.owner_id))["enabled"] is True
+
     async def test_reading_the_checklist_is_still_allowed(self, install):
         """The wizard has to render for the person about to claim it."""
         async with _client(install.app, token=install.session_token()) as http:
