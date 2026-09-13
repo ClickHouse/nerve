@@ -84,7 +84,7 @@ def harness(tmp_path, monkeypatch):
             login_state=AsyncMock(
                 return_value=MagicMock(passwordless=False),
             ),
-            delete_instance_secret=AsyncMock(return_value=False),
+            _delete_instance_secret=AsyncMock(return_value=False),
         )
 
     async def _close_db():

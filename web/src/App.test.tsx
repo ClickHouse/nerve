@@ -8,7 +8,7 @@ import type { AuthStatus } from './api/client';
  *
  * The one that matters is the tab that arrives *holding a token*. A token says
  * it may come in; it does not say where. An instance whose sole account has no
- * password belongs on the accounts page however the tab arrived, and the app used
+ * password belongs on the setup page however the tab arrived, and the app used
  * to render on the token alone — reaching `/chat` before the status descriptor
  * answered, by which time the component that would have redirected was gone.
  */
@@ -106,7 +106,7 @@ describe('startup with a token already in storage', () => {
     getOwnAccount.mockResolvedValue(me());
   });
 
-  it('lands on the accounts page when the instance has no password', async () => {
+  it('lands on the setup page when the instance has no password', async () => {
     authStatus.mockResolvedValue(
       status({ login: 'none', auth_required: false }),
     );
@@ -144,11 +144,11 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
 
-    answer(status({ login: 'none', auth_required: false, setup_pending: true }));
+    answer(status({ login: 'none', auth_required: false }));
     expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
   });
 
-  it('reaches accounts on a real reload, not just with a reset store', async () => {
+  it('reaches setup on a real reload, not just with a reset store', async () => {
     // The same fresh-module path, followed all the way through: a grandfathered
     // token on a passwordless install is precisely the upgrading install PR 3
     // has to route to Accounts, and it is the one shape a reset store hides.
@@ -179,7 +179,7 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
-  it('a dead token on a passwordless install still reaches accounts', async () => {
+  it('a dead token on a passwordless install still reaches setup', async () => {
     // The token is useless, which puts this tab exactly where a tab with no
     // token at all stands — so it takes the same path, rather than stopping at
     // a login form a passwordless install has no answer for.
