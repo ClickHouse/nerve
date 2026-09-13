@@ -319,7 +319,7 @@ async def login(req: LoginRequest):
     if username:
         account = await store.get_account_by_username(username)
     elif state.single_account:
-        account = await store.get_sole_account()
+        account = accounts[0]
     else:
         # Two or more accounts and no username: the request names nobody. Same
         # answer as a wrong password, so the count stays unpublished here too.

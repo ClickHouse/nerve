@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import bcrypt
@@ -30,6 +31,25 @@ from nerve.migrate import bootstrap_identity
 _PASSWORD = "correct horse battery staple"
 _HASH = bcrypt.hashpw(_PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
 _SECRET = "configured-secret-padded-to-thirty-two-bytes"
+
+
+async def _insert_account(
+    db: Database, *, source: str, credential: str | None = None,
+) -> dict:
+    """Seed a migration shape directly; production never creates these states."""
+    actor_id, account_id = str(uuid.uuid4()), str(uuid.uuid4())
+    await db._write(
+        "INSERT INTO actor_refs (id, kind, display_name, created_at) "
+        "VALUES (?, 'human', NULL, 't')",
+        (actor_id,),
+    )
+    await db._write(
+        """INSERT INTO accounts
+               (id, actor_id, credential_source, credential, enabled, created_at)
+           VALUES (?, ?, ?, ?, 1, 't')""",
+        (account_id, actor_id, source, credential),
+    )
+    return await db.get_account(account_id)
 
 
 def _install(tmp_path: Path, *, local_yaml: str, settings_yaml: str = "") -> NerveConfig:
@@ -202,10 +222,7 @@ class TestTheScrub:
         config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
         local_yaml = config.config_dir / "config.local.yaml"
         for source, credential in (("local", "$2b$12$own"), ("none", None)):
-            actor = await db.create_actor_ref(kind="human")
-            await db.create_account(
-                actor_id=actor["id"], credential_source=source, credential=credential,
-            )
+            await _insert_account(db, source=source, credential=credential)
         before = local_yaml.read_bytes()
 
         report = MigrationReport()
@@ -228,10 +245,7 @@ class TestAConcurrentPasswordChange:
         from nerve.migrate import MigrationReport, _migrate_config_credentials
 
         config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
-        actor = await db.create_actor_ref(kind="human")
-        account = await db.create_account(
-            actor_id=actor["id"], credential_source="config",
-        )
+        account = await _insert_account(db, source="config")
         original = db.set_account_credential_if_source
 
         async def change_first(*args, **kwargs):
@@ -261,10 +275,7 @@ class TestAConcurrentPasswordChange:
         """The other direction: the mirror moves `config`/`none` rows to match
         configuration, and a row that has become `local` must be left alone even
         if it was `none` when the loop read it."""
-        actor = await db.create_actor_ref(kind="human")
-        account = await db.create_account(
-            actor_id=actor["id"], credential_source="none",
-        )
+        account = await _insert_account(db, source="none")
         config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
         original = db.set_account_credential_if_source
 
@@ -344,10 +355,7 @@ class TestTheStaleValueWarning:
     ):
         """Spec 1.3: a stale auth.password_hash that no longer does anything is
         exactly what an operator debugs for an hour."""
-        actor = await db.create_actor_ref(kind="human")
-        await db.create_account(
-            actor_id=actor["id"], credential_source="local", credential="$2b$12$own",
-        )
+        await _insert_account(db, source="local", credential="$2b$12$own")
         config = NerveConfig(
             auth=AuthConfig(password_hash=_HASH),
             config_dir=Path("/nonexistent/nerve-test-config-dir"),
@@ -418,9 +426,9 @@ class TestDoctorAgreesWithTheLoginRoute:
         await database.connect()
         try:
             for source in sources:
-                actor = await database.create_actor_ref(kind="human")
-                await database.create_account(
-                    actor_id=actor["id"], credential_source=source,
+                await _insert_account(
+                    database,
+                    source=source,
                     credential="$2b$12$synthetic" if source == "local" else None,
                 )
         finally:

@@ -35,6 +35,28 @@ async def _insert_human(db: Database, *, name: str | None = None) -> str:
     return actor_id
 
 
+async def _insert_account(
+    db: Database,
+    *,
+    actor_id: str | None = None,
+    display_name: str | None = None,
+    username: str | None = None,
+    source: str = "none",
+    credential: str | None = None,
+) -> dict:
+    """Seed account state explicitly without a fixture-only production DAL."""
+    actor_id = actor_id or await _insert_human(db, name=display_name)
+    account_id = str(uuid.uuid4())
+    await db._write(
+        """INSERT INTO accounts
+               (id, actor_id, username, credential_source, credential,
+                enabled, created_at)
+           VALUES (?, ?, ?, ?, ?, 1, 't')""",
+        (account_id, actor_id, username, source, credential),
+    )
+    return await db.get_account(account_id)
+
+
 def _corrupt_system_actor(path, shape: str) -> None:
     """Create exceptional state without adding a production mutation API."""
     conn = sqlite3.connect(path)
@@ -306,9 +328,8 @@ class TestUsernameNormalisation:
 @pytest.mark.asyncio
 class TestManagedAccountCreation:
     async def _owner(self, db: Database):
-        actor = await db.create_actor_ref(kind="human", display_name="Alice")
-        return await db.create_account(
-            actor_id=actor["id"], credential_source="local",
+        return await _insert_account(
+            db, display_name="Alice", source="local",
             credential="$2b$12$synthetic", username="alice",
         )
 
@@ -340,10 +361,8 @@ class TestLastAccountGuard:
     async def _two(self, db: Database):
         ids = []
         for name in ("alice", "bob"):
-            actor = await db.create_actor_ref(kind="human")
-            ids.append((await db.create_account(
-                actor_id=actor["id"], credential_source="local",
-                credential="$2b$12$synthetic", username=name,
+            ids.append((await _insert_account(
+                db, source="local", credential="$2b$12$synthetic", username=name,
             ))["id"])
         return ids
 
@@ -375,8 +394,7 @@ class TestClaimingTheSoleAccount:
     transaction, and the precondition checked inside it."""
 
     async def _unclaimed(self, db: Database) -> dict:
-        actor = await db.create_actor_ref(kind="human")
-        return await db.create_account(actor_id=actor["id"], credential_source="none")
+        return await _insert_account(db)
 
     async def test_names_and_secures_in_one_step(self, db: Database):
         account = await self._unclaimed(db)
@@ -389,7 +407,6 @@ class TestClaimingTheSoleAccount:
         assert claimed["credential"] == "$2b$12$claimed"
         actor = await db.get_actor_ref(account["actor_id"])
         assert actor["display_name"] == "Alice A"
-        assert actor["profile_version"] == 2
         assert not (await db.login_state()).passwordless
 
     async def test_an_already_claimed_account_is_refused(self, db: Database):

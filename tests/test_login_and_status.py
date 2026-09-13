@@ -74,6 +74,26 @@ class _Install:
             username=username, credential=hash_password(password),
         )
 
+    async def set_credential(
+        self,
+        account_id: str,
+        *,
+        credential_source: str,
+        credential: str | None = None,
+    ) -> None:
+        """Seed a credential shape without exposing a fixture-only DAL method."""
+        await self.db._write(
+            "UPDATE accounts SET credential_source = ?, credential = ? WHERE id = ?",
+            (credential_source, credential, account_id),
+        )
+
+    async def set_enabled(self, account_id: str, enabled: bool) -> None:
+        """Create disabled test state without bypassing the production guard."""
+        await self.db._write(
+            "UPDATE accounts SET enabled = ? WHERE id = ?",
+            (1 if enabled else 0, account_id),
+        )
+
 
 @pytest.fixture(autouse=True)
 def _fast_failures(monkeypatch):
@@ -127,7 +147,7 @@ class TestSingleAccountLogin:
         """The account an upgrade creates has no username. Demanding one here
         would lock out every install that upgrades, so password-only login is
         valid while exactly one account exists."""
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local",
             credential=hash_password(_PASSWORD),
         )
@@ -143,7 +163,7 @@ class TestSingleAccountLogin:
         set_config(NerveConfig(auth=AuthConfig(
             jwt_secret=_SECRET, password_hash=hash_password(_PASSWORD),
         )))
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="config",
         )
         async with _client(install.app) as client:
@@ -177,7 +197,7 @@ class TestSingleAccountLogin:
 
     async def test_a_disabled_sole_account_cannot_log_in(self, install):
         await install.secure_the_owner()
-        await install.db.set_account_enabled(install.owner_id, False)
+        await install.set_enabled(install.owner_id, False)
         async with _client(install.app) as client:
             response = await client.post(
                 "/api/auth/login", json={"username": "alice", "password": _PASSWORD},
@@ -286,7 +306,7 @@ class TestMultiAccountLogin:
     ):
         """Order matters: the credential is verified first, so the "disabled"
         answer only ever reaches somebody who already knew the password."""
-        await install.db.set_account_enabled(self.bob["id"], False)
+        await install.set_enabled(self.bob["id"], False)
         async with _client(install.app) as client:
             right = await client.post(
                 "/api/auth/login",
@@ -303,7 +323,7 @@ class TestMultiAccountLogin:
         """Passwordless is bounded to one account. With two, an account with no
         credential authenticates nobody rather than everybody — the state a
         restored `--no-secrets` bundle leaves behind."""
-        await install.db.set_account_credential(
+        await install.set_credential(
             self.bob["id"], credential_source="none",
         )
         async with _client(install.app) as client:
@@ -385,13 +405,13 @@ class TestStatusDescriptor:
         """The accounts screen can set a username on its own. Doing that first
         must not stop the instance reporting as unsecured — it still admits
         every caller, which is the state the wizard exists to end."""
-        await install.db.set_account_username(install.owner_id, "alice")
+        await install.db.update_account_login(install.owner_id, username="alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
         assert body == {"auth_required": False, "login": "none"}
 
     async def test_only_a_password_ends_passwordless_login(self, install):
-        await install.db.set_account_username(install.owner_id, "alice")
+        await install.db.update_account_login(install.owner_id, username="alice")
         await install.db.update_account_login(
             install.owner_id, credential=hash_password(_PASSWORD),
         )
@@ -536,7 +556,7 @@ class TestFailedLoginsCostTheSame:
         get to take it away. Nothing can *set* one — hashing refuses an empty
         password — so this is strictly about honouring what is already there."""
         empty = bcrypt.hashpw(b"", bcrypt.gensalt(rounds=4)).decode()
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local", credential=empty,
         )
         async with _client(install.app) as client:
@@ -554,7 +574,7 @@ class TestFailedLoginsCostTheSame:
         millisecond while an unknown username takes a quarter of a second, and
         the difference is the account's existence."""
         await install.db.update_account_login(install.owner_id, username="alice")
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local",
             credential=_cheap_hash(_PASSWORD, rounds),
         )
@@ -586,7 +606,7 @@ class TestFailedLoginsCostTheSame:
         would stand out by being slower. One observation raises the floor."""
         _fixed_timing(monkeypatch, 0.01)
         await install.db.update_account_login(install.owner_id, username="alice")
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local",
             credential=_cheap_hash(_PASSWORD, rounds=10),
         )
@@ -616,7 +636,7 @@ class TestFailedLoginsCostTheSame:
         _reset_timing()
         await install.db.update_account_login(install.owner_id, username="alice")
         slow = _cheap_hash(_PASSWORD, rounds=13)
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local", credential=slow,
         )
 
@@ -656,7 +676,7 @@ class TestFailedLoginsCostTheSame:
         reactive mark — which is the same one-probe-too-late this is supposed to
         have ended. So it is recomputed every login."""
         _reset_timing()
-        await install.db.set_account_username(install.owner_id, "alice")
+        await install.db.update_account_login(install.owner_id, username="alice")
 
         async def probe(body) -> float:
             async with _client(install.app) as client:
@@ -754,7 +774,7 @@ class TestHashesConvergeOnThePolicyCost:
     async def test_a_successful_login_upgrades_an_older_work_factor(self, install):
         await install.db.update_account_login(install.owner_id, username="alice")
         legacy = _cheap_hash(_PASSWORD, rounds=4)
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local", credential=legacy,
         )
         assert bcrypt_cost(legacy) == 4
@@ -797,7 +817,7 @@ class TestHashesConvergeOnThePolicyCost:
         set_config(NerveConfig(auth=AuthConfig(
             jwt_secret=_SECRET, password_hash=_cheap_hash(_PASSWORD, rounds=4),
         )))
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="config",
         )
         async with _client(install.app) as client:
@@ -810,7 +830,7 @@ class TestHashesConvergeOnThePolicyCost:
 
     async def test_a_failed_upgrade_does_not_fail_the_login(self, install, monkeypatch):
         await install.db.update_account_login(install.owner_id, username="alice")
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local",
             credential=_cheap_hash(_PASSWORD, rounds=4),
         )
@@ -837,7 +857,7 @@ class TestHashesConvergeOnThePolicyCost:
         put the old one back and leave whoever knew it still able to log in."""
         await install.db.update_account_login(install.owner_id, username="alice")
         stale = _cheap_hash(_PASSWORD, rounds=4)
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local", credential=stale,
         )
         account = await install.db.get_account(install.owner_id)
@@ -864,12 +884,12 @@ class TestHashesConvergeOnThePolicyCost:
     async def test_the_swap_is_conditioned_on_the_source_too(self, install):
         """A row that has moved off its own credential in the meantime is left
         alone rather than dragged back to `local`."""
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local",
             credential=_cheap_hash(_PASSWORD, rounds=4),
         )
         account = await install.db.get_account(install.owner_id)
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="config",
         )
 
@@ -888,7 +908,7 @@ class TestHashesConvergeOnThePolicyCost:
             long_password.encode()[:72], bcrypt.gensalt(rounds=4),
         ).decode()
         await install.db.update_account_login(install.owner_id, username="alice")
-        await install.db.set_account_credential(
+        await install.set_credential(
             install.owner_id, credential_source="local", credential=legacy,
         )
         async with _client(install.app) as client:
