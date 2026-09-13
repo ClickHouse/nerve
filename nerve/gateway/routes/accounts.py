@@ -311,13 +311,30 @@ async def change_own_password(
 
     Setting a password moves the account to its own credential, after which
     ``auth.password_hash`` no longer applies to it.
+
+    **While the instance is unclaimed this endpoint refuses.** The one case
+    that needs no current password is exactly the state a passwordless install
+    is in, and a passwordless install hands a session to anybody who asks — so
+    leaving this open would be a second, unguarded way to take the instance
+    over, beside the one the setup token protects. There is one door, and it
+    is ``POST /api/setup/claim``.
     """
     db = get_deps().db
+    config = get_config()
     account = await db.get_account(actor.account_id)
     if account is None:  # pragma: no cover - resolved a moment ago
         raise HTTPException(status_code=404, detail="Account not found")
 
-    existing = account_credential(account, get_config())
+    if instance_is_passwordless(await db.login_state(), config):
+        raise HTTPException(
+            status_code=409,
+            detail="This instance has not been claimed yet. Set the first "
+                   "password through the setup wizard (POST /api/setup/claim), "
+                   "which proves the request comes from the machine itself or "
+                   "carries the setup token.",
+        )
+
+    existing = account_credential(account, config)
     if existing:
         supplied = req.current_password
         if supplied is None or not verify_password(supplied, existing):
