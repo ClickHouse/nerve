@@ -286,6 +286,13 @@ auth:
 It is read at startup and pinned for the life of the process, like `auth.mode`
 and for the same reason, so set it **before** the instance is reachable.
 
+One refinement, in Nerve's favour: uvicorn rewrites the peer address from
+`X-Forwarded-For` when the immediate peer is `127.0.0.1`, so a same-host proxy
+that forwards the real client address makes the guard demand the token after
+all. A remote caller's own `X-Forwarded-For` is ignored — the rewrite only
+happens for a peer that was already loopback — so the header cannot be used to
+look local. Do not rely on either: set the switch.
+
 ### What the wizard can and cannot decide
 
 It is a checklist, not a gate: after the account, every step can be skipped,
