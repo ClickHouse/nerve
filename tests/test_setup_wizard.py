@@ -1053,25 +1053,94 @@ class TestTheRestartStep:
             )
 
         monkeypatch.setattr(setup_routes.daemon, "restart_daemon", _fake_restart)
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
         async with _http(claimed) as http:
             response = await http.post("/api/system/restart")
         assert response.status_code == 200, response.text
         assert response.json()["restarting"] is True
-        assert calls, "the background task did not run"
+        assert calls, "the helper was not started"
         config_dir, kwargs = calls[0]
         assert config_dir == claimed.config_dir
         assert kwargs["old_pid"] == os.getpid(), "this process is the daemon"
+        assert kwargs["delay_seconds"] > 0, (
+            "the helper must hold off until this response is on the wire"
+        )
 
-    async def test_a_restart_that_cannot_start_does_not_break_the_response(
+    async def test_it_says_which_process_answered(self, claimed, monkeypatch):
+        """The client waits for a *different* generation. The old process
+        answers /health perfectly well while it shuts down, so 'anybody home?'
+        accepts the process being replaced."""
+        monkeypatch.setattr(
+            setup_routes.daemon, "restart_daemon",
+            lambda config_dir, **kwargs: setup_routes.daemon.RestartOutcome(
+                method="helper", message="ok", old_pid=1,
+            ),
+        )
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
+        async with _http(claimed) as http:
+            body = (await http.post("/api/system/restart")).json()
+        assert body["boot"] == setup_routes.boot.boot_id()
+        assert body["boot"]
+
+    async def test_a_restart_that_cannot_start_is_reported_as_a_failure(
         self, claimed, monkeypatch,
     ):
+        """Whether one was *begun* is knowable here, and a page told
+        'restarting' for a helper that never existed waits for a process that
+        is never coming."""
         def _boom(config_dir, **kwargs):
-            raise OSError("no")
+            raise OSError("no such directory")
 
         monkeypatch.setattr(setup_routes.daemon, "restart_daemon", _boom)
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
         async with _http(claimed) as http:
             response = await http.post("/api/system/restart")
-        assert response.status_code == 200
+        assert response.status_code == 500
+        assert "no such directory" in response.json()["detail"]
+        assert "still running" in response.json()["detail"]
+
+    async def test_a_second_restart_is_refused_rather_than_spawning_another(
+        self, claimed, monkeypatch,
+    ):
+        """Two helpers race over the same pid and the same pid file."""
+        calls = []
+        monkeypatch.setattr(
+            setup_routes.daemon, "restart_daemon",
+            lambda config_dir, **kwargs: (
+                calls.append(kwargs),
+                setup_routes.daemon.RestartOutcome(
+                    method="helper", message="ok", old_pid=1,
+                ),
+            )[1],
+        )
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
+        async with _http(claimed) as http:
+            first = await http.post("/api/system/restart")
+            second = await http.post("/api/system/restart")
+        assert first.status_code == 200
+        assert second.status_code == 409
+        assert len(calls) == 1
+
+    async def test_concurrent_restarts_start_exactly_one_helper(
+        self, claimed, monkeypatch,
+    ):
+        calls = []
+        monkeypatch.setattr(
+            setup_routes.daemon, "restart_daemon",
+            lambda config_dir, **kwargs: (
+                calls.append(kwargs),
+                setup_routes.daemon.RestartOutcome(
+                    method="helper", message="ok", old_pid=1,
+                ),
+            )[1],
+        )
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
+        async with _http(claimed) as http:
+            responses = await asyncio.gather(*[
+                http.post("/api/system/restart") for _ in range(4)
+            ])
+        assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
+        assert len(calls) == 1
 
 
 # --------------------------------------------------------------------------- #
