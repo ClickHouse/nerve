@@ -177,17 +177,22 @@ before it exists anywhere else, and the server excludes you from its own echo,
 so the app stamps it with your actor id as it is created. Without that, a fresh
 two-tab exchange leaves each tab holding one attributed message and one
 unattributed one, which reads as a single person and suppresses every label on
-both sides. The id comes from `/api/accounts` (`is_self` → `actor_id`) and
-sending waits for that read to settle, so a message sent seconds after signing
-in is still labelled. A caller with no account row gets no id, which is the
-ordinary unattributed path — it never blocks the send.
+both sides. The id is the `actor_id` of the account this session was confirmed
+as — the same `/api/accounts/me` read that binds the session-expired overlay to
+one person, not a second lookup of its own, so there is one answer to "who is
+signed in" and nothing that can disagree with it. A caller with no account row
+gets no id, which is the ordinary unattributed path.
 
-**Identity is per authentication session.** The signed-in actor id is cleared,
-and any read still in flight invalidated, at every boundary where who is signed
-in changes or stops being known: a login starting, a logout, a failed
-authentication, and the global 401. Otherwise a slow answer from one session
-could label the next person's messages with the previous person's actor — worse
-than no attribution, because it is a false statement rather than a missing one.
+**Identity is per authentication session.** It is resolved *before* a session is
+announced as authenticated and committed in the same update, so there is no
+window in which the app is usable and who you are is unknown — nothing to race,
+and no message that can go out unstamped. It is dropped whenever a session ends,
+and on the expired-session overlay it can only be replaced by a positively
+confirmed match for the same account; a different person there is a sign-out.
+A sign-in or startup check whose session ends while it is still deciding is
+discarded rather than committed. Otherwise a slow answer from one session could
+label the next person's messages with the previous person's actor — worse than
+no attribution, because it is a false statement rather than a missing one.
 
 **The null rule.** `actor_id` and `created_by_actor_id` are frequently `null`,
 and `null` renders *exactly* as the UI did before attribution existed: no chip,
