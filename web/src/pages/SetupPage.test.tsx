@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -503,6 +503,17 @@ describe('one mutation at a time', () => {
       (within(automation).getByRole('button', { name: 'Skip' }) as HTMLButtonElement)
         .disabled,
     ).toBe(true));
-    release(state());
+
+    // Let the save finish *inside* act and wait for the render it causes.
+    // Resolving it on the way out of the test leaves React applying state to
+    // a component nobody is watching any more — which is what the "not
+    // wrapped in act" warnings were, and why the assertions after it would
+    // have run before the behaviour they describe.
+    await act(async () => { release(state()); });
+    await waitFor(() => expect(
+      (within(screen.getByRole('region', { name: 'Automation' }))
+        .getByRole('button', { name: 'Skip' }) as HTMLButtonElement).disabled,
+    ).toBe(false));
+    expect(useSetupStore.getState().busy).toBeNull();
   });
 });
