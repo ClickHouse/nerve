@@ -64,7 +64,21 @@ With no password anywhere — none on the account row and no `auth.password_hash
 the owner. That is the intended behaviour for a private, loopback-bound install
 and a real exposure on anything else: Nerve does **not** change the bind address
 or refuse to start over it. Set a password before exposing the gateway beyond
-the machine; the accounts screen is where.
+the machine.
+
+**How that first password is set: the setup wizard, and only there.** An
+install with one account and no password is *unclaimed*, and the wizard at
+`/setup` is what ends that state — it names and secures the account the install
+already has, in one transaction, and signs the browser in with the password it
+set. It is guarded by a **setup token** printed in the server log, which a
+caller whose socket peer is loopback does not need, because being on the machine
+is proof enough. See [Setup](setup.md#claiming-an-instance-from-a-browser).
+
+`PUT /api/accounts/me/password` needs no current password on an account that
+has none — which is exactly this state — so while the instance is unclaimed it
+refuses with a `409` pointing at the claim endpoint. There is one door, and it
+is the guarded one. Once the instance has been claimed, the accounts screen is
+where passwords are changed as usual.
 
 **Passwordless is bounded to one account.** With two accounts it is not a weaker
 login, it is an unanswerable question: nothing distinguishes the callers, so

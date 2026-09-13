@@ -220,6 +220,112 @@ nerve start              # Start the server
 # Open http://localhost:8900
 ```
 
+## Claiming an instance from a browser
+
+`nerve init` asks for a password. The headless path does not: it reads
+`NERVE_PASSWORD` from the environment and defaults it to empty, so a Docker
+install that omits it starts with **one account and no password**. Until
+somebody claims it, everyone who can reach the gateway is signed in as the
+owner and no activity can be told apart.
+
+The web setup wizard at `/setup` is how that ends. Its first step names and
+secures the account the install already has — it does not create a second one,
+so nothing recorded up to that point changes hands — and it signs the browser
+in with the password it just set. Every later step is an ordinary authenticated
+request.
+
+### Who may claim
+
+Two ways to prove you are allowed to:
+
+- **You are on the machine.** The request's *socket peer address* is loopback
+  (`127.0.0.0/8`, `::1`, or the IPv4-mapped `::ffff:127.0.0.1` a dual-stack
+  listener reports). That is at least as strong as reading a token out of the
+  machine's own log, so no token is asked for.
+- **You hold the setup token.** Generated on first start while the instance is
+  unclaimed, and printed:
+
+  ```bash
+  nerve logs          # the startup line, on the machine
+  docker logs nerve   # the same line, for a container
+  nerve status        # prints it again while the instance is unclaimed
+  ```
+
+  It is kept in `nerve.db`, so a restart does not invalidate it, and it is
+  deleted the moment the account has a password. `nerve doctor` deliberately
+  does **not** print it: that report is also relayed by the Telegram `/doctor`
+  command, and a live credential does not belong in a chat log.
+
+Nothing else counts. The peer address comes from the socket, and **no header is
+ever read** — not `X-Forwarded-For`, not `Forwarded`. A caller-supplied header
+that can turn a remote request into a local one defeats the whole guard, and
+Nerve has no forwarding-header handling anywhere.
+
+Claiming is also the only way to set that first password. `PUT
+/api/accounts/me/password` needs no current password on an account that has
+none, which is exactly the state this exists to end, so while the instance is
+unclaimed it refuses and points here. There is one door.
+
+### Docker, and the reverse-proxy limitation
+
+A request from the host into a container arrives over the bridge network, so
+its peer is the bridge gateway rather than loopback: the container case needs
+the token, which is what `docker logs` is for.
+
+The honest limitation is the other way round. **Running Nerve behind a reverse
+proxy on the same host makes every request look local**, because the proxy is
+the peer — so the token requirement switches itself off with nothing to say so.
+For those deployments, force it:
+
+```yaml
+# config.yaml (machine-local) or the tracked settings.yaml
+auth:
+  setup_token_required: true
+```
+
+It is read at startup and pinned for the life of the process, like `auth.mode`
+and for the same reason, so set it **before** the instance is reachable.
+
+### What the wizard can and cannot decide
+
+It is a checklist, not a gate: after the account, every step can be skipped,
+re-entered and done in any order, and an abandoned wizard leaves a working
+instance running on defaults with a reminder in the app.
+
+| Step | Writes |
+|---|---|
+| Claim the account | username, password and display name, in `nerve.db` |
+| Provider credential | `anthropic_api_key` / `openai_api_key` → `config.local.yaml` (0600) |
+| Timezone and name | `timezone` → the tracked `settings.yaml`; the display name → your actor |
+| Telegram | `telegram.bot_token` → `config.local.yaml`; `telegram.enabled` → `config.yaml` |
+| Automation | enables the optional crons the installer wrote, and which sources sync |
+
+Every one of those writes through the same code `nerve init` writes with
+(`nerve/setup_writer.py`), so the two cannot drift about which layer a value
+belongs in. Each step writes only the keys it owns, and merges them into what
+is already on disk rather than regenerating the file.
+
+What it deliberately does not do:
+
+- **Find a credential on your laptop.** `nerve init` reads the macOS keychain
+  and `~/.claude/.credentials.json`; a process inside the VM cannot see either,
+  so the wizard asks for a key instead of pretending to.
+- **Decide the install's shape.** Deployment style and the workspace path are
+  host decisions — `nerve init` on the machine.
+- **Replace the settings screens.** First-run decisions only.
+
+It ends in a restart, because `timezone`, the Telegram token and the gateway
+socket are read at startup (see [Config](config.md#what-still-needs-a-restart)).
+The page waits for the new process and comes back **signed in**: the signing
+secret is pinned and persisted and nothing in the wizard rotates it, so the
+session outlives the process that issued it.
+
+**Under `lockdown` the checklist is read-only.** Configuration there is
+fleet-managed and machine-local values are environment references, so every
+write refuses with the reason. Claiming the account still works, on purpose: it
+writes to `nerve.db` rather than to configuration, and a fleet-managed install
+that could never be claimed would stay open to everyone who can reach it.
+
 ## HTTPS Setup
 
 ```bash
