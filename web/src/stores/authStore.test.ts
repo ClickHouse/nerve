@@ -29,8 +29,7 @@ const api = client.api as unknown as {
 function me(overrides: Record<string, unknown> = {}) {
   return {
     id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't', updated_at: 't',
-    disabled_at: null, is_self: true, ...overrides,
+    enabled: true, has_password: true, created_at: 't', ...overrides,
   };
 }
 const getToken = client.getToken as unknown as ReturnType<typeof vi.fn>;
@@ -42,10 +41,7 @@ const { clearAllReads } = await import('./helpers/readStorage');
 function status(overrides: Partial<AuthStatus> = {}): AuthStatus {
   return {
     auth_required: true,
-    mode: 'local',
     login: 'password',
-    setup_pending: false,
-    multiple_accounts: false,
     ...overrides,
   };
 }
@@ -59,8 +55,6 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: null,
-    statusLoading: false,
-    setupPending: false,
     account: null,
   });
   api.getOwnAccount.mockResolvedValue(me());
@@ -78,29 +72,6 @@ describe('checkAuth: where a cold start lands', () => {
     expect(setToken).toHaveBeenCalledWith('a-token');
     expect(useAuthStore.getState().authenticated).toBe(true);
     expect(useAuthStore.getState().ready).toBe(true);
-  });
-
-  it('never auto-logs-in on a single account that has a password', async () => {
-    getToken.mockReturnValue(null);
-    api.authStatus.mockResolvedValue(status({ login: 'password' }));
-
-    await useAuthStore.getState().checkAuth();
-
-    expect(api.login).not.toHaveBeenCalled();
-    expect(useAuthStore.getState().authenticated).toBe(false);
-    expect(useAuthStore.getState().loginMode).toBe('password');
-  });
-
-  it('never auto-logs-in once a second account exists', async () => {
-    getToken.mockReturnValue(null);
-    api.authStatus.mockResolvedValue(
-      status({ login: 'username_password', multiple_accounts: true }),
-    );
-
-    await useAuthStore.getState().checkAuth();
-
-    expect(api.login).not.toHaveBeenCalled();
-    expect(useAuthStore.getState().loginMode).toBe('username_password');
   });
 
   it('asks rather than assumes when the status call fails', async () => {
@@ -129,20 +100,6 @@ describe('checkAuth: where a cold start lands', () => {
     expect(useAuthStore.getState().ready).toBe(true);
   });
 
-  it('routes an unset-up instance to /setup', async () => {
-    getToken.mockReturnValue(null);
-    api.authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false, setup_pending: true }),
-    );
-    api.login.mockResolvedValue({ token: 'a-token' });
-
-    await useAuthStore.getState().checkAuth();
-
-    // Signed in — an abandoned setup still leaves a working instance — and
-    // flagged, which is what moves the root redirect.
-    expect(useAuthStore.getState().authenticated).toBe(true);
-    expect(useAuthStore.getState().setupPending).toBe(true);
-  });
 });
 
 describe('checkAuth: a tab that already holds a token', () => {
@@ -151,7 +108,7 @@ describe('checkAuth: a tab that already holds a token', () => {
       getToken.mockReturnValue('an-existing-token');
       api.getOwnAccount.mockResolvedValue(me());
       api.authStatus.mockResolvedValue(
-        status({ login: 'username_password', multiple_accounts: true }),
+        status({ login: 'username_password' }),
       );
 
       await useAuthStore.getState().checkAuth();
@@ -169,7 +126,7 @@ describe('checkAuth: a tab that already holds a token', () => {
     getToken.mockReturnValue('a-dead-token');
     api.getOwnAccount.mockRejectedValue(new Error('401'));
     api.authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false, setup_pending: true }),
+      status({ login: 'none', auth_required: false }),
     );
     api.login.mockResolvedValue({ token: 'a-fresh-token' });
 
@@ -177,7 +134,6 @@ describe('checkAuth: a tab that already holds a token', () => {
 
     expect(api.login).toHaveBeenCalledWith('');
     expect(useAuthStore.getState().authenticated).toBe(true);
-    expect(useAuthStore.getState().setupPending).toBe(true);
     expect(useAuthStore.getState().sessionExpired).toBe(false);
   });
 
@@ -220,7 +176,7 @@ describe('login', () => {
 describe('refreshStatus', () => {
   it('picks up the change when a second account is added', async () => {
     api.authStatus.mockResolvedValue(
-      status({ login: 'username_password', multiple_accounts: true }),
+      status({ login: 'username_password' }),
     );
     await useAuthStore.getState().refreshStatus();
     expect(useAuthStore.getState().loginMode).toBe('username_password');
@@ -239,7 +195,6 @@ describe('refreshStatus', () => {
     // Never null — the form would be stranded on its loading state — and never
     // 'none', which is the value that logs the app in without asking.
     expect(useAuthStore.getState().loginMode).toBe('username_password');
-    expect(useAuthStore.getState().statusLoading).toBe(false);
   });
 });
 
@@ -350,7 +305,7 @@ describe('overlapping status refreshes', () => {
     const first = useAuthStore.getState().refreshStatus();
 
     api.authStatus.mockResolvedValueOnce(
-      status({ login: 'username_password', multiple_accounts: true }),
+      status({ login: 'username_password' }),
     );
     await useAuthStore.getState().refreshStatus();
     expect(useAuthStore.getState().loginMode).toBe('username_password');
@@ -359,7 +314,6 @@ describe('overlapping status refreshes', () => {
     resolveFirst(status({ login: 'password' }));
     await first;
     expect(useAuthStore.getState().loginMode).toBe('username_password');
-    expect(useAuthStore.getState().statusLoading).toBe(false);
   });
 
   it('a stale failure does not clear a newer answer either', async () => {

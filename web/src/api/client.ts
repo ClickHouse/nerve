@@ -9,22 +9,12 @@ export type LoginKind = 'none' | 'password' | 'username_password';
 
 /**
  * `GET /api/auth/status` — unauthenticated, so it carries no username and no
- * account count. Three destinations come out of it: the app (authenticated, or
- * auto-logged-in when `login` is `none`), the login page, and `/setup`.
+ * account count. The browser derives first-run routing from `login` itself.
  */
 export interface AuthStatus {
   /** Kept for older clients; `login !== 'none'`. */
   auth_required: boolean;
-  /** Identity mode. `local` in this build. */
-  mode: string;
   login: LoginKind;
-  /**
-   * Nothing has been secured yet: the sole account has no password, so every
-   * caller is admitted as it. Giving it a username does not clear this — only
-   * a password does.
-   */
-  setup_pending: boolean;
-  multiple_accounts: boolean;
 }
 
 /** One local account, as `/api/accounts` returns it. Never carries a credential. */
@@ -41,10 +31,6 @@ export interface Account {
   enabled: boolean;
   has_password: boolean;
   created_at: string;
-  updated_at: string;
-  disabled_at: string | null;
-  /** Whether this row is the signed-in account's own. */
-  is_self: boolean;
 }
 
 /** One page of a lazily-loaded sidebar group (Archived / System). */

@@ -78,11 +78,6 @@ class AccountOut(BaseModel):
     enabled: bool
     has_password: bool
     created_at: str
-    updated_at: str
-    disabled_at: str | None
-    # Whether this row is the caller's own — the accounts screen uses it to
-    # label the row and to hide "disable yourself" behind a confirmation.
-    is_self: bool
 
 
 class AccountListResponse(BaseModel):
@@ -125,7 +120,7 @@ def _hashed(password: str) -> str:
 
 
 def _account_out(
-    account: dict, actor_display: str | None, *, actor: Actor, config,
+    account: dict, actor_display: str | None, *, config,
 ) -> AccountOut:
     return AccountOut(
         id=account["id"],
@@ -139,17 +134,14 @@ def _account_out(
         # password change that skips proving the current one.
         has_password=bool(account_credential(account, config)),
         created_at=account["created_at"],
-        updated_at=account["updated_at"],
-        disabled_at=account["disabled_at"],
-        is_self=account["id"] == actor.account_id,
     )
 
 
-async def _render(db, account: dict, *, actor: Actor) -> AccountOut:
+async def _render(db, account: dict) -> AccountOut:
     ref = await db.get_actor_ref(account["actor_id"])
     return _account_out(
         account, ref["display_name"] if ref else None,
-        actor=actor, config=get_config(),
+        config=get_config(),
     )
 
 
@@ -188,7 +180,7 @@ async def list_accounts(actor: Actor = Depends(require_account)):
         _account_out(
             account,
             (refs.get(account["actor_id"]) or {}).get("display_name"),
-            actor=actor, config=config,
+            config=config,
         )
         for account in accounts
     ])
@@ -200,7 +192,7 @@ async def get_own_account(actor: Actor = Depends(require_account)):
     account = await db.get_account(actor.account_id)
     if account is None:  # pragma: no cover - require_auth resolved it a moment ago
         raise HTTPException(status_code=404, detail="Account not found")
-    return await _render(db, account, actor=actor)
+    return await _render(db, account)
 
 
 @router.post("/api/accounts", response_model=AccountOut, status_code=201)
@@ -226,7 +218,7 @@ async def create_account(req: AccountCreateRequest, actor: Actor = Depends(requi
         "Account %s created by account %s (%d accounts now)",
         account["id"], actor.account_id, await db.count_accounts(),
     )
-    return await _render(db, account, actor=actor)
+    return await _render(db, account)
 
 
 @router.patch("/api/accounts/{account_id}", response_model=AccountOut)
@@ -264,7 +256,7 @@ async def update_account(
         await db.update_actor_profile(
             account["actor_id"], display_name=(req.display_name.strip() or None),
         )
-    return await _render(db, account, actor=actor)
+    return await _render(db, account)
 
 
 @router.post("/api/accounts/{account_id}/disable", response_model=AccountOut)
@@ -284,7 +276,7 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s disabled by account %s", account_id, actor.account_id)
-    return await _render(db, account, actor=actor)
+    return await _render(db, account)
 
 
 @router.post("/api/accounts/{account_id}/enable", response_model=AccountOut)
@@ -295,7 +287,7 @@ async def enable_account(account_id: str, actor: Actor = Depends(require_account
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s enabled by account %s", account_id, actor.account_id)
-    return await _render(db, account, actor=actor)
+    return await _render(db, account)
 
 
 @router.put("/api/accounts/me/password", response_model=AccountOut)
@@ -340,7 +332,7 @@ async def change_own_password(
     if updated is None:  # pragma: no cover - removed between two reads
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s changed its own password", account["id"])
-    return await _render(db, updated, actor=actor)
+    return await _render(db, updated)
 
 
 def account_credential(account: dict, config) -> str:

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api, type Account } from '../api/client';
+import { api, getToken, type Account } from '../api/client';
 import { useAuthStore } from './authStore';
 
 /**
@@ -73,19 +73,39 @@ async function resync(
   // Both, independently. They answer different questions of different servers'
   // worth of state, and the list failing used to skip the status refresh
   // entirely — so an install that had just set its first password or added its
-  // second account could be left with `setupPending` and `loginMode` describing
+  // second account could be left with `loginMode` describing
   // the instance it was five seconds ago, purely because a list request
   // happened to fail.
-  const [listOutcome] = await Promise.allSettled([
+  const sessionToken = getToken();
+  const identity = useAuthStore.getState().account;
+  const [listOutcome, identityOutcome] = await Promise.allSettled([
     api.listAccounts(),
+    identity ? Promise.resolve(identity) : api.getOwnAccount(),
     // refreshStatus swallows its own failures and keeps the last known answer.
     useAuthStore.getState().refreshStatus(),
   ]);
+  const auth = useAuthStore.getState();
+  if (
+    !identity
+    && identityOutcome.status === 'fulfilled'
+    && identityOutcome.value
+    && auth.authenticated
+    && !auth.account
+    && getToken() === sessionToken
+  ) {
+    useAuthStore.setState({
+      account: {
+        id: identityOutcome.value.id,
+        username: identityOutcome.value.username,
+      },
+    });
+  }
   if (listOutcome.status === 'rejected') {
     set({ loading: false });
     return listOutcome.reason;
   }
   set({ accounts: listOutcome.value.accounts, loading: false });
+  if (identityOutcome.status === 'rejected') return identityOutcome.reason;
   return null;
 }
 
@@ -152,11 +172,6 @@ async function applyWrite(
   const failure = await resync(set);
   set({ busyId: null, ...(failure ? { error: SAVED_BUT_STALE } : {}) });
   return true;
-}
-
-/** The signed-in account's own row, once the list has loaded. */
-export function selectSelf(state: AccountState): Account | undefined {
-  return state.accounts.find((account) => account.is_self);
 }
 
 /** Whether anything blocks adding a person, and what to say about it. */

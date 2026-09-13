@@ -471,63 +471,6 @@ def _account_credentials(db_path: Path) -> list[tuple]:
         conn.close()
 
 
-def test_no_secrets_scrubs_the_account_password_hashes(
-    nerve_dir, workspace, config_dir, tmp_path,
-):
-    """Every account's password hash lives on its row, so a bundle carrying
-    nerve.db carries the credentials with it. --no-secrets promises it does
-    not — and the promise has to hold for rows as well as for files."""
-    _plant_accounts(nerve_dir / "nerve.db")
-
-    stripped = backup_mod.create_backup(
-        nerve_dir, workspace, tmp_path / "out1", config_dir=config_dir, include_secrets=False,
-    )
-    staging = tmp_path / "x1"
-    report = backup_mod.verify_bundle(stripped.path, extract_to=staging)
-    assert report.ok, report.errors  # checksums were taken after the scrub
-
-    restored = staging / "state" / "nerve.db"
-    # The hash is gone, and with it the claim that the row has one — the schema
-    # refuses a `local` account with no credential, and `none` is the truth.
-    assert _account_credentials(restored) == [
-        ("alice", "none", None), ("bob", "none", None),
-    ]
-    # Not merely unlinked: secure_delete overwrites the freed pages, so the
-    # hash is not recoverable from the file either.
-    assert _PLANTED_HASH not in restored.read_bytes().decode("latin-1")
-    # ...and the live database is untouched.
-    assert _account_credentials(nerve_dir / "nerve.db") == [
-        ("alice", "local", _PLANTED_HASH), ("bob", "none", None),
-    ]
-
-    kept = backup_mod.create_backup(
-        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir, include_secrets=True,
-    )
-    staging = tmp_path / "x2"
-    backup_mod.verify_bundle(kept.path, extract_to=staging)
-    assert _account_credentials(staging / "state" / "nerve.db") == [
-        ("alice", "local", _PLANTED_HASH), ("bob", "none", None),
-    ]
-
-
-def test_no_secrets_scrubs_both_credentials_in_one_pass(
-    nerve_dir, workspace, config_dir, tmp_path,
-):
-    """The signing secret and the password hashes go together: --no-secrets is
-    a promise about the bundle, not about one table."""
-    _plant_instance_secret(nerve_dir / "nerve.db")
-    _plant_accounts(nerve_dir / "nerve.db")
-
-    bundle = backup_mod.create_backup(
-        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir, include_secrets=False,
-    )
-    staging = tmp_path / "x"
-    assert backup_mod.verify_bundle(bundle.path, extract_to=staging).ok
-    raw = (staging / "state" / "nerve.db").read_bytes().decode("latin-1")
-    assert "planted-signing-secret" not in raw
-    assert _PLANTED_HASH not in raw
-
-
 def test_a_database_without_the_accounts_table_is_left_alone(tmp_path):
     """A bundle from before the accounts table existed has nothing to scrub,
     and that is checked explicitly rather than inferred from an error."""
@@ -1467,53 +1410,6 @@ def _member(bundle: Path, name: str, staging: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_no_secrets_scrubs_tracked_configuration(
-    nerve_dir, workspace, config_dir, tmp_path,
-):
-    """`--no-secrets` promises the archive carries no credential. The tracked
-    workspace config is copied into it verbatim, and the startup migration
-    deliberately leaves a live `auth.password_hash` there when it cannot safely
-    rewrite it — so the promise has to be kept on the way into the bundle."""
-    _with_tracked_config(workspace)
-
-    stripped = backup_mod.create_backup(
-        nerve_dir, workspace, tmp_path / "out1", config_dir=config_dir,
-        include_secrets=False,
-    )
-    settings = _member(
-        stripped.path, "workspace/config/settings.yaml", tmp_path / "x1",
-    )
-    assert _TRACKED_HASH not in settings
-    assert "an-obviously-synthetic-signing-secret" not in settings
-    # The structure survives — it is a config file, not a redaction.
-    assert "timezone: UTC" in settings
-    assert "max_turns: 40" in settings
-    assert "${" in settings          # replaced by an env reference
-    # ...and nowhere else in the archive either.
-    assert _TRACKED_HASH not in stripped.path.read_bytes().decode("latin-1")
-
-    # The cron env block goes with it; a job's environment is as good a place
-    # for a credential as the auth section.
-    jobs = _member(
-        stripped.path, "workspace/config/cron/jobs.yaml", tmp_path / "x2",
-    )
-    assert "a-fake-value" not in jobs
-    assert "nightly" in jobs
-
-
-def test_a_secrets_bundle_keeps_the_tracked_configuration_as_it_is(
-    nerve_dir, workspace, config_dir, tmp_path,
-):
-    source = _with_tracked_config(workspace)
-    kept = backup_mod.create_backup(
-        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir,
-        include_secrets=True,
-    )
-    assert _member(
-        kept.path, "workspace/config/settings.yaml", tmp_path / "x",
-    ) == source.read_text(encoding="utf-8")
-
-
 def test_a_config_file_with_nothing_secret_in_it_is_copied_unchanged(
     nerve_dir, workspace, config_dir, tmp_path,
 ):
@@ -1694,6 +1590,16 @@ def test_no_secrets_leaves_no_credential_anywhere_in_the_archive(
         if value in blob or any(value in body for body in extracted.values())
     }
     assert leaks == {}, leaks
+    assert _account_credentials(staging / "state" / "nerve.db") == [
+        ("alice", "none", None), ("bob", "none", None),
+    ]
+    assert _account_credentials(nerve_dir / "nerve.db")[0] == (
+        "alice", "local", markers["account hash on the row"],
+    )
+    settings = extracted["workspace/config/settings.yaml"]
+    jobs = extracted["workspace/config/cron/jobs.yaml"]
+    assert "timezone: UTC" in settings and "${" in settings
+    assert "nightly" in jobs and "${" in jobs
 
     # ...and the same bundle taken *with* secrets does carry them, or the test
     # above would pass against a backup that archived nothing at all.

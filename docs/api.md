@@ -58,30 +58,24 @@ per-account logins existed — those are upgraded on their first request rather
 than slid. The header is CORS-exposed, so a browser can read it cross-origin.
 
 #### `GET /api/auth/status`
-How to log in, and whether first-run setup is still pending. No auth required.
+How to log in. No auth required.
 
 ```json
 Response: {
   "auth_required": true,
-  "mode": "local",
-  "login": "password",
-  "setup_pending": false,
-  "multiple_accounts": false
+  "login": "password"
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `mode` | the identity mode. `local` in this build |
 | `login` | what the form must collect: `none` (passwordless — send any password), `password` (one account, no username), `username_password` (two or more) |
-| `setup_pending` | nothing has been secured yet: the one account has no password, so every caller is admitted as it. Equals `login == "none"` today; it is a separate field because it is the question "is this instance still unsecured", which the setup wizard owns and may widen. Setting a username does **not** clear it |
-| `multiple_accounts` | more than one account exists |
 | `auth_required` | kept for older clients; equals `login != "none"` |
 
-Three destinations come out of it: the app (already authenticated, or
-auto-logged-in when `login` is `none`), the login page, and the setup page for
-`setup_pending`. **Auto-login with an empty password is correct for `none` and
-for nothing else** — with two accounts it names nobody and the server refuses it.
+Standalone passwordless installs auto-login and open Accounts; other signed-in
+sessions open the app, and signed-out sessions open the login page. **Auto-login
+with an empty password is correct for `none` and for nothing else** — with two
+accounts it names nobody and the server refuses it.
 
 Nothing here identifies anybody: no username, and not the number of accounts.
 Before the gateway has finished starting the answer is the fail-closed one
@@ -101,8 +95,7 @@ An account is:
 {
   "id": "…", "actor_id": "…", "username": "alice", "display_name": "Alice",
   "enabled": true, "has_password": true,
-  "created_at": "…", "updated_at": "…", "disabled_at": null,
-  "is_self": true
+  "created_at": "…"
 }
 ```
 

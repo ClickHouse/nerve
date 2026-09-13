@@ -51,16 +51,13 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: 'password',
-    statusLoading: false,
-    setupPending: false,
     account: { id: 'acc-1', username: 'alice' },
     login,
     refreshStatus,
   });
   (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't', updated_at: 't',
-    disabled_at: null, is_self: true,
+    enabled: true, has_password: true, created_at: 't',
   });
 });
 
@@ -169,8 +166,7 @@ describe('the form does not go stale', () => {
     // an account, and the server now requires a username.
     useAuthStore.setState({ loginMode: 'password' });
     authStatus.mockResolvedValue({
-      auth_required: true, mode: 'local', login: 'username_password',
-      setup_pending: false, multiple_accounts: true,
+      auth_required: true, login: 'username_password',
     });
 
     render(<LoginPage />);
@@ -191,8 +187,7 @@ describe('the form does not go stale', () => {
     expect(screen.getByRole('button', { name: 'Login' })).toBeDisabled();
 
     resolve({
-      auth_required: true, mode: 'local', login: 'password',
-      setup_pending: false, multiple_accounts: false,
+      auth_required: true, login: 'password',
     });
     expect(await screen.findByLabelText('Password')).toBeInTheDocument();
     expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
@@ -214,8 +209,7 @@ describe('the form does not go stale', () => {
     useAuthStore.setState({ loginMode: 'password', login: realLogin });
     apiLogin.mockRejectedValue(new Error('401: Unauthorized'));
     authStatus.mockResolvedValue({
-      auth_required: true, mode: 'local', login: 'username_password',
-      setup_pending: false, multiple_accounts: true,
+      auth_required: true, login: 'username_password',
     });
 
     render(<LoginPage />);
@@ -230,8 +224,7 @@ describe('the form does not go stale', () => {
   it('re-reads it when the overlay appears', async () => {
     useAuthStore.setState({ loginMode: 'password' });
     authStatus.mockResolvedValue({
-      auth_required: true, mode: 'local', login: 'username_password',
-      setup_pending: false, multiple_accounts: true,
+      auth_required: true, login: 'username_password',
     });
 
     render(<SessionExpiredOverlay />);
@@ -243,8 +236,7 @@ describe('the form does not go stale', () => {
   it('re-reads it on logout', async () => {
     useAuthStore.setState({ loginMode: 'password', logout: realLogout });
     authStatus.mockResolvedValue({
-      auth_required: true, mode: 'local', login: 'username_password',
-      setup_pending: false, multiple_accounts: true,
+      auth_required: true, login: 'username_password',
     });
 
     render(<SessionExpiredOverlay />);

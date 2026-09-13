@@ -2,8 +2,9 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Users, Plus, AlertTriangle } from '../components/ui/icons';
 import { Badge, Button, PageHeader, TextField } from '../components/ui';
 import {
-  useAccountStore, blockedReason, selectSelf, type AccountState,
+  useAccountStore, blockedReason, type AccountState,
 } from '../stores/accountStore';
+import { useAuthStore } from '../stores/authStore';
 import type { Account } from '../api/client';
 
 /**
@@ -22,7 +23,8 @@ export function AccountsPage() {
   const loading = useAccountStore((s: AccountState) => s.loading);
   const error = useAccountStore((s: AccountState) => s.error);
   const load = useAccountStore((s: AccountState) => s.load);
-  const self = useAccountStore(selectSelf);
+  const signedInId = useAuthStore((s) => s.account?.id);
+  const self = accounts.find((account) => account.id === signedInId);
   const [adding, setAdding] = useState(false);
 
   useEffect(() => { void load(); }, [load]);
@@ -50,7 +52,12 @@ export function AccountsPage() {
       <div className="flex-1 overflow-auto p-4 lg:p-6">
         <div className="max-w-3xl mx-auto">
           {error && (
-            <p role="alert" className="text-error text-sm mb-4">{error}</p>
+            <div className="flex items-center gap-2 mb-4">
+              <p role="alert" className="text-error text-sm">{error}</p>
+              <Button variant="ghost" size="sm" onClick={() => void load()}>
+                Retry
+              </Button>
+            </div>
           )}
 
           {blocked && (
@@ -73,7 +80,7 @@ export function AccountsPage() {
             <ul className="flex flex-col gap-2">
               {accounts.map((account) => (
                 <li key={account.id}>
-                  <AccountRow account={account} />
+                  <AccountRow account={account} isSelf={account.id === signedInId} />
                 </li>
               ))}
             </ul>
@@ -95,8 +102,8 @@ export function AccountsPage() {
  * in needs somebody else's account. One button press is not enough ceremony for
  * that.
  */
-function disableWarning(account: Account): string {
-  if (account.is_self) {
+function disableWarning(account: Account, isSelf: boolean): string {
+  if (isSelf) {
     return 'Disable your own account? Your next request will be refused, so you '
       + 'will be signed out straight away — and getting back in needs somebody '
       + 'else to re-enable you from their account.';
@@ -106,7 +113,7 @@ function disableWarning(account: Account): string {
     + 'request. You can re-enable them here afterwards.';
 }
 
-function AccountRow({ account }: { account: Account }) {
+function AccountRow({ account, isSelf }: { account: Account; isSelf: boolean }) {
   const setEnabled = useAccountStore((s: AccountState) => s.setEnabled);
   const update = useAccountStore((s: AccountState) => s.update);
   const busyId = useAccountStore((s: AccountState) => s.busyId);
@@ -133,7 +140,7 @@ function AccountRow({ account }: { account: Account }) {
             <span className="text-sm font-medium text-text truncate">
               {account.username ?? <span className="text-text-dim italic">no username</span>}
             </span>
-            {account.is_self && <Badge tone="info">you</Badge>}
+            {isSelf && <Badge tone="info">you</Badge>}
             {!account.enabled && <Badge tone="warning">disabled</Badge>}
             {!account.has_password && <Badge tone="warning">no password</Badge>}
           </div>
@@ -187,7 +194,7 @@ function AccountRow({ account }: { account: Account }) {
         >
           <AlertTriangle size={14} className="text-hue-amber mt-0.5 shrink-0" />
           <div className="min-w-0">
-            <p className="text-sm text-text-muted">{disableWarning(account)}</p>
+            <p className="text-sm text-text-muted">{disableWarning(account, isSelf)}</p>
             <div className="flex items-center gap-2 mt-2">
               <Button
                 variant="primary"
@@ -195,7 +202,7 @@ function AccountRow({ account }: { account: Account }) {
                 onClick={() => void confirmDisable()}
                 disabled={busy}
               >
-                {account.is_self ? 'Disable my account' : 'Disable account'}
+                {isSelf ? 'Disable my account' : 'Disable account'}
               </Button>
               <Button
                 variant="ghost"
