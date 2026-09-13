@@ -853,13 +853,22 @@ class CronService:
                 return key
         return None
 
-    async def _start_new_generation(self, job_id: str) -> str:
-        """Create a fresh chat session for a persistent job and map it."""
+    async def _start_new_generation(
+        self, job_id: str, actor: Actor | None = None,
+    ) -> str:
+        """Create a fresh chat session for a persistent job and map it.
+
+        ``actor`` lets a caller that retires the previous generation first
+        resolve the principal *before* that retirement, so a lookup failure
+        cannot leave a job with a retired chat and no replacement.
+        """
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         session_id = f"cron:{job_id}:{ts}"
+        if actor is None:
+            actor = await system_actor(self.db)
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
-            actor=await system_actor(self.db),
+            actor=actor,
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -991,6 +1000,13 @@ class CronService:
         current = await self._current_persistent_session_id(job.id)
         rotated = False
 
+        # Resolved once, up front: retiring the current generation cancels its
+        # wakeups and stamps it rotated, and the replacement is what the run
+        # then uses. Resolving only at the replacement would leave a failed
+        # rotation with a retired chat and nothing in its place until the next
+        # run redid the whole thing.
+        actor = await system_actor(self.db)
+
         if current and (job.context_rotate_at or job.context_rotate_hours > 0):
             session = await self.db.get_session(current)
             if session:
@@ -1003,7 +1019,7 @@ class CronService:
                     rotated = True
 
         if current is None:
-            current = await self._start_new_generation(job.id)
+            current = await self._start_new_generation(job.id, actor)
         return current, rotated
 
     # -- End persistent session generations ----------------------------------
@@ -1450,8 +1466,10 @@ class CronService:
         rotated = False
         new_session_id: str | None = None
         if session_id and session:
+            # Same ordering as the automatic rotation above.
+            actor = await system_actor(self.db)
             await self._retire_session(job_id, session_id, "manual")
-            new_session_id = await self._start_new_generation(job_id)
+            new_session_id = await self._start_new_generation(job_id, actor)
             rotated = True
 
         logger.info(

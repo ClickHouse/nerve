@@ -112,6 +112,12 @@ async def request_plan_revision(
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
+    # Resolved before anything is written. The plan stays pending either way,
+    # so a failure here is retryable — but retrying would otherwise append a
+    # second identical note to the task's history, and resolving first costs
+    # nothing.
+    revision_actor = await system_actor(engine.db)
+
     # 1. Store feedback on the plan (status stays pending until planner
     #    supersedes it via plan_update).
     await db.update_plan(plan_id, feedback=feedback)
@@ -146,7 +152,6 @@ async def request_plan_revision(
         if session_id.startswith("cron:")
         else session_id
     )
-    revision_actor = await system_actor(engine.db)
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron", actor=revision_actor,
     )
