@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from nerve.config import get_config
 from nerve.db.accounts import (
     AccountError,
+    StaleSessionError,
     LastAccountError,
     PasswordlessInstanceError,
     UnnamedAccountError,
@@ -51,7 +52,7 @@ router = APIRouter()
 # "conflict" means and what tells a UI to re-read and explain rather than to
 # re-validate the form.
 _CONFLICT = (PasswordlessInstanceError, UnnamedAccountError, UsernameTakenError,
-             LastAccountError)
+             LastAccountError, StaleSessionError)
 
 
 class AccountOut(BaseModel):
@@ -205,6 +206,12 @@ async def create_account(req: AccountCreateRequest, actor: Actor = Depends(requi
             username=req.username,
             credential=_hashed(req.password),
             display_name=(req.display_name or None),
+            # The epoch this request was *authorised* under, checked inside the
+            # transaction: a create admitted while the instance was
+            # passwordless must not leave an account behind if a claim landed
+            # while it was in flight (PR 6's claim cutover).
+            acting_account_id=actor.account_id,
+            acting_session_epoch=actor.session_epoch,
         )
     except _CONFLICT as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -240,7 +247,12 @@ async def update_account(
 
     if req.username is not None:
         try:
-            account = await db.update_account_login(account_id, username=req.username)
+            account = await db.update_account_login(
+                account_id, username=req.username,
+                expected_session_epoch=(
+                    actor.session_epoch if account_id == actor.account_id else None
+                ),
+            )
         except _CONFLICT as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
         except AccountError as e:
@@ -269,7 +281,11 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
     """
     db = get_deps().db
     try:
-        account = await db.disable_account(account_id)
+        account = await db.disable_account(
+            account_id,
+            acting_account_id=actor.account_id,
+            acting_session_epoch=actor.session_epoch,
+        )
     except LastAccountError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
@@ -282,7 +298,11 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 async def enable_account(account_id: str, actor: Actor = Depends(require_account)):
     """Re-enable an account. Idempotent."""
     db = get_deps().db
-    account = await db.enable_account(account_id)
+    account = await db.enable_account(
+        account_id,
+        acting_account_id=actor.account_id,
+        acting_session_epoch=actor.session_epoch,
+    )
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s enabled by account %s", account_id, actor.account_id)
@@ -342,6 +362,12 @@ async def change_own_password(
     try:
         updated = await db.update_account_login(
             account["id"], credential=_hashed(req.new_password),
+            # Conditional on the account still being at the epoch this request
+            # was authorised under. The passwordless branch above read a
+            # snapshot; if a claim committed between that read and this write,
+            # the snapshot says "no password to prove" about an account that
+            # now has one, and the write would hand the instance back.
+            expected_session_epoch=actor.session_epoch,
         )
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
