@@ -1190,11 +1190,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
-    from nerve.db.accounts import list_credential_sources_readonly
+    from nerve.db.accounts import inspect_bootstrap_state
     from nerve.gateway.auth import source_authenticates
 
     configured = bool(config.auth.password_hash)
-    sources = list_credential_sources_readonly(paths.db_path())
+    identity_state = inspect_bootstrap_state(paths.db_path())
+    sources = identity_state[0] if identity_state is not None else None
     usable = [
         source for source in (sources or [])
         if source_authenticates(source, configured_password=configured)
