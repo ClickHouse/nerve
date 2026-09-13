@@ -387,7 +387,9 @@ async def claim(req: ClaimRequest, request: Request):
         # this instance served — otherwise `https://evil.example` picks the
         # password for an unclaimed instance on the machine of anybody who
         # visits it. The token remains the way through from anywhere else.
-        ok, why_not = same_origin(request.headers, config)
+        ok, why_not = same_origin(
+            request.headers, config, scheme=request.url.scheme,
+        )
         if not ok:
             needs_token = True
             logger.warning(
