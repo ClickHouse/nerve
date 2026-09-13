@@ -170,14 +170,21 @@ class AccountStore:
         actor_id: str,
         *,
         display_name: str | None | object = _UNSET,
+        acting_account_id: str | None = None,
+        acting_session_epoch: int | None = None,
     ) -> dict | None:
-        """Rename an actor without rewriting authorship references."""
+        """Rename an actor if the acting session is still current."""
         if display_name is _UNSET:
             return await self.get_actor_ref(actor_id)
-        await self._write(
-            "UPDATE actor_refs SET display_name = ? WHERE id = ?",
-            (display_name, actor_id),
-        )
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            await self._require_session_epoch(
+                acting_account_id, acting_session_epoch,
+            )
+            await self.db.execute(
+                "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+                (display_name, actor_id),
+            )
         return await self.get_actor_ref(actor_id)
 
     # -- accounts ------------------------------------------------------------
