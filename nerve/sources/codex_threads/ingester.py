@@ -119,15 +119,20 @@ class CodexIngester:
             return
 
         if event.thread_id not in self._in_scope:
-            # We saw a message before session_meta — common when an
-            # origin replays a half-written file. Refuse to create a
-            # session out of thin air; let the service replay from the
-            # beginning of the file when session_meta arrives.
-            logger.debug(
-                "Ingester: dropping %s for thread %s (no session_meta yet)",
-                event.type, event.thread_id,
+            # A persisted cursor can resume after session_meta in a fresh
+            # process. Rehydrate that decision from the session it created;
+            # without this, a correctly retained message cursor would replay
+            # into a new ingester that silently drops the event.
+            existing = await self.db.get_session(
+                await self._session_id_for(event.thread_id)
             )
-            return
+            if existing is None:
+                logger.debug(
+                    "Ingester: dropping %s for thread %s (no session_meta yet)",
+                    event.type, event.thread_id,
+                )
+                return
+            self.mark_in_scope(event.thread_id)
 
         if event.type in ("turn_started", "turn_completed"):
             # Metadata only — no message row. Useful as a hook for
@@ -255,6 +260,7 @@ class CodexIngester:
                 await self.db.update_session_fields(session_id, {"status": "active"})
             except Exception:
                 logger.exception("Failed to reactivate session %s", session_id)
+                raise
 
     async def _archive_session(self, thread_id: str) -> None:
         session_id = await self._session_id_for(thread_id)
@@ -270,6 +276,7 @@ class CodexIngester:
                 logger.info("Codex thread %s: archived", thread_id[:8])
         except Exception:
             logger.exception("Failed to archive Codex session %s", session_id)
+            raise
 
     async def _session_id_for(self, thread_id: str) -> str:
         mapped = await self.db.get_session_for_native_thread("codex", thread_id)
@@ -319,22 +326,15 @@ class CodexIngester:
             )
 
         created_at = msg.created_at.isoformat() if msg.created_at else None
-        # A synced Codex turn was typed into another program, by somebody this
-        # instance has no way to identify — Nerve sees a rollout file, not a
-        # login. The honest answer is that the instance ingested it, so the
-        # user rows carry the system principal; the assistant and tool rows
-        # keep their own authorship and stay unattributed, exactly like a
-        # native turn's.
-        actor = (
-            await system_actor(self.db) if msg.role == "user" else None
-        )
         try:
             inserted = await self.db.add_message_idempotent(
                 session_id=session_id,
                 role=msg.role,
                 content=msg.content,
                 external_id=msg.external_id,
-                actor=actor,
+                # Imported human input has no provider-to-person mapping.
+                # Assistant and tool output is also unattributed by design.
+                actor=None,
                 channel=msg.channel,
                 thinking=msg.thinking,
                 blocks=msg.blocks,
@@ -345,7 +345,10 @@ class CodexIngester:
                 "Codex ingest: insert failed for %s (external_id=%s)",
                 session_id, msg.external_id,
             )
-            return
+            # The origin worker may only checkpoint an event that landed.
+            # Propagate so it keeps its last successful cursor and replays this
+            # idempotent insert after restart.
+            raise
 
         if inserted is None:
             self.stats["messages_skipped_duplicate"] += 1

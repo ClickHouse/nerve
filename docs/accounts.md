@@ -369,8 +369,8 @@ rewrites nothing.
 | A session you created — from the sidebar, a fork, an approved plan | you |
 | A message you typed — in the browser, over the WebSocket, through `/api/chat`, or composed and deferred with "run later" | you |
 | A session or a prompt the instance produced for itself — a cron generation, a scheduled wakeup, a webhook, a workflow leg, a plan's implementation prompt, a relayed notification answer | the agent's system principal |
-| A Telegram or Slack message | the system principal — see below |
-| An MCP satellite session, or a Codex thread the sync ingested | the system principal |
+| A Telegram or Slack message, or imported Codex human input | `NULL` until a provider-person mapping exists |
+| An MCP satellite session, or a Codex session the sync creates | the system principal |
 | Anything the assistant or a tool produced, including Nerve's own status lines written in the assistant's voice | nobody — the column stays `NULL` |
 
 The dividing line for a message is **who supplied the content**. A person
@@ -385,12 +385,9 @@ Assistant and tool rows stay unattributed on purpose. Their authorship is
 false. Linking a turn back to whoever prompted it is a separate column
 (`caused_by_actor_id`) that this release does not add.
 
-**Channel messages are the agent's, for now.** Telegram and Slack senders are
-provider identities, and matching one to a local account needs a mapping table
-Nerve does not have. The alternatives were guessing from a display name — which
-is exactly what an identity system must never do — or refusing the message, so
-channel traffic is recorded as received by the instance. The transport and the
-sender are still on the message as provenance; they are simply not identity.
+**External people stay unidentified.** Telegram, Slack, and imported Codex
+messages do not carry a Nerve account identity. Their `actor_id` is `NULL`
+until a provider-person mapping exists; transport metadata remains provenance.
 
 **History from before this version says nothing about who wrote it**, and that
 is deliberate. Both columns are `NULL` on every pre-existing row, nothing is
@@ -406,14 +403,9 @@ render as a blank name. That is safe precisely because actor rows are never
 deleted and accounts are tombstoned rather than removed (above). `NULL` is
 exempt, so unattributed history is unaffected.
 
-**`NULL` means one of two things, and never "the lookup failed".** Autonomous
-work resolves the system principal *before* it writes anything, and a run that
-cannot resolve it fails and is reported rather than storing rows under nobody.
-Every production database has been bootstrapped before it serves, so this is
-the shape of a regression rather than a state to expect — but it is worth
-saying which way it breaks, because a row written unattributed would be
-indistinguishable from history that predates this release, forever, and nothing
-could repair it afterwards. A failed run can simply be run again.
+**`NULL` means attribution was not recorded.** That includes legacy history,
+unidentified external people, and assistant/tool output. Autonomous Nerve work
+uses the migration-guaranteed system actor cached by its database.
 
 **Ids are permanent.** If an install later moves to an external identity
 provider, work done before the move keeps the local actor ids it has now and

@@ -32,7 +32,6 @@ import pytest_asyncio
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.db import Database
 from nerve.notifications import handlers as _handlers
-from nerve.identity import ActorResolutionError
 from nerve.notifications.service import NotificationService
 
 from tests.test_notifications_actionable import (
@@ -45,13 +44,7 @@ from tests.actor_rows import ensure_system_principal
 
 @pytest_asyncio.fixture
 async def db(db):  # noqa: F811 — the conftest database, with an identity
-    """The conftest database after local bootstrap.
-
-    Autonomous code resolves the agent's system principal before it writes and
-    fails the run rather than storing a row under nobody, so the paths this
-    file drives need the identity every real database has: production opens
-    nothing without bootstrapping it first.
-    """
+    """The conftest database after local bootstrap."""
     await ensure_system_principal(db)
     return db
 
@@ -396,36 +389,6 @@ class TestExpiryReporting:
         nid = result["notification_id"]
         await db.update_notification(nid, expires_at=_iso(-1))
         return nid
-
-    async def test_a_failed_lookup_leaves_the_question_for_the_next_tick(
-        self, db: Database, fake_config, fake_engine, patch_broadcaster,
-    ):
-        """Expiring is one-way, and the note telling the asking session its
-        question died can only be built from the rows that flip. So the actor
-        is resolved before the flip: a failure costs one tick, not the note.
-        """
-        await db.create_session("s1", actor=None)
-        svc = NotificationService(fake_config, db, fake_engine)
-        nid = await self._expired_question(db, svc)
-
-        real = db.get_system_principal
-
-        async def _no_principal():
-            return None
-
-        db.get_system_principal = _no_principal
-        with pytest.raises(ActorResolutionError):
-            await svc.expire_stale()
-        db.get_system_principal = real
-
-        assert (await db.get_notification(nid))["status"] == "pending"
-        fake_engine.run.assert_not_called()
-
-        # The next tick expires it and reports it together.
-        assert await svc.expire_stale() == 1
-        await asyncio.sleep(0)
-        assert (await db.get_notification(nid))["status"] == "expired"
-        fake_engine.run.assert_called_once()
 
     async def test_expired_question_injected_into_origin_session(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,

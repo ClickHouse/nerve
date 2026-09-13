@@ -26,20 +26,14 @@ from nerve.agent.plan_service import (
     request_plan_revision,
 )
 from nerve.db import Database
-from nerve.identity import Actor, ActorResolutionError
+from nerve.identity import Actor
 
 from tests.actor_rows import ensure_system_principal
 
 
 @pytest_asyncio.fixture
 async def db(db):  # noqa: F811 — the conftest database, with an identity
-    """The conftest database after local bootstrap.
-
-    Autonomous code resolves the agent's system principal before it writes and
-    fails the run rather than storing a row under nobody, so the paths this
-    file drives need the identity every real database has: production opens
-    nothing without bootstrapping it first.
-    """
+    """The conftest database after local bootstrap."""
     await ensure_system_principal(db)
     return db
 
@@ -168,43 +162,6 @@ class TestRequestPlanRevision:
         body = task_md.read_text(encoding="utf-8")
         assert "Revision requested for plan-orig" in body
         assert "needs more tests" in body
-
-    async def test_a_failed_lookup_writes_nothing(self, db: Database, tmp_path):
-        """The plan stays pending either way, so a retry was always possible —
-        but a retry after a half-done attempt would append the revision note
-        to the task a second time. Resolve first, write nothing on failure."""
-        engine, task_id = await _setup(db, tmp_path)
-        real = db.get_system_principal
-
-        async def _no_principal():
-            return None
-
-        db.get_system_principal = _no_principal
-        with pytest.raises(ActorResolutionError):
-            await request_plan_revision(
-                db=db, engine=engine,
-                plan_id="plan-orig", feedback="needs more tests",
-            )
-        db.get_system_principal = real
-
-        plan = await db.get_plan("plan-orig")
-        assert not plan["feedback"]
-        assert plan["status"] == "pending"
-        task_md = tmp_path / (await db.get_task(task_id))["file_path"]
-        assert "Revision requested" not in task_md.read_text(encoding="utf-8")
-        assert engine.runs == []
-
-        # The retry does the whole thing once.
-        await request_plan_revision(
-            db=db, engine=engine,
-            plan_id="plan-orig", feedback="needs more tests",
-        )
-        await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
-
-        assert (await db.get_plan("plan-orig"))["feedback"] == "needs more tests"
-        body = task_md.read_text(encoding="utf-8")
-        assert body.count("Revision requested for plan-orig") == 1
-        assert len(engine.runs) == 1
 
     async def test_routes_to_proposer_session(self, db: Database, tmp_path):
         engine, _ = await _setup(db, tmp_path)
