@@ -598,6 +598,115 @@ class TestClaimingEndsTheSessionsBeforeIt:
 
 
 # --------------------------------------------------------------------------- #
+#  Requests already in flight when the claim commits                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestAnInFlightRequestCannotOutliveTheClaim:
+    """The claim is a cutover, not a door that swings shut behind the last
+    caller through it.
+
+    A passwordless install admits everybody, so a visitor's request can be
+    *authorised* a moment before the claim and land a moment after it. Refusing
+    at the door is not enough: the check and the write have to be one act, so
+    the write carries the epoch its credential named and the row refuses it if
+    the two have diverged.
+    """
+
+    async def _claim_between_read_and_write(self, install, monkeypatch, seam):
+        """Make ``seam`` commit the claim the first time it is touched."""
+        claimed: list[str] = []
+        fired: list[bool] = []
+        original = getattr(install.db, seam)
+
+        async def _claim_then(*args, **kwargs):
+            # Guarded *before* awaiting: the claim goes through this same
+            # seam, so a flag set afterwards would recurse into a second
+            # claim instead of arming the window once.
+            if not fired:
+                fired.append(True)
+                response = await _claim(install)
+                assert response.status_code == 200, response.text
+                claimed.append(response.json()["token"])
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(install.db, seam, _claim_then)
+        return claimed
+
+    async def test_a_password_change_admitted_before_the_claim_is_refused(
+        self, install, monkeypatch,
+    ):
+        """The takeover the reviewer reproduced: the route read a passwordless
+        snapshot, the claim committed, and the write then set the attacker's
+        password on a claimed account."""
+        visitor = install.session_token()
+        claimed = await self._claim_between_read_and_write(
+            install, monkeypatch, "get_account",
+        )
+
+        async with _client(install.app, token=visitor) as http:
+            response = await http.put(
+                "/api/accounts/me/password", json={"new_password": "taken-over"},
+            )
+        assert claimed, "the claim never ran"
+        assert response.status_code in (401, 409), response.text
+
+        account = await install.db.get_account(install.owner_id)
+        assert verify_password(_PASSWORD, account["credential"]), (
+            "an in-flight request replaced the password the claim just set"
+        )
+        assert not verify_password("taken-over", account["credential"])
+
+    async def test_an_account_creation_admitted_before_the_claim_is_refused(
+        self, install, monkeypatch,
+    ):
+        """...and cannot leave a durable second account behind."""
+        visitor = install.session_token()
+        claimed = await self._claim_between_read_and_write(
+            install, monkeypatch, "get_actor_ref",
+        )
+
+        async with _client(install.app, token=visitor) as http:
+            response = await http.post("/api/accounts", json={
+                "username": "mallory", "password": "a-second-way-in",
+            })
+        assert claimed, "the claim never ran"
+        assert response.status_code in (401, 409), response.text
+        assert await install.db.get_account_by_username("mallory") is None
+
+    async def test_a_disable_admitted_before_the_claim_is_refused(
+        self, install, monkeypatch,
+    ):
+        """Locking the new owner out is the other way to keep control."""
+        visitor = install.session_token()
+        await self._claim_between_read_and_write(
+            install, monkeypatch, "get_account",
+        )
+
+        async with _client(install.app, token=visitor) as http:
+            response = await http.post(
+                f"/api/accounts/{install.owner_id}/disable",
+            )
+        assert response.status_code in (401, 409), response.text
+        account = await install.db.get_account(install.owner_id)
+        assert account["enabled"] is True
+
+    async def test_the_claimer_can_do_all_of_it(self, claimed):
+        """The cutover refuses *stale* sessions, not every session: the person
+        who claimed the instance is at the current epoch and unaffected."""
+        async with _http(claimed) as http:
+            changed = await http.put("/api/accounts/me/password", json={
+                "current_password": _PASSWORD, "new_password": "a-newer-one",
+            })
+            created = await http.post("/api/accounts", json={
+                "username": "bob", "password": "another-passphrase",
+            })
+        assert changed.status_code == 200, changed.text
+        assert created.status_code == 201, created.text
+
+
+# --------------------------------------------------------------------------- #
 #  The side door                                                               #
 # --------------------------------------------------------------------------- #
 
