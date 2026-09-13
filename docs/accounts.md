@@ -64,6 +64,11 @@ account's username, display name, and password in one operation. Remote claims
 require the setup token printed by the server. Loopback requests are exempt
 unless `auth.setup_token_required` is enabled.
 
+Claiming increments the account's session epoch. Sessions issued while the
+installation was passwordless stop working on their next request; the claim
+response contains the replacement token. An existing WebSocket remains valid
+until it reconnects.
+
 While the installation is unclaimed, the normal password-change endpoint
 returns `409`; use the claim endpoint instead. See
 [Setup](setup.md#claiming-an-instance-from-a-browser).
