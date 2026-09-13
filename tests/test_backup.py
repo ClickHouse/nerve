@@ -382,11 +382,10 @@ def _plant_instance_secret(db_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
-            "CREATE TABLE instance_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL, "
-            "created_at TEXT NOT NULL)"
+            "CREATE TABLE instance_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
         conn.execute(
-            "INSERT INTO instance_secrets VALUES ('jwt_secret', 'planted-signing-secret', 't')"
+            "INSERT INTO instance_secrets VALUES ('jwt_secret', 'planted-signing-secret')"
         )
         conn.commit()
     finally:
@@ -431,8 +430,8 @@ def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, confi
 def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, tmp_path):
     """Actor references must stay stable across a restore: sessions and
     messages will point at these ids for good, so a restored instance has to
-    find the very same tenant, agent, system principal, owner and account —
-    and the same signing secret, so live sessions keep verifying."""
+    find the same human, system actor and account — and the same signing
+    secret, so live sessions keep verifying."""
     import asyncio
 
     from nerve.db import Database
@@ -445,9 +444,11 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
         db = Database(nd / "nerve.db")
         await db.connect()
         try:
-            identity = await db.bootstrap_local_identity(credential_source="none")
-            secret = await db.ensure_instance_secret(JWT_SECRET_NAME, "stable-signing-secret")
-            return identity, secret, await db.list_accounts()
+            account = await db._bootstrap_first_account(credential_source="none")
+            secret = await db._ensure_instance_secret(
+                JWT_SECRET_NAME, "stable-signing-secret"
+            )
+            return db.system_actor_id, account, secret, await db._account_rows()
         finally:
             await db.close()
 
@@ -456,15 +457,15 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
         await db.connect()  # already at the schema head: no migration runs
         try:
             return (
-                await db.get_local_identity(),
-                await db.get_instance_secret(JWT_SECRET_NAME),
-                await db.list_accounts(),
+                db.system_actor_id,
+                await db._get_instance_secret(JWT_SECRET_NAME),
+                await db._account_rows(),
                 await db.get_system_principal(),
             )
         finally:
             await db.close()
 
-    identity, secret, accounts = asyncio.run(_bootstrap())
+    system_id, identity, secret, accounts = asyncio.run(_bootstrap())
     _make_memu_db(nd / "memu.sqlite")
 
     result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
@@ -474,13 +475,14 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
     )
     assert rep.ok, rep.errors
 
-    found, found_secret, found_accounts, system = asyncio.run(_read_back(nd2 / "nerve.db"))
-    assert (found.tenant_id, found.agent_id, found.system_actor_id) == (
-        identity.tenant_id, identity.agent_id, identity.system_actor_id,
+    found_system_id, found_secret, found_accounts, system = asyncio.run(
+        _read_back(nd2 / "nerve.db")
     )
+    assert found_system_id == system_id
     assert found_accounts == accounts
-    assert found_accounts[0]["id"] == identity.owner_account_id
-    assert system["id"] == identity.system_actor_id
+    assert found_accounts[0]["id"] == identity.account_id
+    assert found_accounts[0]["actor_id"] == identity.actor_id
+    assert system["id"] == system_id
     assert found_secret == secret == "stable-signing-secret"
 
 
@@ -526,8 +528,10 @@ def _nerve_dir_with_stored_key(tmp_path) -> Path:
         db = Database(nd / "nerve.db")
         await db.connect()
         try:
-            await db.bootstrap_local_identity(credential_source="none")
-            await db.ensure_instance_secret(JWT_SECRET_NAME, "backed-up-secret-32-bytes-padded!!")
+            await db._bootstrap_first_account(credential_source="none")
+            await db._ensure_instance_secret(
+                JWT_SECRET_NAME, "backed-up-secret-32-bytes-padded!!"
+            )
         finally:
             await db.close()
 

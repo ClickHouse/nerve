@@ -241,9 +241,8 @@ SQLite with WAL mode (schema version 16):
 - `notifications` — Async notifications and questions (id, session_id, type, title, body, priority, status, options, answer, delivery tracking, expiry)
 - `mcp_servers` — MCP server registry (config is source of truth, DB tracks metadata)
 - `mcp_tool_usage` — MCP tool invocation tracking
-- `actor_refs` — Attribution identity: stable id, `kind` (`human`/`system`), display name, email, profile version (see [Accounts and identity](accounts.md))
+- `actor_refs` — Attribution identity: stable id, `kind` (`human`/`system`), display name (see [Accounts and identity](accounts.md))
 - `accounts` — Local login state, one per human actor: username, `credential_source` (`config`/`local`/`none`), credential, enabled
-- `tenants`, `agents`, `tenant_memberships`, `agent_grants` — The singleton local identity rows the bootstrap creates (one tenant, one agent with its system principal, the owner's membership and bootstrap owner grant)
 - `instance_secrets` — Machine-local secrets that are state rather than configuration (the generated JWT signing secret)
 
 memU SQLite (`~/.nerve/memu.sqlite`):

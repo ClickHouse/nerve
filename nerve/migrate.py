@@ -248,12 +248,6 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # box's runtime directory. Publishing it would point every instance at a
     # path that exists on exactly one of them.
     "workflows.runs_dir",
-    # The identity mode is decided on the box (or where its service is
-    # defined, via NERVE_AUTH_MODE), never by the file a configuration push
-    # delivers: the loader ignores it in the tracked layer outright (see
-    # nerve.config._drop_tracked_auth_mode), so a legacy monolith's value has
-    # to stay in config.yaml or it stops having any effect.
-    "auth.mode",
 })
 
 
@@ -967,11 +961,9 @@ def maybe_migrate(
 #  Identity bootstrap                                                          #
 # --------------------------------------------------------------------------- #
 #
-# Step 2 of the local multi-user migration order ("bootstrap authority"), after
-# the schema expand of v047. Creates the one local owner account, the rows the
-# architecture wants around it (tenant, agent, system principal, membership,
-# grant — see nerve/db/accounts.py) and, when configuration supplies no
-# auth.jwt_secret, the signing secret the gateway runs with.
+# Configuration-aware bootstrap after the v047 schema migration. The migration
+# itself creates the system actor; this step creates only the first human
+# account and, when needed, the signing secret the gateway runs with.
 #
 # Rules it keeps:
 #
@@ -1139,7 +1131,7 @@ async def bootstrap_identity(
     source = _credential_source_for(config)
 
     if dry_run:
-        if await db.count_accounts() == 0:
+        if await db._count_accounts() == 0:
             report.bootstrapped_account = True
             report.identity_actions.append(_account_action(source, dry_run=True))
     else:
@@ -1151,31 +1143,30 @@ async def bootstrap_identity(
         # taken before it: two bootstraps racing — a `nerve migrate` beside a
         # starting daemon — both read zero accounts, but only the one that
         # wins BEGIN IMMEDIATE creates the owner, and only it may say so.
-        identity = await db.bootstrap_local_identity(
+        account = await db._bootstrap_first_account(
             credential_source=source, display_name=display_name,
         )
-        if "owner" in identity.created:
+        if account.created:
             report.bootstrapped_account = True
             report.identity_actions.append(_account_action(source, dry_run=False))
             logger.info(
-                "Identity bootstrap: local tenant %s, agent %s, owner account %s "
-                "(actor %s, credential_source=%s), system principal %s",
-                identity.tenant_id, identity.agent_id, identity.owner_account_id,
-                identity.owner_actor_id, source, identity.system_actor_id,
+                "Identity bootstrap: account %s (actor %s, credential_source=%s); "
+                "system actor %s",
+                account.account_id, account.actor_id, source, db.system_actor_id,
             )
 
     # The mirror runs after the transaction whoever won it, so a caller that
     # lost the race with a different configuration snapshot still brings the
     # row in line with its own. For the winner it is a no-op: the account it
     # just created already carries ``source``.
-    for account in await db.list_accounts():
+    for account in await db._account_rows():
         current = account["credential_source"]
         if current == "local" or current == source:
             continue
         report.updated_credential_source = True
         report.identity_actions.append(_mirror_action(current, source, dry_run))
         if not dry_run:
-            await db.set_account_credential(account["id"], credential_source=source)
+            await db._set_bootstrap_credential_source(account["id"], source)
 
     await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
     return report
@@ -1212,14 +1203,14 @@ async def ensure_jwt_secret(
     report = MigrationReport(dry_run=dry_run) if report is None else report
     if not dry_run:
         _refuse_insecure_secret_storage(db, config, log=True)
-    stored = await db.get_instance_secret(JWT_SECRET_NAME)
+    stored = await db._get_instance_secret(JWT_SECRET_NAME)
 
     if config.auth.jwt_secret:
         if stored is not None:
             report.retired_stored_secret = True
             report.identity_actions.append(_retire_action(dry_run))
             if not dry_run:
-                await db.delete_instance_secret(JWT_SECRET_NAME)
+                await db._delete_instance_secret(JWT_SECRET_NAME)
                 logger.info(
                     "Retired the database-held signing secret: auth.jwt_secret is "
                     "configured and supersedes it",
@@ -1232,7 +1223,7 @@ async def ensure_jwt_secret(
         report.identity_actions.append(_secret_action(dry_run))
         if dry_run:
             return ""
-        stored = await db.ensure_instance_secret(JWT_SECRET_NAME, secrets.token_hex(32))
+        stored = await db._ensure_instance_secret(JWT_SECRET_NAME, secrets.token_hex(32))
         secret = stored
         logger.info(
             "Generated a JWT signing secret and stored it in nerve.db "
@@ -1301,25 +1292,20 @@ def _bootstrap_identity_sync(
 def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationReport) -> None:
     """Dry-run counterpart of :func:`bootstrap_identity`: read-only, and a
     missing database is reported as "would create" rather than created."""
-    from nerve.db.accounts import (
-        JWT_SECRET_NAME,
-        count_accounts_readonly,
-        list_credential_sources_readonly,
-        read_instance_secret,
-    )
+    from nerve.db.accounts import inspect_bootstrap_state
 
     source = _credential_source_for(config)
-    count = count_accounts_readonly(db_path)
-    if not count:  # None (no database / pre-v047 schema) or zero rows
+    state = inspect_bootstrap_state(db_path)
+    sources, stored = state if state is not None else ([], False)
+    if not sources:  # no database / pre-v047 schema, or zero accounts
         report.bootstrapped_account = True
         report.identity_actions.append(_account_action(source, dry_run=True))
     else:
-        for current in list_credential_sources_readonly(db_path) or []:
+        for current in sources:
             if current == "local" or current == source:
                 continue
             report.updated_credential_source = True
             report.identity_actions.append(_mirror_action(current, source, dry_run=True))
-    stored = bool(read_instance_secret(db_path, JWT_SECRET_NAME))
     if config.auth.jwt_secret:
         if stored:
             report.retired_stored_secret = True

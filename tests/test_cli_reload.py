@@ -212,7 +212,7 @@ class TestReloadCommand:
             db = Database(paths.db_path())
             await db.connect()
             try:
-                await db.ensure_instance_secret(
+                await db._ensure_instance_secret(
                     JWT_SECRET_NAME, "generated-secret-padded-to-thirty-two-bytes",
                 )
             finally:

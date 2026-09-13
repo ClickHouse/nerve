@@ -1,8 +1,8 @@
 """Core Database class — connection management, write lock, migrations, and FTS health check.
 
-The Database class composes all domain-specific mixin stores via multiple
-inheritance.  External code continues to import ``Database`` from ``nerve.db``
-(via the package ``__init__.py``), so the public API is unchanged.
+The Database class composes internal domain-specific stores via multiple
+inheritance. Production behavior should enter through a service or workflow,
+not treat individual storage methods as a public compatibility surface.
 """
 
 from __future__ import annotations
@@ -135,6 +135,10 @@ class InsecureStateStorage(RuntimeError):
     raised by the bootstrap when a database-held signing secret would have to
     live in a file other users can read (confidentiality).
     """
+
+
+class IdentityInvariantError(RuntimeError):
+    """The migration-guaranteed singleton system actor is corrupt."""
 
 
 def _mode_of(path: Path):
@@ -315,6 +319,7 @@ class Database(
         # Per-connection pragmas (see _DEFAULT_PRAGMAS). Copied per instance so
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
+        self._system_actor_id: str | None = None
         # What connect() found when it tried to make the state files owner-only.
         # Secured on every ordinary filesystem. The identity bootstrap consults
         # it before it trusts — or stores a signing secret in — the database
@@ -401,6 +406,7 @@ class Database(
                     "; ".join(self.state_permissions.readable_hazards), _DB_FILE_MODE,
                 )
             await run_migrations(self._db)
+            await self._cache_system_actor_id()
             # After migrations (the table exists) and after repair: a key that was
             # readable by other users is compromised and must not be reused.
             if exposed:
@@ -408,6 +414,7 @@ class Database(
             await self._check_fts_integrity()
         except BaseException:
             db, self._db = self._db, None
+            self._system_actor_id = None
             try:
                 await db.close()
             except Exception as e:  # noqa: BLE001 — never mask the real failure
@@ -415,6 +422,31 @@ class Database(
                     "Closing %s after a failed connect raised: %s", self.db_path, e,
                 )
             raise
+
+    async def _cache_system_actor_id(self) -> None:
+        """Validate and cache the one system actor created by migrations."""
+        async with self.db.execute(
+            "SELECT id FROM actor_refs WHERE kind = 'system'"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if len(rows) != 1:
+            raise IdentityInvariantError(
+                "actor identity is corrupt: expected exactly one "
+                f"actor_refs(kind='system') row, found {len(rows)}"
+            )
+        actor_id = rows[0]["id"]
+        if not isinstance(actor_id, str) or not actor_id:
+            raise IdentityInvariantError(
+                "actor identity is corrupt: the system actor has no invariant id"
+            )
+        self._system_actor_id = actor_id
+
+    @property
+    def system_actor_id(self) -> str:
+        """The migration-validated system actor id for this connection."""
+        if self._system_actor_id is None:
+            raise RuntimeError("Database not connected. Call connect() first.")
+        return self._system_actor_id
 
     async def _rotate_exposed_signing_secret(self) -> None:
         """Retire a database-held signing secret that was readable by other
@@ -436,10 +468,10 @@ class Database(
         ) as cur:
             if await cur.fetchone() is None:
                 return  # pre-v047 or a non-nerve database
-        stored = await self.get_instance_secret(JWT_SECRET_NAME)
+        stored = await self._get_instance_secret(JWT_SECRET_NAME)
         if stored is None:
             return
-        await self.delete_instance_secret(JWT_SECRET_NAME)
+        await self._delete_instance_secret(JWT_SECRET_NAME)
         logger.warning(
             "%s (or a sidecar) was readable by other users; the stored JWT signing "
             "secret is treated as compromised and has been retired. A fresh one is "
@@ -465,6 +497,7 @@ class Database(
         if self._db:
             await self._db.close()
             self._db = None
+            self._system_actor_id = None
 
     @property
     def db(self) -> aiosqlite.Connection:

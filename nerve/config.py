@@ -413,43 +413,6 @@ _UNRESOLVED_REF = "${"
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
 
-# How this instance learns who is making a request. ``local`` — local accounts
-# plus a session, authority decided in process — is the only mode this version
-# implements; the key exists so that the mode is an explicit, startup-only
-# setting rather than something inferred from which credentials happen to be
-# present (the class of bug behind the old "empty jwt_secret means open"
-# behaviour). It is never hot-reloaded and never taken from a configuration
-# push: the environment variable wins over every file, the same way the
-# lockdown anchor does, because an authentication mode that can be changed
-# remotely is one a configuration delivery bug can downgrade.
-AUTH_MODES = ("local",)
-AUTH_MODE_ENV = "NERVE_AUTH_MODE"
-
-
-def _as_auth_mode(value: Any) -> str:
-    """Parse ``auth.mode``, refusing anything but a supported mode.
-
-    Unset (or blank) is ``local``. Anything else must name a mode this version
-    implements; a value it does not recognise is a hard error rather than a
-    fallback, because the only default it could fall back to is the mode with
-    the weakest external guarantees, and an operator who wrote ``external``
-    must not get ``local`` in silence.
-    """
-    if value is None:
-        return AUTH_MODES[0]
-    text = str(value).strip().lower()
-    if not text:
-        return AUTH_MODES[0]
-    if text in AUTH_MODES:
-        return text
-    accepted = ", ".join(repr(m) for m in AUTH_MODES)
-    raise ConfigError(
-        f"auth.mode must be one of {accepted}, got {value!r}. This version of "
-        f"Nerve supports local accounts only; an external identity mode is not "
-        f"available yet. Unset the key (and {AUTH_MODE_ENV}) to run in local mode."
-    )
-
-
 def _require_auth_mapping(value: Any, where: str) -> None:
     """Refuse an ``auth`` section that is present but not a mapping.
 
@@ -494,74 +457,6 @@ def _normalise_layer_auth(layer: dict[str, Any], where: str) -> dict[str, Any]:
     if "auth" in layer and layer["auth"] is None:
         layer["auth"] = {}
     return layer
-
-
-def _inject_machine_auth_mode(merged: dict[str, Any], machine: dict[str, Any]) -> None:
-    """Carry ``auth.mode`` from the machine-local layers into the final config.
-
-    The mode is machine-local and must survive the lockdown layer selection
-    (which drops the machine layers), so it is injected here whether locked or
-    not. Only into a valid mapping: a non-mapping ``auth`` anywhere is refused
-    (:func:`_require_auth_mapping`), never replaced.
-    """
-    machine_auth = machine.get("auth")
-    _require_auth_mapping(machine_auth, "config.yaml/config.local.yaml")
-    final_auth = merged.get("auth")
-    _require_auth_mapping(final_auth, "the effective configuration (workspace/config/settings.yaml)")
-    if final_auth is None and "auth" in merged:
-        # ``auth:`` with nothing under it is YAML null: a present, empty section.
-        # It carries no settings, so reading it as the empty mapping discards
-        # nothing — unlike a string or a list, which is refused above.
-        final_auth = merged["auth"] = {}
-    if isinstance(machine_auth, dict) and "mode" in machine_auth:
-        if final_auth is None:
-            merged["auth"] = {"mode": machine_auth["mode"]}
-        else:
-            final_auth["mode"] = machine_auth["mode"]
-
-
-def _apply_auth_mode_anchor(merged: dict[str, Any]) -> None:
-    """Let ``NERVE_AUTH_MODE`` override ``auth.mode`` from every file.
-
-    Applied after interpolation, so it also wins over a
-    ``${NERVE_AUTH_MODE:-local}`` reference. An unset or blank variable
-    expresses no opinion. A malformed ``auth`` section (not a mapping) is
-    refused, never replaced.
-    """
-    raw = os.environ.get(AUTH_MODE_ENV)
-    if raw is None or not raw.strip():
-        return
-    auth = merged.get("auth")
-    _require_auth_mapping(auth, "the effective configuration")
-    if auth is None:
-        auth = merged["auth"] = {}
-    auth["mode"] = raw.strip()
-
-
-def _drop_tracked_auth_mode(ws_settings: dict[str, Any], workspace: Path) -> None:
-    """Remove ``auth.mode`` from the tracked layer, with a warning.
-
-    The identity mode is machine-local: it may be stated in ``config.yaml`` or
-    ``config.local.yaml``, or pinned with ``NERVE_AUTH_MODE``, but never in the
-    file a configuration push or a workspace sync delivers. A pushed file must
-    not be able to change how an instance authenticates — and must not be able
-    to crash it either, so the key is ignored rather than refused. The machine
-    value is injected back independently of the lockdown layer selection (see
-    :func:`_read_config_sources`), so even a locked box keeps the mode its own
-    config.yaml/config.local.yaml or ``NERVE_AUTH_MODE`` states — a tracked
-    ``lockdown`` flip cannot reset it by dropping the machine layers.
-    """
-    auth = ws_settings.get("auth")
-    if not isinstance(auth, dict) or "mode" not in auth:
-        return
-    auth.pop("mode")
-    logger.warning(
-        "config: ignoring 'auth.mode' in %s — the identity mode is read only from "
-        "the machine-local config.yaml/config.local.yaml or %s, so a pushed file can "
-        "never change it. State it in config.local.yaml on the box, or set %s where "
-        "the service is defined.",
-        workspace_settings_file(workspace), AUTH_MODE_ENV, AUTH_MODE_ENV,
-    )
 
 
 def lockdown_anchor() -> bool:
@@ -805,8 +700,6 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
 
     ws_settings = _load_workspace_settings(workspace)
     _normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
-    # The one key the tracked layer may never supply: the identity mode.
-    _drop_tracked_auth_mode(ws_settings, workspace)
 
     # Lockdown is owned by the *tracked* settings file only, so a local edit to
     # config.yaml/config.local.yaml can't unlock (or fake-lock) an instance — the
@@ -837,19 +730,7 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
 
-    # auth.mode is machine-local, resolved independently of the lockdown layer
-    # selection. Lockdown otherwise drops the machine layers, which would let a
-    # tracked ``lockdown: true`` push silently reset a machine-local mode to the
-    # default — an external change to authentication, which 0.1 forbids. So the
-    # value is taken from the machine layers (config.yaml/config.local.yaml) and
-    # injected here whether locked or not; a tracked-file value was already
-    # stripped above, and NERVE_AUTH_MODE still wins in the anchor below. A
-    # non-mapping ``auth`` in any layer is a hard error here, never normalised.
-    _inject_machine_auth_mode(merged, machine)
-
-    resolved = _resolve_env_refs(merged)
-    _apply_auth_mode_anchor(resolved)
-    return resolved
+    return _resolve_env_refs(merged)
 
 
 @dataclass
@@ -2093,10 +1974,6 @@ class RetentionConfig:
 
 @dataclass
 class AuthConfig:
-    # Identity mode; see AUTH_MODES. Startup-only: read once at boot, listed as
-    # restart-only for reloads, and overridable from the environment
-    # (NERVE_AUTH_MODE) so no configuration push can change it.
-    mode: str = "local"
     password_hash: str = ""
     # Signing secret for session tokens. Optional: when unset, one is generated
     # on first start and kept in nerve.db (see nerve.migrate.ensure_jwt_secret);
@@ -2115,9 +1992,6 @@ class AuthConfig:
     @_coerced
     def from_dict(cls, d: dict) -> AuthConfig:
         return cls(
-            # Parsed strictly rather than left to @_coerced, which would fall
-            # back to the default for an unreadable value. See _as_auth_mode.
-            mode=_as_auth_mode(d.get("mode")),
             password_hash=d.get("password_hash", ""),
             jwt_secret=d.get("jwt_secret", ""),
             jwt_expiry_hours=max(1, _lenient_int(d.get("jwt_expiry_hours"), 720)),

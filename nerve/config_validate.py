@@ -110,13 +110,11 @@ def validate_config_bundle(
     # null one becomes the empty overlay so it cannot erase the credentials
     # below it. Checked per layer, so a broken tracked section is reported even
     # where a machine layer would have merged over it.
-    auth_ok = True
     for layer, where in ((base, "config.yaml"), (local, "config.local.yaml")):
         try:
             cfg._normalise_layer_auth(layer, where)
         except cfg.ConfigError as e:
             result.errors.append(str(e))
-            auth_ok = False
     machine = cfg._deep_merge(base, local)
 
     # An environment anchor forces lockdown regardless of the files, so a run in
@@ -158,19 +156,6 @@ def validate_config_bundle(
             cfg._normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
         except cfg.ConfigError as e:
             result.errors.append(str(e))
-            auth_ok = False
-    # Mirror _read_config_sources: the tracked file is never a source for the
-    # identity mode. Dropped here too, so validation judges the config the
-    # daemon will actually run, and reported so the author learns why the key
-    # does nothing where they put it.
-    if isinstance(ws_settings, dict) and isinstance(ws_settings.get("auth"), dict) \
-            and "mode" in ws_settings["auth"]:
-        ws_settings["auth"].pop("mode")
-        result.warnings.append(
-            "auth.mode in the tracked settings.yaml is ignored: the identity mode is "
-            "read only from the machine-local config.yaml/config.local.yaml or "
-            f"{cfg.AUTH_MODE_ENV}, so a configuration push can never change it"
-        )
     # Mirror _read_config_sources: when the tracked settings lock the instance,
     # validate the LOCKED view (workspace-only), since that's what production runs.
     # An unreadable flag is refused rather than assumed, exactly as at load time —
@@ -219,20 +204,9 @@ def validate_config_bundle(
     # Pin the workspace so cron paths resolve against the validated workspace.
     merged["workspace"] = str(workspace)
 
-    # auth.mode is machine-local, injected independently of the lockdown layer
-    # selection, so validation judges the same mode the daemon will run (and
-    # does not silently drop it under a locked view).
-    if auth_ok:
-        cfg._inject_machine_auth_mode(merged, machine)
-
     # Lenient env interpolation — collect unset refs without raising.
     missing: list[str] = []
     merged = cfg._interpolate_env(merged, missing)
-    # Apply the NERVE_AUTH_MODE anchor exactly as runtime does (after
-    # interpolation), so validation and startup agree on the mode in both
-    # directions — env overriding a file value, and a bad env value failing.
-    if auth_ok:
-        cfg._apply_auth_mode_anchor(merged)
     env_names = ", ".join(sorted(set(missing)))
     result.unresolved_env = sorted(set(missing))
     if missing:

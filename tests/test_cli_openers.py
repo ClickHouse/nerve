@@ -1,10 +1,9 @@
 """Every CLI command that opens the state database opens it the production way.
 
 ``nerve.migrate.open_production_db`` is ``Database.connect`` (state-file
-policy, migrations) followed by the configuration-aware identity bootstrap —
-exactly what the gateway does at startup. So a maintenance command that happens
-to be the first thing run after an upgrade leaves the same state ``nerve
-start`` would: one owner account, one system principal, a signing secret. And
+policy and migrations) followed by the first-account/secret bootstrap. So a
+maintenance command that happens to be the first thing run after an upgrade
+leaves the same state ``nerve start`` would: one account and a signing secret. And
 because the policy lives in ``connect()``, the same commands refuse insecure
 state the same way, with the operator remedy instead of a traceback.
 """
@@ -42,7 +41,7 @@ def _config_dir(tmp_path: Path) -> Path:
 
 def _migrated_but_unbootstrapped_db() -> Path:
     """What an upgrade leaves before anything bootstraps: the schema at its
-    head, no identity rows, no signing secret."""
+    head, with its system actor but no account or signing secret."""
 
     async def _make() -> None:
         db = Database(paths.db_path())
@@ -85,7 +84,7 @@ class TestTheFirstCommandAfterAnUpgradeBootstraps:
 
         config_dir = _config_dir(tmp_path)
         _migrated_but_unbootstrapped_db()
-        assert _identity_state() == (0, 0, 0)
+        assert _identity_state() == (0, 1, 0)
 
         result = CliRunner().invoke(main, ["-c", str(config_dir), *argv])
         assert result.exit_code == 0, result.output
@@ -133,7 +132,7 @@ class TestTheCliRefusesInsecureState:
         assert result.exception is None or isinstance(result.exception, SystemExit)
         # Evidence untouched: no repair, no migration side effects, no rows.
         assert stat.S_IMODE(os.stat(db_path).st_mode) == 0o666
-        assert _identity_state() == (0, 0, 0)
+        assert _identity_state() == (0, 1, 0)
 
     def test_a_writable_state_directory_is_refused(self, tmp_path, no_engine):
         from nerve.cli import main

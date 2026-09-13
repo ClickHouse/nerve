@@ -85,7 +85,7 @@ async def _make_db_with_secret(path: Path, secret: str) -> None:
     db = Database(path)
     await db.connect()
     try:
-        await db.ensure_instance_secret(JWT_SECRET_NAME, secret)
+        await db._ensure_instance_secret(JWT_SECRET_NAME, secret)
     finally:
         await db.close()
 
@@ -409,10 +409,10 @@ class TestExposedKeyIsRotated:
         await db.connect()  # repairs to 0600 AND rotates S1
         try:
             assert _mode(db_path) == 0o600
-            assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None
             # Bootstrap now generates a fresh S3, distinct from S1.
             await bootstrap_identity(db, NerveConfig())
-            s3 = await db.get_instance_secret(JWT_SECRET_NAME)
+            s3 = await db._get_instance_secret(JWT_SECRET_NAME)
             assert s3 and s3 != _S1
             assert effective_jwt_secret(NerveConfig()) == s3
             with pytest.raises(Exception):
@@ -430,7 +430,7 @@ class TestExposedKeyIsRotated:
         await db.connect()  # read exposure is not a refusal; it still rotates
         try:
             assert db.state_permissions.readable and not db.state_secured
-            assert await db.get_instance_secret(JWT_SECRET_NAME) is None  # rotated
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None  # rotated
             # No configured secret + still-readable file → refuse to generate one.
             with pytest.raises(InsecureStateStorage):
                 await bootstrap_identity(db, NerveConfig())
@@ -448,7 +448,7 @@ class TestExposedKeyIsRotated:
         try:
             config = NerveConfig(auth=AuthConfig(jwt_secret=_CONFIGURED))
             await bootstrap_identity(db, config)
-            assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None
             assert effective_jwt_secret(config) == _CONFIGURED
             with pytest.raises(Exception):
                 decode_token(s1_token, effective_jwt_secret(config))
@@ -468,7 +468,7 @@ class TestExposedKeyIsRotated:
         try:
             report = await bootstrap_identity(db, NerveConfig())
             assert report.generated_jwt_secret
-            assert await db.get_instance_secret(JWT_SECRET_NAME)
+            assert await db._get_instance_secret(JWT_SECRET_NAME)
         finally:
             await db.close()
 
@@ -492,7 +492,7 @@ class TestRotationReachesThePin:
         db = Database(db_path)
         await db.connect()
         await bootstrap_identity(db, config)  # generates S1 and pins it
-        s1 = await db.get_instance_secret(JWT_SECRET_NAME)
+        s1 = await db._get_instance_secret(JWT_SECRET_NAME)
         await db.close()
         assert s1 and pinned_jwt_secret() == s1
         s1_token = create_token(s1)
@@ -502,14 +502,14 @@ class TestRotationReachesThePin:
         db2 = Database(db_path)
         await db2.connect()  # repairs, retires S1 on disk *and* unpins it
         try:
-            assert await db2.get_instance_secret(JWT_SECRET_NAME) is None
+            assert await db2._get_instance_secret(JWT_SECRET_NAME) is None
             assert pinned_jwt_secret() == ""
             assert effective_jwt_secret(config) == ""  # fail closed: nothing verifies
             with pytest.raises(Exception):
                 decode_token(s1_token, effective_jwt_secret(config))
 
             await bootstrap_identity(db2, config)  # pins the replacement S3
-            s3 = await db2.get_instance_secret(JWT_SECRET_NAME)
+            s3 = await db2._get_instance_secret(JWT_SECRET_NAME)
             assert s3 and s3 != s1
             assert effective_jwt_secret(config) == s3
             with pytest.raises(Exception):
@@ -530,7 +530,7 @@ class TestRotationReachesThePin:
         db = Database(db_path)
         await db.connect()
         try:
-            assert await db.get_instance_secret(JWT_SECRET_NAME) is None
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None
             assert pinned_jwt_secret() == _CONFIGURED
         finally:
             await db.close()

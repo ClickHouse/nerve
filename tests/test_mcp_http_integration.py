@@ -171,8 +171,8 @@ def test_mcp_served_instance_is_not_open_without_a_configured_secret(app_with_mc
         # app's loop, which the TestClient exposes as its blocking portal.
         db = gw._engine.db
         portal = client.portal
-        assert portal.call(db.count_accounts) == 1
-        assert portal.call(db.get_instance_secret, JWT_SECRET_NAME) == effective_jwt_secret()
+        assert portal.call(db._count_accounts) == 1
+        assert portal.call(db._get_instance_secret, JWT_SECRET_NAME) == effective_jwt_secret()
 
 
 def test_mcp_initialize_handshake(app_with_mcp):
