@@ -140,6 +140,28 @@ person, and a form that took any username would let somebody else unlock a
 colleague's tab and inherit it. Using a different account goes through "log
 out", which is what discards all of that first.
 
+### Attribution
+
+Messages and sessions store stable actor ids, never names. The UI resolves their
+current names from `GET /api/actors`: Nerve is always labelled, while a human is
+labelled only when their actor id differs from the signed-in viewer. Thus Alice
+does not see repeated labels on her own history, but Bob sees Alice throughout
+an Alice-only transcript and sidebar. The same rule applies to the open-session
+header; on phones it keeps the name visible and hides only the "Started by"
+verb visually.
+
+Null ids in legacy or unidentified-human history render no attribution element.
+Names are held only in memory. Equal rendered names get collision-safe id
+suffixes in visible text, and a missing display name uses `Unnamed account`.
+The system principal uses `Nerve` and a bot glyph.
+
+Optimistic and live messages carry actor ids so labels are correct before a
+reload. The actor directory coalesces concurrent reads and performs one
+follow-up for ids arriving while a read is in flight. Account mutations force a
+refresh, so same-tab renames update immediately without rewriting messages;
+renames in another tab converge on reload. Request generations prevent a stale
+lookup from repopulating the map after logout or overwriting a newer refresh.
+
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
 - **System** — Hostname, platform, memory (RSS), disk usage
@@ -184,6 +206,9 @@ cd web && npx vite build
 
 Uses Zustand for lightweight state management:
 - `authStore` — Login/logout, token management
+- `actorStore` — The actor id → display name map behind attribution labels. In
+  memory only; same-tab account mutations refresh it, while cross-tab renames
+  converge on reload
 - `chatStore` — Sessions, messages, streaming state, agent status, side panel state (tabs, visibility, width), pending interactions (mid-turn user input), sidebar collapsed state, text selection quotes, modified files tracking. WebSocket message handling is dispatched to domain-specific handler modules under `handlers/`, with stateless helpers under `helpers/`.
 - `taskStore` — Task list, search, filters, detail view with content editing
 - `skillsStore` — Skills list with usage stats, detail view with SKILL.md editor, create/update/delete/toggle, filesystem sync

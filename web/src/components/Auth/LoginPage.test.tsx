@@ -51,7 +51,7 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: 'password',
-    account: { id: 'acc-1', username: 'alice' },
+    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
     login,
     refreshStatus,
   });
@@ -106,7 +106,7 @@ describe('SessionExpiredOverlay', () => {
     // sign in, and inherit their drafts and loaded state.
     useAuthStore.setState({
       loginMode: 'username_password',
-      account: { id: 'acc-1', username: 'alice' },
+      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
     });
     render(<SessionExpiredOverlay />);
 
@@ -124,7 +124,7 @@ describe('SessionExpiredOverlay', () => {
   it('keeps the single-account shape unchanged', () => {
     // No username on the account at all — the upgrade case. Nothing to show,
     // nothing to send, and the server resolves the only account there is.
-    useAuthStore.setState({ account: { id: 'acc-1', username: null } });
+    useAuthStore.setState({ account: { id: 'acc-1', username: null, actor_id: 'actor-1' } });
     render(<SessionExpiredOverlay />);
     expect(screen.queryByLabelText('Signed in as')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
@@ -145,7 +145,7 @@ describe('SessionExpiredOverlay', () => {
 
   it('routes a deliberate account switch through log out', async () => {
     useAuthStore.setState({
-      account: { id: 'acc-1', username: 'alice' }, logout,
+      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' }, logout,
     });
     render(<SessionExpiredOverlay />);
     await userEvent.click(

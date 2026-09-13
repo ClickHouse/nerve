@@ -1,6 +1,8 @@
 import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChatMessage, MessageBlock } from '../../types/chat';
+import { useVisibleActorIds } from '../../stores/actorStore';
+import { useAuthStore } from '../../stores/authStore';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
@@ -27,6 +29,11 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
+
+  const viewerActorId = useAuthStore((s) => s.account?.actor_id ?? null);
+  const namedSenders = useVisibleActorIds(
+    messages.map(m => m.actor_id), viewerActorId,
+  );
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
@@ -71,7 +78,11 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
         return (
           <div key={msg.id ?? i}>
             {msg.role === 'user'
-              ? <UserMessage message={msg} actions={actions} />
+              ? <UserMessage
+                  message={msg}
+                  actions={actions}
+                  showActor={!!msg.actor_id && namedSenders.has(msg.actor_id)}
+                />
               : <AssistantMessage message={msg} actions={actions} />
             }
             {forks && forks.length > 0 && (

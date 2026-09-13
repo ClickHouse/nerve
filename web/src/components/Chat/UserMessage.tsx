@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import type { ChatMessage, ImageBlockData, FileBlockData } from '../../types/chat';
+import { ActorLabel } from './ActorLabel';
 import { Download, FileText } from '../ui/icons';
 import { getToken } from '../../api/client';
 import { formatMessageTime } from '../../utils/messageTime';
@@ -10,10 +11,12 @@ function authUrl(url: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
 }
 
-export function UserMessage({ message, actions }: {
+export function UserMessage({ message, actions, showActor = false }: {
   message: ChatMessage;
   /** Hover toolbar (MessageActions) — anchored to the reading column. */
   actions?: ReactNode;
+  /** Name a non-viewer sender above the text. Null legacy rows stay unchanged. */
+  showActor?: boolean;
 }) {
   const text = message.blocks.find(b => b.type === 'text')?.content || '';
   const images = message.blocks.filter(b => b.type === 'image') as ImageBlockData[];
@@ -28,6 +31,11 @@ export function UserMessage({ message, actions }: {
             U
           </div>
           <div className="min-w-0 flex-1">
+            {showActor && message.actor_id && (
+              <div className="pt-0.5">
+                <ActorLabel actorId={message.actor_id} />
+              </div>
+            )}
             {text && <div className="whitespace-pre-wrap text-base leading-relaxed pt-0.5">{text}</div>}
 
             {/* Attached images */}
