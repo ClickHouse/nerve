@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,7 +28,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
-from nerve import setup_state, setup_token
+from nerve import boot, setup_state, setup_token
 from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.db.accounts import JWT_SECRET_NAME
 from nerve.gateway.auth import (
@@ -140,12 +141,13 @@ class _Install:
     def restarted(self, **kwargs) -> NerveConfig:
         """Model what a restart does: a new process, with a new config.
 
-        The process clock matters because a *secret* is recorded as "present"
-        rather than as itself, so "was this written after the daemon started"
-        is the only way to tell a key that is in force from one that replaced
-        it and is waiting.
+        The generation matters as much as the config does. Everything the
+        checklist notes down about work in flight is scoped to the process
+        that noted it — a secret is recorded as "present" rather than as
+        itself, so nothing else can tell a key that is in force from one
+        pasted over it — and a new generation is what retires those notes.
         """
-        setup_state.PROCESS_STARTED = datetime.now(timezone.utc)
+        boot.BOOT_ID = secrets.token_hex(8)
         return self.reconfigure(**kwargs)
 
     def reconfigure(self, **kwargs) -> NerveConfig:
@@ -160,16 +162,26 @@ class _Install:
 
 
 @pytest.fixture(autouse=True)
-def process_clock(monkeypatch):
-    """Start each test with a process older than every write it makes.
+def no_ambient_credential(monkeypatch):
+    """Answer the provider step from the instance, not from this shell.
 
-    ``setup_state.PROCESS_STARTED`` is a module global set at import, which in
-    production is the daemon starting. ``_Install.restarted()`` moves it; this
-    puts it back.
+    A Docker install is handed its credential in the environment, so the step
+    reads it — which means a developer who exports `ANTHROPIC_API_KEY` gets a
+    different checklist from one who does not. The tests say which world they
+    are in.
     """
-    monkeypatch.setattr(
-        setup_state, "PROCESS_STARTED", datetime.now(timezone.utc),
-    )
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def process_generation(monkeypatch):
+    """One generation per test, restored afterwards.
+
+    ``boot.BOOT_ID`` is a module global set at import, which in production is
+    the daemon starting. ``_Install.restarted()`` moves it; this puts it back.
+    """
+    monkeypatch.setattr(boot, "BOOT_ID", secrets.token_hex(8))
 
 
 @pytest_asyncio.fixture
@@ -902,6 +914,52 @@ class TestTheChecklist:
         async with _http(claimed) as http:
             state = (await http.get("/api/setup")).json()
         assert state["restart_pending"] is False
+
+    async def test_a_step_stops_being_done_when_its_reason_stops_being_true(
+        self, claimed,
+    ):
+        """A note the wizard left is not evidence forever.
+
+        The provider step is "done" because a credential is configured. Once a
+        later process has started, the instance is the witness — so a
+        credential removed by hand afterwards leaves the step to do again,
+        rather than green because of something the wizard wrote down months
+        ago.
+        """
+        async with _http(claimed) as http:
+            saved = (await http.put(
+                "/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY},
+            )).json()
+        assert _status_of(saved, "provider") == "done"
+
+        # A restart, and the operator has since taken the key back out.
+        claimed.restarted()
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "provider") == "pending"
+        assert state["restart_pending"] is False, (
+            "a restart that has happened must stop being reported as pending"
+        )
+
+    async def test_a_skip_is_a_decision_and_survives(self, claimed):
+        """What is retired is what the instance can answer for itself. "I do
+        not want Telegram" is not one of those."""
+        async with _http(claimed) as http:
+            await http.post("/api/setup/steps/channels/skip")
+        claimed.restarted()
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "channels") == "skipped"
+
+    async def test_the_automation_answer_survives_too(self, claimed):
+        """Which crons an operator wanted is a decision nothing else records,
+        so it is not transitional."""
+        async with _http(claimed) as http:
+            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
+        claimed.restarted()
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "automation") == "done"
 
     async def test_finished_once_everything_is_answered(self, claimed):
         async with _http(claimed) as http:
