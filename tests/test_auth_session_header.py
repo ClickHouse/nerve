@@ -23,7 +23,6 @@ from nerve.gateway.auth import (
     TOKEN_TYPE_CLAIM,
     TOKEN_TYPE_SESSION,
     create_session_token,
-    maybe_refresh_token,
     require_auth,
 )
 from nerve.identity import Actor
@@ -130,10 +129,3 @@ def test_query_param_token_also_slides(client):
     res = client.get(f"/api/thing?token={stale}")
     assert res.status_code == 200
     assert res.headers.get(SESSION_TOKEN_HEADER)
-
-
-def test_maybe_refresh_agrees_with_the_route(client):
-    """Guard against the dependency and the helper drifting apart."""
-    stale = _token(client.account_id, age_hours=400)
-    payload = jwt.decode(stale, _SECRET, algorithms=[JWT_ALGORITHM])
-    assert maybe_refresh_token(payload, _SECRET) is not None

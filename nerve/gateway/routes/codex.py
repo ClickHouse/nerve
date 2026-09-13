@@ -23,7 +23,7 @@ from nerve.gateway.auth import (
     resolve_actor_from_claims,
 )
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import Actor, ActorResolutionError
+from nerve.identity import ActorResolutionError
 from nerve.mcp_server.auth import McpAuthError, authenticate_mcp, bound_session_id
 
 router = APIRouter()
@@ -77,8 +77,8 @@ async def mint_worker_token(request: Request):
     return {"token": token, "worker_id": worker_id, "expires_in": 7200}
 
 
-@router.get("/api/codex/status")
-async def codex_status(actor: Actor = Depends(require_auth)):
+@router.get("/api/codex/status", dependencies=[Depends(require_auth)])
+async def codex_status():
     deps = get_deps()
     backend = deps.engine._backends.get("codex")
     preflight = await backend.preflight() if backend is not None else {
@@ -91,8 +91,10 @@ async def codex_status(actor: Actor = Depends(require_auth)):
     }
 
 
-@router.get("/api/codex/ultracode/dashboard")
-async def ultracode_dashboard_status(actor: Actor = Depends(require_auth)):
+@router.get(
+    "/api/codex/ultracode/dashboard", dependencies=[Depends(require_auth)],
+)
+async def ultracode_dashboard_status():
     deps = _dashboard_deps()
     status = installation_status(deps.engine.config)
     return {
@@ -106,20 +108,16 @@ async def ultracode_dashboard_status(actor: Actor = Depends(require_auth)):
     }
 
 
-@router.get("/api/codex/ultracode/runs")
-async def ultracode_dashboard_runs(
-    limit: int = 50,
-    actor: Actor = Depends(require_auth),
-):
+@router.get("/api/codex/ultracode/runs", dependencies=[Depends(require_auth)])
+async def ultracode_dashboard_runs(limit: int = 50):
     deps = _dashboard_deps()
     return {"runs": list_dashboard_runs(deps.engine.config, limit=limit)}
 
 
-@router.get("/api/codex/ultracode/runs/{workflow_id}")
-async def ultracode_dashboard_run(
-    workflow_id: str,
-    actor: Actor = Depends(require_auth),
-):
+@router.get(
+    "/api/codex/ultracode/runs/{workflow_id}", dependencies=[Depends(require_auth)],
+)
+async def ultracode_dashboard_run(workflow_id: str):
     deps = _dashboard_deps()
     run = read_dashboard_run(deps.engine.config, workflow_id)
     if run is None:

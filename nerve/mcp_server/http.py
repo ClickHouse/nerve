@@ -59,12 +59,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ASGI scope key carrying the resolved :class:`~nerve.identity.Actor` for an
-# MCP request. Dotted, per the ASGI convention for extension keys, and
-# per-request by construction — the scope dict belongs to one request.
-MCP_ACTOR_SCOPE_KEY = "nerve.actor"
-
-
 async def _send_status(send: Send, status: int, message: str) -> None:
     """Emit a small ASGI error response with a JSON body."""
     body = json.dumps({"error": message}).encode("utf-8")
@@ -133,10 +127,9 @@ def _bound_identity_from_request(
     notify/ask_user/memorize/task_* behave exactly like the in-process
     Claude MCP. Ordinary tokens return ``None`` → satellite attribution.
 
-    The signature was already verified at the ASGI mount; this re-decode
-    only extracts the (signed) claim — cheap HS256, per tool call. *Identity*
-    is not re-derived here: the mount resolved the actor once and left it on
-    the request's scope under :data:`MCP_ACTOR_SCOPE_KEY`.
+    The signature was already verified at the ASGI mount; this re-decode only
+    extracts the signed claim — cheap HS256, per tool call. Actor resolution
+    at the mount is an admission check; tool handling does not consume it.
     """
     secret = effective_jwt_secret(config)
     if not secret:
@@ -295,7 +288,7 @@ def mount_deferred(
             await _send_status(send, 503, "MCP server is starting up")
             return
         try:
-            actor = await resolve_actor_from_claims(store, claims)
+            await resolve_actor_from_claims(store, claims)
         except ActorResolutionError as e:
             await _send_status(send, 401, str(e))
             return
@@ -304,12 +297,6 @@ def mount_deferred(
         if manager is None:
             await _send_status(send, 503, "MCP server is starting up")
             return
-
-        # Per-request, on the request's own scope — never a module global. The
-        # session-bound token is re-read per tool call for its session claim
-        # (see _bound_identity_from_request); this is the identity half of the
-        # same answer, resolved once at the door.
-        scope[MCP_ACTOR_SCOPE_KEY] = actor
 
         await manager.handle_request(scope, receive, send)
 

@@ -19,11 +19,10 @@ from nerve.config import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 # --- Memory files ---
@@ -66,7 +65,7 @@ def _list_memory_files_sync(workspace: Path) -> list[dict]:
 
 
 @router.get("/api/memory/files")
-async def list_memory_files(actor: Actor = Depends(require_auth)):
+async def list_memory_files():
     """List markdown files in workspace memory directory."""
     config = get_config()
     files = await asyncio.to_thread(_list_memory_files_sync, config.workspace)
@@ -74,7 +73,7 @@ async def list_memory_files(actor: Actor = Depends(require_auth)):
 
 
 @router.get("/api/memory/file/{file_path:path}")
-async def read_memory_file(file_path: str, actor: Actor = Depends(require_auth)):
+async def read_memory_file(file_path: str):
     config = get_config()
     full_path = config.workspace / file_path
     # Prevent path traversal
@@ -99,7 +98,7 @@ class FileWriteRequest(BaseModel):
 
 
 @router.put("/api/memory/file/{file_path:path}")
-async def write_memory_file(file_path: str, req: FileWriteRequest, actor: Actor = Depends(require_auth)):
+async def write_memory_file(file_path: str, req: FileWriteRequest):
     config = get_config()
     full_path = config.workspace / file_path
     try:
@@ -185,7 +184,7 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
 
 
 @router.get("/api/memory/memu")
-async def get_memu_data(actor: Actor = Depends(require_auth)):
+async def get_memu_data():
     """Get memU categories and items for the memory UI."""
     deps = get_deps()
     if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
@@ -221,7 +220,7 @@ class CategoryUpdateRequest(BaseModel):
 
 
 @router.post("/api/memory/memu/categories")
-async def create_memu_category(req: CategoryCreateRequest, actor: Actor = Depends(require_auth)):
+async def create_memu_category(req: CategoryCreateRequest):
     """Create a new memU memory category at runtime."""
     bridge = _require_memu()
     success = await bridge.create_category(req.name, req.description, source="web_ui")
@@ -231,7 +230,7 @@ async def create_memu_category(req: CategoryCreateRequest, actor: Actor = Depend
 
 
 @router.patch("/api/memory/memu/items/{item_id}")
-async def update_memu_item(item_id: str, req: ItemUpdateRequest, actor: Actor = Depends(require_auth)):
+async def update_memu_item(item_id: str, req: ItemUpdateRequest):
     """Update a memU memory item's content, type, or categories."""
     bridge = _require_memu()
     if req.content is None and req.memory_type is None and req.categories is None:
@@ -249,7 +248,7 @@ async def update_memu_item(item_id: str, req: ItemUpdateRequest, actor: Actor = 
 
 
 @router.delete("/api/memory/memu/items/{item_id}")
-async def delete_memu_item(item_id: str, actor: Actor = Depends(require_auth)):
+async def delete_memu_item(item_id: str):
     """Delete a memU memory item."""
     bridge = _require_memu()
     success = await bridge.delete_item(memory_id=item_id, source="web_ui")
@@ -259,7 +258,7 @@ async def delete_memu_item(item_id: str, actor: Actor = Depends(require_auth)):
 
 
 @router.patch("/api/memory/memu/categories/{category_id}")
-async def update_memu_category(category_id: str, req: CategoryUpdateRequest, actor: Actor = Depends(require_auth)):
+async def update_memu_category(category_id: str, req: CategoryUpdateRequest):
     """Update a memU category's summary or description (re-embeds)."""
     bridge = _require_memu()
     if req.summary is None and req.description is None:
@@ -276,7 +275,6 @@ async def update_memu_category(category_id: str, req: CategoryUpdateRequest, act
 @router.get("/api/memory/memu/audit")
 async def get_memu_audit_log(
     action: str = "", target_type: str = "", limit: int = 100, offset: int = 0,
-    actor: Actor = Depends(require_auth),
 ):
     """Paginated audit log for memU operations."""
     deps = get_deps()
@@ -288,7 +286,7 @@ async def get_memu_audit_log(
 
 
 @router.get("/api/memory/memu/health")
-async def memu_health(actor: Actor = Depends(require_auth)):
+async def memu_health():
     """memU memory service health and metrics."""
     deps = get_deps()
     if not deps.engine or not deps.engine._memory_bridge:

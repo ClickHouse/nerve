@@ -152,13 +152,11 @@ def is_legacy_session_token(payload: dict) -> bool:
     )
 
 
-def maybe_refresh_token(
-    payload: dict, jwt_secret: str, actor: Actor | None = None,
-) -> str | None:
+def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
     """Refresh an account session after its refresh threshold."""
     if payload.get("aud") or payload.get(TOKEN_TYPE_CLAIM) != TOKEN_TYPE_SESSION:
         return None
-    account_id = actor.account_id if actor is not None else payload.get("sub")
+    account_id = payload.get("sub")
     if not account_id:
         return None
     iat, exp = payload.get("iat"), payload.get("exp")
@@ -305,7 +303,7 @@ async def require_auth(request: Request) -> Actor:
     if is_legacy_session_token(payload) and actor.account_id:
         request.state.refreshed_token = create_session_token(secret, actor.account_id)
     else:
-        refreshed = maybe_refresh_token(payload, secret, actor)
+        refreshed = maybe_refresh_token(payload, secret)
         if refreshed:
             request.state.refreshed_token = refreshed
     return actor

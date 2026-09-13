@@ -121,17 +121,6 @@ TEST_ACTOR = Actor(
 
 
 @pytest.fixture
-def request_actor() -> Actor:
-    """The actor to pass a route function called directly in a test.
-
-    ``require_auth`` returns an :class:`~nerve.identity.Actor`, so a test that
-    calls a route coroutine itself (rather than through the app) supplies one.
-    The same value the ``bypass_auth`` override injects.
-    """
-    return TEST_ACTOR
-
-
-@pytest.fixture
 def bypass_auth():
     """Replace ``require_auth`` on a test app.
 

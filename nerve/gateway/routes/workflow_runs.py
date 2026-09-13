@@ -17,11 +17,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
-from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 # Bounded journal reads: cap run.json size, tail events.ndjson/result.md.
 _RUN_JSON_MAX_BYTES = 256 * 1024
@@ -59,7 +58,6 @@ async def list_workflow_runs(
     status: str = "",
     limit: int = 50,
     offset: int = 0,
-    actor: Actor = Depends(require_auth),
 ):
     """List runs (newest first). ``status``: 'active', an exact status, or empty."""
     service = _service()
@@ -72,9 +70,7 @@ async def list_workflow_runs(
 
 
 @router.post("/api/workflow-runs")
-async def create_workflow_run(
-    req: WorkflowRunCreateRequest, actor: Actor = Depends(require_auth),
-):
+async def create_workflow_run(req: WorkflowRunCreateRequest):
     """Start a run; returns its wire shape (usually already 'running')."""
     service = _service()
     from nerve.workflows.service import WorkflowRunError
@@ -99,7 +95,7 @@ async def create_workflow_run(
 
 
 @router.get("/api/workflow-runs/{run_id}")
-async def get_workflow_run(run_id: str, actor: Actor = Depends(require_auth)):
+async def get_workflow_run(run_id: str):
     service = _service()
     run = await service.get_run(run_id)
     if run is None:
@@ -111,7 +107,6 @@ async def get_workflow_run(run_id: str, actor: Actor = Depends(require_auth)):
 async def kill_workflow_run(
     run_id: str,
     req: WorkflowRunKillRequest = WorkflowRunKillRequest(),
-    actor: Actor = Depends(require_auth),
 ):
     """Kill a run (idempotent on terminal runs); scoped to its own session."""
     service = _service()
@@ -125,7 +120,7 @@ async def kill_workflow_run(
 
 
 @router.get("/api/workflow-runs/{run_id}/journal")
-async def get_workflow_run_journal(run_id: str, actor: Actor = Depends(require_auth)):
+async def get_workflow_run_journal(run_id: str):
     """Bounded read of the run's journal dir (run.json / events / result)."""
     service = _service()
     run = await service.get_run(run_id)
