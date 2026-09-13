@@ -11,6 +11,17 @@ import { clearAllReads } from './helpers/readStorage';
 export interface SignedInAccount {
   id: string;
   username: string | null;
+  /**
+   * The permanent identity behind the login — what this person's sessions and
+   * messages are stored under, and so what a message sent from this tab has to
+   * be stamped with before anyone else can see who sent it.
+   *
+   * A different column from `id`: that one is the login and can be renamed
+   * away, this one outlives every rename. Carried here rather than read
+   * separately so there is exactly one answer to "who is signed in", confirmed
+   * at the same moment and discarded at the same moment as the rest of it.
+   */
+  actor_id: string;
 }
 
 /**
@@ -114,7 +125,7 @@ let sessionEstablished = false;
 let statusGeneration = 0;
 
 function identityOf(account: Account): SignedInAccount {
-  return { id: account.id, username: account.username };
+  return { id: account.id, username: account.username, actor_id: account.actor_id };
 }
 
 /** The signed-in account, or `null` if it cannot be read right now. */
@@ -312,3 +323,25 @@ setUnauthorizedHandler(() => {
   // takes — a second account, most of all. Ask before drawing the form.
   void useAuthStore.getState().refreshStatus();
 });
+
+/**
+ * The actor id to stamp on a row this tab is about to show before the server's
+ * copy of it exists — a message you have just sent, which the gateway excludes
+ * you from its own echo of.
+ *
+ * Derived from {@link AuthState.account} rather than held separately, so there
+ * is nothing to keep in step and nothing that can disagree with it. That also
+ * makes it safe by construction across an authentication boundary: `account` is
+ * resolved *before* a session is announced as authenticated, cleared whenever
+ * one ends, and — on the session-expired overlay — only ever replaced by a
+ * positively confirmed match for the same account. There is therefore no window
+ * in which this returns the previous person, and none in which a message can be
+ * sent while it is still unknown.
+ *
+ * `null` when identity could not be read at all (a caller with no account row:
+ * the instance's own credential, an MCP token). That is the ordinary
+ * unattributed path and renders exactly as history does.
+ */
+export function selfActorId(): string | null {
+  return useAuthStore.getState().account?.actor_id ?? null;
+}
