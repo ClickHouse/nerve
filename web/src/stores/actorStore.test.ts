@@ -47,8 +47,7 @@ beforeEach(() => {
   (api.listAccounts as unknown as ReturnType<typeof vi.fn>)
     .mockResolvedValue({ accounts: [] });
   (api.authStatus as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-    auth_required: true, login: 'password', setup_pending: false,
-    multiple_accounts: true,
+    auth_required: true, login: 'password',
   });
 });
 

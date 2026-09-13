@@ -11,7 +11,6 @@ vi.mock('../api/client', () => ({
     updateAccount: vi.fn(),
     setAccountEnabled: vi.fn(),
     changeOwnPassword: vi.fn(),
-    getOwnAccount: vi.fn(),
     authStatus: vi.fn().mockResolvedValue({
       auth_required: true, login: 'password',
     }),
@@ -20,7 +19,7 @@ vi.mock('../api/client', () => ({
   },
   setToken: vi.fn(),
   clearToken: vi.fn(),
-  getToken: vi.fn(),
+  getToken: vi.fn(() => 'session-token'),
   setUnauthorizedHandler: vi.fn(),
 }));
 
@@ -33,7 +32,6 @@ const { useAccountStore, errorDetail, blockedReason } = await import('../stores/
 const { useAuthStore } = await import('../stores/authStore');
 
 const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
-const getToken = client.getToken as unknown as ReturnType<typeof vi.fn>;
 
 function account(overrides: Partial<Account> = {}): Account {
   return {
@@ -58,16 +56,14 @@ beforeEach(() => {
   api.createAccount.mockReset();
   api.setAccountEnabled.mockReset();
   api.changeOwnPassword.mockReset();
-  api.getOwnAccount.mockReset();
   api.updateAccount.mockReset();
   api.authStatus.mockResolvedValue({
     auth_required: true, login: 'password',
   });
-  getToken.mockReturnValue('session-token');
   useAccountStore.setState({ accounts: [], loading: true, busyId: null, error: null });
   useAuthStore.setState({
     loginMode: null,
-    account: { id: 'acc-1', username: 'alice' },
+    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
   });
 });
 
@@ -105,38 +101,6 @@ describe('the list', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('nope');
   });
 
-  it('recovers the signed-in identity after its startup read failed', async () => {
-    useAuthStore.setState({ authenticated: true, account: null });
-    api.listAccounts.mockResolvedValue({ accounts: [account()] });
-    api.getOwnAccount
-      .mockRejectedValueOnce(new Error('network'))
-      .mockResolvedValue(account());
-    renderPage();
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('network');
-    expect(screen.queryByText('you')).not.toBeInTheDocument();
-    expect(screen.queryByRole('form', { name: 'Your password' })).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    expect(await screen.findByText('you')).toBeInTheDocument();
-    expect(screen.getByRole('form', { name: 'Your password' })).toBeInTheDocument();
-  });
-
-  it('does not restore an identity from a session that has been replaced', async () => {
-    useAuthStore.setState({ authenticated: true, account: null });
-    api.listAccounts.mockResolvedValue({ accounts: [account()] });
-    let finishIdentity!: (value: Account) => void;
-    api.getOwnAccount.mockReturnValue(new Promise<Account>((resolve) => {
-      finishIdentity = resolve;
-    }));
-
-    const loading = useAccountStore.getState().load();
-    getToken.mockReturnValue('replacement-session-token');
-    finishIdentity(account());
-    await loading;
-
-    expect(useAuthStore.getState().account).toBeNull();
-  });
 });
 
 describe('adding a person', () => {

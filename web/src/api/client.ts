@@ -278,15 +278,25 @@ export interface WorkflowRunJournal {
 }
 
 let authToken: string | null = localStorage.getItem('nerve_token');
+let tokenRevision = 0;
 
-export function setToken(token: string) {
+/** Install a token and return the revision that owns it. */
+export function setToken(token: string): number {
   authToken = token;
+  tokenRevision += 1;
   localStorage.setItem('nerve_token', token);
+  return tokenRevision;
 }
 
-export function clearToken() {
+/** Clear the current token, optionally only if a caller still owns it. */
+export function clearToken(expectedRevision?: number): boolean {
+  if (expectedRevision !== undefined && expectedRevision !== tokenRevision) {
+    return false;
+  }
   authToken = null;
+  tokenRevision += 1;
   localStorage.removeItem('nerve_token');
+  return true;
 }
 
 export function getToken(): string | null {
@@ -302,9 +312,11 @@ const SESSION_TOKEN_HEADER = 'X-Nerve-Token';
  * talking to the server never expires — no daily re-login, no logout
  * mid-sentence.
  */
-function absorbRefreshedToken(res: Response): void {
+function absorbRefreshedToken(res: Response, requestRevision: number): void {
   const fresh = res.headers.get(SESSION_TOKEN_HEADER);
-  if (fresh && fresh !== authToken) setToken(fresh);
+  if (requestRevision === tokenRevision && fresh && fresh !== authToken) {
+    setToken(fresh);
+  }
 }
 
 /**
@@ -324,28 +336,32 @@ export function setUnauthorizedHandler(handler: () => void): void {
   onUnauthorized = handler;
 }
 
-function handleUnauthorized(): Error {
-  clearToken();
-  onUnauthorized?.();
+function handleUnauthorized(requestRevision: number): Error {
+  // A response belongs to the token revision that sent it. A logout, login,
+  // or accepted slide makes older 401s informational rather than authority to
+  // clear the new session or put its UI into the expiry state.
+  if (clearToken(requestRevision)) onUnauthorized?.();
   return new Error('Unauthorized');
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const requestToken = authToken;
+  const requestRevision = tokenRevision;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),
   };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+  if (requestToken) {
+    headers['Authorization'] = `Bearer ${requestToken}`;
   }
 
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
 
-  absorbRefreshedToken(res);
-
   if (res.status === 401) {
-    throw handleUnauthorized();
+    throw handleUnauthorized(requestRevision);
   }
+
+  absorbRefreshedToken(res, requestRevision);
 
   if (!res.ok) {
     const body = await res.text();
