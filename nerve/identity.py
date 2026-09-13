@@ -160,4 +160,3 @@ async def system_actor(store: "AccountStore") -> Actor:
         account_id=None,
         display_name=row["display_name"],
     )
-
