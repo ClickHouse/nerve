@@ -6,6 +6,7 @@ import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, Modifie
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
+import { useAuthStore } from './authStore';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
@@ -1090,8 +1091,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
+    //
+    // The sender is stamped here because nobody else can: the gateway excludes
+    // this tab from the `user_message` echo, so this row is the only copy that
+    // exists until the transcript is re-read. Without it a two-person session
+    // holds one attributed message and one unattributed one in each tab, which
+    // the visibility rule reads as a single person — and neither side sees a
+    // label until a reload. `selfActorId` is null when it could not be read,
+    // which is the ordinary unattributed path.
+    const sender = useAuthStore.getState().selfActorId;
     set((state) => ({
-      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString() }],
+      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString(), actor_id: sender }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },
@@ -1187,7 +1197,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' as const },
         messages: [
-          { role: 'user' as const, blocks: buildBlocks(), created_at: now },
+          // The deferred prompt is this person's; the acknowledgement beside it
+          // is Nerve's own voice and stays unattributed, which is exactly how
+          // the route stores the two rows.
+          { role: 'user' as const, blocks: buildBlocks(), created_at: now, actor_id: useAuthStore.getState().selfActorId },
           { role: 'assistant' as const, blocks: [{ type: 'text', content: res.ack }], created_at: now },
         ],
       };

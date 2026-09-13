@@ -19,13 +19,59 @@ import type { ChatMessage } from '../../types/chat';
  * is asserted directly rather than inferred.
  */
 
+// The chat store reads localStorage at module init and Node 25 injects an inert
+// global that shadows jsdom's (see chatStore.test.ts) — install a real one
+// before the dynamic imports below.
+function installStorage(): void {
+  const data = new Map<string, string>();
+  const storage = {
+    getItem: (k: string) => (data.has(k) ? data.get(k)! : null),
+    setItem: (k: string, v: string) => void data.set(k, String(v)),
+    removeItem: (k: string) => void data.delete(k),
+    clear: () => data.clear(),
+    key: (i: number) => [...data.keys()][i] ?? null,
+    get length() { return data.size; },
+  };
+  for (const target of [globalThis, globalThis.window]) {
+    if (target) Object.defineProperty(target, 'localStorage', { value: storage, configurable: true, writable: true });
+  }
+}
+installStorage();
+
 vi.mock('../../api/client', () => ({
-  api: { listActors: vi.fn(), getActor: vi.fn() },
+  api: {
+    listActors: vi.fn(),
+    getActor: vi.fn(),
+    listAccounts: vi.fn(async () => ({ accounts: [] })),
+    authStatus: vi.fn(async () => ({
+      auth_required: true, mode: 'local', login: 'password',
+      setup_pending: false, multiple_accounts: true,
+    })),
+    checkAuth: vi.fn(async () => ({ authenticated: true })),
+    login: vi.fn(),
+  },
   getToken: vi.fn(() => 'tok'),
+  setToken: vi.fn(),
+  clearToken: vi.fn(),
+  setUnauthorizedHandler: vi.fn(),
+}));
+vi.mock('../../stores/helpers/draftStorage', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  clearAllDrafts: vi.fn(),
+}));
+vi.mock('../../stores/helpers/readStorage', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  clearAllReads: vi.fn(),
+}));
+vi.mock('../../api/websocket', () => ({
+  ws: { sendMessage: vi.fn(() => 'sent'), switchSession: vi.fn(), send: vi.fn(), connect: vi.fn() },
 }));
 
 const { api } = await import('../../api/client');
 const { useActorStore } = await import('../../stores/actorStore');
+const { useAuthStore } = await import('../../stores/authStore');
+const { useChatStore } = await import('../../stores/chatStore');
+const { handleUserMessage } = await import('../../stores/handlers/sessionHandlers');
 const { MessageList } = await import('./MessageList');
 
 const listActors = api.listActors as unknown as ReturnType<typeof vi.fn>;
@@ -66,7 +112,11 @@ function labels(): string[] {
 beforeEach(() => {
   vi.clearAllMocks();
   useActorStore.getState().reset();
+  useAuthStore.setState({ selfActorId: null });
+  useChatStore.setState({ messages: [], activeSession: '', virtualSession: null });
   listActors.mockResolvedValue({ actors: [alice(), bob(), system()] });
+  (api.listAccounts as unknown as ReturnType<typeof vi.fn>)
+    .mockResolvedValue({ accounts: [] });
 });
 
 describe('a message with a sender', () => {
@@ -194,6 +244,52 @@ describe('a message with no sender', () => {
   });
 });
 
+describe('two people with the same display name', () => {
+  const ALEX_1 = '0199aaaa-1111-7000-8000-0000000000ab';
+  const ALEX_2 = '0199aaaa-1111-7000-8000-0000000000cd';
+
+  const bothAlexes = [
+    actorRef(ALEX_1, { display_name: 'Alex' }),
+    actorRef(ALEX_2, { display_name: 'Alex' }),
+  ];
+
+  it('are told apart in the label, not only in the tooltip', async () => {
+    listActors.mockResolvedValue({ actors: bothAlexes });
+    renderTranscript([said('one', ALEX_1, 1), said('two', ALEX_2, 2)]);
+
+    // A phone has no hover, so the discriminator has to be visible text.
+    await waitFor(() => expect(labels()).toEqual(['Alex (0000ab)', 'Alex (0000cd)']));
+  });
+
+  it('keep the full id in the tooltip for whoever needs to be sure', async () => {
+    listActors.mockResolvedValue({ actors: bothAlexes });
+    renderTranscript([said('one', ALEX_1, 1), said('two', ALEX_2, 2)]);
+
+    await screen.findByText('Alex (0000ab)');
+    expect(screen.getByTitle(`Sent by Alex (0000ab) — actor ${ALEX_1}`)).toBeInTheDocument();
+  });
+
+  it('leave an unshared name completely alone', async () => {
+    listActors.mockResolvedValue({
+      actors: [actorRef(ALEX_1, { display_name: 'Alex' }), bob()],
+    });
+    renderTranscript([said('one', ALEX_1, 1), said('two', BOB, 2)]);
+
+    await waitFor(() => expect(labels()).toEqual(['Alex', 'Bob']));
+  });
+
+  it('tell two nameless accounts apart as well', async () => {
+    listActors.mockResolvedValue({
+      actors: [actorRef(ALEX_1), actorRef(ALEX_2)],
+    });
+    renderTranscript([said('one', ALEX_1, 1), said('two', ALEX_2, 2)]);
+
+    await waitFor(() => expect(labels()).toEqual([
+      'Unnamed account (0000ab)', 'Unnamed account (0000cd)',
+    ]));
+  });
+});
+
 describe('assistant rows', () => {
   it('carry no attribution markup anywhere inside them', async () => {
     const { container } = renderTranscript([
@@ -207,6 +303,122 @@ describe('assistant rows', () => {
     expect(assistant.querySelectorAll('[data-attribution]')).toHaveLength(0);
     expect(assistant.textContent).not.toContain('Alice');
     expect(assistant.textContent).not.toContain('Nerve');
+  });
+});
+
+/**
+ * The gate, as a user meets it: two people in one session, right now, with no
+ * reload anywhere.
+ *
+ * This is the case the parts conspire to break. The gateway excludes a sender
+ * from its own echo, so each tab holds one message it created locally and one
+ * that arrived over the socket. If the local one is unattributed, each
+ * transcript contains exactly one actor id, the visibility rule reads that as
+ * one person, and *neither* tab shows a label — the two-simultaneous-humans
+ * requirement fails while every individual piece looks correct.
+ */
+describe('two people, live, in one session', () => {
+  /** A tab signed in as `me`, with `activeSession` open. */
+  function tab(me: string) {
+    useAuthStore.setState({ selfActorId: me });
+    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null });
+  }
+
+  /** The socket event the *other* tab's message arrives as. */
+  function echo(from: string, content: string) {
+    handleUserMessage(
+      { type: 'user_message', session_id: 's1', content, actor_id: from },
+      useChatStore.getState,
+      useChatStore.setState,
+    );
+  }
+
+  it('labels both bubbles in the tab that spoke first', async () => {
+    tab(ALICE);
+    await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
+    echo(BOB, 'not yet');
+
+    renderTranscript(useChatStore.getState().messages);
+
+    await waitFor(() => expect(labels()).toEqual(['Alice', 'Bob']));
+  });
+
+  it('labels both bubbles in the tab that answered', async () => {
+    tab(BOB);
+    echo(ALICE, 'ship it?');
+    await act(async () => { await useChatStore.getState().sendMessage('not yet'); });
+
+    renderTranscript(useChatStore.getState().messages);
+
+    await waitFor(() => expect(labels()).toEqual(['Alice', 'Bob']));
+  });
+
+  it('stamps your own message with your actor, not a name', async () => {
+    tab(ALICE);
+    await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
+
+    const [mine] = useChatStore.getState().messages;
+    expect(mine.actor_id).toBe(ALICE);
+    // The id and nothing else — a name here would be the stored-snapshot bug
+    // this whole branch exists to avoid.
+    expect(JSON.stringify(mine)).not.toContain('Alice');
+  });
+
+  it('leaves your own message unattributed when the actor could not be read', async () => {
+    // A caller with no account row — the agent's own principal, an MCP token —
+    // gets a 403 from /api/accounts, which is the ordinary null path.
+    tab(ALICE);
+    useAuthStore.setState({ selfActorId: null });
+    await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
+
+    expect(useChatStore.getState().messages[0].actor_id).toBeNull();
+    renderTranscript(useChatStore.getState().messages);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(labels()).toEqual([]);
+  });
+
+  it('does not label a conversation you are having with yourself', async () => {
+    tab(ALICE);
+    await act(async () => { await useChatStore.getState().sendMessage('one'); });
+    await act(async () => { await useChatStore.getState().sendMessage('two'); });
+
+    renderTranscript(useChatStore.getState().messages);
+
+    // Settle inside `act`: this one does fetch the map (there is an id to
+    // resolve), it just decides not to label anything with it.
+    await act(async () => { await new Promise((r) => setTimeout(r, 20)); });
+    expect(labels()).toEqual([]);
+  });
+});
+
+describe('the signed-in actor', () => {
+  it('is read once per session and dropped on logout', async () => {
+    const listAccounts = api.listAccounts as unknown as ReturnType<typeof vi.fn>;
+    listAccounts.mockResolvedValue({
+      accounts: [
+        { id: 'acc-1', actor_id: BOB, is_self: false },
+        { id: 'acc-2', actor_id: ALICE, is_self: true },
+      ],
+    });
+
+    await act(async () => { await useAuthStore.getState().checkAuth(); });
+
+    // Keyed on `actor_id` and on `is_self` — never on the account id, which is
+    // the login rather than the person.
+    await waitFor(() => expect(useAuthStore.getState().selfActorId).toBe(ALICE));
+
+    act(() => useAuthStore.getState().logout());
+    expect(useAuthStore.getState().selfActorId).toBeNull();
+  });
+
+  it('stays null when the account list is refused', async () => {
+    const listAccounts = api.listAccounts as unknown as ReturnType<typeof vi.fn>;
+    listAccounts.mockRejectedValue(new Error('403: not an account'));
+
+    await act(async () => { await useAuthStore.getState().checkAuth(); });
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(useAuthStore.getState().selfActorId).toBeNull();
   });
 });
 

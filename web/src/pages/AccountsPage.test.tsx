@@ -36,6 +36,7 @@ const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 function account(overrides: Partial<Account> = {}): Account {
   return {
     id: 'acc-1',
+    actor_id: 'actor-1',
     username: 'alice',
     display_name: 'Alice',
     enabled: true,

@@ -33,6 +33,25 @@ interface AuthState {
   /** The instance has never been set up: no password and no username on its
    *  one account. Routed to `/setup`. */
   setupPending: boolean;
+  /**
+   * The signed-in account's *actor* id — the id its sessions and messages are
+   * stored under.
+   *
+   * Attribution needs it for one thing the server cannot help with: a message
+   * you have just sent exists in your own transcript before it exists anywhere
+   * else. The gateway excludes the sender from the `user_message` echo (there
+   * is nothing to echo back to the tab that sent it), so without this your own
+   * bubble carries no sender until the page is reloaded — and in a fresh
+   * two-tab exchange that leaves each tab holding one attributed message and
+   * one unattributed one, which reads as a single person and suppresses every
+   * label on both sides.
+   *
+   * Null until it is read, and null forever on a caller with no account row —
+   * the agent's own principal, an MCP token — for which `/api/accounts` is
+   * refused. That is the ordinary unattributed path and renders as it always
+   * has, so nothing depends on this being present.
+   */
+  selfActorId: string | null;
   login: (password: string, username?: string) => Promise<void>;
   logout: () => void;
   checkAuth: () => Promise<void>;
@@ -51,6 +70,30 @@ interface AuthState {
  */
 let sessionEstablished = false;
 
+/**
+ * Read who we are signed in as, once per session.
+ *
+ * `/api/accounts` is the only endpoint that publishes it today: it is keyed by
+ * account, carries `is_self`, and PR 3 added `actor_id` to the row. Key on
+ * `actor_id` and never on `id` — the account id is the login, the actor id is
+ * the person, and only the actor id is what a message was stored under.
+ *
+ * Swallows everything. A 403 is the expected answer for a caller with no
+ * account row, a 401 is already handled globally, and neither is a reason to
+ * fail a login: the only thing lost is the label on your own unsaved bubble.
+ *
+ * When a `GET /api/auth/me` arrives (PR 6), this function is the only thing
+ * that changes.
+ */
+async function readSelfActorId(set: (partial: { selfActorId: string | null }) => void): Promise<void> {
+  try {
+    const { accounts } = await api.listAccounts();
+    set({ selfActorId: accounts.find((a) => a.is_self)?.actor_id ?? null });
+  } catch {
+    set({ selfActorId: null });
+  }
+}
+
 export const useAuthStore = create<AuthState>((set) => ({
   authenticated: !!getToken(),
   loading: false,
@@ -59,6 +102,7 @@ export const useAuthStore = create<AuthState>((set) => ({
   sessionExpired: false,
   loginMode: 'password',
   setupPending: false,
+  selfActorId: null,
 
   login: async (password: string, username?: string) => {
     set({ loading: true, error: null });
@@ -67,6 +111,9 @@ export const useAuthStore = create<AuthState>((set) => ({
       setToken(token);
       sessionEstablished = true;
       set({ authenticated: true, loading: false, sessionExpired: false });
+      // Not awaited: nothing on screen waits for it, and a slow or refused
+      // account list must not hold up the app coming back after a re-login.
+      void readSelfActorId(set);
     } catch (e: any) {
       set({ error: e.message || 'Login failed', loading: false });
     }
@@ -85,7 +132,10 @@ export const useAuthStore = create<AuthState>((set) => ({
     // a cache, and the whole point of this one is that it is not.
     useActorStore.getState().reset();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
-    set({ authenticated: false, sessionExpired: false });
+    // Who we are is per session too, and the next person to sign in here is
+    // not this one — an optimistic bubble stamped with the previous account's
+    // actor would be a false attribution, which is worse than none.
+    set({ authenticated: false, sessionExpired: false, selfActorId: null });
   },
 
   refreshStatus: async () => {
@@ -125,6 +175,7 @@ export const useAuthStore = create<AuthState>((set) => ({
           // checking must be cleared here too — App renders null while it
           // is true, so leaving it set blanks the app after auto-login.
           set({ authenticated: true, checking: false });
+          void readSelfActorId(set);
           return;
         } catch {
           // Fall through to the login page.
@@ -137,6 +188,9 @@ export const useAuthStore = create<AuthState>((set) => ({
       await api.checkAuth();
       sessionEstablished = true;
       set({ authenticated: true, checking: false });
+      // A reload arrives here rather than through `login`, and it is the more
+      // common way a tab reaches an authenticated app.
+      void readSelfActorId(set);
     } catch {
       // On the startup path the stored token was already dead on arrival — a
       // cold start, not an expiry under a live app, so fall through to the

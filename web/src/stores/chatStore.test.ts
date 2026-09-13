@@ -27,7 +27,12 @@ vi.mock('../api/client', () => ({
     listSessions: vi.fn(),
     listArchivedSessions: vi.fn(),
     listSystemSessions: vi.fn(),
+    listAccounts: vi.fn(async () => ({ accounts: [] })),
   },
+  // The store stamps an optimistic message with the signed-in actor, so it now
+  // reaches authStore, which reads these two at module load.
+  getToken: vi.fn(),
+  setUnauthorizedHandler: vi.fn(),
 }));
 vi.mock('../api/websocket', () => ({
   ws: { switchSession: vi.fn(), send: vi.fn(), connect: vi.fn() },
