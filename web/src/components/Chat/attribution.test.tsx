@@ -38,11 +38,23 @@ function installStorage(): void {
 }
 installStorage();
 
+/**
+ * Token storage, for real.
+ *
+ * Whose token is in storage is the thing under test in two of these specs —
+ * a stale sign-in must take back its own and leave a newer one alone — and a
+ * `getToken` that always answers the same string would make both pass without
+ * meaning anything.
+ */
+const tokenStore = vi.hoisted(() => ({ value: 'tok' as string | null }));
+
 vi.mock('../../api/client', () => ({
   api: {
     listActors: vi.fn(),
     getActor: vi.fn(),
     getOwnAccount: vi.fn(),
+    createSession: vi.fn(),
+    runLater: vi.fn(),
     authStatus: vi.fn(async () => ({
       auth_required: true, mode: 'local', login: 'password',
       setup_pending: false, multiple_accounts: true,
@@ -50,9 +62,9 @@ vi.mock('../../api/client', () => ({
     checkAuth: vi.fn(async () => ({ authenticated: true })),
     login: vi.fn(async () => ({ token: 'tok' })),
   },
-  getToken: vi.fn(() => 'tok'),
-  setToken: vi.fn(),
-  clearToken: vi.fn(),
+  getToken: vi.fn(() => tokenStore.value),
+  setToken: vi.fn((token: string) => { tokenStore.value = token; }),
+  clearToken: vi.fn(() => { tokenStore.value = null; }),
   setUnauthorizedHandler: vi.fn(),
 }));
 vi.mock('../../stores/helpers/draftStorage', async (orig) => ({
@@ -69,6 +81,8 @@ vi.mock('../../api/websocket', () => ({
 
 const client = await import('../../api/client');
 const { api } = client;
+const setToken = client.setToken as unknown as ReturnType<typeof vi.fn>;
+const clearToken = client.clearToken as unknown as ReturnType<typeof vi.fn>;
 const { useActorStore } = await import('../../stores/actorStore');
 const { useAuthStore, selfActorId } = await import('../../stores/authStore');
 const { useChatStore } = await import('../../stores/chatStore');
@@ -120,7 +134,8 @@ function labels(): string[] {
 beforeEach(() => {
   vi.clearAllMocks();
   useActorStore.getState().reset();
-  useAuthStore.setState({ account: null });
+  useAuthStore.setState({ account: null, loading: false, sessionExpired: false });
+  tokenStore.value = 'tok';
   useChatStore.setState({ messages: [], activeSession: '', virtualSession: null });
   listActors.mockResolvedValue({ actors: [alice(), bob(), system()] });
   (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>)
@@ -376,7 +391,8 @@ describe('two people, live, in one session', () => {
     // A caller with no account row — the agent's own principal, an MCP token —
     // gets a 403 from /api/accounts, which is the ordinary null path.
     tab(ALICE);
-    useAuthStore.setState({ account: null });
+    useAuthStore.setState({ account: null, loading: false, sessionExpired: false });
+  tokenStore.value = 'tok';
     await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
 
     expect(useChatStore.getState().messages[0].actor_id).toBeNull();
@@ -524,6 +540,115 @@ describe('identity across an auth boundary', () => {
     // Not knowing who you are must never become a way to lose a message.
     expect(useChatStore.getState().messages).toHaveLength(1);
     expect(useChatStore.getState().messages[0].actor_id).toBeNull();
+  });
+
+  it('never installs a credential for a session that has ended', async () => {
+    // The overlay keeps its log-out button live while an unlock is in flight,
+    // so this is a thing a person can do. A token arriving afterwards must not
+    // quietly sign them back in.
+    const slowLogin = deferred<{ token: string }>();
+    login().mockReturnValueOnce(slowLogin.promise);
+    getOwnAccount().mockResolvedValue(accountFor(ALICE));
+
+    let signIn!: Promise<void>;
+    act(() => { signIn = useAuthStore.getState().login('pw', 'alice'); });
+    act(() => useAuthStore.getState().logout());
+
+    await act(async () => {
+      slowLogin.resolve({ token: 'alices-late-token' });
+      await signIn;
+    });
+
+    expect(setToken).not.toHaveBeenCalledWith('alices-late-token');
+    expect(useAuthStore.getState().authenticated).toBe(false);
+    // And the form is usable again: a spinner nobody will ever stop is a login
+    // page that cannot be submitted until the tab is reloaded.
+    expect(useAuthStore.getState().loading).toBe(false);
+  });
+
+  it('does not take back a token that is no longer its own', async () => {
+    // Alice's identity read is still open when she signs out and Bob signs in.
+    // Her attempt must clean up after itself without touching his credential.
+    const alicesIdentity = deferred<ReturnType<typeof accountFor>>();
+    login().mockResolvedValueOnce({ token: 'alices-token' });
+    getOwnAccount().mockReturnValueOnce(alicesIdentity.promise);
+
+    let alicesSignIn!: Promise<void>;
+    act(() => { alicesSignIn = useAuthStore.getState().login('pw', 'alice'); });
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => useAuthStore.getState().logout());
+    login().mockResolvedValueOnce({ token: 'bobs-token' });
+    getOwnAccount().mockResolvedValue(accountFor(BOB, 'acc-2'));
+    await act(async () => { await useAuthStore.getState().login('pw', 'bob'); });
+    expect(selfActorId()).toBe(BOB);
+    clearToken.mockClear();
+
+    await act(async () => {
+      alicesIdentity.resolve(accountFor(ALICE));
+      await alicesSignIn;
+    });
+
+    // Bob stays signed in, with his own token untouched.
+    expect(clearToken).not.toHaveBeenCalled();
+    expect(selfActorId()).toBe(BOB);
+    expect(useAuthStore.getState().authenticated).toBe(true);
+  });
+
+  it('labels a deferred run-later with whoever asked for it', async () => {
+    // Alice schedules something; Bob signs in before the requests come back.
+    // The server records Alice, so the row on screen has to say Alice too —
+    // otherwise a reload changes the attribution.
+    login().mockResolvedValue({ token: 'alices-token' });
+    getOwnAccount().mockResolvedValue(accountFor(ALICE));
+    await act(async () => { await useAuthStore.getState().login('pw', 'alice'); });
+    expect(selfActorId()).toBe(ALICE);
+
+    const scheduled = deferred<{ ack: string }>();
+    (api.createSession as unknown as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ id: 'later-1', title: '', source: 'web', updated_at: 't' });
+    (api.runLater as unknown as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(scheduled.promise);
+
+    useChatStore.setState({ messages: [], activeSession: '', virtualSession: null });
+    let later!: Promise<void>;
+    act(() => { later = useChatStore.getState().runLater('sweep at 9', '1h'); });
+
+    await act(async () => {
+      scheduled.resolve({ ack: 'Scheduled.' });
+      await later;
+    });
+
+    expect(useChatStore.getState().messages[0].actor_id).toBe(ALICE);
+  });
+
+  it('abandons a run-later whose session ended rather than relabelling it', async () => {
+    login().mockResolvedValue({ token: 'alices-token' });
+    getOwnAccount().mockResolvedValue(accountFor(ALICE));
+    await act(async () => { await useAuthStore.getState().login('pw', 'alice'); });
+
+    const scheduled = deferred<{ ack: string }>();
+    (api.createSession as unknown as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ id: 'later-1', title: '', source: 'web', updated_at: 't' });
+    (api.runLater as unknown as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(scheduled.promise);
+
+    useChatStore.setState({ messages: [], activeSession: '', virtualSession: null });
+    let later!: Promise<void>;
+    act(() => { later = useChatStore.getState().runLater('sweep at 9', '1h'); });
+
+    act(() => useAuthStore.getState().logout());
+    getOwnAccount().mockResolvedValue(accountFor(BOB, 'acc-2'));
+    await act(async () => { await useAuthStore.getState().login('pw', 'bob'); });
+
+    await act(async () => {
+      scheduled.resolve({ ack: 'Scheduled.' });
+      await later;
+    });
+
+    // Bob's screen does not gain Alice's scheduled prompt, and nothing on it
+    // is labelled with him either.
+    expect(useChatStore.getState().messages).toHaveLength(0);
   });
 
   it('takes the actor from whoever actually unlocked the app', async () => {
