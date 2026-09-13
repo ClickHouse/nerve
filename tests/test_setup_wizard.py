@@ -792,6 +792,7 @@ class TestTheChecklist:
     async def test_the_automation_step_toggles_the_crons_the_installer_wrote(
         self, claimed,
     ):
+        before = claimed.tracked()["sync"]["gmail"]
         async with _http(claimed) as http:
             response = await http.put("/api/setup/automation", json={
                 "crons": ["inbox-processor"], "github": True,
@@ -807,7 +808,33 @@ class TestTheChecklist:
         assert jobs["task-planner"] is False
         assert jobs["memory-maintenance"] is True, "a core cron is never touched"
         assert claimed.tracked()["sync"]["github"]["enabled"] is True
-        assert claimed.tracked()["sync"]["gmail"]["enabled"] is False
+        # Gmail was not mentioned, so it is exactly what the installer left.
+        assert claimed.tracked()["sync"]["gmail"] == before
+
+    async def test_re_entering_it_changes_only_what_was_asked_for(self, claimed):
+        """The blocker: a step entered again to turn one cron on used to
+        switch off every sync source configured anywhere else, and clear the
+        Gmail addresses with them. Omitted means untouched."""
+        async with _http(claimed) as http:
+            await http.put("/api/setup/automation", json={
+                "github": True, "gmail": True,
+                "gmail_accounts": ["alice@example.invalid"],
+                "crons": [],
+            })
+            settled = claimed.tracked()
+            machine = claimed.machine()
+
+            await http.put("/api/setup/automation", json={"crons": ["inbox-processor"]})
+
+        assert claimed.tracked() == settled, "a cron change rewrote the sync settings"
+        assert claimed.machine() == machine, "a cron change cleared the mailboxes"
+        jobs = {
+            job["id"]: job["enabled"]
+            for job in yaml.safe_load(
+                claimed.system_crons.read_text(encoding="utf-8"),
+            )["jobs"]
+        }
+        assert jobs["inbox-processor"] is True
 
     async def test_the_automation_step_is_re_enterable(self, claimed):
         async with _http(claimed) as http:
@@ -974,6 +1001,164 @@ class TestTheChecklist:
             state = (await http.get("/api/setup")).json()
         assert state["restart_pending"] is False
         assert state["finished"] is True
+
+
+@pytest.mark.asyncio
+class TestOneMutationAtATime:
+    """Two tabs, or one tab's form and another's skip.
+
+    Every step reads the checklist's notes, changes them and writes them back,
+    so without a lock each request saves over a snapshot taken before the
+    other — and a skip disappears because a provider save that started first
+    finished last.
+    """
+
+    async def test_concurrent_steps_all_survive(self, claimed):
+        async with _http(claimed) as http:
+            responses = await asyncio.gather(
+                http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY}),
+                http.post("/api/setup/steps/channels/skip"),
+                http.put("/api/setup/profile", json={"display_name": "Alice Example"}),
+                http.put("/api/setup/automation", json={"crons": []}),
+            )
+        assert [r.status_code for r in responses] == [200, 200, 200, 200]
+
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "provider") == "done"
+        assert _status_of(state, "channels") == "skipped"
+        assert _status_of(state, "profile") == "done"
+        assert _status_of(state, "automation") == "done"
+
+    async def test_the_notes_on_disk_agree_with_the_answer(self, claimed):
+        async with _http(claimed) as http:
+            await asyncio.gather(*[
+                http.post(f"/api/setup/steps/{step}/skip")
+                for step in ("provider", "channels", "automation")
+            ])
+        assert setup_state.load_state().skipped == {
+            "provider", "channels", "automation",
+        }
+
+
+@pytest.mark.asyncio
+class TestNothingHalfLands:
+    """A step that writes to more than one place either does all of it or
+    answers with an error for work it has not done."""
+
+    async def test_an_unusable_settings_file_stops_the_step_before_the_rename(
+        self, claimed,
+    ):
+        claimed.settings.write_text("- this is a list\n", encoding="utf-8")
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/profile", json={
+                "timezone": "Europe/Berlin", "display_name": "Alice Example",
+            })
+        assert response.status_code == 409
+        assert "settings" in response.json()["detail"]
+        ref = await claimed.db.get_actor_ref(await claimed.owner_actor_id())
+        assert ref["display_name"] is None, "the rename landed anyway"
+
+    async def test_a_refused_step_is_not_recorded_as_done(self, claimed):
+        claimed.settings.write_text("- this is a list\n", encoding="utf-8")
+        async with _http(claimed) as http:
+            assert (await http.put(
+                "/api/setup/automation", json={"github": True, "crons": ["inbox-processor"]},
+            )).status_code == 409
+        assert "automation" not in setup_state.load_state().done
+        jobs = yaml.safe_load(claimed.system_crons.read_text(encoding="utf-8"))["jobs"]
+        assert all(
+            not job["enabled"] for job in jobs if job["id"] == "inbox-processor"
+        ), "the cron file was published for a step that failed"
+
+
+@pytest.mark.asyncio
+class TestCronChangesAreAppliedOrOwned:
+    """A rewritten cron file the scheduler has not re-read is a change that
+    has not happened — and a checklist saying "nothing is waiting" over it is
+    the one wrong answer that matters, because then nobody restarts."""
+
+    async def test_an_unreachable_scheduler_becomes_restart_debt(self, claimed):
+        async with _http(claimed) as http:
+            state = (await http.put(
+                "/api/setup/automation", json={"crons": ["inbox-processor"]},
+            )).json()
+        assert state["restart_pending"] is True
+        assert any("scheduler" in reason for reason in state["restart_pending_reasons"])
+        assert state["finished"] is False
+
+    async def test_a_live_scheduler_is_reloaded_and_owes_nothing(
+        self, claimed, monkeypatch,
+    ):
+        reloads = []
+
+        class _Cron:
+            async def reload(self):
+                reloads.append(True)
+                return {"jobs": 1}
+
+        import nerve.gateway.server as server_module
+
+        monkeypatch.setattr(server_module, "_cron_service", _Cron(), raising=False)
+        async with _http(claimed) as http:
+            state = (await http.put(
+                "/api/setup/automation", json={"crons": ["inbox-processor"]},
+            )).json()
+        assert reloads, "the scheduler was never told"
+        assert state["restart_pending_reasons"] == []
+
+    async def test_a_reload_that_fails_is_debt_rather_than_an_error(
+        self, claimed, monkeypatch,
+    ):
+        class _Cron:
+            async def reload(self):
+                raise RuntimeError("no scheduler today")
+
+        import nerve.gateway.server as server_module
+
+        monkeypatch.setattr(server_module, "_cron_service", _Cron(), raising=False)
+        async with _http(claimed) as http:
+            state = (await http.put(
+                "/api/setup/automation", json={"crons": ["inbox-processor"]},
+            )).json()
+        # The file was written; only the applying failed, and the checklist
+        # says so rather than pretending either way.
+        assert state["restart_pending"] is True
+        assert state["restart_pending_reasons"]
+
+    async def test_a_selection_that_changes_nothing_owes_nothing(
+        self, claimed, monkeypatch,
+    ):
+        async with _http(claimed) as http:
+            state = (await http.put(
+                "/api/setup/automation", json={"crons": []},
+            )).json()
+        assert state["restart_pending_reasons"] == []
+
+
+@pytest.mark.asyncio
+class TestAWhitespaceTokenIsNoToken:
+    async def test_it_is_refused_rather_than_marked_done(self, claimed):
+        async with _http(claimed) as http:
+            response = await http.put(
+                "/api/setup/channels", json={"telegram_bot_token": "   "},
+            )
+        assert response.status_code == 400
+        assert "channels" not in setup_state.load_state().done
+        assert "telegram" not in claimed.secrets()
+
+    async def test_the_allow_list_is_left_alone_when_it_is_not_given(self, claimed):
+        """Pairing is how people are added to it; a setup step must not clear
+        what pairing built."""
+        async with _http(claimed) as http:
+            await http.put("/api/setup/channels", json={
+                "telegram_bot_token": _TELEGRAM_TOKEN,
+                "telegram_allowed_users": [4242],
+            })
+            await http.put("/api/setup/channels", json={
+                "telegram_bot_token": "0000000000:a-replacement-placeholder",
+            })
+        assert claimed.secrets()["telegram"]["allowed_users"] == [4242]
 
 
 def _status_of(state: dict, step: str) -> str:

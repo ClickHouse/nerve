@@ -80,6 +80,7 @@ from nerve.setup_writer import (
     merge_private_paths,
     merge_settings_paths,
     set_optional_crons,
+    settings_problem,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,17 @@ _RESTART_DELAY_SECONDS = 0.75
 # a second restart could achieve that the first is not already doing.
 _restart_lock = asyncio.Lock()
 _restart_requested = False
+
+# One mutation at a time. Every step reads the checklist's notes, changes them
+# and writes them back, so two requests in flight — two tabs, or one tab's form
+# and another's skip — would each save over a snapshot taken before the other.
+# An asyncio.Lock is enough because the daemon is one process with one event
+# loop; a multi-worker server would need a lock the processes share. See the
+# handoff.
+_state_lock = asyncio.Lock()
+
+# What a rewritten cron file the scheduler has not re-read amounts to.
+_CRON_DEBT = "the scheduler is still running the cron settings it started with"
 
 _LOCKDOWN_REFUSED = (
     "This instance is in lockdown: its configuration is fleet-managed and is "
@@ -204,6 +216,10 @@ class SetupStateOut(BaseModel):
     read_only_reason: str | None
     restart_pending: bool
     restart_pending_paths: list[str]
+    # Things waiting on a restart that are not configuration keys — a cron file
+    # the running scheduler has not picked up, say. Written for a person to
+    # read, because there is no path to name.
+    restart_pending_reasons: list[str]
     # Every required step done and nothing waiting on a restart.
     finished: bool
     steps: list[SetupStepOut]
@@ -223,16 +239,27 @@ class ProfileRequest(BaseModel):
 
 
 class ChannelsRequest(BaseModel):
-    telegram_bot_token: str = Field(min_length=1)
+    # Not `min_length=1`: that accepts a string of spaces, which strips to
+    # nothing, writes nothing, and would still have marked the step done.
+    telegram_bot_token: str
+    # Omitted means "leave the allow-list alone" — pairing is how people are
+    # added to it, and a setup step must not clear what pairing built.
     telegram_allowed_users: list[int] | None = None
 
 
 class AutomationRequest(BaseModel):
-    crons: list[str] = Field(default_factory=list)
-    github: bool = False
-    gmail: bool = False
-    gmail_accounts: list[str] = Field(default_factory=list)
-    telegram: bool = False
+    """Every field optional, and an omitted one means *untouched*.
+
+    The step is re-enterable, so it is entered again to change one thing — and
+    a body that defaulted the rest to ``false`` turned "enable this cron" into
+    "and switch off the sync sources somebody configured elsewhere".
+    """
+
+    crons: list[str] | None = None
+    github: bool | None = None
+    gmail: bool | None = None
+    gmail_accounts: list[str] | None = None
+    telegram: bool | None = None
     telegram_api_id: int | None = None
     telegram_api_hash: str | None = None
 
@@ -507,9 +534,11 @@ def _render(context: _Context) -> SetupStateOut:
     except OSError as e:  # pragma: no cover - unreadable workspace
         logger.warning("Could not read the cron file for setup: %s", e)
 
+    debts = sorted(context.state.debts)
     finished = (
         not context.unclaimed
         and not pending
+        and not debts
         and all(s.status in {"done", "skipped"} for s in steps)
     )
 
@@ -518,8 +547,9 @@ def _render(context: _Context) -> SetupStateOut:
         lockdown=bool(config.lockdown),
         writable=problem is None,
         read_only_reason=problem,
-        restart_pending=bool(pending),
+        restart_pending=bool(pending) or bool(debts),
         restart_pending_paths=pending,
+        restart_pending_reasons=debts,
         finished=finished,
         steps=steps,
         crons=[
@@ -541,16 +571,15 @@ async def get_setup(actor: Actor = Depends(require_account)):
     return _render(await _context(actor))
 
 
-def _apply(
+def _write(
     context: _Context,
     *,
-    step: str,
     choices: SetupChoices,
     machine_paths: tuple[str, ...] = (),
     portable_paths: tuple[str, ...] = (),
     secret_paths: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Write one step's keys, and only its keys.
+    """Write one step's keys, and only its keys. Returns what was applied.
 
     The values come from :func:`build_config_layers` and
     :func:`build_config_local` — the same functions ``nerve init`` writes
@@ -558,7 +587,14 @@ def _apply(
     layer a value belongs in is decided in exactly one place: change it there
     and both the installer and the wizard follow.
 
-    Returns what was applied, for the state file to remember.
+    **Order matters, and it is the order of fallibility.** The tracked
+    settings file is checked before anything is published, because "that file
+    is not a mapping" is the failure most likely to arrive and a step that had
+    already written a credential before discovering it would answer with an
+    error for work it had half done. What remains after the check are two
+    atomic publications; a failure between them leaves the credential written
+    and its switch unset, which is the safe half to land — a bot that stays
+    off rather than one started without a token.
     """
     config_dir = _require_writable(context.config)
     machine, portable, _shadowed = build_config_layers(choices)
@@ -566,10 +602,26 @@ def _apply(
     portable_flat = leaf_paths(portable)
     secret_flat = leaf_paths(build_config_local(choices))
 
-    applied: dict[str, Any] = {}
-
     machine_updates = {p: machine_flat[p] for p in machine_paths if p in machine_flat}
     secret_updates = {p: secret_flat[p] for p in secret_paths if p in secret_flat}
+    portable_updates = {
+        p: portable_flat[p] for p in portable_paths if p in portable_flat
+    }
+
+    workspace = Path(context.config.workspace)
+    if portable_updates:
+        problem = settings_problem(workspace)
+        if problem:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{workspace / 'config' / 'settings.yaml'} is not usable as "
+                    f"settings ({problem}), so nothing was written. Fix it in "
+                    "the workspace repository and try again."
+                ),
+            )
+
+    applied: dict[str, Any] = {}
     if machine_updates or secret_updates:
         # Two writers, because the two files are not the same kind of file.
         # config.local.yaml holds credentials and is forced owner-only, failing
@@ -599,25 +651,73 @@ def _apply(
         applied.update(machine_updates)
         applied.update(secret_updates)
 
-    portable_updates = {p: portable_flat[p] for p in portable_paths if p in portable_flat}
     if portable_updates:
-        outcome = merge_settings_paths(Path(context.config.workspace), portable_updates)
-        if outcome.status in {"invalid_yaml", "not_a_mapping"}:
+        outcome = merge_settings_paths(workspace, portable_updates)
+        if outcome.status in {"invalid_yaml", "not_a_mapping"}:  # pragma: no cover
+            # Checked above; reachable only if the file changed underneath us.
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"{outcome.path} is not usable as settings "
-                    f"({outcome.status.replace('_', ' ')}), so it was left alone. "
-                    "Fix it in the workspace repository and try again."
-                ),
+                detail=f"{outcome.path} is not usable as settings; it was left alone.",
             )
         applied.update(portable_updates)
 
-    setup_state.record_applied(context.state, applied)
+    return applied
+
+
+def _record(
+    context: _Context,
+    *,
+    step: str,
+    applied: dict[str, Any] | None = None,
+    debts: tuple[str, ...] = (),
+) -> None:
+    """Note that a step was answered, after every write it makes has landed.
+
+    Separate from :func:`_write` so a failure in a later target cannot leave a
+    step recorded as done — the checklist would then say "provider: done" for
+    a request the caller was told had failed.
+    """
+    if applied:
+        setup_state.record_applied(context.state, applied)
+    for debt in debts:
+        context.state.debts.add(debt)
     context.state.done.add(step)
     context.state.skipped.discard(step)
     setup_state.save_state(context.state)
-    return applied
+
+
+async def _apply_cron_toggles(context: _Context, wanted: set[str]) -> tuple[str, ...]:
+    """Publish the cron selection and hand it to the running scheduler.
+
+    Returns the debts it left behind: a rewritten ``system.yaml`` the
+    scheduler has not picked up is a change that has not happened, and a
+    checklist reporting "nothing is waiting" over it would be wrong in the one
+    way that matters — nobody would restart, and the crons they asked for
+    would never run.
+    """
+    outcome = set_optional_crons(Path(context.config.workspace), wanted)
+    if outcome.status == "unreadable":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{outcome.path} could not be read ({outcome.detail}); nothing "
+                   "was changed.",
+        )
+    if outcome.status == "unchanged":
+        return ()
+
+    # The same reload `nerve reload` and POST /api/cron/reload perform. Read at
+    # call time rather than imported at module load, because the lifespan
+    # publishes it after this module is imported.
+    from nerve.gateway.server import _cron_service
+
+    if _cron_service is None:
+        return (_CRON_DEBT,)
+    try:
+        await _cron_service.reload()
+    except Exception as e:  # noqa: BLE001 - the write landed; only the apply failed
+        logger.warning("Setup: the cron file was written but not reloaded: %s", e)
+        return (_CRON_DEBT,)
+    return ()
 
 
 @router.put("/api/setup/provider", response_model=SetupStateOut)
@@ -628,6 +728,8 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_acco
     waterfall reads the operator's macOS keychain and
     ``~/.claude/.credentials.json``; a process inside the VM cannot see either,
     so the wizard asks for a key instead of pretending to find one.
+
+    PATCH-shaped: a key that is absent or blank is left exactly as it is.
     """
     anthropic = (req.anthropic_api_key or "").strip()
     openai = (req.openai_api_key or "").strip()
@@ -637,14 +739,18 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_acco
             detail="Give an Anthropic API key, an OpenAI key, or skip this step.",
         )
 
-    context = await _context(actor)
-    choices = SetupChoices(anthropic_api_key=anthropic, openai_api_key=openai)
-    _apply(
-        context, step=STEP_PROVIDER, choices=choices,
-        secret_paths=("anthropic_api_key", "openai_api_key"),
-    )
-    logger.info("Setup: a provider credential was stored by account %s", actor.account_id)
-    return _render(await _context(actor))
+    async with _state_lock:
+        context = await _context(actor)
+        applied = _write(
+            context,
+            choices=SetupChoices(anthropic_api_key=anthropic, openai_api_key=openai),
+            secret_paths=("anthropic_api_key", "openai_api_key"),
+        )
+        _record(context, step=STEP_PROVIDER, applied=applied)
+        logger.info(
+            "Setup: a provider credential was stored by account %s", actor.account_id,
+        )
+        return _render(await _context(actor))
 
 
 @router.put("/api/setup/profile", response_model=SetupStateOut)
@@ -654,9 +760,16 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
     The name is a presentation snapshot (0.7): it changes what every label in
     the app says and rewrites nothing that was stored, because it goes onto
     the actor the bootstrap created rather than creating a second one.
+
+    PATCH-shaped: each field is written only when it is given, so renaming
+    yourself cannot move the instance's shared scheduling timezone.
     """
-    context = await _context(actor)
     timezone = (req.timezone or "").strip()
+    display_name = req.display_name
+    if not timezone and display_name is None:
+        raise HTTPException(
+            status_code=400, detail="Give a time zone, a display name, or both.",
+        )
     if timezone:
         try:
             ZoneInfo(timezone)
@@ -665,42 +778,35 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
                 status_code=400,
                 detail=f"{timezone!r} is not a time zone this machine knows.",
             ) from e
-        # Both halves or neither. The name goes into the database and the zone
-        # into a file, and a request that asked for both must not land the name
-        # and then answer with the failure of the other — a committed write
-        # reported as a failure is a form that primes a retry which can only
-        # conflict with what already happened.
-        _require_writable(context.config)
 
-    db = get_deps().db
-    if req.display_name is not None:
-        # Written first because it is the half that works on a read-only
-        # instance: under lockdown, naming yourself is the one thing the
-        # checklist can still do.
-        if not actor.account_id:  # pragma: no cover - require_account checked
-            raise HTTPException(status_code=403, detail="No account to rename")
-        account = await db.get_account(actor.account_id)
-        if account is None:  # pragma: no cover - resolved a moment ago
-            raise HTTPException(status_code=404, detail="Account not found")
-        await db.update_actor_profile(
-            account["actor_id"], display_name=(req.display_name.strip() or None),
-        )
+    async with _state_lock:
+        context = await _context(actor)
+        db = get_deps().db
 
-    if timezone:
-        _apply(
-            context, step=STEP_PROFILE,
-            choices=SetupChoices(timezone=timezone),
-            portable_paths=("timezone",),
-        )
-    elif req.display_name is not None:
-        context.state.done.add(STEP_PROFILE)
-        context.state.skipped.discard(STEP_PROFILE)
-        setup_state.save_state(context.state)
-    else:
-        raise HTTPException(
-            status_code=400, detail="Give a time zone, a display name, or both.",
-        )
-    return _render(await _context(actor))
+        # The configuration write first, because it is the one that can fail:
+        # a request for both halves must not rename you and *then* answer with
+        # the failure of the other, which is a committed write reported as a
+        # failure and a form primed for a retry that can only conflict with it.
+        applied: dict[str, Any] = {}
+        if timezone:
+            applied = _write(
+                context,
+                choices=SetupChoices(timezone=timezone),
+                portable_paths=("timezone",),
+            )
+
+        if display_name is not None:
+            if not actor.account_id:  # pragma: no cover - require_account checked
+                raise HTTPException(status_code=403, detail="No account to rename")
+            account = await db.get_account(actor.account_id)
+            if account is None:  # pragma: no cover - resolved a moment ago
+                raise HTTPException(status_code=404, detail="Account not found")
+            await db.update_actor_profile(
+                account["actor_id"], display_name=(display_name.strip() or None),
+            )
+
+        _record(context, step=STEP_PROFILE, applied=applied)
+        return _render(await _context(actor))
 
 
 @router.put("/api/setup/channels", response_model=SetupStateOut)
@@ -711,19 +817,37 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_acco
     given a token — and the token itself never leaves ``config.local.yaml``.
     Both are restart-only, so the checklist reports the restart as pending
     until it happens.
+
+    PATCH-shaped: the allow-list is written only when it is given, so setting
+    a token does not clear the people already paired with the bot.
     """
-    context = await _context(actor)
-    choices = SetupChoices(
-        telegram_bot_token=req.telegram_bot_token.strip(),
-        telegram_allowed_users=list(req.telegram_allowed_users or []),
-    )
-    _apply(
-        context, step=STEP_CHANNELS, choices=choices,
-        machine_paths=("telegram.enabled",),
-        secret_paths=("telegram.bot_token", "telegram.allowed_users"),
-    )
-    logger.info("Setup: a Telegram bot token was stored by account %s", actor.account_id)
-    return _render(await _context(actor))
+    token = (req.telegram_bot_token or "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail="A Telegram bot token is required here; skip the step instead.",
+        )
+
+    async with _state_lock:
+        context = await _context(actor)
+        allowed = req.telegram_allowed_users
+        choices = SetupChoices(
+            telegram_bot_token=token,
+            telegram_allowed_users=list(allowed or []),
+        )
+        secret_paths = ("telegram.bot_token",)
+        if allowed is not None:
+            secret_paths += ("telegram.allowed_users",)
+        applied = _write(
+            context, choices=choices,
+            machine_paths=("telegram.enabled",),
+            secret_paths=secret_paths,
+        )
+        _record(context, step=STEP_CHANNELS, applied=applied)
+        logger.info(
+            "Setup: a Telegram bot token was stored by account %s", actor.account_id,
+        )
+        return _render(await _context(actor))
 
 
 @router.put("/api/setup/automation", response_model=SetupStateOut)
@@ -734,44 +858,76 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
     on them and adds nothing, because whether an install is a personal or a
     worker one is a wizard answer no running instance records — and a
     checklist step should not be rewriting a file an operator may have edited.
-    """
-    context = await _context(actor)
-    _require_writable(context.config)
-    wanted = {c.strip() for c in req.crons if c.strip()}
 
-    outcome = set_optional_crons(Path(context.config.workspace), wanted)
-    if outcome.status == "unreadable":
-        raise HTTPException(
-            status_code=409,
-            detail=f"{outcome.path} could not be read ({outcome.detail}); nothing "
-                   "was changed.",
+    PATCH-shaped throughout. Every field is optional and an omitted one is
+    left exactly as it is: re-entering this step to turn one cron on must not
+    switch off the sync sources somebody configured on another screen.
+    """
+    async with _state_lock:
+        context = await _context(actor)
+        _require_writable(context.config)
+        live = context.config.sync
+
+        # Omitted means untouched, so each toggle starts from what the instance
+        # currently says rather than from a default.
+        choices = SetupChoices(
+            github_sync=live.github.enabled if req.github is None else req.github,
+            gmail_sync=live.gmail.enabled if req.gmail is None else req.gmail,
+            gmail_accounts=(
+                list(live.gmail.accounts) if req.gmail_accounts is None
+                else [a.strip() for a in req.gmail_accounts if a.strip()]
+            ),
+            telegram_sync=(
+                live.telegram.enabled if req.telegram is None else req.telegram
+            ),
+            telegram_api_id=int(
+                (live.telegram.api_id if req.telegram_api_id is None
+                 else req.telegram_api_id) or 0
+            ),
+            telegram_api_hash=(
+                (live.telegram.api_hash if req.telegram_api_hash is None
+                 else req.telegram_api_hash) or ""
+            ).strip(),
         )
 
-    choices = SetupChoices(
-        github_sync=req.github,
-        gmail_sync=req.gmail,
-        gmail_accounts=[a.strip() for a in req.gmail_accounts if a.strip()],
-        telegram_sync=req.telegram,
-        telegram_api_id=int(req.telegram_api_id or 0),
-        telegram_api_hash=(req.telegram_api_hash or "").strip(),
-    )
-    _apply(
-        context, step=STEP_AUTOMATION, choices=choices,
-        machine_paths=("sync.gmail.accounts",),
-        portable_paths=(
-            "sync.github.enabled",
-            "sync.github_events.enabled",
-            "sync.gmail.enabled",
-            "sync.telegram.enabled",
-        ),
-        secret_paths=("sync.telegram.api_id", "sync.telegram.api_hash"),
-    )
+        # Only the paths this request actually names are written. Taking the
+        # live value for an omitted field and writing *that* would be a no-op
+        # in meaning and a change in the file — a diff in a git-tracked
+        # settings file for a question nobody was asked.
+        secret_paths: tuple[str, ...] = ()
+        if req.telegram_api_id is not None or req.telegram_api_hash is not None:
+            secret_paths = ("sync.telegram.api_id", "sync.telegram.api_hash")
+        machine_paths: tuple[str, ...] = ()
+        if req.gmail_accounts is not None:
+            machine_paths = ("sync.gmail.accounts",)
+        portable_paths: tuple[str, ...] = ()
+        if req.github is not None:
+            portable_paths += ("sync.github.enabled", "sync.github_events.enabled")
+        if req.gmail is not None:
+            portable_paths += ("sync.gmail.enabled",)
+        if req.telegram is not None:
+            portable_paths += ("sync.telegram.enabled",)
 
-    logger.info(
-        "Setup: automation set by account %s (crons on: %s)",
-        actor.account_id, ", ".join(sorted(wanted)) or "none",
-    )
-    return _render(await _context(actor))
+        # The fallible writes first; the cron file is published last, because
+        # it is the target there is no way back from.
+        applied = _write(
+            context, choices=choices,
+            machine_paths=machine_paths,
+            portable_paths=portable_paths,
+            secret_paths=secret_paths,
+        )
+
+        debts: tuple[str, ...] = ()
+        if req.crons is not None:
+            wanted = {c.strip() for c in req.crons if c.strip()}
+            debts = await _apply_cron_toggles(context, wanted)
+            logger.info(
+                "Setup: automation set by account %s (crons on: %s)",
+                actor.account_id, ", ".join(sorted(wanted)) or "none",
+            )
+
+        _record(context, step=STEP_AUTOMATION, applied=applied, debts=debts)
+        return _render(await _context(actor))
 
 
 @router.post("/api/setup/steps/{step_id}/skip", response_model=SetupStateOut)
