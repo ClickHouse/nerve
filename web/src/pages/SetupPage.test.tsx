@@ -545,6 +545,38 @@ describe('signing out', () => {
     expect(useSetupStore.getState().state).toBeNull();
   });
 
+  it('does not let a save started before it overwrite the next person', async () => {
+    let answer: (v: unknown) => void = () => {};
+    api.setupProvider.mockReturnValue(new Promise((r) => { answer = r; }));
+    const saving = useSetupStore.getState().save(
+      'provider', () => api.setupProvider({ anthropic_api_key: 'alice-key' }),
+    );
+
+    act(() => { useAuthStore.getState().logout(); });
+    // Bob signs in and his own checklist lands.
+    const bobs = state({ finished: true });
+    act(() => { useSetupStore.setState({ state: bobs, busy: 'channels' }); });
+
+    await act(async () => { answer(state({ finished: false })); await saving; });
+
+    expect(useSetupStore.getState().state).toBe(bobs);
+    expect(useSetupStore.getState().busy).toBe('channels');
+  });
+
+  it('does not let a skip started before it overwrite the next person', async () => {
+    let answer: (v: unknown) => void = () => {};
+    api.setupSkip.mockReturnValue(new Promise((r) => { answer = r; }));
+    const skipping = useSetupStore.getState().skip('channels', true);
+
+    act(() => { useAuthStore.getState().logout(); });
+    const bobs = state({ finished: true });
+    act(() => { useSetupStore.setState({ state: bobs, busy: null }); });
+
+    await act(async () => { answer(state({ finished: false })); await skipping; });
+
+    expect(useSetupStore.getState().state).toBe(bobs);
+  });
+
   it('does not let a read started before it repopulate the store', async () => {
     let answer: (v: unknown) => void = () => {};
     api.setupState.mockReturnValue(new Promise((r) => { answer = r; }));
