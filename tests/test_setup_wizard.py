@@ -598,6 +598,88 @@ class TestClaimingEndsTheSessionsBeforeIt:
 
 
 # --------------------------------------------------------------------------- #
+#  Nothing but the claim, while nobody has claimed it                          #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestAVisitorCanOnlyClaim:
+    """Rule one of the cutover.
+
+    A passwordless install mints a real session for any password, so
+    `require_account` admits the very visitor the setup token exists to keep
+    out. Every write except the claim therefore has to refuse until the
+    instance has been claimed — otherwise "account first" means only that the
+    account is first among the things a stranger may do.
+    """
+
+    MUTATIONS = [
+        ("put", "/api/setup/provider", {"anthropic_api_key": _ANTHROPIC_KEY}),
+        ("put", "/api/setup/profile", {"timezone": "Europe/Berlin"}),
+        ("put", "/api/setup/profile", {"display_name": "Mallory"}),
+        ("put", "/api/setup/channels", {"telegram_bot_token": _TELEGRAM_TOKEN}),
+        ("put", "/api/setup/automation", {"crons": ["inbox-processor"]}),
+        ("post", "/api/setup/steps/channels/skip", None),
+        ("post", "/api/setup/steps/channels/unskip", None),
+        ("post", "/api/system/restart", None),
+    ]
+
+    @pytest.mark.parametrize("method,path,body", MUTATIONS)
+    async def test_a_visitor_session_writes_nothing(
+        self, install, method, path, body,
+    ):
+        before = {
+            p: p.read_text(encoding="utf-8")
+            for p in (
+                install.config_local, install.config_yaml,
+                install.settings, install.system_crons,
+            )
+        }
+        async with _client(install.app, token=install.session_token()) as http:
+            call = getattr(http, method)
+            response = await (call(path, json=body) if body is not None else call(path))
+
+        assert response.status_code == 409, (path, response.text)
+        assert "/api/setup/claim" in response.json()["detail"]
+        for path_on_disk, text in before.items():
+            assert path_on_disk.read_text(encoding="utf-8") == text, path_on_disk
+        assert setup_state.load_state().done == set()
+        assert setup_state.load_state().skipped == set()
+
+    async def test_reading_the_checklist_is_still_allowed(self, install):
+        """The wizard has to render for the person about to claim it."""
+        async with _client(install.app, token=install.session_token()) as http:
+            response = await http.get("/api/setup")
+        assert response.status_code == 200
+        assert response.json()["setup_pending"] is True
+
+    async def test_the_restart_a_visitor_asked_for_never_started(
+        self, install, monkeypatch,
+    ):
+        calls = []
+        monkeypatch.setattr(
+            setup_routes.daemon, "restart_daemon",
+            lambda *a, **k: calls.append(k),
+        )
+        monkeypatch.setattr(setup_routes, "_restart_requested", False)
+        async with _client(install.app, token=install.session_token()) as http:
+            response = await http.post("/api/system/restart")
+        assert response.status_code == 409
+        assert calls == []
+
+    async def test_everything_works_once_it_has_been_claimed(self, claimed):
+        """The refusal is about the instance's state, not about the endpoints:
+        every one of them works the moment step one is done."""
+        async with _http(claimed) as http:
+            for method, path, body in self.MUTATIONS[:-1]:
+                call = getattr(http, method)
+                response = await (
+                    call(path, json=body) if body is not None else call(path)
+                )
+                assert response.status_code == 200, (path, response.text)
+
+
+# --------------------------------------------------------------------------- #
 #  Requests already in flight when the claim commits                           #
 # --------------------------------------------------------------------------- #
 

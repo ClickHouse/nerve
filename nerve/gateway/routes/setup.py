@@ -514,6 +514,28 @@ def _require_writable(config) -> Path:
     return Path(config.config_dir)
 
 
+# Rule one of the claim cutover: while nobody has claimed the instance, the
+# only write anybody may perform is the claim itself.
+#
+# `require_account` is not a boundary here. A passwordless install mints a real
+# session for any password, so every one of these endpoints is reachable by the
+# visitor the setup token exists to keep out — and "account first" means the
+# account comes first, not that it comes first among the steps a stranger may
+# take.
+_UNCLAIMED_REFUSED = (
+    "This instance has not been claimed yet, so it accepts no changes but the "
+    "claim itself: anyone who can reach it is signed in as the owner, and a "
+    "setting written now would have been written by anybody. Finish step one "
+    "(POST /api/setup/claim) first."
+)
+
+
+def _require_claimed(context: _Context) -> None:
+    """Refuse every mutation but the claim while the instance is unclaimed."""
+    if context.unclaimed:
+        raise HTTPException(status_code=409, detail=_UNCLAIMED_REFUSED)
+
+
 def _provider_detail(config) -> str:
     """What the instance is talking to a model with, if anything."""
     if config.provider.type == "bedrock":
@@ -878,6 +900,7 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_acco
 
     async with _loop_lock("state"):
         context = await _context(actor)
+        _require_claimed(context)
         applied = _write(
             context,
             choices=SetupChoices(anthropic_api_key=anthropic, openai_api_key=openai),
@@ -918,6 +941,7 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
 
     async with _loop_lock("state"):
         context = await _context(actor)
+        _require_claimed(context)
         db = get_deps().db
 
         # Everything that can be discovered before writing, first: whether the
@@ -985,6 +1009,7 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_acco
 
     async with _loop_lock("state"):
         context = await _context(actor)
+        _require_claimed(context)
         allowed = req.telegram_allowed_users
         choices = SetupChoices(
             telegram_bot_token=token,
@@ -1020,6 +1045,7 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
     """
     async with _loop_lock("state"):
         context = await _context(actor)
+        _require_claimed(context)
         _require_writable(context.config)
         live = context.config.sync
 
@@ -1117,6 +1143,7 @@ async def skip_step(step_id: str, actor: Actor = Depends(require_account)):
         )
     async with _loop_lock("state"):
         context = await _context(actor)
+        _require_claimed(context)
         context.state.skipped.add(step_id)
         context.state.done.discard(step_id)
         _save_or_refuse(context)
@@ -1130,6 +1157,7 @@ async def unskip_step(step_id: str, actor: Actor = Depends(require_account)):
         raise HTTPException(status_code=400, detail=f"Unknown setup step: {step_id}")
     async with _loop_lock("state"):
         context = await _context(actor)
+        _require_claimed(context)
         context.state.skipped.discard(step_id)
         _save_or_refuse(context)
         return _render(await _context(actor))
@@ -1167,6 +1195,11 @@ async def restart_system(actor: Actor = Depends(require_account)):
     signals anything, which is what gets this response onto the wire first.
     """
     config = get_config()
+    if await instance_is_unclaimed(get_deps().db, config):
+        # Restarting is not a configuration write, but it is an action, and
+        # while the instance admits everybody it is an action anybody can take
+        # — including over and over. Step one first.
+        raise HTTPException(status_code=409, detail=_UNCLAIMED_REFUSED)
     config_dir = Path(config.config_dir) if config.config_dir else paths.nerve_home()
     # This process *is* the daemon being replaced. Reading the pid file would
     # be answering the same question less reliably.
