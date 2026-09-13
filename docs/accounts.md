@@ -60,17 +60,19 @@ the gateway to other users or networks.
 ### Claiming the first account
 
 A new passwordless installation is unclaimed. Use `/setup` to set the first
-account's username, display name, and password in one operation. Remote claims
-require the setup token printed by the server. Loopback requests are exempt
-unless `auth.setup_token_required` is enabled.
+account's username, display name, and password in one operation. Until then,
+`POST /api/setup/claim` is the only permitted write; other setup, account, and
+restart mutations return `409`.
+
+Remote claims require the setup token printed by the server. Loopback requests
+are exempt unless `auth.setup_token_required` is enabled, but a tokenless claim
+must still come from a page served by the same Nerve instance.
 
 Claiming increments the account's session epoch. Sessions issued while the
 installation was passwordless are invalidated, and their open WebSockets are
 closed. The claim response contains the replacement token.
 
-While the installation is unclaimed, the normal password-change endpoint
-returns `409`; use the claim endpoint instead. See
-[Setup](setup.md#claiming-an-instance-from-a-browser).
+See [Setup](setup.md#claiming-an-instance-from-a-browser).
 
 Passwords must be non-empty and no longer than 72 UTF-8 bytes. Nerve stores
 passwords as bcrypt hashes. Unknown usernames and incorrect passwords return the

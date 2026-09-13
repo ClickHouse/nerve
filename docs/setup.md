@@ -256,10 +256,36 @@ Two ways to prove you are allowed to:
   does **not** print it: that report is also relayed by the Telegram `/doctor`
   command, and a live credential does not belong in a chat log.
 
-Nothing else counts. The peer address comes from the socket, and **no header is
-ever read** — not `X-Forwarded-For`, not `Forwarded`. A caller-supplied header
-that can turn a remote request into a local one defeats the whole guard, and
-Nerve has no forwarding-header handling anywhere.
+Nothing else counts *for locality*. The peer address comes from the socket, and
+**no header is ever read** to decide it — not `X-Forwarded-For`, not
+`Forwarded`. A caller-supplied header that can turn a remote request into a
+local one defeats the whole guard, and Nerve has no forwarding-header handling
+anywhere.
+
+**A tokenless claim must also be same-origin.** Loopback says the caller is on
+this machine; it does not say who wrote the page doing the asking. A browser
+there runs whatever site its owner visited, and Nerve answers
+`Access-Control-Allow-Origin: *`, so without this a page on
+`https://evil.example` could post to `http://127.0.0.1:8900` and choose the
+username and password of an unclaimed instance — locking its owner out of their
+own machine. So the exemption also requires:
+
+- `Origin`, when the browser sends one, to be this instance;
+- `Sec-Fetch-Site` to be `same-origin` or `none`;
+- `Host` to name an address this instance answers on, which is what stops DNS
+  rebinding: a name the attacker controls that resolves to loopback is
+  same-origin with *itself*, and only the `Host` header gives it away.
+
+Anything else — a hostile origin, a rebound name, a header that cannot be read
+— simply requires the setup token, which is a stronger statement than any
+header makes: whoever holds it read it off this machine's own log. A request
+with no `Origin` and no `Sec-Fetch-Site` at all is not a page (`curl` on the
+machine), and the peer address is the whole story for it.
+
+The wildcard CORS policy is fine for the rest of the API, which authenticates
+on a bearer token that a cross-origin page can neither obtain nor attach. The
+claim is the one endpoint that deliberately accepts no credential, which is
+exactly why it needs this instead.
 
 Claiming is also the only way to set that first password. `PUT
 /api/accounts/me/password` needs no current password on an account that has
