@@ -1066,6 +1066,36 @@ class TestOneMutationAtATime:
 
 
 @pytest.mark.asyncio
+class TestReadingAndWritingDoNotRaceEachOther:
+    """Reading the checklist can write: the first read after a restart retires
+    what the previous process left behind. That write has to be inside the same
+    lock the steps take, or it lands on top of one."""
+
+    async def test_a_read_racing_every_step_loses_nothing(self, claimed):
+        async with _http(claimed) as http:
+            await http.put("/api/setup/provider", json={"anthropic_api_key": _ANTHROPIC_KEY})
+        claimed.restarted(anthropic_api_key=_ANTHROPIC_KEY)
+
+        async with _http(claimed) as http:
+            results = await asyncio.gather(
+                http.get("/api/setup"),
+                http.post("/api/setup/steps/channels/skip"),
+                http.get("/api/setup"),
+                http.put("/api/setup/automation", json={"crons": []}),
+                http.get("/api/setup"),
+            )
+        assert {r.status_code for r in results} == {200}
+
+        async with _http(claimed) as http:
+            final = (await http.get("/api/setup")).json()
+        assert _status_of(final, "channels") == "skipped"
+        assert _status_of(final, "automation") == "done"
+        on_disk = setup_state.load_state()
+        assert on_disk.skipped == {"channels"}
+        assert "automation" in on_disk.done
+
+
+@pytest.mark.asyncio
 class TestNothingHalfLands:
     """A step that writes to more than one place either does all of it or
     answers with an error for work it has not done."""

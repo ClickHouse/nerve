@@ -88,6 +88,9 @@ class SetupState:
     #: The generation that wrote the entries above, or ``""`` for a state that
     #: has not been written yet.
     boot: str = ""
+    #: Whether :func:`retire_transitional` dropped anything from this object
+    #: since it was loaded, so the caller knows there is something to persist.
+    retired: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -179,7 +182,7 @@ def retire_transitional(state: SetupState, transitional_done: set[str]) -> bool:
     """
     if state.boot == boot.boot_id():
         return False
-    retired = (
+    dropped = (
         bool(state.applied) or bool(state.debts)
         or bool(state.done & transitional_done)
     )
@@ -187,7 +190,8 @@ def retire_transitional(state: SetupState, transitional_done: set[str]) -> bool:
     state.debts = set()
     state.done -= transitional_done
     state.boot = boot.boot_id()
-    return retired
+    state.retired = state.retired or dropped
+    return dropped
 
 
 def save_state(state: SetupState) -> bool:

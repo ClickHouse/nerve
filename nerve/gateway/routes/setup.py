@@ -430,16 +430,20 @@ class _Context:
 
 
 async def _context(actor: Actor) -> _Context:
+    """The checklist's world, as one read.
+
+    Retires an earlier process's notes *in memory* — anything left behind
+    describes a write that has since been picked up, or undone by hand, and
+    the instance is the better witness either way. It does not persist that:
+    this runs inside ``_state_lock`` for a mutation (which saves the retired
+    state with its own change) and outside it for a plain read, and a save
+    from outside the lock is exactly the interleaving the lock exists to
+    prevent. :func:`get_setup` persists it under the lock instead.
+    """
     config = get_config()
     unclaimed = await instance_is_unclaimed(get_deps().db, config)
     state = setup_state.load_state()
-    # Anything an earlier process left behind describes a write that has since
-    # been picked up — or undone by hand — and the instance is the better
-    # witness either way. Persisted so it happens once rather than on every
-    # read, and best-effort: a state file that cannot be rewritten must not
-    # stop the checklist from being read.
-    if setup_state.retire_transitional(state, _TRANSITIONAL_STEPS):
-        setup_state.save_state(state)
+    setup_state.retire_transitional(state, _TRANSITIONAL_STEPS)
     return _Context(
         config=config,
         state=state,
@@ -602,8 +606,18 @@ async def get_setup(actor: Actor = Depends(require_account)):
 
     Authenticated. The only setup fact an anonymous caller needs is whether the
     instance is unclaimed, and ``/api/auth/status`` already carries it.
+
+    Takes the mutation lock, because reading can *write*: an earlier process's
+    notes are retired on the first read after a restart, and persisting that
+    from outside the lock would race a step that is saving its own change.
     """
-    return _render(await _context(actor))
+    async with _state_lock:
+        context = await _context(actor)
+        if context.state.boot == boot.boot_id() and context.state.retired:
+            # Best-effort: a state file that cannot be rewritten must not stop
+            # the checklist from being read.
+            setup_state.save_state(context.state)
+        return _render(context)
 
 
 def _write(
