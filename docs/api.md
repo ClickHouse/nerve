@@ -146,8 +146,11 @@ would otherwise break them, so two concurrent calls cannot both win — there is
 no window in which two callers each disable the other's account and leave
 nobody.
 
-Disabling takes effect at the account's **next** request, not retroactively, and
-an open WebSocket keeps the identity it was accepted with until it reconnects.
+Disabling takes effect at the account's **next** request, not retroactively —
+and at an open WebSocket's next *frame*, which is re-checked against the
+account row before anything is done with it. The connection is closed rather
+than re-pointed: what it already sent stays attributed to the actor it was
+accepted with.
 
 ### Setup
 
@@ -175,8 +178,11 @@ the password it set.
 
 **Every session issued before the claim stops working.** The claim bumps the
 account's session epoch, so the tokens a passwordless install handed out are
-one epoch behind and are refused at their next request, HTTP and WebSocket
-alike; the token returned here is minted at the new epoch. See
+one epoch behind: refused at their next HTTP request, refused at a WebSocket
+handshake, and — for sockets that are *already open* — closed outright with
+`1008`, with every inbound frame re-checked against the account row in case a
+close was missed. The token returned here is minted at the new epoch, so the
+browser doing the claiming is the one session that survives. See
 [Accounts and identity](accounts.md#passwordless).
 
 One transaction does the whole claim, so a half-claimed account — named but
