@@ -189,10 +189,14 @@ One transaction does the whole claim, so a half-claimed account — named but
 still open, or secured but unreachable — never exists, and of two callers
 racing to claim a fresh install exactly one wins.
 
+A tokenless claim must also come from a page this instance served
+(`Origin` / `Sec-Fetch-Site` / `Host`); a cross-origin one needs the token.
+See [Setup](setup.md#claiming-an-instance-from-a-browser).
+
 | Response | When |
 |---|---|
 | `400` | the username is malformed or reserved, or the password is longer than bcrypt's 72 bytes |
-| `403` | the token is required and was missing or wrong — identical in both cases, and judged before anything about the instance is read |
+| `403` | the token is required and was missing or wrong — identical in both cases, and judged before anything about the instance is read. A cross-origin or rebound-host request from a loopback peer lands here too, because it needs the token |
 | `409` | the instance is not claimable: it has been claimed already, or a configured `auth.password_hash` is authenticating it |
 | `503` | no signing secret, or the gateway has not finished starting |
 
@@ -237,6 +241,11 @@ picked up).
 Each returns the whole checklist, so one round trip both writes and refreshes.
 Every one is idempotent and re-enterable, and writes only the keys its step
 owns — merged into what is on disk, never regenerating the file.
+
+**While the instance is unclaimed every one of these refuses with `409`**, as
+do `POST /api/system/restart` and the account mutations: a passwordless install
+mints a session for anybody, so the claim is the only write that crosses that
+boundary. See [Accounts and identity](accounts.md#the-claim-cutover).
 
 **These are PATCH semantics**, and the `?` above is load-bearing: an omitted
 field is left exactly as it is. A step is entered again to change one thing,

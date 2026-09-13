@@ -80,6 +80,28 @@ refuses with a `409` pointing at the claim endpoint. There is one door, and it
 is the guarded one. Once the instance has been claimed, the accounts screen is
 where passwords are changed as usual.
 
+### The claim cutover
+
+Claiming is a **cutover**, not a door that swings shut behind the last caller
+through it. Three rules, and the wizard, the account routes and the WebSocket
+endpoint all follow them:
+
+1. **While unclaimed, the only write anybody may perform is the claim.** A
+   passwordless install mints a real session for any password, so "is there a
+   session?" is not a boundary: every setup write, the restart endpoint and
+   every account mutation refuse with a `409` naming
+   `POST /api/setup/claim`. (The rest of the product stays usable — a
+   passwordless install is meant to work until somebody secures it.)
+2. **At the claim, the epoch bump is the cutover.** Anything admitted under
+   the old epoch is stale from that instant: HTTP mutations carry the epoch
+   their credential stated into their own write transaction and the row
+   refuses them if the two have diverged; WebSocket connections record the
+   epoch from the verified token — never a later read of the row — and are
+   re-checked once they enter the registry and before every frame.
+3. **Locality is not the identity of the code in the browser.** A tokenless
+   claim must also be same-origin; see
+   [Setup](setup.md#claiming-an-instance-from-a-browser).
+
 **Claiming also ends every session that came before it.** A passwordless
 install hands an ordinary account session to everybody who reaches it, and
 those tokens name the same account and have thirty days left — so securing the
