@@ -89,8 +89,36 @@ class SetupState:
         }
 
 
+def _string_set(value: Any) -> set[str]:
+    """The strings in ``value``, or an empty set if it is not a list of them."""
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    return {item for item in value if isinstance(item, str)}
+
+
+def _string_map(value: Any, *, coerce: bool = False) -> dict[str, Any]:
+    """The string-keyed entries of ``value``, or ``{}`` if it is not a mapping."""
+    if not isinstance(value, dict):
+        return {}
+    if coerce:
+        return {k: str(v) for k, v in value.items() if isinstance(k, str)}
+    return {k: v for k, v in value.items() if isinstance(k, str)}
+
+
 def load_state() -> SetupState:
-    """Read the checklist's notes. Never raises."""
+    """Read the checklist's notes. **Never raises** — every field is checked.
+
+    This file is the wizard's own scratch pad, written by the wizard and read
+    by nobody else, so anything malformed in it is either a partially written
+    file or a version that did not exist yet. Neither is a reason for
+    ``GET /api/setup`` to answer 500 until somebody deletes a file they have
+    never heard of, so an unusable field reads as absent and an unusable
+    *version* reads as an empty state.
+
+    "Never raises" was previously a claim rather than a property:
+    ``{"applied": []}`` is valid JSON, a valid object, and raised
+    ``AttributeError`` on ``.items()``.
+    """
     path = state_file()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -100,18 +128,24 @@ def load_state() -> SetupState:
         logger.warning("Setup state at %s is unreadable (%s); starting empty", path, e)
         return SetupState()
     if not isinstance(raw, dict):
+        logger.warning("Setup state at %s is not an object; starting empty", path)
         return SetupState()
+
+    version = raw.get("version")
+    if not isinstance(version, int) or version > _VERSION:
+        # Written by a newer Nerve. Its fields may mean something else, and
+        # guessing is how a downgrade corrupts the newer version's file.
+        logger.warning(
+            "Setup state at %s has version %r (this build writes %d); "
+            "starting empty", path, version, _VERSION,
+        )
+        return SetupState()
+
     return SetupState(
-        skipped={str(s) for s in raw.get("skipped") or [] if isinstance(s, str)},
-        done={str(s) for s in raw.get("done") or [] if isinstance(s, str)},
-        applied={
-            str(k): v for k, v in (raw.get("applied") or {}).items()
-            if isinstance(k, str)
-        },
-        applied_at={
-            str(k): str(v) for k, v in (raw.get("applied_at") or {}).items()
-            if isinstance(k, str)
-        },
+        skipped=_string_set(raw.get("skipped")),
+        done=_string_set(raw.get("done")),
+        applied=_string_map(raw.get("applied")),
+        applied_at=_string_map(raw.get("applied_at"), coerce=True),
     )
 
 
