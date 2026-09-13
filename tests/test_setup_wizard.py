@@ -56,6 +56,7 @@ _LOOPBACK = ("127.0.0.1", 41000)
 _REMOTE = ("203.0.113.7", 41000)     # TEST-NET-3, never routable
 _ANTHROPIC_KEY = "anthropic-key-placeholder"
 _TELEGRAM_TOKEN = "0000000000:telegram-bot-token-placeholder"
+_TELEGRAM_API_HASH = "telegram-api-hash-placeholder"
 
 
 def _legacy_token(secret: str = _SECRET) -> str:
@@ -1130,6 +1131,55 @@ class TestTheChecklist:
             )["jobs"]
         }
         assert jobs["inbox-processor"] is True
+
+    async def test_telegram_sync_and_its_credentials(self, claimed):
+        """The source the wizard accepts and the UI now offers.
+
+        Its credentials are not the bot token: the bot is how Nerve talks *as*
+        you, these are how it reads your own messages.
+        """
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/automation", json={
+                "telegram": True,
+                "telegram_api_id": 1234567,
+                "telegram_api_hash": _TELEGRAM_API_HASH,
+            })
+        assert response.status_code == 200, response.text
+        assert claimed.tracked()["sync"]["telegram"]["enabled"] is True
+        stored = claimed.secrets()["sync"]["telegram"]
+        assert stored["api_id"] == 1234567
+        assert stored["api_hash"] == _TELEGRAM_API_HASH
+        # ...and it is a secret, so it is in the private file only.
+        assert _TELEGRAM_API_HASH not in claimed.settings.read_text(encoding="utf-8")
+
+    async def test_credentials_supplied_before_the_source_is_on_are_kept(
+        self, claimed,
+    ):
+        """They used to be dropped on the floor: the builder keyed them off
+        the switch, so somebody who pasted credentials with the source still
+        off was told it saved and found nothing there."""
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/automation", json={
+                "telegram_api_id": 7654321,
+                "telegram_api_hash": _TELEGRAM_API_HASH,
+            })
+        assert response.status_code == 200, response.text
+        assert claimed.secrets()["sync"]["telegram"]["api_id"] == 7654321
+
+    async def test_one_credential_does_not_erase_the_other(self, claimed):
+        async with _http(claimed) as http:
+            await http.put("/api/setup/automation", json={
+                "telegram_api_id": 1234567,
+                "telegram_api_hash": _TELEGRAM_API_HASH,
+            })
+            await http.put("/api/setup/automation", json={
+                "telegram_api_id": 7654321,
+            })
+        stored = claimed.secrets()["sync"]["telegram"]
+        assert stored["api_id"] == 7654321
+        assert stored["api_hash"] == _TELEGRAM_API_HASH, (
+            "supplying one credential erased the other"
+        )
 
     async def test_the_automation_step_is_re_enterable(self, claimed):
         async with _http(claimed) as http:

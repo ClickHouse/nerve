@@ -534,8 +534,15 @@ def build_config_local(choices: SetupChoices) -> dict[str, Any]:
                 choices.telegram_allowed_users
             )
 
-    # Sync credentials (secrets — go in local config)
-    if choices.telegram_sync and choices.telegram_api_id:
+    # Sync credentials (secrets — go in local config).
+    #
+    # Keyed off the credential, not off the switch. Whether the source is
+    # *enabled* is a separate value in a separate layer, and dropping a
+    # credential because the switch is off means somebody who supplies one
+    # before turning the source on is told it was saved and finds nothing
+    # there. `nerve init` never collects one without the switch, so its output
+    # is unchanged — the goldens say so.
+    if choices.telegram_api_id:
         local.setdefault("sync", {})["telegram"] = {
             "api_id": choices.telegram_api_id,
             "api_hash": choices.telegram_api_hash,
