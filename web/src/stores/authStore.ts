@@ -4,6 +4,7 @@ import {
   type Account, type LoginKind,
 } from '../api/client';
 import { useActorStore } from './actorStore';
+import { useSetupStore } from './setupStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
@@ -25,6 +26,11 @@ function purgeAccountScopedState(): void {
   clearAllReads();
   // Do not let a name snapshot outlive the session that read it.
   useActorStore.getState().reset();
+  // The setup checklist too, and this one *is* about the account: its profile
+  // form holds the signed-in person's display name, so a checklist that
+  // outlived a sign-out would offer Alice's name to Bob as something he had
+  // typed — and submit it as his own on the next save.
+  useSetupStore.getState().reset();
 }
 
 /**

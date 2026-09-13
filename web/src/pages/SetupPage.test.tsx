@@ -487,6 +487,109 @@ describe('hydration', () => {
   });
 });
 
+describe('Telegram sync', () => {
+  it('is offered, hydrated, and sends only what moved', async () => {
+    api.setupState.mockResolvedValue(state({
+      values: { ...state().values, sync_telegram: false },
+    }));
+    api.setupAutomation.mockResolvedValue(state());
+    renderPage();
+    const automation = await screen.findByRole('region', { name: 'Automation' });
+
+    const toggle = within(automation).getByLabelText('Telegram') as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    await userEvent.click(toggle);
+
+    // Its credentials are not the bot token, and they only appear once the
+    // source is on.
+    await userEvent.type(
+      within(automation).getByLabelText('Telegram API id'), '1234567',
+    );
+    await userEvent.type(
+      within(automation).getByLabelText('Telegram API hash'), 'a-hash-placeholder',
+    );
+    await userEvent.click(within(automation).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.setupAutomation).toHaveBeenCalled());
+    expect(api.setupAutomation.mock.calls[0][0]).toEqual({
+      telegram: true,
+      telegram_api_id: 1234567,
+      telegram_api_hash: 'a-hash-placeholder',
+    });
+  });
+
+  it('hides the credential fields while the source is off', async () => {
+    renderPage();
+    const automation = await screen.findByRole('region', { name: 'Automation' });
+    expect(within(automation).queryByLabelText('Telegram API id')).toBeNull();
+  });
+});
+
+describe('signing out', () => {
+  it('takes the wizard state with it', async () => {
+    // Alice's checklist, with her name in the profile form.
+    api.setupState.mockResolvedValue(state({
+      values: { ...state().values, display_name: 'Alice Example' },
+    }));
+    useAuthStore.setState({
+      account: { id: 'acc-alice', username: 'alice', actor_id: 'actor-alice' },
+    });
+    renderPage();
+    const profile = await screen.findByRole('region', { name: 'Timezone and name' });
+    expect(
+      (within(profile).getByLabelText('Your display name') as HTMLInputElement).value,
+    ).toBe('Alice Example');
+
+    act(() => { useAuthStore.getState().logout(); });
+    // Nothing of hers survives for whoever signs in next.
+    expect(useSetupStore.getState().state).toBeNull();
+  });
+
+  it('does not let a read started before it repopulate the store', async () => {
+    let answer: (v: unknown) => void = () => {};
+    api.setupState.mockReturnValue(new Promise((r) => { answer = r; }));
+    const load = useSetupStore.getState().load();
+
+    act(() => { useAuthStore.getState().logout(); });
+    await act(async () => { answer(state()); await load; });
+
+    expect(useSetupStore.getState().state).toBeNull();
+  });
+});
+
+describe('a second person on the same browser', () => {
+  it('does not offer them the last person\'s name as their own', async () => {
+    // Alice fills in her name and signs out; Bob signs in and the wizard
+    // re-renders for him. The form keeps `useState`, which new props do not
+    // reset — so without remounting, Bob's form holds Alice's name and the
+    // next save submits it as *his* profile.
+    api.setupState.mockResolvedValue(state({
+      values: { ...state().values, display_name: 'Alice Example' },
+    }));
+    useAuthStore.setState({
+      account: { id: 'acc-alice', username: 'alice', actor_id: 'actor-alice' },
+    });
+    renderPage();
+    const profile = await screen.findByRole('region', { name: 'Timezone and name' });
+    expect(
+      (within(profile).getByLabelText('Your display name') as HTMLInputElement).value,
+    ).toBe('Alice Example');
+
+    act(() => {
+      useAuthStore.setState({
+        account: { id: 'acc-bob', username: 'bob', actor_id: 'actor-bob' },
+      });
+      useSetupStore.setState({
+        state: state({ values: { ...state().values, display_name: null } }),
+      });
+    });
+
+    await waitFor(() => expect(
+      (screen.getByLabelText('Your display name') as HTMLInputElement).value,
+    ).toBe(''));
+  });
+});
+
 describe('one mutation at a time', () => {
   it('disables every other control while a save is in flight', async () => {
     let release: (v: unknown) => void = () => {};

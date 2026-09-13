@@ -1124,9 +1124,14 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
         # live value for an omitted field and writing *that* would be a no-op
         # in meaning and a change in the file — a diff in a git-tracked
         # settings file for a question nobody was asked.
+        # One path per field actually supplied: writing both because one was
+        # given would erase the other, and an empty api_hash over a working
+        # one is a source that silently stops reading.
         secret_paths: tuple[str, ...] = ()
-        if req.telegram_api_id is not None or req.telegram_api_hash is not None:
-            secret_paths = ("sync.telegram.api_id", "sync.telegram.api_hash")
+        if req.telegram_api_id is not None:
+            secret_paths += ("sync.telegram.api_id",)
+        if (req.telegram_api_hash or "").strip():
+            secret_paths += ("sync.telegram.api_hash",)
         machine_paths: tuple[str, ...] = ()
         if req.gmail_accounts is not None:
             machine_paths = ("sync.gmail.accounts",)

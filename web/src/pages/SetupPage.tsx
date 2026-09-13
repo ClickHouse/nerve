@@ -283,13 +283,20 @@ function StepCard(
 
 function Checklist() {
   const state = useSetupStore((s: SetupStoreState) => s.state);
+  const accountKey = useAuthStore((s) => s.account?.id ?? 'nobody');
   if (!state) return null;
 
+  // Keyed by the account the values describe, so a different person signing
+  // in remounts the forms instead of inheriting the last one's name in a
+  // field they never typed in — the state a form keeps is `useState`, which
+  // no amount of new props resets.
   const forms: Record<string, ReactNode> = {
-    provider: <ProviderForm values={state.values} />,
-    profile: <ProfileForm values={state.values} />,
-    channels: <ChannelsForm values={state.values} />,
-    automation: <AutomationForm crons={state.crons} values={state.values} />,
+    provider: <ProviderForm key={accountKey} values={state.values} />,
+    profile: <ProfileForm key={accountKey} values={state.values} />,
+    channels: <ChannelsForm key={accountKey} values={state.values} />,
+    automation: (
+      <AutomationForm key={accountKey} crons={state.crons} values={state.values} />
+    ),
   };
 
   return (
@@ -516,10 +523,16 @@ function AutomationForm(
   const [enabled, setEnabled] = useState<string[]>(
     () => crons.filter((c) => c.enabled).map((c) => c.id),
   );
-  // Hydrated, so re-entering this step to change a cron does not submit two
+  // Hydrated, so re-entering this step to change a cron does not submit
   // switched-off sources somebody configured on another screen.
   const [github, setGithub] = useState(values.sync_github);
   const [gmail, setGmail] = useState(values.sync_gmail);
+  const [telegram, setTelegram] = useState(values.sync_telegram);
+  // Telegram's inbox needs its own API credentials (my.telegram.org), which
+  // are not the bot token: the bot is how Nerve talks *as* you, these are how
+  // it reads your own messages.
+  const [apiId, setApiId] = useState('');
+  const [apiHash, setApiHash] = useState('');
 
   const toggle = (id: string) => setEnabled((ids) => (
     ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]
@@ -533,12 +546,22 @@ function AutomationForm(
     // Only what changed: the server leaves an omitted field exactly as it is,
     // and that is the whole point of the shape.
     const body: {
-      crons?: string[]; github?: boolean; gmail?: boolean;
+      crons?: string[]; github?: boolean; gmail?: boolean; telegram?: boolean;
+      telegram_api_id?: number; telegram_api_hash?: string;
     } = {};
     if (cronsChanged) body.crons = enabled;
     if (github !== values.sync_github) body.github = github;
     if (gmail !== values.sync_gmail) body.gmail = gmail;
-    await save('automation', () => api.setupAutomation(body));
+    if (telegram !== values.sync_telegram) body.telegram = telegram;
+    // Sent whenever they were typed, whether or not the switch moved: they
+    // are what makes the source work, and re-entering the step to supply
+    // them is exactly what somebody does after turning it on.
+    if (apiId.trim()) body.telegram_api_id = Number(apiId.trim());
+    if (apiHash.trim()) body.telegram_api_hash = apiHash.trim();
+    if (await save('automation', () => api.setupAutomation(body))) {
+      setApiId('');
+      setApiHash('');
+    }
   };
 
   return (
@@ -577,6 +600,37 @@ function AutomationForm(
         label="Gmail"
         labelSize="sm"
       />
+      <Checkbox
+        checked={telegram}
+        onChange={(e) => setTelegram(e.target.checked)}
+        label="Telegram"
+        labelSize="sm"
+      />
+      {telegram && (
+        <div className="flex flex-col gap-2 pl-5">
+          <p className="text-2xs text-text-dim">
+            Reading your Telegram messages needs its own API credentials from{' '}
+            <code>my.telegram.org</code> — not the bot token above. Leave these
+            blank if they are already configured.
+          </p>
+          <TextField
+            value={apiId}
+            onChange={(e) => setApiId(e.target.value)}
+            placeholder="API id"
+            aria-label="Telegram API id"
+            inputMode="numeric"
+            autoComplete="off"
+          />
+          <TextField
+            type="password"
+            value={apiHash}
+            onChange={(e) => setApiHash(e.target.value)}
+            placeholder="API hash"
+            aria-label="Telegram API hash"
+            autoComplete="off"
+          />
+        </div>
+      )}
       <div>
         <Button type="submit" variant="primary" size="sm" disabled={busy !== null}>
           Save

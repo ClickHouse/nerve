@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { api, setToken, type SetupState } from '../api/client';
 import { errorDetail } from './accountStore';
 import { useActorStore } from './actorStore';
-import { useAuthStore } from './authStore';
+import { bindSender, useAuthStore } from './authStore';
 
 /**
  * The first-run checklist.
@@ -81,9 +81,16 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   }),
 
   load: async () => {
+    // Stamped with the session that asked. A read started before a sign-out
+    // and answered after it describes somebody else's instance state — and
+    // would repopulate a store that was deliberately emptied.
+    const asked = bindSender().stillCurrent;
     try {
-      set({ state: await api.setupState(), loading: false, error: null });
+      const state = await api.setupState();
+      if (!asked()) return;
+      set({ state, loading: false, error: null });
     } catch (e) {
+      if (!asked()) return;
       set({ loading: false, error: errorDetail(e, 'Could not read the setup state') });
     }
   },
