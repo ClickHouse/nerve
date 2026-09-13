@@ -82,6 +82,23 @@ Before the gateway has finished starting the answer is the fail-closed one
 (`login: "username_password"`, `auth_required: true`), which asks rather than
 assumes.
 
+#### `GET /api/auth/me`
+Who this request is. Requires a session.
+
+```json
+Response: {
+  "actor_id": "…", "account_id": "…", "username": "alice",
+  "display_name": "Alice", "kind": "human"
+}
+```
+
+Built from the actor the request already resolved to. It carries no credential,
+no credential source and no token, and `kind` is `system` for the credentials
+the instance mints for itself (which have no `account_id` and no username).
+
+Use it for "signed in as", and to label your own message before the server's
+copy of it comes back.
+
 ### Accounts
 
 Every account may manage accounts — there are no roles — so these need only a
@@ -131,6 +148,95 @@ nobody.
 
 Disabling takes effect at the account's **next** request, not retroactively, and
 an open WebSocket keeps the identity it was accepted with until it reconnects.
+
+### Setup
+
+The first-run wizard. `GET /api/setup` and every write below need a session
+like any other endpoint; **`POST /api/setup/claim` does not**, and is the only
+unauthenticated write in the product. See
+[Setup](setup.md#claiming-an-instance-from-a-browser) for why, and for where
+the setup token comes from.
+
+#### `POST /api/setup/claim`
+Name and secure the account an unclaimed install already has.
+
+```json
+Request:  { "username": "alice", "password": "…",
+            "display_name": "Alice", "setup_token": "…" }
+Response: { "token": "eyJ…", "account_id": "…", "actor_id": "…",
+            "username": "alice", "display_name": "Alice" }
+```
+
+`setup_token` is required only when the request did not come from the machine
+itself — a loopback socket peer needs none, unless
+`auth.setup_token_required` is on. The response's `token` is an ordinary
+session token for the account just claimed, so the browser is signed in with
+the password it set.
+
+One transaction does the whole claim, so a half-claimed account — named but
+still open, or secured but unreachable — never exists, and of two callers
+racing to claim a fresh install exactly one wins.
+
+| Response | When |
+|---|---|
+| `400` | the username is malformed or reserved, or the password is longer than bcrypt's 72 bytes |
+| `403` | the token is required and was missing or wrong — identical in both cases, and judged before anything about the instance is read |
+| `409` | the instance is not claimable: it has been claimed already, or a configured `auth.password_hash` is authenticating it |
+| `503` | no signing secret, or the gateway has not finished starting |
+
+#### `GET /api/setup`
+The checklist, in one read.
+
+```json
+Response: {
+  "setup_pending": false, "lockdown": false, "writable": true,
+  "read_only_reason": null,
+  "restart_pending": true, "restart_pending_paths": ["timezone"],
+  "finished": false,
+  "steps": [{ "id": "account", "title": "Claim this instance",
+              "status": "done", "required": true, "can_skip": false,
+              "detail": "The account has a password." }],
+  "crons": [{ "id": "inbox-processor", "name": "Inbox Processor",
+              "description": "…", "enabled": false }]
+}
+```
+
+A step's `status` is `done`, `skipped` or `pending`, and is *derived* from
+configuration wherever it can be — so an install set up at the terminal shows
+the same list. `restart_pending_paths` compares what the wizard wrote against
+what this process is running, so it clears itself at the restart.
+
+| Endpoint | Does |
+|---|---|
+| `PUT /api/setup/provider` | `{anthropic_api_key?, openai_api_key?}` → `config.local.yaml` |
+| `PUT /api/setup/profile` | `{timezone?, display_name?}` — the zone to the tracked settings, the name onto your actor |
+| `PUT /api/setup/channels` | `{telegram_bot_token, telegram_allowed_users?}` |
+| `PUT /api/setup/automation` | `{crons[], github?, gmail?, gmail_accounts[], telegram?, telegram_api_id?, telegram_api_hash?}` |
+| `POST /api/setup/steps/{id}/skip` | remember that a step was declined |
+| `POST /api/setup/steps/{id}/unskip` | put it back on the list |
+
+Each returns the whole checklist, so one round trip both writes and refreshes.
+Every one is idempotent and re-enterable, and writes only the keys its step
+owns — merged into what is on disk, never regenerating the file.
+
+| Response | When |
+|---|---|
+| `400` | nothing to set, a time zone this machine does not know, or an unknown/unskippable step |
+| `409` | the instance is in lockdown, has no machine-local configuration directory, or its tracked settings file is not usable |
+| `500` | the file could not be written owner-only — nothing was written |
+
+#### `POST /api/system/restart`
+Restart the daemon: what `nerve restart` does, asked for over HTTP. Requires a
+session. Allowed under lockdown, because a restart writes no configuration.
+
+```json
+Response: { "restarting": true, "method": "helper", "message": "…" }
+```
+
+The work happens after the response is sent, so the answer is on the wire
+before the process is signalled. Sessions survive it — the signing secret is
+pinned and persisted, and nothing in the wizard rotates it — so a browser that
+polls `/api/auth/status` until it answers comes back already signed in.
 
 ### Actors
 
