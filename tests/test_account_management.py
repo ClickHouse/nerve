@@ -71,6 +71,15 @@ class _Install:
             self.owner_id, username=username, credential=hash_password(_PASSWORD),
         )
 
+    async def set_credential(
+        self, *, credential_source: str, credential: str | None = None,
+    ) -> None:
+        """Seed a credential shape without a fixture-only production method."""
+        await self.db._write(
+            "UPDATE accounts SET credential_source = ?, credential = ? WHERE id = ?",
+            (credential_source, credential, self.owner_id),
+        )
+
 
 @pytest.fixture(autouse=True)
 def _fast_failures(monkeypatch):
@@ -502,9 +511,7 @@ class TestOwnPassword:
         set_config(NerveConfig(auth=AuthConfig(
             jwt_secret=_SECRET, password_hash=configured,
         )))
-        await install.db.set_account_credential(
-            install.owner_id, credential_source="config",
-        )
+        await install.set_credential(credential_source="config")
         async with _client(install.app) as client:
             assert (await client.put(
                 "/api/accounts/me/password", json={"new_password": "another-one"},
@@ -554,9 +561,7 @@ class TestOwnPassword:
         import bcrypt
 
         empty = bcrypt.hashpw(b"", bcrypt.gensalt(rounds=4)).decode()
-        await install.db.set_account_credential(
-            install.owner_id, credential_source="local", credential=empty,
-        )
+        await install.set_credential(credential_source="local", credential=empty)
         async with _client(install.app) as client:
             omitted = await client.put(
                 "/api/accounts/me/password", json={"new_password": "a-new-one"},

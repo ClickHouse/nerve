@@ -441,8 +441,8 @@ WebSocket handshake and the MCP endpoint — is refused, locked or not.
 
 ## Backups
 
-`nerve.db` is part of every backup, so a restore brings back the same actor,
-account, tenant and agent ids and the same signing secret.
+`nerve.db` is part of every backup, so a restore brings back the same actor and
+account IDs and the same signing secret.
 
 A `--no-secrets` bundle carries **no credential at all**, which takes three
 things beyond omitting the obvious files:

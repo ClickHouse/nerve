@@ -441,18 +441,18 @@ def _plant_accounts(db_path: Path) -> None:
             "  credential_source TEXT NOT NULL"
             "    CHECK (credential_source IN ('config', 'local', 'none')),"
             "  credential TEXT, enabled INTEGER NOT NULL DEFAULT 1,"
-            "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, disabled_at TEXT,"
+            "  created_at TEXT NOT NULL,"
             "  CHECK ((credential_source = 'local' AND credential IS NOT NULL)"
             "         OR (credential_source IN ('config', 'none') AND credential IS NULL)))"
         )
         conn.execute(
             "INSERT INTO accounts VALUES "
-            "('acc-1', 'actor-1', 'alice', 'local', ?, 1, 't', 't', NULL)",
+            "('acc-1', 'actor-1', 'alice', 'local', ?, 1, 't')",
             (_PLANTED_HASH,),
         )
         conn.execute(
             "INSERT INTO accounts VALUES "
-            "('acc-2', 'actor-2', 'bob', 'none', NULL, 1, 't', 't', NULL)"
+            "('acc-2', 'actor-2', 'bob', 'none', NULL, 1, 't')"
         )
         conn.commit()
     finally:
@@ -1594,7 +1594,7 @@ def test_a_transitional_config_account_restores_as_passwordless(
         database = Database(path)
         await database.connect()
         try:
-            await database.bootstrap_local_identity(credential_source="config")
+            await database._bootstrap_first_account(credential_source="config")
         finally:
             await database.close()
 

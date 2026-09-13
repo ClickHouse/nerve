@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from nerve.identity import ACTOR_KINDS
-
 BOOTSTRAP_CREDENTIAL_SOURCES = ("config", "none")
 CREDENTIAL_SOURCES = ("config", "local", "none")
 JWT_SECRET_NAME = "jwt_secret"
@@ -113,10 +111,6 @@ def login_state_from(accounts: list[dict]) -> LoginState:
     )
 
 
-def new_id() -> str:
-    """A fresh identity id — UUID4, the shape a control plane would issue."""
-    return str(uuid.uuid4())
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -143,26 +137,6 @@ class AccountStore:
 
     # -- actor_refs ----------------------------------------------------------
 
-    async def create_actor_ref(
-        self,
-        *,
-        kind: str,
-        display_name: str | None = None,
-        email: str | None = None,
-        actor_id: str | None = None,
-    ) -> dict:
-        if kind not in ACTOR_KINDS:
-            raise ValueError(f"actor kind must be one of {ACTOR_KINDS}, got {kind!r}")
-        actor_id = actor_id or new_id()
-        now = _now()
-        await self._write(
-            """INSERT INTO actor_refs
-                   (id, kind, display_name, email, profile_version, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 1, ?, ?)""",
-            (actor_id, kind, display_name, email, now, now),
-        )
-        return await self.get_actor_ref(actor_id)  # type: ignore[return-value]
-
     async def get_actor_ref(self, actor_id: str) -> dict | None:
         async with self.db.execute(
             "SELECT * FROM actor_refs WHERE id = ?", (actor_id,)
@@ -184,90 +158,17 @@ class AccountStore:
         actor_id: str,
         *,
         display_name: str | None | object = _UNSET,
-        email: str | None | object = _UNSET,
     ) -> dict | None:
-        """Change presentation fields, bumping ``profile_version``.
-
-        Renaming rewrites nothing else: authorship references the id, so the
-        history keeps pointing at the same actor under the new name.
-        """
-        sets: list[str] = []
-        params: list = []
-        if display_name is not _UNSET:
-            sets.append("display_name = ?")
-            params.append(display_name)
-        if email is not _UNSET:
-            sets.append("email = ?")
-            params.append(email)
-        if not sets:
+        """Rename an actor without rewriting authorship references."""
+        if display_name is _UNSET:
             return await self.get_actor_ref(actor_id)
-        sets.append("profile_version = profile_version + 1")
-        sets.append("updated_at = ?")
-        params.extend([_now(), actor_id])
         await self._write(
-            f"UPDATE actor_refs SET {', '.join(sets)} WHERE id = ?", tuple(params),
+            "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+            (display_name, actor_id),
         )
         return await self.get_actor_ref(actor_id)
 
     # -- accounts ------------------------------------------------------------
-
-    async def create_account(
-        self,
-        *,
-        actor_id: str,
-        credential_source: str,
-        credential: str | None = None,
-        username: str | None = None,
-        enabled: bool = True,
-        account_id: str | None = None,
-    ) -> dict:
-        """Insert an account for an existing human actor_ref.
-
-        Enforces the identity invariants the schema also guards, with clearer
-        errors: the actor must be human (never the system principal), a
-        ``local`` account carries a credential and a ``config``/``none`` one
-        does not, and ``disabled_at`` is set iff the account is disabled. A
-        username, when given, goes through :func:`normalise_username` — every
-        username that reaches the table does, whichever method put it there.
-
-        The low-level primitive: it creates the account row and nothing else.
-        Adding a *person* is :meth:`create_managed_account`, which also creates
-        the actor in the same transaction and applies the account-management
-        guards.
-        """
-        if credential_source not in CREDENTIAL_SOURCES:
-            raise ValueError(
-                f"credential_source must be one of {CREDENTIAL_SOURCES}, "
-                f"got {credential_source!r}"
-            )
-        if credential_source == "local" and not credential:
-            raise ValueError("credential is required when credential_source='local'")
-        if credential_source in ("config", "none") and credential is not None:
-            raise ValueError(
-                f"credential must be None when credential_source={credential_source!r}"
-            )
-        # A login belongs to a human. An unknown actor_id is left to the foreign
-        # key / trigger (IntegrityError); a known non-human is rejected here.
-        actor = await self.get_actor_ref(actor_id)
-        if actor is not None and actor["kind"] != "human":
-            raise ValueError(
-                "account actor_id must reference a human actor_ref, "
-                f"not a {actor['kind']!r} principal"
-            )
-        if username is not None:
-            username = normalise_username(username)
-        account_id = account_id or new_id()
-        now = _now()
-        disabled_at = None if enabled else now
-        await self._write(
-            """INSERT INTO accounts
-                   (id, actor_id, username, credential_source, credential, enabled,
-                    created_at, updated_at, disabled_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (account_id, actor_id, username, credential_source, credential,
-             1 if enabled else 0, now, now, disabled_at),
-        )
-        return await self.get_account(account_id)  # type: ignore[return-value]
 
     async def get_account(self, account_id: str) -> dict | None:
         async with self.db.execute(
@@ -390,26 +291,6 @@ class AccountStore:
             (credential_source, account_id),
         )
 
-    async def set_account_username(self, account_id: str, username: str | None) -> dict | None:
-        """Set the login identifier, validating it.
-
-        ``None`` clears it. Anything else goes through
-        :func:`normalise_username` (character set, length, reserved names) and
-        is stored lower-cased; a clash with another account raises
-        :class:`UsernameTakenError` — the unique index is what decides, so two
-        callers racing on the same name cannot both win.
-        """
-        if username is not None:
-            username = normalise_username(username)
-        try:
-            await self._write(
-                "UPDATE accounts SET username = ?, updated_at = ? WHERE id = ?",
-                (username, _now(), account_id),
-            )
-        except sqlite3.IntegrityError as e:
-            raise UsernameTakenError(f"The username '{username}' is already taken") from e
-        return await self.get_account(account_id)
-
     # -- account management --------------------------------------------------
     # Guards share their BEGIN IMMEDIATE transaction with the mutation. Accounts
     # are disabled, never deleted, so single-account relaxations cannot return.
@@ -438,7 +319,7 @@ class AccountStore:
         if not credential:
             raise AccountError("A new account needs a password")
 
-        actor_id, account_id = new_id(), new_id()
+        actor_id, account_id = _new_id(), _new_id()
         async with self._atomic():
             # The write lock up front: the guards below are read-then-write, and
             # a deferred transaction would let two callers both read a state
@@ -473,19 +354,17 @@ class AccountStore:
 
             now = _now()
             await self.db.execute(
-                """INSERT INTO actor_refs
-                       (id, kind, display_name, email, profile_version,
-                        created_at, updated_at)
-                   VALUES (?, 'human', ?, NULL, 1, ?, ?)""",
-                (actor_id, display_name, now, now),
+                """INSERT INTO actor_refs (id, kind, display_name, created_at)
+                   VALUES (?, 'human', ?, ?)""",
+                (actor_id, display_name, now),
             )
             try:
                 await self.db.execute(
                     """INSERT INTO accounts
                            (id, actor_id, username, credential_source, credential,
-                            enabled, created_at, updated_at, disabled_at)
-                       VALUES (?, ?, ?, 'local', ?, 1, ?, ?, NULL)""",
-                    (account_id, actor_id, username, credential, now, now),
+                            enabled, created_at)
+                       VALUES (?, ?, ?, 'local', ?, 1, ?)""",
+                    (account_id, actor_id, username, credential, now),
                 )
             except sqlite3.IntegrityError as e:
                 # The unique index is the real arbiter of the check above: two
@@ -527,8 +406,7 @@ class AccountStore:
             ) as cursor:
                 if await cursor.fetchone() is None:
                     return None
-            sets.append("updated_at = ?")
-            params.extend([_now(), account_id])
+            params.append(account_id)
             try:
                 await self.db.execute(
                     f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", tuple(params),
@@ -545,9 +423,9 @@ class AccountStore:
             raise AccountError("both the expected and the new credential are required")
         result = await self._write(
             """UPDATE accounts
-                  SET credential = ?, updated_at = ?
+                  SET credential = ?
                 WHERE id = ? AND credential = ? AND credential_source = 'local'""",
-            (credential, _now(), account_id, expected),
+            (credential, account_id, expected),
         )
         return result.rowcount > 0
 
@@ -575,9 +453,9 @@ class AccountStore:
             credential = None
         result = await self._write(
             """UPDATE accounts
-                  SET credential_source = ?, credential = ?, updated_at = ?
+                  SET credential_source = ?, credential = ?
                 WHERE id = ? AND credential_source = ?""",
-            (credential_source, credential, _now(), account_id, expected_source),
+            (credential_source, credential, account_id, expected_source),
         )
         return result.rowcount > 0
 
@@ -615,14 +493,13 @@ class AccountStore:
                     "already. Sign in instead."
                 )
 
-            now = _now()
             try:
                 await self.db.execute(
                     """UPDATE accounts
                           SET username = ?, credential_source = 'local',
-                              credential = ?, updated_at = ?
+                              credential = ?
                         WHERE id = ?""",
-                    (username, credential, now, account["id"]),
+                    (username, credential, account["id"]),
                 )
             except sqlite3.IntegrityError as e:  # pragma: no cover - one account
                 raise UsernameTakenError(
@@ -630,12 +507,8 @@ class AccountStore:
                 ) from e
             if display_name is not None:
                 await self.db.execute(
-                    """UPDATE actor_refs
-                          SET display_name = ?,
-                              profile_version = profile_version + 1,
-                              updated_at = ?
-                        WHERE id = ?""",
-                    (display_name or None, now, account["actor_id"]),
+                    "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+                    (display_name or None, account["actor_id"]),
                 )
         return await self.get_account(account["id"])  # type: ignore[return-value]
 
@@ -648,13 +521,12 @@ class AccountStore:
                 return None
             if not account["enabled"]:
                 return account
-            now = _now()
             cursor = await self.db.execute(
                 """UPDATE accounts
-                      SET enabled = 0, updated_at = ?, disabled_at = COALESCE(disabled_at, ?)
+                      SET enabled = 0
                     WHERE id = ? AND enabled = 1
                       AND (SELECT COUNT(*) FROM accounts WHERE enabled = 1) > 1""",
-                (now, now, account_id),
+                (account_id,),
             )
             changed = cursor.rowcount
             await cursor.close()
@@ -676,10 +548,8 @@ class AccountStore:
             if account["enabled"]:
                 return account
             await self.db.execute(
-                """UPDATE accounts
-                      SET enabled = 1, updated_at = ?, disabled_at = NULL
-                    WHERE id = ?""",
-                (_now(), account_id),
+                "UPDATE accounts SET enabled = 1 WHERE id = ?",
+                (account_id,),
             )
         return await self.get_account(account_id)
 
