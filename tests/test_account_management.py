@@ -196,10 +196,11 @@ class TestNoCredentialEverLeaves:
         async with _client(install.app) as client:
             before = await client.get("/api/accounts/me", headers=install.headers())
             assert before.json()["has_password"] is False
-            await client.put(
-                "/api/accounts/me/password",
-                json={"new_password": _PASSWORD}, headers=install.headers(),
-            )
+            # The *first* password is set by the claim endpoint, not here: this
+            # endpoint refuses while the instance is unclaimed (PR 6), because
+            # the case that needs no current password is the case a
+            # passwordless install hands to anybody.
+            await install.secure_the_owner()
             after = await client.get("/api/accounts/me", headers=install.headers())
             assert after.json()["has_password"] is True
 
@@ -336,11 +337,13 @@ class TestPasswordlessGuard:
                 headers=install.headers(),
             )).status_code == 409
 
-            # 1. the first account sets its own password...
-            assert (await client.put(
-                "/api/accounts/me/password", json={"new_password": _PASSWORD},
-                headers=install.headers(),
-            )).status_code == 200
+            # 1. the first account gets a password — which on an unclaimed
+            # instance happens through POST /api/setup/claim (PR 6), so it is
+            # set directly here: this test is about the *second* account's
+            # guards, not about which door the first password comes through.
+            await install.db.update_account_login(
+                install.owner_id, credential=hash_password(_PASSWORD),
+            )
             # 2. ...and is still refused, because it has no username yet.
             blocked = await client.post(
                 "/api/accounts", json={"username": "bob", "password": _PASSWORD},
@@ -513,16 +516,53 @@ class TestUsernamesThroughTheApi:
 
 @pytest.mark.asyncio
 class TestOwnPassword:
-    async def test_a_first_password_needs_no_current_one(self, install: _Install):
+    async def test_the_first_password_of_an_unclaimed_instance_is_refused_here(
+        self, install: _Install,
+    ):
+        """PR 6: there is one door, and it is the guarded one.
+
+        This endpoint needs no current password when the account has none —
+        which is exactly the state a passwordless install is in, and a
+        passwordless install hands a session to anybody who asks. So while the
+        instance is unclaimed it refuses and points at the claim endpoint,
+        which requires a loopback caller or the setup token.
+        """
         async with _client(install.app) as client:
             response = await client.put(
                 "/api/accounts/me/password", json={"new_password": _PASSWORD},
                 headers=install.headers(),
             )
-        assert response.status_code == 200
+        assert response.status_code == 409
+        assert "/api/setup/claim" in response.json()["detail"]
         account = await install.db.get_account(install.owner_id)
+        assert not account["credential"]
+
+    async def test_an_account_with_no_password_beside_others_may_still_set_one(
+        self, install: _Install,
+    ):
+        """The guard is about the *instance*, not about this account.
+
+        Two accounts and one of them has no credential — a restored
+        ``--no-secrets`` bundle — is not the unclaimed state: nobody is being
+        admitted without a password, so the account that has none may set its
+        first one with nothing to prove beyond being signed in.
+        """
+        await install.secure_the_owner()
+        second = await install.db.create_managed_account(
+            username="bob", credential=hash_password(_PASSWORD),
+        )
+        await install.db.set_account_credential(
+            second["id"], credential_source="none", credential=None,
+        )
+        async with _client(install.app) as client:
+            response = await client.put(
+                "/api/accounts/me/password", json={"new_password": "a-fresh-one"},
+                headers=install.headers(second["id"]),
+            )
+        assert response.status_code == 200, response.text
+        account = await install.db.get_account(second["id"])
         assert account["credential_source"] == "local"
-        assert verify_password(_PASSWORD, account["credential"])
+        assert verify_password("a-fresh-one", account["credential"])
 
     async def test_changing_one_requires_the_current_one(self, install: _Install):
         await install.secure_the_owner()
@@ -642,6 +682,86 @@ class TestOwnPassword:
                 headers=install.headers(),
             )
         assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+#  Structural: what the route surface promises                                 #
+# --------------------------------------------------------------------------- #
+
+
+class TestTheRouteSurface:
+    """Checked against the modules rather than through a client, so a route
+    added later without a gate fails here rather than in production."""
+
+    @staticmethod
+    def _endpoints():
+        import inspect
+
+        from nerve.gateway.routes import (
+            accounts, auth, codex, config, cron, diagnostics, external_agents,
+            files, mcp_servers, memory, models, notifications, plans,
+            prompt_rewrite, review_loops, sessions, setup, skills, sources,
+            tasks, workflow_runs,
+        )
+
+        modules = [
+            accounts, auth, codex, config, cron, diagnostics, external_agents,
+            files, mcp_servers, memory, models, notifications, plans,
+            prompt_rewrite, review_loops, sessions, setup, skills, sources,
+            tasks, workflow_runs,
+        ]
+        for module in modules:
+            for route in module.router.routes:
+                endpoint = getattr(route, "endpoint", None)
+                if endpoint is None:
+                    continue
+                gates = [
+                    p.default.dependency.__name__
+                    for p in inspect.signature(endpoint).parameters.values()
+                    if getattr(p.default, "dependency", None) is not None
+                ]
+                yield sorted(route.methods), str(route.path), gates
+
+    def test_only_four_api_endpoints_are_unauthenticated(self):
+        """Login and status are the doors themselves; the worker-token exchange
+        authenticates through the MCP path instead. Anything else appearing
+        here is a hole.
+
+        The fourth is PR 6's claim: the state it ends — one account with no
+        password — already admits every caller, so requiring a session would
+        protect nothing. What protects it is its own guard (a loopback socket
+        peer, or the setup token), which this scan cannot see; the tests in
+        ``test_setup_wizard.py`` are what pin it."""
+        open_endpoints = {
+            (tuple(methods), path)
+            for methods, path, gates in self._endpoints()
+            if path.startswith("/api")
+            and "require_auth" not in gates
+            and "require_account" not in gates
+        }
+        assert open_endpoints == {
+            (("POST",), "/api/auth/login"),
+            (("GET",), "/api/auth/status"),
+            (("POST",), "/api/codex/worker-token"),
+            (("POST",), "/api/setup/claim"),
+        }
+
+    def test_every_account_endpoint_requires_a_human_account(self):
+        account_endpoints = [
+            (tuple(methods), path, gates)
+            for methods, path, gates in self._endpoints()
+            if path.startswith("/api/accounts")
+        ]
+        assert len(account_endpoints) == 7
+        for methods, path, gates in account_endpoints:
+            assert gates == ["require_account"], (methods, path, gates)
+
+    def test_there_is_no_endpoint_that_deletes_an_account(self):
+        """Removal is disablement; the row is the tombstone that keeps a
+        grandfathered token from resolving to the wrong account."""
+        for methods, path, _ in self._endpoints():
+            if path.startswith("/api/accounts"):
+                assert "DELETE" not in methods, path
 
 
 # --------------------------------------------------------------------------- #

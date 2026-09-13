@@ -305,7 +305,7 @@ _SETTINGS_HEADER = """\
 """
 _SETTINGS_HEADER_LINES = _SETTINGS_HEADER.count("\n")
 
-_CONFIG_YAML_HEADER = (
+CONFIG_YAML_HEADER = (
     "# Nerve — Machine-local configuration\n"
     "# Settings specific to this box: workspace location,\n"
     "# bind address, deployment style, local credentials handles.\n"
@@ -553,7 +553,7 @@ def write_config_yaml(choices: SetupChoices, config_dir: Path) -> Path:
     # trigger it: safe_dump escapes non-ASCII to \xNN, so the dumped body is
     # always ASCII.
     with open(config_path, "w", encoding="utf-8") as f:
-        f.write(_CONFIG_YAML_HEADER)
+        f.write(CONFIG_YAML_HEADER)
         yaml.safe_dump(machine, f, default_flow_style=False, sort_keys=False)
     return config_path
 
@@ -732,7 +732,9 @@ def leading_comment(text: str) -> str:
     return "".join(kept)
 
 
-def merge_private_paths(path: Path, updates: dict[str, Any]) -> None:
+def merge_private_paths(
+    path: Path, updates: dict[str, Any], *, header: str = "",
+) -> None:
     """Merge dotted paths into a machine-local file, owner-only.
 
     The read-modify-write the web wizard needs, and the only way it is allowed
@@ -747,6 +749,9 @@ def merge_private_paths(path: Path, updates: dict[str, Any]) -> None:
     :func:`nerve.paths.write_private_text`, which raises
     :class:`nerve.paths.InsecureFileError` with nothing written rather than
     leaving credentials in a file other users can read.
+
+    ``header`` is used only when the file does not exist yet, so a file
+    created here opens with the same explanation the installer's would.
     """
     original = path.read_text(encoding="utf-8") if path.exists() else ""
     data: dict[str, Any] = {}
@@ -762,10 +767,10 @@ def merge_private_paths(path: Path, updates: dict[str, Any]) -> None:
         else:
             set_leaf(data, dotted, value)
 
-    header = leading_comment(original) if original else _CONFIG_LOCAL_HEADER
+    opening = leading_comment(original) if original else (header or _CONFIG_LOCAL_HEADER)
     paths.write_private_text(
         path,
-        header + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+        opening + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
     )
 
 
@@ -892,3 +897,140 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
             jobs.append(job)
 
     return jobs
+
+
+# --- Turning the installer's optional crons on and off ------------------------
+#
+# The web wizard cannot regenerate ``system.yaml`` the way `nerve init` does:
+# the job list depends on whether this is a personal or a worker install, and
+# that is a wizard answer no running instance records. So the web path flips
+# ``enabled`` on the jobs the installer already wrote and touches nothing else
+# — which is also the only change a checklist step should be making to a file
+# an operator may have edited.
+
+_CRON_FILE_HEADER = (
+    "# Nerve — System Cron Jobs\n"
+    "# Managed by 'nerve init'. Safe to re-generate.\n"
+    "# To add custom crons, use jobs.yaml instead.\n\n"
+)
+
+# Ids the wizard is allowed to toggle: the optional ones. The core crons are
+# always on and are not offered (a checklist that can switch memory
+# maintenance off is a settings editor).
+OPTIONAL_CRON_IDS = tuple(cron["id"] for cron in PRODUCTIVITY_CRONS)
+
+
+@dataclass(frozen=True)
+class CronToggle:
+    """One optional cron, as the checklist offers it."""
+
+    id: str
+    name: str
+    description: str
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class CronToggleOutcome:
+    status: str          # written | unchanged | missing | unreadable
+    path: Path
+    enabled: tuple[str, ...] = ()
+    disabled: tuple[str, ...] = ()
+    detail: str = ""
+
+
+def system_cron_file(workspace: Path) -> Path:
+    return Path(workspace) / "config" / "cron" / "system.yaml"
+
+
+def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """``(document, raw_text, problem)`` for the generated cron file."""
+    path = system_cron_file(workspace)
+    if not path.exists():
+        return None, "", "missing"
+    raw = path.read_text(encoding="utf-8")
+    try:
+        loaded = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        return None, raw, f"unreadable: {e}"
+    if loaded is not None and not isinstance(loaded, dict):
+        return None, raw, "unreadable: not a mapping"
+    document = loaded or {}
+    if not isinstance(document.get("jobs"), list):
+        return None, raw, "unreadable: no job list"
+    return document, raw, ""
+
+
+def list_optional_crons(workspace: Path) -> list[CronToggle]:
+    """The optional crons this install actually has, and whether each is on.
+
+    Empty when the file is missing or unreadable: the checklist then says the
+    step has nothing to offer rather than inventing jobs that were never
+    written.
+    """
+    document, _raw, problem = _read_system_crons(workspace)
+    if problem or document is None:
+        return []
+    present = {
+        str(job.get("id")): bool(job.get("enabled"))
+        for job in document["jobs"]
+        if isinstance(job, dict) and job.get("id")
+    }
+    known = {cron["id"]: cron for cron in PRODUCTIVITY_CRONS}
+    return [
+        CronToggle(
+            id=cron_id,
+            name=str(known[cron_id].get("name") or cron_id),
+            description=str(known[cron_id].get("description") or ""),
+            enabled=present[cron_id],
+        )
+        for cron_id in OPTIONAL_CRON_IDS
+        if cron_id in present
+    ]
+
+
+def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutcome:
+    """Enable exactly ``enabled_ids`` among the optional crons; leave the rest.
+
+    Idempotent, and re-enterable: it is the state of the list that is set, not
+    a delta applied to it. Jobs the wizard does not own — the core crons, and
+    anything an operator added — keep whatever they say.
+    """
+    path = system_cron_file(workspace)
+    document, raw, problem = _read_system_crons(workspace)
+    if problem or document is None:
+        return CronToggleOutcome(
+            status="missing" if problem == "missing" else "unreadable",
+            path=path,
+            detail=problem,
+        )
+
+    enabled, disabled = [], []
+    changed = False
+    for job in document["jobs"]:
+        if not isinstance(job, dict):
+            continue
+        job_id = str(job.get("id") or "")
+        if job_id not in OPTIONAL_CRON_IDS:
+            continue
+        wanted = job_id in enabled_ids
+        (enabled if wanted else disabled).append(job_id)
+        if bool(job.get("enabled")) != wanted:
+            job["enabled"] = wanted
+            changed = True
+
+    if not changed:
+        return CronToggleOutcome(
+            status="unchanged", path=path,
+            enabled=tuple(enabled), disabled=tuple(disabled),
+        )
+
+    header = leading_comment(raw) or _CRON_FILE_HEADER
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header)
+        yaml.safe_dump(document, f, default_flow_style=False, sort_keys=False)
+
+    return CronToggleOutcome(
+        status="written", path=path,
+        enabled=tuple(enabled), disabled=tuple(disabled),
+    )
