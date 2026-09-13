@@ -1533,22 +1533,53 @@ def test_a_config_file_with_nothing_secret_in_it_is_copied_unchanged(
     ) == body
 
 
-def test_an_unparseable_config_file_is_still_archived(
+def test_a_no_secrets_backup_refuses_a_config_file_it_cannot_inspect(
     nerve_dir, workspace, config_dir, tmp_path,
 ):
-    """There is nothing to rewrite *safely* in a file that will not parse, and
-    dropping it would lose whatever the operator was in the middle of."""
+    """"Nothing to rewrite" and "could not look" used to be the same answer, so
+    a file that would not parse was copied into a bundle documented as carrying
+    no credential — which is the one thing a parse failure cannot rule out."""
     cfg = workspace / "config"
     cfg.mkdir(parents=True, exist_ok=True)
-    (cfg / "settings.yaml").write_text("this: [is not: valid\n", encoding="utf-8")
+    marker = "$2b$12$MARKER-inside-a-file-that-will-not-parse"
+    (cfg / "settings.yaml").write_text(
+        f"this: [is not: valid\nauth: password_hash: '{marker}'\n", encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    out.mkdir()
 
-    bundle = backup_mod.create_backup(
-        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
-        include_secrets=False,
+    with pytest.raises(BackupError) as excinfo:
+        backup_mod.create_backup(
+            nerve_dir, workspace, out, config_dir=config_dir, include_secrets=False,
+        )
+    assert "settings.yaml" in str(excinfo.value)
+    assert "--no-secrets" in str(excinfo.value)
+    # Nothing was published, so the marker is nowhere in the output directory.
+    for path in out.rglob("*"):
+        if path.is_file():
+            assert marker not in path.read_bytes().decode("latin-1"), path
+
+    # ...and the same instance backs up fine *with* secrets: this is a promise
+    # that cannot be kept, not a broken backup.
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir,
+        include_secrets=True,
     )
-    assert "this: [is not: valid" in _member(
-        bundle.path, "workspace/config/settings.yaml", tmp_path / "x",
-    )
+    assert kept.path.is_file()
+
+
+def test_a_config_file_that_is_not_a_mapping_is_refused_too(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    cfg = workspace / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text("- just\n- a list\n", encoding="utf-8")
+
+    with pytest.raises(BackupError, match="settings.yaml"):
+        backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+            include_secrets=False,
+        )
 
 
 def test_the_rewritten_file_is_staged_owner_only(
@@ -1681,3 +1712,55 @@ def test_no_secrets_leaves_no_credential_anywhere_in_the_archive(
         "account hash on the row", "jwt secret in nerve.db",
     ):
         assert markers[label] in kept_bodies, label
+
+
+def test_a_transitional_config_account_restores_as_passwordless(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """The shape PR 1 leaves behind, backed up before the first start that
+    migrates it. Its credential lives in config.local.yaml, which this bundle
+    omits — so a row left on `config` comes back able to authenticate against
+    nothing, and not recognised as passwordless either. That is the one state
+    with no way out of it."""
+    import asyncio
+
+    from nerve.db import Database
+
+    async def bootstrap(path: Path) -> None:
+        database = Database(path)
+        await database.connect()
+        try:
+            await database.bootstrap_local_identity(credential_source="config")
+        finally:
+            await database.close()
+
+    async def state_of(path: Path):
+        database = Database(path)
+        await database.connect()
+        try:
+            return await database.login_state(), await database.list_accounts()
+        finally:
+            await database.close()
+
+    db_path = nerve_dir / "nerve.db"
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(db_path) + suffix).unlink(missing_ok=True)
+    asyncio.run(bootstrap(db_path))
+    before, _ = asyncio.run(state_of(db_path))
+    assert before.passwordless is False          # it reads auth.password_hash
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    assert backup_mod.verify_bundle(bundle.path, extract_to=staging).ok
+
+    after, accounts = asyncio.run(state_of(staging / "state" / "nerve.db"))
+    assert [a["credential_source"] for a in accounts] == ["none"]
+    assert [a["credential"] for a in accounts] == [None]
+    # ...which is what makes the restored instance usable: passwordless, so its
+    # owner can sign in and set a password, rather than locked out of an account
+    # whose credential was in a file this bundle does not carry.
+    assert after.passwordless is True
+    assert after.single_account is True

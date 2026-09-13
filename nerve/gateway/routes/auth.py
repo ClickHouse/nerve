@@ -24,6 +24,7 @@ from nerve.gateway.auth import (
     require_auth,
     verify_password,
 )
+from nerve.db.accounts import login_state_from
 from nerve.gateway.routes.accounts import account_credential, instance_is_passwordless
 from nerve.identity import Actor, ActorResolutionError, actor_for_account
 
@@ -112,9 +113,19 @@ _FAILURE_BUDGET_FLOOR_SECONDS = 0.05
 # from a work factor an account really carries, and clamping it below the
 # comparison it exists to hide would simply put the enumeration back.
 _REACTIVE_BUDGET_CEILING_SECONDS = 2.0
-# ...and a ceiling for the calibrated value all the same, because a work factor
-# nobody could log in with in under half a minute is a misconfiguration, not a
-# case to keep padding for.
+# ...and a ceiling for the calibrated value all the same.
+#
+# **The cap question, decided.** Any work factor is *accepted* — refusing to
+# verify a hash would lock out the install that carries it, which is the one
+# thing this release promises not to do. So the ceiling is not a limit on what
+# may be stored; it is the point past which the padding stops pretending. A
+# comparison slower than this takes longer than the budget however long the
+# budget is, and an account whose password takes half a minute to check is
+# distinguishable by timing no matter what — while also being an account nobody
+# can log into in a reasonable time. It is a misconfiguration to fix, not a case
+# to keep padding for, and `docs/accounts.md` says so. Everything below the
+# ceiling — which is every work factor bcrypt is used at in practice — is fully
+# masked.
 _CALIBRATED_BUDGET_CEILING_SECONDS = 30.0
 # The budget sits this far above the comparison it was measured from. Without
 # the headroom it lands exactly on one, ordinary variation in the next
@@ -127,6 +138,17 @@ _failure_budget: float | None = None
 # What calibration alone produced, kept apart from the reactive mark so the
 # latter's ceiling can be expressed relative to it.
 _calibrated_budget: float | None = None
+# One comparison at the policy cost, on this machine. The *only* thing cached
+# across logins: it is a property of the hardware, while the slowest cost in use
+# is a property of the accounts, and those change under a running gateway — a
+# `config` or `none` row reads `auth.password_hash` the moment a reload swaps
+# it, so a budget calibrated once at first login goes stale the instant somebody
+# introduces a slower hash, and stays stale until a *known-user* probe raises
+# the reactive mark. Which is one probe too late, again.
+_policy_comparison_seconds: float | None = None
+# A value tests pin in place of calibrating. Production never sets it: a real
+# budget is always derived from this machine and these accounts.
+_pinned_budget: float | None = None
 
 
 def _slowest_stored_cost(accounts: list[dict], configured_password: str) -> int:
@@ -145,47 +167,56 @@ def _slowest_stored_cost(accounts: list[dict], configured_password: str) -> int:
     return max([cost for cost in candidates if cost is not None] + [BCRYPT_COST])
 
 
-async def prepare_login_timing(store, config) -> float:
-    """Calibrate the failure budget, once per process. Returns it.
+def prepare_login_timing(config, accounts: list[dict]) -> float:
+    """Calibrate the failure budget for the accounts as they stand now.
 
     Called at the top of :func:`login`, **before** that request takes its own
     start time: the measurement costs a comparison, and paying for it inside a
     request's timed window is what made the first failure of a process stand out
-    from every later one. A future startup hook may call it earlier — it is
-    idempotent and cheap after the first time — which would move that one cost
-    off the first login.
+    from every later one.
+
+    Run on **every** login, not once, because what it depends on changes under a
+    running gateway: a `config` or `none` row verifies against
+    `auth.password_hash`, which a configuration reload can replace with a hash
+    at any work factor. Only the per-comparison measurement is cached — that is
+    the hardware — and the slowest cost in use is recomputed from rows the
+    caller has already fetched, so the recalibration costs an exponent and no
+    query at all.
+
+    It therefore comes *down* as well as up: when the last odd work factor is
+    re-hashed at the policy cost, the next login stops paying for it. The
+    reactive mark can still raise it within the request (see
+    :func:`_observe_comparison`) for anything this could not know.
     """
-    global _failure_budget, _calibrated_budget
-    if _failure_budget is not None:
-        return _failure_budget
+    global _failure_budget, _calibrated_budget, _policy_comparison_seconds
 
-    started = time.monotonic()
-    verify_password("measuring the login response budget", _DECOY_HASH)
-    one_policy_comparison = time.monotonic() - started
+    if _pinned_budget is not None:
+        _failure_budget = _calibrated_budget = _pinned_budget
+        return _pinned_budget
 
-    try:
-        accounts = await store.list_accounts()
-    except Exception as e:  # noqa: BLE001 - calibration must not fail a login
-        logger.warning("Could not read accounts to calibrate login timing: %s", e)
-        accounts = []
+    if _policy_comparison_seconds is None:
+        started = time.monotonic()
+        verify_password("measuring the login response budget", _DECOY_HASH)
+        _policy_comparison_seconds = time.monotonic() - started
+
     slowest = _slowest_stored_cost(accounts, config.auth.password_hash)
-
-    _calibrated_budget = min(
+    calibrated = min(
         _CALIBRATED_BUDGET_CEILING_SECONDS,
         max(
             _FAILURE_BUDGET_FLOOR_SECONDS,
-            one_policy_comparison * (2 ** (slowest - BCRYPT_COST))
+            _policy_comparison_seconds * (2 ** (slowest - BCRYPT_COST))
             * _FAILURE_BUDGET_HEADROOM,
         ),
     )
-    _failure_budget = _calibrated_budget
-    if slowest != BCRYPT_COST:
+    if slowest != BCRYPT_COST and calibrated != _calibrated_budget:
         logger.info(
-            "Login failure budget calibrated to %.2fs: an account is stored at "
-            "bcrypt cost %d rather than %d. It drops back once that account's "
-            "owner next signs in, which re-hashes it at the current cost.",
-            _failure_budget, slowest, BCRYPT_COST,
+            "Login failure budget is %.2fs: a credential in use is at bcrypt "
+            "cost %d rather than %d. It drops back once that account's owner "
+            "next signs in, which re-hashes it at the current cost.",
+            calibrated, slowest, BCRYPT_COST,
         )
+    _calibrated_budget = calibrated
+    _failure_budget = calibrated
     return _failure_budget
 
 
@@ -196,10 +227,20 @@ def _reactive_ceiling() -> float:
 
 def _set_failure_budget(seconds: float | None) -> None:
     """Pin (or clear) the budget. For tests, which cannot afford a quarter of a
-    second per failed login and need a known value to measure against."""
-    global _failure_budget, _calibrated_budget
+    second per failed login and need a known value to measure against.
+
+    A pinned value survives recalibration — the budget is recomputed on every
+    login now, so a value merely assigned would be gone by the next one.
+    ``None`` unpins and clears the cached measurement, so the next login
+    calibrates from scratch.
+    """
+    global _failure_budget, _calibrated_budget, _policy_comparison_seconds
+    global _pinned_budget
+    _pinned_budget = seconds
     _failure_budget = seconds
     _calibrated_budget = seconds
+    if seconds is None:
+        _policy_comparison_seconds = None
 
 
 def _observe_comparison(seconds: float) -> None:
@@ -341,13 +382,16 @@ async def login(req: LoginRequest):
         # without the database there is no account to name.
         raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
 
-    # Before the clock starts, never inside it: calibration costs a comparison
-    # and a read of the accounts, and paying for either within a request's own
-    # timed window is what made the *first* failure of a process stand out.
-    await prepare_login_timing(store, config)
+    # One read of the accounts, used for both: which login shape applies, and
+    # the slowest work factor a comparison could take. Before the clock starts,
+    # never inside it — calibration costs a comparison the first time, and
+    # paying for that within a request's own timed window is what made the first
+    # failure of a process stand out from every later one.
+    accounts = await store.list_accounts()
+    prepare_login_timing(config, accounts)
     started_at = time.monotonic()
 
-    state = await store.login_state()
+    state = login_state_from(accounts)
     passwordless = instance_is_passwordless(state, config)
     username = (req.username or "").strip()
 

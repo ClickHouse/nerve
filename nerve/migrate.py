@@ -1160,11 +1160,12 @@ async def _migrate_config_credentials(
             if account["credential_source"] == "config"
         ]
     if stragglers or pending_config_rows:
-        report.migrated_config_credential = True
-        report.identity_actions.append(
-            _copy_action(len(stragglers) + pending_config_rows, dry_run)
-        )
-        if not dry_run:
+        if dry_run:
+            report.migrated_config_credential = True
+            report.identity_actions.append(
+                _copy_action(len(stragglers) + pending_config_rows, dry_run=True)
+            )
+        else:
             moved = 0
             for account in stragglers:
                 # Conditioned on the row still being on `config`. This runs from
@@ -1179,11 +1180,27 @@ async def _migrate_config_credentials(
                     credential=config.auth.password_hash,
                 ):
                     moved += 1
-            logger.info(
-                "Identity: %d of %d account(s) moved off the configured password "
-                "onto their own credential in nerve.db. The hash was copied, so "
-                "nobody's password changed.", moved, len(stragglers),
-            )
+            # Reported from what the writes actually did, not from what they
+            # were going to do: a concurrent password change is entitled to win,
+            # and telling the operator the configured hash was copied onto that
+            # account when it was not is worse than saying nothing.
+            skipped = len(stragglers) - moved
+            if moved:
+                report.migrated_config_credential = True
+                report.identity_actions.append(_copy_action(moved, dry_run=False))
+                logger.info(
+                    "Identity: %d account(s) moved off the configured password "
+                    "onto their own credential in nerve.db. The hash was copied, "
+                    "so nobody's password changed.", moved,
+                )
+            if skipped:
+                note = (
+                    f"{skipped} account(s) were left as they are: their credential "
+                    "changed while this migration was running, so the newer one "
+                    "stands. Nothing was lost, and nothing is left to do."
+                )
+                report.identity_actions.append(note)
+                logger.info("Identity: %s", note)
 
     # The retirement is judged on its own, every start, and not only by the run
     # that did the copy. The copy commits to the database before the file is

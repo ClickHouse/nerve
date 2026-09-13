@@ -184,14 +184,29 @@ Hashes are *accepted* at any work factor, because a password copied off an
 upgrading install's configuration carries whatever produced it, possibly years
 ago, and refusing it would lock that install out.
 
-The response budget is **calibrated from the highest work factor the accounts
-actually carry**, before the first login is served — not from the current one.
-Reacting to a slow comparison after making it would be one probe too late: that
-request has already taken four times as long as an unknown username did, and
-that is the whole of an enumeration. The budget therefore comes down on its own
-as an install converges, since it is worked out afresh at each start. An
-operator who stores a very high work factor makes every *failed* login that slow
-for as long as the account keeps it, which is the honest price of hiding it.
+The response budget is **calibrated from the highest work factor in use** —
+every account's own hash and the configured `auth.password_hash` — rather than
+from the current policy cost. Reacting to a slow comparison after making it
+would be one probe too late: that request has already taken four times as long
+as an unknown username did, and that is the whole of an enumeration.
+
+It is recomputed on **every** login, not once, because what it depends on
+changes under a running gateway: an account still reading `auth.password_hash`
+picks up a configuration reload immediately, at whatever work factor the new
+value carries. Only the per-comparison measurement is cached — that is a
+property of the machine — so a recalculation costs an exponent and no extra
+query. It comes *down* as well as up: when the last odd work factor is re-hashed
+at the policy cost, the next login stops paying for it.
+
+An operator who stores a very high work factor makes every *failed* login that
+slow for as long as the account keeps it, which is the honest price of hiding
+it. **Above about half a minute per comparison the padding stops pretending:**
+any work factor is still *accepted* — refusing to verify a hash would lock out
+the install that carries it, which is the one thing this release promises not to
+do — but a comparison slower than that ceiling takes longer than the budget
+however long the budget is, so such an account is distinguishable by timing. It
+is also an account nobody can sign into in a reasonable time, so the remedy is
+to fix the work factor rather than to keep padding for it.
 
 A hash at any other cost is **replaced at the current one the next time its
 owner logs in successfully**. It happens silently, on a login that has already
@@ -441,6 +456,19 @@ things beyond omitting the obvious files:
   `auth.password_hash` alone when it is in a tracked or fleet-managed file (see
   above), so a live verifier can be sitting in exactly the file the bundle
   otherwise copies verbatim. A cron job's `env:` block goes the same way.
+
+A `--no-secrets` backup **refuses** rather than guessing if one of those
+configuration files cannot be parsed: "there is nothing to rewrite" and "I could
+not look" are different answers, and only the first is compatible with promising
+the bundle carries no credential. Fix the file, or take the backup with secrets
+and keep it as private as the instance itself.
+
+Every account comes back **passwordless**, including one still on the
+transitional `config` source. Its credential lives in `config.local.yaml`, which
+this bundle omits, so leaving it on `config` would restore an account that can
+neither authenticate nor be recognised as passwordless — the one state with no
+way out of it, and reachable simply by backing up between an upgrade and the
+first start that migrates.
 
 The live database and the real config files are never touched; the snapshot is
 edited after it is taken and before it is checksummed, SQLite overwrites the

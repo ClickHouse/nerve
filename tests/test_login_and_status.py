@@ -620,7 +620,9 @@ class TestFailedLoginsCostTheSame:
 
         # Calibration, with nothing having compared against the slow hash yet —
         # so anything it knows, it knows from reading the accounts.
-        budget = await auth_routes.prepare_login_timing(install.db, get_config())
+        budget = auth_routes.prepare_login_timing(
+            get_config(), await install.db.list_accounts(),
+        )
         started = time.monotonic()
         verify_password("wrong", slow)
         one_slow_comparison = time.monotonic() - started
@@ -641,6 +643,64 @@ class TestFailedLoginsCostTheSame:
         assert unknown >= budget * 0.9, (unknown, budget)
         assert known >= budget * 0.9, (known, budget)
         assert abs(known - unknown) < budget * 0.5, (unknown, known, budget)
+
+    async def test_a_slower_hash_introduced_after_calibration_is_covered(
+        self, install,
+    ):
+        """A `none` or `config` row verifies against auth.password_hash, which a
+        configuration *reload* can replace at any moment with a hash at any work
+        factor. A budget worked out once at first login goes stale the instant
+        that happens, and stays stale until some known-user probe raises the
+        reactive mark — which is the same one-probe-too-late this is supposed to
+        have ended. So it is recomputed every login."""
+        auth_routes._set_failure_budget(None)
+        await install.db.set_account_username(install.owner_id, "alice")
+
+        async def probe(body) -> float:
+            async with _client(install.app) as client:
+                started = time.monotonic()
+                response = await client.post("/api/auth/login", json=body)
+                assert response.status_code == 401
+                return time.monotonic() - started
+
+        # Calibrated on an ordinary install, and warm.
+        await probe({"username": "nobody-here", "password": "wrong"})
+        settled = auth_routes._failure_budget
+        assert settled is not None
+
+        # Now the configured hash is swapped for a much slower one, with no
+        # restart — exactly what a reload does.
+        set_config(NerveConfig(auth=AuthConfig(
+            jwt_secret=_SECRET, password_hash=_cheap_hash(_PASSWORD, rounds=14),
+        )))
+
+        # Unknown first, so nothing has had the chance to *observe* the new cost.
+        unknown = await probe({"username": "nobody-here", "password": "wrong"})
+        known = await probe({"username": "alice", "password": "wrong"})
+
+        assert auth_routes._failure_budget > settled, auth_routes._failure_budget
+        assert unknown >= known * 0.75, (unknown, known)
+        assert known >= unknown * 0.75, (unknown, known)
+
+    async def test_the_budget_comes_back_down_when_the_slow_hash_goes(self, install):
+        """It is recomputed, not ratcheted: an install that converges on the
+        policy cost stops paying for the one account that had not."""
+        auth_routes._set_failure_budget(None)
+        set_config(NerveConfig(auth=AuthConfig(
+            jwt_secret=_SECRET, password_hash=_cheap_hash(_PASSWORD, rounds=14),
+        )))
+        async with _client(install.app) as client:
+            await client.post("/api/auth/login", json={"password": "wrong"})
+        slow = auth_routes._failure_budget
+
+        set_config(NerveConfig(auth=AuthConfig(jwt_secret=_SECRET)))
+        await install.db.update_account_login(
+            install.owner_id, credential=hash_password(_PASSWORD),
+        )
+        async with _client(install.app) as client:
+            await client.post("/api/auth/login", json={"password": "wrong"})
+
+        assert auth_routes._failure_budget < slow, (auth_routes._failure_budget, slow)
 
     async def test_calibration_reads_the_configured_hash_too(self, install):
         """`config` and `none` rows verify against auth.password_hash, so its
@@ -756,12 +816,18 @@ class TestHashesConvergeOnThePolicyCost:
         async def boom(*args, **kwargs):
             raise RuntimeError("database is locked")
 
-        monkeypatch.setattr(install.db, "update_account_login", boom)
+        before = (await install.db.get_account(install.owner_id))["credential"]
+        # The method the re-hash actually calls — a compare-and-swap since the
+        # unconditional write could revert a concurrent password change.
+        monkeypatch.setattr(install.db, "replace_credential_if_unchanged", boom)
         async with _client(install.app) as client:
             response = await client.post(
                 "/api/auth/login", json={"username": "alice", "password": _PASSWORD},
             )
         assert response.status_code == 200
+        assert (await install.db.get_account(
+            install.owner_id,
+        ))["credential"] == before
 
     async def test_a_concurrent_password_change_is_not_reverted(self, install):
         """The credential is read, compared against, and only then replaced. A

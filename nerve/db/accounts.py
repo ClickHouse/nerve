@@ -163,6 +163,26 @@ class LoginState:
     sole_account_id: str | None = None
 
 
+def login_state_from(accounts: list[dict]) -> LoginState:
+    """The login predicate over an already-fetched list of accounts.
+
+    Split out so a caller that needs the rows for something else — the login
+    route reads their work factors to calibrate its response budget — can get
+    both from one query instead of two.
+    """
+    if len(accounts) != 1:
+        return LoginState(
+            accounts=len(accounts), single_account=False, passwordless=False,
+        )
+    sole = accounts[0]
+    return LoginState(
+        accounts=1,
+        single_account=True,
+        passwordless=sole["credential_source"] == "none",
+        sole_account_id=sole["id"],
+    )
+
+
 def new_id() -> str:
     """A fresh identity id — UUID4, the shape a control plane would issue."""
     return str(uuid.uuid4())
@@ -486,18 +506,7 @@ class AccountStore:
         is configured), and PR 3's startup migration moves every such row to
         ``local`` anyway.
         """
-        accounts = await self.list_accounts()
-        if len(accounts) != 1:
-            return LoginState(
-                accounts=len(accounts), single_account=False, passwordless=False,
-            )
-        sole = accounts[0]
-        return LoginState(
-            accounts=1,
-            single_account=True,
-            passwordless=sole["credential_source"] == "none",
-            sole_account_id=sole["id"],
-        )
+        return login_state_from(await self.list_accounts())
 
     async def create_managed_account(
         self,
