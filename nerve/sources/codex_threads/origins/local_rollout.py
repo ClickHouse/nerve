@@ -118,6 +118,7 @@ class LocalRolloutOrigin(CodexOrigin):
             "in_scope": sorted(str(p) for p in self._in_scope),
             "out_of_scope": sorted(str(p) for p in self._out_of_scope),
             "archived": sorted(str(p) for p in self._archived_emitted),
+            "thread_ids": {str(k): v for k, v in self._thread_ids.items()},
         })
 
     # ------------------------------------------------------------------
@@ -140,6 +141,9 @@ class LocalRolloutOrigin(CodexOrigin):
         self._in_scope = {Path(p) for p in (data.get("in_scope") or [])}
         self._out_of_scope = {Path(p) for p in (data.get("out_of_scope") or [])}
         self._archived_emitted = {Path(p) for p in (data.get("archived") or [])}
+        self._thread_ids = {
+            Path(k): str(v) for k, v in (data.get("thread_ids") or {}).items()
+        }
 
     # ------------------------------------------------------------------
     # Filesystem scan

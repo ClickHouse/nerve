@@ -22,7 +22,6 @@ from nerve.identity import system_actor
 
 if TYPE_CHECKING:
     from nerve.db import Database
-    from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -76,19 +75,6 @@ class SatelliteSessionResolver:
 
     def __init__(self, db: "Database") -> None:
         self.db = db
-
-    async def _satellite_actor(self) -> "Actor":
-        """Who a satellite session belongs to: the agent's system principal.
-
-        An MCP connection is another program talking to this instance, and the
-        satellite row exists so that traffic is visible in the session list. It
-        is the instance's own row rather than any person's — even when the
-        caller authenticated with a human's session token, which the endpoint
-        resolves and leaves on the ASGI scope
-        (``nerve.mcp_server.http.MCP_ACTOR_SCOPE_KEY``) for a later PR that
-        wants per-call attribution.
-        """
-        return await system_actor(self.db)
 
     @staticmethod
     def build_session_id(client_name: str, identifier: str) -> str:
@@ -160,10 +146,7 @@ class SatelliteSessionResolver:
                 "origin_ids": ["nerve-mcp-detected"],
             }
             title = f"Codex/mcp ({client_session_id[:8]})"
-            # Outside the catch below, and before the insert: see resolve()'s
-            # docstring. A satellite id whose row does not exist is worse than
-            # a refused call.
-            actor = await self._satellite_actor()
+            actor = await system_actor(self.db)
             try:
                 await self.db.create_session(
                     session_id=sid,
@@ -195,7 +178,7 @@ class SatelliteSessionResolver:
             "runtime": f"{safe_client}-external",
         }
         title = f"{safe_client} ({mcp_session_id[:8]})"
-        actor = await self._satellite_actor()
+        actor = await system_actor(self.db)
         try:
             await self.db.create_session(
                 session_id=sid,
@@ -215,20 +198,7 @@ class SatelliteSessionResolver:
         return sid
 
     async def _survivable_or_raise(self, sid: str) -> None:
-        """Swallow a lost create race; re-raise anything else.
-
-        The only failure this method may absorb is another request having
-        created the row between ``get_session()`` and ``create_session()`` —
-        harmless, because the row the caller needs now exists. (The insert is
-        ``INSERT OR IGNORE``, so that race normally raises nothing at all;
-        this is the belt-and-braces path.)
-
-        Anything else — a database error, a constraint violation — leaves no
-        row, and returning the id anyway would hand a tool call a session that
-        exists nowhere. So it propagates: :func:`build_ctx_resolver` fails,
-        and the MCP dispatcher turns that into a context error *before* the
-        handler runs.
-        """
+        """Swallow a lost create race only when the required row now exists."""
         if await self.db.get_session(sid) is None:
             logger.exception(
                 "Failed to create satellite session %s — refusing the call", sid,

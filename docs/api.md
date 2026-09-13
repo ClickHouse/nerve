@@ -67,23 +67,19 @@ where a name is looked up at render time — a rename changes every label and
 moves no stored row.
 
 ```json
-{ "id": "…", "kind": "human", "display_name": "Alice", "profile_version": 3 }
+{ "id": "…", "kind": "human", "display_name": "Alice" }
 ```
 
 | Endpoint | Does |
 |---|---|
 | `GET /api/actors` | `{ "actors": [...] }`, oldest first. One row per person plus the system principal, so a single call labels a whole list |
-| `GET /api/actors/{id}` | one actor; `404` if no such actor |
 
-`kind` is `human` or `system`. `profile_version` advances on every rename, so a
-client can tell a stale cached name from a current one without comparing
-strings.
+`kind` is `human` or `system`.
 
 This is an identity, not an account: nothing from `accounts` appears here (no
 username, no `enabled`, no `has_password`), and an actor need not have an
 account at all — the system principal does not. A disabled person's actor is
 still readable, because their history stays in the UI after their access ends.
-Email is never published: it is always NULL on a local install.
 
 #### `GET /api/auth/check`
 Verify current authentication.
@@ -182,11 +178,9 @@ Request:  { "title": "My Session" }
 Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…" }
 ```
 
-`created_by_actor_id` is whoever the request resolved to — an actor id for
-[`GET /api/actors`](#actors), not an account id. It is `null` only on sessions
-that predate attribution; everything created since carries one, because a write
-that cannot resolve its actor fails rather than storing the row anonymously.
-Every session payload carries the field, including the sidebar feeds above.
+`created_by_actor_id` is an actor id for [`GET /api/actors`](#actors), not an
+account id. It is `null` for legacy rows and sessions caused by an unidentified
+external person. Every session payload carries the field.
 
 #### `GET /api/sessions/{id}`
 Get session details.
@@ -198,11 +192,11 @@ Get messages for a session.
 Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…" }] }
 ```
 
-`actor_id` is who supplied the message: the person who typed it, or the agent's
-system principal for a prompt the instance composed for itself (a cron job, a
-wakeup, a channel message). It is `null` on assistant and tool rows — their
-authorship is `role` — and on everything recorded before attribution existed.
-`channel` stays transport provenance and is never identity. See
+`actor_id` is who supplied the message: the signed-in person who typed it, or
+the system principal for a prompt Nerve composed itself. It is `null` on
+Slack, Telegram, and imported Codex human input until identity mappings exist;
+on assistant/tool output; and on legacy history. `channel` stays transport
+provenance and is never identity. See
 [Accounts and identity](accounts.md) for what is and is not attributed.
 
 #### `DELETE /api/sessions/{id}`

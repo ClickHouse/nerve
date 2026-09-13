@@ -29,13 +29,7 @@ from tests.actor_rows import ensure_system_principal
 
 @pytest_asyncio.fixture
 async def db(db):  # noqa: F811 — the conftest database, with an identity
-    """The conftest database after local bootstrap.
-
-    Autonomous code resolves the agent's system principal before it writes and
-    fails the run rather than storing a row under nobody, so the paths this
-    file drives need the identity every real database has: production opens
-    nothing without bootstrapping it first.
-    """
+    """The conftest database after local bootstrap."""
     await ensure_system_principal(db)
     return db
 
@@ -81,6 +75,7 @@ async def test_service_starts_origin_and_ingests_events(db, tmp_path):
         roles = {m["role"] for m in msgs}
         assert "user" in roles
         assert "assistant" in roles
+        assert {m["actor_id"] for m in msgs if m["role"] == "user"} == {None}
 
         # Cursor was persisted along the way.
         cursor = await db.get_sync_cursor("codex:local-pi")
@@ -97,14 +92,17 @@ async def test_service_starts_origin_and_ingests_events(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_ingest_is_replayed_after_a_restart(db, tmp_path):
+@pytest.mark.parametrize("failed_table", ["sessions", "messages"])
+async def test_a_failed_ingest_is_replayed_after_a_restart(
+    db, tmp_path, failed_table,
+):
     """The cursor must never move past an event that was not persisted.
 
     The origin advances its own offset before it yields, so the live cursor
     during a failed ingest already covers the event. Checkpointing it there
     would skip the event for good: the next scan starts past it and nothing
-    replays it. Driven with the real failure this can have — the system
-    principal not resolving — rather than a synthetic one.
+    replays it. A SQLite trigger supplies a real insert failure at that
+    boundary; dropping it makes the same rollout retryable.
     """
     sessions_dir = tmp_path / "sessions"
     archive_dir = tmp_path / "archived_sessions"
@@ -121,30 +119,42 @@ async def test_a_failed_ingest_is_replayed_after_a_restart(db, tmp_path):
     thread_id = "11111111-2222-3333-4444-555555555555"
     sid = codex_session_id(thread_id)
 
+    trigger = {
+        "sessions": """CREATE TRIGGER fail_codex_insert
+            BEFORE INSERT ON sessions WHEN NEW.backend = 'codex'
+            BEGIN SELECT RAISE(ABORT, 'injected Codex insert failure'); END""",
+        "messages": """CREATE TRIGGER fail_codex_insert
+            BEFORE INSERT ON messages WHEN NEW.channel = 'codex'
+            BEGIN SELECT RAISE(ABORT, 'injected Codex insert failure'); END""",
+    }[failed_table]
+    await db.db.execute(trigger)
+    await db.db.commit()
+
     # --- the run that fails -------------------------------------------------
-    real_principal = db.get_system_principal
-
-    async def _no_principal():
-        return None
-
-    db.get_system_principal = _no_principal
     service = build_service(config, db)
     await service.start()
     try:
         for _ in range(30):
             await asyncio.sleep(0.05)
-            if await db.get_sync_cursor("codex:local-pi") is not None:
+            stats = service.status()["origins"][0]["stats"]
+            if stats["threads_in_scope"]:
                 break
     finally:
         await service.stop()
-        db.get_system_principal = real_principal
 
-    assert await db.get_session(sid) is None, "nothing should have been stored"
-    assert await db.get_sync_cursor("codex:local-pi") is None, (
-        "the cursor moved past an event that was never ingested"
-    )
+    session = await db.get_session(sid)
+    cursor = await db.get_sync_cursor("codex:local-pi")
+    if failed_table == "sessions":
+        assert session is None, "nothing should have been stored"
+        assert cursor is None, "the cursor moved past the failed session event"
+    else:
+        assert session is not None, "the session event should have landed"
+        assert await db.get_messages(sid) == []
+        assert cursor, "successful events before the failed message were not checkpointed"
 
     # --- the restart that succeeds -----------------------------------------
+    await db.db.execute("DROP TRIGGER fail_codex_insert")
+    await db.db.commit()
     service = build_service(config, db)
     await service.start()
     try:

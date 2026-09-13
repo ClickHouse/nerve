@@ -91,14 +91,14 @@ clients resolve display names through `GET /api/actors`.
 | Event | Stored actor |
 |---|---|
 | A person creates a session or sends a message | That person's actor |
-| Nerve creates a session or prompt | The system actor |
-| Telegram, Slack, or MCP input without a local account mapping | The system actor |
+| Nerve creates a session or prompt, including MCP and Codex sessions | The system actor |
+| Telegram, Slack, or imported Codex input | None until a local identity mapping exists |
 | Assistant and tool output | None |
 
 Existing records remain unattributed. Nerve does not infer identity from channel
 or source metadata. Account and session administration actions are not yet
-recorded as audit events. Autonomous writes fail before persisting if the system
-actor cannot be resolved, so a missing actor never means a failed lookup.
+recorded as audit events. Missing attribution means legacy history, unidentified
+external input, or assistant/tool output; autonomous work uses the system actor.
 
 ## Session-signing secret
 

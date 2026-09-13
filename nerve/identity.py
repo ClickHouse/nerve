@@ -1,9 +1,21 @@
 """Request and autonomous-work identity.
 
-This top-level module imports neither the database nor gateway at runtime, so
-both may use :class:`Actor`. Actors are resolved per request and passed down;
-there is no process-global current actor. ``actor_id`` is permanent identity,
-while ``display_name`` is only a presentation snapshot.
+An :class:`Actor` is the identity carried through an operation: the person who
+made the request, or the agent's system principal when the work is autonomous
+(cron, hooks, background agents). Human actors are resolved per request and
+passed down the call chain. Only the migration-guaranteed system actor may be
+cached by the database; there is no process-global "current actor".
+
+This module sits at the top level, outside both :mod:`nerve.db` and
+:mod:`nerve.gateway`, because both ends need it: the gateway resolves an actor
+on the request, and the data-access layer stores its id. It therefore imports
+neither at runtime — the database handle arrives as an argument and is typed
+only for the checker — so ``nerve.db`` can import this module without a cycle.
+
+Identity vs presentation (RFC 3.3): ``actor_id`` is the identity and is
+permanent. ``display_name`` is a *snapshot* taken when the actor was resolved;
+renaming an account changes what later requests carry and rewrites nothing that
+was stored before. Names are never identity or authorization keys.
 """
 
 from __future__ import annotations
@@ -98,17 +110,9 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
 async def system_actor(store: "AccountStore") -> Actor:
     """The agent's system principal — the identity autonomous work acts as.
 
-    Scheduled runs, channel traffic, background agents and the agent's own
+    Scheduled runs, hooks, background agents and the agent's own
     calls into its API are attributed to this actor rather than to a person
     (0.6). It has no account and never logs in.
-
-    Raises rather than degrading, and every persistent autonomous write goes
-    through it. Every production opener bootstraps the identity before it can
-    serve, so the only way this fails is a regression or a corrupted database —
-    and a run that wrote its rows *without* an actor in that state would leave
-    audit gaps indistinguishable from history that predates attribution, which
-    nothing can later repair. Failing the run is recoverable; a permanent NULL
-    is not. Resolve before the first write, so a failure costs nothing.
     """
     try:
         row = await store.get_system_principal()
