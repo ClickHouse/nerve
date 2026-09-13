@@ -1,6 +1,9 @@
-import { actorName, isSystemActor, useActorRef } from '../../stores/actorStore';
+import {
+  actorDiscriminator, actorName, ambiguousActorIds, isSystemActor, useActorStore,
+} from '../../stores/actorStore';
+import { useEffect } from 'react';
 import { Badge } from '../ui';
-import { Bot } from '../ui/icons';
+import { Bot, User } from '../ui/icons';
 
 /**
  * Attribution labels: who sent a message, who started a session.
@@ -26,29 +29,50 @@ import { Bot } from '../ui/icons';
  * assistant row has no attribution markup anywhere inside it.
  */
 
+interface Attribution {
+  /** What the label reads, discriminator included when one is needed. */
+  name: string;
+  system: boolean;
+  /** True when `name` is the neutral fallback rather than a real name. */
+  anonymous: boolean;
+  /** True when another actor renders the same name and a suffix was added. */
+  ambiguous: boolean;
+}
+
 /** What to say about an actor, given whatever the map currently knows. */
-function useAttribution(actorId: string | null | undefined) {
-  const actor = useActorRef(actorId);
-  const name = actorName(actor);
+function useAttribution(actorId: string | null | undefined): Attribution {
+  const actors = useActorStore((s) => s.actors);
+  const resolve = useActorStore((s) => s.resolve);
+  useEffect(() => {
+    if (actorId) resolve([actorId]);
+  }, [actorId, resolve]);
+
+  const actor = actorId ? actors[actorId] : undefined;
+  const base = actorName(actor);
   const system = isSystemActor(actor);
+  // Display names are not identity and two of them can be equal, so a label
+  // that is only a name can name two different people. When that happens both
+  // get a stable slice of their own id appended — in the label, not just the
+  // tooltip, because the tooltip is not there on a phone.
+  const ambiguous = !!actorId && ambiguousActorIds(actors).has(actorId);
   return {
-    name,
+    name: ambiguous ? `${base} (${actorDiscriminator(actorId!)})` : base,
     system,
-    /** True when `name` is the neutral fallback rather than a real name. */
     anonymous: !actor?.display_name?.trim() && !system,
+    ambiguous,
   };
 }
 
-function tooltip(
-  verb: string,
-  actorId: string,
-  { name, system, anonymous }: { name: string; system: boolean; anonymous: boolean },
-): string {
+function tooltip(verb: string, actorId: string, attribution: Attribution): string {
+  const { name, system, anonymous, ambiguous } = attribution;
   if (system) return `${verb} ${name} itself — scheduled or autonomous work`;
-  // The id earns its place only when there is no name to show: it is the one
-  // thing that tells "this account has no display name" apart from "this id is
-  // from somewhere this instance has never heard of".
+  // The id earns its place when there is no name to show — it is the one thing
+  // that tells "this account has no display name" apart from "this id is from
+  // somewhere this instance has never heard of" — and again when the name is
+  // shared, where the short suffix says there are two and the full id says
+  // which.
   if (anonymous) return `${verb} actor ${actorId}`;
+  if (ambiguous) return `${verb} ${name} — actor ${actorId}`;
   return `${verb} ${name}`;
 }
 
@@ -81,24 +105,36 @@ export function ActorLabel({ actorId }: { actorId: string | null | undefined }) 
  *
  * Always shown when the session has a creator, unlike the list labels: the
  * header describes one session, so this is an answer rather than a repetition,
- * and it is the only place the full answer exists. Hidden below `md` for the
- * same reason as the backend and model chips beside it — on a phone the title
- * needs the width more than the metadata does, and the session list still
- * marks the agent's own sessions there.
+ * and it is the only place the full answer exists.
+ *
+ * **It does not disappear on a phone.** It did, matching the backend and model
+ * chips beside it, and that was wrong: those two are conveniences, this is the
+ * only place a phone can learn who a shared session belongs to — the session
+ * list marks a person only once two of them have started something, and on a
+ * phone that list is a drawer you have to open. So the chip stays at every
+ * width and sheds its *text* instead: below `md` the glyph carries it and the
+ * name is `sr-only`, which keeps the full sentence for a screen reader and the
+ * `title` for a long press, while costing the title bar about 22px.
  */
 export function SessionCreator({ actorId }: { actorId: string | null | undefined }) {
   const attribution = useAttribution(actorId);
   if (!actorId) return null;
+  const label = tooltip('Started by', actorId, attribution);
   return (
     <Badge
       data-attribution="session-header"
       tone="neutral"
       size="xs"
-      title={tooltip('Started by', actorId, attribution)}
-      className="hidden md:inline-flex shrink-0 max-w-[12rem] overflow-hidden"
+      title={label}
+      className="shrink-0 max-w-[12rem] overflow-hidden"
     >
-      {attribution.system && <Bot size={11} className="shrink-0" aria-hidden="true" />}
-      <span className="truncate">Started by {attribution.name}</span>
+      {/* Decorative at `md` and up, where the text says the same thing; below
+          it the text is still in the DOM for assistive technology, so the
+          glyph never has to carry an accessible name of its own. */}
+      {attribution.system
+        ? <Bot size={11} className="shrink-0" aria-hidden="true" />
+        : <User size={11} className="shrink-0" aria-hidden="true" />}
+      <span className="sr-only md:not-sr-only md:truncate">Started by {attribution.name}</span>
     </Badge>
   );
 }
@@ -139,7 +175,12 @@ export function SessionCreatorMarker({ actorId }: { actorId: string | null | und
     <span
       data-attribution="session-row"
       title={label}
-      className="shrink-0 max-w-[4.5rem] truncate text-2xs text-text-dim"
+      // Wider when a discriminator is in play: truncating "Alice (c3d4e5)" back
+      // to "Alice (c3…" would drop the one part of it that disambiguates, which
+      // is the only reason the marker is on the row at all.
+      className={`shrink-0 truncate text-2xs text-text-dim ${
+        attribution.ambiguous ? 'max-w-[7.5rem]' : 'max-w-[4.5rem]'
+      }`}
     >
       {attribution.name}
     </span>
